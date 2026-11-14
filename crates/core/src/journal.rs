@@ -1947,6 +1947,7 @@ impl Session {
                 | Outcome::SucceededWithDetails { .. }
                 | Outcome::Failed(_)
                 | Outcome::TextResult { .. }
+                | Outcome::TextResultWithStructuredContent { .. }
         ) || !self.operations().iter().any(|(inv, state)| {
             inv.operation_id == operation_id
                 && matches!(

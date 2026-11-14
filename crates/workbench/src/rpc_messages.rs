@@ -633,6 +633,15 @@ impl Projection {
                 let outcome = operation.map(|(_, outcome)| outcome);
                 let mut value =
                     super::rpc_events::tool_event_result_value(content, outcome, *is_structured);
+                if matches!(
+                    outcome,
+                    Some(pi_rs::Outcome::TextResultWithStructuredContent { .. })
+                ) {
+                    value
+                        .as_object_mut()
+                        .expect("result object")
+                        .remove("structuredContent");
+                }
                 value["role"] = json!("toolResult");
                 value["toolCallId"] = json!(call_id);
                 value["toolName"] = json!(name);

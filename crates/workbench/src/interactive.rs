@@ -1580,6 +1580,10 @@ impl View {
                         is_error: false,
                         ..
                     }
+                    | pi_rs::Outcome::TextResultWithStructuredContent {
+                        is_error: false,
+                        ..
+                    }
             ) && !matches!(outcome, pi_rs::Outcome::Structured { data, .. } | pi_rs::Outcome::StructuredWithDetails { data, .. } if data["isError"] != true);
             *finished = true;
         }

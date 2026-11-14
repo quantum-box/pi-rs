@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
+// A duplex tool-result request and its completion can each contain an 8 MiB
+// journaled outcome, including JSON-escaped structured shell output.
+const MAX_DUPLEX_MESSAGE: u64 = 16 * 1024 * 1024;
+#[cfg(test)]
+use super::json_size::MAX_NESTED_ARGUMENT_BYTES;
 // A lifecycle event can include an 8 MiB journaled tool result, whose JSON
 // representation may expand to six times its original size when escaped.
 const MAX_REQUEST: u64 = 64 * 1024 * 1024;
@@ -39,9 +44,19 @@ struct Endpoint {
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
     text_result_v2: bool,
+    structured_text_result: bool,
 }
 
 impl Endpoint {
+    fn project_outcome(&self, outcome: &Outcome) -> Outcome {
+        if self.structured_text_result && self.text_result_v2 {
+            outcome.clone()
+        } else if self.text_result_v2 {
+            outcome.protocol_text_result()
+        } else {
+            outcome.legacy_text_result()
+        }
+    }
     fn command(&self, protocol: &str) -> Command {
         let mut command = Command::new(&self.path);
         if let Some(flags) = &self.flags {
@@ -302,6 +317,8 @@ struct Description {
     tool_result_hook: bool,
     #[serde(default)]
     text_result_v2: bool,
+    #[serde(default)]
+    structured_text_result: bool,
     #[serde(default)]
     tool_message_error: bool,
     #[serde(default)]
@@ -623,6 +640,7 @@ impl ExecutableExtension {
             flags: None,
             pi_lifecycle_fields: false,
             text_result_v2: false,
+            structured_text_result: false,
         };
         let description =
             call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
@@ -632,6 +650,7 @@ impl ExecutableExtension {
         };
         extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
         extension.endpoint.text_result_v2 = extension.description.text_result_v2;
+        extension.endpoint.structured_text_result = extension.description.structured_text_result;
         extension.apply_flags(&mut BTreeMap::new())?;
         Ok(extension)
     }
@@ -1596,11 +1615,7 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
         let legacy = !self.endpoint.text_result_v2;
-        let sent = if legacy {
-            outcome.legacy_text_result()
-        } else {
-            outcome.clone()
-        };
+        let sent = self.endpoint.project_outcome(outcome);
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
             outcome: sent.clone(),
@@ -1620,10 +1635,15 @@ impl Extension for ExecutableExtension {
         if legacy
             && let Outcome::TextResult {
                 output, details, ..
+            }
+            | Outcome::TextResultWithStructuredContent {
+                output, details, ..
             } = outcome
         {
             return Ok(updated.map(|result| {
-                if result == sent {
+                if result == sent
+                    && !matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
+                {
                     return outcome.clone();
                 }
                 match result {
@@ -1658,7 +1678,7 @@ impl Extension for ExecutableExtension {
         }
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
-            outcome: outcome.clone(),
+            outcome: self.endpoint.project_outcome(outcome),
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
             text_result_v2: true,
@@ -1667,9 +1687,12 @@ impl Extension for ExecutableExtension {
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
-            .await
-            .map_err(|error| error.to_string())?
+        let updated: Option<Outcome> = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(updated)
     }
 
     fn after_tool(
@@ -1680,11 +1703,7 @@ impl Extension for ExecutableExtension {
     ) -> ExtensionResult<Option<ExtensionState>> {
         self.request(ProtocolRequest::AfterTool {
             name: name.into(),
-            outcome: if self.endpoint.text_result_v2 {
-                outcome.clone()
-            } else {
-                outcome.legacy_text_result()
-            },
+            outcome: self.endpoint.project_outcome(outcome),
             state: state.cloned(),
         })
     }
@@ -1927,6 +1946,9 @@ struct ShellProgressHost {
 }
 #[async_trait::async_trait]
 impl ToolHost for ShellProgressHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.inner.supports_prevalidated_call_accounting()
+    }
     fn tools(&self) -> Vec<ToolSpec> {
         self.inner.tools()
     }
@@ -1958,6 +1980,12 @@ impl ToolHost for ShellProgressHost {
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
         self.inner.call(name, arguments).await
+    }
+    async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
+        self.inner.call_batch(calls).await
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        self.inner.call_batch_prevalidated(calls).await
     }
     async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
         let data: Vec<u8> = serde_json::from_value(
@@ -1997,6 +2025,8 @@ struct DuplexRequest {
     has_custom_messages: bool,
     #[serde(default)]
     has_keyed_messages: bool,
+    #[serde(default)]
+    has_prevalidated_calls: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2015,6 +2045,12 @@ enum DuplexFrame {
     },
     Call {
         calls: Vec<(String, Value)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rejected: Vec<usize>,
+    },
+    #[serde(skip)]
+    CheckedCall {
+        calls: Vec<(String, Option<Value>)>,
     },
     Complete {
         response: std::result::Result<Value, String>,
@@ -2022,27 +2058,209 @@ enum DuplexFrame {
 }
 
 fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
-    let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 >= MAX_MESSAGE {
-        return Err("native extension frame exceeds 4 MiB".into());
+    write_bounded_line(writer, value, MAX_MESSAGE)
+}
+fn duplex_write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
+    write_bounded_line(writer, value, MAX_DUPLEX_MESSAGE)
+}
+fn write_bounded_line(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    limit: u64,
+) -> ExtensionResult<()> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+        exceeded: bool,
     }
-    bytes.push(b'\n');
+    impl Write for Bounded {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if data.len() > self.limit.saturating_sub(self.bytes.len()) {
+                self.exceeded = true;
+                return Err(std::io::Error::other("frame limit exceeded"));
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Bounded {
+        bytes: Vec::new(),
+        limit: (limit - 1) as usize,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        return Err(if buffer.exceeded {
+            format!(
+                "native extension frame exceeds {} MiB",
+                limit / (1024 * 1024)
+            )
+        } else {
+            error.to_string()
+        });
+    }
+    buffer.bytes.push(b'\n');
     writer
-        .write_all(&bytes)
+        .write_all(&buffer.bytes)
         .and_then(|_| writer.flush())
         .map_err(|error| error.to_string())
 }
 fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> ExtensionResult<T> {
+    read_bounded_line(reader, MAX_MESSAGE)
+}
+fn duplex_read_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+) -> ExtensionResult<T> {
+    read_bounded_line(reader, MAX_DUPLEX_MESSAGE)
+}
+fn read_bounded_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+    limit: u64,
+) -> ExtensionResult<T> {
+    let bytes = read_bounded_frame(reader, limit)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))
+}
+fn read_bounded_frame(reader: &mut impl BufRead, limit: u64) -> ExtensionResult<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_MESSAGE + 1)
+        .take(limit + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("native extension frame exceeds 4 MiB".into());
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "native extension frame exceeds {} MiB",
+            limit / (1024 * 1024)
+        ));
     }
     if bytes.is_empty() {
         return Err("native extension connection closed".into());
+    }
+    Ok(bytes)
+}
+
+// Inspect call count without allocating their arbitrary JSON arguments. The
+// frame may put `type` after `calls`, so borrow the raw array before parsing it.
+fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> {
+    #[derive(Deserialize)]
+    struct Preflight<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        calls: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        rejected: Option<&'a serde_json::value::RawValue>,
+    }
+    struct BoundedCalls<'a>(
+        Vec<(
+            &'a serde_json::value::RawValue,
+            &'a serde_json::value::RawValue,
+        )>,
+    );
+    impl<'de> Deserialize<'de> for BoundedCalls<'de> {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = BoundedCalls<'de>;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("an array of at most 4096 tool calls")
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut calls = Vec::new();
+                    for _ in 0..4096 {
+                        match sequence.next_element::<(
+                            &'de serde_json::value::RawValue,
+                            &'de serde_json::value::RawValue,
+                        )>()? {
+                            None => return Ok(BoundedCalls(calls)),
+                            Some(call) => calls.push(call),
+                        }
+                    }
+                    if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "native extension batch exceeds execution limit",
+                        ));
+                    }
+                    Ok(BoundedCalls(calls))
+                }
+            }
+            deserializer.deserialize_seq(Visitor)
+        }
+    }
+    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE)?;
+    let prefix: Preflight<'_> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if prefix.kind == "call"
+        && let Some(calls) = prefix.calls
+    {
+        let BoundedCalls(calls) = serde_json::from_str::<BoundedCalls<'_>>(calls.get())
+            .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        let rejected = if let Some(raw) = prefix.rejected {
+            struct Indices(Vec<usize>);
+            impl<'de> Deserialize<'de> for Indices {
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    deserializer: D,
+                ) -> std::result::Result<Self, D::Error> {
+                    struct V;
+                    impl<'de> serde::de::Visitor<'de> for V {
+                        type Value = Indices;
+                        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.write_str("at most 4096 ordered indices")
+                        }
+                        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                            self,
+                            mut seq: A,
+                        ) -> std::result::Result<Self::Value, A::Error> {
+                            let mut indices = Vec::new();
+                            while let Some(index) = seq.next_element::<usize>()? {
+                                if indices.len() == 4096
+                                    || indices.last().is_some_and(|prior| *prior >= index)
+                                {
+                                    return Err(serde::de::Error::custom(
+                                        "invalid prevalidated call indices",
+                                    ));
+                                }
+                                indices.push(index);
+                            }
+                            Ok(Indices(indices))
+                        }
+                    }
+                    deserializer.deserialize_seq(V)
+                }
+            }
+            serde_json::from_str::<Indices>(raw.get())
+                .map_err(|error| format!("invalid native extension frame: {error}"))?
+                .0
+        } else {
+            Vec::new()
+        };
+        if rejected.last().is_some_and(|index| *index >= calls.len()) {
+            return Err("invalid prevalidated call indices".into());
+        }
+        let mut rejected = rejected.into_iter().peekable();
+        let calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                let name = serde_json::from_str::<String>(name.get())?;
+                let value = if rejected.peek() == Some(&index) {
+                    rejected.next();
+                    None
+                } else {
+                    super::json_size::compact_value(arguments.get())?
+                };
+                Ok::<_, serde_json::Error>((name, value))
+            })
+            .collect::<serde_json::Result<Vec<_>>>()
+            .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        return Ok(DuplexFrame::CheckedCall { calls });
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension frame: {error}"))
@@ -2152,11 +2370,18 @@ fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
 
 fn call_duplex<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
-    request: ProtocolRequest,
+    mut request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
 ) -> ExtensionResult<T> {
+    if let ProtocolRequest::Lifecycle {
+        event: LifecycleEvent::ToolExecutionEnd { result, .. },
+        ..
+    } = &mut request
+    {
+        *result = endpoint.project_outcome(result);
+    }
     let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
@@ -2165,7 +2390,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     let (errors, failed) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         for value in writes {
-            if let Err(error) = write_line(&mut input, &value) {
+            if let Err(error) = duplex_write_line(&mut input, &value) {
                 let _ = errors.send(error);
                 break;
             }
@@ -2175,10 +2400,11 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
-            let frame = read_line::<DuplexFrame>(&mut output);
+            let frame = read_duplex_frame(&mut output);
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
+                    | DuplexFrame::CheckedCall { .. }
                     | DuplexFrame::SendMessage { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
@@ -2197,6 +2423,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 has_progress: host.supports_progress(),
                 has_custom_messages: host.supports_custom_messages(),
                 has_keyed_messages: host.supports_keyed_messages(),
+                has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -2233,29 +2460,37 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                     .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
             }
-            Ok(Ok(DuplexFrame::Call { calls })) => {
+            Ok(Ok(DuplexFrame::CheckedCall { calls })) => {
                 if calls.len() > 4096 {
                     return Err("native extension batch exceeds execution limit".into());
                 }
-                let results = runtime.block_on(async {
+                let results = if !host.supports_prevalidated_call_accounting()
+                    && calls.iter().any(|(_, value)| value.is_none())
+                {
+                    calls
+                        .into_iter()
+                        .map(|_| {
+                            Outcome::Skipped("host cannot account for prevalidated calls".into())
+                        })
+                        .collect()
+                } else {
+                    runtime.block_on(async {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Err("native extension cancelled during host call".to_owned()),
-                        results = host.call_batch(calls) => Ok(results),
+                        results = host.call_batch_prevalidated(calls) => Ok(results),
                     }
-                })?;
-                let results: Vec<_> = if endpoint.text_result_v2 {
-                    results
-                } else {
-                    results
-                        .into_iter()
-                        .map(|result| result.legacy_text_result())
-                        .collect()
+                })?
                 };
+                let results: Vec<_> = results
+                    .into_iter()
+                    .map(|result| endpoint.project_outcome(&result))
+                    .collect();
                 writer
                     .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
             }
+            Ok(Ok(DuplexFrame::Call { .. })) => unreachable!("call frames are prevalidated"),
             Ok(Ok(DuplexFrame::Ui { request })) => {
                 let response = runtime.block_on(async {
                     tokio::select! {
@@ -2289,10 +2524,51 @@ struct RemoteHost {
     has_progress: bool,
     has_custom_messages: bool,
     has_keyed_messages: bool,
+    has_prevalidated_calls: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
+}
+impl RemoteHost {
+    async fn send_calls(&self, calls: Vec<(String, Value)>, rejected: Vec<usize>) -> Vec<Outcome> {
+        let count = calls.len();
+        let io = self.io.clone();
+        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            duplex_write_line(&mut io.1, &DuplexFrame::Call { calls, rejected })?;
+            let outcomes: Vec<Outcome> = duplex_read_line(&mut io.0)?;
+            if outcomes.len() != count {
+                return Err("native extension received an invalid batch size".into());
+            }
+            Ok(outcomes)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
+    }
+}
+fn wire_prevalidated_calls(
+    calls: Vec<(String, Option<Value>)>,
+) -> (Vec<(String, Value)>, Vec<usize>) {
+    let mut rejected = Vec::new();
+    let calls = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, value))| {
+            if value.is_none() {
+                rejected.push(index);
+            }
+            (name, value.unwrap_or(Value::Null))
+        })
+        .collect();
+    (calls, rejected)
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.has_prevalidated_calls
+    }
     fn supports_progress(&self) -> bool {
         self.has_progress
     }
@@ -2305,8 +2581,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2324,8 +2600,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Ui { request })?;
-            read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
+            duplex_write_line(&mut io.1, &DuplexFrame::Ui { request })?;
+            duplex_read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2349,7 +2625,7 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(
+            duplex_write_line(
                 &mut io.1,
                 &DuplexFrame::SendMessage {
                     message,
@@ -2357,7 +2633,7 @@ impl ToolHost for RemoteHost {
                     key: None,
                 },
             )?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2380,7 +2656,7 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(
+            duplex_write_line(
                 &mut io.1,
                 &DuplexFrame::SendMessage {
                     message,
@@ -2388,7 +2664,7 @@ impl ToolHost for RemoteHost {
                     key: Some(key),
                 },
             )?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -2399,34 +2675,40 @@ impl ToolHost for RemoteHost {
             .remove(0)
     }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
-        let count = calls.len();
-        let io = self.io.clone();
-        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
-            let mut io = io
-                .lock()
-                .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Call { calls })?;
-            let outcomes: Vec<Outcome> = read_line(&mut io.0)?;
-            if outcomes.len() != count {
-                return Err("native extension received an invalid batch size".into());
-            }
-            Ok(outcomes)
-        })
+        self.send_calls(calls, Vec::new()).await
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        if self.has_prevalidated_calls {
+            let (calls, rejected) = wire_prevalidated_calls(calls);
+            return self.send_calls(calls, rejected).await;
+        }
+        // An older peer cannot charge rejected positions. Fail the batch closed
+        // rather than silently letting invalid attempts bypass its call budget.
+        if calls.iter().any(|(_, value)| value.is_none()) {
+            return calls
+                .into_iter()
+                .map(|_| Outcome::Skipped("host cannot account for prevalidated calls".into()))
+                .collect();
+        }
+        self.call_batch(
+            calls
+                .into_iter()
+                .map(|(name, value)| (name, value.expect("checked above")))
+                .collect(),
+        )
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
     }
 }
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let mut input = std::io::BufReader::new(std::io::stdin());
-    let request: DuplexRequest = read_line(&mut input).map_err(Error::Config)?;
+    let request: DuplexRequest = duplex_read_line(&mut input).map_err(Error::Config)?;
     let host = Arc::new(RemoteHost {
         tools: request.tools,
         has_ui: request.has_ui,
         has_progress: request.has_progress,
         has_custom_messages: request.has_custom_messages,
         has_keyed_messages: request.has_keyed_messages,
+        has_prevalidated_calls: request.has_prevalidated_calls,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2437,7 +2719,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         .io
         .lock()
         .map_err(|_| Error::Config("native extension connection lock failed".into()))?;
-    write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
+    duplex_write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -2528,14 +2810,24 @@ fn call<T: serde::de::DeserializeOwned>(
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
+    let response_limit = if endpoint.text_result_v2
+        && endpoint.structured_text_result
+        && matches!(
+            &request,
+            ProtocolRequest::ToolResult {
+                outcome: Outcome::TextResultWithStructuredContent { .. },
+                ..
+            }
+        ) {
+        MAX_DUPLEX_MESSAGE
+    } else {
+        MAX_MESSAGE
+    };
     let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
-    if !endpoint.text_result_v2
-        && wire["type"] == "lifecycle"
-        && wire["event"]["type"] == "tool_execution_end"
-    {
+    if wire["type"] == "lifecycle" && wire["event"]["type"] == "tool_execution_end" {
         let result = &mut wire["event"]["result"];
         if let Ok(outcome) = serde_json::from_value::<Outcome>(result.clone()) {
-            *result = serde_json::to_value(outcome.legacy_text_result())
+            *result = serde_json::to_value(endpoint.project_outcome(&outcome))
                 .map_err(|error| error.to_string())?;
         }
     }
@@ -2555,12 +2847,13 @@ fn call<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = output
-            .take(MAX_MESSAGE + 1)
+            .take(response_limit + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
         let _ = reader.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut completed_read = None;
     let status = loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(
@@ -2571,6 +2864,18 @@ fn call<T: serde::de::DeserializeOwned>(
             return Err(
                 "native extension exceeded 30 seconds; outcome requires reconciliation".into(),
             );
+        }
+        if completed_read.is_none()
+            && let Ok(result) = read.try_recv()
+        {
+            let bytes = result.map_err(|error| error.to_string())?;
+            if bytes.len() as u64 > response_limit {
+                return Err(format!(
+                    "native extension response exceeds {} MiB",
+                    response_limit / (1024 * 1024)
+                ));
+            }
+            completed_read = Some(bytes);
         }
         if let Some(status) = child
             .process
@@ -2585,16 +2890,22 @@ fn call<T: serde::de::DeserializeOwned>(
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| "extension input writer timed out")?
         .map_err(|error| error.to_string())?;
-    let bytes = read
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "extension output reader timed out")?
-        .map_err(|error| error.to_string())?;
+    let bytes = match completed_read {
+        Some(bytes) => bytes,
+        None => read
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "extension output reader timed out")?
+            .map_err(|error| error.to_string())?,
+    };
     child.finished = true;
     if !status.success() {
         return Err(format!("native extension exited with {status}"));
     }
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("native extension response exceeds 4 MiB".into());
+    if bytes.len() as u64 > response_limit {
+        return Err(format!(
+            "native extension response exceeds {} MiB",
+            response_limit / (1024 * 1024)
+        ));
     }
     let envelope: Envelope = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension response: {error}"))?;
@@ -2763,6 +3074,7 @@ async fn dispatch_with_host(
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             text_result_v2: true,
+            structured_text_result: true,
             tool_message_error: true,
             tool_message_structured: true,
             tool_message_provenance_v2: true,
@@ -4994,6 +5306,64 @@ else:
         );
     }
 
+    #[tokio::test]
+    async fn negotiated_result_retains_presence_through_dispatch() {
+        struct Hook(bool);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "hook"
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: self.0.then(|| "secret".into()),
+                    details: Some(serde_json::json!({"changed":true})),
+                    is_error: None,
+                }))
+            }
+        }
+        for replace in [false, true] {
+            let original = Outcome::TextResultWithStructuredContent {
+                output: "secret".into(),
+                details: None,
+                structured_content: serde_json::json!({"output":"secret"}),
+                is_error: false,
+            };
+            let response = dispatch(
+                Arc::new(Hook(replace)),
+                ProtocolRequest::ToolResult {
+                    call: pi_rs_core::ToolCall {
+                        id: "id".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                    outcome: original,
+                    operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    state: None,
+                    text_result_v2: true,
+                },
+            )
+            .await
+            .unwrap();
+            let outcome: Outcome = serde_json::from_value::<Option<Outcome>>(response)
+                .unwrap()
+                .unwrap();
+            if replace {
+                assert!(matches!(outcome, Outcome::TextResult { .. }));
+            } else {
+                assert!(
+                    matches!(outcome, Outcome::TextResultWithStructuredContent { details:Some(details), .. } if details["changed"] == true)
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn executable_result_patch_chain_and_legacy_negotiation() {
@@ -5049,6 +5419,557 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
         assert!(
             matches!(outcome, Outcome::TextResult { details: Some(details), .. } if details["code"] == 42)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_result_negotiation_preserves_metadata_and_drops_replaced_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':name.startswith('modern'), 'structured_text_result':name.startswith('modern')}
+elif r['type']=='tool_result':
+    o=r['outcome']
+    if name=='modern_metadata':
+        assert o['status']=='text_result_with_structured_content'
+        o['detail']['details']={'changed':True}
+        value=o
+    elif name=='modern_replace':
+        assert o['status']=='text_result_with_structured_content'
+        value={'status':'text_result','detail':{'output':o['detail']['output'],'details':None,'is_error':False}}
+    elif name=='legacy_metadata':
+        assert o['status']=='succeeded'
+        value={'status':'succeeded_with_details','detail':{'output':o['detail'],'details':{'changed':True}}}
+    else:
+        assert o['status']=='failed'
+        value={'status':'failed','detail':'redacted'}
+else: raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for name in [
+            "modern_metadata",
+            "modern_replace",
+            "legacy_metadata",
+            "legacy_failed",
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let failure = name == "legacy_failed";
+            let original = Outcome::TextResultWithStructuredContent {
+                output: "secret".into(),
+                details: failure.then(|| serde_json::json!({"truncation":{"truncated":true}})),
+                structured_content: serde_json::json!({"output":"secret"}),
+                is_error: failure,
+            };
+            let updated = ext
+                .tool_result_update(&call, &original, &context, None)
+                .await
+                .unwrap()
+                .unwrap();
+            match name {
+                "modern_metadata" => assert!(
+                    matches!(updated, Outcome::TextResultWithStructuredContent { details:Some(details), structured_content, .. } if details["changed"] == true && structured_content["output"] == "secret")
+                ),
+                "modern_replace" => assert!(
+                    matches!(updated, Outcome::TextResult { output, .. } if output == "secret")
+                ),
+                "legacy_metadata" => assert!(
+                    matches!(updated, Outcome::SucceededWithDetails { details, .. } if details["changed"] == true)
+                ),
+                _ => assert!(
+                    matches!(updated, Outcome::TextResult { output, details:Some(details), is_error:true } if output == "redacted" && details["truncation"]["truncated"] == true)
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_structured_result_accepts_escaped_shell_output() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'test','dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'tool_hook_host_calls':True, 'text_result_v2':True, 'structured_text_result':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    request=json.loads(sys.stdin.readline())['request']
+    outcome=request['outcome']
+    assert len(outcome['detail']['structured_content']['output']) == 1024 * 1024
+    assert outcome['detail']['structured_content']['output'] == '\0' * (1024 * 1024)
+    print(json.dumps({'type':'complete','response':{'Ok':outcome}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "display".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"\0".repeat(1024 * 1024)}),
+            is_error: false,
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let returned = extension
+            .tool_result_update_with_host(&call, &outcome, &context, None, Arc::new(Host))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned, outcome);
+    }
+
+    #[test]
+    fn duplex_frame_limit_is_symmetric_and_bounded() {
+        let value = "\0".repeat(1024 * 1024);
+        let mut frame = Vec::new();
+        duplex_write_line(&mut frame, &value).unwrap();
+        assert!(frame.len() > MAX_MESSAGE as usize);
+        assert_eq!(
+            duplex_read_line::<String>(&mut std::io::Cursor::new(&frame)).unwrap(),
+            value
+        );
+        assert!(read_line::<String>(&mut std::io::Cursor::new(&frame)).is_err());
+        let oversized = "x".repeat(MAX_DUPLEX_MESSAGE as usize);
+        assert!(
+            duplex_write_line(&mut Vec::new(), &oversized)
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+        let oversized_frame = vec![b'x'; MAX_DUPLEX_MESSAGE as usize + 1];
+        assert!(
+            duplex_read_line::<Value>(&mut std::io::Cursor::new(oversized_frame))
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+    }
+
+    #[test]
+    fn duplex_batch_checks_count_before_materializing_arguments() {
+        let call = r#"["tool",{}]"#;
+        let valid = format!(
+            "{{\"calls\":[{}],\"type\":\"call\"}}\n",
+            vec![call; 4096].join(",")
+        );
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(valid)), Ok(DuplexFrame::CheckedCall { calls }) if calls.len() == 4096)
+        );
+        let invalid = format!(
+            "{{\"calls\":[{},[\"tool\",[{}]]],\"type\":\"call\"}}\n",
+            vec![call; 4096].join(","),
+            vec!["{}"; 100_000].join(",")
+        );
+        let error = match read_duplex_frame(&mut std::io::Cursor::new(invalid)) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized batch accepted"),
+        };
+        assert!(error.contains("batch exceeds execution limit"));
+    }
+
+    #[test]
+    fn duplex_preflight_bounds_compact_arguments_before_materialization() {
+        let at_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 2));
+        let frame = format!(
+            "{{\"calls\":[[\"first\",{{\"a\":1}}],[\"limit\",{at_limit}],[\"last\",[true,null]]],\"type\":\"call\"}}\n"
+        );
+        let parsed = read_duplex_frame(&mut std::io::Cursor::new(frame))
+            .unwrap_or_else(|error| panic!("valid batch rejected: {error}"));
+        assert!(
+            matches!(parsed, DuplexFrame::CheckedCall { calls } if calls.len() == 3 && calls[0].1.as_ref().unwrap()["a"] == 1 && calls[1].1.as_ref().unwrap().as_str().unwrap().len() == MAX_NESTED_ARGUMENT_BYTES - 2 && calls[2].1 == Some(serde_json::json!([true,null])))
+        );
+        let over_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 1));
+        let frame = format!("{{\"type\":\"call\",\"calls\":[[\"large\",{over_limit}]]}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1.is_none())
+        );
+        let structured = format!("[{}{{}}]", "{},".repeat(2_000_000));
+        assert!(structured.len() > MAX_NESTED_ARGUMENT_BYTES);
+        let frame = format!("{{\"calls\":[[\"large\",{structured}]],\"type\":\"call\"}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls.len()==1 && calls[0].1.is_none())
+        );
+        let escaped = format!("\"{}\"", "\\u0061".repeat(200_000));
+        let whitespace = format!("[{}1]", " ".repeat(MAX_NESTED_ARGUMENT_BYTES));
+        let frame = format!(
+            "{{\"type\":\"call\",\"calls\":[[\"escaped\",{escaped}],[\"space\",{whitespace}]]}}\n"
+        );
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1.as_ref().unwrap().as_str().unwrap().len() == 200_000 && calls[1].1 == Some(serde_json::json!([1])))
+        );
+        let discarded = format!("{{\"x\":[{}{{}}],\"x\":0}}", "{},".repeat(500_000));
+        let frame = format!("{{\"type\":\"call\",\"calls\":[[\"duplicate\",{discarded}]]}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1 == Some(serde_json::json!({"x":0})))
+        );
+    }
+
+    #[test]
+    fn duplex_prevalidated_positions_keep_null_arguments_distinct() {
+        let (calls, rejected) = wire_prevalidated_calls(vec![
+            ("null".into(), Some(Value::Null)),
+            ("oversized".into(), None),
+            ("after".into(), Some(serde_json::json!({}))),
+        ]);
+        let mut frame = Vec::new();
+        duplex_write_line(&mut frame, &DuplexFrame::Call { calls, rejected }).unwrap();
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1 == Some(Value::Null) && calls[1].1.is_none() && calls[2].1 == Some(serde_json::json!({})))
+        );
+        for rejected in ["[1,1]", "[2,1]", "[3]"] {
+            let frame = format!(
+                "{{\"type\":\"call\",\"calls\":[[\"a\",null],[\"b\",null],[\"c\",null]],\"rejected\":{rejected}}}"
+            );
+            assert!(read_duplex_frame(&mut std::io::Cursor::new(frame)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn old_duplex_peer_fails_mixed_prevalidated_batch_closed() {
+        let mut host = RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        };
+        assert!(!host.supports_prevalidated_call_accounting());
+        host.has_prevalidated_calls = true;
+        assert!(host.supports_prevalidated_call_accounting());
+        host.has_prevalidated_calls = false;
+        let results = host
+            .call_batch_prevalidated(vec![
+                ("large".into(), None),
+                ("valid".into(), Some(Value::Null)),
+            ])
+            .await;
+        assert_eq!(
+            results,
+            vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_batch_skips_only_oversized_call_and_preserves_order() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                self.0.lock().unwrap().push(name.into());
+                Outcome::Succeeded(name.into())
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<Value>)>,
+            ) -> Vec<Outcome> {
+                let mut outputs = Vec::new();
+                for (name, value) in calls {
+                    outputs.push(if let Some(value) = value {
+                        self.call(&name, value).await
+                    } else {
+                        Outcome::Skipped("nested tool arguments exceed size limit".into())
+                    });
+                }
+                outputs
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}], 'host_calls':True, 'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    assert json.loads(sys.stdin.readline())['has_prevalidated_calls'] is True
+    print(json.dumps({'type':'call','calls':[['first',{}],['too_large',[{}]*400000],['last',{}]]},separators=(',',':')),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert [v['status'] for v in values] == ['succeeded','skipped','succeeded']
+    assert values[0]['detail']=='first' and values[2]['detail']=='last'
+    assert values[1]['detail']=='nested tool arguments exceed size limit'
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let host = Arc::new(Host(std::sync::Mutex::new(Vec::new())));
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let outcome = tool
+            .invoke_transaction(serde_json::json!({}), context, None, host.clone())
+            .await
+            .outcome;
+        assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(*host.0.lock().unwrap(), vec!["first", "last"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_default_custom_host_does_not_advertise_or_bypass_accounting() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DefaultHost(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for DefaultHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded(name.into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}],'host_calls':True,'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    assert json.loads(sys.stdin.readline())['has_prevalidated_calls'] is False
+    print(json.dumps({'type':'call','calls':[['valid',{}]]}),flush=True)
+    assert json.loads(sys.stdin.readline())[0]['detail']=='valid'
+    print(json.dumps({'type':'call','calls':[['large',[{}]*400000],['not-dispatched',{}]]},separators=(',',':')),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert len(values)==2 and all(v['status']=='skipped' and v['detail']=='host cannot account for prevalidated calls' for v in values)
+    print(json.dumps({'type':'call','calls':[['large',None],['not-dispatched',{}]],'rejected':[0]}),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert len(values)==2 and all(v['status']=='skipped' and v['detail']=='host cannot account for prevalidated calls' for v in values)
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let host = Arc::new(DefaultHost(AtomicUsize::new(0)));
+        assert!(!host.supports_prevalidated_call_accounting());
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let wrapper = Arc::new(ShellProgressHost {
+            inner: host.clone(),
+            output,
+        });
+        assert!(!wrapper.supports_prevalidated_call_accounting());
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let outcome = tool
+            .invoke_transaction(serde_json::json!({}), context, None, wrapper.clone())
+            .await
+            .outcome;
+        assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+        let calls = vec![
+            ("large".into(), None),
+            ("valid".into(), Some(serde_json::json!({}))),
+        ];
+        let denied = vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2];
+        assert_eq!(host.call_batch_prevalidated(calls.clone()).await, denied);
+        assert_eq!(wrapper.call_batch_prevalidated(calls).await, denied);
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shell_progress_wrapper_forwards_prevalidated_calls_and_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Budgeted {
+            attempts: AtomicUsize,
+            dispatched: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for Budgeted {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("batch must be forwarded")
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<Value>)>,
+            ) -> Vec<Outcome> {
+                calls
+                    .into_iter()
+                    .map(|(name, args)| {
+                        if self.attempts.fetch_add(1, Ordering::Relaxed) >= 4096 {
+                            Outcome::Skipped("nested tool execution limit reached".into())
+                        } else if args.is_none() {
+                            Outcome::Skipped("nested tool arguments exceed size limit".into())
+                        } else {
+                            self.dispatched.lock().unwrap().push(name.clone());
+                            Outcome::Succeeded(name)
+                        }
+                    })
+                    .collect()
+            }
+        }
+        let inner = Arc::new(Budgeted {
+            attempts: AtomicUsize::new(4094),
+            dispatched: std::sync::Mutex::new(Vec::new()),
+        });
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let wrapper = ShellProgressHost {
+            inner: inner.clone(),
+            output,
+        };
+        assert!(wrapper.supports_prevalidated_call_accounting());
+        let result = wrapper
+            .call_batch_prevalidated(vec![
+                ("large".into(), None),
+                ("valid".into(), Some(serde_json::json!({}))),
+                ("over-budget".into(), Some(serde_json::json!({}))),
+            ])
+            .await;
+        assert_eq!(
+            result,
+            vec![
+                Outcome::Skipped("nested tool arguments exceed size limit".into()),
+                Outcome::Succeeded("valid".into()),
+                Outcome::Skipped("nested tool execution limit reached".into())
+            ]
+        );
+        assert_eq!(*inner.dispatched.lock().unwrap(), vec!["valid"]);
+        assert_eq!(inner.attempts.load(Ordering::Relaxed), 4097);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonduplex_structured_result_accepts_escaped_shell_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+r=json.load(sys.stdin)
+if r['type']=='describe':
+    value={'id':'test','dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':True, 'structured_text_result':True}
+else:
+    value=r['outcome']
+    assert len(value['detail']['structured_content']['output']) == 1024 * 1024
+    value['detail']['details']={'updated':True}
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "display".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"\0".repeat(1024 * 1024)}),
+            is_error: false,
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let returned = extension
+            .tool_result_update(&call, &outcome, &context, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(returned, Outcome::TextResultWithStructuredContent { details:Some(details), structured_content, .. } if details["updated"] == true && structured_content["output"].as_str().unwrap().len() == 1024 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonduplex_unnegotiated_oversize_response_fails_without_waiting_for_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys, time
+r=json.load(sys.stdin)
+if r['type']=='describe':
+    print(json.dumps({'version':1,'response':{'Ok':{'id':'old','dependencies':[],'commands':[],'tools':[],'tool_result_hook':True}}}))
+else:
+    sys.stdout.write('x' * (5 * 1024 * 1024))
+    sys.stdout.flush()
+    time.sleep(20)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            extension.tool_result_update(&call, &Outcome::Succeeded("ok".into()), &context, None),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("response exceeds 4 MiB"));
     }
 
     #[tokio::test]

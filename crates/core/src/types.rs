@@ -759,6 +759,14 @@ pub enum Outcome {
         details: Option<Value>,
         is_error: bool,
     },
+    /// Text sent to the model with a separate structured result for event consumers.
+    TextResultWithStructuredContent {
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        structured_content: Value,
+        is_error: bool,
+    },
     Skipped(String),
     /// An effect may have occurred. Only an authoritative reconciliation can clear this state.
     Unknown(String),
@@ -792,7 +800,8 @@ impl Outcome {
     pub fn is_error(&self) -> bool {
         match self {
             Self::Failed(_) | Self::Skipped(_) | Self::Unknown(_) => true,
-            Self::TextResult { is_error, .. } => *is_error,
+            Self::TextResult { is_error, .. }
+            | Self::TextResultWithStructuredContent { is_error, .. } => *is_error,
             Self::Structured { data, .. } | Self::StructuredWithDetails { data, .. } => {
                 data["isError"] == true
             }
@@ -827,6 +836,34 @@ impl Outcome {
                 is_error: true,
                 ..
             } => Self::Failed(output.clone()),
+            Self::TextResultWithStructuredContent {
+                output,
+                details,
+                is_error,
+                ..
+            } => Self::TextResult {
+                output: output.clone(),
+                details: details.clone(),
+                is_error: *is_error,
+            }
+            .legacy_text_result(),
+            _ => self.clone(),
+        }
+    }
+
+    /// Project the structured-result extension to the existing text-result protocol.
+    pub fn protocol_text_result(&self) -> Self {
+        match self {
+            Self::TextResultWithStructuredContent {
+                output,
+                details,
+                is_error,
+                ..
+            } => Self::TextResult {
+                output: output.clone(),
+                details: details.clone(),
+                is_error: *is_error,
+            },
             _ => self.clone(),
         }
     }
@@ -835,7 +872,8 @@ impl Outcome {
         match self {
             Self::Succeeded(output) | Self::SucceededWithDetails { output, .. } => output.clone(),
             Self::Failed(reason) => format!("Tool failed: {reason}"),
-            Self::TextResult { output, .. } => output.clone(),
+            Self::TextResult { output, .. }
+            | Self::TextResultWithStructuredContent { output, .. } => output.clone(),
             Self::Skipped(reason) => format!("Tool did not start: {reason}"),
             Self::Unknown(reason) => format!("Tool outcome unknown: {reason}"),
             Self::Pending { .. } => "Tool operation is still pending".into(),

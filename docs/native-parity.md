@@ -2127,6 +2127,35 @@ other local-tool output/error parity remain open.
 
 ### Shell partial-line notice checkpoint
 
+Completed local and injected remote model shell calls expose Pi's separate
+`structuredContent` in tool events: bounded full output, truncation state,
+exit code, rounded wall time and the full-output path when truncated. Text sent
+to the model remains the display result; nonzero exits retain their error flag
+and truncation details. Timeout and cancellation remain error results without
+structured content. A text-replacing extension patch drops the now-stale
+structured value; metadata-only in-process patches preserve it. Executables
+advertising `structured_text_result` receive the structured outcome and
+preserve that distinction through the returned outcome. Older executable
+protocols receive a compatible text result; any returned replacement drops
+the structured value because those protocols cannot distinguish a same-text
+replacement from a metadata-only update. Legacy failure replacements retain
+existing error details.
+Duplex native-extension frames have a symmetric 16 MiB bound so escaped
+structured shell output can cross the process boundary; oversized frames are
+rejected, and the separate shell-stream protocol retains its 4 MiB bound.
+Single-shot responses use the same 16 MiB allowance for negotiated structured
+result hooks and retain the 4 MiB bound for other requests. Duplex call batches
+are checked against the existing 4,096-call limit before their arguments are
+materialized. A streaming preflight measures each argument's compact JSON size
+against the existing 1 MiB limit. Oversized calls are skipped individually;
+other calls remain ordered and participate in the shared nested-call budget.
+Shell-progress and SDK host wrappers forward prevalidated positions; the
+duplex host proxy advertises this support only when its underlying host opts in
+to charging every position against its ordered call budget. A peer or custom
+host without that capability rejects a batch containing an oversized call
+rather than bypassing its call budget. The default in-process `ToolHost`
+implementation applies the same fail-closed rule to direct callers.
+
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count
 to zero, while an unterminated line retains its UTF-8 byte count. The retained

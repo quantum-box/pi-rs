@@ -1,6 +1,7 @@
 //! Native extensions whose state follows the durable session branch.
 pub mod codemode;
 mod exec;
+mod json_size;
 mod process;
 pub mod tool_search;
 pub use exec::{ExecOptions, ExecResult, exec_command};

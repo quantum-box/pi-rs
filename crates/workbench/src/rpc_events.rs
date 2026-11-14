@@ -324,6 +324,12 @@ impl Stream {
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
+                        if matches!(outcome, Outcome::TextResultWithStructuredContent { .. }) {
+                            message
+                                .as_object_mut()
+                                .expect("result object")
+                                .remove("structuredContent");
+                        }
                         message["role"] = json!("toolResult");
                         message["toolCallId"] = json!(invocation.call.id);
                         message["toolName"] = json!(invocation.call.name);
@@ -529,12 +535,24 @@ pub(super) fn tool_result_value(
     {
         result["details"] = details.clone();
     }
-    if let Some(Outcome::TextResult {
-        details: Some(details),
-        ..
-    }) = outcome
+    if let Some(
+        Outcome::TextResult {
+            details: Some(details),
+            ..
+        }
+        | Outcome::TextResultWithStructuredContent {
+            details: Some(details),
+            ..
+        },
+    ) = outcome
     {
         result["details"] = details.clone();
+    }
+    if let Some(Outcome::TextResultWithStructuredContent {
+        structured_content, ..
+    }) = outcome
+    {
+        result["structuredContent"] = structured_content.clone();
     }
     result
 }
@@ -877,6 +895,62 @@ mod streaming_tool_tests {
             is_error: false,
         };
         assert!(!tool_failed(&success));
+    }
+
+    #[test]
+    fn structured_text_result_projects_event_fields_without_changing_model_text() {
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "bad\n\nCommand exited with code 7".into(),
+            details: Some(json!({"source":"shell"})),
+            structured_content: json!({"output":"bad","exit_code":7,"truncated":false,"wall_time_seconds":0.1}),
+            is_error: true,
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(false));
+        assert_eq!(result["content"][0]["text"], outcome.tool_content());
+        assert_eq!(result["structuredContent"]["exit_code"], 7);
+        assert_eq!(result["details"]["source"], "shell");
+        assert!(tool_failed(&outcome));
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "call".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["structuredContent"]["exit_code"], 7);
+        assert_eq!(end["isError"], true);
+        let message = &events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap()["message"];
+        assert!(message.get("structuredContent").is_none());
+        assert_eq!(
+            message["content"][0]["text"],
+            "bad\n\nCommand exited with code 7"
+        );
     }
 
     #[test]
