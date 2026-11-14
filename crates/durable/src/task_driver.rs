@@ -483,12 +483,11 @@ fn fail_cleanup(shared: &Shared, error: String) {
 
 impl Shared {
     fn notify_host(&self) {
-        if let Ok(mut sender) = self.notifications.lock() {
-            if let Some(tx) = sender.as_ref() {
-                if matches!(tx.try_send(()), Err(TrySendError::Disconnected(_))) {
-                    *sender = None;
-                }
-            }
+        if let Ok(mut sender) = self.notifications.lock()
+            && let Some(tx) = sender.as_ref()
+            && matches!(tx.try_send(()), Err(TrySendError::Disconnected(_)))
+        {
+            *sender = None;
         }
     }
     fn notify_work(&self) {
