@@ -93,3 +93,53 @@ async fn generic_tasks_run_under_the_same_owner_and_survive_reopen() {
     driver.shutdown().unwrap();
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn signal_is_admitted_while_handler_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Scheduler::open(dir.path().join("db"), options()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("gated", true, move |_: &Task| {
+        started_tx.send(()).unwrap();
+        release.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!("done")))
+    });
+    let driver = Arc::new(s.start_tasks(registry).unwrap());
+    let id = Uuid::new_v4();
+    let task = Task::new(
+        id,
+        TaskOwner::Conversation(Uuid::new_v4()),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        5,
+    )
+    .unwrap()
+    .registered("gated".into(), true);
+    driver.submit(&task).unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let d = driver.clone();
+    let mut signal = tokio::task::spawn_blocking(move || {
+        d.signal(&pi_rs_durable::task_store::Signal::new(
+            Uuid::new_v4(),
+            id,
+            "wake".into(),
+            json!(null),
+        ))
+    });
+    let before_release = tokio::time::timeout(std::time::Duration::from_secs(2), &mut signal).await;
+    release_tx.send(()).unwrap();
+    assert!(
+        before_release.is_ok(),
+        "signal was blocked by the running handler"
+    );
+    before_release.unwrap().unwrap().unwrap();
+    Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+    s.shutdown().await.unwrap();
+}

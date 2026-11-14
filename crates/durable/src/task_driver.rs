@@ -1,8 +1,14 @@
 //! Background driver for the generic task scheduler sharing a Harness owner.
 //! The host registers handlers before starting the driver. A handler must be
 //! bounded or cooperative: shutdown waits for an in-progress synchronous step.
-use crate::{task::Task, task_scheduler, task_store::Signal};
+use crate::{
+    task::{Task, TaskOwner, TaskState},
+    task_scheduler,
+    task_store::{Save, Signal, TaskStore},
+};
+use durable_store::owner::OwnedStore;
 use std::{
+    collections::HashMap,
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,6 +26,8 @@ pub enum Error {
 }
 struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
+    owner: Arc<OwnedStore>,
+    policies: HashMap<String, bool>,
     state: Mutex<State>,
     wake: Condvar,
 }
@@ -36,8 +44,12 @@ pub struct Driver {
 }
 impl Driver {
     pub fn start(scheduler: task_scheduler::Scheduler) -> Self {
+        let owner = scheduler.owner();
+        let policies = scheduler.policies();
         let shared = Arc::new(Shared {
             scheduler: Mutex::new(scheduler),
+            owner,
+            policies,
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
         });
@@ -84,43 +96,47 @@ impl Driver {
             worker: Some(worker),
         }
     }
-    fn check(&self) -> Result<(), Error> {
+    fn check(&self) -> Result<std::sync::MutexGuard<'_, State>, Error> {
         let state = self.shared.state.lock().map_err(|_| Error::Poisoned)?;
         if state.stop {
             return Err(Error::Stopped(
                 state.failure.clone().unwrap_or_else(|| "shutdown".into()),
             ));
         }
-        Ok(())
+        Ok(state)
     }
     pub fn submit(&self, task: &Task) -> Result<(), Error> {
-        self.check()?;
-        self.shared
-            .scheduler
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .submit(task)?;
+        let _state = self.check()?;
+        let registered = task
+            .kind()
+            .and_then(|kind| self.shared.policies.get(kind))
+            .copied();
+        if registered != Some(task.replay_safe())
+            || !matches!(task.owner(), TaskOwner::Conversation(_))
+            || task.state() != &TaskState::Ready
+        {
+            return Err(task_scheduler::Error::Ownership.into());
+        }
+        TaskStore::new(self.shared.owner.store())
+            .save(&[Save::Create(task)])
+            .map_err(task_scheduler::Error::from)?;
         self.shared.wake.notify_one();
         Ok(())
     }
     pub fn signal(&self, signal: &Signal) -> Result<(), Error> {
-        self.check()?;
-        self.shared
-            .scheduler
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .signal(signal)?;
+        let _state = self.check()?;
+        TaskStore::new(self.shared.owner.store())
+            .send_signal(signal)
+            .map_err(task_scheduler::Error::from)?;
         self.shared.wake.notify_one();
         Ok(())
     }
     pub fn get(&self, id: Uuid) -> Result<Option<Task>, Error> {
-        self.check()?;
-        Ok(self
-            .shared
-            .scheduler
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .get(id)?)
+        let _state = self.check()?;
+        Ok(TaskStore::new(self.shared.owner.store())
+            .load(id)
+            .map_err(task_scheduler::Error::from)?
+            .map(|snapshot| snapshot.task))
     }
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.stop();

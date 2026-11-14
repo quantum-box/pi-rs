@@ -142,6 +142,16 @@ pub struct Scheduler {
     poisoned: bool,
 }
 impl Scheduler {
+    pub(crate) fn owner(&self) -> Arc<OwnedStore> {
+        self.attachment.owner.clone()
+    }
+    pub(crate) fn policies(&self) -> HashMap<String, bool> {
+        self.registry
+            .entries
+            .iter()
+            .map(|(name, registration)| (name.clone(), registration.replay_safe))
+            .collect()
+    }
     /// Opens exclusively and reconciles interrupted invocations. Parked tasks are
     /// untouched. Missing registrations leave their running records untouched.
     pub fn open(path: impl AsRef<Path>, registry: Registry) -> Result<Self, Error> {
