@@ -121,6 +121,22 @@ pub enum Status {
     Done { answer: String },
     Unanswered { reason: String },
 }
+/// Durable outcome of an idle manual compaction operation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ManualCompactionStatus {
+    Running,
+    Applied,
+    Declined,
+    Aborted,
+    RestartLimit,
+}
+
+/// An operation ID is stable across summary attempts and process recovery.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualCompaction {
+    pub id: Uuid,
+    pub status: ManualCompactionStatus,
+}
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionKind {
@@ -476,6 +492,10 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
     pub submissions: Vec<Submission>,
+    #[serde(default)]
+    pub manual_compactions: Vec<ManualCompaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_manual_compaction: Option<Uuid>,
     #[serde(default)]
     pub application_writes: Vec<ApplicationWrite>,
     #[serde(default)]
@@ -2054,6 +2074,8 @@ impl Harness {
             context_generation: Some(Uuid::new_v4()),
             transcript: None,
             submissions: vec![],
+            manual_compactions: vec![],
+            active_manual_compaction: None,
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],
@@ -2101,6 +2123,8 @@ impl Harness {
             .retain(|name| !name.starts_with(crate::subagent_management::EXTENSION_PREFIX));
         state.config = config;
         state.submissions.clear();
+        state.manual_compactions.clear();
+        state.active_manual_compaction = None;
         state.application_writes.retain(|write| write.placed);
         for write in &mut state.application_writes {
             write.request_id = None;
@@ -2165,6 +2189,8 @@ impl Harness {
         state.active = None;
         state.abort_requested = false;
         state.submissions.clear();
+        state.manual_compactions.clear();
+        state.active_manual_compaction = None;
         state.application_writes.retain(|write| write.placed);
         for write in &mut state.application_writes {
             write.request_id = None;
@@ -2295,6 +2321,8 @@ impl Harness {
             context_generation: Some(Uuid::new_v4()),
             transcript: if prefix.is_some() { None } else { transcript },
             submissions: vec![],
+            manual_compactions: vec![],
+            active_manual_compaction: None,
             aborted_generations: vec![],
             resets: serde_json::from_value(
                 point
@@ -3179,6 +3207,18 @@ impl Harness {
         keep_recent_tokens: usize,
         instructions: Option<&str>,
     ) -> Result<bool, Error> {
+        Ok(self
+            .request_manual_compaction(id, keep_recent_tokens, instructions)?
+            .is_some())
+    }
+    /// Start an idle manual compaction and return its durable operation ID.
+    /// None means there is no older complete turn to compact.
+    pub fn request_manual_compaction(
+        &mut self,
+        id: Uuid,
+        keep_recent_tokens: usize,
+        instructions: Option<&str>,
+    ) -> Result<Option<Uuid>, Error> {
         let (mut c, version) = self.load(id)?;
         if !matches!(c.phase, Phase::Idle) || c.active.is_some() {
             return Err(Error::Invalid(
@@ -3193,17 +3233,23 @@ impl Harness {
             instructions,
         )?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let generation = *c.context_generation.get_or_insert_with(Uuid::new_v4);
+        let operation_id = Uuid::new_v4();
+        c.manual_compactions.push(ManualCompaction {
+            id: operation_id,
+            status: ManualCompactionStatus::Running,
+        });
+        c.active_manual_compaction = Some(operation_id);
         c.phase = Phase::CompactionHook {
             preparation: Box::new(preparation.bind_context(generation)),
-            operation_id: Uuid::new_v4(),
+            operation_id,
             reason: crate::extension::CompactionReason::Manual,
         };
         c.compaction_return_turns = None;
         self.save(&c, Expected::Version(version))?;
-        Ok(true)
+        Ok(Some(operation_id))
     }
     pub fn submit(
         &mut self,
@@ -4170,6 +4216,7 @@ impl Harness {
                 }
             }
         } else {
+            finish_manual_compaction(&mut c, ManualCompactionStatus::Aborted)?;
             c.abort_requested = false;
             finish_abort(&mut c);
         }
@@ -4319,6 +4366,7 @@ impl Harness {
                             }
                         }
                         crate::extension::BeforeCompact::Decline => {
+                            finish_manual_compaction(&mut c, ManualCompactionStatus::Declined)?;
                             c.phase = c
                                 .compaction_return_turns
                                 .take()
@@ -4334,6 +4382,7 @@ impl Harness {
                             c.messages =
                                 result.apply_in_context(&c.messages, c.context_generation)?;
                             c.context_generation = Some(Uuid::new_v4());
+                            finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
                             c.phase = c
                                 .compaction_return_turns
                                 .take()
@@ -4400,6 +4449,7 @@ impl Harness {
                         }
                     }
                     if restarts >= self.options.restart_limit {
+                        finish_manual_compaction(&mut c, ManualCompactionStatus::RestartLimit)?;
                         c.phase = c
                             .compaction_return_turns
                             .take()
@@ -4433,6 +4483,7 @@ impl Harness {
                     }
                     c.messages = result.apply_in_context(&c.messages, c.context_generation)?;
                     c.context_generation = Some(Uuid::new_v4());
+                    finish_manual_compaction(&mut c, ManualCompactionStatus::Applied)?;
                     c.phase = c
                         .compaction_return_turns
                         .take()
@@ -6572,6 +6623,21 @@ impl Scheduler {
         }
         Ok(queued)
     }
+    /// Admit and schedule an idle manual compaction with a durable identity.
+    pub fn request_manual_compaction(
+        &mut self,
+        id: Uuid,
+        keep_recent_tokens: usize,
+        instructions: Option<&str>,
+    ) -> Result<Option<Uuid>, Error> {
+        let operation =
+            self.harness
+                .request_manual_compaction(id, keep_recent_tokens, instructions)?;
+        if operation.is_some() {
+            self.schedule(id);
+        }
+        Ok(operation)
+    }
     /// Commits the admission before scheduling, including duplicate request IDs.
     pub fn submit(
         &mut self,
@@ -7405,6 +7471,24 @@ fn place_reset(c: &mut Conversation, marker: crate::reset::Reset) {
     c.auto_compaction_attempted = false;
 }
 
+fn finish_manual_compaction(
+    c: &mut Conversation,
+    status: ManualCompactionStatus,
+) -> Result<(), Error> {
+    if let Some(id) = c.active_manual_compaction.take() {
+        let operation = c
+            .manual_compactions
+            .iter_mut()
+            .find(|operation| operation.id == id)
+            .ok_or_else(|| Error::Invalid("missing active manual compaction".into()))?;
+        if operation.status != ManualCompactionStatus::Running {
+            return Err(Error::Invalid("manual compaction already settled".into()));
+        }
+        operation.status = status;
+    }
+    Ok(())
+}
+
 fn append_tool(
     c: &mut Conversation,
     calls: &[ToolCall],
@@ -8229,6 +8313,8 @@ mod scheduler_tests {
             context_generation: Some(Uuid::new_v4()),
             transcript: None,
             submissions: vec![],
+            manual_compactions: vec![],
+            active_manual_compaction: None,
             aborted_generations: vec![],
             resets: vec![],
             pending_resets: vec![],

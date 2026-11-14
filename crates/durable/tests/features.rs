@@ -313,6 +313,7 @@ async fn manual_compaction_retry_preserves_request_and_context() {
         ..opts()
     };
     let id;
+    let operation;
     {
         let mut h = Harness::open_paused(&path, options()).unwrap();
         h.install_extension(compact_extension(vec![Arc::new(CaptureHook(
@@ -333,10 +334,10 @@ async fn manual_compaction_retry_preserves_request_and_context() {
         h.submit_and_run(id, None, "latest".into(), &cancel)
             .await
             .unwrap();
-        assert!(
-            h.request_compaction_with_instructions(id, 0, Some("preserve names"))
-                .unwrap()
-        );
+        operation = h
+            .request_manual_compaction(id, 0, Some("preserve names"))
+            .unwrap()
+            .unwrap();
         let stop = CancellationToken::new();
         let trigger = stop.clone();
         let captured = requests.clone();
@@ -350,16 +351,40 @@ async fn manual_compaction_retry_preserves_request_and_context() {
     }
     {
         let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().manual_compactions[0],
+            pi_rs_durable::runtime::ManualCompaction {
+                id: operation,
+                status: pi_rs_durable::runtime::ManualCompactionStatus::Running
+            }
+        );
         h.install_extension(compact_extension(vec![Arc::new(CaptureHook(
             hooks.clone(),
         ))]))
         .unwrap();
         h.resume(&cancel).await.unwrap();
-        let messages = h.conversation(id).unwrap().messages;
+        let c = h.conversation(id).unwrap();
+        assert_eq!(
+            c.manual_compactions[0].status,
+            pi_rs_durable::runtime::ManualCompactionStatus::Applied
+        );
+        let messages = c.messages;
         assert!(
             matches!(&messages[0], Message::User { content } if content.contains("recovered summary"))
         );
         assert!(matches!(&messages[1], Message::User { content } if content == "latest"));
+        let fork = h.fork(id).unwrap();
+        assert!(h.conversation(fork).unwrap().manual_compactions.is_empty());
+    }
+    {
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().manual_compactions[0],
+            pi_rs_durable::runtime::ManualCompaction {
+                id: operation,
+                status: pi_rs_durable::runtime::ManualCompactionStatus::Applied
+            }
+        );
     }
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -371,6 +396,158 @@ async fn manual_compaction_retry_preserves_request_and_context() {
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].instructions.as_deref(), Some("preserve names"));
     assert!(matches!(&hooks[0].messages[0], Message::User { content } if content == "old"));
+}
+
+#[tokio::test]
+async fn manual_compaction_restart_limit_has_terminal_status() {
+    use pi_rs_durable::runtime::ManualCompactionStatus;
+    struct PendingSummary(Arc<tokio::sync::Semaphore>);
+    #[async_trait]
+    impl Model for PendingSummary {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                self.0.add_permits(1);
+                Ok(stream::pending().boxed())
+            } else { ModelStub.stream(request).await }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let options = || Options {
+        model: Arc::new(PendingSummary(started.clone())),
+        restart_limit: 1,
+        ..opts()
+    };
+    let cancel = CancellationToken::new();
+    let id;
+    let operation;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "new".into(), &cancel)
+            .await
+            .unwrap();
+        operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+        let stop = CancellationToken::new();
+        let trigger = stop.clone();
+        let signal = started.clone();
+        tokio::spawn(async move {
+            signal.acquire().await.unwrap().forget();
+            trigger.cancel();
+        });
+        assert!(h.resume(&stop).await.is_err());
+    }
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.resume(&cancel).await.unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.manual_compactions[0].id, operation);
+        assert_eq!(
+            c.manual_compactions[0].status,
+            ManualCompactionStatus::RestartLimit
+        );
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "old"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn manual_compaction_abort_during_summary_survives_reopen() {
+    use pi_rs_durable::runtime::{ManualCompactionStatus, Scheduler};
+    use tokio::sync::Semaphore;
+    struct PendingSummary(Arc<Semaphore>);
+    #[async_trait]
+    impl Model for PendingSummary {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                self.0.add_permits(1);
+                Ok(stream::pending().boxed())
+            } else {
+                ModelStub.stream(request).await
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "new".into(), &cancel)
+            .await
+            .unwrap();
+    }
+    let started = Arc::new(Semaphore::new(0));
+    let options = Options {
+        model: Arc::new(PendingSummary(started.clone())),
+        ..opts()
+    };
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let operation = scheduler
+        .request_manual_compaction(id, 0, None)
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(
+        scheduler.conversation(id).unwrap().manual_compactions[0].status,
+        ManualCompactionStatus::Running
+    );
+    let queued = scheduler
+        .submit(id, None, "queued during summary".into())
+        .unwrap();
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        scheduler.wait_for_idle(id, &cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        scheduler.conversation(id).unwrap().manual_compactions[0].status,
+        ManualCompactionStatus::Aborted
+    );
+    scheduler.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.manual_compactions[0].id, operation);
+    assert_eq!(
+        c.manual_compactions[0].status,
+        ManualCompactionStatus::Aborted
+    );
+    assert!(c.submissions.iter().any(|s| s.id == queued && matches!(&s.status, pi_rs_durable::runtime::Status::Unanswered { reason } if reason == "aborted")));
+    assert!(
+        c.messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content == "old"))
+    );
 }
 
 #[tokio::test]
@@ -1044,13 +1221,21 @@ async fn before_compact_decline_preserves_messages() {
     h.submit_and_run(id, None, "old".into(), &cancel)
         .await
         .unwrap();
+    assert_eq!(h.request_manual_compaction(id, 0, None).unwrap(), None);
+    assert!(h.conversation(id).unwrap().manual_compactions.is_empty());
     h.submit_and_run(id, None, "latest".into(), &cancel)
         .await
         .unwrap();
     let before = h.conversation(id).unwrap().messages;
-    assert!(h.request_compaction(id, 0).unwrap());
+    let operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
     h.resume(&cancel).await.unwrap();
-    assert_eq!(h.conversation(id).unwrap().messages, before);
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.messages, before);
+    assert_eq!(c.manual_compactions[0].id, operation);
+    assert_eq!(
+        c.manual_compactions[0].status,
+        pi_rs_durable::runtime::ManualCompactionStatus::Declined
+    );
 }
 
 #[tokio::test]

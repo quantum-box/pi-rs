@@ -543,6 +543,14 @@ than upstream entry records, so it exposes messages and a message index rather
 than entry IDs or head markers. `request_compaction_with_instructions` persists
 optional manual instructions for the summary request and hook, including across
 recovery; `request_compaction` remains the instruction-free convenience API.
+`request_manual_compaction` returns an operation ID, or `None` when there is
+nothing to compact. Its `manual_compactions` record survives reopen and records
+whether the operation is running, applied, declined, aborted, or stopped at the
+restart limit. The same ID is used for the hook across recovery; each model
+attempt has its own request ID. Records are not inherited by forks and currently
+grow without retention. Failures requiring reopen leave the operation running
+until recovery or abort resolves it. This remains an idle-only conversation
+phase, not a separately scheduled upstream task.
 Runtime-owned preparations also pin the context generation; a reset or another
 applied compaction invalidates the pinned generation even if message text later
 matches. Legacy in-flight preparations without a generation can finish while
