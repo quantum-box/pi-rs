@@ -326,30 +326,44 @@ async fn access_at(
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
     tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| error("cannot start refresh runtime"))?;
-        let _barrier = super::process::refresh_barrier()?;
-        let value = runtime.block_on(service.refresh(&value.refresh))?;
-        super::config::update_object_locked(&path, Some(&guard), |data| {
-            let current = data
-                .get_mut("xai")
-                .ok_or_else(|| error("credentials changed during refresh"))?;
-            if *current != previous {
-                return Err(error("credentials changed during refresh"));
+        #[cfg(test)]
+        eprintln!("xai diagnostic: blocking worker started");
+        let result = (|| -> Result<String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| error("cannot start refresh runtime"))?;
+            let _barrier = super::process::refresh_barrier()?;
+            #[cfg(test)]
+            eprintln!("xai diagnostic: barrier acquired");
+            let value = runtime.block_on(service.refresh(&value.refresh))?;
+            #[cfg(test)]
+            eprintln!("xai diagnostic: response parsed; persisting");
+            super::config::update_object_locked(&path, Some(&guard), |data| {
+                let current = data
+                    .get_mut("xai")
+                    .ok_or_else(|| error("credentials changed during refresh"))?;
+                if *current != previous {
+                    return Err(error("credentials changed during refresh"));
+                }
+                current["access"] = value.access.clone().into();
+                current["refresh"] = value.refresh.clone().into();
+                current["expires"] = value.expires.into();
+                Ok(())
+            })?;
+            // Preserve a successfully rotated credential even if its lifetime
+            // does not satisfy the caller's explicit minimum.
+            if minimum.is_some() && expires_soon(&value, refresh_window) {
+                return Err(error("refreshed token expires too soon"));
             }
-            current["access"] = value.access.clone().into();
-            current["refresh"] = value.refresh.clone().into();
-            current["expires"] = value.expires.into();
-            Ok(())
-        })?;
-        // Preserve a successfully rotated credential even if its lifetime
-        // does not satisfy the caller's explicit minimum.
-        if minimum.is_some() && expires_soon(&value, refresh_window) {
-            return Err(error("refreshed token expires too soon"));
-        }
-        Ok(value.access)
+            Ok(value.access)
+        })();
+        #[cfg(test)]
+        eprintln!(
+            "xai diagnostic: worker finished: {:?}",
+            result.as_ref().map(|_| ())
+        );
+        result
     })
     .await
     .map_err(|_| error("refresh task failed"))?

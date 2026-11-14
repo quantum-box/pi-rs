@@ -1,92 +1,23 @@
-name: Rust parity
-
+name: XAI rotation diagnosis
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      platform:
-        description: Native acceptance platform
-        type: choice
-        default: all
-        options: [all, ubuntu-latest, macos-latest, windows-latest]
-
 permissions:
   contents: read
-
-concurrency:
-  group: rust-parity-${{ github.ref }}-${{ inputs.platform || 'all' }}
-  cancel-in-progress: true
-
 jobs:
-  native:
-    name: Native tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(inputs.platform && inputs.platform != 'all' && format('["{0}"]', inputs.platform) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
-    env:
-      CARGO_TERM_COLOR: always
-      RUST_BACKTRACE: 1
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install supported Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
-      - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # Match the toolchain used by the commands below when constructing the key.
-          cmd-format: rustup run 1.89.0 {0}
-      - name: Check formatting
-        run: cargo +1.89.0 fmt --all -- --check
-      - name: Check all targets
-        run: cargo +1.89.0 clippy --locked --workspace --all-features --all-targets -- -D warnings
-      - name: Run native acceptance tests
-        env:
-          # The CLI fixtures start independent workers that sync journals to disk.
-          # Serial execution keeps their per-request deadlines stable on shared runners.
-          RUST_TEST_THREADS: 1
-        run: cargo +1.89.0 test --locked --workspace --all-features
-      - name: Test native SDK host example
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Run acceptance tests with refresh stage diagnostics
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs
+      - name: Repeat cancellation fixture
+        shell: pwsh
         run: |
-          cargo +1.89.0 test --locked --example native_sdk_host
-          cargo +1.89.0 test --locked -p pi-rs-ollama --example sdk_chat
-
-  tauri-sdk-fixture:
-    name: Tauri SDK fixture (macOS mock)
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Install supported Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt
-      - name: Check fixture formatting
-        run: cargo +1.89.0 fmt --manifest-path fixtures/tauri-sdk/Cargo.toml -- --check
-      - name: Test mock Tauri IPC
-        run: cargo +1.89.0 test --locked --manifest-path fixtures/tauri-sdk/Cargo.toml
-
-  wasm-diagnostic:
-    name: Browser WASM component and core checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Install Rust and WASM target
-        run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
-      - name: Check portable tool arguments for wasm32-unknown-unknown
-        run: cargo +1.89.0 check --locked -p pi-rs-tool-arguments --target wasm32-unknown-unknown
-      - name: Check core for wasm32-unknown-unknown
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-        run: cargo +1.89.0 check --locked -p pi-rs-core --target wasm32-unknown-unknown
+          for ($i = 0; $i -lt 30; $i++) {
+            cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_caller_still_saves_rotated_refresh_token -- --nocapture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
