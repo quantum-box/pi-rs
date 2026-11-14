@@ -336,6 +336,18 @@ impl SessionSnapshot {
     }
 }
 
+fn open_initial_snapshot(path: &std::path::Path, emit_entries: bool) -> Result<SessionSnapshot> {
+    let session = match Session::snapshot(path) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Session::open(path)?
+        }
+        result => result?,
+    };
+    // Any exclusive lock acquired while creating the journal ends when this
+    // function returns, before the worker opens the session for a run.
+    Ok(SessionSnapshot::from_session(&session, emit_entries))
+}
+
 fn snapshot_for_share(
     active: &Mutex<ControlState>,
     snapshot: &Mutex<SessionSnapshot>,
@@ -544,19 +556,10 @@ async fn run_worker(
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
-    let initial_session = match Session::snapshot(&args.session) {
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Session::open(&args.session)?
-        }
-        result => result?,
-    };
-    let snapshot = Arc::new(Mutex::new(SessionSnapshot::from_session(
-        &initial_session,
+    let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
+        &args.session,
         args.mode == Some(super::OutputMode::Rpc),
-    )));
-    // Session::open creates and exclusively locks a missing journal. Release
-    // that handle before the worker tries to open the same session.
-    drop(initial_session);
+    )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
@@ -1840,6 +1843,15 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn initial_snapshot_releases_new_journal_lock_for_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new-session.jsonl");
+        let snapshot = open_initial_snapshot(&path, true).unwrap();
+        let worker_session = Session::open(&path).unwrap();
+        assert_eq!(snapshot.records[0].id, worker_session.records()[0].id);
+    }
 
     #[test]
     fn live_session_snapshot_preserves_compaction_metadata_for_rpc_reads() {
