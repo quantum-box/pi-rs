@@ -1040,6 +1040,13 @@ impl Session {
         self.select_provider_model(None, model, thinking)
     }
 
+    pub(crate) fn needs_native_model_selection_marker(&self) -> bool {
+        self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
+            matches!(&record.event, Event::SourceEntry { format, entry }
+                if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message")))
+        })
+    }
+
     pub fn select_provider_model(
         &mut self,
         provider: Option<&str>,
@@ -1962,10 +1969,7 @@ impl Session {
         // Distinguish a native selection from a conversion appended directly
         // after a Pi source entry that did not itself produce a selection.
         if matches!(&event, Event::ModelSelected { .. })
-            && self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
-                matches!(&record.event, Event::SourceEntry { format, entry }
-                    if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message")))
-            })
+            && self.needs_native_model_selection_marker()
         {
             self.append(Event::SourceEntry {
                 format: "pi-rs:native-model-selection".into(),
