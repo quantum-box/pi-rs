@@ -329,6 +329,7 @@ impl Harness {
                 tool_states: state.tool_states.clone(),
                 documents: HashMap::new(),
                 active: state.active,
+                pending_resets: state.pending_resets.clone(),
                 phase: serde_json::to_value(&state.phase)?,
             };
             let mut checks = vec![Check {
@@ -443,7 +444,10 @@ impl Harness {
     /// are not inherited. Historical entry-point forking is not yet supported.
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
         let (mut state, _) = self.load(id)?;
-        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle) || state.active.is_some() {
+        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            || state.active.is_some()
+            || !state.pending_resets.is_empty()
+        {
             return Err(Error::Invalid(
                 "fork requires a settled conversation".into(),
             ));

@@ -195,6 +195,13 @@ impl Scheduler {
             if item.task.state() != &TaskState::Running {
                 continue;
             }
+            if !item.task.replay_safe() {
+                self.finish_failed(
+                    &item,
+                    "interrupted: execution outcome requires reconciliation".into(),
+                )?;
+                continue;
+            }
             let Ok(reg) = self.registered(&item.task) else {
                 // Leave a task blocked until its definition is restored.
                 continue;
@@ -266,11 +273,15 @@ impl Scheduler {
                 progress = true;
             }
         }
-        let Some(snapshot) = self
-            .ts()
-            .list()?
-            .into_iter()
-            .find(|s| s.task.state() == &TaskState::Ready && self.registered(&s.task).is_ok())
+        let tasks = self.ts().list()?;
+        let Some(snapshot) = tasks
+            .iter()
+            .find(|s| {
+                s.task.state() == &TaskState::Ready
+                    && self.registered(&s.task).is_ok()
+                    && self.ancestors_available(&s.task, &tasks)
+            })
+            .cloned()
         else {
             return Ok(progress);
         };
@@ -345,6 +356,28 @@ impl Scheduler {
         self.ts().save(&batch)?;
         self.poisoned = false;
         Ok(true)
+    }
+    /// A child must not execute while an interrupted or missing ancestor is
+    /// still awaiting recovery; such an ancestor can later cancel the subtree.
+    fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
+        let mut owner = task.owner();
+        let mut visited = HashSet::new();
+        while let TaskOwner::Task(id) = owner {
+            if !visited.insert(*id) {
+                return false;
+            }
+            let Some(parent) = tasks.iter().find(|entry| entry.task.id() == *id) else {
+                return false;
+            };
+            if parent.task.is_terminal()
+                || parent.task.state() == &TaskState::Running
+                || self.registered(&parent.task).is_err()
+            {
+                return false;
+            }
+            owner = parent.task.owner();
+        }
+        true
     }
     /// Cancel a task and all of its owned descendants in one transaction.
     /// This requires exclusive scheduler ownership and cannot interrupt `tick`.
@@ -513,6 +546,47 @@ mod tests {
             scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
             TaskState::Succeeded(_)
         ));
+    }
+    #[test]
+    fn missing_interrupted_parent_cannot_dispatch_its_children() {
+        for safe in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tasks.db");
+            let owner = Arc::new(OwnedStore::open(&path).unwrap());
+            let store = TaskStore::new(owner.store());
+            let mut parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                safe,
+                5,
+            );
+            parent.start().unwrap();
+            let child = task(2, TaskOwner::Task(parent.id()), "child", true, 5);
+            store
+                .save(&[Save::Create(&parent), Save::Create(&child)])
+                .unwrap();
+            drop(owner);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = calls.clone();
+            let mut registry = Registry::default();
+            registry.register("child", true, move |_: &Task| {
+                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Step::Succeed(json!("done")))
+            });
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            assert!(!scheduler.tick(0).unwrap());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let child_state = scheduler.get(child.id()).unwrap().unwrap();
+            assert_eq!(
+                child_state.state(),
+                if safe {
+                    &TaskState::Ready
+                } else {
+                    &TaskState::Cancelled
+                }
+            );
+        }
     }
 
     #[test]

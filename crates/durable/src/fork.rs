@@ -38,6 +38,8 @@ pub struct Snapshot {
     pub tool_states: HashMap<String, ExtensionState>,
     pub documents: HashMap<String, Value>,
     pub active: Option<Uuid>,
+    #[serde(default)]
+    pub pending_resets: Vec<crate::reset::Reset>,
     /// The runtime's serialized phase; only the exact `Idle` variant is safe.
     pub phase: Value,
 }
@@ -102,6 +104,7 @@ pub fn extract(parent_id: Uuid, record: &Record) -> Result<ForkPoint, Error> {
         return Err(Error::WrongConversation);
     }
     if snapshot.active.is_some()
+        || !snapshot.pending_resets.is_empty()
         || snapshot.phase != Value::String("Idle".into())
         || snapshot
             .submissions
@@ -200,6 +203,7 @@ mod tests {
             )]),
             documents: HashMap::from([("todos".into(), json!(["old"]))]),
             active: None,
+            pending_resets: vec![],
             phase: json!("Idle"),
         }
     }
