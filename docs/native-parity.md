@@ -3375,7 +3375,11 @@ terminals and unsupported diagrams retain the Markdown fence. Streaming
 can show a readable prefix while the last diagram line is incomplete.
 Completed output retains source and a warning when that last line failed.
 The journal, print output, and model context retain the original Markdown.
-Detailed warnings for partially accepted flowchart statements remain.
+Partially accepted flowchart statements retain the source and report the first
+warning and the count of additional warnings after streaming; during streaming
+the readable portion remains visible. Like Pi v1.5.0’s
+`grok-mermaid` parser, a class name immediately followed by an undirected link
+without whitespace can consume part of that link and render an incomplete graph.
 
 ### Model session affinity checkpoint
 
