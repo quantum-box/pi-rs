@@ -720,8 +720,8 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let model = std::thread::spawn(move || {
-        let (mut socket, _request) = accept_model_request(model_listener);
-        started_tx.send(()).unwrap();
+        let (mut socket, request) = accept_model_request(model_listener);
+        started_tx.send(request).unwrap();
         release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
         let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -848,31 +848,42 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     );
     wait_output(&mut master, "Share URL:");
     master.write_all(b"hello\r").unwrap();
-    if let Err(error) = started_rx.recv_timeout(Duration::from_secs(20)) {
-        let mut output = Vec::new();
-        let mut buffer = [0; 8192];
-        while let Ok(count) = master.read(&mut buffer) {
-            if count == 0 {
-                break;
+    let model_request = started_rx
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|error| {
+            let mut output = Vec::new();
+            let mut buffer = [0; 8192];
+            while let Ok(count) = master.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..count]);
             }
-            output.extend_from_slice(&buffer[..count]);
-        }
-        panic!(
-            "model request did not start: {error}; terminal: {}",
-            String::from_utf8_lossy(&output)
-        );
-    }
+            panic!(
+                "model request did not start: {error}; terminal: {}",
+                String::from_utf8_lossy(&output)
+            );
+        });
+    assert!(
+        model_request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("fixture-context-hook")))
+    );
     master.write_all(b"/share\r").unwrap();
     let active = receive_share(&mut master);
     assert_eq!(active.last().unwrap()["customType"], "pi.share");
     assert!(active.last().unwrap()["data"].get("journalKey").is_none());
     assert!(active.last().unwrap()["data"].get("journalTag").is_none());
-    assert!(
-        active.last().unwrap()["data"]["systemPrompt"]
-            .as_str()
-            .unwrap()
-            .contains("fixture-context-hook")
-    );
+    let shared_prompt = active.last().unwrap()["data"]["systemPrompt"]
+        .as_str()
+        .unwrap();
+    assert!(shared_prompt.contains("Terminal share prompt"));
+    assert!(!shared_prompt.contains("fixture-context-hook"));
     release_tx.send(()).unwrap();
     wait_output(&mut master, "done");
     let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();

@@ -260,22 +260,11 @@ impl SessionSnapshot {
                 self.revision = self.revision.wrapping_add(1);
                 self.share_pending = true;
             }
-            pi_rs::Notification::Request(request) => {
+            pi_rs::Notification::Request(_) => {
                 self.revision = self.revision.wrapping_add(1);
                 if !*summary {
-                    let system_prompt = request
-                        .messages
-                        .iter()
-                        .filter_map(|message| match message {
-                            pi_rs::Message::System { content } => Some(content.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    self.share_active = Some(Arc::new(super::sessions::ShareContext {
-                        system_prompt,
-                        tools: request.tools.clone(),
-                    }));
+                    // Pi shares agent state, not request-only context transforms.
+                    self.share_active = None;
                 }
                 self.share_pending = false;
                 *summary = false;
@@ -2867,7 +2856,16 @@ mod share_context_tests {
         snapshot.track_share_event(&Notification::Request(&request), &mut summary);
         assert_eq!(
             snapshot.share_snapshot().unwrap().context.system_prompt,
-            "request-specific prompt"
+            "refreshed prompt"
+        );
+        assert!(
+            snapshot
+                .share_snapshot()
+                .unwrap()
+                .context
+                .tools
+                .iter()
+                .any(|tool| tool.name == "read")
         );
         snapshot.settle_share_context();
         let context = snapshot.share_snapshot().unwrap().context;
@@ -3008,7 +3006,7 @@ mod share_context_tests {
         snapshot.track_share_event(&Notification::Request(&request), &mut summary);
         let result = snapshot.share_snapshot().unwrap();
         assert_eq!(result.head, 2);
-        assert_eq!(result.context.system_prompt, "new");
+        assert_eq!(result.context.system_prompt, "base");
     }
 }
 
