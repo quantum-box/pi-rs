@@ -7416,8 +7416,14 @@ impl Harness {
                                 && c.extensions.is_empty()
                                 && stored_identity == Some(DispatchIdentity::Other)
                             {
-                                Some(NestedResume { operation_id, restarts, dispatch_identity: DispatchIdentity::Other })
-                            } else { None };
+                                Some(NestedResume {
+                                    operation_id,
+                                    restarts,
+                                    dispatch_identity: DispatchIdentity::Other,
+                                })
+                            } else {
+                                None
+                            };
                             c.phase = Phase::Blocked {
                                 tool_panicked,
                                 turns,
@@ -8484,7 +8490,8 @@ impl Scheduler {
         reference: &str,
         outcome: Outcome,
     ) -> Result<(), Error> {
-        self.harness.reconcile_nested_pending(id, root, operation, reference, outcome)?;
+        self.harness
+            .reconcile_nested_pending(id, root, operation, reference, outcome)?;
         self.schedule(id);
         Ok(())
     }
@@ -8496,7 +8503,8 @@ impl Scheduler {
         reference: &str,
         reason: String,
     ) -> Result<(), Error> {
-        self.harness.cancel_nested_pending(id, root, operation, reference, reason)?;
+        self.harness
+            .cancel_nested_pending(id, root, operation, reference, reason)?;
         self.schedule(id);
         Ok(())
     }

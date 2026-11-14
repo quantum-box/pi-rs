@@ -1187,13 +1187,9 @@ async fn killed_nested_poll_can_be_explicitly_reconciled_after_reopen() {
     )
     .unwrap();
     drop(h);
-    let mut h = Harness::open(
-        root.join("db"),
-        process_options(root, false),
-        &cancel,
-    )
-    .await
-    .unwrap();
+    let mut h = Harness::open(root.join("db"), process_options(root, false), &cancel)
+        .await
+        .unwrap();
     h.resume_conversation(id, &cancel).await.unwrap();
     assert!(h.blocked(id).unwrap().is_none());
     assert_eq!(

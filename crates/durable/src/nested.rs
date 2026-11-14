@@ -252,12 +252,18 @@ impl Drop for InvocationScope {
                 .unwrap_or(0)
                 != 0
             {
-                self.0.shared.non_pending_failure.store(true, Ordering::Release);
+                self.0
+                    .shared
+                    .non_pending_failure
+                    .store(true, Ordering::Release);
                 self.0.shared.failed.store(true, Ordering::Release);
                 self.0.shared.cancellation.cancel();
             }
         } else {
-            self.0.shared.non_pending_failure.store(true, Ordering::Release);
+            self.0
+                .shared
+                .non_pending_failure
+                .store(true, Ordering::Release);
             self.0.shared.failed.store(true, Ordering::Release);
         }
     }
@@ -322,7 +328,9 @@ impl NestedHost {
         self.call_inner(Some(key), name, arguments).await
     }
     fn fail(&self, reason: impl Into<String>) -> Outcome {
-        self.shared.non_pending_failure.store(true, Ordering::Release);
+        self.shared
+            .non_pending_failure
+            .store(true, Ordering::Release);
         self.shared.failed.store(true, Ordering::Release);
         Outcome::Unknown(reason.into())
     }
@@ -673,11 +681,13 @@ impl NestedHost {
                     return self.fail("nested polling cancelled");
                 }
                 Ok(crate::poll::PollResult::Unavailable | crate::poll::PollResult::TimedOut) => {
-                    return self.pending_failure("nested polling failed; pending reference retained");
+                    return self
+                        .pending_failure("nested polling failed; pending reference retained");
                 }
                 Err(payload) => {
                     crate::extension::discard_panic_payload(payload);
-                    return self.pending_failure("nested polling failed; pending reference retained");
+                    return self
+                        .pending_failure("nested polling failed; pending reference retained");
                 }
             };
             // Unknown is not a terminal observation. Keep the last accepted
