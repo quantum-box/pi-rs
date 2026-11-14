@@ -174,6 +174,12 @@ fn worker_returns_keyed_share_journal_tag() {
             "--offline",
             "--no-mcp",
             "--no-trust",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:9",
             "--stdin-control",
             "serve",
         ])
