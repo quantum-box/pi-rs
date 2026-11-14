@@ -10,7 +10,11 @@ use crossterm::{
     },
 };
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{Color as SyntaxColor, StyleModifier, Theme as SyntaxTheme, ThemeItem},
+    parsing::SyntaxSet,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -544,7 +548,53 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
 }
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static SYNTAX_THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+// Syntect's synthetic colors identify semantic roles; the active Pi theme is
+// applied afterwards so indexed terminal colors and dim styling survive.
+const SYNTAX_ROLES: &[(&str, &str)] = &[
+    ("comment, punctuation.definition.comment", "syntaxComment"),
+    (
+        "keyword, storage.modifier, storage.type.function",
+        "syntaxKeyword",
+    ),
+    ("entity.name.function, support.function", "syntaxFunction"),
+    ("variable, entity.other.attribute-name", "syntaxVariable"),
+    ("string, punctuation.definition.string", "syntaxString"),
+    ("constant.numeric, constant.language", "syntaxNumber"),
+    (
+        "storage.type, entity.name.type, entity.name.class, support.type, support.class",
+        "syntaxType",
+    ),
+    ("keyword.operator", "syntaxOperator"),
+    ("punctuation", "syntaxPunctuation"),
+    ("markup.inserted", "toolDiffAdded"),
+    ("markup.deleted", "toolDiffRemoved"),
+];
+static SYNTAX_THEME: LazyLock<SyntaxTheme> = LazyLock::new(|| {
+    let mut theme = SyntaxTheme::default();
+    theme.settings.foreground = Some(SyntaxColor {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    });
+    theme.scopes = SYNTAX_ROLES
+        .iter()
+        .enumerate()
+        .map(|(index, (scope, _))| ThemeItem {
+            scope: scope.parse().expect("valid syntax scope"),
+            style: StyleModifier {
+                foreground: Some(SyntaxColor {
+                    r: (index + 1) as u8,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                }),
+                ..StyleModifier::default()
+            },
+        })
+        .collect();
+    theme
+});
 
 fn detect_hyperlinks(get: impl Fn(&str) -> Option<String>, tmux: impl Fn() -> bool) -> bool {
     match get("PI_HYPERLINKS").as_deref() {
@@ -902,6 +952,7 @@ fn markdown_at_depth(
     let mut links = Vec::new();
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
+    let mut last_code_separator = None;
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         if quote_skip > 0 {
             match event {
@@ -983,6 +1034,7 @@ fn markdown_at_depth(
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                previous_paragraph_end = None;
                 code = Some(match kind {
                     CodeBlockKind::Fenced(language) => {
                         language.split_whitespace().next().unwrap_or("").to_owned()
@@ -1013,31 +1065,28 @@ fn markdown_at_depth(
                         )],
                         width,
                     ));
-                    let syntax = SYNTAXES
-                        .find_syntax_by_token(&language)
-                        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
-                    let syntax_theme = &SYNTAX_THEMES.themes[if theme.name == "light" {
-                        "InspiredGitHub"
-                    } else {
-                        "base16-ocean.dark"
-                    }];
-                    let mut highlighter = HighlightLines::new(syntax, syntax_theme);
+                    let syntax = SYNTAXES.find_syntax_by_token(&language);
+                    let mut highlighter =
+                        syntax.map(|syntax| HighlightLines::new(syntax, &SYNTAX_THEME));
                     for line in code_text.lines() {
                         let pieces = highlighter
-                            .highlight_line(line, &SYNTAXES)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|(style, text)| {
-                                Span::new(
-                                    text,
-                                    Color::Rgb {
-                                        r: style.foreground.r,
-                                        g: style.foreground.g,
-                                        b: style.foreground.b,
-                                    },
-                                )
+                            .as_mut()
+                            .and_then(|highlighter| {
+                                highlighter.highlight_line(line, &SYNTAXES).ok()
                             })
-                            .collect::<Vec<_>>();
+                            .map(|pieces| {
+                                pieces
+                                    .into_iter()
+                                    .map(|(style, text)| {
+                                        let role = usize::from(style.foreground.r)
+                                            .checked_sub(1)
+                                            .and_then(|index| SYNTAX_ROLES.get(index))
+                                            .map_or("text", |(_, role)| *role);
+                                        Span::themed(text, theme, role)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_else(|| vec![Span::themed(line, theme, "mdCodeBlock")]);
                         let indent = width.saturating_sub(1).min(2);
                         for mut line in wrap(&pieces, width.saturating_sub(indent)) {
                             line.spans
@@ -1051,6 +1100,10 @@ fn markdown_at_depth(
                     ));
                     if let Some(warning) = warning {
                         lines.extend(wrap(&[Span::themed(warning, theme, "warning")], width));
+                    }
+                    if lists.is_empty() {
+                        last_code_separator = Some(lines.len());
+                        lines.push(Line::default());
                     }
                     code_text.clear();
                 }
@@ -1235,6 +1288,9 @@ fn markdown_at_depth(
     if last_heading_separator == lines.len().checked_sub(1) && last_heading_separator.is_some() {
         lines.pop();
     }
+    if last_code_separator == lines.len().checked_sub(1) && last_code_separator.is_some() {
+        lines.pop();
+    }
     lines
 }
 fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Option<&Span>) {
@@ -1271,6 +1327,65 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fenced_code_separates_following_blocks_without_trailing_blank_line() {
+        for source in ["```\ncode\n```\nnext", "```\ncode\n```\n\nnext"] {
+            let lines: Vec<String> = markdown(source, &Theme::system(), 80)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(lines, ["```", "  code", "```", "", "next"]);
+        }
+        let lines = markdown("```\ncode\n```", &Theme::system(), 80);
+        assert_eq!(lines.len(), 3);
+    }
+    #[test]
+    fn fenced_code_uses_active_theme_roles_and_plain_fallback() {
+        let mut definition: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
+        definition["name"] = "custom".into();
+        definition["colors"]["syntaxKeyword"] = "#123456".into();
+        definition["colors"]["syntaxComment"] = "#654321".into();
+        definition["colors"]["mdCodeBlock"] = "#abcdef".into();
+        let theme = Theme::parse(&definition.to_string(), None).unwrap();
+        let lines = markdown(
+            "```rust\nfn main() {\n  // hello\n}\n```\n\n```unknown-language\nplain code\n```",
+            &theme,
+            80,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("fn") && span.color == theme.color("syntaxKeyword")),
+            "{spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("hello")
+                    && span.color == theme.color("syntaxComment"))
+        );
+        assert!(spans.iter().any(
+            |span| span.text.contains("plain code") && span.color == theme.color("mdCodeBlock")
+        ));
+
+        definition["colors"]["syntaxKeyword"] = "#ff0000".into();
+        let changed = Theme::parse(&definition.to_string(), None).unwrap();
+        let lines = markdown("```rust\nfn main() {}\n```", &changed, 80);
+        assert!(
+            lines.iter().flat_map(|line| &line.spans).any(
+                |span| span.text.contains("fn") && span.color == changed.color("syntaxKeyword")
+            )
+        );
+        let system = Theme::system();
+        let lines = markdown("```rust\n// comment\n```", &system, 80);
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.text.contains("comment")
+                && span.color == system.color("syntaxComment")
+                && span.dim == system.is_dim("syntaxComment")
+        }));
+    }
     #[test]
     fn markdown_separates_headings_from_following_blocks() {
         for (source, expected) in [
