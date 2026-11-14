@@ -7274,16 +7274,33 @@ impl EditorForeground {
         }))
     }
 
+    fn restore(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = self.tty.as_raw_fd();
+        set_foreground(fd, self.previous)?;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.baseline) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn suspend_and_resume(&self, editor_group: libc::pid_t) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
         let fd = self.tty.as_raw_fd();
-        // Without shell job control Pi shares its parent's process group.
-        // Suspending that group freezes the shell, and stopping Pi alone leaves
-        // a non-job-control shell waiting with no way to foreground it. Resume
-        // the editor instead, retaining its foreground and terminal state.
+        // Suspend only when the parent can plausibly supervise a foreground
+        // job in this same session. A shared process group or a parent in a
+        // different session cannot reliably foreground Pi again.
         let group = unsafe { libc::getpgrp() };
-        let parent_group = unsafe { libc::getpgid(libc::getppid()) };
-        if parent_group < 0 || parent_group == group {
+        let parent = unsafe { libc::getppid() };
+        let parent_group = unsafe { libc::getpgid(parent) };
+        let session = unsafe { libc::getsid(0) };
+        let parent_session = unsafe { libc::getsid(parent) };
+        if parent_group <= 0
+            || parent_group == group
+            || session <= 0
+            || parent_session != session
+            || self.previous != group
+        {
             if unsafe { libc::kill(-editor_group, libc::SIGCONT) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -7322,12 +7339,7 @@ impl EditorForeground {
 #[cfg(unix)]
 impl Drop for EditorForeground {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        let fd = self.tty.as_raw_fd();
-        let _ = set_foreground(fd, self.previous);
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSANOW, &self.baseline);
-        }
+        let _ = self.restore();
     }
 }
 
@@ -7795,6 +7807,33 @@ mod tests {
         use std::process::Stdio;
         use std::time::{Duration, Instant};
         const CHILD: &str = "PI_RS_EDITOR_JOB_CONTROL_TEST";
+        const SUPERVISOR: &str = "PI_RS_EDITOR_TEST_SUPERVISOR";
+        let managed = suspend && !shared_group && !test_name.contains("without_supervisor");
+        if let Some(program) = std::env::var_os(SUPERVISOR) {
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env_remove(SUPERVISOR)
+                .env(CHILD, program)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            super::set_foreground(0, child.id() as libc::pid_t).unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, libc::WUNTRACED) },
+                child.id() as libc::pid_t
+            );
+            assert!(libc::WIFSTOPPED(status));
+            println!("SUPERVISOR_SAW_STOP");
+            super::set_foreground(0, child.id() as libc::pid_t).unwrap();
+            assert_eq!(
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGCONT) },
+                0
+            );
+            assert!(child.wait().unwrap().success());
+            return;
+        }
         if let Some(program) = std::env::var_os(CHILD) {
             if shared_group {
                 assert_eq!(unsafe { libc::getpgrp() }, unsafe {
@@ -7842,6 +7881,12 @@ mod tests {
             } else {
                 editor.cancel();
             }
+            editor
+                ._foreground
+                .as_ref()
+                .expect("PTY foreground")
+                .restore()
+                .expect("restore PTY foreground and original termios");
             drop(editor);
             let mut restored: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
@@ -7893,10 +7938,14 @@ mod tests {
         };
         command
             .args(["--exact", test_name, "--nocapture"])
-            .env(CHILD, &program)
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
+        if managed {
+            command.env(SUPERVISOR, &program);
+        } else {
+            command.env(CHILD, &program);
+        }
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
@@ -7943,12 +7992,9 @@ mod tests {
                     let _ = child.wait();
                     panic!("shell was stopped along with the editor");
                 }
-                if (shared_group && rc == 0) || (rc > 0 && libc::WIFSTOPPED(status)) {
-                    if !shared_group {
-                        unsafe {
-                            libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
-                        }
-                    }
+                if rc == 0 {
+                    // The supervisor resumes a managed job; unsupervised and
+                    // shared-group cases must resume without external SIGCONT.
                     // Wait for the child to confirm it restored editor foreground.
                     let until = Instant::now() + Duration::from_secs(3);
                     while !output
@@ -7986,6 +8032,9 @@ mod tests {
                     String::from_utf8_lossy(&output)
                 );
                 assert!(String::from_utf8_lossy(&output).contains("PARENT_FINISHED"));
+                if managed {
+                    assert!(String::from_utf8_lossy(&output).contains("SUPERVISOR_SAW_STOP"));
+                }
                 if shared_group {
                     assert!(String::from_utf8_lossy(&output).contains("SHELL_ALIVE"));
                 }
@@ -8017,6 +8066,16 @@ mod tests {
             "interactive::tests::editor_suspend_keeps_shared_group_shell_running",
             true,
             true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_suspend_without_supervisor_resumes_without_sigcont() {
+        editor_pty_regression(
+            "interactive::tests::editor_suspend_without_supervisor_resumes_without_sigcont",
+            true,
+            false,
         );
     }
 

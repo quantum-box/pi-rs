@@ -4143,8 +4143,9 @@ the dialog, and extension cancellation still removes the correlated request.
 If the extension worker exits during editing, its editor is stopped and the
 terminal is restored. On Unix, suspending the external editor suspends the
 parent job and resumes the editor with its terminal settings. When the shell
-shares Pi's process group without job control, the editor resumes immediately
-instead of suspending a job that cannot be foregrounded. Cancellation restores
+shares Pi's process group without job control, or Pi's parent is in a different
+session, the editor resumes immediately instead of suspending a job that cannot
+be foregrounded. Cancellation restores
 the original terminal settings. Interrupts received while an editor
 is active do not disable subsequent terminal interrupt handling.
 The native 1 MiB extension response limit also applies to externally edited text.
