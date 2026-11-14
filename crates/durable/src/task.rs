@@ -3,8 +3,7 @@
 //! `task_store` provides durable wait evaluation; the host schedules polling
 //! and executes tasks after acquiring a reservation.
 
-#[path = "task_scheduler.rs"]
-pub mod scheduler;
+pub use crate::task_scheduler as scheduler;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

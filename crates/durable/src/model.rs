@@ -4,9 +4,6 @@
 //! snapshots. Tool-call deltas must never be executed. A `length`
 //! finish reason means the caller must fail the calls rather than execute them.
 
-#[path = "progress.rs"]
-pub mod progress;
-
 use std::{collections::HashSet, future::Future};
 
 use futures_util::StreamExt;
@@ -39,7 +36,7 @@ pub enum GenerationProgress {
     Reasoning(String),
     ToolCallDelta(ToolCallDelta),
     /// Latest provider metadata, a replacement rather than a delta.
-    Metadata(ModelMetadata),
+    Metadata(Box<ModelMetadata>),
 }
 
 /// The authoritative result of a completed stream, suitable for durable storage.
@@ -202,7 +199,7 @@ where
             Some(Ok(ModelEvent::Metadata(update))) => {
                 metadata = update.clone();
                 if metadata_events {
-                    progress(GenerationProgress::Metadata(update));
+                    progress(GenerationProgress::Metadata(Box::new(update)));
                 }
             }
             Some(Ok(ModelEvent::Complete { calls, usage })) => {

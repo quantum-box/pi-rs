@@ -37,7 +37,7 @@ use pi_rs_core::ModelMetadata;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::GenerationProgress;
+use crate::model::GenerationProgress;
 
 /// Maximum JSON-encoded bytes per stored record, including metadata and envelope.
 pub const MAX_PROGRESS_BYTES: usize = 1024 * 1024;
@@ -123,7 +123,7 @@ impl Snapshot {
                 }
                 next.text.push_str(delta);
             }
-            GenerationProgress::Metadata(metadata) => next.metadata = metadata.clone(),
+            GenerationProgress::Metadata(metadata) => next.metadata = (**metadata).clone(),
             GenerationProgress::Reasoning(_) | GenerationProgress::ToolCallDelta(_) => {
                 return Ok(());
             }
@@ -221,7 +221,7 @@ mod tests {
                 })),
                 Err(ModelError::RetryableModel("retry".into())),
             ];
-            let result = super::super::collect_generation_with_metadata(
+            let result = crate::model::collect_generation_with_metadata(
                 future::ready(Ok(stream::iter(events).boxed())),
                 &CancellationToken::new(),
                 |event| snapshot.push(&event).unwrap(),
@@ -261,7 +261,7 @@ mod tests {
         let mut staged = Snapshot::load(&store, id).unwrap();
         let cancel = CancellationToken::new();
         let events = stream::iter(vec![Ok(ModelEvent::Text(" lost".into()))]);
-        let result = super::super::collect_generation_with_metadata(
+        let result = crate::model::collect_generation_with_metadata(
             future::ready(Ok(events.boxed())),
             &cancel,
             |event| {
@@ -322,7 +322,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            snapshot.push(&GenerationProgress::Metadata(metadata)),
+            snapshot.push(&GenerationProgress::Metadata(Box::new(metadata))),
             Err(Error::TooLarge)
         ));
         assert_eq!(

@@ -198,13 +198,13 @@ impl Scheduler {
         self.check()?;
         let mut progress = false;
         for snapshot in self.ts().list()? {
-            if matches!(snapshot.task.state(), TaskState::Waiting(_)) {
-                if matches!(
+            if matches!(snapshot.task.state(), TaskState::Waiting(_))
+                && matches!(
                     self.ts().poll_wait(&snapshot, now_millis)?,
                     WakeResult::Woken { .. }
-                ) {
-                    progress = true;
-                }
+                )
+            {
+                progress = true;
             }
         }
         let Some(snapshot) = self

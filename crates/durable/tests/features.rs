@@ -115,3 +115,180 @@ async fn fork_copies_settled_context_but_not_submissions() {
         h.conversation(parent).unwrap().messages
     );
 }
+
+#[tokio::test]
+async fn historical_fork_uses_selected_settled_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let mut h = Harness::open(dir.path().join("db"), opts(), &cancel)
+        .await
+        .unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(parent, None, "first".into(), &cancel)
+        .await
+        .unwrap();
+    let cursor = h
+        .history(parent, Cursor(0), NonZeroUsize::new(1000).unwrap())
+        .unwrap()
+        .next;
+    h.submit_and_run(parent, None, "second".into(), &cancel)
+        .await
+        .unwrap();
+    let fork = h.fork_at(parent, cursor).unwrap();
+    let c = h.conversation(fork).unwrap();
+    assert!(
+        c.messages
+            .iter()
+            .any(|m| matches!(m,Message::User{content} if content=="first"))
+    );
+    assert!(
+        !c.messages
+            .iter()
+            .any(|m| matches!(m,Message::User{content} if content=="second"))
+    );
+    assert!(c.submissions.is_empty());
+}
+
+struct AutoModel {
+    summaries: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl Model for AutoModel {
+    async fn context_window(&self, _: &str) -> Option<u32> {
+        Some(20_000)
+    }
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+        let summary=request.messages.iter().any(|m|matches!(m,Message::System{content} if content.starts_with("You are a context summarization")));
+        if summary {
+            self.summaries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let output = if summary {
+            "older work summary"
+        } else {
+            "answer"
+        };
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text(output.into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn automatically_compacts_before_request_when_context_fills() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let model = Arc::new(AutoModel {
+        summaries: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let options = Options {
+        model: model.clone(),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut h = Harness::open(dir.path().join("db"), options, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "x".repeat(90_000), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(id, None, "latest".into(), &cancel)
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(model.summaries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        c.messages
+            .iter()
+            .any(|m| matches!(m,Message::User{content} if content.contains("older work summary")))
+    );
+    assert!(
+        c.messages
+            .iter()
+            .any(|m| matches!(m,Message::User{content} if content=="latest"))
+    );
+}
+struct SmallModel {
+    summaries: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl Model for SmallModel {
+    async fn context_window(&self, _: &str) -> Option<u32> {
+        Some(4096)
+    }
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+        let summary=request.messages.iter().any(|m|matches!(m,Message::System{content} if content.starts_with("You are a context summarization")));
+        if summary {
+            self.summaries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text(
+                if summary { "short summary" } else { "answer" }.into(),
+            )),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn automatic_compaction_scales_retention_to_small_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let model = Arc::new(SmallModel {
+        summaries: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let options = Options {
+        model: model.clone(),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut h = Harness::open(dir.path().join("db"), options, &cancel)
+        .await
+        .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "small".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+    h.submit_and_run(id, None, "x".repeat(14_000), &cancel)
+        .await
+        .unwrap();
+    h.submit_and_run(id, None, "latest".into(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(model.summaries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::User{content} if content.contains("short summary")))
+    );
+}

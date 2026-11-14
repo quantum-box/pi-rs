@@ -4,7 +4,9 @@
 //! inside storage transactions. Independent conversations can run concurrently.
 pub use crate::state::InputMode;
 use crate::{
-    model::{CompletedGeneration, collect_generation, model_request},
+    model::{
+        CompletedGeneration, GenerationProgress, collect_generation_with_metadata, model_request,
+    },
     recovery::{ReplayPolicy, ToolRecovery, UncertainPolicy, recover_tool},
 };
 use durable_store::{
@@ -24,7 +26,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -38,6 +40,10 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("observation: {0}")]
     Observer(#[from] crate::observer::Error),
+    #[error("generation progress: {0}")]
+    Progress(#[from] crate::progress::Error),
+    #[error("fork: {0}")]
+    Fork(#[from] crate::fork::Error),
     #[error("model: {0}")]
     Model(#[from] pi_rs_core::Error),
     #[error("conversation not found")]
@@ -85,6 +91,12 @@ pub struct Submission {
     pub request_id: Option<String>,
     pub content: String,
     pub status: Status,
+}
+/// A persisted interrupted partial, for display only; it is never sent to a model.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AbortedGeneration {
+    pub request_id: Uuid,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -170,9 +182,15 @@ pub struct Conversation {
     pub messages: Vec<Message>,
     pub submissions: Vec<Submission>,
     #[serde(default)]
+    pub aborted_generations: Vec<AbortedGeneration>,
+    #[serde(default)]
     tool_states: HashMap<String, ExtensionState>,
     #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
+    #[serde(default)]
+    auto_compaction_attempted: bool,
+    #[serde(default)]
+    compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
     phase: Phase,
 }
@@ -291,20 +309,59 @@ impl Harness {
         let mut expected = expected;
         loop {
             let value = serde_json::to_vec(&state)?;
-            let event =
-                serde_json::json!({"messages": state.messages, "submissions": state.submissions});
+            let event = serde_json::json!({"messages": state.messages, "submissions": state.submissions, "aborted_generations": state.aborted_generations});
             let append = crate::observer::Observer::new(self.owner.store(), state.id)
                 .prepare_append(&event)?;
+            let fork_key =
+                format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
+            let fork_snapshot = crate::fork::Snapshot {
+                version: 1,
+                conversation_id: state.id,
+                config: state.config.clone(),
+                messages: state.messages.clone(),
+                submissions: state.submissions.clone(),
+                tool_states: state.tool_states.clone(),
+                documents: HashMap::new(),
+                active: state.active,
+                phase: serde_json::to_value(&state.phase)?,
+            };
             let mut checks = vec![Check {
                 key: key.clone(),
                 expected: expected.clone(),
             }];
             checks.extend(append.checks);
+            checks.push(Check {
+                key: fork_key.clone(),
+                expected: Expected::Missing,
+            });
             let mut mutations = vec![Mutation::Put {
                 key: key.clone(),
                 value,
             }];
             mutations.extend(append.mutations);
+            mutations.push(Mutation::Put {
+                key: fork_key,
+                value: serde_json::to_vec(&fork_snapshot)?,
+            });
+            let terminal = match &state.phase {
+                Phase::Accounting { request_id, .. } => Some((*request_id, true)),
+                Phase::AbandonedModel { request_id, .. } => Some((*request_id, false)),
+                _ => None,
+            };
+            if let Some((request_id, complete)) = terminal {
+                let snapshot = crate::progress::Snapshot::load(self.owner.store(), request_id)?;
+                if snapshot.is_persisted()
+                    && matches!(snapshot.state(), crate::progress::State::Running(_))
+                {
+                    let prepared = if complete {
+                        snapshot.prepare_complete()?
+                    } else {
+                        snapshot.prepare_abort()?
+                    };
+                    checks.extend(prepared.checks);
+                    mutations.extend(prepared.mutations);
+                }
+            }
             match self.owner.store().commit(&checks, &mutations) {
                 Ok(()) => break,
                 Err(durable_store::Error::Conflict { .. }) if self.merge_admissions => {
@@ -360,8 +417,11 @@ impl Harness {
             config,
             messages: vec![],
             submissions: vec![],
+            aborted_generations: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
+            auto_compaction_attempted: false,
+            compaction_return_turns: None,
             active: None,
             phase: Phase::Idle,
         };
@@ -380,8 +440,45 @@ impl Harness {
         state.id = Uuid::new_v4();
         state.active = None;
         state.submissions.clear();
+        state.aborted_generations.clear();
         state.input_modes.clear();
+        state.auto_compaction_attempted = false;
+        state.compaction_return_turns = None;
         state.phase = Phase::Idle;
+        self.save(&state, Expected::Missing)?;
+        Ok(state.id)
+    }
+    /// Fork a committed, settled snapshot by its observation cursor. Older
+    /// snapshots without historical configuration fail closed.
+    pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
+        self.load(id)?;
+        if cursor.0 == 0 {
+            return Err(crate::fork::Error::InvalidCursor.into());
+        }
+        let key = format!("runtime/fork/{}/{:020}", id, cursor.0);
+        let entry = self
+            .owner
+            .store()
+            .get(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidCursor)?;
+        let record = crate::observer::Record {
+            cursor,
+            value: serde_json::from_slice(&entry.value)?,
+        };
+        let point = crate::fork::extract(id, &record)?;
+        let state = Conversation {
+            id: Uuid::new_v4(),
+            config: point.config,
+            messages: point.messages,
+            submissions: vec![],
+            aborted_generations: vec![],
+            tool_states: point.tool_states,
+            input_modes: HashMap::new(),
+            auto_compaction_attempted: false,
+            compaction_return_turns: None,
+            active: None,
+            phase: Phase::Idle,
+        };
         self.save(&state, Expected::Missing)?;
         Ok(state.id)
     }
@@ -439,6 +536,7 @@ impl Harness {
             preparation: Box::new(preparation),
             restarts: 0,
         };
+        c.compaction_return_turns = None;
         self.save(&c, Expected::Version(version))?;
         Ok(true)
     }
@@ -531,6 +629,19 @@ impl Harness {
                     request_id,
                     restarts,
                 } => {
+                    let progress = crate::progress::Snapshot::load(self.owner.store(), request_id)?;
+                    if let crate::progress::State::Running(partial) = progress.state()
+                        && !partial.text.is_empty()
+                        && !c
+                            .aborted_generations
+                            .iter()
+                            .any(|entry| entry.request_id == request_id)
+                    {
+                        c.aborted_generations.push(AbortedGeneration {
+                            request_id,
+                            text: partial.text.clone(),
+                        });
+                    }
                     let n = restarts.saturating_add(1);
                     c.phase = Phase::AbandonedModel {
                         turns,
@@ -687,6 +798,7 @@ impl Harness {
                     let s = &mut c.submissions[i];
                     s.status = Status::Running;
                     c.active = Some(s.id);
+                    c.auto_compaction_attempted = false;
                     c.messages.push(Message::User {
                         content: s.content.clone(),
                     });
@@ -745,7 +857,10 @@ impl Harness {
                         }
                     }
                     if restarts >= self.options.restart_limit {
-                        c.phase = Phase::Idle;
+                        c.phase = c
+                            .compaction_return_turns
+                            .take()
+                            .map_or(Phase::Idle, |turns| Phase::ModelReady { turns });
                     } else {
                         c.phase = Phase::CompactionReady {
                             preparation,
@@ -774,13 +889,67 @@ impl Harness {
                         }
                     }
                     c.messages = result.apply(&c.messages)?;
-                    c.phase = Phase::Idle;
+                    c.phase = c
+                        .compaction_return_turns
+                        .take()
+                        .map_or(Phase::Idle, |turns| Phase::ModelReady { turns });
                     self.save(&c, Expected::Version(version))?;
                 }
                 Phase::ModelReady { turns } => {
                     if turns >= self.options.max_turns {
                         finish_failure(&mut c, "turn limit".into());
                     } else {
+                        if !c.auto_compaction_attempted {
+                            let window = tokio::select! {
+                                _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
+                                window = tokio::time::timeout(Duration::from_secs(5), self.options.model.context_window(&c.config.model)) => window.ok().flatten(),
+                            };
+                            if let Some(window) = window {
+                                let mut messages = vec![Message::System {
+                                    content: c.config.system_prompt.clone(),
+                                }];
+                                messages.extend(c.messages.clone());
+                                let specs: Vec<_> =
+                                    self.tools.values().map(|tool| tool.tool.spec()).collect();
+                                let request = model_request(
+                                    &c.config.model,
+                                    messages,
+                                    specs,
+                                    c.config.max_output_tokens,
+                                );
+                                let window = u64::from(window);
+                                let reserve = 16_384u64
+                                    .min(window / 4)
+                                    .max(u64::from(c.config.max_output_tokens).min(window));
+                                let estimated = pi_rs_core::estimate_request_tokens(&request);
+                                if estimated >= window.saturating_sub(reserve) {
+                                    c.auto_compaction_attempted = true;
+                                    let message_tokens: u64 = c
+                                        .messages
+                                        .iter()
+                                        .map(pi_rs_core::estimate_message_tokens)
+                                        .sum();
+                                    let overhead = estimated.saturating_sub(message_tokens);
+                                    let keep =
+                                        window.saturating_sub(reserve).saturating_sub(overhead) / 2;
+                                    if let Some(preparation) = crate::compact::prepare(
+                                        &c.messages,
+                                        c.config.model.clone(),
+                                        c.config.max_output_tokens,
+                                        usize::try_from(keep.min(20_000)).unwrap_or(20_000),
+                                        None,
+                                    )? {
+                                        c.compaction_return_turns = Some(turns);
+                                        c.phase = Phase::CompactionReady {
+                                            preparation: Box::new(preparation),
+                                            restarts: 0,
+                                        };
+                                        self.save(&c, Expected::Version(version))?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         c.phase = Phase::ModelRunning {
                             turns,
                             request_id: Uuid::new_v4(),
@@ -801,15 +970,45 @@ impl Harness {
                     specs.sort_by(|a, b| a.name.cmp(&b.name));
                     let request =
                         model_request(&c.config.model, messages, specs, c.config.max_output_tokens);
-                    let response = match collect_generation(
+                    let store = self.owner.store();
+                    let mut snapshot = crate::progress::Snapshot::load(store, request_id)?;
+                    let mut last_flush: Option<Instant> = None;
+                    let mut text_flushed = false;
+                    let mut progress_failure = None;
+                    let mut progress_full = false;
+                    let request_cancel = cancel.child_token();
+                    let response = collect_generation_with_metadata(
                         self.options
                             .model
                             .stream_in_session(request_id, id, request),
-                        cancel,
-                        |_| {},
+                        &request_cancel,
+                        |event| {
+                            if progress_failure.is_some() || progress_full { return; }
+                            let is_text = matches!(&event, GenerationProgress::Text(text) if !text.is_empty());
+                            if let Err(error) = snapshot.push(&event) {
+                                if matches!(error, crate::progress::Error::TooLarge) { progress_full = true; }
+                                else { progress_failure = Some(error.to_string()); request_cancel.cancel(); }
+                                return;
+                            }
+                            if (is_text && !text_flushed) || last_flush.is_none_or(|time| time.elapsed() >= Duration::from_millis(100)) {
+                                let committed = snapshot.prepare_checkpoint().and_then(|batch| {
+                                    store.commit(&batch.checks, &batch.mutations).map_err(crate::progress::Error::from)
+                                }).and_then(|_| crate::progress::Snapshot::load(store, request_id));
+                                match committed {
+                                    Ok(next) => { snapshot = next; last_flush = Some(Instant::now()); if is_text { text_flushed = true; } },
+                                    Err(error) => { progress_failure = Some(error.to_string()); request_cancel.cancel(); }
+                                }
+                            }
+                        },
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some(error) = progress_failure {
+                        self.failed = true;
+                        return Err(Error::Invalid(format!(
+                            "progress checkpoint failed: {error}"
+                        )));
+                    }
+                    let response = match response {
                         Ok(r) => r,
                         Err(e) => {
                             self.failed = true;
@@ -903,6 +1102,7 @@ impl Harness {
                         c.messages.push(Message::User {
                             content: submission.content.clone(),
                         });
+                        c.auto_compaction_attempted = false;
                         c.phase = Phase::ModelReady { turns };
                     } else if let Some(answer) = answer {
                         finish_answer(&mut c, answer);
@@ -1252,6 +1452,9 @@ impl Scheduler {
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
         self.harness.fork(id)
     }
+    pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
+        self.harness.fork_at(id, cursor)
+    }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
         self.harness.conversation(id)
     }
@@ -1447,6 +1650,7 @@ fn append_tool(
         call_id: call.id.clone(),
         content,
     });
+    c.auto_compaction_attempted = false;
     Ok(())
 }
 fn finish_answer(c: &mut Conversation, answer: String) {
@@ -1541,8 +1745,11 @@ mod scheduler_tests {
             config: config(),
             messages: vec![],
             submissions: vec![],
+            aborted_generations: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
+            auto_compaction_attempted: false,
+            compaction_return_turns: None,
             active: None,
             phase: Phase::Idle,
         };

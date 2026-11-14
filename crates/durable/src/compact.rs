@@ -108,13 +108,19 @@ pub fn prepare(
         if bytes >= keep_recent_tokens.saturating_mul(4) {
             break;
         }
-        bytes = bytes.saturating_add(serde_json::to_vec(message)?.len());
+        let message_bytes = serde_json::to_vec(message)?.len();
+        if budget_start != messages.len()
+            && bytes.saturating_add(message_bytes) > keep_recent_tokens.saturating_mul(4)
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(message_bytes);
         budget_start = index;
     }
     let desired = latest_user.min(budget_start);
-    let first_kept = (system_end..=desired)
-        .rev()
-        .find(|&i| is_user(&messages[i]));
+    // Start at the first complete user turn at or after the budget boundary;
+    // keeping an older assistant without its user would split a turn.
+    let first_kept = (desired..=latest_user).find(|&i| is_user(&messages[i]));
     let Some(first_kept) = first_kept.filter(|&i| i > system_end) else {
         return Ok(None);
     };
