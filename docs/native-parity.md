@@ -1051,6 +1051,22 @@ Text reads now scan files with bounded memory, including files larger than
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
 
+### Image read omission checkpoint
+
+Image reads that cannot be decoded, converted or resized return Pi's text
+notice explaining why the image was omitted, including for injected read
+operations. Programmatic callers receive that text rather than an image.
+Unsupported inline formats such as BMP are converted to PNG even with image
+resizing disabled; conversion and resize failures have distinct notices.
+Conversion preserves image orientation; resizing operates on decoded pixels
+without applying the source byte limit to an intermediate encoding. Supported
+inline formats pass through without decoding when resizing is disabled.
+The native 20 MiB source limit, cancellation and filesystem errors remain
+separate failures. When an injected backend only implements `read_file`, its
+whole response is buffered before the 20 MiB check; bounded transfer requires
+the optional streaming `open_file` operation. The 6 MiB limit when resizing
+is disabled still applies to the source and converted output.
+
 ### RPC navigation checkpoint
 
 RPC clients can discover and cycle endpoint models, set or cycle thinking,

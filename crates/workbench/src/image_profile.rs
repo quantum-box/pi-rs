@@ -88,6 +88,56 @@ pub(super) fn normalize_cancellable<R: BufRead + Seek>(
     normalize_encoded(bytes, format, profile, token)
 }
 
+pub(super) fn decode_source_cancellable<R: BufRead + Seek>(
+    reader: ImageReader<R>,
+    max_bytes: usize,
+    token: Option<&pi_rs::CancellationToken>,
+) -> Result<DynamicImage> {
+    check_cancelled(token)?;
+    let format = reader
+        .format()
+        .ok_or_else(|| Error::Config("unknown image format".into()))?;
+    let mut bytes = Vec::new();
+    reader
+        .into_inner()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    check_cancelled(token)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::Config(if max_bytes == MAX_IMAGE_SOURCE_BYTES {
+            "image exceeds 20 MiB".into()
+        } else {
+            "image exceeds the 6 MiB original image limit".into()
+        }));
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(image_error)?;
+    let orientation = decoder.orientation().map_err(image_error)?;
+    check_cancelled(token)?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(image_error)?;
+    check_cancelled(token)?;
+    image.apply_orientation(orientation);
+    check_cancelled(token)?;
+    Ok(image)
+}
+
+pub(super) fn convert_to_png_cancellable<R: BufRead + Seek>(
+    reader: ImageReader<R>,
+    max_bytes: usize,
+    token: Option<&pi_rs::CancellationToken>,
+) -> Result<Vec<u8>> {
+    let image = decode_source_cancellable(reader, max_bytes, token)?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(image_error)?;
+    check_cancelled(token)?;
+    Ok(png)
+}
+
 pub fn normalize_content(
     content: ImageContent,
     profile: ImageResizeProfile,
@@ -132,6 +182,25 @@ fn normalize_encoded(
 
 pub fn prepare_pixels(image: DynamicImage, profile: ImageResizeProfile) -> Result<ModelImage> {
     prepare(image, None, profile, None)
+}
+
+pub(super) fn prepare_pixels_cancellable(
+    image: DynamicImage,
+    profile: ImageResizeProfile,
+    token: Option<&pi_rs::CancellationToken>,
+) -> Result<ModelImage> {
+    check_cancelled(token)?;
+    if image.width() <= profile.max_width.unwrap_or(2000)
+        && image.height() <= profile.max_height.unwrap_or(2000)
+    {
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .map_err(image_error)?;
+        check_cancelled(token)?;
+        return prepare(image, Some((png, "image/png")), profile, token);
+    }
+    prepare(image, None, profile, token)
 }
 
 fn prepare(
