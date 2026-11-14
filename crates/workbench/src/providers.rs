@@ -442,6 +442,20 @@ impl Deferred {
 }
 
 impl Client {
+    /// Resolve dynamic credentials and request headers once before deciding
+    /// which affinity defaults are actually needed.
+    pub(super) async fn resolve_affinity_headers(&self) -> Result<(Self, HeaderMap)> {
+        match self {
+            Self::Deferred(deferred) => deferred.resolve_with_headers().await,
+            Self::Ollama(client) => Ok((self.clone(), client.context_headers())),
+            Self::Anthropic(client) => Ok((self.clone(), client.context_headers())),
+            Self::Google(client) => Ok((self.clone(), client.context_headers())),
+            Self::OpenAi(client) => Ok((self.clone(), client.context_headers())),
+            Self::PiMessages(client) => Ok((self.clone(), client.context_headers())),
+            _ => Ok((self.clone(), HeaderMap::new())),
+        }
+    }
+
     pub fn deferred(
         provider: Provider,
         adapter: Adapter,

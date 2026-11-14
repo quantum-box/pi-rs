@@ -106,7 +106,17 @@ impl Model for WorkbenchModel {
         request: ModelRequest,
     ) -> Result<ModelStream> {
         let mut headers = HeaderMap::new();
-        if !self.session_affinity.is_empty() && !external_id.is_empty() {
+        let (client, configured) = if !self.session_affinity.is_empty() && !external_id.is_empty() {
+            self.client.resolve_affinity_headers().await?
+        } else {
+            (self.client.clone(), HeaderMap::new())
+        };
+        if !external_id.is_empty()
+            && self
+                .session_affinity
+                .iter()
+                .any(|name| !configured.contains_key(*name))
+        {
             // Fetch's Headers converts JS strings to ByteString (Latin-1),
             // then strips HTTP whitespace at the edges before validation.
             // Reject unrepresentable or invalid bytes rather than dispatching
@@ -129,11 +139,12 @@ impl Model for WorkbenchModel {
             let value = HeaderValue::from_bytes(trimmed)
                 .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
             for &name in self.session_affinity {
-                headers.insert(name, value.clone());
+                if !configured.contains_key(name) {
+                    headers.insert(name, value.clone());
+                }
             }
         }
-        let stream = self
-            .client
+        let stream = client
             .stream_with_headers(self.filtered(request), &headers, false)
             .await?;
         Ok(self.estimate_usage(stream))
@@ -454,6 +465,169 @@ mod tests {
                 listener.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_affinity_headers_override_before_default_validation() {
+        use super::super::providers::{Adapter, Provider};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        const MULTI: &[&str] = &["session_id", "x-client-request-id", "x-session-affinity"];
+        for (deferred, names, explicit, identity, dispatch) in [
+            (
+                false,
+                &MULTI[..],
+                vec![
+                    ("SESSION_ID", "s"),
+                    ("X-CLIENT-REQUEST-ID", "r"),
+                    ("X-SESSION-AFFINITY", "a"),
+                ],
+                "日本",
+                true,
+            ),
+            (false, &MULTI[..], vec![("SESSION_ID", "s")], "日本", false),
+            (false, &MULTI[..], vec![("SESSION_ID", "s")], "café", true),
+            (
+                false,
+                &["x-session-id"][..],
+                vec![("X-SESSION-ID", "override")],
+                "日本",
+                true,
+            ),
+            (
+                true,
+                &["x-session-id"][..],
+                vec![("x-session-id", "override")],
+                "日本",
+                true,
+            ),
+        ] {
+            let listener = std::sync::Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = if dispatch {
+                let listener = listener.clone();
+                Some(std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let mut block = [0; 1024];
+                        let count = socket.read(&mut block).unwrap();
+                        assert_ne!(count, 0);
+                        bytes.extend_from_slice(&block[..count]);
+                    }
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    bytes
+                }))
+            } else {
+                None
+            };
+            let client = if deferred {
+                let environment = serde_json::json!({"AFFINITY_OVERRIDE":"override"});
+                let headers = super::super::model_profiles::RequestHeaders::for_test(
+                    "x-session-id",
+                    "${AFFINITY_OVERRIDE}",
+                )
+                .with_environment(environment.as_object());
+                Client::deferred(
+                    Provider::Ollama,
+                    Adapter::ChatCompletions,
+                    &format!("http://{address}"),
+                    None,
+                    headers,
+                )
+                .with_context_probes(false)
+            } else {
+                let mut headers = HeaderMap::new();
+                for (name, value) in &explicit {
+                    headers.insert(
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        HeaderValue::from_str(value).unwrap(),
+                    );
+                }
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(&format!("http://{address}"), None)
+                        .unwrap()
+                        .with_native_probes(false)
+                        .with_headers(headers),
+                )
+            };
+            let model = WorkbenchModel {
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: names,
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                model.stream_in_session_with_identity(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    identity,
+                    request,
+                ),
+            )
+            .await
+            .expect("fixture timed out");
+            if let Some(server) = server {
+                assert!(
+                    !matches!(result, Err(pi_rs::Error::Config(_))),
+                    "explicit headers should allow dispatch"
+                );
+                let bytes = server.join().unwrap();
+                let get = |name: &str| {
+                    bytes.split(|byte| *byte == b'\n').find_map(|line| {
+                        let colon = line.iter().position(|byte| *byte == b':')?;
+                        if !line[..colon].eq_ignore_ascii_case(name.as_bytes()) {
+                            return None;
+                        }
+                        let value = line[colon + 1..]
+                            .strip_suffix(b"\r")
+                            .unwrap_or(&line[colon + 1..]);
+                        Some(value.strip_prefix(b" ").unwrap_or(value).to_vec())
+                    })
+                };
+                for (name, value) in &explicit {
+                    assert_eq!(get(name).as_deref(), Some(value.as_bytes()));
+                }
+                if identity == "café" {
+                    assert_eq!(get("x-client-request-id").as_deref(), Some(&b"caf\xe9"[..]));
+                    assert_eq!(get("x-session-affinity").as_deref(), Some(&b"caf\xe9"[..]));
+                }
+            } else {
+                assert!(matches!(result, Err(pi_rs::Error::Config(_))));
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
         }
     }
 
