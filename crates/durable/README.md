@@ -550,7 +550,9 @@ restart limit. The same ID is used for the hook across recovery; each model
 attempt has its own request ID. Records are not inherited by forks and currently
 grow without retention. Failures requiring reopen leave the operation running
 until recovery or abort resolves it. This remains an idle-only conversation
-phase, not a separately scheduled upstream task.
+phase, not a separately scheduled upstream task. Admission also rejects an
+idle conversation with an unsettled abort, so that an earlier abort cannot
+cancel a newly accepted operation.
 Runtime-owned preparations also pin the context generation; a reset or another
 applied compaction invalidates the pinned generation even if message text later
 matches. Legacy in-flight preparations without a generation can finish while

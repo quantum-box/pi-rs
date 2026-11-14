@@ -3220,7 +3220,7 @@ impl Harness {
         instructions: Option<&str>,
     ) -> Result<Option<Uuid>, Error> {
         let (mut c, version) = self.load(id)?;
-        if !matches!(c.phase, Phase::Idle) || c.active.is_some() {
+        if !matches!(c.phase, Phase::Idle) || c.active.is_some() || c.abort_requested {
             return Err(Error::Invalid(
                 "compaction requires an idle conversation".into(),
             ));
@@ -8261,6 +8261,8 @@ mod scheduler_tests {
             "submissions": [], "active": null, "phase": "Idle"
         });
         let mut c: Conversation = serde_json::from_value(json).unwrap();
+        assert!(c.manual_compactions.is_empty());
+        assert_eq!(c.active_manual_compaction, None);
         assert_eq!(c.queue_modes, QueueModes::default());
         c.queue_modes = QueueModes {
             steering_mode: QueueMode::All,
@@ -8295,6 +8297,47 @@ mod scheduler_tests {
         assert_eq!(
             encoded,
             serde_json::json!({"steeringMode":"all", "followUpMode":"one-at-a-time"})
+        );
+    }
+
+    #[test]
+    fn stale_worker_cannot_overwrite_manual_compaction_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        state.messages = vec![
+            Message::User {
+                content: "old".into(),
+            },
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: None,
+            },
+            Message::User {
+                content: "new".into(),
+            },
+        ];
+        h.save(&state, Expected::Version(version)).unwrap();
+        let mut worker = h.worker();
+        let (stale, version) = worker.load(id).unwrap();
+        let operation = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+        assert!(matches!(
+            worker.save(&stale, Expected::Version(version)),
+            Err(Error::Invalid(_))
+        ));
+        let saved = h.conversation(id).unwrap();
+        assert_eq!(saved.active_manual_compaction, Some(operation));
+        assert_eq!(
+            saved.manual_compactions[0].status,
+            ManualCompactionStatus::Running
         );
     }
 
@@ -8343,6 +8386,17 @@ mod scheduler_tests {
             status: Status::Queued,
         });
         assert!(admission_only(&base, &latest).unwrap());
+        let mut compaction = base.clone();
+        let id = Uuid::new_v4();
+        compaction.manual_compactions.push(ManualCompaction {
+            id,
+            status: ManualCompactionStatus::Running,
+        });
+        compaction.active_manual_compaction = Some(id);
+        assert!(!admission_only(&base, &compaction).unwrap());
+        let mut settled = compaction.clone();
+        finish_manual_compaction(&mut settled, ManualCompactionStatus::Applied).unwrap();
+        assert!(!admission_only(&compaction, &settled).unwrap());
         latest.phase = Phase::ModelReady { turns: 0 };
         assert!(!admission_only(&base, &latest).unwrap());
     }

@@ -38,6 +38,98 @@ fn opts() -> Options {
 }
 
 #[tokio::test]
+async fn manual_compaction_rejects_an_earlier_pending_abort() {
+    use pi_rs_durable::runtime::ManualCompactionStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "new".into(), &cancel)
+            .await
+            .unwrap();
+        h.request_abort(id).unwrap();
+        assert!(h.request_manual_compaction(id, 0, None).is_err());
+        assert!(h.conversation(id).unwrap().manual_compactions.is_empty());
+    }
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    assert!(h.request_manual_compaction(id, 0, None).is_err());
+    h.resume(&cancel).await.unwrap();
+    h.continue_queued(id).unwrap();
+    let op = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+    h.resume(&cancel).await.unwrap();
+    let records = h.conversation(id).unwrap().manual_compactions;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, op);
+    assert_eq!(records[0].status, ManualCompactionStatus::Applied);
+}
+
+#[tokio::test]
+async fn manual_compaction_model_error_remains_running_until_abort_after_reopen() {
+    use pi_rs_durable::runtime::ManualCompactionStatus;
+    struct FailingSummary;
+    #[async_trait]
+    impl Model for FailingSummary {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request.messages.iter().any(|m| matches!(m, Message::System { content } if content.starts_with("You are a context summarization"))) {
+                return Err(Error::Model("summary failed".into()));
+            }
+            ModelStub.stream(request).await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let options = || Options {
+        model: Arc::new(FailingSummary),
+        ..opts()
+    };
+    let id;
+    let op;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 128,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "old".into(), &cancel)
+            .await
+            .unwrap();
+        h.submit_and_run(id, None, "new".into(), &cancel)
+            .await
+            .unwrap();
+        op = h.request_manual_compaction(id, 0, None).unwrap().unwrap();
+        assert!(h.resume(&cancel).await.is_err());
+    }
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().manual_compactions[0].status,
+        ManualCompactionStatus::Running
+    );
+    h.request_abort(id).unwrap();
+    h.resume(&cancel).await.unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let record = &h.conversation(id).unwrap().manual_compactions[0];
+    assert_eq!(record.id, op);
+    assert_eq!(record.status, ManualCompactionStatus::Aborted);
+}
+
+#[tokio::test]
 async fn bounded_conversation_history_reopens_and_forks_at_captured_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
@@ -338,6 +430,9 @@ async fn manual_compaction_retry_preserves_request_and_context() {
             .request_manual_compaction(id, 0, Some("preserve names"))
             .unwrap()
             .unwrap();
+        let cursor = h.history_head(id).unwrap();
+        let fork = h.fork_at(id, cursor).unwrap();
+        assert!(h.conversation(fork).unwrap().manual_compactions.is_empty());
         let stop = CancellationToken::new();
         let trigger = stop.clone();
         let captured = requests.clone();
