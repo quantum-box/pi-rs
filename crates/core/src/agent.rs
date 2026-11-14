@@ -1290,19 +1290,15 @@ impl Agent<'_> {
                     // to replay. A validated completed summary can be committed
                     // without a second billable provider request.
                     if active.registry.extensions.is_empty()
-                        && let Some((summary, spent, billing)) = completed_overflow_summary(
-                            session,
-                            run_id,
-                            "pi-rs:overflow-recovery",
-                            active.model_name,
-                        )
+                        && let Some((summary, spent, billing, retention)) =
+                            completed_overflow_summary(
+                                session,
+                                run_id,
+                                "pi-rs:overflow-recovery",
+                                active.model_name,
+                            )
                         && spent <= budget
                     {
-                        let retention = configured_retention(
-                            session,
-                            active.compaction_tokens(session).keep_recent_tokens,
-                            1,
-                        )?;
                         active
                             .commit_compaction_with_host(
                                 session,
@@ -1982,16 +1978,11 @@ impl Agent<'_> {
             // A completed summary is safe to reuse only when no external
             // hooks could have run before the interruption.
             if self.registry.extensions.is_empty()
-                && let Some((summary, _, billing)) = completed_overflow_summary(
+                && let Some((summary, _, billing, retention)) = completed_overflow_summary(
                     session,
                     run_id,
                     "pi-rs:silent-overflow",
                     self.model_name,
-                )
-                && let Ok(retention) = configured_retention(
-                    session,
-                    self.compaction_tokens(session).keep_recent_tokens,
-                    1,
                 )
             {
                 let _ = self
@@ -4076,6 +4067,16 @@ impl Agent<'_> {
                 "older context does not fit the summary request".into(),
             ));
         }
+        if matches!(reason, crate::CompactionTrigger::Overflow) {
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":retention.boundary,"keepTurns":retention.keep_turns,"splitTurn":retention.split_turn}),
+                },
+                observer,
+            )?;
+        }
         let allowance = request.max_output_tokens;
         let reply = active
             .reply(
@@ -4420,6 +4421,7 @@ type RecoveredSummary = (
     String,
     u32,
     Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+    RetentionPlan,
 );
 
 fn completed_overflow_summary(
@@ -4447,6 +4449,29 @@ fn completed_overflow_summary(
         return None;
     };
     if model != model_name {
+        return None;
+    }
+    let plan = branch.get(request_index.checked_sub(1)?)?;
+    let Event::SourceEntry { format, entry } = &plan.event else {
+        return None;
+    };
+    if format != "pi-rs:overflow-retention-v1" || plan.run_id != Some(run_id) {
+        return None;
+    }
+    let retention = RetentionPlan {
+        boundary: if entry["boundary"].is_null() {
+            None
+        } else {
+            Some(entry["boundary"].as_u64()?)
+        },
+        keep_turns: usize::try_from(entry["keepTurns"].as_u64()?).ok()?,
+        split_turn: entry["splitTurn"].as_bool()?,
+    };
+    if retention
+        .boundary
+        .is_some_and(|id| !branch.iter().any(|record| record.id == id && id < plan.id))
+        || !has_summary_prefix(session, retention.boundary)
+    {
         return None;
     }
     let following = &branch[request_index + 1..];
@@ -4512,7 +4537,7 @@ fn completed_overflow_summary(
         }
         _ => return None,
     };
-    Some((partial.clone(), spent, billing))
+    Some((partial.clone(), spent, billing, retention))
 }
 
 fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRecoveryState> {
@@ -7141,9 +7166,21 @@ mod tree_tests {
             let summary_id = Uuid::new_v4();
             session.set_run_id(Some(run_id));
             session
+                .append(Event::User {
+                    content: "old context".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
                 .append(Event::SourceEntry {
                     format: "pi-rs:overflow-recovery".into(),
                     entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            session
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":null,"keepTurns":1,"splitTurn":false}),
                 })
                 .unwrap();
             session
@@ -7175,6 +7212,15 @@ mod tree_tests {
                 })
                 .unwrap();
             if !changed_model {
+                assert!(
+                    completed_overflow_summary(
+                        &session,
+                        run_id,
+                        "pi-rs:overflow-recovery",
+                        "fixture"
+                    )
+                    .is_some()
+                );
                 session
                     .append(Event::User {
                         content: "new context".into(),
@@ -7320,6 +7366,12 @@ mod tree_tests {
             })
             .unwrap();
         session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":5,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        session
             .append(Event::ModelRequested {
                 model: "fixture".into(),
                 messages: 1,
@@ -7386,7 +7438,7 @@ mod tree_tests {
             "only the retried turn may call the model"
         );
         assert!(session.records().iter().any(
-            |r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")
+            |r| matches!(&r.event, Event::Compacted { summary, retain_from: Some(5), .. } if summary == "saved summary")
         ));
     }
 
@@ -7442,6 +7494,12 @@ mod tree_tests {
                     .append(Event::SourceEntry {
                         format: "pi-rs:silent-overflow".into(),
                         entry: serde_json::json!({"requestId":turn_id}),
+                    })
+                    .unwrap();
+                session
+                    .append(Event::SourceEntry {
+                        format: "pi-rs:overflow-retention-v1".into(),
+                        entry: serde_json::json!({"boundary":5,"keepTurns":1,"splitTurn":false}),
                     })
                     .unwrap();
             }
