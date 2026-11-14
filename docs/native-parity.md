@@ -175,10 +175,12 @@ Live acceptance with an Ant Ling account remains open.
 
 ### Vercel AI Gateway checkpoint
 
-Vercel AI Gateway exposes the 303 chat models from the pinned Pi v1.5.0
-catalog through its Messages endpoint and `AI_GATEWAY_API_KEY`. Model-specific
-reasoning and empty-signature compatibility are retained. Classifier models
-and live acceptance with a Vercel account remain open.
+Vercel AI Gateway exposes the 303 chat models and 14 classifier models from the
+pinned Pi v1.5.0 catalog using `AI_GATEWAY_API_KEY`. Classifiers use the gateway's
+System One endpoint, and Codemode supports discovery and classification with
+the same endpoint-scoped credential rules as other providers. Model-specific
+reasoning and empty-signature compatibility are retained. Live acceptance with
+a Vercel account remains open.
 
 ### Kimi Code API key checkpoint
 

@@ -305,6 +305,26 @@ impl Catalogue {
         let mut seen = BTreeSet::new();
         for (name, provider) in &combined {
             let name = name.to_ascii_lowercase();
+            // Preserve the prior model-only custom endpoint binding before the
+            // built-in catalog is merged; ambiguous declarations bind nothing.
+            let configured_binding =
+                if name == "vercel-ai-gateway" && provider["baseUrl"].as_str().is_none() {
+                    providers
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                        .and_then(|(_, configured)| {
+                            configured["models"]
+                                .as_array()
+                                .filter(|models| {
+                                    models
+                                        .iter()
+                                        .any(|model| model["baseUrl"].as_str().is_some())
+                                })
+                                .map(|_| unambiguous_model_base(configured))
+                        })
+                } else {
+                    None
+                };
             let inferred_base =
                 if provider["baseUrl"].as_str().is_none() && official_base(&name).is_none() {
                     unambiguous_model_base(provider)
@@ -372,10 +392,14 @@ impl Catalogue {
                         Error::Config(format!("operation provider {name} requires baseUrl"))
                     })?;
                 let (base, endpoint) = endpoints(base, api.route())?;
-                let key_endpoint = provider["baseUrl"]
-                    .as_str()
-                    .or_else(|| official_base(&name))
-                    .or(inferred_base.as_deref())
+                let key_base = match &configured_binding {
+                    Some(binding) => binding.as_deref(),
+                    None => provider["baseUrl"]
+                        .as_str()
+                        .or_else(|| official_base(&name))
+                        .or(inferred_base.as_deref()),
+                };
+                let key_endpoint = key_base
                     .map(|base| endpoints(base, api.route()))
                     .transpose()?
                     .map(|(_, endpoint)| endpoint);
@@ -494,6 +518,7 @@ pub(super) fn official_base(provider: &str) -> Option<&'static str> {
     match provider {
         "typesafe" => Some("https://api.typesafe.ai/v1"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "vercel-ai-gateway" => Some("https://ai-gateway.vercel.sh/typesafe/v1"),
         _ => None,
     }
 }
@@ -593,6 +618,7 @@ impl Entry {
             let key = match (self.provider.as_str(), official) {
                 ("typesafe", true) => "TYPESAFE_API_KEY",
                 ("openrouter", true) => "OPENROUTER_API_KEY",
+                ("vercel-ai-gateway", true) => "AI_GATEWAY_API_KEY",
                 _ => return None,
             };
             env(key)
@@ -1005,6 +1031,235 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vercel_builtin_classifier_catalogue_is_endpoint_bound() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let models: Vec<_> = catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "vercel-ai-gateway")
+            .collect();
+        assert_eq!(models.len(), 14);
+        let ids: BTreeSet<_> = models.iter().map(|entry| entry.model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "baseten/elephant-1",
+                "baseten/joey-1",
+                "baseten/mammoth-1",
+                "convaiinnovations/laya",
+                "liquid/d1",
+                "liquid/d1-ultra",
+                "microsoft/microsoft-decision-1",
+                "openai/gpt-6-luna-decisions",
+                "perplexity/pplx-decider-flash-v1.2",
+                "perplexity/pplx-decider-v1.2",
+                "scaledown/scaledown-classify-1",
+                "typesafe-ai/jev",
+                "typesafe-ai/jev-1.13.0",
+                "typesafe-ai/jev-1.14.0",
+            ])
+        );
+        let entry = models
+            .iter()
+            .find(|entry| entry.model.id == "typesafe-ai/jev")
+            .unwrap();
+        assert_eq!(
+            entry.endpoint.as_str(),
+            "https://ai-gateway.vercel.sh/typesafe/v1/systemone"
+        );
+        assert_eq!(entry.descriptor()["type"], "classifier");
+        assert!(models.iter().all(|entry| {
+            entry
+                .model
+                .input
+                .as_ref()
+                .is_some_and(|input| input == &["text"])
+        }));
+        let empty = Keys::parse(&json!({}));
+        let ambient = |name: &str| (name == "AI_GATEWAY_API_KEY").then(|| "ambient-key".to_owned());
+        assert_eq!(
+            entry
+                .credential_with_env(&empty, ambient)
+                .unwrap()
+                .literal(),
+            Some("ambient-key")
+        );
+        let saved =
+            Keys::parse(&json!({"vercel-ai-gateway":{"type":"api_key","key":"stored-key"}}));
+        assert_eq!(
+            entry
+                .credential_with_env(&saved, ambient)
+                .unwrap()
+                .literal(),
+            Some("stored-key")
+        );
+        let scoped = Keys::parse(
+            &json!({"vercel-ai-gateway":{"type":"api_key","key":"other-key","endpoint":"https://example.org/v1"}}),
+        );
+        assert_eq!(
+            entry
+                .credential_with_env(&scoped, ambient)
+                .unwrap()
+                .literal(),
+            Some("ambient-key")
+        );
+        let mut custom = (*entry).clone();
+        custom.endpoint = Url::parse("https://example.org/v1/systemone").unwrap();
+        assert!(custom.credential_with_env(&saved, ambient).is_none());
+    }
+
+    #[tokio::test]
+    async fn vercel_saved_key_enables_all_classifiers_without_network() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let keys = Keys::parse(
+            &json!({"vercel-ai-gateway":{"type":"api_key","key":"stored-key","endpoint":"https://ai-gateway.vercel.sh/v1/messages","literal":true}}),
+        );
+        let available = catalogue
+            .list(
+                Kind::Classifier,
+                Some("vercel-ai-gateway"),
+                None,
+                true,
+                &keys,
+            )
+            .await;
+        assert_eq!(available.len(), 14);
+        assert!(available.iter().all(|entry| entry["type"] == "classifier"));
+    }
+
+    #[test]
+    fn vercel_model_only_endpoint_keeps_custom_binding_without_leaking_to_builtins() {
+        let config = json!({"vercel-ai-gateway":{"apiKey":"custom-key", "headers":{"x-secret":"value"}, "models":[
+            {"type":"classifier","id":"custom","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1234/v1"}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let custom = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "vercel-ai-gateway" && entry.model.id == "custom")
+            .unwrap();
+        let builtin = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "vercel-ai-gateway" && entry.model.id == "typesafe-ai/jev"
+            })
+            .unwrap();
+        assert_eq!(custom.api_key.as_deref(), Some("custom-key"));
+        assert_eq!(
+            custom.model.headers.get("x-secret").map(String::as_str),
+            Some("value")
+        );
+        assert!(builtin.api_key.is_none());
+        assert!(!builtin.model.headers.contains_key("x-secret"));
+        let mut ambiguous = config;
+        ambiguous["vercel-ai-gateway"]["models"].as_array_mut().unwrap().push(json!({"type":"classifier","id":"other","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1235/v1"}));
+        let catalogue = Catalogue::parse(ambiguous.as_object().unwrap()).unwrap();
+        assert!(
+            catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "vercel-ai-gateway")
+                .all(|entry| entry.api_key.is_none()
+                    && !entry.model.headers.contains_key("x-secret"))
+        );
+    }
+
+    #[tokio::test]
+    async fn vercel_classifier_uses_system_one_on_configured_endpoint() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/typesafe/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut bytes = [0; 2048];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut bytes = [0; 2048];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            let body = r#"{"answers":{"ok":{"type":"noul","noul":0.8}}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let config = json!({"vercel-ai-gateway":{"baseUrl":base,"apiKey":"fixture-key"}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "vercel-ai-gateway" && entry.model.id == "typesafe-ai/jev"
+            })
+            .unwrap();
+        let keys = Keys::parse(&json!({}));
+        assert_eq!(
+            catalogue
+                .list(
+                    Kind::Classifier,
+                    Some("vercel-ai-gateway"),
+                    Some("typesafe-ai/jev"),
+                    true,
+                    &keys
+                )
+                .await
+                .len(),
+            1
+        );
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = json!({"state":{"text":"fixture"},"questions":{"ok":{"type":"bool","instructions":"classify","criteria":{"true":"yes","false":"no"}}}});
+        let mut result = json!({});
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            operation.perform(entry, &context, &keys, &mut result),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&request[..end])
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(headers.starts_with("post /typesafe/v1/systemone "));
+        assert!(headers.contains("authorization: bearer fixture-key"));
+        let body: Value = serde_json::from_slice(&request[end..]).unwrap();
+        assert_eq!(body["model"], "typesafe-ai/jev");
+        assert_eq!(body["questions"]["ok"]["type"], "noul");
+        assert_eq!(result["answers"]["ok"]["probability"], 0.8);
+    }
 
     #[tokio::test]
     async fn resolve_uses_catalogue_without_provider_request() {
