@@ -1923,10 +1923,11 @@ async fn execute(
     if matches!(command, Command::Interactive) {
         return interactive::run(args, follow_up_prompts, ready).await;
     }
-    if let Some(parent) = args
-        .session
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
+    if !matches!(&command, Command::Share)
+        && let Some(parent) = args
+            .session
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
