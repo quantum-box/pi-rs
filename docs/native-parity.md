@@ -156,8 +156,11 @@ result are rejected. Later legacy hook changes can retain more history, but
 cannot move an extension-provided boundary forward. Native summary size and
 timeout limits still apply. Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
-summary request, the host requires reconciliation rather than repeating it.
-Full Pi preparation payload and all provider overflow classifications remain gaps.
+summary request, native does not repeat the ambiguous operation. Retry-required
+recovery reports that reconciliation is needed; for a completed silent-overflow
+answer, native preserves the answer and skips the ambiguous compaction. An
+automatic reconciliation workflow, full Pi preparation payload and all
+provider overflow classifications remain gaps.
 
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed
