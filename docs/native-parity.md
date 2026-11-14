@@ -2096,9 +2096,10 @@ materialized. A streaming preflight measures each argument's compact JSON size
 against the existing 1 MiB limit. Oversized calls are skipped individually;
 other calls remain ordered and participate in the shared nested-call budget.
 Shell-progress and SDK host wrappers forward prevalidated positions; the
-duplex host proxy negotiates the same support across executable boundaries.
-An older peer that lacks this negotiation rejects a batch containing an
-oversized call rather than bypassing its call budget.
+duplex host proxy advertises this support only when its underlying host opts in
+to charging every position against its ordered call budget. A peer or custom
+host without that capability rejects a batch containing an oversized call
+rather than bypassing its call budget.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count

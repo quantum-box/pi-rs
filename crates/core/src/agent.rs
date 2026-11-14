@@ -4225,6 +4225,9 @@ enum TurnProgress {
 }
 #[async_trait::async_trait]
 impl ToolHost for NestedHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        true
+    }
     fn supports_progress(&self) -> bool {
         self.progress.is_some()
     }
@@ -5704,6 +5707,7 @@ mod nested_host_tests {
             depth: 0,
             call_count: Arc::new(AtomicUsize::new(4094)),
         };
+        assert!(host.supports_prevalidated_call_accounting());
         let calls = vec![
             ("large".into(), None),
             ("valid".into(), Some(serde_json::json!({}))),

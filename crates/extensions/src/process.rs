@@ -1946,6 +1946,9 @@ struct ShellProgressHost {
 }
 #[async_trait::async_trait]
 impl ToolHost for ShellProgressHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.inner.supports_prevalidated_call_accounting()
+    }
     fn tools(&self) -> Vec<ToolSpec> {
         self.inner.tools()
     }
@@ -2420,7 +2423,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 has_progress: host.supports_progress(),
                 has_custom_messages: host.supports_custom_messages(),
                 has_keyed_messages: host.supports_keyed_messages(),
-                has_prevalidated_calls: true,
+                has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -2461,13 +2464,24 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 if calls.len() > 4096 {
                     return Err("native extension batch exceeds execution limit".into());
                 }
-                let results = runtime.block_on(async {
+                let results = if !host.supports_prevalidated_call_accounting()
+                    && calls.iter().any(|(_, value)| value.is_none())
+                {
+                    calls
+                        .into_iter()
+                        .map(|_| {
+                            Outcome::Skipped("host cannot account for prevalidated calls".into())
+                        })
+                        .collect()
+                } else {
+                    runtime.block_on(async {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Err("native extension cancelled during host call".to_owned()),
                         results = host.call_batch_prevalidated(calls) => Ok(results),
                     }
-                })?;
+                })?
+                };
                 let results: Vec<_> = results
                     .into_iter()
                     .map(|result| endpoint.project_outcome(&result))
@@ -2552,6 +2566,9 @@ fn wire_prevalidated_calls(
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.has_prevalidated_calls
+    }
     fn supports_progress(&self) -> bool {
         self.has_progress
     }
@@ -5645,7 +5662,7 @@ else:
 
     #[tokio::test]
     async fn old_duplex_peer_fails_mixed_prevalidated_batch_closed() {
-        let host = RemoteHost {
+        let mut host = RemoteHost {
             tools: vec![],
             has_ui: false,
             has_progress: false,
@@ -5657,6 +5674,10 @@ else:
                 std::io::stdout(),
             ))),
         };
+        assert!(!host.supports_prevalidated_call_accounting());
+        host.has_prevalidated_calls = true;
+        assert!(host.supports_prevalidated_call_accounting());
+        host.has_prevalidated_calls = false;
         let results = host
             .call_batch_prevalidated(vec![
                 ("large".into(), None),
@@ -5679,9 +5700,26 @@ else:
             fn tools(&self) -> Vec<ToolSpec> {
                 vec![]
             }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
+            }
             async fn call(&self, name: &str, _: Value) -> Outcome {
                 self.0.lock().unwrap().push(name.into());
                 Outcome::Succeeded(name.into())
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<Value>)>,
+            ) -> Vec<Outcome> {
+                let mut outputs = Vec::new();
+                for (name, value) in calls {
+                    outputs.push(if let Some(value) = value {
+                        self.call(&name, value).await
+                    } else {
+                        Outcome::Skipped("nested tool arguments exceed size limit".into())
+                    });
+                }
+                outputs
             }
         }
         let root = tempfile::tempdir().unwrap();
@@ -5693,7 +5731,7 @@ if '--pi-rs-extension-v1' in sys.argv:
     d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}], 'host_calls':True, 'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
-    json.loads(sys.stdin.readline())
+    assert json.loads(sys.stdin.readline())['has_prevalidated_calls'] is True
     print(json.dumps({'type':'call','calls':[['first',{}],['too_large',[{}]*400000],['last',{}]]},separators=(',',':')),flush=True)
     values=json.loads(sys.stdin.readline())
     assert [v['status'] for v in values] == ['succeeded','skipped','succeeded']
@@ -5718,6 +5756,66 @@ else:
         assert_eq!(*host.0.lock().unwrap(), vec!["first", "last"]);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_default_custom_host_does_not_advertise_or_bypass_accounting() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DefaultHost(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for DefaultHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded(name.into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}],'host_calls':True,'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    assert json.loads(sys.stdin.readline())['has_prevalidated_calls'] is False
+    print(json.dumps({'type':'call','calls':[['valid',{}]]}),flush=True)
+    assert json.loads(sys.stdin.readline())[0]['detail']=='valid'
+    print(json.dumps({'type':'call','calls':[['large',[{}]*400000],['not-dispatched',{}]]},separators=(',',':')),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert len(values)==2 and all(v['status']=='skipped' and v['detail']=='host cannot account for prevalidated calls' for v in values)
+    print(json.dumps({'type':'call','calls':[['large',None],['not-dispatched',{}]],'rejected':[0]}),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert len(values)==2 and all(v['status']=='skipped' and v['detail']=='host cannot account for prevalidated calls' for v in values)
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let host = Arc::new(DefaultHost(AtomicUsize::new(0)));
+        assert!(!host.supports_prevalidated_call_accounting());
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let wrapper = Arc::new(ShellProgressHost {
+            inner: host.clone(),
+            output,
+        });
+        assert!(!wrapper.supports_prevalidated_call_accounting());
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let outcome = tool
+            .invoke_transaction(serde_json::json!({}), context, None, wrapper)
+            .await
+            .outcome;
+        assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn shell_progress_wrapper_forwards_prevalidated_calls_and_budget() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5729,6 +5827,9 @@ else:
         impl ToolHost for Budgeted {
             fn tools(&self) -> Vec<ToolSpec> {
                 vec![]
+            }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
             }
             async fn call(&self, _: &str, _: Value) -> Outcome {
                 panic!("batch must be forwarded")
@@ -5761,6 +5862,7 @@ else:
             inner: inner.clone(),
             output,
         };
+        assert!(wrapper.supports_prevalidated_call_accounting());
         let result = wrapper
             .call_batch_prevalidated(vec![
                 ("large".into(), None),

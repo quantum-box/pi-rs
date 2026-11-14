@@ -219,6 +219,9 @@ struct ScopedIdleHost {
 
 #[async_trait::async_trait]
 impl crate::ToolHost for ScopedIdleHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        !self.scope.lifetime.is_cancelled() && self.inner.supports_prevalidated_call_accounting()
+    }
     fn callback_scope_owner(&self) -> Option<Uuid> {
         Some(self.scope.owner.id)
     }
@@ -326,6 +329,9 @@ struct OwnerBoundHost {
 }
 #[async_trait::async_trait]
 impl crate::ToolHost for OwnerBoundHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.inner.supports_prevalidated_call_accounting()
+    }
     fn callback_scope_owner(&self) -> Option<Uuid> {
         Some(self.owner_id)
     }
@@ -3002,6 +3008,9 @@ mod tests {
             fn tools(&self) -> Vec<crate::ToolSpec> {
                 vec![]
             }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
+            }
             async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
                 panic!("batch should be forwarded")
             }
@@ -3022,11 +3031,28 @@ mod tests {
                     .collect()
             }
         }
+        struct DefaultInner;
+        #[async_trait::async_trait]
+        impl ToolHost for DefaultInner {
+            fn tools(&self) -> Vec<crate::ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
+                crate::Outcome::Succeeded("ok".into())
+            }
+        }
+        let default_inner: Arc<dyn ToolHost> = Arc::new(DefaultInner);
+        let default_owner = OwnerBoundHost {
+            inner: default_inner.clone(),
+            owner_id: Uuid::new_v4(),
+        };
+        assert!(!default_owner.supports_prevalidated_call_accounting());
         let inner = Arc::new(Inner(AtomicUsize::new(0)));
         let owner = OwnerBoundHost {
             inner: inner.clone(),
             owner_id: Uuid::new_v4(),
         };
+        assert!(owner.supports_prevalidated_call_accounting());
         let calls = || {
             vec![
                 ("big".into(), None),
@@ -3059,6 +3085,12 @@ mod tests {
             inner: inner.clone(),
             scope,
         };
+        assert!(scoped.supports_prevalidated_call_accounting());
+        let default_scoped = ScopedIdleHost {
+            inner: default_inner,
+            scope: scoped.scope.clone(),
+        };
+        assert!(!default_scoped.supports_prevalidated_call_accounting());
         assert_eq!(
             scoped.call_batch_prevalidated(calls()).await,
             vec![
@@ -3067,6 +3099,7 @@ mod tests {
             ]
         );
         lifetime.cancel();
+        assert!(!scoped.supports_prevalidated_call_accounting());
         assert_eq!(
             scoped.call_batch_prevalidated(calls()).await,
             vec![crate::Outcome::Skipped("idle input callback has finished".into()); 2]

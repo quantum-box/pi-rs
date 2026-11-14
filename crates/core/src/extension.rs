@@ -368,6 +368,12 @@ pub trait ToolHost: Send + Sync {
         )
         .await
     }
+    /// Opt in only if `call_batch_prevalidated` charges every position to the
+    /// same ordered attempt budget as `call_batch`, including rejected ones.
+    #[doc(hidden)]
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        false
+    }
     /// Submit calls whose arguments were size-checked before decoding. `None`
     /// marks an oversized argument and must never be dispatched.
     #[doc(hidden)]
