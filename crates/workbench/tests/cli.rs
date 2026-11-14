@@ -2728,7 +2728,18 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     let state = request(json!({"type":"get_state", "id":"state2"}));
     assert_eq!(state["model"]["input"], json!(["text"]));
     drop(input);
-    let status = child.0.wait().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            panic!("RPC process did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     reader.join().unwrap();
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
