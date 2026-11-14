@@ -662,7 +662,7 @@ impl Scheduler {
             .load(snapshot.task.id())?
             .ok_or(Error::Ownership)?;
         drop(gate);
-        let mut documents = crate::document::TaskDocuments::new(owner.store())?;
+        let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
         let result = handler.run_with_documents(&running.task, &mut documents);
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         // An abort can commit while the synchronous handler is running. Its

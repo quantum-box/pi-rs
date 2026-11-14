@@ -27,6 +27,10 @@ pub enum Error {
     UnreadOrWritten,
     #[error("duplicate task in admission")]
     DuplicateTask,
+    #[error(
+        "application entries require a directly conversation-owned task and a nonempty non-pi. kind"
+    )]
+    InvalidApplicationEntry,
 }
 
 /// An application-defined address. Components are encoded unambiguously;
@@ -353,11 +357,15 @@ pub struct TaskDocuments<'a> {
     revision: u64,
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
+    task: crate::task::Task,
+    entries: Option<(Option<u64>, Vec<crate::application_entry::ApplicationEntry>)>,
 }
 impl<'a> TaskDocuments<'a> {
-    pub(crate) fn new(store: &'a Store) -> Result<Self, Error> {
+    pub(crate) fn new(store: &'a Store, task: &crate::task::Task) -> Result<Self, Error> {
         Ok(Self {
             store,
+            task: task.clone(),
+            entries: None,
             revision: store.document_snapshot()?,
             reads: HashMap::new(),
             writes: HashMap::new(),
@@ -390,6 +398,41 @@ impl<'a> TaskDocuments<'a> {
         self.writes.insert(address.clone(), value);
         Ok(())
     }
+    /// Stage an immutable application record with this task as its author.
+    /// Only directly conversation-owned tasks are supported. The returned ID is
+    /// provisional until the step commits and can change on replay.
+    pub fn append_entry(&mut self, kind: &str, data: Value) -> Result<uuid::Uuid, Error> {
+        let crate::task::TaskOwner::Conversation(conversation) = self.task.owner() else {
+            return Err(Error::InvalidApplicationEntry);
+        };
+        if kind.is_empty() || kind.starts_with("pi.") {
+            return Err(Error::InvalidApplicationEntry);
+        }
+        if self.entries.is_none() {
+            let record = self
+                .store
+                .get(&crate::application_entry::key(*conversation))?;
+            let version = record.as_ref().map(|r| r.version);
+            let entries = record
+                .map(|r| serde_json::from_slice(&r.value))
+                .transpose()?
+                .unwrap_or_default();
+            self.entries = Some((version, entries));
+        }
+        let id = uuid::Uuid::new_v4();
+        self.entries
+            .as_mut()
+            .unwrap()
+            .1
+            .push(crate::application_entry::ApplicationEntry {
+                id,
+                conversation_id: *conversation,
+                author_task_id: self.task.id(),
+                kind: kind.into(),
+                data,
+            });
+        Ok(id)
+    }
     pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
         let mut batch = OwnedBatch {
             checks: Vec::new(),
@@ -410,6 +453,20 @@ impl<'a> TaskDocuments<'a> {
                     None => Mutation::Delete { key },
                 });
             }
+        }
+        if let Some((version, entries)) = self.entries {
+            let crate::task::TaskOwner::Conversation(conversation) = self.task.owner() else {
+                return Err(Error::InvalidApplicationEntry);
+            };
+            let key = crate::application_entry::key(*conversation);
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: version.map_or(Expected::Missing, Expected::Version),
+            });
+            batch.mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(&entries)?,
+            });
         }
         Ok(batch)
     }

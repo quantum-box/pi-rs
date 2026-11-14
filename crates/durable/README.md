@@ -678,3 +678,9 @@ the driver shuts down or fails, and taking the subscription is one-shot. No host
 callback runs from the driver. Unlike upstream `onWake`, these hints do not give
 an active/deadline snapshot or replace the driver's polling and timers, and do
 not cover conversation scheduling. They are not a durable alarm mechanism.
+
+### Task application entries
+
+A directly conversation-owned generic task can call `TaskDocuments::append_entry(kind, data)` in `run_with_documents`. Its ordered application records, successful checkpoint transition, checked document writes and Wait children commit atomically. Read committed records with `application_entry::list(&store, conversation_id)`; records include conversation and author task IDs. The returned entry ID is provisional until commit and may change on retry. Empty kinds and the `pi.` namespace are reserved.
+
+This is an independent, unbounded per-conversation JSON log, rewritten on each append. It is not the conversation runtime transcript or `submit_write` stream and is not included in observations, resets, model context, forks or entry-ID lookup. It provides no ordering across those streams. Nested task authors and staged-entry reads are unsupported. Failed steps and aborts discard staged records; conflicts retry only replay-safe handlers under the existing task transaction policy.

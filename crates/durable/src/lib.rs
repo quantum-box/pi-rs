@@ -3,6 +3,7 @@
 //! State transitions must be committed atomically by the host. This crate is
 //! under development; it does not yet provide a complete agent harness.
 
+pub mod application_entry;
 #[cfg(feature = "coding-tools")]
 pub mod coding_tools;
 pub mod compact;
