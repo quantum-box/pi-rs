@@ -53,7 +53,7 @@ jobs:
           cargo +1.89.0 test --locked -p pi-rs-ollama --example sdk_chat
 
   wasm-diagnostic:
-    name: Browser WASM core diagnostic (non-gating)
+    name: WASM component check and core diagnostic
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -64,6 +64,8 @@ jobs:
         run: |
           rustup toolchain install 1.89.0 --profile minimal
           rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
+      - name: Check portable tool arguments for wasm32-unknown-unknown
+        run: cargo +1.89.0 check --locked -p pi-rs-tool-arguments --target wasm32-unknown-unknown
       # Diagnostic only: neither a passing compile nor this job implies browser support.
       - name: Check core for wasm32-unknown-unknown
         continue-on-error: true

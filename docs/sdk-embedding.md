@@ -80,6 +80,20 @@ See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 
 ## Browser WASM status
 
+The standalone `pi-rs-tool-arguments` crate isolates complete tool-argument
+parsing and incremental JSON previews from the native agent and its filesystem,
+process, network, and randomness dependencies. Rust embeddings can depend on
+this crate directly to build those values without depending on `pi-rs-core`.
+The existing `pi_rs::parse_tool_arguments` export remains available, and
+`pi_rs::StreamingJson` exposes the same preview parser used by the terminal
+and RPC frontends. Preview values are not final tool validation: call
+`parse_tool_arguments` on the complete input before executing a tool.
+
+CI checks this isolated crate with `cargo check --locked -p
+pi-rs-tool-arguments --target wasm32-unknown-unknown`, and its parser tests run
+on native targets. This is a compile check for a library component; it does not
+run the component in a browser or establish browser support for the SDK.
+
 **Browser WASM is not currently supported or tested.** The target name
 `wasm32-unknown-unknown` alone does not imply a browser host. The native core
 has unconditional dependencies on `cap-std` and `tempfile`, uses filesystem
