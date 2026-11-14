@@ -1,11 +1,17 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 #[test]
 fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
     let root = tempfile::tempdir().unwrap();
+    // Files avoid filling a pipe while waiting for the process to exit.
+    let stdout_path = root.path().join("stdout");
+    let stderr_path = root.path().join("stderr");
+    let stdout = std::fs::File::create(&stdout_path).unwrap();
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
         .env("PI_RS_HOME", root.path().join("home"))
@@ -18,8 +24,8 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
             "rpc",
         ])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
@@ -34,13 +40,24 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         .write_all(b"{\"type\":\"get_state\",\"id\":\"last\"}\r")
         .unwrap();
     drop(input);
-    let output = child.wait_with_output().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("RPC process did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(
-        output.status.success(),
+        status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&std::fs::read(stderr_path).unwrap())
     );
-    let responses: Vec<Value> = String::from_utf8(output.stdout)
+    let responses: Vec<Value> = String::from_utf8(std::fs::read(stdout_path).unwrap())
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
