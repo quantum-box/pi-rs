@@ -131,6 +131,27 @@ fn select(h: &mut Harness, hooks: usize) -> uuid::Uuid {
     id
 }
 #[tokio::test]
+async fn historical_fork_preserves_adapter_and_tool_filter() {
+    use pi_rs_durable::observer::Cursor;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h =
+        Harness::open_paused(dir.path().join("db"), options(Arc::new(Regular::default()))).unwrap();
+    install(&mut h, Arc::new(Fake::default()), &[]);
+    let id = select(&mut h, 0);
+    h.select_tools(id, Some(vec![])).unwrap();
+    let cursor = h
+        .history(id, Cursor(0), std::num::NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .next;
+    h.select_tools(id, None).unwrap();
+    h.select_provider_adapter(id, false).unwrap();
+    let child = h.fork_at(id, cursor).unwrap();
+    let state = h.conversation(child).unwrap();
+    assert_eq!(state.provider_adapter.as_deref(), Some("fake/v1"));
+    assert_eq!(state.allowed_tools, Some(vec![]));
+}
+
+#[tokio::test]
 async fn scheduler_preloads_adapter_before_recovery() {
     use pi_rs_durable::{extension::Registry, runtime::Scheduler};
     let dir = tempfile::tempdir().unwrap();
