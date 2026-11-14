@@ -516,8 +516,11 @@ impl NestedHost {
                 Ok(crate::poll::PollResult::Cancelled) => {
                     return self.fail("nested polling cancelled");
                 }
-                Ok(crate::poll::PollResult::Unavailable | crate::poll::PollResult::TimedOut)
-                | Err(_) => {
+                Ok(crate::poll::PollResult::Unavailable | crate::poll::PollResult::TimedOut) => {
+                    return self.fail("nested polling failed; pending reference retained");
+                }
+                Err(payload) => {
+                    crate::extension::discard_panic_payload(payload);
                     return self.fail("nested polling failed; pending reference retained");
                 }
             };
@@ -579,6 +582,12 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
 
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("panic payload drop");
+        }
+    }
     struct Polling {
         invoked: AtomicUsize,
         mode: AtomicUsize,
@@ -609,6 +618,7 @@ mod tests {
             match self.mode.load(Ordering::SeqCst) {
                 0 => std::future::pending().await,
                 1 => None,
+                3 => std::panic::panic_any(PanicOnDrop),
                 _ => Some(Outcome::Succeeded("done".into())),
             }
         }
@@ -668,6 +678,15 @@ mod tests {
         assert!(h.seal_and_inspect().is_err());
         drop(h);
 
+        tool.mode.store(3, Ordering::SeqCst);
+        let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(matches!(
+            h.call_keyed("job-key", "polling", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert!(h.seal_and_inspect().is_err());
+        drop(h);
+
         tool.mode.store(2, Ordering::SeqCst);
         let h = polling_host(&path, root, tool.clone(), CancellationToken::new());
         assert_eq!(
@@ -680,6 +699,46 @@ mod tests {
         assert!(ids.len() >= 5 && ids.iter().all(|id| *id == ids[0]));
     }
 
+    #[tokio::test]
+    async fn timed_out_poll_seals_uncertain_and_reopens_without_redispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let tool = Arc::new(Polling {
+            invoked: AtomicUsize::new(0),
+            mode: AtomicUsize::new(0),
+            ids: Mutex::new(vec![]),
+        });
+        let host = NestedHost::new(
+            Arc::new(OwnedStore::open(&path).unwrap()),
+            root,
+            vec![RegisteredTool {
+                tool: tool.clone(),
+                replay: ReplayPolicy::Unsafe,
+            }],
+            CancellationToken::new(),
+            Duration::from_millis(20),
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.call_keyed("job-key", "polling", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert!(host.seal_and_wait().await.is_err());
+        drop(host);
+        tool.mode.store(2, Ordering::SeqCst);
+        let host = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert_eq!(
+            host.call_keyed("job-key", "polling", json!({})).await,
+            Outcome::Succeeded("done".into())
+        );
+        host.seal_and_inspect().unwrap();
+        assert_eq!(tool.invoked.load(Ordering::SeqCst), 1);
+        let ids = tool.ids.lock().unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| *id == ids[0]));
+    }
     struct Fake {
         calls: Arc<AtomicUsize>,
         pending: bool,

@@ -1140,3 +1140,117 @@ async fn killed_nested_poll_reattaches_to_unsafe_job() {
         std::fs::read_to_string(root.join("poll-id")).unwrap()
     );
 }
+
+struct AbortPolling {
+    started: tokio::sync::Semaphore,
+    stopped: Arc<tokio::sync::Semaphore>,
+    ids: std::sync::Mutex<Vec<uuid::Uuid>>,
+    invoked: AtomicUsize,
+}
+struct PollDrop(Arc<tokio::sync::Semaphore>);
+impl Drop for PollDrop {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
+}
+#[async_trait]
+impl Tool for AbortPolling {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, _: Value, ctx: ToolContext) -> Outcome {
+        self.invoked.fetch_add(1, Ordering::SeqCst);
+        self.ids.lock().unwrap().push(ctx.operation_id);
+        Outcome::Pending {
+            reference: "opaque/\u{0}reference".into(),
+        }
+    }
+    async fn poll(&self, reference: &str, ctx: ToolContext) -> Option<Outcome> {
+        assert_eq!(reference, "opaque/\u{0}reference");
+        self.ids.lock().unwrap().push(ctx.operation_id);
+        let _drop = PollDrop(self.stopped.clone());
+        self.started.add_permits(1);
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen() {
+    use pi_rs_durable::runtime::Scheduler;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let child = Arc::new(AbortPolling {
+        started: tokio::sync::Semaphore::new(0),
+        stopped: Arc::new(tokio::sync::Semaphore::new(0)),
+        ids: std::sync::Mutex::new(vec![]),
+        invoked: AtomicUsize::new(0),
+    });
+    let opts = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: Arc::new(Parent),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, opts()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), child.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(child.stopped.try_acquire().is_ok());
+    assert!(scheduler.blocked(id).unwrap().is_some());
+    scheduler.shutdown().await.unwrap();
+
+    let owner = durable_store::owner::OwnedStore::open(&path).unwrap();
+    let records = owner.store().list(b"nested/").unwrap();
+    assert_eq!(records.len(), 1);
+    let record: Value = serde_json::from_slice(&records[0].1.value).unwrap();
+    assert_eq!(
+        serde_json::from_value::<Outcome>(record["outcome"].clone()).unwrap(),
+        Outcome::Pending {
+            reference: "opaque/\u{0}reference".into(),
+        }
+    );
+    let ids = child.ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(record["operation_id"], ids[0].to_string());
+    drop(ids);
+    drop(owner);
+
+    let scheduler = Scheduler::open(&path, opts()).unwrap();
+    assert!(scheduler.blocked(id).unwrap().is_some());
+    assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+}
