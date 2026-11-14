@@ -146,7 +146,10 @@ threshold, and supported overflow compaction. A supplied summary bypasses the su
 optional details and usage into the journal, and emits the normal lifecycle
 notification; cancellation leaves the branch unchanged. Executable extensions
 negotiate this hook before receiving the new request. Existing post-summary
-compaction hooks continue to run. An extension-provided summary does not consume
+compaction hooks continue to run. The detailed compaction lifecycle callback and
+negotiated executable protocol carry the `overflow` trigger; legacy lifecycle
+callbacks receive `threshold` so their closed Rust enum remains source compatible.
+An extension-provided summary does not consume
 a model request, so threshold compaction can use it even when only the turn's
 final model request remains. A declined optional hook preserves that request and
 does not emit a failed-compaction event. Unlike Pi, the native hook must retain at
