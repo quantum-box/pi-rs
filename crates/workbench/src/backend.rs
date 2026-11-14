@@ -524,12 +524,12 @@ pub fn run(
     Box::pin(run_worker(args, ready))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 fn worker_share_store() -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
     worker_share_store_at(&super::config::agent_dir())
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 fn worker_share_store_at(
     parent: &std::path::Path,
 ) -> Result<Option<pi_rs_workbench::private_share_store::Store>> {
@@ -543,7 +543,7 @@ fn worker_share_store_at(
 }
 
 // Invalidation-only bridge: it does not publish or serve snapshots yet.
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 fn invalidate_existing_share_generation<'a>(
     store: Option<&'a pi_rs_workbench::private_share_store::Store>,
     path: &std::path::Path,
@@ -560,7 +560,7 @@ fn invalidate_existing_share_generation<'a>(
     Ok(Some(store.try_begin(path, binding)?))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 fn optional_share_generation<'a>(
     store: Option<&'a pi_rs_workbench::private_share_store::Store>,
     path: &std::path::Path,
@@ -574,11 +574,12 @@ async fn run_worker(
     mut args: Cli,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    // Cache publishing and lookup are disabled. Storage errors must not stop
-    // the existing worker; enabling a reader requires a durable failure fence.
-    #[cfg(any(unix, windows))]
+    // This invalidation bridge runs only in tests. Synchronous storage I/O
+    // cannot be allowed to stall ordinary worker startup while cache lookup and
+    // a durable failure fence are not yet implemented.
+    #[cfg(all(test, any(unix, windows)))]
     let share_store = worker_share_store().ok().flatten();
-    #[cfg(any(unix, windows))]
+    #[cfg(all(test, any(unix, windows)))]
     let mut share_generation = optional_share_generation(share_store.as_ref(), &args.session);
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
@@ -861,7 +862,7 @@ async fn run_worker(
             if switched {
                 // Try invalidating the target before lifecycle and discovery.
                 // Failure only disables this prototype's generation tracking.
-                #[cfg(any(unix, windows))]
+                #[cfg(all(test, any(unix, windows)))]
                 {
                     let next = optional_share_generation(share_store.as_ref(), &session);
                     share_generation = next;
@@ -1443,7 +1444,7 @@ async fn run_worker(
     )
     .await;
     let result = runtime.close().await;
-    #[cfg(any(unix, windows))]
+    #[cfg(all(test, any(unix, windows)))]
     drop(share_generation);
     result
 }
@@ -2049,6 +2050,35 @@ mod share_context_tests {
         assert!(result.unwrap().is_none());
         assert!(optional_share_generation(None, &directory.path().join("session.jsonl")).is_none());
         assert!(!directory.path().join("share-context-v1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_optional_invalidation_can_leave_previous_snapshot_readable() {
+        use pi_rs_workbench::private_share_store::Store;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = root.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let binding = store.binding_for_session(&session, &()).unwrap();
+        store
+            .begin(&path, binding.clone())
+            .unwrap()
+            .publish(binding.clone(), json!({"old":true}))
+            .unwrap();
+        drop(session);
+        let directory = root.path().join("share-context-v1");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let lease = optional_share_generation(Some(&store), &path);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(lease.is_none());
+        // This reproduces the unresolved failure-fence problem. A production
+        // reader must not be enabled while this old snapshot remains usable.
+        assert_eq!(
+            store.read(&path, &binding).unwrap(),
+            Some(json!({"old":true}))
+        );
     }
 
     #[cfg(any(unix, windows))]
