@@ -265,6 +265,7 @@ fn standalone_share_does_not_upload_after_extension_hook_failure() {
         let path = root.path().join("session.jsonl");
         let prompt = root.path().join("prompt.txt");
         let marker = root.path().join("hook-ran");
+        let events = root.path().join("hook-events");
         let extension = root.path().join("break-resources.py");
         std::fs::write(&prompt, "original prompt").unwrap();
         std::fs::write(&extension, r##"#!/usr/bin/env python3
@@ -272,10 +273,16 @@ import json, os, sys
 r = json.load(sys.stdin)
 if r['type'] == 'describe':
     response = {'Ok': {'id':'break-resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'lifecycle_hook':True,'session_lifecycle_hook':True}}
-elif r['type'] == 'lifecycle' and r['event']['type'] == 'session_start' and os.environ['SHARE_FAIL_START'] == '1':
-    with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
-    response = {'Err': 'fixture start failed'}
+elif r['type'] == 'lifecycle':
+    event = r['event']['type']
+    with open(os.environ['SHARE_EVENTS'], 'a') as f: f.write(event + '\n')
+    if event == 'session_start' and os.environ['SHARE_FAIL_START'] == '1':
+        with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
+        response = {'Err': 'fixture start failed'}
+    else:
+        response = {'Ok': None}
 elif r['type'] == 'discover_resources':
+    with open(os.environ['SHARE_EVENTS'], 'a') as f: f.write('discover_resources\n')
     with open(os.environ['SHARE_MARKER'], 'w') as f: f.write('ran')
     response = {'Err': 'fixture discovery failed'}
 else:
@@ -295,6 +302,7 @@ print(json.dumps({'version':1,'response':response}))
             .env("RADIUS_API_KEY", "fixture")
             .env("PI_RS_RADIUS_SHARE_URL", endpoint)
             .env("SHARE_MARKER", &marker)
+            .env("SHARE_EVENTS", &events)
             .env("SHARE_FAIL_START", if fail_start { "1" } else { "0" })
             .args([
                 "--offline",
@@ -333,6 +341,15 @@ print(json.dumps({'version':1,'response':response}))
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!output.status.success(), "failed reconstruction was shared");
+        let events = std::fs::read_to_string(events).unwrap();
+        assert_eq!(
+            events.lines().collect::<Vec<_>>(),
+            if fail_start {
+                vec!["session_start", "session_shutdown"]
+            } else {
+                vec!["session_start", "discover_resources", "session_shutdown"]
+            },
+        );
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "Radius was contacted"
