@@ -2675,25 +2675,6 @@ impl Harness {
         }
         self.submit_internal_with_options(id, request_id, content, options, &mut change, None)
     }
-    pub(crate) fn submit_internal(
-        &mut self,
-        id: Uuid,
-        request_id: Option<String>,
-        content: String,
-        mode: InputMode,
-    ) -> Result<Uuid, Error> {
-        self.submit_internal_with_options(
-            id,
-            request_id,
-            content,
-            AdmissionOptions {
-                mode,
-                ..Default::default()
-            },
-            &mut |_| Ok(()),
-            None,
-        )
-    }
     pub(crate) fn submit_reporter_input(
         &mut self,
         id: Uuid,

@@ -2915,7 +2915,7 @@ fn reporter_generation_fences_prepared_admission_and_survives_reopen() {
         .is_err()
     );
     drop(h);
-    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let h = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(
         generation_check(h.owner.store(), parent).unwrap().0,
         generation + 1
