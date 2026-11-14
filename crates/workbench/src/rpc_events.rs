@@ -24,6 +24,7 @@ pub(super) struct Stream {
     metadata: ModelMetadata,
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
+    result_metadata: HashMap<Uuid, Value>,
     pending_tools: HashMap<u64, PendingTool>,
     aborted: bool,
     summary: bool,
@@ -51,6 +52,13 @@ impl Stream {
     pub fn observe(&mut self, event: &Value, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event["type"].as_str() {
+            Some("internal_tool_result_metadata") => {
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok())
+                    && let Some(content) = event.get("structuredContent")
+                {
+                    self.result_metadata.insert(id, content.clone());
+                }
+            }
             Some("summary_request_start") => {
                 self.finish_turn(&mut events);
                 self.summary = true;
@@ -89,7 +97,14 @@ impl Stream {
                 self.finish_turn(&mut events);
                 self.summary = true;
             }
-            Notification::Committed(record) => self.record(record.event.clone(), args, &mut events),
+            Notification::Committed(record) => {
+                if let Event::ToolFinished { operation_id, .. } = &record.event
+                    && let Some(content) = pi_rs::tool_result_event_metadata(*operation_id)
+                {
+                    self.result_metadata.insert(*operation_id, content);
+                }
+                self.record(record.event.clone(), args, &mut events)
+            }
             Notification::Text(delta) if !self.assistant.is_null() => {
                 self.delta("text", delta, &mut events);
             }
@@ -309,11 +324,15 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_event_result_value(
+                    let mut result = tool_event_result_value(
                         &outcome.tool_content(),
                         Some(&outcome),
                         Some(outcome.is_structured()),
                     );
+                    let sidecar = self.result_metadata.remove(&operation_id);
+                    if let Some(content) = &sidecar {
+                        result["structuredContent"] = content.clone();
+                    }
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
@@ -324,7 +343,9 @@ impl Stream {
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
-                        if matches!(outcome, Outcome::TextResultWithStructuredContent { .. }) {
+                        if sidecar.is_some()
+                            || matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
+                        {
                             message
                                 .as_object_mut()
                                 .expect("result object")
@@ -662,6 +683,53 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn structured_read_metadata_is_correlated_and_not_added_to_messages() {
+        let operation_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "read-call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let metadata = json!("page\n\n[1 more line]");
+        stream.result_metadata.insert(other_id, json!("other"));
+        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata}), &args).is_empty());
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded(metadata.as_str().unwrap().into()),
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["structuredContent"], metadata);
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert!(message["message"].get("structuredContent").is_none());
+        assert_eq!(stream.result_metadata.get(&other_id), Some(&json!("other")));
+        assert!(!stream.result_metadata.contains_key(&operation_id));
+    }
 
     #[test]
     fn multimodal_tool_events_preserve_order_and_native_metadata() {

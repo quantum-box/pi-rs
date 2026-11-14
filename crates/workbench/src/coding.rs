@@ -780,6 +780,15 @@ struct CancellableReader<R> {
     inner: R,
     cancellation: pi_rs::CancellationToken,
 }
+fn read_event_content(outcome: &Outcome) -> Option<Value> {
+    match outcome {
+        Outcome::Succeeded(output)
+        | Outcome::SucceededWithDetails { output, .. }
+        | Outcome::TextResult { output, .. } => Some(json!(output)),
+        _ => None,
+    }
+}
+
 impl<R> CancellableReader<R> {
     fn check(&self) -> std::io::Result<()> {
         if self.cancellation.is_cancelled() {
@@ -807,6 +816,9 @@ impl<R: Seek> Seek for CancellableReader<R> {
 impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
+    }
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        read_event_content(outcome)
     }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
@@ -2009,6 +2021,13 @@ impl Tool for CodingTool {
         }
     }
 
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        if matches!(self.kind, Kind::Read { .. }) {
+            read_event_content(outcome)
+        } else {
+            None
+        }
+    }
     fn execution(&self) -> ToolExecution {
         match self.kind {
             Kind::Read { .. } | Kind::Grep | Kind::Find | Kind::List => ToolExecution::ParallelRead,

@@ -247,8 +247,8 @@ form, including multiple keys and explicitly unbound actions.
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
 frontends. The standalone crate is compile-checked for
-`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
-on that target. Preview behavior retains the existing native parser's documented
+`wasm32-unknown-unknown`; the experimental browser SDK supports the text-only
+sessions described above. Preview behavior retains the existing native parser's documented
 differences from Pi's streaming parser.
 
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
@@ -687,6 +687,22 @@ Lock acquisition also observes cancellation while another writer is active.
 RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
+
+For text reads, Pi exposes the displayed page as both text content and a
+`structuredContent` string. Native agent tool-result events receive this string
+through operation-correlated transient metadata, including continuation and
+truncation notices. The journal, SDK observers, result hooks, direct calls and
+programmatic calls retain their existing `Outcome` variants, and the public
+`Notification` variants are unchanged. In-process partial patches preserve
+the structured value when they only update metadata, and discard it when they
+explicitly replace output, including with the same text. Custom host hooks may
+opt in to reporting output-field presence; native executable extensions negotiate
+that capability and forward the field-presence result across the process boundary.
+A duplex host remains available for nested calls even if it cannot send custom
+messages. Single-shot and duplex presence responses allow only the fixed wrapper
+overhead; the underlying outcome and nonterminal frames still obey their original
+limits. Older executables
+and opaque overrides remain conservative when field presence is unavailable. Image read structured output remains a separate parity gap.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even

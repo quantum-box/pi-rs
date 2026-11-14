@@ -2321,7 +2321,15 @@ impl Agent<'_> {
                     message,
                 });
             }
-            self.finish_tool(session, &invocation, reply, states, observer, replies)?;
+            self.finish_tool(
+                session,
+                &invocation,
+                reply,
+                states,
+                observer,
+                replies,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -2348,6 +2356,7 @@ impl Agent<'_> {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_tool(
         &self,
         session: &mut Session,
@@ -2356,6 +2365,7 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
         replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+        allow_event_metadata: bool,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -2435,6 +2445,17 @@ impl Agent<'_> {
             outcome => outcome,
         };
         let operation_id = invocation.operation_id;
+        let event_metadata = if allow_event_metadata {
+            self.registry
+                .tools
+                .get(&invocation.call.name)
+                .and_then(|registered| registered.tool.event_structured_content(&outcome))
+                .filter(|value| {
+                    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max_output_bytes)
+                })
+        } else {
+            None
+        };
         let waiting = match &outcome {
             Outcome::Unknown(_) => Some(Error::Reconciliation(operation_id)),
             Outcome::Pending { .. } => Some(Error::PendingOperation(operation_id)),
@@ -2442,16 +2463,18 @@ impl Agent<'_> {
         };
         let changes = self.tool_state_changes(&invocation.call.name, &outcome, states, update);
         let persisted = changes.as_ref().cloned().unwrap_or_default();
-        commit_with_reply(
-            session,
-            Event::ToolFinished {
-                operation_id,
-                outcome,
-                states: persisted,
-            },
-            observer,
-            replies,
-        )?;
+        with_tool_result_event_metadata(operation_id, event_metadata, || {
+            commit_with_reply(
+                session,
+                Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    states: persisted,
+                },
+                observer,
+                replies,
+            )
+        })?;
         if let Some(error) = waiting {
             return Err(error);
         }
@@ -4587,6 +4610,78 @@ fn branch_excerpt(entry: Message) -> String {
         Message::Tool {
             call_id, content, ..
         } => format!("Tool {call_id}: {content}"),
+    }
+}
+
+thread_local! {
+    static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Returns transient result metadata only while the matching committed-record
+/// observer is being called on the current thread. Never persists the value.
+#[doc(hidden)]
+pub fn tool_result_event_metadata(operation_id: Uuid) -> Option<serde_json::Value> {
+    TOOL_EVENT_METADATA.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|(id, _)| *id == operation_id)
+            .and_then(|(_, value)| value.clone())
+    })
+}
+
+fn with_tool_result_event_metadata<T>(
+    id: Uuid,
+    value: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            TOOL_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    TOOL_EVENT_METADATA.with(|stack| stack.borrow_mut().push((id, value)));
+    let _guard = Pop;
+    f()
+}
+
+#[cfg(test)]
+mod metadata_scope_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_scope_is_correlated_nested_and_unwind_safe() {
+        let outer = Uuid::new_v4();
+        let inner = Uuid::new_v4();
+        assert!(tool_result_event_metadata(outer).is_none());
+        with_tool_result_event_metadata(outer, Some(serde_json::json!("outer")), || {
+            assert_eq!(
+                tool_result_event_metadata(outer),
+                Some(serde_json::json!("outer"))
+            );
+            with_tool_result_event_metadata(inner, None, || {
+                assert!(tool_result_event_metadata(outer).is_none());
+                assert!(tool_result_event_metadata(inner).is_none());
+            });
+            let _ = std::panic::catch_unwind(|| {
+                with_tool_result_event_metadata(inner, Some(serde_json::json!("inner")), || {
+                    assert_eq!(
+                        tool_result_event_metadata(inner),
+                        Some(serde_json::json!("inner"))
+                    );
+                    panic!("test unwind");
+                })
+            });
+            assert_eq!(
+                tool_result_event_metadata(outer),
+                Some(serde_json::json!("outer"))
+            );
+            assert!(tool_result_event_metadata(inner).is_none());
+        });
+        assert!(tool_result_event_metadata(outer).is_none());
     }
 }
 
