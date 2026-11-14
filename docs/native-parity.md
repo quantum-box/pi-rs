@@ -4225,7 +4225,8 @@ non-null content. Other specialized message variants remain open.
 ### RPC truncated JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
-initial object property names, unfinished strings with complete escapes, and
+initial object property names, unfinished strings with complete escapes
+(including lone surrogate escapes), and
 missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
 counted as line breaks. Other malformed JSON, including incomplete escapes,
 retains the native parser's diagnostics; full malformed-input parity remains

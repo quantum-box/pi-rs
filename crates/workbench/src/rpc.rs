@@ -790,6 +790,18 @@ mod jsonl_framing_tests {
                 "Unterminated string in JSON at position 4 (line 1 column 5)",
             ),
             (
+                "\"\\uDC00",
+                "Unterminated string in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\uDC00\\uDC00",
+                "Unterminated string in JSON at position 13 (line 1 column 14)",
+            ),
+            (
+                "{\"a\":\"\\uD800hello",
+                "Unterminated string in JSON at position 17 (line 1 column 18)",
+            ),
+            (
                 "[\r\n1",
                 "Expected ',' or ']' after array element in JSON at position 4 (line 2 column 2)",
             ),
@@ -817,6 +829,24 @@ mod jsonl_framing_tests {
             assert_eq!(super::rpc_json_error(input, &error), error.to_string());
         }
     }
+
+    #[test]
+    fn surrogate_errors_do_not_hide_other_syntax_errors() {
+        for input in [
+            "\"\\uDC00\"",
+            "\"\\uDC00\" trailing \"unfinished",
+            "\"\\uDC00\\x",
+            "\"\\uDC00\\u12",
+            "\"\\uDC00\n",
+        ] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+    }
 }
 
 fn parse_request(line: &str) -> Result<Value> {
@@ -835,14 +865,18 @@ fn parse_request(line: &str) -> Result<Value> {
 // Preserve Pi/V8 diagnostics for common incomplete JSONL records. Other
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
-    if !error.is_eof() {
+    let message = error.to_string();
+    let surrogate_eof = (message.starts_with("lone leading surrogate in hex escape")
+        || message.starts_with("unexpected end of hex escape"))
+        && unterminated_surrogate_string(line, error);
+    if !error.is_eof() && !surrogate_eof {
         return error.to_string();
     }
-    let message = error.to_string();
     let tail = line.trim_end_matches([' ', '\t', '\n', '\r']);
     // Only map complete escapes: a dangling backslash or partial Unicode escape
     // has a different V8 diagnostic and is left to serde for now.
-    let reason = if message.starts_with("EOF while parsing a string") && complete_json_escapes(line)
+    let reason = if surrogate_eof
+        || message.starts_with("EOF while parsing a string") && complete_json_escapes(line)
     {
         Some("Unterminated string in JSON")
     } else if message.starts_with("EOF while parsing a list") {
@@ -883,6 +917,63 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+// serde rejects lone surrogate escapes that V8 permits in JSON strings. Only
+// project its diagnostic when that same string is still open and its escape
+// syntax is complete; errors after a closed string must remain unchanged.
+fn unterminated_surrogate_string(line: &str, error: &serde_json::Error) -> bool {
+    let Some(error_line) = error.line().checked_sub(1) else {
+        return false;
+    };
+    let mut lines = line.split_inclusive('\n');
+    let offset: usize = lines.by_ref().take(error_line).map(str::len).sum();
+    let error_offset = offset.saturating_add(error.column());
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut start = None;
+    let mut surrogate = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                if start.is_some() {
+                    start = None;
+                    surrogate = None;
+                } else {
+                    start = Some(index);
+                }
+                index += 1;
+            }
+            b'\\' if start.is_some() => {
+                let Some(&escape) = bytes.get(index + 1) else {
+                    return false;
+                };
+                if escape == b'u' {
+                    let Some(hex) = bytes.get(index + 2..index + 6) else {
+                        return false;
+                    };
+                    if !hex.iter().all(u8::is_ascii_hexdigit) {
+                        return false;
+                    }
+                    let code =
+                        u16::from_str_radix(std::str::from_utf8(hex).unwrap_or_default(), 16)
+                            .unwrap_or_default();
+                    if (0xD800..=0xDFFF).contains(&code) {
+                        surrogate.get_or_insert(index);
+                    }
+                    index += 6;
+                } else if b"\"\\/bfnrt".contains(&escape) {
+                    index += 2;
+                } else {
+                    return false;
+                }
+            }
+            byte if start.is_some() && byte < 0x20 => return false,
+            _ => index += 1,
+        }
+    }
+    start.is_some_and(|start| start < error_offset)
+        && surrogate.is_some_and(|surrogate| surrogate < error_offset)
 }
 
 fn complete_json_escapes(line: &str) -> bool {
