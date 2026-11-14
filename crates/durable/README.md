@@ -349,10 +349,10 @@ Stop is scoped by the bound parent
 and its named reservation, not by a calling task. The host must trust the configured tools and registry. It must also ensure
 the child configuration is suitable for every child; no per-child model,
 agent definition, working directory, history inheritance, or recursion policy is
-provided. Named links are independent, not task-owned background anchors.
+provided. Named links are independent by default. `Harness::anchor_subagent` can explicitly attach a parked, conversation-owned background task and a foreground ownership edge to an existing named child. Attachment is atomic and idempotent across reopen; an ordinary parent abort does not reach the child, while `request_abort_task` on the anchor marks the child for abort. The caller must drive cleanup. The management stop action still aborts only the child's current work and leaves the anchor in place. Automatic attachment, anchor termination and background-inclusive parent abort are not implemented.
 
 This is not the complete upstream background-subagent extension. Named links do
-not form an ownership tree, and named children do not inherit parent management extensions.
+do not automatically form an ownership tree, and named children do not inherit parent management extensions.
 A parent cancellation does not cancel child work. Scheduler shutdown requests
 cooperative cancellation of all local workers and waits for them; it is not a
 durable abort and cannot guarantee termination or rollback of external effects.

@@ -211,6 +211,7 @@ fn reporter_crash_worker() {
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let parent = h.create_conversation(config()).unwrap();
     let child = h.ensure_subagent(parent, "reader", config()).unwrap().child;
+    h.anchor_subagent(parent, "reader").unwrap();
     h.submit(child, None, "bootstrap".into()).unwrap();
     let (link, first) = h
         .submit_subagent_reported(
@@ -497,4 +498,72 @@ async fn dropping_idle_scheduler_releases_reporter_owner() {
     })
     .await
     .unwrap();
+}
+
+#[test]
+fn anchor_process_worker() {
+    let Ok(path) = std::env::var("SUBAGENT_ANCHOR_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h.create_conversation(config()).unwrap();
+    let other = h.create_conversation(config()).unwrap();
+    let (link, _) = h
+        .submit_subagent(
+            parent,
+            "worker",
+            config(),
+            "one",
+            "work".into(),
+            InputMode::FollowUp,
+        )
+        .unwrap();
+    let other_link = h.ensure_subagent(other, "worker", config()).unwrap();
+    let anchor = h.anchor_subagent(parent, "worker").unwrap();
+    assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+    h.request_abort(parent).unwrap();
+    std::fs::write(
+        format!("{path}.anchor-ids"),
+        format!(
+            "{parent} {} {other} {} {anchor}",
+            link.child, other_link.child
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn anchor_survives_process_reopen_and_isolates_parent_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    assert!(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "anchor_process_worker", "--nocapture"])
+            .env("SUBAGENT_ANCHOR_DB", &path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let ids = std::fs::read_to_string(format!("{}.anchor-ids", path.display())).unwrap();
+    let ids: Vec<Uuid> = ids
+        .split_whitespace()
+        .map(|id| id.parse().unwrap())
+        .collect();
+    let (parent, child, other, other_child, anchor) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+    assert!(!h.conversation(child).unwrap().abort_requested);
+    assert_eq!(
+        h.subagent_status(parent, Some("worker")).unwrap()[0].state,
+        ChildState::Working
+    );
+    h.request_abort_task(anchor).unwrap();
+    assert!(h.conversation(child).unwrap().abort_requested);
+    assert!(!h.conversation(other_child).unwrap().abort_requested);
+    assert!(h.anchor_subagent(other, "missing").is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
+    assert!(h.conversation(child).unwrap().abort_requested);
+    assert!(!h.conversation(other_child).unwrap().abort_requested);
 }

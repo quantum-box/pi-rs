@@ -185,10 +185,17 @@ pub(crate) fn owner_chain_checks(
     task: Uuid,
     child: Uuid,
 ) -> Result<Vec<Check>, Error> {
+    owner_chain_from(store, TaskOwner::Task(task), child)
+}
+
+pub(crate) fn owner_chain_from(
+    store: &Store,
+    mut next: TaskOwner,
+    child: Uuid,
+) -> Result<Vec<Check>, Error> {
     let mut checks = Vec::new();
     let mut seen_tasks = HashSet::new();
     let mut seen_conversations = HashSet::new();
-    let mut next = TaskOwner::Task(task);
     loop {
         match next {
             TaskOwner::Task(id) => {

@@ -284,6 +284,128 @@ impl Harness {
         }
         Ok(link)
     }
+    /// Attach a persistent background ownership boundary to an existing named child.
+    /// The task and edge are committed atomically. Retrying returns the same task,
+    /// including after reopening. The anchor stays parked; stopping child work via
+    /// the management tool does not terminate it. A storage error requires reopen.
+    pub fn anchor_subagent(&mut self, parent: Uuid, name: &str) -> Result<Uuid, Error> {
+        use crate::ownership_edge::{self, Edge, Mode};
+        use crate::task::{Checkpoint, Task, TaskOwner, WaitFor};
+        use crate::task_store::{self, TaskStore};
+        let anchor_key = format!("runtime/subagent-anchor/{parent}/{name}").into_bytes();
+        loop {
+            let link = self.subagent(parent, name)?.ok_or(Error::NotFound)?;
+            let store = self.subagent_store()?;
+            if let Some(entry) = store.get(&anchor_key)? {
+                let id: Uuid = serde_json::from_slice(&entry.value)?;
+                let task = TaskStore::new(store)
+                    .load(id)
+                    .map_err(|e| Error::Invalid(format!("anchor task: {e}")))?
+                    .ok_or(Error::NotFound)?;
+                let edge = ownership_edge::EdgeStore::new(store)
+                    .get(link.child)
+                    .map_err(|e| Error::Invalid(format!("anchor edge: {e}")))?
+                    .ok_or(Error::NotFound)?;
+                if task.task.owner() != &TaskOwner::Conversation(parent)
+                    || !task.task.is_background()
+                    || edge.edge
+                        != (Edge {
+                            task: id,
+                            task_owner: TaskOwner::Conversation(parent),
+                            child: link.child,
+                            mode: Mode::Foreground,
+                        })
+                {
+                    return Err(Error::Invalid("invalid subagent anchor".into()));
+                }
+                return Ok(id);
+            }
+            let child_key = format!("runtime/conversation/{}", link.child).into_bytes();
+            let child_entry = store.get(&child_key)?.ok_or(Error::NotFound)?;
+            let child: Conversation = serde_json::from_slice(&child_entry.value)?;
+            if child.id != link.child || child.config != link.config {
+                return Err(Error::Invalid("invalid subagent child".into()));
+            }
+            let reservation_key = key(parent, name);
+            let reservation = store.get(&reservation_key)?.ok_or(Error::NotFound)?;
+            let id = Uuid::new_v4();
+            let owner = TaskOwner::Conversation(parent);
+            let mut task = Task::new(
+                id,
+                owner.clone(),
+                Checkpoint {
+                    phase: "subagent-anchor".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .and_then(Task::background)
+            .map_err(|e| Error::Invalid(format!("anchor task: {e:?}")))?;
+            task.start()
+                .and_then(|()| task.wait(WaitFor::TasksAny(vec![])))
+                .map_err(|e| Error::Invalid(format!("anchor wait: {e:?}")))?;
+            let edge = Edge {
+                task: id,
+                task_owner: owner.clone(),
+                child: link.child,
+                mode: Mode::Foreground,
+            };
+            let edge_key = ownership_edge::edge_key(link.child);
+            let task_key = task_store::key(id);
+            let mut checks = ownership_edge::owner_chain_from(store, owner, link.child)
+                .map_err(|e| Error::Invalid(format!("anchor owner chain: {e}")))?;
+            checks.extend([
+                Check {
+                    key: anchor_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: task_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: edge_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: child_key,
+                    expected: Expected::Version(child_entry.version),
+                },
+                Check {
+                    key: reservation_key,
+                    expected: Expected::Version(reservation.version),
+                },
+            ]);
+            let mutations = [
+                Mutation::Put {
+                    key: anchor_key.clone(),
+                    value: serde_json::to_vec(&id)?,
+                },
+                Mutation::Put {
+                    key: task_key,
+                    value: serde_json::to_vec(&task)?,
+                },
+                Mutation::Put {
+                    key: edge_key,
+                    value: serde_json::to_vec(&edge)?,
+                },
+            ];
+            match store.commit(&checks, &mutations) {
+                Ok(()) => return Ok(id),
+                Err(durable_store::Error::Conflict { .. }) => {
+                    if store.get(&ownership_edge::edge_key(link.child))?.is_some()
+                        && store.get(&anchor_key)?.is_none()
+                    {
+                        return Err(Error::Invalid("subagent already has an owner".into()));
+                    }
+                }
+                Err(e) => {
+                    self.subagent_storage_failed();
+                    return Err(e.into());
+                }
+            }
+        }
+    }
     pub fn submit_subagent(
         &mut self,
         parent: Uuid,

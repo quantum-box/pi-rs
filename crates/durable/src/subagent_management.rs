@@ -564,6 +564,8 @@ mod tests {
         let other = h.create_conversation(config()).unwrap();
         let child = h.ensure_subagent(parent, "worker", config()).unwrap().child;
         let other_child = h.ensure_subagent(other, "worker", config()).unwrap().child;
+        let anchor = h.anchor_subagent(parent, "worker").unwrap();
+        assert_eq!(h.anchor_subagent(parent, "worker").unwrap(), anchor);
         h.submit_with_mode(
             child,
             Some("first".into()),
