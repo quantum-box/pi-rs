@@ -893,6 +893,7 @@ fn has_email_prefix(text: &str, start: usize, lower_bound: usize) -> bool {
 #[cfg(test)]
 thread_local! {
     static BARE_LINK_SEARCHES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static BARE_WEB_MATCH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
@@ -900,10 +901,7 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
         regex::Regex::new(r#"(?:"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*[a-zA-Z0-9])+"#).unwrap()
     });
     static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?:(?i:https?://|ftp://)|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*").unwrap()
-    });
-    static CJK_PUNCT: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"[\p{P}&&[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Hangul}\p{scx=Bopomofo}]]|[，．：；！？（）［］｛｝“”‘’…—]").unwrap()
+        regex::Regex::new(r"(?:(?i:https?://|ftp://)|www\.)(?:[a-zA-Z0-9-]+\.?)+[\S--[<]--[\p{P}&&[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Hangul}\p{scx=Bopomofo}]]--[，．：；！？（）［］｛｝“”‘’…—]]*").unwrap()
     });
     let mut links = Vec::new();
     let mut offset = 0;
@@ -919,6 +917,10 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
                 counts.set((web + 1, mail));
             });
             next_web = Some(URL.find_at(text, offset));
+            #[cfg(test)]
+            if let Some(found) = next_web.flatten() {
+                BARE_WEB_MATCH_BYTES.with(|bytes| bytes.set(bytes.get() + found.len()));
+            }
         }
         if next_mail.is_none_or(|cached: Option<regex::Match<'_>>| {
             cached.is_some_and(|m| m.start() < offset)
@@ -941,9 +943,7 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
             (Some(web), Some(mail)) => {
                 // A complete mailbox can also be a valid www URL. Pi picks
                 // HTTP, but silently choosing either destination is unsafe.
-                let web_end = CJK_PUNCT
-                    .find(web.as_str())
-                    .map_or(web.end(), |p| web.start() + p.start());
+                let web_end = web.end();
                 let trailing = text.get(mail.end()..web_end);
                 let ambiguous = web.as_str().starts_with("www.")
                     && trailing.is_some_and(|tail| {
@@ -973,7 +973,6 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
         };
         let start = found.start();
         let mut end = found.end();
-        let candidate = &text[start..end];
         // Marked can match only the suffix after an omitted local-part
         // character (e.g. o'connor@example.com). Never link a different
         // recipient; leave the whole address as text instead.
@@ -1009,9 +1008,6 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
             continue;
         }
         if !email {
-            if let Some(punctuation) = CJK_PUNCT.find(candidate) {
-                end = start + punctuation.start();
-            }
             // An unmatched opening parenthesis is outside marked's URL token.
             // Stop there before trimming any punctuation immediately before it.
             let mut scan = start;
@@ -2519,6 +2515,22 @@ mod tests {
             );
             let (web, mail) = BARE_LINK_SEARCHES.with(|counts| counts.get());
             assert_eq!(if absent_is_web { web } else { mail }, 1, "{item}");
+        }
+        for separator in ['，', '。', '・', '…', '—'] {
+            let source = vec!["https://a.example/中文"; 512].join(&separator.to_string());
+            BARE_WEB_MATCH_BYTES.with(|bytes| bytes.set(0));
+            let links = bare_links(&source);
+            assert_eq!(links.len(), 512, "{separator}");
+            assert!(
+                links
+                    .iter()
+                    .all(|(_, target)| target.as_deref() == Some("https://a.example/中文"))
+            );
+            assert_eq!(
+                BARE_WEB_MATCH_BYTES.with(|bytes| bytes.get()),
+                512 * "https://a.example/中文".len(),
+                "{separator}"
+            );
         }
     }
 
