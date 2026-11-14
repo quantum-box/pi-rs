@@ -70,16 +70,37 @@ Current limits and differences from upstream Pi Durable:
 The design and planned parity work are in `docs/pi-durable-design.md`. Upstream
 reference: `earendil-works/pi` commit `827383a15262905f82e418483825a49dbb1adbf5`.
 
-`subagent` provides a persistent parent/key link to a separate conversation and
-idempotent admission using a caller-supplied request ID. A reservation is written
-before conversation creation; retry `ensure_subagent` after reopening to finish
-an interrupted creation. Children start empty with explicit configuration, not
-as copies of the parent. Reusing a key with different configuration is rejected.
-The scheduler resumes admitted conversations after restart. A link alone does not
-schedule work. This is a host primitive, not the upstream background-subagent
-extension: there is no automatic answer reporter, child-tool restriction, status
-command, or ownership-aware abort. Parent cancellation does not propagate to a
-child; the runtime has no per-conversation abort API. Implementing upstream
-semantics requires runtime ownership/background boundaries, targeted abort with
-executor fencing, and durable reporter/answer-deduplication transactions. The
-host must supply those integrations and reconcile external effects.
+`subagent` provides a persistent parent/key link to a separate conversation.
+`ensure_subagent_with_history` can seed a child with a settled parent's messages
+and tool state, using the requested child configuration. The seed is saved with
+the reservation before creation, so retry after interruption uses the same
+snapshot even if the parent has changed. Queued or running parents cannot be
+forked. Existing links retain their original configuration and history mode.
+Children do not inherit submissions, active work, or ownership.
+
+`Scheduler::submit_subagent_reported` persists a reporter intent before child
+admission. The background scheduler resumes pending intents after reopening,
+submits the child input idempotently, and admits an answer or failure as a parent
+follow-up. Multiple steering inputs sharing one answer use a persisted answer ID
+and a single reserved parent request ID. Retrying after parent admission but
+before the reporter receipt cannot insert a duplicate report. The prefix
+`__pi_rs_subagent_report/` is reserved for the runtime in all conversations.
+These guarantees assume the database is retained and all writers use this API;
+they do not make model or tool external effects exactly once. Reporter work is
+retried while the scheduler is open; `reporter_error` exposes the most recent
+background error. Storage errors require shutdown and reopening. The explicitly
+driven `Harness` persists intents but does not run the reporter; open a
+`Scheduler` to deliver them. Legacy answers created before answer IDs cannot be
+reported and require reconciliation.
+
+This is not the complete upstream background-subagent extension. There is no
+child-tool restriction, status command, parent ownership tree, or targeted abort.
+A parent cancellation does not cancel child work. Scheduler shutdown requests
+cooperative cancellation of all local workers and waits for them; it is not a
+durable abort and cannot guarantee termination or rollback of external effects.
+Dropping a scheduler stops its reporter poller; reopening resumes unfinished
+intents. Report delivery can be delayed by other work in the same child
+conversation. Reporter receipts and answer IDs are retained and scanned without
+a retention policy.
+Full upstream semantics require ownership/background boundaries, targeted abort
+with executor fencing, and corresponding tool and reporting integration.

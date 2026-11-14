@@ -75,8 +75,9 @@ fn concurrent_duplicate_and_distinct_admissions_retry_cas() {
     let barrier = Arc::new(std::sync::Barrier::new(8));
     let threads: Vec<_> = (0..8)
         .map(|i| {
+            // Worker handles normally merge execution changes; admissions must
+            // still retry the request-ID check on a conflict.
             let mut worker = owner.worker();
-            worker.merge_admissions = false;
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();

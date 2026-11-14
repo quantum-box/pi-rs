@@ -219,6 +219,8 @@ pub struct Conversation {
     #[serde(default)]
     input_modes: HashMap<Uuid, InputMode>,
     #[serde(default)]
+    answer_ids: HashMap<Uuid, Uuid>,
+    #[serde(default)]
     auto_compaction_attempted: bool,
     #[serde(default)]
     retry_state: RetryState,
@@ -228,6 +230,14 @@ pub struct Conversation {
     compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
     phase: Phase,
+}
+
+impl Conversation {
+    /// Identity of the answer settling a submission. Older persisted answers
+    /// predate answer IDs and return None.
+    pub fn answer_id(&self, submission: Uuid) -> Option<Uuid> {
+        self.answer_ids.get(&submission).copied()
+    }
 }
 
 pub struct Harness {
@@ -506,6 +516,7 @@ impl Harness {
             pending_resets: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
+            answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
             retry_state: RetryState::default(),
             overflow_compaction_attempted: false,
@@ -515,6 +526,39 @@ impl Harness {
         };
         self.save(&state, Expected::Missing)?;
         Ok(id)
+    }
+    pub(crate) fn subagent_seed(
+        &self,
+        parent: Uuid,
+        child: Uuid,
+        config: Config,
+    ) -> Result<Conversation, Error> {
+        let (mut state, _) = self.load(parent)?;
+        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            || state.active.is_some()
+            || state
+                .submissions
+                .iter()
+                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+        {
+            return Err(Error::Invalid(
+                "subagent history fork requires a settled parent".into(),
+            ));
+        }
+        state.id = child;
+        state.config = config;
+        state.submissions.clear();
+        state.aborted_generations.clear();
+        state.resets.clear();
+        state.input_modes.clear();
+        state.answer_ids.clear();
+        state.auto_compaction_attempted = false;
+        state.compaction_return_turns = None;
+        state.phase = Phase::Idle;
+        Ok(state)
+    }
+    pub(crate) fn create_subagent_from_seed(&mut self, seed: &Conversation) -> Result<(), Error> {
+        self.save(seed, Expected::Missing)
     }
     /// Fork the current settled conversation. Queued inputs and request IDs
     /// are not inherited. Historical entry-point forking is not yet supported.
@@ -533,6 +577,7 @@ impl Harness {
         state.submissions.clear();
         state.aborted_generations.clear();
         state.input_modes.clear();
+        state.answer_ids.clear();
         state.auto_compaction_attempted = false;
         state.retry_state = RetryState::default();
         state.overflow_compaction_attempted = false;
@@ -569,6 +614,7 @@ impl Harness {
             pending_resets: vec![],
             tool_states: point.tool_states,
             input_modes: HashMap::new(),
+            answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
             retry_state: RetryState::default(),
             overflow_compaction_attempted: false,
@@ -699,6 +745,23 @@ impl Harness {
         content: String,
         mode: InputMode,
     ) -> Result<Uuid, Error> {
+        if request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
+        {
+            return Err(Error::Invalid(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
+        self.submit_internal(id, request_id, content, mode)
+    }
+    pub(crate) fn submit_internal(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        mode: InputMode,
+    ) -> Result<Uuid, Error> {
         if content.trim().is_empty() {
             return Err(Error::Invalid("empty input".into()));
         }
@@ -743,7 +806,13 @@ impl Harness {
             } else if matches!(c.phase, Phase::FailedIdle) {
                 c.phase = Phase::Idle;
             }
-            match self.save(&c, Expected::Version(version)) {
+            // Re-evaluate request-ID uniqueness after every concurrent admission.
+            // Merging by submission UUID could otherwise admit the same key twice.
+            let merge = self.merge_admissions;
+            self.merge_admissions = false;
+            let result = self.save(&c, Expected::Version(version));
+            self.merge_admissions = merge;
+            match result {
                 Ok(()) => return Ok(sid),
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
@@ -1799,8 +1868,11 @@ impl Harness {
 pub struct Scheduler {
     harness: Harness,
     tasks: std::collections::HashMap<Uuid, Vec<tokio::task::JoinHandle<Result<(), Error>>>>,
-    locks: std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>,
+    locks: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
     cancel: CancellationToken,
+    reporter_cancel: CancellationToken,
+    reporter: Option<tokio::task::JoinHandle<()>>,
+    reporter_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Scheduler {
@@ -1814,12 +1886,16 @@ impl Scheduler {
         let mut scheduler = Self {
             harness,
             tasks: HashMap::new(),
-            locks: HashMap::new(),
+            locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancel: CancellationToken::new(),
+            reporter_cancel: CancellationToken::new(),
+            reporter: None,
+            reporter_error: Arc::new(std::sync::Mutex::new(None)),
         };
         for id in ids {
             scheduler.schedule(id);
         }
+        scheduler.start_reporter();
         Ok(scheduler)
     }
     pub fn create_conversation(&mut self, config: Config) -> Result<Uuid, Error> {
@@ -1936,7 +2012,7 @@ impl Scheduler {
     }
     /// Schedule a retry after an execution error or a dropped worker.
     pub fn schedule(&mut self, id: Uuid) {
-        let lock = self.locks.entry(id).or_default().clone();
+        let lock = conversation_lock(&self.locks, id);
         let mut worker = self.harness.worker();
         let cancel = self.cancel.clone();
         let task = tokio::spawn(async move {
@@ -1963,6 +2039,93 @@ impl Scheduler {
         });
         self.tasks.entry(id).or_default().push(task);
     }
+    /// Most recent background reporter failure, if any. Reopen after storage errors.
+    pub fn reporter_error(&self) -> Option<String> {
+        self.reporter_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn start_reporter(&mut self) {
+        let source = self.harness.worker();
+        let locks = self.locks.clone();
+        let cancel = self.reporter_cancel.clone();
+        let errors = self.reporter_error.clone();
+        self.reporter = Some(tokio::spawn(async move {
+            let mut active: HashMap<Vec<u8>, tokio::task::JoinHandle<Result<(), Error>>> =
+                HashMap::new();
+            loop {
+                let done: Vec<_> = active
+                    .iter()
+                    .filter(|(_, task)| task.is_finished())
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in done {
+                    if let Some(task) = active.remove(&key) {
+                        match task.await {
+                            Ok(Ok(())) => (),
+                            Ok(Err(Error::Interrupted)) if cancel.is_cancelled() => (),
+                            Ok(Err(e)) => {
+                                *errors.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(e.to_string())
+                            }
+                            Err(e) => {
+                                *errors.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(e.to_string())
+                            }
+                        }
+                    }
+                }
+                if cancel.is_cancelled() {
+                    break;
+                }
+                match source.pending_reporters() {
+                    Ok(pending) => {
+                        for (key, reporter) in pending {
+                            if active.contains_key(&key) {
+                                continue;
+                            }
+                            let mut worker = source.worker();
+                            let locks = locks.clone();
+                            let cancel = cancel.clone();
+                            let task_key = key.clone();
+                            active.insert(
+                                key,
+                                tokio::spawn(async move {
+                                    let child = worker.reporter_child(&reporter)?;
+                                    let lock = conversation_lock(&locks, child);
+                                    {
+                                        let _guard = lock.lock().await;
+                                        worker.recover_conversation(child)?;
+                                        worker.drive(child, &cancel).await?;
+                                    }
+                                    if let Some(parent) =
+                                        worker.deliver_report(&task_key, &reporter)?
+                                    {
+                                        let lock = conversation_lock(&locks, parent);
+                                        let _guard = lock.lock().await;
+                                        worker.recover_conversation(parent)?;
+                                        worker.drive(parent, &cancel).await?;
+                                    }
+                                    Ok(())
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        *errors.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string())
+                    }
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => (),
+                }
+            }
+            for (_, task) in active {
+                let _ = task.await;
+            }
+        }));
+    }
     /// Wait for the most recently scheduled execution of a conversation.
     pub async fn wait(&mut self, id: Uuid) -> Result<(), Error> {
         if let Some(tasks) = self.tasks.get_mut(&id) {
@@ -1980,6 +2143,12 @@ impl Scheduler {
     /// Stop workers at cancellation points and wait for them before returning.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         self.cancel.cancel();
+        self.reporter_cancel.cancel();
+        if let Some(reporter) = self.reporter.take() {
+            reporter
+                .await
+                .map_err(|e| Error::Invalid(format!("reporter task failed: {e}")))?;
+        }
         let tasks = std::mem::take(&mut self.tasks);
         let mut error = None;
         for task in tasks.into_values().flatten() {
@@ -2033,6 +2202,25 @@ fn start_overflow_compaction(
         finish_failure(c, reason);
     }
     Ok(())
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // The poller is otherwise perpetual and would keep the owner alive.
+        self.reporter_cancel.cancel();
+    }
+}
+
+fn conversation_lock(
+    locks: &std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    id: Uuid,
+) -> Arc<tokio::sync::Mutex<()>> {
+    locks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(id)
+        .or_default()
+        .clone()
 }
 
 fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Error> {
@@ -2111,9 +2299,11 @@ fn append_tool(
     Ok(())
 }
 fn finish_answer(c: &mut Conversation, answer: String) {
+    let answer_id = Uuid::new_v4();
     c.active = None;
     for s in &mut c.submissions {
         if s.status == Status::Running {
+            c.answer_ids.insert(s.id, answer_id);
             s.status = Status::Done {
                 answer: answer.clone(),
             };
@@ -2207,6 +2397,7 @@ mod scheduler_tests {
             pending_resets: vec![],
             tool_states: HashMap::new(),
             input_modes: HashMap::new(),
+            answer_ids: HashMap::new(),
             auto_compaction_attempted: false,
             retry_state: RetryState::default(),
             overflow_compaction_attempted: false,
