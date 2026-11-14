@@ -33,7 +33,7 @@ struct Envelope {
 mod unix {
     use super::{Binding, Envelope, Value};
     use hmac::{Hmac, Mac};
-    use serde::Serialize;
+    use serde::{Serialize, de::DeserializeOwned};
     use sha2::Sha256;
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
@@ -337,6 +337,20 @@ mod unix {
             })
         }
 
+        /// Decode a cached context only when the full journal and supplied
+        /// provenance match. Unknown or malformed context schemas are misses.
+        pub fn read_session<P: Serialize, C: DeserializeOwned>(
+            &self,
+            path: &Path,
+            session: &pi_rs::Session,
+            provenance: &P,
+        ) -> io::Result<Option<C>> {
+            let binding = self.binding_for_session(session, provenance)?;
+            Ok(self
+                .read(path, &binding)?
+                .and_then(|value| serde_json::from_value(value).ok()))
+        }
+
         fn lock(&self, path: &Path, binding: &Binding, create: bool) -> io::Result<File> {
             let name = name_for(&self.key, path, binding.session_id, "lock")?;
             let file = open_at(
@@ -417,6 +431,20 @@ mod unix {
     }
 
     impl Generation<'_> {
+        /// Serialize a clean live context against the final session and
+        /// provenance. The caller must hold the session's exclusive lock and
+        /// prove the runtime has settled through publication.
+        pub fn publish_session<P: Serialize, C: Serialize>(
+            self,
+            session: &pi_rs::Session,
+            provenance: &P,
+            context: &C,
+        ) -> io::Result<()> {
+            let binding = self.store.binding_for_session(session, provenance)?;
+            let context = serde_json::to_value(context)?;
+            self.publish(binding, context)
+        }
+
         /// Publish only after the live runtime has settled and the caller has
         /// independently revalidated the complete binding and journal.
         pub fn publish(self, binding: Binding, context: Value) -> io::Result<()> {
@@ -608,6 +636,55 @@ mod tests {
             .unwrap();
         assert_eq!(binding.journal_digest, changed_binding.journal_digest);
         assert_ne!(binding.provenance_digest, changed_binding.provenance_digest);
+    }
+
+    #[test]
+    fn session_round_trip_rejects_journal_and_runtime_changes() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Context {
+            prompt: String,
+            tools: Vec<String>,
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let path = Path::new("/private/live-session.jsonl");
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let provenance = serde_json::json!({"tools":["read"],"extensionGeneration":1});
+        let start = store.binding_for_session(&session, &provenance).unwrap();
+        let generation = store.begin(path, start).unwrap();
+        session
+            .append_user_with_images("message".into(), vec![], None)
+            .unwrap();
+        let expected = Context {
+            prompt: "live prompt".into(),
+            tools: vec!["read".into()],
+        };
+        generation
+            .publish_session(&session, &provenance, &expected)
+            .unwrap();
+        assert_eq!(
+            store
+                .read_session::<_, Context>(path, &session, &provenance)
+                .unwrap(),
+            Some(expected)
+        );
+        let changed = serde_json::json!({"tools":["read"],"extensionGeneration":2});
+        assert!(
+            store
+                .read_session::<_, Context>(path, &session, &changed)
+                .unwrap()
+                .is_none()
+        );
+        session
+            .append_user_with_images("next".into(), vec![], None)
+            .unwrap();
+        assert!(
+            store
+                .read_session::<_, Context>(path, &session, &provenance)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

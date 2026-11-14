@@ -94,9 +94,9 @@ An isolated storage prototype now exists in `private_share_store`: on Linux and
 macOS it uses an owner-only directory and files, no-follow directory-relative
 operations, generation locks, durable invalidation, atomic publication, exact
 journal/provenance binding checks, keyed filenames and fingerprints,
-authenticated envelopes,
-and read-only legacy misses. macOS extended ACLs are rejected;
-unverified Unix ACL semantics fail closed. Tests include a killed process,
+authenticated envelopes, typed session/context round trips, and read-only
+legacy misses. macOS extended ACLs are rejected; unverified Unix ACL semantics
+fail closed. Tests include a killed process,
 concurrent generations, old format, symlink substitution, and access modes.
 
 The prototype is not connected to live sessions or standalone sharing. The
