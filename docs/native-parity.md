@@ -350,6 +350,8 @@ styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
 delimiters inside bare links are treated as URL text before inline formatting,
 while explicit links and code spans retain their normal interpretation.
+Unlike Pi, an email whose local part contains unsupported punctuation is left
+unlinked instead of linking a suffix that names a different recipient.
 Wrapped link fragments are closed on every rendered line, and control characters
 in destinations cannot enter terminal escape sequences. Fullscreen clicks on
 visible links launch the platform handler without a shell; dragging selects text

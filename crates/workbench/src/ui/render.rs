@@ -887,6 +887,37 @@ fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
         let mut end = found.end();
         let candidate = &text[start..end];
         let email = !candidate.contains("://") && !candidate.starts_with("www.");
+        // Marked can match only the suffix after an omitted local-part
+        // character (e.g. o'connor@example.com). Never link a different
+        // recipient; leave the whole address as text instead.
+        if email
+            && text[..start].chars().next_back().is_some_and(|c| {
+                c.is_alphanumeric()
+                    || unicode_normalization::char::is_combining_mark(c)
+                    || matches!(
+                        c,
+                        '!' | '#'
+                            | '$'
+                            | '%'
+                            | '&'
+                            | '\''
+                            | '*'
+                            | '/'
+                            | '='
+                            | '?'
+                            | '^'
+                            | '`'
+                            | '{'
+                            | '|'
+                            | '}'
+                            | '~'
+                            | '’'
+                    )
+            })
+        {
+            offset = found.end();
+            continue;
+        }
         if !email {
             if let Some(punctuation) = CJK_PUNCT.find(candidate) {
                 end = start + punctuation.start();
@@ -2207,6 +2238,62 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn bare_email_never_links_a_partial_local_part() {
+        let theme = Theme::system();
+        for address in [
+            "o'connor@example.com",
+            "foo!bar@example.com",
+            "foo%bar@example.com",
+            "foo/bar@example.com",
+            "o’connor@example.com",
+            "éconnor@example.com",
+            "e\u{301}connor@example.com",
+        ] {
+            for hyperlinks in [false, true] {
+                let lines = markdown_at_depth(
+                    address,
+                    &theme,
+                    100,
+                    0,
+                    super::super::mermaid::Mermaid::Off,
+                    hyperlinks,
+                    false,
+                );
+                let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+                assert_eq!(
+                    spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                    address
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .all(|span| span.hyperlink.is_none() && !span.underline),
+                    "{address}: {spans:?}"
+                );
+            }
+        }
+        let lines = markdown_at_depth(
+            "**first.last+tag@example.com**",
+            &theme,
+            100,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+            false,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.bold
+                    && span.hyperlink.as_deref() == Some("mailto:first.last+tag@example.com"))
+        );
     }
 
     #[test]
