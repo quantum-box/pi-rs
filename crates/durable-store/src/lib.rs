@@ -156,6 +156,11 @@ impl Store {
     /// Commit containing this put, including puts later overwritten or deleted.
     /// None means the key/version is unknown or predates commit tracking.
     pub fn commit_for_version(&self, key: &[u8], version: u64) -> Result<Option<u64>, Error> {
+        // SQLite versions are signed 64-bit integers; larger values cannot
+        // have been allocated and must not fail parameter conversion.
+        if version > i64::MAX as u64 {
+            return Ok(None);
+        }
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn
             .query_row(

@@ -298,4 +298,177 @@ fn failed_write_rolls_back_sequence_and_version_mapping() {
     conn.execute_batch("DROP TRIGGER reject_second;").unwrap();
     store.commit(&[], &[put(b"a", b"ok")]).unwrap();
     assert_eq!(store.commit_for_version(b"a", 1).unwrap(), Some(1));
+    assert_eq!(store.commit_for_version(b"a", u64::MAX).unwrap(), None);
+}
+
+#[test]
+fn migration_failure_rolls_back_and_retries_with_legacy_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("migration.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_store_meta VALUES(1, 7); CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL) WITHOUT ROWID; INSERT INTO durable_store_entries VALUES(x'61',x'62',7); CREATE TABLE durable_commit_meta (id INTEGER PRIMARY KEY, sequence INTEGER NOT NULL, legacy_version INTEGER NOT NULL); CREATE TRIGGER reject_migration BEFORE INSERT ON durable_commit_meta BEGIN SELECT RAISE(ABORT, 'fail migration'); END;").unwrap();
+    assert!(Store::open(&path).is_err());
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='durable_commit_versions'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+    conn.execute_batch("DROP TRIGGER reject_migration").unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.legacy_version_boundary().unwrap(), 7);
+    assert_eq!(store.commit_sequence().unwrap(), 0);
+    assert_eq!(store.get(b"a").unwrap().unwrap().version, 7);
+}
+
+#[test]
+fn concurrent_opens_migrate_once_and_writers_share_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_store_meta VALUES(1, 7); CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL) WITHOUT ROWID;").unwrap();
+    drop(conn);
+    let barrier = Arc::new(Barrier::new(2));
+    let threads: Vec<_> = (0..2)
+        .map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let store = Store::open(path).unwrap();
+                store.commit(&[], &[put(&[i], b"value")]).unwrap();
+                assert_eq!(store.legacy_version_boundary().unwrap(), 7);
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let store = Store::open(path).unwrap();
+    assert_eq!(store.commit_sequence().unwrap(), 2);
+    let mut sequences: Vec<_> = store
+        .list(b"")
+        .unwrap()
+        .into_iter()
+        .map(|(key, entry)| {
+            store
+                .commit_for_version(&key, entry.version)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    sequences.sort();
+    assert_eq!(sequences, [1, 2]);
+}
+
+#[test]
+fn exhausted_sequence_rejects_mutations_but_not_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exhausted.db");
+    let store = Store::open(&path).unwrap();
+    store.commit(&[], &[put(b"a", b"old")]).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE durable_commit_meta SET sequence=?1", [i64::MAX])
+        .unwrap();
+    store.commit(&[], &[]).unwrap();
+    store
+        .commit(&[check(b"a", Expected::Version(1))], &[])
+        .unwrap();
+    assert!(matches!(
+        store.commit(&[check(b"a", Expected::Missing)], &[]),
+        Err(Error::Conflict { .. })
+    ));
+    assert!(matches!(
+        store.commit(&[], &[Mutation::Delete { key: b"a".into() }]),
+        Err(Error::VersionExhausted)
+    ));
+    assert_eq!(store.get(b"a").unwrap().unwrap().value, b"old");
+    assert_eq!(store.commit_sequence().unwrap(), i64::MAX as u64);
+    assert_eq!(store.commit_for_version(b"a", 1).unwrap(), Some(1));
+}
+
+#[test]
+fn version_exhaustion_rolls_back_sequence_and_earlier_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("versions.db");
+    let store = Store::open(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE durable_store_meta SET version=?1", [i64::MAX - 1])
+        .unwrap();
+    assert!(matches!(
+        store.commit(&[], &[put(b"a", b"one"), put(b"b", b"two")]),
+        Err(Error::VersionExhausted)
+    ));
+    assert_eq!(store.commit_sequence().unwrap(), 0);
+    assert!(store.get(b"a").unwrap().is_none());
+    assert_eq!(
+        store.commit_for_version(b"a", i64::MAX as u64).unwrap(),
+        None
+    );
+    store.commit(&[], &[put(b"a", b"one")]).unwrap();
+    assert_eq!(
+        store.commit_for_version(b"a", i64::MAX as u64).unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
+fn repeated_mutations_and_missing_deletes_are_one_commit_each() {
+    let store = Store::memory().unwrap();
+    store
+        .commit(
+            &[],
+            &[
+                put(b"a", b"one"),
+                Mutation::Delete { key: b"a".into() },
+                put(b"a", b"two"),
+                Mutation::Delete { key: b"a".into() },
+            ],
+        )
+        .unwrap();
+    assert!(store.get(b"a").unwrap().is_none());
+    assert_eq!(store.commit_for_version(b"a", 1).unwrap(), Some(1));
+    assert_eq!(store.commit_for_version(b"a", 2).unwrap(), Some(1));
+    store
+        .commit(&[], &[Mutation::Delete { key: b"a".into() }])
+        .unwrap();
+    assert_eq!(store.commit_sequence().unwrap(), 2);
+    store.commit(&[], &[put(b"a", b"three")]).unwrap();
+    assert_eq!(store.commit_for_version(b"a", 3).unwrap(), Some(3));
+}
+
+#[test]
+fn sequence_crash_child() {
+    let Ok(path) = std::env::var("DURABLE_SEQUENCE_CRASH_DB") else {
+        return;
+    };
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE; UPDATE durable_commit_meta SET sequence=2; UPDATE durable_store_meta SET version=2; INSERT INTO durable_store_entries VALUES(x'62',x'76',2); INSERT INTO durable_commit_versions VALUES(x'62',2,2);").unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn process_exit_rolls_back_sequence_and_mappings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crash.db");
+    let store = Store::open(&path).unwrap();
+    store.commit(&[], &[put(b"a", b"stable")]).unwrap();
+    drop(store);
+    assert!(std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("sequence_crash_child")
+        .env("DURABLE_SEQUENCE_CRASH_DB", &path)
+        .status()
+        .unwrap()
+        .success());
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.commit_sequence().unwrap(), 1);
+    assert_eq!(store.commit_for_version(b"a", 1).unwrap(), Some(1));
+    assert_eq!(store.commit_for_version(b"b", 2).unwrap(), None);
+    assert!(store.get(b"b").unwrap().is_none());
+    store.commit(&[], &[put(b"b", b"recovered")]).unwrap();
+    assert_eq!(store.commit_for_version(b"b", 2).unwrap(), Some(2));
 }
