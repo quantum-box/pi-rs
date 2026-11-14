@@ -1409,6 +1409,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn radius_share_rejects_missing_live_tag_before_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: ShareContext {
+                system_prompt: "live".into(),
+                tools: vec![],
+            },
+            journal_tag: None,
+        };
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![],
+            idle_timeout: None,
+        };
+        let error = match destination
+            .share(session, root.path(), Some(snapshot), Some([1; 32]))
+            .await
+        {
+            Ok(_) => panic!("untagged live context was shared"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Session changed"));
+    }
+
+    #[tokio::test]
     async fn radius_share_rejects_live_journal_mismatch_before_upload() {
         let root = tempfile::tempdir().unwrap();
         let mut original = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
