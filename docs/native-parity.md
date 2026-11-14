@@ -1323,8 +1323,11 @@ empty directory output and continuation notices.
 
 Single-file `grep` preserves the requested file name in its output when the
 path is a symbolic link, while workspace boundary checks still use the resolved
-target. Focused checks compare the output with Pi v1.5.0 for both linked and
-ordinary files, including context lines.
+target. For explicitly named binary files, NUL bytes are treated as line
+breaks while searching, matching Pi's ripgrep invocation; directory traversal
+continues to skip binary files. Context still comes from the original file, as
+in Pi. Focused checks compare both linked and ordinary files, including context
+lines.
 
 Unrestricted `grep` applies path-containing glob overrides to the absolute
 search paths passed to ripgrep by Pi. Basename globs, negated globs, and
