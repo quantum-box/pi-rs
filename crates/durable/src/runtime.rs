@@ -2086,7 +2086,7 @@ impl Harness {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             };
             if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id) {
-                if base || origin == id || found.is_some() {
+                if origin == id || found.is_some() {
                     return Err(crate::fork::Error::InvalidSnapshot.into());
                 }
                 // Rebind only the cursor's owner; fork_at_position independently

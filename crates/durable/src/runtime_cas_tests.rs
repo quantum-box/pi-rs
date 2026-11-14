@@ -1948,6 +1948,54 @@ fn config_change_does_not_authorize_interior_tool_batch_cut() {
 }
 
 #[test]
+fn inherited_reset_boundary_forks_from_its_origin_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "at-reset".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "before".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let old = h
+        .view_positioned(parent, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    h.reset(parent, Some("handoff".into())).unwrap();
+    let entry = h
+        .view_positioned(parent, std::num::NonZeroUsize::MIN)
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    let child = h.fork(parent).unwrap();
+    let (mut state, version) = h.load(parent).unwrap();
+    state.config.model = "later".into();
+    h.save(&state, Expected::Version(version)).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.fork_by_entry_id(child, old).is_err());
+    let fork = h.fork_by_entry_id(child, entry).unwrap();
+    let result = h.conversation(fork).unwrap();
+    assert_eq!(result.config.model, "at-reset");
+    assert_eq!(result.messages, h.conversation(child).unwrap().messages);
+    assert_eq!(result.resets.len(), 1);
+}
+
+#[test]
 fn inherited_entry_forks_use_visible_origin_commit_and_documents() {
     use crate::document::Address;
     let dir = tempfile::tempdir().unwrap();

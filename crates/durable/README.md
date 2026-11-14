@@ -57,8 +57,9 @@ result, legacy batches without the required proof, and interior replacement
 batches fail closed. The document revision must also be unchanged across the
 commit, even if an unrelated scope caused the change.
 Replacement batches assign fresh occurrence IDs, and an interior fork currently
-materializes a new transcript with fresh IDs. Annotated append occurrences in a
-shared immutable chain may be selected by ID using their origin’s historical cut. See the parity document for remaining limitations.
+materializes a new transcript with fresh IDs. Annotated occurrences in a shared
+immutable chain, including complete replacement boundaries, may be selected by ID
+using their origin’s historical cut. See the parity document for remaining limitations.
 
 The runtime can also fork a settled conversation at its current state or a
 supported historical snapshot cursor, and performs explicit idle compaction. It also
