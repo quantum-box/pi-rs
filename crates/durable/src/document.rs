@@ -742,7 +742,13 @@ impl<'a> TaskDocuments<'a> {
             self.entries = Some((conversation, version, entries, checks, false));
         }
         if expected.is_some_and(|head| {
-            self.entries.as_ref().unwrap().2.last().map(|entry| entry.id) != head
+            self.entries
+                .as_ref()
+                .unwrap()
+                .2
+                .last()
+                .map(|entry| entry.id)
+                != head
         }) {
             return Err(Error::ApplicationEntryHeadMismatch);
         }
@@ -1118,7 +1124,10 @@ mod nested_entry_tests {
                 Err(Error::ApplicationEntryHeadMismatch)
             ));
             decision
-                .put(&address, json!({"decision": true}).as_object().unwrap().clone())
+                .put(
+                    &address,
+                    json!({"decision": true}).as_object().unwrap().clone(),
+                )
                 .unwrap();
             let batch = decision.into_batch().unwrap();
             assert!(matches!(
@@ -1144,7 +1153,9 @@ mod nested_entry_tests {
         let batch = parent_tx.into_batch().unwrap();
         db.commit(&batch.checks, &batch.mutations).unwrap();
         let docs = Documents::new(&db);
-        let batch = docs.fork_scope(parent, child, docs.snapshot().unwrap()).unwrap();
+        let batch = docs
+            .fork_scope(parent, child, docs.snapshot().unwrap())
+            .unwrap();
         db.commit(&batch.checks, &batch.mutations).unwrap();
         let mut parent_tx =
             TaskDocuments::new(&db, &task(1, TaskOwner::Conversation(parent))).unwrap();
@@ -1160,7 +1171,10 @@ mod nested_entry_tests {
             .unwrap();
         let batch = child_tx.into_batch().unwrap();
         db.commit(&batch.checks, &batch.mutations).unwrap();
-        assert_eq!(crate::application_entry::list(&db, parent).unwrap().len(), 2);
+        assert_eq!(
+            crate::application_entry::list(&db, parent).unwrap().len(),
+            2
+        );
         assert_eq!(crate::application_entry::list(&db, child).unwrap().len(), 2);
     }
 
@@ -1174,9 +1188,13 @@ mod nested_entry_tests {
             tx.append_entry_if_head(Some(Uuid::from_u128(99)), "app.x", json!(0)),
             Err(Error::ApplicationEntryHeadMismatch)
         ));
-        db.commit(&[], &[Mutation::Delete {
-            key: format!("runtime/conversation/{id}").into_bytes(),
-        }]).unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Delete {
+                key: format!("runtime/conversation/{id}").into_bytes(),
+            }],
+        )
+        .unwrap();
         let batch = tx.into_batch().unwrap();
         assert!(matches!(
             db.commit(&batch.checks, &batch.mutations),
