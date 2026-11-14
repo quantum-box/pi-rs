@@ -600,7 +600,12 @@ An internal scheduler-owned summary worker can execute a persisted preparation,
 settle usage, and recover or abort when explicitly scheduled by operation ID.
 An internal placement call accepts only an idle context at the exact version
 captured at preparation; a change settles the operation stale. The context edit
-and terminal status commit together. Placement limits transcript records and
+and terminal status commit together. Before an eligible placement decision,
+the internal path atomically stores a version-fenced pending state and an
+immutable placement-admission ticket. Its store commit sequence survives
+reopen and can be compared with tracked conversation commits. This is an
+ordering prerequisite, not yet a shared inbox or a public admission path.
+Placement limits transcript records and
 processed payload sizes, but the storage API still materializes individual
 entries before their sizes can be checked. `Scheduler::open_with_summary_recovery`
 opts into startup discovery with host-attested model and usage-settlement

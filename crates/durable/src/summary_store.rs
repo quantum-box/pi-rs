@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/summary-operation/";
 const REQUEST_PREFIX: &[u8] = b"durable/summary-request/";
+const PLACEMENT_PREFIX: &[u8] = b"durable/summary-placement/";
 /// Bounds the persisted request and result separately, in serialized bytes.
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Bounds both retries and the retained attempt/usage history per operation.
@@ -78,6 +79,12 @@ pub enum State {
         generation: Box<CompletedGeneration>,
     },
     Completed {
+        request_id: Uuid,
+        result: Box<CompactionResult>,
+    },
+    /// A result admitted for placement, with an immutable ticket committed in
+    /// the same transaction. Placement or staleness has not yet been decided.
+    PlacementPending {
         request_id: Uuid,
         result: Box<CompactionResult>,
     },
@@ -185,6 +192,14 @@ pub struct Snapshot {
     pub version: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PlacementTicket {
+    pub operation: Uuid,
+    pub conversation: Uuid,
+    pub conversation_version: u64,
+    pub request_id: Uuid,
+}
+
 pub struct SummaryStore<'a> {
     store: &'a Store,
 }
@@ -194,6 +209,9 @@ impl<'a> SummaryStore<'a> {
     }
     fn key(id: Uuid) -> Vec<u8> {
         [PREFIX, id.as_bytes()].concat()
+    }
+    fn placement_key(id: Uuid) -> Vec<u8> {
+        [PLACEMENT_PREFIX, id.as_bytes()].concat()
     }
 
     #[cfg(test)]
@@ -346,7 +364,12 @@ impl<'a> SummaryStore<'a> {
                     | State::Accounting { .. }
                     | State::Aborting { .. }
             );
-            if needs_worker || matches!(op.state, State::Completed { .. }) {
+            if needs_worker
+                || matches!(
+                    op.state,
+                    State::Completed { .. } | State::PlacementPending { .. }
+                )
+            {
                 if op.provider.as_ref() != Some(provider) {
                     blocked.push(id);
                 } else if needs_worker {
@@ -358,6 +381,104 @@ impl<'a> SummaryStore<'a> {
         unreachable!()
     }
 
+    /// Commit an immutable placement admission and the pending state together,
+    /// while fencing the exact conversation version selected at preparation.
+    /// The ticket's store commit sequence is the durable ordering boundary.
+    pub(crate) fn admit_placement(
+        &self,
+        snap: &Snapshot,
+        conversation_key: Vec<u8>,
+        conversation_version: u64,
+    ) -> Result<(), Error> {
+        let mut op = snap.operation.clone();
+        if op.placement_version != Some(conversation_version)
+            || conversation_key != crate::runtime::Harness::key(op.session_id)
+        {
+            return Err(Error::State);
+        }
+        let State::Completed { request_id, result } = op.state else {
+            return Err(Error::State);
+        };
+        let ticket = PlacementTicket {
+            operation: op.id,
+            conversation: op.session_id,
+            conversation_version,
+            request_id,
+        };
+        op.state = State::PlacementPending { request_id, result };
+        let key = Self::key(op.id);
+        let ticket_key = Self::placement_key(op.id);
+        self.store
+            .commit(
+                &[
+                    Check {
+                        key: key.clone(),
+                        expected: Expected::Version(snap.version),
+                    },
+                    Check {
+                        key: conversation_key,
+                        expected: Expected::Version(conversation_version),
+                    },
+                    Check {
+                        key: ticket_key.clone(),
+                        expected: Expected::Missing,
+                    },
+                ],
+                &[
+                    Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&op)?,
+                    },
+                    Mutation::Put {
+                        key: ticket_key,
+                        value: serde_json::to_vec(&ticket)?,
+                    },
+                ],
+            )
+            .map_err(|e| match e {
+                durable_store::Error::Conflict { .. } => Error::Conflict,
+                other => Error::Store(other),
+            })
+    }
+
+    /// Read and validate the immutable ticket and its original store commit.
+    pub(crate) fn placement_ticket(
+        &self,
+        snap: &Snapshot,
+    ) -> Result<(PlacementTicket, u64), Error> {
+        let (request_id, pending) = match snap.operation.state() {
+            State::PlacementPending { request_id, .. } => (request_id, true),
+            State::Placed { request_id } | State::Stale { request_id } => (request_id, false),
+            _ => return Err(Error::State),
+        };
+        let key = Self::placement_key(snap.operation.id);
+        let entry = self.store.get(&key)?.ok_or(Error::InvalidRecord)?;
+        let ticket: PlacementTicket = serde_json::from_slice(&entry.value)?;
+        if ticket.operation != snap.operation.id
+            || ticket.conversation != snap.operation.session_id
+            || Some(ticket.conversation_version) != snap.operation.placement_version
+            || ticket.request_id != *request_id
+        {
+            return Err(Error::InvalidRecord);
+        }
+        let sequence = self
+            .store
+            .commit_for_version(&key, entry.version)?
+            .filter(|sequence| *sequence > 0)
+            .ok_or(Error::InvalidRecord)?;
+        let operation_sequence = self
+            .store
+            .commit_for_version(&Self::key(snap.operation.id), snap.version)?
+            .ok_or(Error::InvalidRecord)?;
+        if self.store.first_commit_for_key(&key)? != Some(sequence)
+            || (pending && operation_sequence != sequence)
+            || (!pending && operation_sequence <= sequence)
+        {
+            return Err(Error::InvalidRecord);
+        }
+        Ok((ticket, sequence))
+    }
+
     /// Prepare a terminal placement decision for the host's atomic transaction.
     pub(crate) fn placement_batch(
         &self,
@@ -365,8 +486,10 @@ impl<'a> SummaryStore<'a> {
         placed: bool,
     ) -> Result<(Vec<Check>, Vec<Mutation>), Error> {
         let mut op = snap.operation.clone();
-        let State::Completed { request_id, .. } = op.state else {
-            return Err(Error::State);
+        let request_id = match op.state {
+            State::Completed { request_id, .. } if !placed => request_id,
+            State::PlacementPending { request_id, .. } => request_id,
+            _ => return Err(Error::State),
         };
         op.state = if placed {
             State::Placed { request_id }

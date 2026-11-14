@@ -267,13 +267,29 @@ async fn placement_kill_child() {
         .unwrap();
     scheduler.schedule_summary(id).unwrap();
     scheduler.wait_summary(id).await.unwrap();
+    let store = SummaryStore::new(scheduler.harness.owner.store());
+    let snap = store.get(id).unwrap().unwrap();
+    let key = Harness::key(conversation);
+    let version = scheduler
+        .harness
+        .owner
+        .store()
+        .get(&key)
+        .unwrap()
+        .unwrap()
+        .version;
+    store.admit_placement(&snap, key, version).unwrap();
+    let (_, sequence) = store
+        .placement_ticket(&store.get(id).unwrap().unwrap())
+        .unwrap();
+    std::fs::write(dir.join("sequence"), sequence.to_string()).unwrap();
     std::fs::write(dir.join("ids"), format!("{id} {conversation}")).unwrap();
     std::fs::write(dir.join("ready"), b"ready").unwrap();
     std::future::pending::<()>().await;
 }
 
 #[tokio::test]
-async fn killed_completed_worker_places_once_after_reopen() {
+async fn killed_pending_placement_recovers_once_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -302,6 +318,14 @@ async fn killed_completed_worker_places_once_after_reopen() {
     let id = ids.next().unwrap();
     let conversation = ids.next().unwrap();
     let mut scheduler = open_manual(dir.path().join("db"), opts(TestModel::new(0))).unwrap();
+    let pending = state(&scheduler, id);
+    let (_, sequence) = SummaryStore::new(scheduler.harness.owner.store())
+        .placement_ticket(&pending)
+        .unwrap();
+    assert_eq!(
+        sequence.to_string(),
+        std::fs::read_to_string(dir.path().join("sequence")).unwrap()
+    );
     assert_eq!(
         scheduler.place_summary(id).unwrap(),
         SummaryPlacement::Placed
@@ -428,13 +452,17 @@ async fn staged_placement_loses_to_concurrent_conversation_commit() {
     let owner = scheduler.harness.owner.clone();
     let store = SummaryStore::new(owner.store());
     let snap = store.get(id).unwrap().unwrap();
-    let State::Completed { result, .. } = snap.operation.state() else {
-        panic!("expected completed")
-    };
     let (mut candidate, version) = scheduler
         .harness
         .load_for_summary_placement(conversation)
         .unwrap();
+    store
+        .admit_placement(&snap, Harness::key(conversation), version)
+        .unwrap();
+    let snap = store.get(id).unwrap().unwrap();
+    let State::PlacementPending { result, .. } = snap.operation.state() else {
+        panic!("expected pending placement")
+    };
     candidate.messages = result
         .apply_in_context(&candidate.messages, candidate.context_generation)
         .unwrap();
@@ -472,7 +500,7 @@ async fn staged_placement_loses_to_concurrent_conversation_commit() {
     ));
     assert!(matches!(
         state(&scheduler, id).operation.state(),
-        State::Completed { .. }
+        State::PlacementPending { .. }
     ));
     assert_eq!(
         scheduler.place_summary(id).unwrap(),
@@ -486,6 +514,233 @@ async fn staged_placement_loses_to_concurrent_conversation_commit() {
             .messages,
         changed.messages
     );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn placement_ticket_orders_commits_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(1);
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let snap = store.get(id).unwrap().unwrap();
+    let key = Harness::key(conversation);
+    let version = owner.store().get(&key).unwrap().unwrap().version;
+    let before = owner
+        .store()
+        .commit_for_version(&key, version)
+        .unwrap()
+        .unwrap();
+    store.admit_placement(&snap, key.clone(), version).unwrap();
+    let pending = store.get(id).unwrap().unwrap();
+    let (ticket, admitted) = store.placement_ticket(&pending).unwrap();
+    assert_eq!(ticket.operation, id);
+    assert_eq!(ticket.conversation, conversation);
+    assert!(before < admitted);
+    assert!(matches!(
+        store.admit_placement(&snap, key.clone(), version),
+        Err(crate::summary_store::Error::Conflict)
+    ));
+    scheduler
+        .harness
+        .submit_write(conversation, None, "note".into(), None)
+        .unwrap();
+    let later = owner.store().get(&key).unwrap().unwrap().version;
+    assert!(
+        owner
+            .store()
+            .commit_for_version(&key, later)
+            .unwrap()
+            .unwrap()
+            > admitted
+    );
+    scheduler.harness.reset(conversation, None).unwrap();
+    let reset_version = owner.store().get(&key).unwrap().unwrap().version;
+    assert!(
+        owner
+            .store()
+            .commit_for_version(&key, reset_version)
+            .unwrap()
+            .unwrap()
+            > owner
+                .store()
+                .commit_for_version(&key, later)
+                .unwrap()
+                .unwrap()
+    );
+    drop(owner);
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = open_manual(&path, opts(model)).unwrap();
+    let pending = state(&scheduler, id);
+    let (reopened, sequence) = SummaryStore::new(scheduler.harness.owner.store())
+        .placement_ticket(&pending)
+        .unwrap();
+    assert_eq!(reopened, ticket);
+    assert_eq!(sequence, admitted);
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Stale
+    );
+    let (retained, retained_sequence) = SummaryStore::new(scheduler.harness.owner.store())
+        .placement_ticket(&state(&scheduler, id))
+        .unwrap();
+    assert_eq!((retained, retained_sequence), (ticket, admitted));
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Stale
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_placement_recovers_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(1);
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let snap = store.get(id).unwrap().unwrap();
+    let key = Harness::key(conversation);
+    let version = owner.store().get(&key).unwrap().unwrap().version;
+    store.admit_placement(&snap, key, version).unwrap();
+    let (ticket, sequence) = store
+        .placement_ticket(&store.get(id).unwrap().unwrap())
+        .unwrap();
+    drop(owner);
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = open_manual(&path, opts(model)).unwrap();
+    let (recovered, recovered_sequence) = SummaryStore::new(scheduler.harness.owner.store())
+        .placement_ticket(&state(&scheduler, id))
+        .unwrap();
+    assert_eq!((recovered, recovered_sequence), (ticket, sequence));
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Placed
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn admission_conflict_cannot_publish_a_ticket() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(1);
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model)).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let snap = store.get(id).unwrap().unwrap();
+    let key = Harness::key(conversation);
+    let version = owner.store().get(&key).unwrap().unwrap().version;
+    scheduler.harness.reset(conversation, None).unwrap();
+    assert!(matches!(
+        store.admit_placement(&snap, key, version),
+        Err(crate::summary_store::Error::Conflict)
+    ));
+    assert!(matches!(
+        store.get(id).unwrap().unwrap().operation.state(),
+        State::Completed { .. }
+    ));
+    let ticket_key = [b"durable/summary-placement/".as_slice(), id.as_bytes()].concat();
+    assert!(owner.store().get(&ticket_key).unwrap().is_none());
+    assert_eq!(
+        scheduler.place_summary(id).unwrap(),
+        SummaryPlacement::Stale
+    );
+    drop(owner);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_placement_fails_closed_if_ticket_is_rewritten_or_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = TestModel::new(1);
+    let mut scheduler = open_manual(dir.path().join("db"), opts(model)).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    scheduler
+        .create_independent_summary(id, conversation, 64, 0)
+        .unwrap();
+    scheduler.schedule_summary(id).unwrap();
+    scheduler.wait_summary(id).await.unwrap();
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let snap = store.get(id).unwrap().unwrap();
+    let key = Harness::key(conversation);
+    let version = owner.store().get(&key).unwrap().unwrap().version;
+    let before = scheduler
+        .harness
+        .conversation(conversation)
+        .unwrap()
+        .messages;
+    store.admit_placement(&snap, key, version).unwrap();
+    let ticket_key = [b"durable/summary-placement/".as_slice(), id.as_bytes()].concat();
+    let entry = owner.store().get(&ticket_key).unwrap().unwrap();
+    owner
+        .store()
+        .commit(
+            &[Check {
+                key: ticket_key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key: ticket_key.clone(),
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+    assert!(scheduler.place_summary(id).is_err());
+    let entry = owner.store().get(&ticket_key).unwrap().unwrap();
+    owner
+        .store()
+        .commit(
+            &[Check {
+                key: ticket_key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Delete { key: ticket_key }],
+        )
+        .unwrap();
+    assert!(scheduler.place_summary(id).is_err());
+    assert!(matches!(
+        state(&scheduler, id).operation.state(),
+        State::PlacementPending { .. }
+    ));
+    assert_eq!(
+        scheduler
+            .harness
+            .conversation(conversation)
+            .unwrap()
+            .messages,
+        before
+    );
+    drop(owner);
     scheduler.shutdown().await.unwrap();
 }
 

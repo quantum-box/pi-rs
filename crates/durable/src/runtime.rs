@@ -8970,10 +8970,11 @@ impl Scheduler {
                     "summary provider identity is missing or does not match".into(),
                 ));
             }
-            let result = match snap.operation.state() {
+            let (result, pending) = match snap.operation.state() {
                 State::Placed { .. } => return Ok(SummaryPlacement::Placed),
                 State::Stale { .. } => return Ok(SummaryPlacement::Stale),
-                State::Completed { result, .. } => result,
+                State::Completed { result, .. } => (result, false),
+                State::PlacementPending { result, .. } => (result, true),
                 _ => return Err(Error::Invalid("summary is not completed".into())),
             };
             let conversation = snap.operation.session_id();
@@ -8982,6 +8983,20 @@ impl Scheduler {
             let observed = current
                 .as_ref()
                 .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+            if pending {
+                store
+                    .placement_ticket(&snap)
+                    .map_err(|e| self.summary_store_error(e))?;
+            } else if let Some(version) = snap.operation.placement_version()
+                && current
+                    .as_ref()
+                    .is_some_and(|entry| entry.version == version)
+            {
+                match store.admit_placement(&snap, key.clone(), version) {
+                    Ok(()) | Err(crate::summary_store::Error::Conflict) => continue,
+                    Err(error) => return Err(self.summary_store_error(error)),
+                }
+            }
             let mut placement = None;
             if current.as_ref().map(|entry| entry.version) == snap.operation.placement_version()
                 && snap.operation.placement_version().is_some()
@@ -9151,7 +9166,10 @@ impl Scheduler {
                     marked = true;
                     break;
                 }
-                State::Completed { .. } | State::Placed { .. } | State::Stale { .. } => {
+                State::Completed { .. }
+                | State::PlacementPending { .. }
+                | State::Placed { .. }
+                | State::Stale { .. } => {
                     return Err(Error::Invalid("summary already completed".into()));
                 }
                 _ => match store.begin_abort(id, snap.version) {

@@ -55,6 +55,7 @@ pub(crate) async fn run(
         }
         match snap.operation.state() {
             State::Completed { .. }
+            | State::PlacementPending { .. }
             | State::Placed { .. }
             | State::Stale { .. }
             | State::Aborted => return Ok(()),
