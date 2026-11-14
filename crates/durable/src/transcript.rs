@@ -645,7 +645,8 @@ mod tests {
         create(&db, id);
         let transcript = Transcript::new(&db, id);
         let message_id = Uuid::new_v4();
-        let good = json!({"AppendV2": {"ids": [message_id], "messages": [{"role":"user","content":""}]}});
+        let good =
+            json!({"AppendV2": {"ids": [message_id], "messages": [{"role":"user","content":""}]}});
         let binding = MessageContentBlocks {
             message_id,
             blocks: vec![json!({"type":"text", "text":"kept"})],
@@ -672,7 +673,9 @@ mod tests {
         ));
         commit(
             &db,
-            transcript.prepare_append_with_blocks(&good, vec![binding]).unwrap(),
+            transcript
+                .prepare_append_with_blocks(&good, vec![binding])
+                .unwrap(),
         );
         let cursor = transcript.snapshot().unwrap();
         let link = cursor.next.unwrap();

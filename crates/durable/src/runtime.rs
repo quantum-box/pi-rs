@@ -9378,7 +9378,10 @@ mod scheduler_tests {
         assert_eq!(snapshot["content_blocks"]["0"]["blocks"], json!(blocks));
         assert_eq!(snapshot["content_blocks"]["1"]["message_id"], json!(second));
         let through = h.history_head(id).unwrap();
-        assert!(h.history_through(id, crate::observer::Cursor(0), through, limit).is_ok());
+        assert!(
+            h.history_through(id, crate::observer::Cursor(0), through, limit)
+                .is_ok()
+        );
         let cursor = h.unified_history_start(id, false).unwrap();
         assert!(h.unified_history(&cursor, limit).is_ok());
         let c = h.conversation(id).unwrap();
