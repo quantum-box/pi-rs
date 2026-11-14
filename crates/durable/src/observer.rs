@@ -486,4 +486,97 @@ mod tests {
         .unwrap();
         assert!(matches!(o.read(Cursor(0), limit(1)), Err(Error::Corrupt)));
     }
+
+    #[test]
+    fn progress_streams_are_isolated_and_detect_a_missing_first_event() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::from_u128(1);
+        let progress = Observer::tool_progress(&db, id);
+        let other = Observer::tool_progress(&db, Uuid::from_u128(2));
+        let history = Observer::new(&db, id);
+        append(&history, json!("history"));
+        append(&progress, json!("first"));
+        append(&progress, json!("second"));
+        append(&other, json!("other"));
+        let first = progress.read(Cursor(0), limit(1)).unwrap();
+        assert_eq!(first.records[0].value, json!("first"));
+        assert!(first.has_more);
+        assert_eq!(
+            progress.read(first.next, limit(1)).unwrap().records[0].value,
+            json!("second")
+        );
+        assert_eq!(
+            history.read(Cursor(0), limit(2)).unwrap().records[0].value,
+            json!("history")
+        );
+        assert_eq!(
+            other.read(Cursor(0), limit(2)).unwrap().records[0].value,
+            json!("other")
+        );
+        assert!(matches!(
+            other.read(Cursor(2), limit(1)),
+            Err(Error::FutureCursor)
+        ));
+        db.commit(
+            &[],
+            &[Mutation::Delete {
+                key: record_key_with(b"durable/tool-progress-events/", id, 1),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            progress.read(Cursor(0), limit(1)),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn stale_progress_and_terminal_batches_cannot_overtake_each_other() {
+        use crate::tool_progress::{Snapshot, State};
+        for terminal_first in [false, true] {
+            let db = Store::memory().unwrap();
+            let id = Uuid::new_v4();
+            let observer = Observer::tool_progress(&db, id);
+            let mut running = Snapshot::load(&db, id).unwrap();
+            running.update(json!("partial")).unwrap();
+            let mut update = running.prepare_checkpoint().unwrap();
+            let event = observer.prepare_append(&json!(running.state())).unwrap();
+            update.checks.extend(event.checks);
+            update.mutations.extend(event.mutations);
+            let snapshot = Snapshot::load(&db, id).unwrap();
+            let mut terminal = snapshot.prepare_abort().unwrap();
+            let event = observer
+                .prepare_append(&json!(State::Aborted(None)))
+                .unwrap();
+            terminal.checks.extend(event.checks);
+            terminal.mutations.extend(event.mutations);
+            let (winner, loser) = if terminal_first {
+                (&terminal, &update)
+            } else {
+                (&update, &terminal)
+            };
+            db.commit(&winner.checks, &winner.mutations).unwrap();
+            assert!(matches!(
+                db.commit(&loser.checks, &loser.mutations),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            if !terminal_first {
+                let snapshot = Snapshot::load(&db, id).unwrap();
+                let mut retry = snapshot.prepare_abort().unwrap();
+                let event = observer
+                    .prepare_append(&json!(State::Aborted(Some(json!("partial")))))
+                    .unwrap();
+                retry.checks.extend(event.checks);
+                retry.mutations.extend(event.mutations);
+                db.commit(&retry.checks, &retry.mutations).unwrap();
+            }
+            let page = observer.read(Cursor(0), limit(3)).unwrap();
+            assert_eq!(page.records.len(), if terminal_first { 1 } else { 2 });
+            assert_eq!(page.records.last().unwrap().value["state"], "aborted");
+            assert!(matches!(
+                Snapshot::load(&db, id).unwrap().state(),
+                State::Aborted(_)
+            ));
+        }
+    }
 }
