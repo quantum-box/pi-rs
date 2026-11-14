@@ -434,6 +434,33 @@ mod tests {
     }
 
     #[test]
+    fn different_session_ids_at_same_path_share_generation() {
+        let root = std::env::temp_dir().join(format!("pi-share-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let first = Binding {
+            session_id: uuid::Uuid::new_v4(),
+            head: 1,
+            journal_digest: [1; 32],
+            provenance_digest: [2; 32],
+        };
+        let mut second = first.clone();
+        second.session_id = uuid::Uuid::new_v4();
+        store
+            .begin(&path, second.clone())
+            .unwrap()
+            .publish(second.clone(), json!({"old":true}))
+            .unwrap();
+        let lease = store.try_begin(&path, first).unwrap();
+        assert_eq!(store.read(&path, &second).unwrap(), None);
+        drop(lease);
+        assert_eq!(store.read(&path, &second).unwrap(), None);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn restoring_old_snapshot_and_marker_does_not_override_new_anchor() {
         let root = std::env::temp_dir().join(format!("pi-share-replay-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();

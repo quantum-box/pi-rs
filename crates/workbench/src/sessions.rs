@@ -1210,6 +1210,64 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn radius_upload_uses_reopened_journal_bound_cached_context() {
+        use pi_rs_workbench::private_share_store::Store;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let provenance = serde_json::json!({"workspace":"fixture", "configuration":"v1"});
+        let context = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: ShareContext {
+                system_prompt: "cached live instructions".into(),
+                tools: vec![],
+            },
+        };
+        let store = Store::open(root.path()).unwrap();
+        let binding = store.binding_for_session(&session, &provenance).unwrap();
+        store
+            .begin(&path, binding)
+            .unwrap()
+            .publish_session(&session, &provenance, &context)
+            .unwrap();
+        drop(store);
+        drop(session);
+        let session = Session::snapshot(&path).unwrap();
+        let store = Store::open_existing(root.path()).unwrap().unwrap();
+        let snapshot: ShareSnapshot = store
+            .read_session(&path, &session, &provenance)
+            .unwrap()
+            .unwrap();
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
+        )
+        .await;
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![proxy],
+            idle_timeout: None,
+        };
+        destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+            .unwrap();
+        let (_, _, body) = server.await.unwrap();
+        let entries: Vec<serde_json::Value> = body
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries.last().unwrap()["data"]["systemPrompt"],
+            "cached live instructions"
+        );
+        assert_eq!(entries.last().unwrap()["customType"], "pi.share");
+    }
+
     #[tokio::test]
     async fn radius_share_rejects_stale_snapshot_before_upload() {
         let root = tempfile::tempdir().unwrap();

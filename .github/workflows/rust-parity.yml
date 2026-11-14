@@ -25,3 +25,5 @@ jobs:
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
       - name: Test live share capture
         run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
+      - name: Test Radius cached context export
+        run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs radius_upload_uses_reopened_journal_bound_cached_context

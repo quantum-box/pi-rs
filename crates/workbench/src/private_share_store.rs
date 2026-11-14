@@ -771,6 +771,25 @@ mod tests {
     }
 
     #[test]
+    fn different_session_ids_at_same_path_share_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("/workspace/session.jsonl");
+        let store = Store::open(directory.path()).unwrap();
+        let first = binding();
+        let mut second = first.clone();
+        second.session_id = uuid::Uuid::new_v4();
+        store
+            .begin(path, second.clone())
+            .unwrap()
+            .publish(second.clone(), serde_json::json!({"old":true}))
+            .unwrap();
+        let lease = store.try_begin(path, first).unwrap();
+        assert_eq!(store.read(path, &second).unwrap(), None);
+        drop(lease);
+        assert_eq!(store.read(path, &second).unwrap(), None);
+    }
+
+    #[test]
     fn restart_requires_exact_binding_and_a_clean_generation() {
         let directory = tempfile::tempdir().unwrap();
         let path = Path::new("/workspace/session.jsonl");
