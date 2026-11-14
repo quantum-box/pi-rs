@@ -667,6 +667,14 @@ async fn before_compact_replays_memo_after_cancellation_and_first_decision_wins(
         assert!(c.messages.iter().any(
             |m| matches!(m, Message::User { content } if content.contains("hook checkpoint"))
         ));
+        assert!(
+            h.extension_reports()
+                .unwrap()
+                .iter()
+                .any(|batch| batch.conversation_id == id
+                    && batch.phase == "before_compact"
+                    && !batch.reports.is_empty())
+        );
     }
     assert_eq!(*seen.lock().unwrap(), vec![CompactionReason::Manual; 3]);
 }
