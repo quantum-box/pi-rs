@@ -995,19 +995,31 @@ impl Session {
     }
 
     pub(crate) fn model_selection_at(&self, target: u64) -> Option<(String, Option<String>)> {
+        self.model_identity_at(target)
+            .map(|(_, model, thinking)| (model, thinking))
+    }
+
+    /// The provider belongs to the same selection record as the model. Older
+    /// records and request-only histories have no reliable provider identity.
+    pub(crate) fn model_identity_at(
+        &self,
+        target: u64,
+    ) -> Option<(Option<String>, String, Option<String>)> {
         let branch = self.path(target);
         branch
             .iter()
             .rev()
             .find_map(|record| match &record.event {
                 Event::ModelSelected {
-                    model, thinking, ..
-                } => Some((model.clone(), thinking.clone())),
+                    model,
+                    thinking,
+                    provider,
+                } => Some((provider.clone(), model.clone(), thinking.clone())),
                 _ => None,
             })
             .or_else(|| {
                 branch.iter().rev().find_map(|record| match &record.event {
-                    Event::ModelRequested { model, .. } => Some((model.clone(), None)),
+                    Event::ModelRequested { model, .. } => Some((None, model.clone(), None)),
                     _ => None,
                 })
             })
