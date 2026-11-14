@@ -1386,10 +1386,10 @@ impl Agent<'_> {
                             active.model_name,
                         )
                     {
+                        active.settle_usage(request_id, &usage, &metadata).await?;
                         if spent > budget {
                             return Err(Error::Budget);
                         }
-                        active.settle_usage(request_id, &usage, &metadata).await?;
                         active
                             .commit_compaction_with_host(
                                 session,
@@ -2217,14 +2217,25 @@ impl Agent<'_> {
                 Some(followups),
             )
             .await;
-        if let Err(error) = result
-            && self.registry.extensions.is_empty()
-            && completed_overflow_summary(session, run_id, "pi-rs:silent-overflow", self.model_name)
+        if let Err(error) = result {
+            if self.registry.extensions.is_empty()
+                && completed_overflow_summary(
+                    session,
+                    run_id,
+                    "pi-rs:silent-overflow",
+                    self.model_name,
+                )
                 .is_some()
-        {
-            // A completed summary must be settled before the run is closed;
-            // leave it recoverable if settlement failed after the durable reply.
-            return Err(error);
+            {
+                // Preserve a completed response when its settlement failed.
+                return Err(error);
+            }
+            // The marker now exists. Resolve it through the same durable skip
+            // path used after a restart, without repeating the summary call.
+            Box::pin(
+                self.compact_silent_overflow(session, run_id, states, cancel, observer, followups),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -8005,14 +8016,22 @@ mod tree_tests {
             }
         }
         let mut unknown_session = Session::from_records(unknown_records).unwrap();
+        let unknown_model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(false),
+            settlements: std::sync::Mutex::new(Vec::new()),
+            allowances: std::sync::Mutex::new(Vec::new()),
+        };
         let unknown_agent = Agent {
+            model: &unknown_model,
             limits: Limits {
                 model_requests: 3,
                 ..limited_agent.limits.clone()
             },
             ..limited_agent
         };
-        assert!(
+        assert!(matches!(
             unknown_agent
                 .run_correlated(
                     &mut unknown_session,
@@ -8022,8 +8041,13 @@ mod tree_tests {
                     &CancellationToken::new(),
                     &mut |_| {}
                 )
-                .await
-                .is_err()
+                .await,
+            Err(Error::Budget)
+        ));
+        assert_eq!(
+            unknown_model.settlements.lock().unwrap().len(),
+            1,
+            "incurred summary usage is settled before enforcing the remaining budget"
         );
         assert_eq!(
             limited_model.0.load(Ordering::SeqCst),

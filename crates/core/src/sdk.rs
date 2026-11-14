@@ -9768,6 +9768,70 @@ mod tests {
         }
     }
 
+    struct SilentFailureModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for SilentFailureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            if request.messages.iter().any(|message| matches!(message, crate::Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
+                return Err(Error::Model("summary failed".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(crate::Usage {
+                        input_tokens: if call == 0 { 1001 } else { 1 },
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_compaction_failure_does_not_block_the_next_prompt() {
+        for model_requests in [1, 3] {
+            let model = Arc::new(SilentFailureModel(AtomicUsize::new(0)));
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .append(crate::Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .build(journal)
+                .unwrap();
+            assert_eq!(session.prompt("new").await.unwrap(), "answer");
+            assert!(session.journal().unwrap().records().iter().any(|record| matches!(&record.event, crate::Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+            assert_eq!(session.prompt("next").await.unwrap(), "answer");
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                if model_requests == 1 { 2 } else { 3 }
+            );
+            session.close().await.unwrap();
+        }
+    }
+
     struct TriggerCommand;
     impl Extension for TriggerCommand {
         fn id(&self) -> &str {
