@@ -49,10 +49,10 @@ fn share_context_tracks_idle_and_inflight_worker() {
             if line.is_empty() || line == "\r\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    length = value.trim().parse().unwrap();
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
             }
         }
         let mut body = vec![0; length];
@@ -202,10 +202,10 @@ fn terminal_shares_idle_and_during_model_request() {
                 if line.is_empty() || line == "\r\n" {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        size = value.trim().parse().unwrap();
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    size = value.trim().parse().unwrap();
                 }
             }
             let mut bytes = vec![0; size];
@@ -235,10 +235,10 @@ fn terminal_shares_idle_and_during_model_request() {
             if line.is_empty() || line == "\r\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    length = value.trim().parse().unwrap();
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
             }
         }
         let mut bytes = vec![0; length];
