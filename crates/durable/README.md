@@ -96,6 +96,15 @@ an atomic view attachment or a replacement for upstream's watch frames; progress
 and commits omitted from the observer log remain absent. The higher-level
 `history` and `watch_history` APIs are unchanged.
 
+`Observer::watch_for` bounds a polling wait and returns either an ordered page
+or `TimedOut` with the unchanged cursor. A zero wait still reads once; errors
+are returned even at the deadline. After processing a page, persist its `next`
+cursor before resuming, including after reopening. A timeout means only that the
+final poll found no record: it is not a stream or harness end reason. A record
+found by that poll wins even if scheduling delays it past the deadline.
+Dropping the future cancels the wait. Synchronous store reads can block past the
+deadline; polling works across processes but does not wake on a close or failure.
+
 `Harness::view` and `Scheduler::view` capture conversation metadata, the
 committed running model/compaction progress checkpoint, the current tool attempt’s
 committed replacement partial, and a newest-first

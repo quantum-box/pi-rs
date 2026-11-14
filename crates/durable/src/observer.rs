@@ -43,6 +43,8 @@ pub enum Error {
     SequenceExhausted,
     #[error("poll interval must be nonzero")]
     ZeroPollInterval,
+    #[error("wait duration exceeds the clock range")]
+    WaitTooLong,
 }
 
 /// Sequence zero means the beginning; all other values identify a record.
@@ -62,6 +64,13 @@ pub struct Page {
     pub next: Cursor,
     /// Whether this snapshot contains more records after `next`.
     pub has_more: bool,
+}
+
+/// Result of a bounded polling wait. A timeout does not close the stream.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WaitOutcome {
+    Records(Page),
+    TimedOut { cursor: Cursor },
 }
 
 /// Checks and mutations to add to a host's atomic state transition.
@@ -270,6 +279,37 @@ impl<'a> Observer<'a> {
                 return Ok(page);
             }
             tokio::time::sleep(poll).await;
+        }
+    }
+
+    /// Poll for records for at most `wait`, returning the unchanged cursor on
+    /// timeout. Dropping the future cancels the wait without changing a cursor.
+    /// Synchronous store reads cannot be preempted by the deadline.
+    pub async fn watch_for(
+        &self,
+        after: Cursor,
+        limit: NonZeroUsize,
+        poll: Duration,
+        wait: Duration,
+    ) -> Result<WaitOutcome, Error> {
+        if poll.is_zero() {
+            return Err(Error::ZeroPollInterval);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(wait)
+            .ok_or(Error::WaitTooLong)?;
+        loop {
+            let page = self.read(after, limit)?;
+            if !page.records.is_empty() {
+                return Ok(WaitOutcome::Records(page));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(WaitOutcome::TimedOut { cursor: after });
+            }
+            tokio::time::sleep(
+                poll.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
         }
     }
 }
@@ -525,6 +565,84 @@ mod tests {
             o.watch(rest.next, limit(1), Duration::ZERO).await,
             Err(Error::ZeroPollInterval)
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_timeout_and_reopen_preserve_cursor_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wait.db");
+        let id = Uuid::new_v4();
+        let cursor;
+        {
+            let db = Store::open(&path).unwrap();
+            let observer = Observer::new(&db, id);
+            append(&observer, json!(1));
+            append(&observer, json!(2));
+            let WaitOutcome::Records(first) = observer
+                .watch_for(Cursor(0), limit(1), Duration::from_millis(1), Duration::ZERO)
+                .await
+                .unwrap()
+            else {
+                panic!("expected records")
+            };
+            assert_eq!(first.records[0].value, json!(1));
+            cursor = first.next;
+        }
+        let db = Store::open(&path).unwrap();
+        let observer = Observer::new(&db, id);
+        let WaitOutcome::Records(second) = observer
+            .watch_for(cursor, limit(1), Duration::from_millis(1), Duration::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("expected records after reopening")
+        };
+        assert_eq!(second.records[0].value, json!(2));
+        assert_eq!(
+            observer
+                .watch_for(second.next, limit(1), Duration::from_secs(1), Duration::from_millis(5))
+                .await
+                .unwrap(),
+            WaitOutcome::TimedOut { cursor: second.next }
+        );
+        append(&observer, json!(3));
+        let WaitOutcome::Records(third) = observer
+            .watch_for(second.next, limit(1), Duration::from_millis(1), Duration::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("expected subsequent record")
+        };
+        assert_eq!(third.records[0].value, json!(3));
+        assert!(matches!(
+            observer.watch_for(Cursor(4), limit(1), Duration::from_millis(1), Duration::ZERO).await,
+            Err(Error::FutureCursor)
+        ));
+        assert!(matches!(
+            observer.watch_for(third.next, limit(1), Duration::ZERO, Duration::ZERO).await,
+            Err(Error::ZeroPollInterval)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_observes_later_commit() {
+        let db = Arc::new(Store::memory().unwrap());
+        let writer = Arc::clone(&db);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            append(&Observer::new(&writer, Uuid::nil()), json!("new"));
+        });
+        let observer = Observer::new(&db, Uuid::nil());
+        let outcome = observer
+            .watch_for(Cursor(0), limit(1), Duration::from_millis(2), Duration::from_secs(2))
+            .await
+            .unwrap();
+        task.await.unwrap();
+        let WaitOutcome::Records(page) = outcome else {
+            panic!("expected the later commit")
+        };
+        assert_eq!(page.next, Cursor(1));
+        assert_eq!(page.records[0].value, json!("new"));
     }
 
     #[test]

@@ -105,6 +105,10 @@ Later appends do not extend the catch-up, and the boundary can be reused after
 reopening. This does not atomically attach a conversation or document view,
 produce Chord operations, or include changes absent from the observer log; record
 bytes and retained history are unbounded. Compare upstream's [watch contract](https://github.com/earendil-works/pi/blob/17d6ca759a070c377147f6d76b72dab9a3ba42a3/packages/durable/docs/spec.md).
+`watch_for` adds a bounded polling wait with an explicit timeout and unchanged
+cursor, not an upstream watch end reason. Upstream removed `watchEvents` in
+favor of conversation views; its watches terminate with lifecycle reasons, which
+this standalone log does not provide. See the [upstream changelog](https://github.com/earendil-works/pi/blob/827383a15262905f82e418483825a49dbb1adbf5/packages/durable/CHANGELOG.md) and [watch documentation](https://github.com/earendil-works/pi/blob/827383a15262905f82e418483825a49dbb1adbf5/packages/durable/README.md#watching-a-conversation).
 
 **Conversation history replay checkpoint:** `Harness` and `Scheduler` expose
 `history_head` and `history_through` for finite, paged replay of expanded
