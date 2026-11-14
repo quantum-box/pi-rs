@@ -4270,16 +4270,23 @@ pub(super) async fn run(
             dirty = true;
         }
         if let Some(editor) = &mut external_editor {
-            if let Some(status) = editor.poll()? {
-                let editor = external_editor.take().expect("active editor");
-                let result = editor.result(status);
-                let target = editor.target;
-                drop(editor);
-                finish_external_editor(&args, &mut view, &mut _terminal, target, Some(result))?;
-                dirty = true;
-            } else {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
+            match editor.poll() {
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                outcome => {
+                    let editor = external_editor.take().expect("active editor");
+                    let result = match outcome {
+                        Ok(Some(status)) => editor.result(status),
+                        Err(error) => Err(error),
+                        Ok(None) => unreachable!(),
+                    };
+                    let target = editor.target;
+                    drop(editor);
+                    finish_external_editor(&args, &mut view, &mut _terminal, target, Some(result))?;
+                    dirty = true;
+                }
             }
         }
         if (dirty && last_frame.elapsed() >= frame_interval)
@@ -7252,6 +7259,127 @@ fn set_foreground(fd: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result
     }
 }
 
+// A stopped process cannot know whether its parent will handle job control.
+// A separate process group resumes Pi only while Pi still owns the terminal.
+#[cfg(unix)]
+struct EditorResumeWatchdog {
+    pid: libc::pid_t,
+    alive: std::os::fd::RawFd,
+}
+
+#[cfg(unix)]
+impl EditorResumeWatchdog {
+    fn start(fd: std::os::fd::RawFd, group: libc::pid_t) -> std::io::Result<Self> {
+        let mut ready_pipe = [0; 2];
+        let mut alive_pipe = [0; 2];
+        if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::pipe(alive_pipe.as_mut_ptr()) } != 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(ready_pipe[0]);
+                libc::close(ready_pipe[1]);
+            }
+            return Err(error);
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(ready_pipe[0]);
+                libc::close(ready_pipe[1]);
+                libc::close(alive_pipe[0]);
+                libc::close(alive_pipe[1]);
+            }
+            return Err(error);
+        }
+        if pid == 0 {
+            // After fork in a multithreaded process, use only libc operations
+            // and _exit: no Rust allocation, locks, or destructors.
+            unsafe {
+                libc::close(ready_pipe[0]);
+                libc::close(alive_pipe[1]);
+                let nonblocking = libc::fcntl(alive_pipe[0], libc::F_SETFL, libc::O_NONBLOCK) == 0;
+                let ready = u8::from(nonblocking && libc::setpgid(0, 0) == 0);
+                libc::write(ready_pipe[1], (&ready as *const u8).cast(), 1);
+                libc::close(ready_pipe[1]);
+                if ready == 1 {
+                    // Repeated checks handle SIGCONT racing with SIGSTOP.
+                    for attempt in 0..13 {
+                        let mut delay = if attempt == 0 {
+                            libc::timespec {
+                                tv_sec: 1,
+                                tv_nsec: 0,
+                            }
+                        } else {
+                            libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: 250_000_000,
+                            }
+                        };
+                        let mut remaining: libc::timespec = std::mem::zeroed();
+                        while libc::nanosleep(&delay, &mut remaining) != 0 {
+                            delay = remaining;
+                        }
+                        let mut byte = 0u8;
+                        let status = libc::read(alive_pipe[0], (&mut byte as *mut u8).cast(), 1);
+                        if status == 0 {
+                            break;
+                        }
+                        if libc::tcgetpgrp(fd) == group {
+                            libc::kill(-group, libc::SIGCONT);
+                        }
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(ready_pipe[1]);
+            libc::close(alive_pipe[0]);
+        }
+        let mut ready = 0u8;
+        let read = loop {
+            let n = unsafe { libc::read(ready_pipe[0], (&mut ready as *mut u8).cast(), 1) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break n;
+        };
+        unsafe {
+            libc::close(ready_pipe[0]);
+        }
+        if read != 1 || ready != 1 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                libc::close(alive_pipe[1]);
+            }
+            return Err(std::io::Error::other(
+                "could not start editor resume watchdog",
+            ));
+        }
+        Ok(Self {
+            pid,
+            alive: alive_pipe[1],
+        })
+    }
+}
+#[cfg(unix)]
+impl Drop for EditorResumeWatchdog {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.alive);
+            libc::kill(self.pid, libc::SIGKILL);
+            while libc::waitpid(self.pid, std::ptr::null_mut(), 0) < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 impl EditorForeground {
     fn prepare() -> std::io::Result<Option<Self>> {
@@ -7321,13 +7449,34 @@ impl EditorForeground {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.baseline) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // Suspend the whole Pi job so its parent shell regains control. SIGSTOP
-        // also works when Pi's process group is orphaned or SIGTSTP is ignored.
-        if unsafe { libc::kill(0, libc::SIGSTOP) } != 0 {
+        // A parent in the same session may still lack job control. If no shell
+        // takes the terminal, wake the stopped job instead of hanging forever.
+        let watchdog = match EditorResumeWatchdog::start(fd, group) {
+            Ok(watchdog) => watchdog,
+            Err(_) => {
+                if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                set_foreground(fd, editor_group)?;
+                if unsafe { libc::kill(-editor_group, libc::SIGCONT) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                #[cfg(test)]
+                EDITOR_JOB_RESUMES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+        };
+        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // The shell foregrounds Pi before continuing it. Restore the editor's
-        // terminal state before handing input back to the stopped editor.
+        // A shell may send SIGCONT without fg; stay stopped until foregrounded.
+        while unsafe { libc::tcgetpgrp(fd) } != group {
+            if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        drop(watchdog);
+        // Restore the editor's terminal state before handing input back.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &editor_settings) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -7463,6 +7612,11 @@ impl RunningExternalEditor {
 
 impl Drop for RunningExternalEditor {
     fn drop(&mut self) {
+        // A wrapper can exit while its descendants keep running. The Windows
+        // job must be terminated even after the wrapper has been reaped.
+        #[cfg(windows)]
+        self.cancel();
+        #[cfg(not(windows))]
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             self.cancel();
         }
@@ -7826,6 +7980,7 @@ mod tests {
         const CHILD: &str = "PI_RS_EDITOR_JOB_CONTROL_TEST";
         const SUPERVISOR: &str = "PI_RS_EDITOR_TEST_SUPERVISOR";
         let managed = suspend && !shared_group && !test_name.contains("without_supervisor");
+        let plain_launcher = test_name.contains("without_job_control_launcher");
         if let Some(program) = std::env::var_os(SUPERVISOR) {
             use std::os::unix::process::CommandExt;
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -7836,6 +7991,11 @@ mod tests {
                 .spawn()
                 .unwrap();
             super::set_foreground(0, child.id() as libc::pid_t).unwrap();
+            if plain_launcher {
+                assert!(child.wait().unwrap().success());
+                println!("LAUNCHER_FINISHED");
+                return;
+            }
             let mut status = 0;
             assert_eq!(
                 unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, libc::WUNTRACED) },
@@ -7861,6 +8021,11 @@ mod tests {
             return;
         }
         if let Some(program) = std::env::var_os(CHILD) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while unsafe { libc::tcgetpgrp(0) } != unsafe { libc::getpgrp() } {
+                assert!(Instant::now() < until, "supervisor did not foreground Pi");
+                std::thread::sleep(Duration::from_millis(2));
+            }
             if shared_group {
                 assert_eq!(unsafe { libc::getpgrp() }, unsafe {
                     libc::getpgid(libc::getppid())
@@ -7880,6 +8045,26 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if suspend {
+                assert_eq!(
+                    unsafe { libc::tcgetpgrp(0) },
+                    editor.child.id() as libc::pid_t
+                );
+                // Consume any stop notification from initial foreground handoff.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        editor.child.id() as libc::id_t,
+                        &mut info,
+                        libc::WSTOPPED | libc::WNOHANG,
+                    )
+                };
+                assert_eq!(rc, 0);
+                println!("READY_FOR_CTRL_Z");
+                let go = std::path::PathBuf::from(&program).with_extension("go");
+                while !go.exists() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 let mut announced = false;
                 loop {
                     if editor.poll().unwrap().is_some() {
@@ -8005,10 +8190,11 @@ mod tests {
             if suspend
                 && !sent
                 && output
-                    .windows(b"EDITOR_READY".len())
-                    .any(|part| part == b"EDITOR_READY")
+                    .windows(b"READY_FOR_CTRL_Z".len())
+                    .any(|part| part == b"READY_FOR_CTRL_Z")
             {
                 master.write_all(&[26]).unwrap();
+                std::fs::write(program.with_extension("go"), "go").unwrap();
                 sent = true;
             }
             if suspend && sent && !resumed {
@@ -8072,7 +8258,13 @@ mod tests {
                 );
                 assert!(String::from_utf8_lossy(&output).contains("PARENT_FINISHED"));
                 if managed {
-                    assert!(String::from_utf8_lossy(&output).contains("SUPERVISOR_SAW_STOP"));
+                    assert!(
+                        String::from_utf8_lossy(&output).contains(if plain_launcher {
+                            "LAUNCHER_FINISHED"
+                        } else {
+                            "SUPERVISOR_SAW_STOP"
+                        })
+                    );
                 }
                 if shared_group {
                     assert!(String::from_utf8_lossy(&output).contains("SHELL_ALIVE"));
@@ -8120,6 +8312,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn editor_suspend_without_job_control_launcher_resumes() {
+        editor_pty_regression(
+            "interactive::tests::editor_suspend_without_job_control_launcher_resumes",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn editor_exits_while_suspended_without_stopping_tui() {
         editor_pty_regression(
             "interactive::tests::editor_exits_while_suspended_without_stopping_tui",
@@ -8157,6 +8359,33 @@ mod tests {
         drop(editor);
         std::thread::sleep(Duration::from_secs(4));
         assert!(!marker.exists(), "wrapper descendant outlived cancellation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exiting_external_editor_wrapper_does_not_leave_descendants() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("editor.cmd");
+        let marker = directory.path().join("descendant-finished");
+        std::fs::write(&wrapper, format!(
+            "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked\"\r\necho started>\"%~1\"\r\nexit /b 0\r\n",
+            marker.display().to_string().replace('\'', "''"),
+        )).unwrap();
+        let mut editor = super::RunningExternalEditor::start(
+            &format!("\"{}\"", wrapper.display()),
+            "draft",
+            super::ExternalEditorTarget::Main,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while editor.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "wrapper did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(editor);
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!marker.exists(), "descendant survived its wrapper");
     }
 
     #[cfg(unix)]
