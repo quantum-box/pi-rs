@@ -36,7 +36,12 @@ fn digest<T: Serialize>(key: &[u8; 32], domain: &str, value: &T) -> io::Result<[
 }
 fn name_for(key: &[u8; 32], path: &Path, id: uuid::Uuid, suffix: &str) -> io::Result<String> {
     let path: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let digest = digest(key, "share-session-windows-v1", &(path, id))?;
+    // Every identity at the same pathname shares one generation boundary.
+    let digest = if matches!(suffix, "lock" | "generation" | "anchor") {
+        digest(key, "share-path-windows-v2", &path)?
+    } else {
+        digest(key, "share-session-windows-v1", &(path, id))?
+    };
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(format!("{hex}.{suffix}"))
 }

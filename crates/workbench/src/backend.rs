@@ -2118,7 +2118,7 @@ mod share_context_tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn replacing_journal_after_invalidation_can_leave_another_identity_clean() {
+    fn replacing_journal_after_invalidation_cannot_revive_another_identity() {
         use pi_rs_workbench::private_share_store::Store;
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -2129,9 +2129,8 @@ mod share_context_tests {
         let replacement_binding = store.binding_for_session(&replacement, &()).unwrap();
         drop(original);
         drop(replacement);
-        // The replacement identity has an independently clean historical entry
-        // for this pathname. This setup exposes the remaining race; it is not a
-        // claim that a standalone reader is safe to enable.
+        // A historical entry for a different session identity at the same
+        // pathname must be invalidated when the worker starts.
         store
             .begin(&path, replacement_binding.clone())
             .unwrap()
@@ -2147,11 +2146,9 @@ mod share_context_tests {
             store.binding_for_session(&now, &()).unwrap(),
             replacement_binding
         );
-        assert_eq!(
-            store.read(&path, &replacement_binding).unwrap(),
-            Some(json!({"stale":true}))
-        );
+        assert_eq!(store.read(&path, &replacement_binding).unwrap(), None);
         drop(lease);
+        assert_eq!(store.read(&path, &replacement_binding).unwrap(), None);
     }
 
     #[test]
