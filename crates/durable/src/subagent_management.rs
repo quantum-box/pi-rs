@@ -208,11 +208,13 @@ mod tests {
             )
             .await;
         assert_eq!(format!("{first:?}"), format!("{second:?}"));
-        let h = tool.harness.lock().unwrap();
-        let link = h.subagent(parent, "worker").unwrap().unwrap();
-        let child = h.conversation(link.child).unwrap();
-        assert_eq!(child.submissions.len(), 1);
-        drop(h);
+        let link = {
+            let h = tool.harness.lock().unwrap();
+            let link = h.subagent(parent, "worker").unwrap().unwrap();
+            let child = h.conversation(link.child).unwrap();
+            assert_eq!(child.submissions.len(), 1);
+            link
+        };
         drop(tool);
         let scheduler = Scheduler::open_with_subagent_management(
             &path,
