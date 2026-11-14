@@ -1679,8 +1679,8 @@ impl Harness {
                 .documents
                 .get("pi-rs/runtime/provider-adapter")
                 .map(|v| serde_json::from_value(v.clone()))
-                ),
-                (
+                .transpose()?
+                .unwrap_or_default(),
             allowed_tools: point
                 .documents
                 .get("pi-rs/runtime/allowed-tools")
