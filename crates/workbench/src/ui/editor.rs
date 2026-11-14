@@ -15,10 +15,17 @@ fn word_segments(text: &str) -> Vec<(usize, usize, bool)> {
     let mut segments = Vec::new();
     for (end, kind) in segmenter.segment_str(text).iter_with_word_type() {
         if end > start {
-            // ICU4X can mark Hebrew letters as non-word, unlike Intl.Segmenter.
-            // Do not use is_alphanumeric: non-decimal numeric symbols such as
-            // superscript ² are non-word segments in the reference.
-            let word = kind.is_word_like() || text[start..end].chars().any(char::is_alphabetic);
+            // ICU4X can classify a Hebrew segment ending in an ASCII
+            // apostrophe as non-word while Intl.Segmenter marks it word-like.
+            // Do not promote arbitrary alphabetic segments: a ZWJ emoji
+            // sequence can include letters while remaining non-word.
+            let segment = &text[start..end];
+            let hebrew_apostrophe = segment.ends_with('\'')
+                && segment
+                    .chars()
+                    .any(|c| ('\u{0590}'..='\u{05ff}').contains(&c) && c.is_alphabetic())
+                && !segment.contains('\u{200d}');
+            let word = kind.is_word_like() || hebrew_apostrophe;
             segments.push((start, end, word));
         }
         start = end;
@@ -529,6 +536,29 @@ mod tests {
         editor.cursor = 0;
         editor.action("tui.editor.cursorWordRight");
         assert_eq!(editor.cursor, "שלום".len());
+    }
+
+    #[test]
+    fn zwj_emoji_segments_remain_non_word_with_hebrew_fallback() {
+        let mut editor = Editor::default();
+        for text in ["a‍😀!b", "א‍😀!b"] {
+            editor.replace(text.into());
+            editor.cursor = 0;
+            editor.action("tui.editor.cursorWordRight");
+            assert_eq!(&editor.text[..editor.cursor], &text[..text.len() - 1]);
+            editor.action("tui.editor.cursorWordLeft");
+            assert_eq!(editor.cursor, 0);
+            editor.action("tui.editor.deleteWordForward");
+            assert_eq!(editor.text, "b");
+            editor.action("tui.editor.undo");
+            editor.cursor = text.len() - 1;
+            editor.action("tui.editor.deleteWordBackward");
+            assert_eq!(editor.text, "b");
+        }
+        editor.replace("אב'".into());
+        editor.cursor = 0;
+        editor.action("tui.editor.cursorWordRight");
+        assert_eq!(&editor.text[..editor.cursor], "אב");
     }
 
     #[test]
