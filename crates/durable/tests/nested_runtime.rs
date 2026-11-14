@@ -930,3 +930,84 @@ async fn cancellation_after_panic_preserves_report_and_prevents_replay() {
             .contains("sensitive")
     );
 }
+
+struct PendingNested {
+    invoked: AtomicUsize,
+    polled: AtomicUsize,
+}
+#[async_trait]
+impl Tool for PendingNested {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.invoked.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: "child-job".into(),
+        }
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        self.polled.fetch_add(1, Ordering::SeqCst);
+        Some(Outcome::Succeeded("finished".into()))
+    }
+}
+
+#[tokio::test]
+async fn nested_pending_is_not_polled_and_blocks_parent_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let child = Arc::new(PendingNested {
+        invoked: AtomicUsize::new(0),
+        polled: AtomicUsize::new(0),
+    });
+    let options = || Options {
+        model: Arc::new(FakeModel),
+        tools: vec![
+            RegisteredTool {
+                tool: Arc::new(Parent),
+                replay: ReplayPolicy::Safe,
+            },
+            RegisteredTool {
+                tool: child.clone(),
+                replay: ReplayPolicy::Safe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let id;
+    {
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        let (_, reason) = h
+            .blocked(id)
+            .unwrap()
+            .expect("unresolved nested result must block");
+        assert!(reason.contains("nested tool requires reconciliation"));
+    }
+    {
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.resume_conversation(id, &cancel).await.unwrap();
+        assert!(h.blocked(id).unwrap().is_some());
+    }
+    assert_eq!(child.invoked.load(Ordering::SeqCst), 1);
+    assert_eq!(child.polled.load(Ordering::SeqCst), 0);
+}
