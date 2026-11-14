@@ -201,6 +201,8 @@ Saved silent-overflow recovery runs before checking the current auto-compaction
 setting or model window. A resumed run restores request and output limits from
 its journal; missing or unconfirmed usage reserves the request's full output
 allowance, while a replayed reply or summary is charged once.
+If cancellation arrives before silent recovery begins, it returns cancellation
+without delivering queued steering or marking the saved operation complete.
 Overflow recovery remains partial: when an
 interrupted operation may have invoked an extension hook or sent an unconfirmed
 summary request, native does not repeat the ambiguous operation. Retry-required

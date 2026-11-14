@@ -1980,7 +1980,7 @@ impl Agent<'_> {
         followups: &mut mpsc::Receiver<T>,
     ) -> Result<()> {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Err(Error::Cancelled);
         }
         let branch = session.branch();
         let pending_silent_request = branch
@@ -8581,6 +8581,76 @@ mod tree_tests {
             },
         };
         let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        for steering in [false, true] {
+            let mut cancelled_session = Session::from_records(session.records().to_vec()).unwrap();
+            let steering_id = Uuid::new_v4();
+            if steering {
+                cancelled_session
+                    .append(Event::InputQueued {
+                        input: crate::QueuedInput {
+                            id: steering_id,
+                            kind: crate::InputKind::Steer,
+                            content: "retain me".into(),
+                        },
+                    })
+                    .unwrap();
+            }
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            assert!(matches!(
+                agent
+                    .compact_silent_overflow(
+                        &mut cancelled_session,
+                        run_id,
+                        &ExtensionStates::new(),
+                        &cancel,
+                        &mut |_| {},
+                        &mut inputs
+                    )
+                    .await,
+                Err(Error::Cancelled)
+            ));
+            assert!(resumable_compaction_run(&cancelled_session).is_some());
+            if steering {
+                assert!(
+                    cancelled_session
+                        .queued_inputs()
+                        .iter()
+                        .any(|input| input.input.id == steering_id)
+                );
+            }
+
+            let cancel = CancellationToken::new();
+            let mut observer = |notification: Notification<'_>| {
+                if matches!(notification, Notification::Committed(record) if matches!(record.event, Event::Run { state: RunState::Running, .. }))
+                {
+                    cancel.cancel();
+                }
+            };
+            assert!(matches!(
+                agent
+                    .run_correlated(
+                        &mut cancelled_session,
+                        run_id,
+                        None,
+                        &mut inputs,
+                        &cancel,
+                        &mut observer
+                    )
+                    .await,
+                Err(Error::Cancelled)
+            ));
+            assert!(resumable_compaction_run(&cancelled_session).is_some());
+            if steering {
+                assert!(
+                    cancelled_session
+                        .queued_inputs()
+                        .iter()
+                        .any(|input| input.input.id == steering_id)
+                );
+                assert!(!cancelled_session.records().iter().any(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)));
+            }
+        }
         let failure = agent
             .run_correlated(
                 &mut session,
