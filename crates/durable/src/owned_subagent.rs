@@ -378,6 +378,83 @@ mod tests {
         assert!(h.conversation(child).unwrap().abort_requested);
     }
 
+    #[test]
+    fn standalone_driver_rejection_leaves_graph_unchanged_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let foreground = h
+            .ensure_task_owned_subagent(task, owner.clone(), "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let background = h
+            .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
+            .unwrap()
+            .child;
+        let driver = h.start_tasks(Default::default()).unwrap();
+        assert!(matches!(
+            driver.request_abort(task),
+            Err(crate::task_driver::Error::Task(
+                crate::task_scheduler::Error::ForegroundAbortUnsupported
+            ))
+        ));
+        assert!(!driver.get(task).unwrap().unwrap().abort_requested());
+        assert!(!h.conversation(foreground).unwrap().abort_requested);
+        assert!(!h.conversation(background).unwrap().abort_requested);
+        driver.shutdown().unwrap();
+        drop(h);
+
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(
+            !TaskStore::new(h.subagent_store().unwrap())
+                .load(task)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(!h.conversation(foreground).unwrap().abort_requested);
+        assert!(!h.conversation(background).unwrap().abort_requested);
+    }
+
+    #[test]
+    fn standalone_driver_abort_races_foreground_admission_atomically() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+            let (task, owner) = setup(&mut h);
+            let driver = h.start_tasks(Default::default()).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let mut worker = h.worker();
+            let b = barrier.clone();
+            let admission = std::thread::spawn(move || {
+                b.wait();
+                worker.ensure_task_owned_subagent(task, owner, "fg", config(), Mode::Foreground)
+            });
+            barrier.wait();
+            let abort = driver.request_abort(task);
+            let admitted = admission.join().unwrap();
+            match admitted {
+                Ok(child) => {
+                    assert!(matches!(
+                        abort,
+                        Err(crate::task_driver::Error::Task(
+                            crate::task_scheduler::Error::ForegroundAbortUnsupported
+                        ))
+                    ));
+                    assert!(!h.conversation(child.child).unwrap().abort_requested);
+                    assert!(!driver.get(task).unwrap().unwrap().abort_requested());
+                }
+                Err(_) => {
+                    assert!(abort.is_ok());
+                    assert!(driver.get(task).unwrap().unwrap().abort_requested());
+                }
+            }
+            driver.shutdown().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn scheduler_cancels_active_foreground_but_not_background() {
         use std::sync::atomic::{AtomicUsize, Ordering};
