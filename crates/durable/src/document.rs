@@ -21,7 +21,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Signal(#[from] crate::task_store::Error),
-    #[error("self-delivery or a repeated typed signal key cannot be staged")]
+    #[error("self-delivery or an unsupported repeated typed signal cannot be staged")]
     SignalComposition,
     #[error("invalid or unsupported document operations or stale base")]
     InvalidOperations,
@@ -1203,7 +1203,7 @@ pub struct TaskDocuments<'a> {
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
     signal: OwnedBatch,
-    signal_keys: HashSet<(uuid::Uuid, String, String)>,
+    signal_keys: HashMap<(uuid::Uuid, String, String), crate::task_store::SignalResult>,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
 }
@@ -1224,7 +1224,7 @@ impl<'a> TaskDocuments<'a> {
                 checks: Vec::new(),
                 mutations: Vec::new(),
             },
-            signal_keys: HashSet::new(),
+            signal_keys: HashMap::new(),
             child_reads: HashMap::new(),
             keyed_children: Vec::new(),
             revision: store.document_snapshot()?,
@@ -1332,7 +1332,10 @@ impl<'a> TaskDocuments<'a> {
     /// outcome is provisional until this task's checkpoint commits. A conflict
     /// replays only registered replay-safe handlers. Supply a fresh clock value
     /// on replay; elapsed monotonic time is checked at the storage commit boundary.
-    /// Clock jumps after staging are not observed. Self-delivery is excluded.
+    /// Clock jumps after staging are not observed. Repeating a delivered or
+    /// duplicate key validates the new payload and returns duplicate without
+    /// staging another receipt; an invalid value may be retried. Repeats after
+    /// a closed or missing target and self-delivery remain unsupported.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1345,8 +1348,32 @@ impl<'a> TaskDocuments<'a> {
             return Err(Error::ReadAfterWrite);
         }
         let identity = (task_id, token.name().to_owned(), key.to_owned());
-        if task_id == self.task.id() || self.signal_keys.contains(&identity) {
+        if task_id == self.task.id() {
             return Err(Error::SignalComposition);
+        }
+        if let Some(previous) = self.signal_keys.get(&identity) {
+            if matches!(
+                previous,
+                crate::task_store::SignalResult::Delivered
+                    | crate::task_store::SignalResult::Duplicate
+            ) {
+                return match crate::task_store::Signal::new_typed(
+                    uuid::Uuid::nil(),
+                    task_id,
+                    token,
+                    key,
+                    value,
+                ) {
+                    Ok(_) => Ok(crate::task_store::SignalResult::Duplicate),
+                    Err(crate::task_store::Error::InvalidSignalPayload) => {
+                        Ok(crate::task_store::SignalResult::Invalid)
+                    }
+                    Err(error) => Err(error.into()),
+                };
+            }
+            if *previous != crate::task_store::SignalResult::Invalid {
+                return Err(Error::SignalComposition);
+            }
         }
         let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
             task_id,
@@ -1397,7 +1424,7 @@ impl<'a> TaskDocuments<'a> {
             }
             self.signal.mutations.push(mutation);
         }
-        self.signal_keys.insert(identity);
+        self.signal_keys.insert(identity, result);
         Ok(result)
     }
 

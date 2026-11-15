@@ -391,10 +391,18 @@ impl Handler for MultiSend {
                 );
             }
         }
-        assert!(matches!(
-            docs.signal_at(Uuid::from_u128(2), &token, "a", json!(4), now),
-            Err(pi_rs_durable::document::Error::SignalComposition)
-        ));
+        let repeated = docs.signal_at(Uuid::from_u128(2), &token, "a", json!(4), now);
+        if matches!(
+            results[0],
+            SignalResult::Delivered | SignalResult::Duplicate
+        ) {
+            assert_eq!(repeated.unwrap(), SignalResult::Duplicate);
+        } else {
+            assert!(matches!(
+                repeated,
+                Err(pi_rs_durable::document::Error::SignalComposition)
+            ));
+        }
         self.attempts.lock().unwrap().push(results);
         docs.get(&addr()).unwrap();
         docs.put(&addr(), json!({"done":true}).as_object().unwrap().clone())
@@ -850,5 +858,95 @@ fn committed_typed_signal_survives_process_death_before_wait_poll() {
         ts.deliver_signal_at(receiver, &token, "a", json!(2), 60_001)
             .unwrap(),
         SignalResult::Duplicate
+    );
+}
+
+struct RepeatedTypedSignal {
+    results: Arc<Mutex<Vec<SignalResult>>>,
+}
+impl Handler for RepeatedTypedSignal {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        let token = SignalToken::with_schema("answer", 1, json!({"type":"integer"})).unwrap();
+        let target = Uuid::from_u128(2);
+        let results = vec![
+            docs.signal_at(target, &token, "a", json!(1), 99).unwrap(),
+            docs.signal_at(target, &token, "a", json!("invalid"), 99)
+                .unwrap(),
+            docs.signal_at(target, &token, "a", json!(2), 99).unwrap(),
+            docs.signal_at(target, &token, "b", json!("invalid"), 99)
+                .unwrap(),
+            docs.signal_at(target, &token, "b", json!(3), 99).unwrap(),
+            docs.signal_at(target, &token, "b", json!(4), 99).unwrap(),
+        ];
+        *self.results.lock().unwrap() = results;
+        docs.get(&addr()).unwrap();
+        docs.put(
+            &addr(),
+            json!({"committed":true}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        Ok(Step::Continue(cp("done")))
+    }
+}
+
+#[test]
+fn repeated_staged_signal_validates_each_value_and_commits_one_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    setup(&path, None);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry.register(
+        "sender",
+        true,
+        RepeatedTypedSignal {
+            results: results.clone(),
+        },
+    );
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    scheduler.submit(&task(1, "sender")).unwrap();
+    assert!(scheduler.tick(99).unwrap());
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![
+            SignalResult::Delivered,
+            SignalResult::Invalid,
+            SignalResult::Duplicate,
+            SignalResult::Invalid,
+            SignalResult::Delivered,
+            SignalResult::Duplicate
+        ]
+    );
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    let token = SignalToken::with_schema("answer", 1, json!({"type":"integer"})).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .read_typed_signal(Uuid::from_u128(2), &token, "a")
+            .unwrap(),
+        Some(json!(1))
+    );
+    assert_eq!(
+        TaskStore::new(&db)
+            .read_typed_signal(Uuid::from_u128(2), &token, "b")
+            .unwrap(),
+        Some(json!(3))
+    );
+    assert_eq!(
+        Documents::new(&db).get(&addr()).unwrap().unwrap().value["committed"],
+        true
+    );
+    assert_eq!(
+        TaskStore::new(&db)
+            .load(Uuid::from_u128(1))
+            .unwrap()
+            .unwrap()
+            .task
+            .checkpoint()
+            .phase,
+        "done"
     );
 }

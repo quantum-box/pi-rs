@@ -474,8 +474,10 @@ Current limits and differences from upstream Pi Durable:
   an empty key with a future deadline, monotonic elapsed time since staging is
   checked under the storage write lock; crossing the deadline conflicts and
   replay must sample a fresh timestamp. Clock jumps after staging are not observed.
-  Repeating a typed key in the same invocation is rejected; upstream instead
-  returns duplicate for the repeated delivery. Self-delivery is excluded (upstream
+  Repeating a key after a delivered or duplicate result validates the new
+  value and returns duplicate without changing the staged receipt. An invalid
+  value may be retried; repeats after a closed or missing target remain
+  unsupported. Self-delivery is excluded (upstream
   permits it), and signal checks cannot overlap another batch
   participant's checked keys (for example an entry's task ancestor or a newly
   created child). It is not a general host transaction or upstream `tx.signal`.
