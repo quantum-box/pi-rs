@@ -105,8 +105,17 @@ pub fn resolve(
     let mut paths = Vec::new();
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
+        let pattern_path = path.strip_prefix(&workspace).unwrap_or(&path);
+        let patterned = pattern_path.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        });
+        let path = if kind == Kind::Prompt && !patterned {
+            normalize_resource_path(&path)
+        } else {
+            path
+        };
         if kind == Kind::Skill {
-            let normalized = normalize_skill_path(&path);
+            let normalized = normalize_resource_path(&path);
             let pattern_path = normalized.strip_prefix(&workspace).unwrap_or(&normalized);
             let patterned = pattern_path.components().any(|component| {
                 matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
@@ -119,14 +128,8 @@ pub fn resolve(
                 continue;
             }
         }
-        if kind == Kind::Prompt && !path.exists() {
-            let pattern_path = path.strip_prefix(&workspace).unwrap_or(&path);
-            let patterned = pattern_path.components().any(|component| {
-                matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
-            });
-            if !patterned {
-                continue;
-            }
+        if kind == Kind::Prompt && !patterned && !path.exists() {
+            continue;
         }
         if !skill_file_is_markdown(kind, &path, warnings) {
             continue;
@@ -262,7 +265,7 @@ fn skill_file_is_markdown(kind: Kind, path: &Path, warnings: &mut Vec<String>) -
     if kind != Kind::Skill {
         return true;
     }
-    let normalized = normalize_skill_path(path);
+    let normalized = normalize_resource_path(path);
     let path = normalized.as_path();
     if path.is_file()
         && !path
@@ -344,7 +347,7 @@ fn expand(
 ) -> Result<Vec<PathBuf>> {
     let normalized;
     let path = if kind == Kind::Skill {
-        normalized = normalize_skill_path(path);
+        normalized = normalize_resource_path(path);
         normalized.as_path()
     } else {
         path
@@ -387,13 +390,19 @@ fn collect(
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
     if kind == Kind::Skill {
-        collect_matching(&normalize_skill_path(path), kind, required, warnings, None)
+        collect_matching(
+            &normalize_resource_path(path),
+            kind,
+            required,
+            warnings,
+            None,
+        )
     } else {
         collect_matching(path, kind, required, warnings, None)
     }
 }
 // Node's resolve removes lexical dot components without resolving symlinks.
-fn normalize_skill_path(path: &Path) -> PathBuf {
+fn normalize_resource_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {

@@ -1775,19 +1775,21 @@ mod tests {
             "missing.md".into(),
             "missing-directory".into(),
             "broken-link.md".into(),
-            "valid.md".into(),
+            "missing-directory/../valid.md".into(),
         ];
         let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.prompts["valid"].body, "available");
         assert!(resources.warnings.is_empty(), "{:?}", resources.warnings);
-        args.prompt_template = vec!["no-match-*.md".into()];
-        assert!(
-            Resources::load(&args)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("matched no files")
-        );
+        for pattern in ["no-match-*.md", "no-match-*/../valid.md"] {
+            args.prompt_template = vec![pattern.into()];
+            assert!(
+                Resources::load(&args)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("matched no files")
+            );
+        }
     }
 
     #[test]
