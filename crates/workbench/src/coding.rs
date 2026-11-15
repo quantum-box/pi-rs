@@ -3051,11 +3051,17 @@ impl CodingTool {
                 _ = cancellation.cancelled(), if !cancelled => {
                     cancelled = true;
                     process.terminate();
+                    if status.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                 }
                 _ = &mut deadline, if !cancelled => {
                     timed_out = true;
                     cancelled = true;
                     process.terminate();
+                    if status.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                 }
                 result = process.wait(), if status.is_none() => {
                     status = Some(result?);
@@ -3066,7 +3072,7 @@ impl CodingTool {
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
                     stdout_open = count != 0;
-                    if count != 0 && status.is_some() {
+                    if count != 0 && status.is_some() && !cancelled {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
                     if sanitize_user_output {
@@ -3088,7 +3094,7 @@ impl CodingTool {
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
-                    if count != 0 && status.is_some() {
+                    if count != 0 && status.is_some() && !cancelled {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
                     if sanitize_user_output {
@@ -6141,6 +6147,47 @@ mod tests {
         let output = result.tool_content();
         assert!(output.contains("out11\n"), "{output:?}");
         assert!(output.contains("err11\n"), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_or_timed_out_shell_bounds_active_descendant_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        // The child escapes the shell's process group and continues writing after
+        // the shell exits, so killing the group cannot close its inherited pipe.
+        let command = "python3 -c 'import os,time; os.setsid(); [(print(i,flush=True),time.sleep(.02)) for i in range(100)]' & exit 0";
+        let cancellation = pi_rs::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            cancel.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tool.shell(&json!({"command":command}), &cancellation),
+        )
+        .await
+        .expect("cancelled shell kept draining")
+        .unwrap();
+        task.await.unwrap();
+        assert!(result.cancelled);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tool.shell(
+                &json!({"command":command,"timeout":0.25}),
+                &pi_rs::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("timed out shell kept draining")
+        .unwrap();
+        assert!(result.timed_out);
     }
 
     #[tokio::test]
