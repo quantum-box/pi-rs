@@ -1,7 +1,7 @@
 //! Pi theme roles and color formats, rendered without embedded escape strings.
 use crossterm::style::Color;
 use palette::convert::FromColorUnclamped;
-use palette::{FromColor, LinSrgb, Okhsl, Oklab, Oklch, Srgb};
+use palette::{FromColor, LinSrgb, Okhsl, Oklch, Srgb};
 use pi_rs::{Error, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -79,7 +79,7 @@ fn unpack_terminal_color(value: u32) -> Option<[u8; 3]> {
     (value & 0x1000000 != 0).then_some([(value >> 16) as u8, (value >> 8) as u8, value as u8])
 }
 
-fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
+pub(super) fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
     let color = |rgb: [u8; 3]| {
         Srgb::new(
             rgb[0] as f64 / 255.0,
@@ -92,8 +92,8 @@ fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
     let white_contrast = 1.05 / (luminance + 0.05);
     let black_contrast = (luminance + 0.05) / 0.05;
     if let Some(foreground) = foreground {
-        let foreground_lightness = Oklab::from_color(color(foreground).into_linear()).l;
-        let background_lightness = Oklab::from_color(linear).l;
+        let foreground_lightness = super::system_theme_color::rgb_to_lab(foreground)[0];
+        let background_lightness = super::system_theme_color::rgb_to_lab(background)[0];
         if (foreground_lightness - background_lightness).abs() > 0.05 {
             let dark = foreground_lightness > background_lightness;
             if (if dark { white_contrast } else { black_contrast }) >= 4.5 {
@@ -153,6 +153,7 @@ pub struct Theme {
     pub name: String,
     pub path: Option<PathBuf>,
     colors: BTreeMap<String, Color>,
+    dim: BTreeSet<String>,
 }
 /// Watches the selected custom file while retaining the last valid theme.
 pub struct ThemeWatcher {
@@ -332,95 +333,43 @@ impl Theme {
             name: definition.name,
             path,
             colors,
+            dim: BTreeSet::new(),
         })
     }
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
     }
     pub fn is_dim(&self, role: &str) -> bool {
-        self.name == "system"
-            && matches!(
-                role,
-                "customMessageText"
-                    | "muted"
-                    | "dim"
-                    | "thinkingText"
-                    | "toolOutput"
-                    | "mdLinkUrl"
-                    | "mdQuote"
-                    | "mdQuoteBorder"
-                    | "mdHr"
-                    | "mdCodeBlockBorder"
-                    | "toolDiffContext"
-                    | "syntaxComment"
-                    | "scrollbarTrack"
-                    | "scrollbarThumb"
-                    | "searchMatchText"
-                    | "borderMuted"
-                    | "thinkingOff"
-            )
+        self.dim.contains(role)
     }
     pub fn system() -> Self {
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
+        let foreground = unpack_terminal_color(TERMINAL_FOREGROUND.load(Ordering::Relaxed));
         let palette = TERMINAL_PALETTE.lock().expect("terminal palette").current;
-        Self::system_with_palette(
+        Self::system_generated(
             background,
-            palette.as_ref().map(|palette| palette.as_slice()),
+            foreground,
+            palette.as_ref().map(|p| p.as_slice()),
         )
     }
 
-    fn system_with_palette(background: Option<[u8; 3]>, palette: Option<&[[u8; 3]]>) -> Self {
-        // Pi uses the terminal's ANSI slots when no palette has been reported.
-        let roles = [
-            ("accent", 5),
-            ("border", 4),
-            ("borderAccent", 5),
-            ("success", 2),
-            ("error", 1),
-            ("warning", 3),
-            ("mdHeading", 3),
-            ("mdLink", 4),
-            ("mdCode", 5),
-            ("mdCodeBlock", 2),
-            ("mdListBullet", 5),
-            ("customMessageLabel", 5),
-            ("toolDiffAdded", 2),
-            ("toolDiffRemoved", 1),
-            ("bashMode", 2),
-            ("syntaxKeyword", 4),
-            ("syntaxFunction", 3),
-            ("syntaxVariable", 6),
-            ("syntaxString", 2),
-            ("syntaxNumber", 5),
-            ("syntaxType", 5),
-            ("thinkingMinimal", 4),
-            ("thinkingLow", 4),
-            ("thinkingMedium", 6),
-            ("thinkingHigh", 5),
-            ("thinkingXhigh", 13),
-            ("thinkingMax", 1),
-        ];
-        // Without a reported background Pi leaves colors as ANSI indices, even if
-        // a palette was reported. The terminal can then render its own colors.
-        let palette = background
-            .and(palette)
-            .filter(|palette| palette.len() == 16);
+    fn system_generated(
+        background: Option<[u8; 3]>,
+        foreground: Option<[u8; 3]>,
+        palette: Option<&[[u8; 3]]>,
+    ) -> Self {
+        let generated = super::system_theme::generate(background, foreground, palette, 1.0, None);
         Self {
             name: "system".into(),
             path: None,
-            colors: roles
-                .into_iter()
-                .map(|(key, index)| {
-                    let color = palette
-                        .map(|palette| {
-                            let [r, g, b] = palette[index as usize];
-                            Color::Rgb { r, g, b }
-                        })
-                        .unwrap_or(Color::AnsiValue(index));
-                    (key.into(), color)
-                })
-                .collect(),
+            colors: generated.colors,
+            dim: generated.dim,
         }
+    }
+
+    #[cfg(test)]
+    fn system_with_palette(background: Option<[u8; 3]>, palette: Option<&[[u8; 3]]>) -> Self {
+        Self::system_generated(background, None, palette)
     }
 }
 
@@ -721,16 +670,21 @@ mod tests {
         assert!(theme.is_dim("muted"));
 
         let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette));
-        assert_eq!(
-            theme.color("accent"),
-            Color::Rgb {
-                r: 17,
-                g: 34,
-                b: 51
-            }
-        );
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!theme.is_dim("muted"));
         let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette[..15]));
-        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+    }
+
+    #[test]
+    fn system_theme_uses_reported_foreground_and_generated_dim_flags() {
+        let bg = Some([0, 0, 0]);
+        let bright = Theme::system_generated(bg, Some([255, 255, 255]), None);
+        let weak = Theme::system_generated(bg, Some([40, 40, 40]), None);
+        assert_eq!(bright.color("text"), Color::Reset);
+        assert!(matches!(weak.color("text"), Color::Rgb { .. }));
+        assert!(!bright.is_dim("muted"));
+        assert!(Theme::system_generated(None, None, None).is_dim("muted"));
     }
 
     #[test]
@@ -740,10 +694,10 @@ mod tests {
             assert_eq!(state.record(index, [index, 10, 20]), index == 0);
         }
         let previous = state.current.unwrap();
-        assert_eq!(
+        assert!(matches!(
             Theme::system_with_palette(Some([0, 0, 0]), Some(&previous)).color("accent"),
-            Color::Rgb { r: 5, g: 10, b: 20 }
-        );
+            Color::Rgb { .. }
+        ));
 
         state.begin();
         for index in 0..15 {
@@ -757,9 +711,9 @@ mod tests {
         }
         assert!(state.record(15, [15, 30, 40]));
         let updated = state.current.unwrap();
-        assert_eq!(
+        assert_ne!(
             Theme::system_with_palette(Some([0, 0, 0]), Some(&updated)).color("accent"),
-            Color::Rgb { r: 5, g: 30, b: 40 }
+            Theme::system_with_palette(Some([0, 0, 0]), Some(&previous)).color("accent")
         );
         state.begin();
         for index in 0..16 {
