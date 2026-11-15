@@ -146,9 +146,16 @@ pub(super) fn top_level(source: &str) -> Vec<MathBlock> {
         let limit = source[line..]
             .find('\n')
             .map_or(source.len(), |offset| line + offset + 1);
+        let opener = line
+            + source[line..limit]
+                .bytes()
+                .take_while(|byte| *byte == b' ')
+                .count();
+        // Inline Markdown syntax inside a display expression belongs to the
+        // math block. Only a container covering its opener can shield it.
         let overlaps = merged
             .get(blocked)
-            .is_some_and(|range| range.start < limit && range.end > line);
+            .is_some_and(|range| range.start <= opener && range.end > opener);
         if !overlaps
             && let Some(MathToken {
                 raw_len,

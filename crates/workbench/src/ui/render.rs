@@ -2532,6 +2532,9 @@ mod tests {
         assert_eq!(rendered("$$x$$\n$$y$$", 80), ["x", "", "y"]);
         assert_eq!(rendered("\\[\nx^2", 80), ["\\[", "x^2"]);
         assert_eq!(rendered("$$\\unknown{x}$$", 80), ["$$\\unknown{x}$$"]);
+        assert_eq!(rendered("$$[x](y)$$", 80), ["[x](y)"]);
+        assert_eq!(rendered("$$`x`$$", 80), ["`x`"]);
+        assert_eq!(rendered("$$<x>$$", 80), ["< x >"]);
         for newline in ["\r\n", "\r"] {
             let source = format!("before{newline}$${newline}x^2{newline}$${newline}after");
             assert_eq!(rendered(&source, 80), ["before", "", "x²", "", "after"]);
