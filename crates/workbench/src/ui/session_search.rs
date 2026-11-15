@@ -430,6 +430,11 @@ mod tests {
         assert!(combined.score(&doc("aZ")).is_some());
         assert!(combined.score(&doc("a\r")).is_none());
         assert!(combined.score(&doc("éZ")).is_none());
+        let bracket = Query::new(r"re:^[\w].$");
+        assert!(bracket.score(&doc("aZ")).is_some());
+        assert!(bracket.score(&doc("éZ")).is_none());
+        // Dot rewriting is intentionally skipped for user bracket expressions.
+        assert!(bracket.score(&doc("a\r")).is_some());
         assert_eq!(js_regex_dots("(?s:.)", "(?s:.)"), "(?s:.)");
         assert_eq!(js_regex_dots("[.]", "[.]"), "[.]");
         assert!(Query::new(r"re:(?s)^.$").score(&doc("\n")).is_some());
