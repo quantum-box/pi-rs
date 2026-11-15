@@ -395,7 +395,7 @@ a task driver and register the exact selected extension handler with
 `Registry::register_shared` and its replay policy; a missing driver leaves the
 hook phase pending, and a mismatched registration fails closed. Reopen with the
 extensions and driver registered to resume. Harness users explicitly resume;
-Scheduler polls waiting phases. Ordinary hook and section errors are reported and skipped; before-tool errors block dispatch. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful supported continuation in creation order, including empty strings and text/image arrays supported by core or a selected durable-aware provider; extensions must bound continuation loops; queued input or reset takes precedence. Failed hook children are reported when observed; invalid child outcomes are ignored without reporting. Unregistered or foreign task requests are reported and skipped. Provider-body hooks require an explicitly configured adapter; tool-result termination and handoff are supported by opt-in `KeyedTool` implementations. Before-tool hooks may sleep on
+Scheduler polls waiting phases. Ordinary hook and section errors are reported and skipped; before-tool errors block dispatch. An after-tools child that succeeds with exactly `{ "terminate": true }` settles the current inputs with the tool-calling answer and runs after-run hooks before queued inputs. onYield may create tasks and chooses the first successful supported continuation in creation order, including empty strings and text/image arrays supported by core or a selected durable-aware provider; extensions must bound continuation loops; queued input or reset takes precedence. Failed hook children are reported when observed; invalid after-tools decisions are reported, while unsupported on-yield outcomes are ignored. Unregistered or foreign task requests are reported and skipped. Provider-body hooks require an explicitly configured adapter; tool-result termination and handoff are supported by opt-in `KeyedTool` implementations. Before-tool hooks may sleep on
 an absolute deadline or named conversation signals; `send_signal` deduplicates
 receipts, and wake consumption commits atomically with the phase transition.
 Invalid sleep requests (no deadline or signal, a negative deadline, an empty name, or a consumed or expired signal key) finish the call without dispatch, with an `invalid_park` error diagnostic. The result passes through after-tool hooks before publication; a failed store read remains a runtime error. The hook sees the wake in `Context.snapshot["phase"]["ToolPreparing"]["wake"]`.
@@ -451,8 +451,11 @@ Current limits and differences from upstream Pi Durable:
   compaction still requires an idle conversation. Streaming checkpoints retain
   text for aborted display but not all upstream live view/metadata semantics.
   The subagent link primitive does not provide an automatic conversation/task ownership tree.
-- Generic task waits support deadlines, signals, deadline-or-signal sleeps, and direct-child
-  all/any/fail-fast joins. `register_with_abort` and `request_abort` provide
+- Generic task waits support deadlines, signals, deadline-or-signal sleeps,
+  all-settled and any joins over existing tasks, and direct-child fail-fast joins.
+  Empty any waits wake on the next scheduling pass. Wait admission checks
+  durable wait and foreground ownership cycles and fences concurrent graph puts.
+  `register_with_abort` and `request_abort` provide
   persisted, child-first cleanup for generic task-owned subtrees. Cleanup must
   tolerate replay after a crash; a missing handler produces a failed record.
   Handler steps run synchronously, so an abort request waits for the active step

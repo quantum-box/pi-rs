@@ -40,10 +40,11 @@ pub enum WaitFor {
         until_millis: Option<i64>,
         signals: Vec<String>,
     },
+    /// Wake when all named tasks are terminal, including unowned tasks.
     Tasks(Vec<Uuid>),
     /// Wake when any named task ends. An empty set is immediately ready.
     TasksAny(Vec<Uuid>),
-    /// Wait for all; a failed child cancels the other listed subtrees.
+    /// Wait for all direct children; a failure cancels the other listed subtrees.
     TasksFailFast(Vec<Uuid>),
 }
 

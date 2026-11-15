@@ -1729,6 +1729,79 @@ mod tests {
     }
 
     #[test]
+    fn all_settled_wait_accepts_unowned_success_and_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("waiter", true, |task: &Task| {
+            if task.checkpoint().phase == "start" {
+                Ok(Step::Wait {
+                    checkpoint: cp("woken"),
+                    condition: WaitFor::Tasks(vec![Uuid::from_u128(2), Uuid::from_u128(3)]),
+                    children: vec![],
+                })
+            } else {
+                assert_eq!(
+                    task.ended_children(),
+                    Some(&[Uuid::from_u128(2), Uuid::from_u128(3)][..])
+                );
+                Ok(Step::Succeed(json!("done")))
+            }
+        });
+        registry.register("other", true, |task: &Task| {
+            if task.id() == Uuid::from_u128(2) {
+                Ok(Step::Fail("failed".into()))
+            } else {
+                Ok(Step::Succeed(json!("ok")))
+            }
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "waiter", true, 3))
+            .unwrap();
+        scheduler
+            .submit(&task(2, owner.clone(), "other", true, 3))
+            .unwrap();
+        scheduler.submit(&task(3, owner, "other", true, 3)).unwrap();
+        for _ in 0..4 {
+            assert!(scheduler.tick(0).unwrap());
+        }
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            &TaskState::Failed("failed".into())
+        );
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(3)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("ok"))
+        );
+    }
+
+    #[test]
+    fn fail_fast_rejects_unowned_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("waiter", true, |_: &Task| {
+            Ok(Step::Wait {
+                checkpoint: cp("wait"),
+                condition: WaitFor::TasksFailFast(vec![Uuid::from_u128(2)]),
+                children: vec![],
+            })
+        });
+        registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "waiter", true, 3))
+            .unwrap();
+        scheduler.submit(&task(2, owner, "other", true, 3)).unwrap();
+        assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
+    }
+
+    #[test]
     fn external_wait_rejects_wait_and_ownership_cycles() {
         for owner_cycle in [false, true] {
             let dir = tempfile::tempdir().unwrap();
