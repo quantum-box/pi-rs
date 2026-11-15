@@ -1315,7 +1315,7 @@ impl Transaction {
         store.commit_with_task_documents(&self.checks, &self.mutations, &self.acquisitions)?;
         Ok(())
     }
-    pub(crate) fn commit_task_graph(self, store: &Store, version: u64) -> Result<(), Error> {
+    pub(crate) fn commit_task_graph(&self, store: &Store, version: u64) -> Result<(), Error> {
         store.commit_task_documents_with_prefix_put_fence(
             &self.checks,
             &self.mutations,

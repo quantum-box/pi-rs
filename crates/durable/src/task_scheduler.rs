@@ -243,6 +243,8 @@ pub enum Error {
     Registration,
     #[error("invalid ownership or child creation")]
     Ownership,
+    #[error("a pending ownership abort must settle task {0}")]
+    PendingAbort(Uuid),
     #[error("foreground owned conversation abort is not supported")]
     ForegroundAbortUnsupported,
     #[error("task has live owned children")]
@@ -461,6 +463,12 @@ pub struct Scheduler {
     failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
     // Interrupted invocations held until pending fail-fast marks have landed.
     deferred_recovery: HashSet<Uuid>,
+    #[cfg(test)]
+    result_commit_hook: Option<Arc<dyn Fn(usize, &durable_store::Store) + Send + Sync>>,
+    #[cfg(test)]
+    failure_commit_hook: Option<Arc<dyn Fn(usize, &durable_store::Store) + Send + Sync>>,
+    #[cfg(test)]
+    inject_batch_prepare_conflict: bool,
     activity: crate::worker_activity::WorkerActivity,
 }
 impl Scheduler {
@@ -530,6 +538,12 @@ impl Scheduler {
             poisoned: false,
             failed_migrations: HashMap::new(),
             deferred_recovery: HashSet::new(),
+            #[cfg(test)]
+            result_commit_hook: None,
+            #[cfg(test)]
+            failure_commit_hook: None,
+            #[cfg(test)]
+            inject_batch_prepare_conflict: false,
             activity: Default::default(),
         };
         scheduler.reconcile()?;
@@ -545,6 +559,37 @@ impl Scheduler {
             Ok(())
         }
     }
+    fn abort_failed_running(
+        &mut self,
+        owner: &Arc<OwnedStore>,
+        root: Uuid,
+        running: Uuid,
+        gate: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), Error> {
+        if let Some(harness) = self.validator.as_mut() {
+            drop(gate);
+            owner
+                .conversation_controls()
+                .fence(|| harness.abort_owned_graph(None, Some(root)))
+                .map_err(|e| Error::Handler(format!("fail-fast abort: {e:?}")))?;
+            let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+            let current = self.ts().load(running)?.ok_or(Error::Ownership)?;
+            if !current.task.abort_requested() {
+                return Err(Error::Ownership);
+            }
+            self.ts().update(&current, |task| task.yield_ready())?;
+        } else {
+            request_abort_subtree(&self.ts(), root)?;
+            let current = self.ts().load(running)?.ok_or(Error::Ownership)?;
+            if !current.task.abort_requested() {
+                return Err(Error::Ownership);
+            }
+            self.ts().update(&current, |task| task.yield_ready())?;
+            drop(gate);
+        }
+        Ok(())
+    }
+
     fn registered(&self, task: &Task) -> Result<&Registration, Error> {
         let entry = self
             .registry
@@ -1196,20 +1241,29 @@ impl Scheduler {
         // handler ran. The gate keeps cooperating admissions out until commit.
         let original_version = running.version;
         let running = current.clone();
+        // Capture before scanning so the eventual commit cannot pass a
+        // concurrent task/ownership graph update after this decision.
+        let success_graph_version = owner
+            .store()
+            .put_version()
+            .map_err(task_store::Error::from)?;
+        if let Some(root) =
+            pending_abort_root_for_running(&self.ts(), running.task.id(), self.validator.is_none())?
+        {
+            self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+            self.poisoned = false;
+            return Ok(true);
+        }
         let step = match result {
             Ok(step) => step,
             Err(reason) if running.task.is_task_tool() => {
-                self.finish_failed_completed(&running, reason)?;
-                self.poisoned = false;
-                return Ok(true);
+                return self.finish_running_failure(&running, reason, &owner, _gate);
             }
             Err(reason) => return Err(Error::Handler(reason)),
         };
         if let Step::Fail(reason) = step {
             // Failure discards all staged effects, including child admissions.
-            self.finish_failed_completed(&running, reason)?;
-            self.poisoned = false;
-            return Ok(true);
+            return self.finish_running_failure(&running, reason, &owner, _gate);
         }
         let mut staged = std::mem::take(&mut documents.keyed_children);
         let parent_key = task_store::key(running.task.id());
@@ -1234,10 +1288,6 @@ impl Scheduler {
                 return Err(Error::Registration);
             }
         }
-        let success_graph_version = owner
-            .store()
-            .put_version()
-            .map_err(task_store::Error::from)?;
         let mut next = running.clone();
         let mut children = Vec::new();
         let mut wait_graph_fence = false;
@@ -1278,18 +1328,18 @@ impl Scheduler {
                     let mut seen = std::collections::HashSet::new();
                     for id in waiting {
                         if *id == next.task.id() || !seen.insert(*id) {
-                            return self.reject_invalid_wait(&running);
+                            return self.reject_invalid_wait(&running, &owner, _gate);
                         }
                         if !children.iter().any(|c| c.id() == *id)
                             && !staged.iter().any(|(_, _, p)| p.child == *id)
                         {
                             let Some(child) = self.ts().load(*id)? else {
-                                return self.reject_invalid_wait(&running);
+                                return self.reject_invalid_wait(&running, &owner, _gate);
                             };
                             if matches!(condition, WaitFor::TasksFailFast(_))
                                 && child.task.owner() != &TaskOwner::Task(next.task.id())
                             {
-                                return self.reject_invalid_wait(&running);
+                                return self.reject_invalid_wait(&running, &owner, _gate);
                             }
                         }
                     }
@@ -1306,7 +1356,9 @@ impl Scheduler {
                     match validate_wait_graph(owner.store(), next.task.id(), waiting, &new_children)
                     {
                         Ok(()) => (),
-                        Err(Error::Ownership) => return self.reject_invalid_wait(&running),
+                        Err(Error::Ownership) => {
+                            return self.reject_invalid_wait(&running, &owner, _gate);
+                        }
                         Err(error) => return Err(error),
                     }
                 }
@@ -1343,10 +1395,22 @@ impl Scheduler {
             let targets: Vec<_> = new_children.keys().copied().collect();
             match validate_wait_graph(owner.store(), next.task.id(), &targets, &new_children) {
                 Ok(()) => (),
-                Err(Error::Ownership) => return self.reject_invalid_wait(&running),
+                Err(Error::Ownership) => return self.reject_invalid_wait(&running, &owner, _gate),
                 Err(error) => return Err(error),
             }
         }
+        // Retain the proposed graph and wait targets for validation after an
+        // unrelated graph-only conflict, without running the handler again.
+        let retry_children: HashMap<Uuid, Task> = new_children
+            .iter()
+            .map(|(id, task)| (*id, (*task).clone()))
+            .collect();
+        let retry_wait = match next.task.state() {
+            TaskState::Waiting(
+                WaitFor::Tasks(ids) | WaitFor::TasksAny(ids) | WaitFor::TasksFailFast(ids),
+            ) => ids.clone(),
+            _ => Vec::new(),
+        };
         next.task
             .record_completed_attempt(&running.task)
             .map_err(Error::Transition)?;
@@ -1360,18 +1424,40 @@ impl Scheduler {
         let mut transaction = crate::document::Transaction::new();
         documents.stage_acquisitions(&mut transaction)?;
         documents.rebase_self_signal_check(running.version);
-        let mut document_batch = match documents.into_batch() {
+        let document_result = documents.into_batch();
+        #[cfg(test)]
+        let document_result = if self.inject_batch_prepare_conflict {
+            Err(crate::document::Error::Store(
+                durable_store::Error::Conflict {
+                    key: b"test/prepare".to_vec(),
+                },
+            ))
+        } else {
+            document_result
+        };
+        let mut document_batch = match document_result {
             Ok(batch) => batch,
             Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {
+                if let Some(root) = pending_abort_root_for_running(
+                    &self.ts(),
+                    running.task.id(),
+                    self.validator.is_none(),
+                )? {
+                    self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+                    self.poisoned = false;
+                    return Ok(true);
+                }
                 // A staged runtime checkpoint observed a newer root while
                 // preparing; no effects committed. Follow normal replay policy.
                 if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
                     self.ts().update(&current, |task| task.yield_ready())?;
                 } else {
-                    self.finish_failed(
+                    return self.finish_running_conflict(
                         &current,
                         "document conflict: execution outcome requires reconciliation".into(),
-                    )?;
+                        &owner,
+                        _gate,
+                    );
                 }
                 self.poisoned = false;
                 return Ok(true);
@@ -1422,18 +1508,79 @@ impl Scheduler {
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
-        let success = matches!(
-            next.task.state(),
-            TaskState::Succeeded(_) | TaskState::Completing(_)
-        );
-        let committed = if success || wait_graph_fence {
-            transaction.commit_task_graph(owner.store(), success_graph_version)
-        } else {
-            transaction.commit(owner.store())
+        let _ = wait_graph_fence;
+        const GRAPH_RETRIES: usize = 8;
+        let mut graph_version = success_graph_version;
+        let mut attempt = 0;
+        let committed = loop {
+            #[cfg(test)]
+            if let Some(hook) = &self.result_commit_hook {
+                hook(attempt, owner.store());
+            }
+            let result = transaction.commit_task_graph(owner.store(), graph_version);
+            let Err(crate::document::Error::Store(durable_store::Error::Conflict { ref key })) =
+                result
+            else {
+                break result;
+            };
+            if !(key == task_store::PREFIX
+                || key == crate::ownership_edge::PREFIX
+                || key == b"runtime/conversation/")
+                || attempt >= GRAPH_RETRIES
+            {
+                break result;
+            }
+            graph_version = owner
+                .store()
+                .put_version()
+                .map_err(task_store::Error::from)?;
+            if let Some(root) = pending_abort_root_for_running(
+                &self.ts(),
+                running.task.id(),
+                self.validator.is_none(),
+            )? {
+                self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+                self.poisoned = false;
+                return Ok(true);
+            }
+            if matches!(next.task.state(), TaskState::Succeeded(_))
+                && has_live_owned(owner.store(), next.task.id(), &self.ts().list()?)?
+            {
+                break result;
+            }
+            let refs: HashMap<_, _> = retry_children
+                .iter()
+                .map(|(id, task)| (*id, task))
+                .collect();
+            if !retry_wait.is_empty() {
+                match validate_wait_graph(owner.store(), next.task.id(), &retry_wait, &refs) {
+                    Ok(()) => (),
+                    Err(Error::Ownership) => break result,
+                    Err(e) => return Err(e),
+                }
+            }
+            if !refs.is_empty() {
+                let targets: Vec<_> = refs.keys().copied().collect();
+                match validate_wait_graph(owner.store(), next.task.id(), &targets, &refs) {
+                    Ok(()) => (),
+                    Err(Error::Ownership) => break result,
+                    Err(e) => return Err(e),
+                }
+            }
+            attempt += 1;
         };
         match committed {
             Ok(()) => {}
             Err(crate::document::Error::Store(durable_store::Error::Conflict { key })) => {
+                if let Some(root) = pending_abort_root_for_running(
+                    &self.ts(),
+                    running.task.id(),
+                    self.validator.is_none(),
+                )? {
+                    self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+                    self.poisoned = false;
+                    return Ok(true);
+                }
                 let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
                 if current.version != running.version {
                     if current.task.abort_requested() {
@@ -1454,10 +1601,12 @@ impl Scheduler {
                     if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
                         self.ts().update(&current, |task| task.yield_ready())?;
                     } else {
-                        self.finish_failed(
+                        return self.finish_running_conflict(
                             &current,
                             "document conflict: execution outcome requires reconciliation".into(),
-                        )?;
+                            &owner,
+                            _gate,
+                        );
                     }
                 } else {
                     return Err(
@@ -1600,10 +1749,52 @@ impl Scheduler {
         self.finish_failed_inner(parent, reason, true)
     }
 
-    fn reject_invalid_wait(&mut self, parent: &task_store::StoredTask) -> Result<bool, Error> {
-        self.finish_failed_completed(parent, "invalid task wait or ownership cycle".into())?;
+    fn finish_running_failure(
+        &mut self,
+        parent: &task_store::StoredTask,
+        reason: String,
+        owner: &Arc<OwnedStore>,
+        gate: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, Error> {
+        match self.finish_failed_completed(parent, reason) {
+            Ok(()) => drop(gate),
+            Err(Error::PendingAbort(root)) => {
+                self.abort_failed_running(owner, root, parent.task.id(), gate)?
+            }
+            Err(error) => return Err(error),
+        }
         self.poisoned = false;
         Ok(true)
+    }
+    fn finish_running_conflict(
+        &mut self,
+        parent: &task_store::StoredTask,
+        reason: String,
+        owner: &Arc<OwnedStore>,
+        gate: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, Error> {
+        match self.finish_failed_inner_with_pending(parent, reason, false, true, || {}) {
+            Ok(()) => drop(gate),
+            Err(Error::PendingAbort(root)) => {
+                self.abort_failed_running(owner, root, parent.task.id(), gate)?
+            }
+            Err(error) => return Err(error),
+        }
+        self.poisoned = false;
+        Ok(true)
+    }
+    fn reject_invalid_wait(
+        &mut self,
+        parent: &task_store::StoredTask,
+        owner: &Arc<OwnedStore>,
+        gate: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, Error> {
+        self.finish_running_failure(
+            parent,
+            "invalid task wait or ownership cycle".into(),
+            owner,
+            gate,
+        )
     }
     fn finish_failed(&self, parent: &task_store::StoredTask, reason: String) -> Result<(), Error> {
         self.finish_failed_inner(parent, reason, false)
@@ -1622,6 +1813,17 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         reason: String,
         completed: bool,
+        before_commit: impl FnMut(),
+    ) -> Result<(), Error> {
+        self.finish_failed_inner_with_pending(parent, reason, completed, completed, before_commit)
+    }
+
+    fn finish_failed_inner_with_pending(
+        &self,
+        parent: &task_store::StoredTask,
+        reason: String,
+        completed: bool,
+        check_pending: bool,
         mut before_commit: impl FnMut(),
     ) -> Result<(), Error> {
         let store = self.ts();
@@ -1630,6 +1832,22 @@ impl Scheduler {
                 .store()
                 .put_version()
                 .map_err(task_store::Error::from)?;
+            if check_pending
+                && let Some(current) = store.load(parent.task.id())?
+                && current.version != parent.version
+                && current.task.abort_requested()
+            {
+                return Err(Error::PendingAbort(parent.task.id()));
+            }
+            if check_pending
+                && let Some(root) = pending_abort_root_for_running(
+                    &store,
+                    parent.task.id(),
+                    self.validator.is_none(),
+                )?
+            {
+                return Err(Error::PendingAbort(root));
+            }
             let records = store.list()?;
             let live = has_live_owned(store.store(), parent.task.id(), &records)?;
             let mut next = parent.clone();
@@ -1646,6 +1864,10 @@ impl Scheduler {
                     .map_err(Error::Transition)?;
             }
             let batch = store.prepare_save(&[Save::Update(&next)])?;
+            #[cfg(test)]
+            if let Some(hook) = &self.failure_commit_hook {
+                hook(attempt, store.store());
+            }
             before_commit();
             match store.store().commit_with_prefix_put_fence(
                 &batch.checks,
@@ -1664,9 +1886,12 @@ impl Scheduler {
                             || key == crate::ownership_edge::PREFIX
                             || key == b"runtime/conversation/") =>
                 {
-                    if store.load(parent.task.id())?.map(|current| current.version)
-                        != Some(parent.version)
-                    {
+                    let current = store.load(parent.task.id())?;
+                    if current.as_ref().map(|item| item.version) != Some(parent.version) {
+                        if check_pending && current.is_some_and(|item| item.task.abort_requested())
+                        {
+                            return Err(Error::PendingAbort(parent.task.id()));
+                        }
                         return Err(task_store::Error::Store(durable_store::Error::Conflict {
                             key: task_store::key(parent.task.id()),
                         })
@@ -1714,6 +1939,89 @@ pub(crate) fn failed_sibling_to_abort(
             })
         })
         .flatten())
+}
+
+// Locate a pending cancellation root that owns this invocation. The caller holds
+// the task gate and fences graph puts through the result commit.
+fn pending_abort_root_for_running(
+    ts: &TaskStore<'_>,
+    running: Uuid,
+    include_background: bool,
+) -> Result<Option<Uuid>, Error> {
+    let records = ts.list()?;
+    let edges = crate::ownership_edge::EdgeStore::new(ts.store());
+    let mut roots = Vec::new();
+    for parent in &records {
+        if let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = parent.task.state()
+            && !parent.task.abort_requested()
+            && failed_sibling_to_abort(ts, parent, ids)?.is_some()
+        {
+            roots.extend(ids.iter().copied().filter(|id| {
+                records.iter().any(|entry| {
+                    entry.task.id() == *id
+                        && !entry.task.is_terminal()
+                        && !entry.task.abort_requested()
+                        && !matches!(entry.task.state(), TaskState::CompletingFailed(_))
+                })
+            }));
+        }
+        if matches!(parent.task.state(), TaskState::CompletingFailed(_))
+            && !parent.task.is_task_tool()
+            && !parent.task.abort_requested()
+        {
+            roots.push(parent.task.id());
+        }
+        if parent.task.is_task_tool() && parent.task.is_completing() {
+            roots.extend(records.iter().filter_map(|child| {
+                (child.task.owner() == &TaskOwner::Task(parent.task.id())
+                    && child.task.is_task_tool()
+                    && !child.task.is_terminal()
+                    && !child.task.abort_requested())
+                .then_some(child.task.id())
+            }));
+        }
+    }
+    for root in roots {
+        let mut pending = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(task_id) = pending.pop() {
+            if !seen.insert(task_id) {
+                continue;
+            }
+            if task_id == running {
+                return Ok(Some(root));
+            }
+            let task = records
+                .iter()
+                .find(|entry| entry.task.id() == task_id)
+                .ok_or(Error::Ownership)?;
+            for child in &records {
+                if child.task.owner() == &TaskOwner::Task(task_id)
+                    && (include_background || !child.task.is_background())
+                {
+                    pending.push(child.task.id());
+                }
+            }
+            for edge in edges
+                .children(task_id)
+                .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+            {
+                if edge.edge.task_owner != *task.task.owner() {
+                    return Err(Error::Ownership);
+                }
+                if edge.edge.mode == crate::ownership_edge::Mode::Foreground {
+                    for child in &records {
+                        if child.task.owner() == &TaskOwner::Conversation(edge.edge.child)
+                            && (include_background || !child.task.is_background())
+                        {
+                            pending.push(child.task.id());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 // Follow durable waits and live foreground ownership from every target. The
@@ -4585,6 +4893,646 @@ mod tests {
         assert_eq!(*observed.lock().unwrap(), vec![Some(vec![a, b])]);
         assert_eq!(
             scheduler.get(parent).unwrap().unwrap().ended_children(),
+            None
+        );
+    }
+
+    #[test]
+    fn fail_fast_conflict_fallback_rescans_before_retirement() {
+        use crate::document::{Address, Documents, TaskDocuments, Transaction};
+        use durable_store::Expected;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Staging {
+            owned: Address,
+            conflict: Address,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.acquire_owned(&self.owned).unwrap();
+                docs.put(
+                    &self.owned,
+                    json!({"value":"staged"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                docs.get(&self.conflict).unwrap();
+                docs.put(
+                    &self.conflict,
+                    json!({"value":"staged"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("must discard")))
+            }
+        }
+        for mode in ["prepare", "commit", "direct"] {
+            let dir = tempfile::tempdir().unwrap();
+            let owned = Address {
+                scope: "fallback".into(),
+                name: "owned".into(),
+                key: mode.into(),
+            };
+            let conflict = Address {
+                scope: "fallback".into(),
+                name: "conflict".into(),
+                key: mode.into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let cleanups = Arc::new(AtomicUsize::new(0));
+            let observed = cleanups.clone();
+            let mut registry = Registry::default();
+            registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+            registry.register_with_abort(
+                "child",
+                false,
+                Staging {
+                    owned: owned.clone(),
+                    conflict: conflict.clone(),
+                    calls: calls.clone(),
+                },
+                move |_: &Task| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step::Succeed(json!(null)))
+                },
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let mut parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                false,
+                3,
+            );
+            parent.start().unwrap();
+            parent
+                .wait(WaitFor::TasksFailFast(vec![
+                    Uuid::from_u128(2),
+                    Uuid::from_u128(3),
+                ]))
+                .unwrap();
+            let child = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+            let sibling = task(3, TaskOwner::Task(parent.id()), "other", false, 3);
+            scheduler
+                .ts()
+                .save(&[
+                    Save::Create(&parent),
+                    Save::Create(&child),
+                    Save::Create(&sibling),
+                ])
+                .unwrap();
+            let mut tx = Transaction::new();
+            tx.acquire_task_document(&owned, child.id()).unwrap();
+            tx.put(
+                &owned,
+                Expected::Missing,
+                json!({"value":"original"}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.put(
+                &conflict,
+                Expected::Missing,
+                json!({"value":"initial"}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(scheduler.owner().store()).unwrap();
+            scheduler.inject_batch_prepare_conflict = mode == "prepare";
+            let conflict_address = conflict.clone();
+            scheduler.result_commit_hook = Some(Arc::new(move |attempt, store| {
+                if mode != "prepare" && attempt == 0 {
+                    let version = Documents::new(store)
+                        .get(&conflict_address)
+                        .unwrap()
+                        .unwrap()
+                        .version;
+                    let mut tx = Transaction::new();
+                    tx.put(
+                        &conflict_address,
+                        Expected::Version(version),
+                        json!({"value":"external"}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                    tx.commit(store).unwrap();
+                }
+            }));
+            let injected = Arc::new(AtomicBool::new(false));
+            let once = injected.clone();
+            scheduler.failure_commit_hook = Some(Arc::new(move |_, store| {
+                if !once.swap(true, Ordering::SeqCst) {
+                    let ts = TaskStore::new(store);
+                    if mode == "direct" {
+                        request_abort_subtree(&ts, Uuid::from_u128(2)).unwrap();
+                    } else {
+                        let sibling = ts.load(Uuid::from_u128(3)).unwrap().unwrap();
+                        ts.update(&sibling, |task| {
+                            task.start()?;
+                            task.fail("failure".into())
+                        })
+                        .unwrap();
+                    }
+                }
+            }));
+            scheduler.tick(0).unwrap();
+            let after = scheduler.get(child.id()).unwrap().unwrap();
+            assert_eq!(after.state(), &TaskState::Ready, "{mode}");
+            assert!(after.abort_requested(), "{mode}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                Documents::new(scheduler.owner().store())
+                    .get(&owned)
+                    .unwrap()
+                    .unwrap()
+                    .value["value"],
+                "original"
+            );
+            assert!(matches!(
+                scheduler.get(parent.id()).unwrap().unwrap().state(),
+                TaskState::Waiting(_)
+            ));
+            scheduler.tick(0).unwrap();
+            assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                scheduler.get(child.id()).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+            assert!(
+                Documents::new(scheduler.owner().store())
+                    .get(&owned)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn fail_fast_failure_commit_rescans_after_graph_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut running = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        running.start_attempt(Uuid::new_v4()).unwrap();
+        let failed = task(3, TaskOwner::Task(parent.id()), "child", false, 3);
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&running),
+                Save::Create(&failed),
+            ])
+            .unwrap();
+        let snapshot = scheduler.ts().load(running.id()).unwrap().unwrap();
+        let mut injected = false;
+        let result =
+            scheduler.finish_failed_inner_with(&snapshot, "own failure".into(), true, || {
+                if !injected {
+                    injected = true;
+                    let sibling = scheduler.ts().load(failed.id()).unwrap().unwrap();
+                    scheduler
+                        .ts()
+                        .update(&sibling, |task| {
+                            task.start()?;
+                            task.fail("failure".into())
+                        })
+                        .unwrap();
+                }
+            });
+        assert!(matches!(result, Err(Error::PendingAbort(id)) if id == running.id()));
+        assert_eq!(
+            scheduler.get(running.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+    }
+
+    #[test]
+    fn fail_fast_graph_conflict_marks_running_before_result_commit() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register_with_abort(
+            "child",
+            false,
+            move |_: &Task| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(Step::Succeed(json!("must discard")))
+            },
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let child = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        let failed = task(3, TaskOwner::Task(parent.id()), "failed", false, 3);
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&child),
+                Save::Create(&failed),
+            ])
+            .unwrap();
+        let injected = Arc::new(AtomicBool::new(false));
+        let once = injected.clone();
+        scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                let ts = TaskStore::new(store);
+                let sibling = ts.load(Uuid::from_u128(3)).unwrap().unwrap();
+                ts.update(&sibling, |task| {
+                    task.start()?;
+                    task.fail("failure".into())
+                })
+                .unwrap();
+            }
+        }));
+        scheduler.tick(0).unwrap();
+        let held = scheduler.get(child.id()).unwrap().unwrap();
+        assert_eq!(held.state(), &TaskState::Ready);
+        assert!(held.abort_requested());
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(scheduler.get(parent.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[test]
+    fn graph_retry_preserves_staged_signal_checks() {
+        use crate::document::TaskDocuments;
+        use crate::task_store::{SignalResult, SignalToken};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Sender(Arc<AtomicUsize>);
+        impl Handler for Sender {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    docs.signal_at(Uuid::from_u128(3), &token, "key", json!(1), 99)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                Ok(Step::Succeed(json!("must not commit")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register("sender", false, Sender(calls.clone()));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let sender = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "sender",
+            false,
+            3,
+        );
+        let other = task(
+            2,
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            "other",
+            false,
+            3,
+        );
+        let receiver = task(
+            3,
+            TaskOwner::Conversation(Uuid::from_u128(11)),
+            "receiver",
+            false,
+            3,
+        );
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&sender),
+                Save::Create(&other),
+                Save::Create(&receiver),
+            ])
+            .unwrap();
+        scheduler.result_commit_hook = Some(Arc::new(move |attempt, store| {
+            let ts = TaskStore::new(store);
+            if attempt == 0 {
+                let other = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
+                ts.update(&other, |task| {
+                    task.start()?;
+                    task.yield_ready()
+                })
+                .unwrap();
+            } else if attempt == 1 {
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    ts.deliver_signal_at(Uuid::from_u128(3), &token, "key", json!(2), 99)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+            }
+        }));
+        scheduler.tick(0).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            scheduler.get(sender.id()).unwrap().unwrap().state(),
+            TaskState::Failed(_)
+        ));
+        let token = SignalToken::new("answer", 1).unwrap();
+        assert_eq!(
+            scheduler
+                .ts()
+                .deliver_signal_at(receiver.id(), &token, "key", json!(2), 99)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        assert_eq!(
+            scheduler
+                .ts()
+                .read_typed_signal(receiver.id(), &token, "key")
+                .unwrap(),
+            Some(json!(2))
+        );
+    }
+
+    #[test]
+    fn graph_retry_preserves_original_running_version_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut registry = Registry::default();
+        registry.register("handler", false, move |_: &Task| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(json!("must not commit")))
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "handler",
+            false,
+            3,
+        );
+        let other = task(
+            2,
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            "other",
+            false,
+            3,
+        );
+        scheduler
+            .ts()
+            .save(&[Save::Create(&root), Save::Create(&other)])
+            .unwrap();
+        scheduler.result_commit_hook = Some(Arc::new(move |attempt, store| {
+            let ts = TaskStore::new(store);
+            if attempt == 0 {
+                let other = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
+                ts.update(&other, |task| {
+                    task.start()?;
+                    task.yield_ready()
+                })
+                .unwrap();
+            } else if attempt == 1 {
+                let running = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+                ts.update(&running, |task| task.advance(cp("external")))
+                    .unwrap();
+            }
+        }));
+        assert!(scheduler.tick(0).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let current = scheduler.ts().load(root.id()).unwrap().unwrap().task;
+        assert_eq!(current.state(), &TaskState::Running);
+        assert_eq!(current.checkpoint().phase, "external");
+    }
+
+    #[test]
+    fn result_graph_conflicts_retry_without_replaying_handler() {
+        use crate::document::{Address, Documents, TaskDocuments, Transaction};
+        use durable_store::Expected;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Staging {
+            calls: Arc<AtomicUsize>,
+            address: Address,
+        }
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.get(&self.address).map_err(|e| e.to_string())?;
+                docs.put(
+                    &self.address,
+                    json!({"value":"handler"}).as_object().unwrap().clone(),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!("done")))
+            }
+        }
+        for mode in ["once", "persistent", "document", "graph_then_document"] {
+            let dir = tempfile::tempdir().unwrap();
+            let address = Address {
+                scope: "retry".into(),
+                name: mode.into(),
+                key: "".into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "handler",
+                false,
+                Staging {
+                    calls: calls.clone(),
+                    address: address.clone(),
+                },
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let root = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "handler",
+                false,
+                3,
+            );
+            let other = task(
+                2,
+                TaskOwner::Conversation(Uuid::from_u128(10)),
+                "other",
+                false,
+                3,
+            );
+            scheduler
+                .ts()
+                .save(&[Save::Create(&root), Save::Create(&other)])
+                .unwrap();
+            let mut tx = Transaction::new();
+            tx.put(
+                &address,
+                Expected::Missing,
+                json!({"value":"initial"}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(scheduler.owner().store()).unwrap();
+            let hook_address = address.clone();
+            let observed = writes.clone();
+            scheduler.result_commit_hook = Some(Arc::new(move |attempt, store| {
+                if (mode == "document" && attempt == 0)
+                    || (mode == "graph_then_document" && attempt == 1)
+                {
+                    let version = Documents::new(store)
+                        .get(&hook_address)
+                        .unwrap()
+                        .unwrap()
+                        .version;
+                    let mut tx = Transaction::new();
+                    tx.put(
+                        &hook_address,
+                        Expected::Version(version),
+                        json!({"value":"external"}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                    tx.commit(store).unwrap();
+                    observed.fetch_add(1, Ordering::SeqCst);
+                } else if mode == "persistent"
+                    || ((mode == "once" || mode == "graph_then_document") && attempt == 0)
+                {
+                    let ts = TaskStore::new(store);
+                    let snapshot = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
+                    ts.update(&snapshot, |task| {
+                        task.start()?;
+                        task.yield_ready()
+                    })
+                    .unwrap();
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+            scheduler.tick(0).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{mode}");
+            let state = scheduler.get(root.id()).unwrap().unwrap();
+            let document = Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .unwrap();
+            if mode == "once" {
+                assert_eq!(state.state(), &TaskState::Succeeded(json!("done")));
+                assert_eq!(document.value["value"], "handler");
+                assert_eq!(writes.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(
+                    matches!(state.state(), TaskState::Failed(reason) if reason.contains("document conflict")),
+                    "{mode}: {:?}",
+                    state.state()
+                );
+                assert_eq!(
+                    document.value["value"],
+                    if mode == "document" || mode == "graph_then_document" {
+                        "external"
+                    } else {
+                        "initial"
+                    }
+                );
+                if mode == "persistent" {
+                    assert_eq!(writes.load(Ordering::SeqCst), 9);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fail_fast_result_scan_finds_running_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let root = task(2, TaskOwner::Task(parent.id()), "root", false, 3);
+        let mut failed = task(3, TaskOwner::Task(parent.id()), "failed", false, 3);
+        failed.start().unwrap();
+        failed.fail("failure".into()).unwrap();
+        let mut nested = task(4, TaskOwner::Task(root.id()), "nested", false, 3);
+        nested.start().unwrap();
+        let unrelated = task(
+            5,
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            "other",
+            false,
+            3,
+        );
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&root),
+                Save::Create(&failed),
+                Save::Create(&nested),
+                Save::Create(&unrelated),
+            ])
+            .unwrap();
+        assert_eq!(
+            pending_abort_root_for_running(&scheduler.ts(), nested.id(), false).unwrap(),
+            Some(root.id())
+        );
+        assert_eq!(
+            pending_abort_root_for_running(&scheduler.ts(), unrelated.id(), false).unwrap(),
             None
         );
     }

@@ -604,8 +604,12 @@ relabeling an operation UUID as a task ID.
 Upstream pi 04fd0897 marks the other live children after a non-completed
 outcome, then waits for all children to settle before resuming their parent.
 pi-rs marks sibling ownership graphs in separate scheduling passes; failed and
-cancelled outcomes trigger the cascade. Recovery holds interrupted invocations under pending
-fail-fast graphs until their marks have been persisted. A completing TaskTool
+cancelled outcomes trigger the cascade. Before publishing a handler result,
+the scheduler rechecks fail-fast ownership and fences concurrent graph puts;
+a relevant abort discards staged output and drains that graph. Graph-only conflicts revalidate ownership and retry the original checked batch
+up to eight times without rerunning the handler. Persistent contention or document conflicts
+follow the invocation's replay policy. Recovery holds interrupted invocations under pending fail-fast graphs
+until their marks have been persisted. A completing TaskTool
 similarly defers interrupted nested TaskTool roots until its nested abort mark;
 direct generic children are not included in that normal settlement cascade. A
 running synchronous handler is allowed to return before its abort cleanup and

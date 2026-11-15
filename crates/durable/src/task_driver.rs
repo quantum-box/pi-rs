@@ -1672,8 +1672,8 @@ mod tests {
         let (_, mut watch) = docs.watch_task_document(&owned).unwrap();
         let driver = Driver::start(scheduler);
         entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        // The driver owns the scheduler lock while invoking the handler. Use the
-        // same fail-fast selection and abort transaction as tick, under its gate.
+        // Commit the failure through the task gate, while the driver remains
+        // inside the handler. Do not invoke the abort helper from the test.
         let marking_owner = owner.clone();
         thread::spawn(move || {
             let _gate = marking_owner.task_gate().lock().unwrap();
@@ -1685,18 +1685,12 @@ mod tests {
                     task.fail("failure".into())
                 })
                 .unwrap();
-            let parent = tasks.load(parent_id).unwrap().unwrap();
-            let selected =
-                task_scheduler::failed_sibling_to_abort(&tasks, &parent, &[running_id, failed_id])
-                    .unwrap();
-            assert_eq!(selected, Some(running_id));
-            task_scheduler::request_abort_subtree(&tasks, running_id).unwrap();
         })
         .join()
         .unwrap();
-        let marked = driver.get(running_id).unwrap().unwrap();
-        assert_eq!(marked.state(), &TaskState::Running);
-        assert!(marked.abort_requested());
+        let running = driver.get(running_id).unwrap().unwrap();
+        assert_eq!(running.state(), &TaskState::Running);
+        assert!(!running.abort_requested());
         assert!(matches!(
             driver.get(parent_id).unwrap().unwrap().state(),
             TaskState::Waiting(_)
@@ -1710,10 +1704,9 @@ mod tests {
         assert!(parent_rx.try_recv().is_err());
         release_tx.send(()).unwrap();
         cleanup_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        assert_eq!(
-            driver.get(running_id).unwrap().unwrap().state(),
-            &TaskState::Running
-        );
+        let cleanup = driver.get(running_id).unwrap().unwrap();
+        assert_eq!(cleanup.state(), &TaskState::Running);
+        assert!(cleanup.abort_requested());
         assert!(matches!(
             driver.get(parent_id).unwrap().unwrap().state(),
             TaskState::Waiting(_)
