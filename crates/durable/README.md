@@ -1416,3 +1416,26 @@ interrupted handlers, and discarded transitions do not acquire one. Older
 executors do not enforce this fence and must not participate in a handoff. It
 records that the handler returned and its transition committed, not that detached work
 or another executor has joined, and it is not wired to live parking.
+
+### Preparing host-supplied images
+
+The opt-in `images` module implements the host-input portion of upstream image fitting. Provide an `ImageProcessor` that decodes, orients and resizes/re-encodes images and call `fit_image` for bytes or `fit_images` for ordered text/image JSON blocks **before** passing them to `append_user_blocks`, `reset_with_blocks`, or a continuation. `ImageLimits::default()` is 2000 by 2000 pixels and 4.5 MiB of base64; `ImageLimitOverrides::resolve` applies per-field overrides supplied by the host. pi-rs does not currently expose upstream's model image-limit catalog, so hosts choose limits. The module has no built-in image codec: a processor is responsible for decoding and enforcing limits, and should return `None` for images it cannot prepare. Every image is passed to it, with the MIME type sniffed from bytes when recognized. Conversion and resizing notes include the coordinate scale. Errors, invalid base64 and unpreparable images are omitted with notes; hosts should include those notes in model-visible text if desired. Text and unchanged image blocks retain their metadata and order; a changed image is replaced by the processor's image block, as upstream does. Invalid block shapes return an error instead of partially transforming the input.
+
+For example, given an existing `processor`, `harness` and conversation `id`:
+
+```rust,ignore
+use pi_rs_durable::images::{fit_images, FittedImages, ImageLimits};
+
+let blocks = match fit_images(&blocks, ImageLimits::default(), &processor).await? {
+    FittedImages::Unchanged => blocks,
+    FittedImages::Fitted { mut content, notes } => {
+        if !notes.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": notes.join(" ")}));
+        }
+        content
+    }
+};
+harness.append_user_blocks(id, blocks)?;
+```
+
+`FittedImages::Unchanged` means the caller should keep the original array; `FittedImages::Fitted` supplies the replacement array and notes. This is an explicit pre-admission API, not automatic fitting: stored images are never refitted when the model changes or a conversation reopens. Upstream's `fit-images` after-tool extension and Photon processor are not provided; pi-rs currently represents model-facing tool output as text and does not expose image blocks to after-tool hooks. No per-request provider or core changes are involved.

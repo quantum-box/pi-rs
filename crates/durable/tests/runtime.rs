@@ -2011,3 +2011,67 @@ async fn incremental_generation_progress_applies_and_completes() {
     watch.close();
     scheduler.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn fitted_blocks_survive_save_and_reopen_without_refitting() {
+    use pi_rs_durable::images::{
+        FittedImages, ImageLimits, ImageProcessor, PreparedImage, fit_images,
+    };
+    struct Processor(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ImageProcessor for Processor {
+        async fn prepare(
+            &self,
+            _: &[u8],
+            _: &str,
+            _: ImageLimits,
+        ) -> Result<Option<PreparedImage>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(PreparedImage {
+                data: "bmV3".into(),
+                mime_type: "image/png".into(),
+                resized: None,
+                converted_from: None,
+            }))
+        }
+    }
+    let processor = Processor(AtomicUsize::new(0));
+    let input = vec![
+        json!({"type":"text","text":"before"}),
+        json!({"type":"image","data":"b2xk","mimeType":"image/png"}),
+        json!({"type":"text","text":"after"}),
+    ];
+    let FittedImages::Fitted { content, .. } =
+        fit_images(&input, ImageLimits::default(), &processor)
+            .await
+            .unwrap()
+    else {
+        panic!()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let opts = || {
+        options(
+            Arc::new(FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            }),
+            Arc::new(FakeTool {
+                calls: AtomicUsize::new(0),
+                interrupt: false,
+                cancel: None,
+            }),
+            ReplayPolicy::Unsafe,
+        )
+    };
+    let mut h = Harness::open_paused(&path, opts()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.append_user_blocks(id, content.clone()).unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, opts()).unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().content_blocks[&0].blocks,
+        content
+    );
+    assert_eq!(processor.0.load(Ordering::SeqCst), 1);
+}
