@@ -1372,6 +1372,20 @@ impl SessionBuilder {
             self.model_name = name;
             self.model_provider = Some(provider);
         }
+        // Registered historical models must be active even before startup
+        // hooks run: synchronous checkout and fork can be called immediately.
+        if let Some((provider, name, _)) = session.model_identity_at(session.head())
+            && let Some(client) = branch_client(
+                &self.registry,
+                session.session_id(),
+                provider.as_deref(),
+                &name,
+            )
+        {
+            self.model = client;
+            self.model_name = name;
+            self.model_provider = provider;
+        }
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
@@ -4814,6 +4828,33 @@ mod tests {
             .navigate_tree(old, crate::TreeNavigationOptions::default())
             .await
             .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(session.prompt("one").await.unwrap(), "b");
+        assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkout_before_startup_inherits_registered_historical_model() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session.checkout(old).unwrap();
         assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
         assert_eq!(session.prompt("one").await.unwrap(), "b");
         assert_eq!(session.prompt("two").await.unwrap(), "b");
