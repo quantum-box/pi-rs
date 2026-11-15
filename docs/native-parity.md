@@ -1018,6 +1018,10 @@ The checkpoint passed 76 workspace tests and all-target Clippy.
 
 ### Owned SDK checkpoint
 
+Native SDK hosts can expand prompt template arguments using the same Pi-style
+substitution implementation as the CLI, including quoted arguments, defaults,
+slices, and non-recursive insertion. The host chooses when to apply expansion.
+
 `SessionBuilder` and `AgentSession` own a model, registry and journal across
 multiple prompts. `SessionControl` supports steering, follow-up input and abort
 from another task. Subscribers receive bounded, owned events without blocking
