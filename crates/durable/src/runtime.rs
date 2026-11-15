@@ -9309,6 +9309,7 @@ impl SummaryPlacementDriver {
                             | Phase::YieldTasksWaiting { .. }
                             | Phase::HookTasksWaiting { turns: Some(_), .. }
                     ) && state.active.is_some()
+                        || summary_tool_phase_eligible(&state)
                         || matches!(
                             state.phase,
                             Phase::Idle
@@ -10206,9 +10207,8 @@ impl Scheduler {
         Ok(true)
     }
 
-    /// Admit one independent summary while a model request is in flight.
-    /// Competing queued inputs, resets and application writes conservatively
-    /// make the pending result stale at the next boundary.
+    /// Admit an independent summary during a model request or an eligible
+    /// single-call tool attempt. Results settle at the next safe boundary.
     pub fn request_busy_independent_compaction(
         &mut self,
         conversation: Uuid,
@@ -10691,8 +10691,8 @@ impl Scheduler {
         }
         let (state, version) = self.harness.load_for_summary_placement(conversation)?;
         let busy_ok = allow_busy
-            && matches!(state.phase, Phase::ModelRunning { .. })
-            && state.active.is_some()
+            && (matches!(state.phase, Phase::ModelRunning { .. }) && state.active.is_some()
+                || summary_tool_phase_eligible(&state))
             && state.pending_independent_summary.is_none()
             && state.pending_resets.is_empty()
             && !state.submissions.iter().any(|s| s.status == Status::Queued);
@@ -11543,6 +11543,40 @@ impl Drop for Scheduler {
         // The poller is otherwise perpetual and would keep the owner alive.
         self.reporter_cancel.cancel();
     }
+}
+
+// Only a single issued call with a durable attempt can be selected while the
+// tool is active. Unknown/blocked outcomes and legacy attempts stay fenced.
+fn summary_tool_phase_eligible(state: &Conversation) -> bool {
+    if state.active.is_none() || state.abort_requested {
+        return false;
+    }
+    let (calls, index, operation) = match &state.phase {
+        Phase::ToolRunning {
+            calls,
+            index,
+            operation_id,
+            replay_ready: false,
+            dispatch_identity: Some(_),
+            ..
+        } => (calls, *index, *operation_id),
+        Phase::Pending {
+            calls,
+            index,
+            operation_id,
+            reference,
+            arguments: Some(_),
+            ..
+        } if !reference.is_empty() => (calls, *index, *operation_id),
+        _ => return false,
+    };
+    !operation.is_nil()
+        && calls.len() == 1
+        && index == 0
+        && state
+            .tool_attempt()
+            .is_some_and(|attempt| !attempt.attempt_id.is_nil())
+        && matches!(state.messages.last(), Some(Message::Assistant { calls: issued, .. }) if issued == calls)
 }
 
 // Prove that model progress has retained the selected ownership and inbox

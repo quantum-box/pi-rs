@@ -616,9 +616,12 @@ conversation also has no generation; a reset, compaction, or fork fences them.
 These checks do not enable busy manual compaction or provide upstream's full
 stale-submission API.
 `Scheduler::request_busy_independent_compaction` accepts a conversation while
-a single model request is running, with no queued inputs or resets at selection.
+a single model request is running or a single model-issued tool call is running
+or parked on a known pending reference, with no queued inputs or resets at
+selection. Tool admission requires a persisted attempt and a matching final
+assistant call; a running call also requires a dispatch identity.
 It persists a bounded selection snapshot. When summarization completes during
-an active model request, on-yield, after-run or after-tools hook, a parked
+an active model request or eligible tool call, on-yield, after-run or after-tools hook, a parked
 lifecycle hook task, or at idle, it checks the source prefix, context generation, original
 submission and write identities, and configuration.
 This permits append-only model progress and fenced model restarts, while queued
@@ -636,6 +639,12 @@ install the extension and task registries, adapter and summary provider before
 recovered workers are scheduled. Keep its returned task driver alive and shut
 it down after the scheduler. Task replay follows the registered handler policy;
 external task effects still require stable idempotency and reconciliation.
+The unfinished tool call is retained in the selected context, and the summary
+waits for the tool boundary and its result. An interrupted unsafe tool remains
+blocked until its outcome is reconciled; summary recovery does not redispatch
+it. Multiple calls in a tool round, task-owned tool waits, blocked or
+replay-ready tools, and unproven attempts are not eligible. A transient
+unsupported phase can conservatively make a completed summary stale.
 
 This is not a general ordered inbox: a changed context, changed selected
 identities or configuration, another unsupported phase, or an old operation

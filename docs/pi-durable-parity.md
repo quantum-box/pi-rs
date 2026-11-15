@@ -182,16 +182,22 @@ original audit table below remains a historical baseline.
 **Independent summary accounting checkpoint:** Completed generations are persisted before usage settlement, including invalid summaries whose usage still needs accounting. Per-attempt receipts record successful settlement for both measured generations and interrupted attempts; publication requires all relevant receipts. The private worker transfers a pending checkpoint only after acquiring the per-operation guard. A crash between provider acknowledgement and receipt requires replay with the same request ID and report, so external settlement must be idempotent. See [worker tests](../crates/durable/src/summary_worker_tests.rs).
 
 **Narrow busy independent summary:** A public opt-in accepts a summary while a
-model request is running. A bounded durable selection snapshot proves that any
+model request or one proven model-issued tool attempt is running, or that tool
+is parked on a known pending reference. A bounded durable selection snapshot proves that any
 intervening changes retain the original submission and write identities and
 configuration; the context generation and selected source prefix must also
 match. Append-only model progress and fenced model restarts can therefore use a
 later conversation version for the atomic placement ticket and pending marker
-while the model is running, in on-yield, after-run or after-tools hooks, in
+while the model or eligible tool is running or pending, in on-yield, after-run or after-tools hooks, in
 parked lifecycle hook task waits, or at idle. An after-tools hook's completed
 decision and child tasks commit with its phase transition; an admission race
 does not rerun the hook. A parked after-tools task settles the round first; a tool handoff
 changes context before the boundary and makes an older summary stale. The
+unfinished tool call is retained, and its result is settled before placement.
+Interrupted unsafe calls remain blocked until explicitly reconciled; summary
+recovery does not redispatch them. Multi-call rounds, task-owned tool waits,
+blocked or replay-ready tools, and unproven attempts remain ineligible; a
+transient unsupported phase can conservatively settle a result stale. The
 summary-and-task recovery constructor installs both registries before scheduling.
 On-yield decisions are checkpointed before inbox
 selection; an admission race does not rerun a completed hook. A crash before
@@ -206,7 +212,8 @@ withdraws it. Pending work survives reopen. The selection and hook snapshots
 share a 512 KiB limit, and the preceding reset prefix is limited to 128. Other
 changed contexts, unsupported phases, and old unbound operations fail closed.
 This is not a general ordered inbox. See
-[public tests](../crates/durable/tests/independent_compaction.rs).
+[public tests](../crates/durable/tests/independent_compaction.rs) and
+[tool concurrency tests](../crates/durable/tests/independent_tool_compaction.rs).
 
 **Independent summary worker and placement:** An opt-in public idle path starts a scheduler-owned independent worker, runs selected `beforeCompact` hooks from a persisted snapshot with operation-scoped memo and optional instructions, settles usage under the per-operation fence, and automatically places or marks its result stale. Conversation graph abort marks running owned summaries and waits for cleanup while preserving an already queued summary write; foreground idle waits include them. Admission still checks the conversation's own phase and queue rather than its owned graph. Placement requires the exact captured conversation version and preserves retained provenance. The recovery constructor installs its adapter and extensions first, scans at most 128 total records of at most 4 MiB each, and resumes matching provider-bound execution and public automatic placement. Hook snapshots are limited to 512 KiB; a missing selected extension blocks execution. Legacy or mismatched identities are blocked; the host must identify the provider, tenant and idempotency namespace correctly. The record limit includes terminal records, public admission rejects a full store, and no retention policy exists. Individual store entries are materialized before size checks. The narrow busy path described above does not yet provide a general ordered inbox. See [public test](../crates/durable/tests/independent_compaction.rs) and [worker tests](../crates/durable/src/summary_worker_tests.rs).
 
