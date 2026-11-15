@@ -4361,6 +4361,15 @@ them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
 
+### Responses prompt cache key configuration
+
+Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
+`enabled`, or `disabled`, with model settings overriding provider settings.
+`auto` and `enabled` use the session-derived cache key when caching is active;
+`disabled` omits the automatic key. An explicit sampling field can still
+supply a key, matching the upstream request merge order. The setting does not
+disable session routing headers or prompt caching itself.
+
 ### Responses cache retention checkpoint
 
 For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
