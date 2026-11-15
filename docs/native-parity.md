@@ -472,6 +472,9 @@ command to finish, even if an internal agent-settled event arrives first.
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID and original type when present. Object, array and numeric types use
 JavaScript string conversion in the diagnostic, including null array elements.
+RPC `set_model` rejects non-string `provider` and `modelId` fields using Pi's
+diagnostic conversion. Missing `provider` still selects within the current
+provider as a native extension.
 The echoed JSON value retains Rust's parsed integer precision, which can differ
 from JavaScript for integers outside the safe range; out-of-range JSON numbers
 such as `1e400` are rejected by the native parser.
