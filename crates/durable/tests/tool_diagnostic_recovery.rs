@@ -60,6 +60,116 @@ fn diagnostic(message: &str) -> ToolDiagnostic {
         code: Some("checkpoint".into()),
     }
 }
+
+struct ReplayDiagnostics {
+    name: &'static str,
+    count: Arc<AtomicUsize>,
+    cancel: CancellationToken,
+}
+#[async_trait::async_trait]
+impl KeyedTool for ReplayDiagnostics {
+    fn spec(&self) -> ToolSpec {
+        spec(self.name)
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let attempt = self.count.fetch_add(1, Ordering::SeqCst);
+        host.diagnostic(diagnostic("repeated")).unwrap();
+        host.diagnostic(diagnostic("repeated")).unwrap();
+        if attempt == 0 {
+            self.cancel.cancel();
+            std::future::pending().await
+        } else {
+            host.diagnostic(diagnostic("new")).unwrap();
+            Outcome::Succeeded("done".into()).into()
+        }
+    }
+}
+struct ReplayParent;
+#[async_trait::async_trait]
+impl KeyedTool for ReplayParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let result = host
+            .call_keyed_with_diagnostics("child", "child", json!({}))
+            .await;
+        for diagnostic in result.diagnostics {
+            host.diagnostic(diagnostic).unwrap();
+        }
+        result.outcome.into()
+    }
+}
+#[tokio::test]
+async fn replay_deduplicates_diagnostics_but_keeps_repetitions_within_attempt() {
+    for nested in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let count = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let options = |token: CancellationToken| {
+            let child = Arc::new(KeyedToolAdapter::new(ReplayDiagnostics {
+                name: if nested { "child" } else { "job" },
+                count: count.clone(),
+                cancel: token,
+            }))
+            .register(ReplayPolicy::Safe);
+            let mut tools = vec![child];
+            if nested {
+                tools.push(
+                    Arc::new(KeyedToolAdapter::new(ReplayParent)).register(ReplayPolicy::Safe),
+                );
+            }
+            Options {
+                model: Arc::new(FakeModel(if nested { "parent" } else { "job" })),
+                tools,
+                restart_limit: 4,
+                max_turns: 4,
+                uncertain_policy: UncertainPolicy::RequireReconciliation,
+            }
+        };
+        let id;
+        {
+            let mut h = Harness::open_paused(&path, options(cancel.clone())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            assert!(
+                h.submit_and_run(id, None, "go".into(), &cancel)
+                    .await
+                    .is_err()
+            );
+        }
+        let mut h = Harness::open(
+            &path,
+            options(CancellationToken::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let c = h.conversation(id).unwrap();
+        let messages: Vec<_> = c.tool_results[0]
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(messages, ["repeated", "repeated", "new"]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+}
 struct Unsettled {
     mode: u8,
     count: Arc<AtomicUsize>,
@@ -328,6 +438,227 @@ async fn nested_diagnostics_reattach_after_parent_interruption_without_child_rep
 }
 
 struct Structured(Arc<AtomicUsize>);
+
+struct NestedRewrite {
+    cancel: Option<CancellationToken>,
+}
+#[async_trait::async_trait]
+impl Hook for NestedRewrite {
+    async fn after_tool_result(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        assert_eq!(result.diagnostics[0].message, "nested checkpoint");
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+            std::future::pending::<()>().await;
+        }
+        let mut safe = result.clone();
+        safe.output = "rewritten child".into();
+        safe.diagnostics = vec![diagnostic("safe child")];
+        Ok(Some(safe))
+    }
+}
+struct CaptureRewritten;
+#[async_trait::async_trait]
+impl KeyedTool for CaptureRewritten {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let result = host
+            .call_keyed_with_diagnostics("child-key", "child", json!({}))
+            .await;
+        assert_eq!(result.outcome, Outcome::Succeeded("rewritten child".into()));
+        assert_eq!(result.diagnostics, vec![diagnostic("safe child")]);
+        for diagnostic in result.diagnostics {
+            host.diagnostic(diagnostic).unwrap();
+        }
+        result.outcome.into()
+    }
+}
+#[tokio::test]
+async fn interrupted_nested_result_hook_is_blocked_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let count = Arc::new(AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(CaptureRewritten)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(Child(count.clone()))).register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(Extension {
+            name: "nested-rewrite".into(),
+            hooks: vec![Arc::new(NestedRewrite {
+                cancel: Some(cancel.clone()),
+            })],
+            ..Default::default()
+        })
+        .unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["nested-rewrite".into()])
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(Extension {
+        name: "nested-rewrite".into(),
+        hooks: vec![Arc::new(NestedRewrite { cancel: None })],
+        ..Default::default()
+    })
+    .unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(h.blocked(id).unwrap().is_some());
+    assert!(h.conversation(id).unwrap().tool_results.is_empty());
+}
+
+#[tokio::test]
+async fn nested_result_hook_rewrites_before_parent_observes_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let options = Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(CaptureRewritten)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(Child(count.clone()))).register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    h.install_extension(Extension {
+        name: "nested-rewrite".into(),
+        hooks: vec![Arc::new(NestedRewrite { cancel: None })],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["nested-rewrite".into()])
+        .unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.conversation(id).unwrap().tool_results[0].diagnostics,
+        vec![diagnostic("safe child")]
+    );
+}
+
+struct PollChild;
+#[async_trait::async_trait]
+impl pi_rs_core::Tool for PollChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        Outcome::Pending {
+            reference: "job".into(),
+        }
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        Some(Outcome::Succeeded("raw".into()))
+    }
+}
+struct PollRewrite;
+#[async_trait::async_trait]
+impl Hook for PollRewrite {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        Ok((call.name == "child").then(|| json!("safe")))
+    }
+}
+struct PollParent;
+#[async_trait::async_trait]
+impl KeyedTool for PollParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let result = host
+            .call_keyed_with_diagnostics("child", "child", json!({}))
+            .await;
+        assert_eq!(result.outcome, Outcome::Succeeded("safe".into()));
+        assert_eq!(
+            result.diagnostics[0].code.as_deref(),
+            Some("output_redacted")
+        );
+        Outcome::Succeeded("parent".into()).into()
+    }
+}
+#[tokio::test]
+async fn polled_nested_result_runs_legacy_hook_before_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(PollParent)).register(ReplayPolicy::Safe),
+            pi_rs_durable::runtime::RegisteredTool {
+                tool: Arc::new(PollChild),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    h.install_extension(Extension {
+        name: "poll-rewrite".into(),
+        hooks: vec![Arc::new(PollRewrite)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["poll-rewrite".into()])
+        .unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(h.blocked(id).unwrap().is_none());
+}
 #[async_trait::async_trait]
 impl KeyedTool for Structured {
     fn spec(&self) -> ToolSpec {

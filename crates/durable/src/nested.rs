@@ -37,6 +37,10 @@ struct Record {
     policy: ReplayPolicy,
     operation_id: Uuid,
     outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged_outcome: Option<Outcome>,
+    #[serde(default)]
+    hooks_required: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<crate::runtime::ToolDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,10 +95,12 @@ pub(crate) fn resolved_for_replay(
     let mut resolved = false;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
-        if matches!(
-            record.outcome,
-            None | Some(Outcome::Pending { .. }) | Some(Outcome::Unknown(_))
-        ) {
+        if record.staged_outcome.is_none()
+            && matches!(
+                record.outcome,
+                None | Some(Outcome::Pending { .. }) | Some(Outcome::Unknown(_))
+            )
+        {
             return Ok(false);
         }
         resolved |= record.resolution.is_some();
@@ -166,7 +172,12 @@ pub(crate) fn resolve_pending(
             "nested pending reference or outcome changed".into(),
         ));
     }
-    record.outcome = Some(outcome);
+    if record.hooks_required {
+        record.staged_outcome = Some(outcome);
+        record.outcome = None;
+    } else {
+        record.outcome = Some(outcome);
+    }
     record.resolution = Some(resolution);
     store.commit(
         &[
@@ -204,6 +215,7 @@ struct Shared {
     root: Uuid,
     tools: HashMap<String, RegisteredTool>,
     output_schemas: std::collections::BTreeMap<String, Value>,
+    hooks: Option<NestedHooks>,
     cancellation: CancellationToken,
     timeout: Duration,
     max_depth: usize,
@@ -214,10 +226,17 @@ struct Shared {
     explicit_suspend: AtomicBool,
     idle: tokio::sync::Notify,
 }
+pub(crate) struct NestedHooks {
+    pub selected: crate::extension::Resolved,
+    pub snapshot: Value,
+    pub conversation: Uuid,
+    pub storage_failed: Arc<AtomicBool>,
+}
 struct NestedDiagnostic {
     shared: Arc<Shared>,
     key: Vec<u8>,
     operation: Uuid,
+    attempt: Mutex<crate::runtime::DiagnosticAttempt>,
 }
 impl NestedDiagnostic {
     fn storage_error(&self, error: impl std::fmt::Display) -> String {
@@ -230,6 +249,10 @@ impl NestedDiagnostic {
 }
 impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
     fn record(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String> {
+        let mut attempt = self
+            .attempt
+            .lock()
+            .map_err(|_| "nested diagnostic lock poisoned")?;
         let store = self.shared.owner.store();
         loop {
             if self.shared.cancellation.is_cancelled() {
@@ -251,13 +274,24 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
                 .ok_or_else(|| self.storage_error("nested intent missing"))?;
             let mut record: Record =
                 serde_json::from_slice(&entry.value).map_err(|e| self.storage_error(e))?;
-            if record.operation_id != self.operation || record.outcome.is_some() {
+            if record.operation_id != self.operation
+                || record.outcome.is_some()
+                || record.staged_outcome.is_some()
+            {
                 return Err("nested attempt is no longer active".into());
             }
-            if record.diagnostics.len() >= 32 {
+            let duplicate = record
+                .diagnostics
+                .iter()
+                .filter(|item| *item == &diagnostic)
+                .count()
+                >= attempt.next(&diagnostic);
+            if !duplicate && record.diagnostics.len() >= 32 {
                 return Err("too many tool diagnostics".into());
             }
-            record.diagnostics.push(diagnostic.clone());
+            if !duplicate {
+                record.diagnostics.push(diagnostic.clone());
+            }
             let value = serde_json::to_vec(&record).map_err(|e| self.storage_error(e))?;
             if serde_json::to_vec(&record.diagnostics)
                 .map_err(|e| e.to_string())?
@@ -276,7 +310,10 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
                     value,
                 }],
             ) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    attempt.accepted(diagnostic);
+                    return Ok(());
+                }
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(error) => return Err(self.storage_error(error)),
             }
@@ -365,7 +402,7 @@ impl NestedHost {
             cancellation,
             timeout,
             max_depth,
-            Default::default(),
+            (Default::default(), None),
         )
     }
     pub(crate) fn new_with_schemas(
@@ -375,7 +412,10 @@ impl NestedHost {
         cancellation: CancellationToken,
         timeout: Duration,
         max_depth: usize,
-        output_schemas: std::collections::BTreeMap<String, Value>,
+        (output_schemas, hooks): (
+            std::collections::BTreeMap<String, Value>,
+            Option<NestedHooks>,
+        ),
     ) -> Result<Arc<Self>, InspectionError> {
         let mut registry = HashMap::new();
         for tool in tools {
@@ -394,6 +434,7 @@ impl NestedHost {
                 root: parent,
                 tools: registry,
                 output_schemas,
+                hooks,
                 cancellation,
                 timeout,
                 max_depth,
@@ -512,7 +553,11 @@ impl NestedHost {
                 .get(&self.explicit_key(self.parent, key))
             {
                 Ok(Some(entry)) => match serde_json::from_slice::<Record>(&entry.value) {
-                    Ok(record) if record.name == name && record.arguments == arguments => {
+                    Ok(record)
+                        if record.name == name
+                            && record.arguments == arguments
+                            && record.outcome.is_some() =>
+                    {
                         record.diagnostics
                     }
                     Ok(_) => Vec::new(),
@@ -828,6 +873,9 @@ impl NestedHost {
                 }
                 return validate_nested_output(&self.shared.output_schemas, name, outcome.clone());
             }
+            if record.staged_outcome.is_some() {
+                return self.finish_staged(&key, record).await;
+            }
             if record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe {
                 return self.fail("interrupted unsafe nested call requires reconciliation");
             }
@@ -865,6 +913,8 @@ impl NestedHost {
                 policy: reg.replay,
                 operation_id: invocation.operation_id,
                 outcome: None,
+                staged_outcome: None,
+                hooks_required: self.shared.hooks.is_some(),
                 diagnostics: Vec::new(),
                 resolution: None,
             };
@@ -923,6 +973,7 @@ impl NestedHost {
             shared: self.shared.clone(),
             key: key.clone(),
             operation: record.operation_id,
+            attempt: Mutex::new(Default::default()),
         });
         let reply = crate::keyed_tool::scope_with_control(
             child.clone(),
@@ -946,7 +997,7 @@ impl NestedHost {
         let outcome = if has_state {
             Outcome::Unknown("nested extension state requires reconciliation".into())
         } else {
-            validate_nested_output(&self.shared.output_schemas, name, reply.outcome)
+            reply.outcome
         };
         // An uncertain descendant poisons the ancestor even if a tool ignored it.
         if self.shared.failed.load(Ordering::Acquire) && !has_state {
@@ -973,7 +1024,25 @@ impl NestedHost {
                 return self.fail("nested result intent changed");
             }
             completed = current;
-            completed.outcome = Some(outcome.clone());
+            if self.shared.hooks.is_some()
+                && matches!(
+                    outcome,
+                    Outcome::Succeeded(_)
+                        | Outcome::SucceededWithDetails { .. }
+                        | Outcome::Failed(_)
+                        | Outcome::Skipped(_)
+                        | Outcome::Truncated { .. }
+                        | Outcome::Structured { .. }
+                )
+            {
+                completed.staged_outcome = Some(outcome.clone());
+            } else {
+                completed.outcome = Some(validate_nested_output(
+                    &self.shared.output_schemas,
+                    name,
+                    outcome.clone(),
+                ));
+            }
             let value = match serde_json::to_vec(&completed) {
                 Ok(v) => v,
                 Err(e) => return self.fail(e.to_string()),
@@ -993,6 +1062,9 @@ impl NestedHost {
                 Err(e) => return self.fail(format!("nested result commit: {e}")),
             }
         }
+        if completed.staged_outcome.is_some() {
+            return self.finish_staged(&key, completed).await;
+        }
         if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
             let version = match store.get(&key) {
                 Ok(Some(entry)) => entry.version,
@@ -1000,7 +1072,159 @@ impl NestedHost {
             };
             return self.poll_pending(&key, completed, version, reg).await;
         }
+        validate_nested_output(&self.shared.output_schemas, name, outcome)
+    }
+
+    async fn finish_staged(&self, key: &[u8], mut record: Record) -> Outcome {
+        let Some(hooks) = &self.shared.hooks else {
+            return self.fail("nested result hooks unavailable for staged outcome");
+        };
+        let Some(original) = record.staged_outcome.clone() else {
+            return self.fail("nested staged outcome missing");
+        };
+        let call = crate::extension::ToolCall {
+            name: record.name.clone(),
+            arguments: record.arguments.clone(),
+        };
+        let memo = crate::extension::DurableMemo::new(
+            self.shared.owner.clone(),
+            record.operation_id,
+            hooks.storage_failed.clone(),
+        );
+        let context = crate::extension::Context {
+            snapshot: &hooks.snapshot,
+            memo: &memo,
+        };
+        let output = original.tool_content();
+        let (legacy, reports) = hooks
+            .selected
+            .after_tool(&call, Value::String(output.clone()), &context)
+            .await;
+        if let Err(error) =
+            self.record_hook_reports(hooks, record.operation_id, "after_tool", reports)
+        {
+            return self.fail(error);
+        }
+        let rewritten = legacy.as_str().is_some_and(|value| value != output);
+        let mut result = crate::extension::ToolResult {
+            output: legacy.as_str().unwrap_or(&output).to_owned(),
+            is_error: matches!(original, Outcome::Failed(_) | Outcome::Skipped(_)),
+            details: match &original {
+                Outcome::SucceededWithDetails { details, .. } => Some(details.clone()),
+                _ => None,
+            },
+            structured_output: match &original {
+                Outcome::Structured { data, .. } => Some(data.clone()),
+                _ => None,
+            },
+            attachments: match &original {
+                Outcome::Structured { attachments, .. } => attachments.clone(),
+                _ => Vec::new(),
+            },
+            diagnostics: record.diagnostics.clone(),
+        };
+        if rewritten {
+            result.details = None;
+            result.structured_output = None;
+            result.attachments.clear();
+            result.diagnostics = vec![crate::runtime::ToolDiagnostic {
+                severity: crate::runtime::DiagnosticSeverity::Info,
+                code: Some("output_redacted".into()),
+                message: "tool metadata withheld after output replacement".into(),
+            }];
+        }
+        let (result, rich_rewritten, reports) = hooks
+            .selected
+            .after_tool_result(&call, result, &context)
+            .await;
+        if let Err(error) =
+            self.record_hook_reports(hooks, record.operation_id, "after_tool_result", reports)
+        {
+            return self.fail(error);
+        }
+        if self.shared.cancellation.is_cancelled() {
+            return self.fail("nested result hooks cancelled");
+        }
+        let outcome = if !rewritten && !rich_rewritten {
+            original
+        } else if result.is_error {
+            Outcome::Failed(result.output)
+        } else if let Some(data) = result.structured_output {
+            Outcome::Structured {
+                data,
+                attachments: result.attachments,
+            }
+        } else if let Some(details) = result.details {
+            Outcome::SucceededWithDetails {
+                output: result.output,
+                details,
+            }
+        } else {
+            Outcome::Succeeded(result.output)
+        };
+        let outcome = validate_nested_output(&self.shared.output_schemas, &record.name, outcome);
+        let entry = match self.shared.owner.store().get(key) {
+            Ok(Some(entry)) => entry,
+            _ => return self.fail("nested staged result missing"),
+        };
+        let current: Record = match serde_json::from_slice(&entry.value) {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        if current.operation_id != record.operation_id
+            || current.outcome.is_some()
+            || current.staged_outcome != record.staged_outcome
+        {
+            return self.fail("nested staged result changed");
+        }
+        record = current;
+        record.staged_outcome = None;
+        record.outcome = Some(outcome.clone());
+        record.diagnostics = result.diagnostics;
+        let value = match serde_json::to_vec(&record) {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        if let Err(error) = self.shared.owner.store().commit(
+            &[Check {
+                key: key.to_vec(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key: key.to_vec(),
+                value,
+            }],
+        ) {
+            return self.fail(format!("nested hook result commit: {error}"));
+        }
         outcome
+    }
+
+    fn record_hook_reports(
+        &self,
+        hooks: &NestedHooks,
+        operation: Uuid,
+        phase: &str,
+        reports: Vec<crate::extension::Report>,
+    ) -> Result<(), String> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        let batch = crate::runtime::ExtensionReportBatch {
+            conversation_id: hooks.conversation,
+            operation_id: operation,
+            phase: phase.into(),
+            reports,
+        };
+        let key = format!(
+            "runtime/extension-report/{}/{operation}/{phase}",
+            hooks.conversation
+        )
+        .into_bytes();
+        crate::report::index(self.shared.owner.store(), key, &batch, false).map_err(|error| {
+            hooks.storage_failed.store(true, Ordering::Release);
+            error.to_string()
+        })
     }
 
     async fn poll_pending(
@@ -1046,9 +1270,19 @@ impl NestedHost {
                     "nested polling returned an uncertain outcome; pending reference retained",
                 );
             }
-            let outcome =
-                validate_nested_output(&self.shared.output_schemas, &record.name, outcome);
-            record.outcome = Some(outcome.clone());
+            let terminal = !matches!(outcome, Outcome::Pending { .. });
+            let staged = terminal && record.hooks_required;
+            let outcome = if staged {
+                outcome
+            } else {
+                validate_nested_output(&self.shared.output_schemas, &record.name, outcome)
+            };
+            if staged {
+                record.staged_outcome = Some(outcome.clone());
+                record.outcome = None;
+            } else {
+                record.outcome = Some(outcome.clone());
+            }
             let value = match serde_json::to_vec(&record) {
                 Ok(value) => value,
                 Err(e) => return self.fail(e.to_string()),
@@ -1064,6 +1298,9 @@ impl NestedHost {
                 }],
             ) {
                 return self.fail(format!("nested poll result commit: {e}"));
+            }
+            if staged {
+                return self.finish_staged(key, record).await;
             }
             if !matches!(outcome, Outcome::Pending { .. }) {
                 return outcome;
@@ -1152,6 +1389,8 @@ mod tests {
             outcome: Some(Outcome::Pending {
                 reference: "opaque".into(),
             }),
+            staged_outcome: None,
+            hooks_required: false,
             diagnostics: Vec::new(),
             resolution: None,
         };

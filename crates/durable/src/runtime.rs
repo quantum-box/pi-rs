@@ -1450,20 +1450,40 @@ struct RuntimeDiagnostic {
     attempt: ToolAttempt,
     cancel: CancellationToken,
     storage_failed: Arc<AtomicBool>,
-    closed: std::sync::Mutex<bool>,
+    state: std::sync::Mutex<DiagnosticAttempt>,
+}
+#[derive(Default)]
+pub(crate) struct DiagnosticAttempt {
+    closed: bool,
+    seen: Vec<(ToolDiagnostic, usize)>,
+}
+impl DiagnosticAttempt {
+    pub(crate) fn next(&self, diagnostic: &ToolDiagnostic) -> usize {
+        self.seen
+            .iter()
+            .find(|(item, _)| item == diagnostic)
+            .map_or(1, |(_, count)| count + 1)
+    }
+    pub(crate) fn accepted(&mut self, diagnostic: ToolDiagnostic) {
+        if let Some((_, count)) = self.seen.iter_mut().find(|(item, _)| *item == diagnostic) {
+            *count += 1;
+        } else {
+            self.seen.push((diagnostic, 1));
+        }
+    }
 }
 impl RuntimeDiagnostic {
     fn close(&self) {
-        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
 }
 impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
     fn record(&self, diagnostic: ToolDiagnostic) -> Result<(), String> {
-        let closed = self
-            .closed
+        let mut attempt = self
+            .state
             .lock()
             .map_err(|_| "tool diagnostic lock poisoned")?;
-        if *closed {
+        if attempt.closed {
             return Err("tool attempt is no longer active".into());
         }
         let store = self.owner.store();
@@ -1494,10 +1514,17 @@ impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
                     .map(|e| serde_json::from_slice(&e.value))
                     .transpose()?
                     .unwrap_or_default();
-                if diagnostics.len() >= 32 {
+                let duplicate = diagnostics
+                    .iter()
+                    .filter(|item| *item == &diagnostic)
+                    .count()
+                    >= attempt.next(&diagnostic);
+                if !duplicate && diagnostics.len() >= 32 {
                     return Err(Error::Invalid("too many tool diagnostics".into()));
                 }
-                diagnostics.push(diagnostic.clone());
+                if !duplicate {
+                    diagnostics.push(diagnostic.clone());
+                }
                 let value = serde_json::to_vec(&diagnostics)?;
                 if value.len() > 65_536 {
                     return Err(Error::Invalid("tool diagnostics exceed size limit".into()));
@@ -1526,7 +1553,10 @@ impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
                 }
             })();
             match result {
-                Ok(true) => return Ok(()),
+                Ok(true) => {
+                    attempt.accepted(diagnostic);
+                    return Ok(());
+                }
                 Ok(false) => continue,
                 Err(error) => {
                     if matches!(error, Error::Storage(_)) {
@@ -10481,7 +10511,7 @@ impl Harness {
                             attempt,
                             cancel: cancel.clone(),
                             storage_failed: self.storage_failed.clone(),
-                            closed: std::sync::Mutex::new(false),
+                            state: std::sync::Mutex::new(DiagnosticAttempt::default()),
                         })
                     });
                     let mut tool_panicked = false;
@@ -10536,7 +10566,19 @@ impl Harness {
                                     cancel.child_token(),
                                     Duration::from_secs(120),
                                     8,
-                                    c.tool_filters.output_schemas.clone(),
+                                    (
+                                        c.tool_filters.output_schemas.clone(),
+                                        if c.extensions.is_empty() {
+                                            None
+                                        } else {
+                                            Some(crate::nested::NestedHooks {
+                                                selected: self.selected_extensions(&c)?,
+                                                snapshot: serde_json::to_value(&c)?,
+                                                conversation: c.id,
+                                                storage_failed: self.storage_failed.clone(),
+                                            })
+                                        },
+                                    ),
                                 ) {
                                     Ok(host) => {
                                         let scope = c.tool_attempt().map(|attempt| {
