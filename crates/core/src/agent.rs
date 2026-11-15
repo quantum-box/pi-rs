@@ -4430,11 +4430,10 @@ impl Agent<'_> {
         let from_extension = extension_result.is_some() || original_summary != compaction.summary;
         if !compaction.summary.trim().is_empty()
             && let Some(files) = &file_operations
+            && let Some(suffix) =
+                files.suffix((64 * 1024usize).saturating_sub(compaction.summary.len()))
         {
-            let suffix = files.suffix();
-            if compaction.summary.len().saturating_add(suffix.len()) <= 64 * 1024 {
-                compaction.summary.push_str(&suffix);
-            }
+            compaction.summary.push_str(&suffix);
         }
         if compaction.summary.trim().is_empty() || compaction.summary.len() > 64 * 1024 {
             return Err(Error::Config(
@@ -4499,17 +4498,28 @@ impl Agent<'_> {
         let persist_metadata = (from_extension && extension_result.is_some())
             || (session.supports_record_metadata()
                 && (from_extension || file_operations.is_some()));
+        let event = Event::Compacted {
+            summary: compaction.summary,
+            system_prompt: None,
+            retain_from,
+            tokens_before: Some(tokens_before),
+            states: changes,
+            usage,
+            usage_metadata,
+        };
+        // Reserve room for the record envelope and other metadata, and keep a
+        // fixed ceiling even when many individual paths are valid.
+        let file_budget = (4 * 1024 * 1024usize).min(
+            (16 * 1024 * 1024usize)
+                .saturating_sub(4096)
+                .saturating_sub(serde_json::to_vec(&event)?.len()),
+        );
+        let generated_details = file_operations
+            .as_ref()
+            .map(|files| files.bounded_details(file_budget));
         commit_compaction_record(
             session,
-            Event::Compacted {
-                summary: compaction.summary,
-                system_prompt: None,
-                retain_from,
-                tokens_before: Some(tokens_before),
-                states: changes,
-                usage,
-                usage_metadata,
-            },
+            event,
             persist_metadata.then(|| {
                 let mut metadata = serde_json::json!({});
                 if from_extension {
@@ -4518,9 +4528,15 @@ impl Agent<'_> {
                 if from_extension && file_operations.is_some() {
                     metadata["nativeGeneratedFileDetails"] = true.into();
                 }
+                if generated_details
+                    .as_ref()
+                    .is_some_and(|(_, truncated)| *truncated)
+                {
+                    metadata["nativeFileDetailsTruncated"] = true.into();
+                }
                 if let Some(details) = extension_result
                     .and_then(|result| result.details.clone())
-                    .or_else(|| file_operations.as_ref().map(|files| files.details()))
+                    .or_else(|| generated_details.map(|(details, _)| details))
                 {
                     metadata["details"] = details;
                 }
@@ -7172,6 +7188,99 @@ mod tree_tests {
             session.record_metadata(record.id).unwrap()["details"]["readFiles"][0],
             path
         );
+    }
+
+    #[tokio::test]
+    async fn file_backed_compaction_bounds_large_metadata_and_remains_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-file-details.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        for index in 0..20 {
+            let name = format!("{index:02}{}", "x".repeat(850_000));
+            let call = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":name}).to_string(),
+                },
+            };
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![call.clone()],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: call.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let id = session
+            .records()
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let metadata = session.record_metadata(id).unwrap();
+        assert_eq!(metadata["nativeFileDetailsTruncated"], true);
+        let retained = metadata["details"]["modifiedFiles"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(retained > 0 && retained < 20);
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
+        drop(session);
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id).unwrap()["nativeFileDetailsTruncated"],
+            true
+        );
+        reopened
+            .append(Event::User {
+                content: "writable after reopen".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let inherited =
+            crate::compaction_files::FileOperations::collect(&reopened, Some(reopened.head()));
+        assert!(inherited.bounded_details(4 * 1024 * 1024).1);
     }
 
     struct RecoverySettlementModel {

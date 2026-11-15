@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub(crate) struct FileOperations {
     read: HashSet<String>,
     modified: HashSet<String>,
+    truncated: bool,
 }
 
 impl FileOperations {
@@ -36,6 +37,7 @@ impl FileOperations {
             && let Some(metadata) = session.record_metadata(previous.id)
             && (metadata["fromExtension"] != true || metadata["nativeGeneratedFileDetails"] == true)
         {
+            files.truncated = metadata["nativeFileDetailsTruncated"] == true;
             for (key, target) in [
                 ("readFiles", &mut files.read),
                 ("modifiedFiles", &mut files.modified),
@@ -108,15 +110,63 @@ impl FileOperations {
         files
     }
 
-    fn sorted(values: &HashSet<String>) -> Vec<String> {
-        let mut result: Vec<_> = values.iter().cloned().collect();
+    fn sorted(values: &HashSet<String>) -> Vec<&str> {
+        let mut result: Vec<_> = values.iter().map(String::as_str).collect();
         result.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
         result
     }
+    #[cfg(test)]
     pub(crate) fn details(&self) -> serde_json::Value {
         serde_json::json!({"readFiles":Self::sorted(&self.read), "modifiedFiles":Self::sorted(&self.modified)})
     }
-    pub(crate) fn suffix(&self) -> String {
+    // Bound the encoded JSON, not the unescaped path length: controls may
+    // expand sixfold on the journal wire. Keep modified files first.
+    pub(crate) fn bounded_details(&self, limit: usize) -> (serde_json::Value, bool) {
+        let mut remaining = limit.saturating_sub(64);
+        let mut truncated = self.truncated;
+        let mut collect = |paths: &HashSet<String>| {
+            let mut kept = Vec::new();
+            for path in Self::sorted(paths) {
+                let encoded = serde_json::to_string(&path)
+                    .expect("string serialization")
+                    .len()
+                    .saturating_add(1);
+                if encoded <= remaining {
+                    remaining -= encoded;
+                    kept.push(path.to_owned());
+                } else {
+                    truncated = true;
+                }
+            }
+            kept
+        };
+        let modified = collect(&self.modified);
+        let read = collect(&self.read);
+        (
+            serde_json::json!({"readFiles":read,"modifiedFiles":modified}),
+            truncated,
+        )
+    }
+    pub(crate) fn suffix(&self, limit: usize) -> Option<String> {
+        let mut size = 0usize;
+        for (name, values) in [
+            ("read-files", &self.read),
+            ("modified-files", &self.modified),
+        ] {
+            if values.is_empty() {
+                continue;
+            }
+            size = size
+                .saturating_add(format!("\n\n<{name}>\n").len())
+                .saturating_add(format!("\n</{name}>").len())
+                .saturating_add(values.len().saturating_sub(1));
+            for value in values {
+                size = size.saturating_add(value.len());
+            }
+            if size > limit {
+                return None;
+            }
+        }
         let mut sections = Vec::new();
         for (name, values) in [
             ("read-files", &self.read),
@@ -128,9 +178,9 @@ impl FileOperations {
             }
         }
         if sections.is_empty() {
-            String::new()
+            Some(String::new())
         } else {
-            format!("\n\n{}", sections.join("\n\n"))
+            Some(format!("\n\n{}", sections.join("\n\n")))
         }
     }
 }
@@ -241,9 +291,12 @@ mod tests {
             serde_json::json!({"readFiles":["a"],"modifiedFiles":["b","nested","z"]})
         );
         assert_eq!(
-            files.suffix(),
+            files.suffix(usize::MAX).unwrap(),
             "\n\n<read-files>\na\n</read-files>\n\n<modified-files>\nb\nnested\nz\n</modified-files>"
         );
+        let suffix = files.suffix(usize::MAX).unwrap();
+        assert_eq!(files.suffix(suffix.len()), Some(suffix.clone()));
+        assert_eq!(files.suffix(suffix.len() - 1), None);
         session
             .append(Event::ContextEdited {
                 target: assistant_id,
@@ -293,5 +346,17 @@ mod tests {
             files.details()["readFiles"],
             serde_json::json!(["a", "😀", "\u{e000}"])
         );
+    }
+
+    #[test]
+    fn bounded_details_counts_escaped_bytes_and_prioritizes_modified_files() {
+        let mut files = FileOperations::default();
+        files.modified.insert("modified".into());
+        files.read.insert("\0".repeat(50));
+        let (details, truncated) = files.bounded_details(128);
+        assert!(truncated);
+        assert_eq!(details["modifiedFiles"], serde_json::json!(["modified"]));
+        assert_eq!(details["readFiles"], serde_json::json!([]));
+        assert!(serde_json::to_vec(&details).unwrap().len() <= 128);
     }
 }

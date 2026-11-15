@@ -156,7 +156,11 @@ and their details are preserved as supplied. Imported nested-call metadata not
 represented as native operations is not yet included.
 If appending the complete file listing would exceed the native 64 KiB summary
 limit, native omits the listing from the summary but retains it in `details`
-on metadata-capable stores. A legacy hook that edits a generated summary retains
+on metadata-capable stores. Generated file details are bounded to at most 4 MiB
+of encoded JSON (and less when the rest of the record requires space); modified
+files are retained first. If entries do not fit, the native metadata carries
+`nativeFileDetailsTruncated: true` across reopen and later compactions. Pi's
+projected `details` contains only the retained paths. A legacy hook that edits a generated summary retains
 the native file history across journal reopen; Pi exports still expose it as a
 hook-originated compaction.
 For the Cerebras Chat Completions provider, a fully received, empty HTTP 400
