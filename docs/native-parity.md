@@ -18,6 +18,10 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Single-line extension input dialogs remove pasted line breaks and expand tabs
+to four spaces, while multiline editor dialogs normalize CRLF and CR to newlines.
+The native one MiB response limit applies after paste sanitization and expansion.
+
 Visible thinking blocks render Markdown with the thinking text style and
 preserve the Markdown theme's explicit colors. As in Pi, Mermaid fences in
 thinking remain code rather than being transformed into diagrams.
@@ -29,6 +33,9 @@ The native RPC stream preserves reasoning item boundaries and final text.
 The additive enriched model stream carries those boundaries through the built-in
 workbench and budget wrappers; third-party wrappers using the legacy stream
 continue to receive deltas without item boundaries.
+
+Chat Completions providers configured with `requiresThinkingAsText` retain
+streamed reasoning and replay it as text before the answer for the same model.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
@@ -122,9 +129,10 @@ reject malformed path escapes and encoded separators, as Pi does.
 
 ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
 minimum lifetime for bearer-token export. A refreshed credential is saved
-before a short lifetime is reported, preserving refresh-token rotation. A
-single live inference with an existing account succeeded; interactive login and
-live refresh acceptance remain open.
+before a short lifetime is reported, preserving refresh-token rotation. In a
+live check, a saved credential was observed expired before a successful text
+inference and had a future expiry afterward. New-account browser login, other
+account configurations and broader live acceptance remain open.
 
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
@@ -719,6 +727,10 @@ Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
 Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
+
+`pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
+default is 300 seconds. Once credential persistence starts, it is allowed to
+finish even if the deadline passes, so its outcome can be reported reliably.
 
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project
@@ -1870,8 +1882,9 @@ host protocol for select, confirm, input and multiline editor dialogs, notices,
 status entries, above/below-editor widgets, window titles and editor text.
 Widgets appear in registration order within each position; replacing or moving
 a widget places it last at its destination, as in Pi.
-Native widgets retain the existing 64-widget and 128-line limits, and do not
-yet match Pi's ten-line truncation, text styling, or fixed fullscreen placement.
+String-array widgets show at most ten input lines and a truncation notice, as in
+Pi. Native widgets retain the existing 64-widget and 128-line request limits;
+their text styling and fixed fullscreen placement remain to be matched.
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
@@ -4231,6 +4244,17 @@ warning and the count of additional warnings after streaming; during streaming
 the readable portion remains visible. Like Pi v1.5.0’s
 `grok-mermaid` parser, a class name immediately followed by an undirected link
 without whitespace can consume part of that link and render an incomplete graph.
+
+### Responses session routing checkpoint
+
+API-key Responses requests in the workbench send Pi's session routing
+headers. The default format sends `session-id` and `x-client-request-id`;
+OpenRouter sends `x-session-id`, and a model or provider can select the
+OpenAI format without `session-id`. Explicit headers take precedence, and
+summary requests omit automatic routing headers. The existing native
+`sendSessionAffinityHeaders` override can disable them. ChatGPT sign-in and
+direct use of the standalone Responses adapter do not yet receive these
+routing headers automatically.
 
 ### Model session affinity checkpoint
 

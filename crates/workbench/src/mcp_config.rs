@@ -20,6 +20,9 @@ pub enum McpCommand {
         name: String,
         #[arg(short = 'l', long)]
         local: bool,
+        /// Maximum time in seconds for OAuth sign-in.
+        #[arg(long, default_value = "300")]
+        timeout: f64,
         /// Pre-registered client ID. Omit for dynamic registration.
         #[arg(long)]
         client_id: Option<String>,
@@ -865,11 +868,21 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
         McpCommand::Login {
             name,
             local,
+            timeout,
             client_id,
             client_secret_env,
             client_metadata_url,
             scopes,
         } => {
+            let timeout = std::time::Duration::try_from_secs_f64(timeout)
+                .ok()
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| {
+                    Error::Config("--timeout must be a positive number of seconds".into())
+                })?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| Error::Config("--timeout is too large".into()))?;
             let path = path(args, local);
             let document = config::read_object(&path)?;
             let value = document.get("mcpServers").and_then(|servers| servers.get(&name))
@@ -907,34 +920,40 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             let server_oauth = server.oauth.clone();
             let http_options = super::http_proxy::configured_mcp(&args.settings)?;
             if let Some(metadata_url) = client_metadata_url {
-                pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options(
+                pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options_and_deadline(
                     &name,
                     url,
                     &metadata_url,
                     &scopes,
                     Some(&http_options),
+                    deadline,
+                    &args.mcp_login_cancel,
                     announce,
                 )
                 .await?;
             } else if client_id.is_none() && server.oauth_client().is_some() {
-                pi_rs_workbench::mcp_auth::login_configured_with_http_options(
+                pi_rs_workbench::mcp_auth::login_configured_with_http_options_and_deadline(
                     &name,
                     url,
                     server.oauth_client(),
                     None,
                     &scopes,
                     Some(&http_options),
+                    deadline,
+                    &args.mcp_login_cancel,
                     announce,
                 )
                 .await?;
             } else {
-                pi_rs_workbench::mcp_auth::login_with_secret_with_http_options(
+                pi_rs_workbench::mcp_auth::login_with_secret_with_http_options_and_deadline(
                     &name,
                     url,
                     client_id.as_deref(),
                     client_secret.as_deref(),
                     &scopes,
                     Some(&http_options),
+                    deadline,
+                    &args.mcp_login_cancel,
                     announce,
                 )
                 .await?;
