@@ -652,6 +652,9 @@ pub struct Conversation {
     /// Optional exact model-facing selection, bounded by enabled tools.
     #[serde(default)]
     pub model_tools: Option<Vec<String>>,
+    /// Persisted remove filters and model-facing deferred-tool declarations.
+    #[serde(default)]
+    pub tool_filters: ToolFilters,
     pub messages: Vec<Message>,
     /// Lossless block arrays indexed by their active message position.
     /// Reconstructed from the transcript; never serialized in the snapshot.
@@ -717,6 +720,15 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nested_resume: Option<NestedResume>,
     phase: Phase,
+}
+
+/// Name-based filter metadata. Deferred names affect model exposure only.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolFilters {
+    pub excluded: Vec<String>,
+    pub model_excluded: Vec<String>,
+    pub deferred: Vec<String>,
+    pub model_add: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1548,6 +1560,21 @@ pub(crate) fn validate_allowed_tools(names: &Option<Vec<String>>) -> Result<(), 
     Ok(())
 }
 
+fn model_tool_selected(c: &Conversation, name: &str) -> bool {
+    c.allowed_tools
+        .as_ref()
+        .is_none_or(|names| names.iter().any(|n| n == name))
+        && !c.tool_filters.excluded.iter().any(|n| n == name)
+        && match &c.model_tools {
+            Some(names) => names.iter().any(|n| n == name),
+            None => {
+                !c.tool_filters.model_excluded.iter().any(|n| n == name)
+                    && (!c.tool_filters.deferred.iter().any(|n| n == name)
+                        || c.tool_filters.model_add.iter().any(|n| n == name))
+            }
+        }
+}
+
 pub(crate) fn default_subagent_tools(options: &Options) -> Vec<String> {
     let mut allowed: Vec<_> = options
         .tools
@@ -1857,21 +1884,46 @@ impl Harness {
         if let Some(allowed) = &c.allowed_tools {
             tools.retain(|name, _| allowed.contains(name));
         }
+        tools.retain(|name, _| !c.tool_filters.excluded.contains(name));
         Ok(tools)
     }
     fn ordered_tool_specs(&self, c: &Conversation) -> Result<Vec<ToolSpec>, Error> {
         let mut tools = self.resolved_tools(c)?;
-        if let Some(allowed) = c.model_tools.as_ref().or(c.allowed_tools.as_ref()) {
-            Ok(allowed
+        if let Some(allowed) = c.model_tools.as_ref() {
+            return Ok(allowed
                 .iter()
                 .filter_map(|name| tools.remove(name))
                 .map(|tool| tool.tool.spec())
-                .collect())
+                .collect());
+        }
+        let mut specs = if let Some(allowed) = &c.allowed_tools {
+            allowed
+                .iter()
+                .filter_map(|name| tools.remove(name))
+                .map(|tool| tool.tool.spec())
+                .collect::<Vec<_>>()
         } else {
             let mut specs: Vec<_> = tools.into_values().map(|tool| tool.tool.spec()).collect();
             specs.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(specs)
+            specs
+        };
+        let mut deferred = HashMap::new();
+        specs.retain(|spec| {
+            if c.tool_filters.deferred.contains(&spec.name) {
+                deferred.insert(spec.name.clone(), spec.clone());
+                false
+            } else {
+                !c.tool_filters.model_excluded.contains(&spec.name)
+            }
+        });
+        for name in &c.tool_filters.model_add {
+            if !c.tool_filters.model_excluded.contains(name) {
+                if let Some(spec) = deferred.remove(name) {
+                    specs.push(spec);
+                }
+            }
         }
+        Ok(specs)
     }
     fn supports_blocks(&self, c: &Conversation) -> bool {
         c.provider_adapter
@@ -1939,9 +1991,11 @@ impl Harness {
         }
         validate_allowed_tools(&names)?;
         c.allowed_tools = names;
+        c.tool_filters.excluded.clear();
         self.save(&c, Expected::Version(version))
     }
-    /// Persist an exact model-facing tool selection. None offers all enabled tools.
+    /// Persist an exact model-facing tool selection. None offers enabled,
+    /// non-deferred tools by default.
     /// This does not change which enabled tools nested calls may execute.
     pub fn select_model_tools(
         &mut self,
@@ -1956,6 +2010,53 @@ impl Harness {
         }
         validate_allowed_tools(&names)?;
         c.model_tools = names;
+        c.tool_filters.model_excluded.clear();
+        c.tool_filters.model_add.clear();
+        self.save(&c, Expected::Version(version))
+    }
+    /// Replace the enabled-tool selection with a remove filter.
+    pub fn select_tools_except(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
+        validate_allowed_tools(&Some(names.clone()))?;
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "tool selection requires a settled conversation".into(),
+            ));
+        }
+        c.allowed_tools = None;
+        c.tool_filters.excluded = names;
+        self.save(&c, Expected::Version(version))
+    }
+    /// Replace the model-facing selection with a remove/add filter.
+    pub fn select_model_tools_patch(
+        &mut self,
+        id: Uuid,
+        remove: Vec<String>,
+        add: Vec<String>,
+    ) -> Result<(), Error> {
+        validate_allowed_tools(&Some(remove.clone()))?;
+        validate_allowed_tools(&Some(add.clone()))?;
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "model tool selection requires a settled conversation".into(),
+            ));
+        }
+        c.model_tools = None;
+        c.tool_filters.model_excluded = remove;
+        c.tool_filters.model_add = add;
+        self.save(&c, Expected::Version(version))
+    }
+    /// Declare deferred names for this conversation; nested calls remain enabled.
+    pub fn set_deferred_tools(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
+        validate_allowed_tools(&Some(names.clone()))?;
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "deferred tool selection requires a settled conversation".into(),
+            ));
+        }
+        c.tool_filters.deferred = names;
         self.save(&c, Expected::Version(version))
     }
     /// Select installed names for a settled conversation, preserving their order.
@@ -2785,6 +2886,7 @@ impl Harness {
                         &state.provider_adapter,
                         &state.allowed_tools,
                         &state.model_tools,
+                        &state.tool_filters,
                         &state.occurrence_epoch_proven,
                         &state.resets,
                         &state.application_writes,
@@ -2797,6 +2899,7 @@ impl Harness {
                             &previous.provider_adapter,
                             &previous.allowed_tools,
                             &previous.model_tools,
+                            &previous.tool_filters,
                             &previous.occurrence_epoch_proven,
                             &previous.resets,
                             &previous.application_writes,
@@ -2816,10 +2919,10 @@ impl Harness {
                 })
                 && matches!((serde_json::to_value((
                     &state.queue_modes, &state.after_failed_run, &state.extensions, &state.provider_adapter,
-                    &state.allowed_tools, &state.model_tools, &state.occurrence_epoch_proven, &state.resets, &state.application_writes, &state.tool_states,
+                    &state.allowed_tools, &state.model_tools, &state.tool_filters, &state.occurrence_epoch_proven, &state.resets, &state.application_writes, &state.tool_states,
                 )), serde_json::to_value((
                     &previous.queue_modes, &previous.after_failed_run, &previous.extensions, &previous.provider_adapter,
-                    &previous.allowed_tools, &previous.model_tools, &previous.occurrence_epoch_proven, &previous.resets, &previous.application_writes, &previous.tool_states,
+                    &previous.allowed_tools, &previous.model_tools, &previous.tool_filters, &previous.occurrence_epoch_proven, &previous.resets, &previous.application_writes, &previous.tool_states,
                 ))), (Ok(a), Ok(b)) if a == b)
         }).map(|previous| previous.messages.len());
         // Inline legacy messages predate this commit; their original identities and
@@ -3014,6 +3117,10 @@ impl Harness {
                 (
                     "pi-rs/runtime/model-tools".into(),
                     serde_json::to_value(&state.model_tools)?,
+                ),
+                (
+                    "pi-rs/runtime/tool-filters".into(),
+                    serde_json::to_value(&state.tool_filters)?,
                 ),
                 (
                     "pi-rs/runtime/occurrence-epoch-proven".into(),
@@ -3346,6 +3453,7 @@ impl Harness {
             provider_adapter: None,
             allowed_tools: None,
             model_tools: None,
+            tool_filters: ToolFilters::default(),
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
@@ -3618,6 +3726,12 @@ impl Harness {
             model_tools: point
                 .documents
                 .get("pi-rs/runtime/model-tools")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
+            tool_filters: point
+                .documents
+                .get("pi-rs/runtime/tool-filters")
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default(),
@@ -6763,14 +6877,7 @@ impl Harness {
                     let current = if c.extensions.is_empty() {
                         calls
                             .get(index)
-                            .filter(|call| {
-                                c.allowed_tools
-                                    .as_ref()
-                                    .is_none_or(|names| names.contains(&call.name))
-                                    && c.model_tools
-                                        .as_ref()
-                                        .is_none_or(|names| names.contains(&call.name))
-                            })
+                            .filter(|call| model_tool_selected(&c, &call.name))
                             .and_then(|x| self.tools.get(&x.name))
                     } else {
                         None
@@ -7303,13 +7410,7 @@ impl Harness {
         let Some(call) = calls.get(index) else {
             return Ok(false);
         };
-        if c.allowed_tools
-            .as_ref()
-            .is_some_and(|names| !names.contains(&call.name))
-            || c.model_tools
-                .as_ref()
-                .is_some_and(|names| !names.contains(&call.name))
-        {
+        if !model_tool_selected(&c, &call.name) {
             return Ok(false);
         }
         let Some(reg) = self.tools.get(&call.name) else {
@@ -8703,11 +8804,7 @@ impl Harness {
                     } else if let Some(reg) = self
                         .resolved_tools(&c)?
                         .get(&calls[index].name)
-                        .filter(|_| {
-                            c.model_tools
-                                .as_ref()
-                                .is_none_or(|names| names.contains(&calls[index].name))
-                        })
+                        .filter(|_| model_tool_selected(&c, &calls[index].name))
                     {
                         let operation_id = Uuid::new_v4();
                         let invocation = Invocation {
@@ -8816,11 +8913,10 @@ impl Harness {
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
                     let tools = self.resolved_tools(&c)?;
-                    let Some(reg) = tools.get(&call.name).filter(|_| {
-                        c.model_tools
-                            .as_ref()
-                            .is_none_or(|names| names.contains(&call.name))
-                    }) else {
+                    let Some(reg) = tools
+                        .get(&call.name)
+                        .filter(|_| model_tool_selected(&c, &call.name))
+                    else {
                         let arguments = pi_rs_core::parse_tool_arguments(&call.arguments)
                             .unwrap_or(serde_json::Value::Null);
                         c.phase = Phase::ToolFinished {
@@ -9040,11 +9136,10 @@ impl Harness {
                         self.save(&c, Expected::Version(version))?;
                         continue;
                     }
-                    let reply = if let Some(reg) = tools.get(&call.name).filter(|_| {
-                        c.model_tools
-                            .as_ref()
-                            .is_none_or(|names| names.contains(&call.name))
-                    }) {
+                    let reply = if let Some(reg) = tools
+                        .get(&call.name)
+                        .filter(|_| model_tool_selected(&c, &call.name))
+                    {
                         let invocation = Invocation {
                             operation_id,
                             call: call.clone(),
@@ -10416,6 +10511,20 @@ impl Scheduler {
         names: Option<Vec<String>>,
     ) -> Result<(), Error> {
         self.harness.select_model_tools(id, names)
+    }
+    pub fn select_tools_except(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
+        self.harness.select_tools_except(id, names)
+    }
+    pub fn select_model_tools_patch(
+        &mut self,
+        id: Uuid,
+        remove: Vec<String>,
+        add: Vec<String>,
+    ) -> Result<(), Error> {
+        self.harness.select_model_tools_patch(id, remove, add)
+    }
+    pub fn set_deferred_tools(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
+        self.harness.set_deferred_tools(id, names)
     }
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)
@@ -12118,12 +12227,14 @@ fn summary_progress_only(base: &Conversation, latest: &Conversation) -> Result<b
             &base.provider_adapter,
             &base.allowed_tools,
             &base.model_tools,
+            &base.tool_filters,
         ))? != serde_json::to_value((
             &latest.config,
             &latest.extensions,
             &latest.provider_adapter,
             &latest.allowed_tools,
             &latest.model_tools,
+            &latest.tool_filters,
         ))?
     {
         return Ok(false);
@@ -12263,6 +12374,20 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
 }
 
 fn place_round_handoff(c: &mut Conversation) {
+    for name in c
+        .round_added_tools
+        .iter()
+        .flatten()
+        .filter(|name| !name.is_empty())
+    {
+        c.tool_filters.excluded.retain(|excluded| excluded != name);
+        c.tool_filters
+            .model_excluded
+            .retain(|excluded| excluded != name);
+        if c.model_tools.is_none() && !c.tool_filters.model_add.contains(name) {
+            c.tool_filters.model_add.push(name.clone());
+        }
+    }
     if let Some(allowed) = &mut c.allowed_tools {
         for name in c.round_added_tools.iter().flatten() {
             if !name.is_empty() && !allowed.contains(name) {
@@ -15811,6 +15936,7 @@ mod scheduler_tests {
             provider_adapter: None,
             allowed_tools: None,
             model_tools: None,
+            tool_filters: ToolFilters::default(),
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,

@@ -484,15 +484,27 @@ history-seeded children inherit the parent snapshot unless explicitly restricted
 
 `Harness::select_model_tools` and `Scheduler::select_model_tools` optionally persist
 an exact ordered model-facing selection on a settled conversation. `None` offers
-all enabled tools; an empty list offers none. The enabled allowlist remains the
+enabled non-deferred tools by default; an empty list offers none. The enabled allowlist remains the
 ceiling, and nested calls can still access enabled tools hidden from the model.
 Model-issued calls to hidden tools are rejected. Unknown names remain stored;
 forks retain the selection and old conversations default to `None`. Tool control
-additions append to both lists when each is set, preserving the existing behavior
-when the model selection is unset. Like upstream, a tool returning `add_tools` can
-therefore widen the enabled allowlist as well as the model selection; only trusted
-tool implementations should return this control. This bounded subset does not
-implement upstream caller permissions, remove patches, or deferred tools.
+additions append to both lists when each is set. `select_tools_except` replaces
+the enabled selection with a name-based remove filter; `select_model_tools_patch`
+replaces the model selection with remove and add lists. `set_deferred_tools`
+declares conversation-scoped deferred names: they remain available to nested
+tools but are omitted from model requests unless explicitly selected or loaded
+by the model add list. Non-deferred names in the add list do not change model
+ordering. With a patch, normal tools retain enabled order and loaded deferred
+tools follow in add order. Unknown names remain stored for later registration.
+`add_tools` removes added names from both remove filters and appends them to
+exact selections or the model add list at the tool-round boundary. A tool can
+therefore widen execution and model selection; only trusted tools should return
+this control. The filter and deferred declarations survive reopen and forks;
+updates require a settled conversation. Unlike upstream's registration-level
+deferred metadata, these declarations are set per conversation, and unset host
+tools are ordered by name. Selection APIs reject empty or duplicate names.
+There is no built-in deferred-tool search; a host tool can return `add_tools`.
+Per-tool caller permissions remain unsupported.
 
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
