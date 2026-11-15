@@ -145,7 +145,7 @@ impl Model for WorkbenchModel {
             }
         }
         let stream = client
-            .stream_with_headers(self.filtered(request), &headers, false)
+            .stream_with_headers(self.filtered(request), &headers, false, Some(external_id))
             .await?;
         Ok(self.estimate_usage(stream))
     }
@@ -157,7 +157,7 @@ impl Model for WorkbenchModel {
     ) -> Result<ModelStream> {
         let stream = self
             .client
-            .stream_with_headers(self.filtered(request), &HeaderMap::new(), true)
+            .stream_with_headers(self.filtered(request), &HeaderMap::new(), true, None)
             .await?;
         Ok(self.estimate_usage(stream))
     }
@@ -310,6 +310,104 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_session_cache_key_uses_external_identity_and_skips_summaries() {
+        use std::io::{Read, Write};
+        for (identity, summary, expected) in [
+            (
+                "session-one".to_owned(),
+                false,
+                Some("session-one".to_owned()),
+            ),
+            (
+                format!("{}tail", "猫".repeat(64)),
+                false,
+                Some("猫".repeat(64)),
+            ),
+            (String::new(), false, None),
+            ("session-one".to_owned(), true, None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let model = WorkbenchModel {
+                client: Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(
+                        &format!("http://{address}/responses"),
+                        "fixture".into(),
+                    )
+                    .unwrap(),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: &[],
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            if summary {
+                let _ = model
+                    .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                    .await;
+            } else {
+                let _ = model
+                    .stream_in_session_with_identity(
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        &identity,
+                        request,
+                    )
+                    .await;
+            }
+            let body = server.join().unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(|v| v.as_str()),
+                expected.as_deref()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn external_identity_is_used_for_affinity_header() {

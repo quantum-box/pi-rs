@@ -4174,8 +4174,9 @@ For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
 supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
 overrides can disable long retention. Summary requests remove configured cache
 fields and, for explicit-mode models, request explicit caching with no
-breakpoints. ChatGPT plan requests omit these API-specific options. The
-Responses adapter does not yet send Pi's session-derived prompt cache key.
+breakpoints. ChatGPT plan requests omit these API-specific options. Responses requests use the active session ID as their prompt cache key,
+clamped to 64 Unicode characters, and omit it for summary requests. Pi’s
+Responses session-routing headers remain unsupported.
 
 ### Native Messages cache control checkpoint
 
