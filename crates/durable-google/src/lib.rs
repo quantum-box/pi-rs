@@ -6,7 +6,7 @@ use pi_rs_core::{
     Error, Message, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, Usage, extract_tool_images,
 };
-use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Response, Url, header::HeaderValue};
 use serde_json::{Value, json};
 use std::{
@@ -225,7 +225,7 @@ fn wire_request(
     thinking: Option<&str>,
     replay_scope: &str,
 ) -> Result<Value> {
-    wire_request_with_blocks(request, thinking, replay_scope, None)
+    wire_request_with_blocks(request, thinking, replay_scope, None, None)
 }
 
 fn wire_request_with_blocks(
@@ -233,6 +233,7 @@ fn wire_request_with_blocks(
     thinking: Option<&str>,
     replay_scope: &str,
     durable: Option<&DurableRequest>,
+    tools: Option<&DurableToolRequest>,
 ) -> Result<Value> {
     if let Some(durable) = durable {
         let mut ids = BTreeSet::new();
@@ -374,7 +375,63 @@ fn wire_request_with_blocks(
                         "Google tool result has no preceding call".into(),
                     ));
                 };
-                let (text, images) = extract_tool_images(content.clone());
+                let (text, images) = if let Some(binding) =
+                    tools.and_then(|t| t.tool_blocks.get(&index))
+                {
+                    if request.messages.iter().filter(|m| matches!(m, Message::Tool { call_id: other, .. } if other == call_id)).count() != 1 {
+                        return Err(Error::Config("ambiguous tool result call ID".into()));
+                    }
+                    let mut text = String::new();
+                    let mut images = Vec::new();
+                    let mut seen_text = false;
+                    for block in &binding.blocks {
+                        let obj = block
+                            .as_object()
+                            .ok_or_else(|| Error::Config("invalid tool block".into()))?;
+                        match block["type"].as_str() {
+                            Some("text") if obj.len() == 2 && !seen_text && images.is_empty() => {
+                                text = block["text"]
+                                    .as_str()
+                                    .ok_or_else(|| Error::Config("invalid text".into()))?
+                                    .to_string();
+                                seen_text = true;
+                            }
+                            Some("image")
+                                if obj.len() == 3
+                                    && obj.keys().all(|k| {
+                                        ["type", "data", "mimeType"].contains(&k.as_str())
+                                    }) =>
+                            {
+                                let image = pi_rs_core::ImageContent {
+                                    data: block["data"]
+                                        .as_str()
+                                        .ok_or_else(|| Error::Config("invalid image".into()))?
+                                        .into(),
+                                    mime_type: block["mimeType"]
+                                        .as_str()
+                                        .ok_or_else(|| Error::Config("invalid image".into()))?
+                                        .into(),
+                                };
+                                image.validate()?;
+                                images.push(image);
+                            }
+                            _ => {
+                                return Err(Error::Config(
+                                    "Google cannot preserve this tool block order or metadata"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                    if binding.blocks.is_empty() || (!images.is_empty() && !gemini_v3) {
+                        return Err(Error::Config(
+                            "Google cannot preserve these tool blocks for this model".into(),
+                        ));
+                    }
+                    (text, images)
+                } else {
+                    extract_tool_images(content.clone())
+                };
                 let mut response = json!({"name":name,"response":{"output":text}});
                 if let Some(id) = id {
                     response["id"] = json!(id);
@@ -472,6 +529,46 @@ fn valid_content(body: &Value) -> bool {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for GoogleAdapter {
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        _: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<Value> {
+        request.validate_bindings()?;
+        if !valid_model_id(model_id(&request.request.request.model)) {
+            return Err(Error::Config("invalid Google model ID".into()));
+        }
+        wire_request_with_blocks(
+            &request.request.request,
+            None,
+            "google",
+            Some(&request.request),
+            Some(request),
+        )
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &Value,
+    ) -> Result<()> {
+        request.validate_bindings()?;
+        self.validate(attempt, &request.request.request, body)?;
+        let expected = wire_request_with_blocks(
+            &request.request.request,
+            None,
+            "google",
+            Some(&request.request),
+            Some(request),
+        )?;
+        if body.get("contents") != expected.get("contents") {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn supports_durable_blocks(&self) -> bool {
         true
     }
@@ -483,7 +580,7 @@ impl ProviderAdapter for GoogleAdapter {
         if !valid_model_id(model_id(&request.request.model)) {
             return Err(Error::Config("invalid Google model ID".into()));
         }
-        wire_request_with_blocks(&request.request, None, "google", Some(request))
+        wire_request_with_blocks(&request.request, None, "google", Some(request), None)
     }
     fn validate_durable(
         &self,
@@ -494,7 +591,7 @@ impl ProviderAdapter for GoogleAdapter {
         self.validate(attempt, &request.request, body)?;
         if !request.blocks.is_empty()
             && body.get("contents")
-                != wire_request_with_blocks(&request.request, None, "google", Some(request))?
+                != wire_request_with_blocks(&request.request, None, "google", Some(request), None)?
                     .get("contents")
         {
             return Err(Error::Config("provider hook changed durable input".into()));

@@ -6,7 +6,7 @@ use pi_rs_core::{
     Error, Message, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result,
     ToolCall, ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,6 +51,30 @@ impl OllamaAdapter {
 }
 #[async_trait::async_trait]
 impl ProviderAdapter for OllamaAdapter {
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<Value> {
+        let mut body = self.prepare_durable(attempt, &request.request).await?;
+        body["messages"] = json!(tool_messages(request)?);
+        Ok(body)
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request, body)?;
+        if body.get("messages") != Some(&json!(tool_messages(request)?)) {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn supports_durable_blocks(&self) -> bool {
         true
     }
@@ -268,6 +292,37 @@ fn durable_messages(durable: &DurableRequest) -> Result<Vec<Value>> {
             ));
         }
         messages.push(json!({"role":"user","content":blocks}));
+    }
+    Ok(messages)
+}
+
+fn tool_messages(request: &DurableToolRequest) -> Result<Vec<Value>> {
+    request.validate_bindings()?;
+    let mut messages = durable_messages(&request.request)?;
+    for (&index, binding) in &request.tool_blocks {
+        let Message::Tool { call_id, .. } = &request.request.request.messages[index] else {
+            unreachable!()
+        };
+        let mut sample = request.request.request.clone();
+        sample.messages = vec![Message::User {
+            content: String::new(),
+        }];
+        let user = DurableRequest {
+            request: sample,
+            blocks: [(0, binding.clone())].into_iter().collect(),
+        };
+        let encoded = durable_messages(&user)?;
+        let content = encoded[0]["content"].clone();
+        let mut found = 0;
+        for message in &mut messages {
+            if message["role"] == "tool" && message["tool_call_id"] == *call_id {
+                found += 1;
+                message["content"] = content.clone();
+            }
+        }
+        if found != 1 {
+            return Err(Error::Config("ambiguous tool result call ID".into()));
+        }
     }
     Ok(messages)
 }

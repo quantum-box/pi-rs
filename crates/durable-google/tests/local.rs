@@ -377,3 +377,93 @@ async fn base_path_and_model_ids_cannot_change_request_target() {
         )
     );
 }
+
+fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
+    let mut request = request();
+    request.messages = vec![
+        Message::User {
+            content: "go".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "c1".into(),
+            content: String::new(),
+        },
+    ];
+    pi_rs_durable::model::DurableToolRequest {
+        request: pi_rs_durable::model::DurableRequest {
+            request,
+            blocks: Default::default(),
+        },
+        tool_blocks: [(
+            2,
+            pi_rs_durable::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","mimeType":"image/png","data":"aGk="}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test]
+async fn google_tool_blocks_reject_unrepresentable_order_and_tampering() {
+    let adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
+    let a = attempt();
+    let mut req = ordered_tool_request();
+    assert!(adapter.prepare_with_tool_blocks(&a, &req).await.is_err());
+    req.tool_blocks.get_mut(&2).unwrap().blocks.pop();
+    let mut body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    let response = &body["contents"][2]["parts"][0]["functionResponse"];
+    assert_eq!(response["response"]["output"], "first");
+    assert_eq!(response["parts"][0]["inlineData"]["data"], "aGk=");
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    body["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"] =
+        json!("YQ==");
+    assert!(adapter.validate_with_tool_blocks(&a, &req, &body).is_err());
+    req.request.request.model = "gemini-2.5-flash".into();
+    assert!(adapter.prepare_with_tool_blocks(&a, &req).await.is_err());
+}
+
+#[tokio::test]
+async fn google_tool_result_reaches_fake_http() {
+    let response = Box::leak(
+        sse(r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#)
+            .into_boxed_str(),
+    );
+    let (url, server) = server(response, false).await;
+    let adapter = GoogleAdapter::new(&url, "secret-key").unwrap();
+    let a = attempt();
+    let mut req = ordered_tool_request();
+    req.tool_blocks.get_mut(&2).unwrap().blocks.pop();
+    let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &req.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let bytes = server.await.unwrap();
+    let split = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let sent: Value = serde_json::from_slice(&bytes[split + 4..]).unwrap();
+    assert_eq!(sent, body);
+    assert_eq!(
+        sent["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"],
+        "aGk="
+    );
+}

@@ -7,7 +7,7 @@ use pi_rs_core::{
     Error, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
     ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
@@ -55,8 +55,74 @@ impl AnthropicAdapter {
         })
     }
 }
+
+fn tool_payload(request: &DurableToolRequest) -> Result<Value> {
+    request.validate_bindings()?;
+    let mut body = encode::encode_request_with_blocks(
+        request.request.request.clone(),
+        SCOPE,
+        Some(&request.request),
+    )?;
+    for (&index, binding) in &request.tool_blocks {
+        let pi_rs_core::Message::Tool { call_id, .. } = &request.request.request.messages[index]
+        else {
+            unreachable!()
+        };
+        let mut sample = request.request.request.clone();
+        sample.messages = vec![pi_rs_core::Message::User {
+            content: String::new(),
+        }];
+        let user = DurableRequest {
+            request: sample,
+            blocks: [(0, binding.clone())].into_iter().collect(),
+        };
+        let content = encode::encode_request_with_blocks(user.request.clone(), SCOPE, Some(&user))?
+            ["messages"][0]["content"]
+            .clone();
+        let messages = body["messages"]
+            .as_array_mut()
+            .ok_or_else(|| Error::Config("invalid messages".into()))?;
+        let mut found = 0;
+        for message in messages {
+            if let Some(blocks) = message["content"].as_array_mut() {
+                for block in blocks {
+                    if block["type"] == "tool_result" && block["tool_use_id"] == *call_id {
+                        found += 1;
+                        block["content"] = content.clone();
+                    }
+                }
+            }
+        }
+        if found != 1 {
+            return Err(Error::Config("ambiguous tool result call ID".into()));
+        }
+    }
+    Ok(body)
+}
 #[async_trait::async_trait]
 impl ProviderAdapter for AnthropicAdapter {
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        _: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<Value> {
+        tool_payload(request)
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request, body)?;
+        if body.get("messages") != tool_payload(request)?.get("messages") {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn supports_durable_blocks(&self) -> bool {
         true
     }

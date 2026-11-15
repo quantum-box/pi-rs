@@ -435,3 +435,83 @@ async fn durable_hook_reaches_http_server() {
     ));
     thread.join().unwrap();
 }
+
+fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
+    let mut request = request();
+    request.messages = vec![
+        Message::User {
+            content: "go".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "c1".into(),
+            content: String::new(),
+        },
+    ];
+    pi_rs_durable::model::DurableToolRequest {
+        request: pi_rs_durable::model::DurableRequest {
+            request,
+            blocks: Default::default(),
+        },
+        tool_blocks: [(
+            2,
+            pi_rs_durable::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","mimeType":"image/png","data":"aGk="}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test]
+async fn ollama_tool_blocks_preserve_order_and_reject_hook_tampering() {
+    let adapter = OllamaAdapter::new("http://127.0.0.1:1").unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    let mut body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    assert_eq!(
+        body["messages"][2]["content"],
+        json!([{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}},{"type":"text","text":"last"}])
+    );
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    body["messages"][2]["content"][0]["text"] = json!("changed");
+    assert!(adapter.validate_with_tool_blocks(&a, &req, &body).is_err());
+}
+
+#[tokio::test]
+async fn ollama_tool_result_reaches_fake_http_in_order() {
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ),
+        false,
+    );
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &req.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}

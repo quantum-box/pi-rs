@@ -630,6 +630,13 @@ async fn yield_blocks_reopen_and_dispatch_in_order() {
     ))
     .unwrap();
     h.install_extension(extension()).unwrap();
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .any(|b| b.blocks.len() == 3)
+    );
     h.resume_conversation(id, &CancellationToken::new())
         .await
         .unwrap();
@@ -781,4 +788,247 @@ async fn before_request_cannot_discard_block_binding() {
             .contains("cannot replace durable content bindings"),
         "{err}"
     );
+}
+
+fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
+    let mut request = request();
+    request.messages = vec![
+        Message::User {
+            content: "go".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "c1".into(),
+            content: String::new(),
+        },
+    ];
+    pi_rs_durable::model::DurableToolRequest {
+        request: pi_rs_durable::model::DurableRequest {
+            request,
+            blocks: Default::default(),
+        },
+        tool_blocks: [(
+            2,
+            pi_rs_durable::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","mimeType":"image/png","data":"aGk="}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test]
+async fn tool_blocks_reach_http_in_order_and_reject_hook_tampering() {
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        ),
+        false,
+    );
+    let adapter = OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    assert_eq!(
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["type"] == "function_call_output")
+            .unwrap()["output"]
+            .clone(),
+        json!([{"type":"input_text","text":"first"},{"type":"input_image","image_url":"data:image/png;base64,aGk="},{"type":"input_text","text":"last"}])
+    );
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    let mut changed = body.clone();
+    let key = if changed.get("input").is_some() {
+        "input"
+    } else {
+        "messages"
+    };
+    changed[key] = json!([]);
+    assert!(
+        adapter
+            .validate_with_tool_blocks(&a, &req, &changed)
+            .is_err()
+    );
+    let mut duplicate = req.clone();
+    duplicate.request.request.messages.push(Message::Tool {
+        call_id: "c1".into(),
+        content: String::new(),
+    });
+    assert!(
+        adapter
+            .prepare_with_tool_blocks(&a, &duplicate)
+            .await
+            .is_err()
+    );
+    collect_generation(
+        adapter.dispatch(&a, &req.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}
+
+struct ToolBlocksFixture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait::async_trait]
+impl pi_rs_core::Tool for ToolBlocksFixture {
+    fn spec(&self) -> pi_rs_core::ToolSpec {
+        pi_rs_core::ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: pi_rs_core::ToolContext) -> pi_rs_core::Outcome {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        pi_rs_core::Outcome::Succeeded("fixture".into())
+    }
+}
+struct BlockAndInterrupt(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for BlockAndInterrupt {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool_blocks(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolBlockResult,
+        _: bool,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        let mut result = result.clone();
+        result.output = vec![
+            json!({"type":"text","text":"first"}),
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            json!({"type":"text","text":"last"}),
+        ];
+        Ok(Some(result))
+    }
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::BeforeRequest
+            && value.get("tool_content_blocks").is_some()
+            && self.0.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut changed = value.clone();
+            changed["tool_content_blocks"] = json!({});
+            return Ok(GenerationDecision::Replace(changed));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+#[tokio::test]
+async fn persisted_tool_blocks_resume_to_http_without_reexecution() {
+    use pi_rs_durable::{
+        extension::Extension,
+        recovery::{ReplayPolicy, UncertainPolicy},
+        runtime::{Config, Harness, Options, RegisteredTool},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let first = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}]}}\n\n"
+    );
+    let (url, rx, thread) = server(http(first), false);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(UnusedModel),
+        tools: vec![RegisteredTool {
+            tool: Arc::new(ToolBlocksFixture(calls.clone())),
+            replay: ReplayPolicy::Unsafe,
+        }],
+        restart_limit: 3,
+        max_turns: 3,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let hook = Arc::new(BlockAndInterrupt(AtomicBool::new(true)));
+    let extension = || Extension {
+        name: "blocks".into(),
+        hooks: vec![hook.clone()],
+        ..Default::default()
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    assert!(
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .is_err()
+    );
+    rx.recv().unwrap();
+    thread.join().unwrap();
+    drop(h);
+    hook.0.store(false, Ordering::SeqCst);
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        ),
+        false,
+    );
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let body = rx.recv().unwrap();
+    let result = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(result["call_id"], "c1");
+    assert_eq!(
+        result["output"],
+        json!([{"type":"input_text","text":"first"},{"type":"input_image","image_url":"data:image/png;base64,aGk="},{"type":"input_text","text":"last"}])
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    thread.join().unwrap();
 }

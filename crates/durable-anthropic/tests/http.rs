@@ -379,3 +379,102 @@ async fn truncated_tool_call_is_marked_for_runtime_to_skip() {
     rx.recv().unwrap();
     thread.join().unwrap();
 }
+
+fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
+    let mut request = request();
+    request.messages = vec![
+        Message::User {
+            content: "go".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "c1".into(),
+            content: String::new(),
+        },
+    ];
+    pi_rs_durable::model::DurableToolRequest {
+        request: pi_rs_durable::model::DurableRequest {
+            request,
+            blocks: Default::default(),
+        },
+        tool_blocks: [(
+            2,
+            pi_rs_durable::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"first"}),
+                    json!({"type":"image","mimeType":"image/png","data":"aGk="}),
+                    json!({"type":"text","text":"last"}),
+                ],
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test]
+async fn tool_blocks_reach_http_in_order_and_reject_hook_tampering() {
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    );
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+    assert_eq!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|v| v["content"].as_array().unwrap().iter())
+            .find(|v| v["type"] == "tool_result")
+            .unwrap()["content"]
+            .clone(),
+        json!([{"type":"text","text":"first"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"last"}])
+    );
+    adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    let mut changed = body.clone();
+    let key = if changed.get("input").is_some() {
+        "input"
+    } else {
+        "messages"
+    };
+    changed[key] = json!([]);
+    assert!(
+        adapter
+            .validate_with_tool_blocks(&a, &req, &changed)
+            .is_err()
+    );
+    let mut duplicate = req.clone();
+    duplicate.request.request.messages.push(Message::Tool {
+        call_id: "c1".into(),
+        content: String::new(),
+    });
+    assert!(
+        adapter
+            .prepare_with_tool_blocks(&a, &duplicate)
+            .await
+            .is_err()
+    );
+    collect_generation(
+        adapter.dispatch(&a, &req.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}

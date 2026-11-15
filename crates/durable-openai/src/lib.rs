@@ -6,7 +6,7 @@ use pi_rs_core::{
     Error, Message, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{DurableRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
@@ -200,6 +200,41 @@ fn durable_payload(durable: &DurableRequest) -> Result<Value> {
     Ok(body)
 }
 
+fn tool_payload(request: &DurableToolRequest) -> Result<Value> {
+    request.validate_bindings()?;
+    let mut body = durable_payload(&request.request)?;
+    let input = body["input"]
+        .as_array_mut()
+        .ok_or_else(|| Error::Config("invalid input".into()))?;
+    for (&index, binding) in &request.tool_blocks {
+        let Message::Tool { call_id, .. } = &request.request.request.messages[index] else {
+            unreachable!()
+        };
+        let positions: Vec<_> = input
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item["type"] == "function_call_output" && item["call_id"] == *call_id
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if positions.len() != 1 {
+            return Err(Error::Config("ambiguous tool result call ID".into()));
+        }
+        let mut sample = request.request.request.clone();
+        sample.messages = vec![Message::User {
+            content: String::new(),
+        }];
+        let user = DurableRequest {
+            request: sample,
+            blocks: [(0, binding.clone())].into_iter().collect(),
+        };
+        let encoded = durable_payload(&user)?;
+        input[positions[0]]["output"] = encoded["input"][0]["content"].clone();
+    }
+    Ok(body)
+}
+
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
     value[name]
         .as_str()
@@ -230,6 +265,28 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl ProviderAdapter for OpenAiResponsesAdapter {
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        _: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<Value> {
+        tool_payload(request)
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request, body)?;
+        if body.get("input") != tool_payload(request)?.get("input") {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn id(&self) -> &str {
         "openai-responses-api/v1"
     }
