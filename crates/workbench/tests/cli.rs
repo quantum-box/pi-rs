@@ -158,6 +158,7 @@ fn mcp_added_oauth_secret_reference_is_resolved_for_login() {
     assert!(!resolved.status.success());
     assert!(!String::from_utf8_lossy(&resolved.stderr).contains("missing environment variable"));
     assert!(!String::from_utf8_lossy(&resolved.stderr).contains("private-fixture-secret"));
+    assert!(!String::from_utf8_lossy(&resolved.stdout).contains("private-fixture-secret"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert!(!String::from_utf8_lossy(&before).contains("private-fixture-secret"));
 }
