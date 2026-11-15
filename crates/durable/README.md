@@ -569,8 +569,25 @@ tools are searched in name order for ties. Install the same extension before
 resuming an interrupted conversation. A committed search control survives
 reopen; interruption before its outcome is committed follows the existing
 extension-tool recovery and reconciliation policy.
-The model-visible result lists loaded names; this runtime currently discards
-the tool outcome's separate structured details when recording the result.
+The model-visible result lists loaded names; its `loaded` details are also
+available in the conversation's durable tool-result metadata.
+Each conversation exposes `tool_results`, ordered terminal-operation metadata
+with operation ID, call ID, tool name, error flag, optional details or structured
+output, attachments, and diagnostics. It is committed with the tool outcome
+before after-tool hooks, included in history snapshots and inherited at a proven
+fork cut. Resets and compaction retain it. `SucceededWithDetails` keeps details
+out of model messages; existing `Outcome::Structured` model serialization is
+unchanged. Failed or skipped results produce an error diagnostic, and truncated
+output produces a warning. Durable keyed tools can call `KeyedHost::diagnostic`
+while executing a top-level attempt; at most 32 diagnostics of at most 4 KiB
+each are accepted. Result metadata above 64 KiB is replaced by a truncation
+diagnostic, while the tool's model output is retained and the tool is not
+re-executed. Records have no retention policy. Diagnostics emitted before a
+pending or unknown result, nested-tool diagnostics, historical records created
+before this feature, and synthetic skips without operation identities are not
+backfilled. Reconciliation accepts the existing terminal outcome types, and
+structured-output schema validation is not implemented.
+
 `Harness::set_tool_callers` and `Scheduler::set_tool_callers` persist a
 registered tool's caller override for a settled conversation: `Both`,
 `ModelOnly`, `ToolsOnly`, or `Neither`; `None` restores the default of both.

@@ -18,6 +18,7 @@ struct Dispatch {
     ordinary: Arc<dyn ToolHost>,
     claimed: AtomicBool,
     control: Arc<Mutex<crate::reset::ToolControl>>,
+    diagnostics: Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
     stream: Option<Arc<dyn StreamSink>>,
 }
 tokio::task_local! { static CURRENT_HOST: Dispatch; }
@@ -37,6 +38,7 @@ pub(crate) async fn scope<F: std::future::Future>(
         ordinary,
         Arc::new(Mutex::new(Default::default())),
         None,
+        None,
         future,
     )
     .await
@@ -48,6 +50,7 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
     control: Arc<Mutex<crate::reset::ToolControl>>,
+    diagnostics: Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
     stream: Option<Arc<dyn StreamSink>>,
     future: F,
 ) -> F::Output {
@@ -59,6 +62,7 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
         ordinary,
         claimed: AtomicBool::new(false),
         control,
+        diagnostics,
         stream,
     };
     CURRENT_HOST.scope(dispatch, future).await
@@ -104,8 +108,31 @@ pub struct KeyedHost {
     ordinary: Arc<dyn ToolHost>,
     nested: Arc<NestedHost>,
     stream: Option<Arc<dyn StreamSink>>,
+    diagnostics: Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
 }
 impl KeyedHost {
+    /// Record a bounded diagnostic for the completed top-level tool result.
+    pub fn diagnostic(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String> {
+        if diagnostic.message.len() > 4096
+            || diagnostic
+                .code
+                .as_ref()
+                .is_some_and(|code| code.len() > 256)
+        {
+            return Err("tool diagnostic exceeds size limit".into());
+        }
+        let mut diagnostics = self
+            .diagnostics
+            .as_ref()
+            .ok_or("nested tool diagnostics are not supported")?
+            .lock()
+            .map_err(|_| "tool diagnostic lock poisoned")?;
+        if diagnostics.len() >= 32 {
+            return Err("too many tool diagnostics".into());
+        }
+        diagnostics.push(diagnostic);
+        Ok(())
+    }
     pub fn ordinary(&self) -> &Arc<dyn ToolHost> {
         &self.ordinary
     }
@@ -332,12 +359,16 @@ impl<T: KeyedTool> Tool for KeyedToolAdapter<T> {
                 {
                     None
                 } else {
-                    Some((dispatch.nested.clone(), dispatch.stream.clone()))
+                    Some((
+                        dispatch.nested.clone(),
+                        dispatch.stream.clone(),
+                        dispatch.diagnostics.clone(),
+                    ))
                 }
             })
             .ok()
             .flatten();
-        let Some((nested, stream)) = nested else {
+        let Some((nested, stream, diagnostics)) = nested else {
             return Outcome::Skipped("keyed tool requires durable runtime".into()).into();
         };
         let (reply, control) = self
@@ -350,6 +381,7 @@ impl<T: KeyedTool> Tool for KeyedToolAdapter<T> {
                     ordinary,
                     nested,
                     stream,
+                    diagnostics,
                 },
             )
             .await;

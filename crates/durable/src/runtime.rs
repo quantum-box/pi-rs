@@ -655,6 +655,9 @@ pub struct Conversation {
     /// Persisted remove filters and model-facing deferred-tool declarations.
     #[serde(default)]
     pub tool_filters: ToolFilters,
+    /// Durable metadata for terminal tool operations, independent of model messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ToolResultMetadata>,
     pub messages: Vec<Message>,
     /// Lossless block arrays indexed by their active message position.
     /// Reconstructed from the transcript; never serialized in the snapshot.
@@ -720,6 +723,107 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nested_resume: Option<NestedResume>,
     phase: Phase,
+}
+
+/// A diagnostic associated with a tool result, not part of model output.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDiagnostic {
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticSeverity {
+    Info,
+    Warn,
+    Error,
+}
+/// Separately retained metadata for one terminal tool operation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolResultMetadata {
+    pub operation_id: Uuid,
+    pub call_id: String,
+    pub tool: String,
+    pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<pi_rs_core::AttachmentRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ToolDiagnostic>,
+}
+
+fn record_tool_result(
+    c: &mut Conversation,
+    calls: &[ToolCall],
+    index: usize,
+    operation_id: Uuid,
+    outcome: &Outcome,
+    mut diagnostics: Vec<ToolDiagnostic>,
+) -> Result<(), Error> {
+    let call = calls
+        .get(index)
+        .ok_or_else(|| Error::Invalid("invalid tool result index".into()))?;
+    if c.tool_results
+        .iter()
+        .any(|result| result.operation_id == operation_id)
+    {
+        return Ok(());
+    }
+    let (mut details, mut structured_output, mut attachments) = match outcome {
+        Outcome::SucceededWithDetails { details, .. } => (Some(details.clone()), None, Vec::new()),
+        Outcome::Structured { data, attachments } => {
+            (None, Some(data.clone()), attachments.clone())
+        }
+        _ => (None, None, Vec::new()),
+    };
+    if let Outcome::Failed(reason) | Outcome::Skipped(reason) = outcome {
+        let code = if matches!(outcome, Outcome::Skipped(_)) {
+            "tool_skipped"
+        } else {
+            "tool_failed"
+        };
+        diagnostics.push(ToolDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            message: reason.clone(),
+            code: Some(code.into()),
+        });
+    }
+    if let Outcome::Truncated { original_bytes } = outcome {
+        diagnostics.push(ToolDiagnostic {
+            severity: DiagnosticSeverity::Warn,
+            message: format!("tool output omitted ({original_bytes} bytes)"),
+            code: Some("output_truncated".into()),
+        });
+    }
+    let size = serde_json::to_vec(&(&details, &structured_output, &attachments, &diagnostics))
+        .map_or(usize::MAX, |v| v.len());
+    if size > 65_536 {
+        details = None;
+        structured_output = None;
+        attachments.clear();
+        diagnostics.clear();
+        diagnostics.push(ToolDiagnostic {
+            severity: DiagnosticSeverity::Warn,
+            message: "tool result metadata exceeded 65536 bytes".into(),
+            code: Some("metadata_truncated".into()),
+        });
+    }
+    c.tool_results.push(ToolResultMetadata {
+        operation_id,
+        call_id: call.id.clone(),
+        tool: call.name.clone(),
+        is_error: matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_)),
+        details,
+        structured_output,
+        attachments,
+        diagnostics,
+    });
+    Ok(())
 }
 
 /// Name-based filter metadata. Deferred names affect model exposure only.
@@ -3337,6 +3441,7 @@ impl Harness {
                         &state.allowed_tools,
                         &state.model_tools,
                         &state.tool_filters,
+                        &state.tool_results,
                         &state.occurrence_epoch_proven,
                         &state.resets,
                         &state.application_writes,
@@ -3350,6 +3455,7 @@ impl Harness {
                             &previous.allowed_tools,
                             &previous.model_tools,
                             &previous.tool_filters,
+                            &previous.tool_results,
                             &previous.occurrence_epoch_proven,
                             &previous.resets,
                             &previous.application_writes,
@@ -3369,10 +3475,10 @@ impl Harness {
                 })
                 && matches!((serde_json::to_value((
                     &state.queue_modes, &state.after_failed_run, &state.extensions, &state.provider_adapter,
-                    &state.allowed_tools, &state.model_tools, &state.tool_filters, &state.occurrence_epoch_proven, &state.resets, &state.application_writes, &state.tool_states,
+                    &state.allowed_tools, &state.model_tools, &state.tool_filters, &state.tool_results, &state.occurrence_epoch_proven, &state.resets, &state.application_writes, &state.tool_states,
                 )), serde_json::to_value((
                     &previous.queue_modes, &previous.after_failed_run, &previous.extensions, &previous.provider_adapter,
-                    &previous.allowed_tools, &previous.model_tools, &previous.tool_filters, &previous.occurrence_epoch_proven, &previous.resets, &previous.application_writes, &previous.tool_states,
+                    &previous.allowed_tools, &previous.model_tools, &previous.tool_filters, &previous.tool_results, &previous.occurrence_epoch_proven, &previous.resets, &previous.application_writes, &previous.tool_states,
                 ))), (Ok(a), Ok(b)) if a == b)
         }).map(|previous| previous.messages.len());
         // Inline legacy messages predate this commit; their original identities and
@@ -3533,7 +3639,7 @@ impl Harness {
         let mut persisted = state.clone();
         persisted.messages.clear();
         let value = serde_json::to_vec(&persisted)?;
-        let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes});
+        let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes, "tool_results": state.tool_results});
         append.set_value(&event)?;
         let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
         let fork_snapshot = crate::fork::Snapshot {
@@ -3571,6 +3677,10 @@ impl Harness {
                 (
                     "pi-rs/runtime/tool-filters".into(),
                     serde_json::to_value(&state.tool_filters)?,
+                ),
+                (
+                    "pi-rs/runtime/tool-results".into(),
+                    serde_json::to_value(&state.tool_results)?,
                 ),
                 (
                     "pi-rs/runtime/occurrence-epoch-proven".into(),
@@ -3904,6 +4014,7 @@ impl Harness {
             allowed_tools: None,
             model_tools: None,
             tool_filters: ToolFilters::default(),
+            tool_results: Vec::new(),
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
@@ -4182,6 +4293,12 @@ impl Harness {
             tool_filters: point
                 .documents
                 .get("pi-rs/runtime/tool-filters")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default(),
+            tool_results: point
+                .documents
+                .get("pi-rs/runtime/tool-results")
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default(),
@@ -7608,6 +7725,7 @@ impl Harness {
                             } else {
                                 "tool interrupted and may have partially run"
                             };
+                            record_tool_result(&mut c, &calls, index, operation_id, &Outcome::Failed(reason.into()), Vec::new())?;
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
@@ -7903,6 +8021,7 @@ impl Harness {
                         arguments: Some(arguments),
                     };
                 } else {
+                    record_tool_result(&mut c, &calls, index, operation_id, &outcome, Vec::new())?;
                     append_tool(&mut c, &calls, index, outcome.tool_content())?;
                     for i in index + 1..calls.len() {
                         append_tool(
@@ -9519,6 +9638,14 @@ impl Harness {
                                 }
                             }
                             Err(outcome) => {
+                                record_tool_result(
+                                    &mut c,
+                                    &calls,
+                                    index,
+                                    operation_id,
+                                    &outcome,
+                                    Vec::new(),
+                                )?;
                                 append_tool(&mut c, &calls, index, outcome.tool_content())?;
                                 c.phase = Phase::Tools {
                                     turns,
@@ -9528,6 +9655,14 @@ impl Harness {
                             }
                         }
                     } else {
+                        record_tool_result(
+                            &mut c,
+                            &calls,
+                            index,
+                            Uuid::new_v4(),
+                            &Outcome::Skipped("tool unavailable".into()),
+                            Vec::new(),
+                        )?;
                         append_tool(&mut c, &calls, index, "tool unavailable".into())?;
                         c.phase = Phase::Tools {
                             turns,
@@ -9591,6 +9726,14 @@ impl Harness {
                     else {
                         let arguments = pi_rs_core::parse_tool_arguments(&call.arguments)
                             .unwrap_or(serde_json::Value::Null);
+                        record_tool_result(
+                            &mut c,
+                            &calls,
+                            index,
+                            operation_id,
+                            &Outcome::Skipped("tool unavailable".into()),
+                            Vec::new(),
+                        )?;
                         c.phase = Phase::ToolFinished {
                             turns,
                             calls,
@@ -9629,6 +9772,14 @@ impl Harness {
                             let arguments =
                                 pi_rs_core::parse_tool_arguments(&calls[index].arguments)
                                     .unwrap_or(serde_json::Value::Null);
+                            record_tool_result(
+                                &mut c,
+                                &calls,
+                                index,
+                                operation_id,
+                                &outcome,
+                                Vec::new(),
+                            )?;
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
@@ -9712,6 +9863,14 @@ impl Harness {
                         }
                     };
                     if let Some(reason) = rejection {
+                        record_tool_result(
+                            &mut c,
+                            &calls,
+                            index,
+                            operation_id,
+                            &Outcome::Skipped(reason.clone()),
+                            Vec::new(),
+                        )?;
                         c.phase = Phase::ToolFinished {
                             turns,
                             calls,
@@ -9745,6 +9904,14 @@ impl Harness {
                                 }
                             }
                             Err(outcome) => {
+                                record_tool_result(
+                                    &mut c,
+                                    &calls,
+                                    index,
+                                    operation_id,
+                                    &outcome,
+                                    Vec::new(),
+                                )?;
                                 c.phase = Phase::ToolFinished {
                                     turns,
                                     calls,
@@ -9805,6 +9972,7 @@ impl Harness {
                     };
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
+                    let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
                     let mut tool_panicked = false;
                     let mut nested_resume_candidate = false;
                     let task_adapter = tools
@@ -9888,6 +10056,7 @@ impl Harness {
                                                         invocation.operation_id,
                                                         progress_host.clone(),
                                                         control.clone(),
+                                                        Some(diagnostics.clone()),
                                                         c.tool_attempt().map(|attempt| {
                                                             Arc::new(RuntimeStreamOutput {
                                                             owner: Arc::downgrade(&self.owner),
@@ -10068,6 +10237,18 @@ impl Harness {
                             }
                         }
                         other => {
+                            let reported = diagnostics
+                                .lock()
+                                .expect("tool diagnostics mutex poisoned")
+                                .clone();
+                            record_tool_result(
+                                &mut c,
+                                &calls,
+                                index,
+                                operation_id,
+                                &other,
+                                reported,
+                            )?;
                             // Older persisted rounds may predate either control vector.
                             c.round_terminates.resize(calls.len(), false);
                             c.round_handoffs.resize(calls.len(), None);
@@ -10160,6 +10341,14 @@ impl Harness {
                             arguments: Some(arguments),
                         }
                     } else {
+                        record_tool_result(
+                            &mut c,
+                            &calls,
+                            index,
+                            operation_id,
+                            &outcome,
+                            Vec::new(),
+                        )?;
                         Phase::ToolFinished {
                             turns,
                             calls,
@@ -10226,6 +10415,14 @@ impl Harness {
                             };
                         }
                         crate::poll::PollResult::Outcome(outcome) => {
+                            record_tool_result(
+                                &mut c,
+                                &calls,
+                                index,
+                                operation_id,
+                                &outcome,
+                                Vec::new(),
+                            )?;
                             let arguments = arguments.unwrap_or_else(|| {
                                 pi_rs_core::parse_tool_arguments(&calls[index].arguments)
                                     .unwrap_or(serde_json::Value::Null)
@@ -10420,6 +10617,7 @@ impl Harness {
             }
         }
         c.nested_resume = None;
+        record_tool_result(&mut c, &calls, index, operation_id, &outcome, Vec::new())?;
         if c.abort_requested {
             if !self.conversation_tasks(c.id)?.is_empty() {
                 return Err(Error::Invalid("owned task cleanup is still pending".into()));
@@ -16721,6 +16919,7 @@ mod scheduler_tests {
             allowed_tools: None,
             model_tools: None,
             tool_filters: ToolFilters::default(),
+            tool_results: Vec::new(),
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
