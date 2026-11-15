@@ -29,7 +29,9 @@ pub(super) fn blocks(
             }
             "redacted_thinking" if block["data"].as_str().is_some_and(|data| !data.is_empty()) => {
                 thought.push_str("[Reasoning redacted]");
-                result.push(json!({"type":"thinking", "thinking":"[Reasoning redacted]"}));
+                result.push(
+                    json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true}),
+                );
             }
             "tool_use" => {
                 let call = calls.next()?;
@@ -71,7 +73,7 @@ mod tests {
             result,
             vec![
                 json!({"type":"thinking","thinking":"a"}),
-                json!({"type":"thinking","thinking":"[Reasoning redacted]"}),
+                json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true}),
                 json!({"type":"text","text":"b"})
             ]
         );

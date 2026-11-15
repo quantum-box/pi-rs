@@ -726,6 +726,62 @@ impl Client {
         }
     }
 
+    pub async fn stream_detailed_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        match self {
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_detailed_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_detailed_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_detailed_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => Ok(Box::pin(
+                self.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                )
+                .await?
+                .map(|event| event.map(Into::into)),
+            )),
+        }
+    }
+
     pub fn aliases(&self) -> Vec<(String, String)> {
         match self {
             Self::PiMessages(client) => client.aliases(),
@@ -1170,6 +1226,26 @@ impl Model for Client {
             Self::Bedrock(client) => client.context_window(model).await,
             Self::Deferred(client) => client.resolve().await.ok()?.context_window(model).await,
         }
+    }
+
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.stream_detailed_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::DetailedModelStream> {
+        self.stream_detailed_with_headers(request, &HeaderMap::new(), true, None)
+            .await
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {

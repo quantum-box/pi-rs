@@ -102,7 +102,7 @@ impl Stream {
             {
                 if let Some(index) = event["index"].as_u64() {
                     if event["type"] == "reasoning_item_start" {
-                        self.reasoning_item_index(index, &mut events);
+                        self.reasoning_item_start(index, event["redacted"] == true, &mut events);
                     } else if event["type"] == "reasoning_item_delta" {
                         if let Some(delta) = event["delta"].as_str() {
                             self.reasoning_item_delta(index, delta, &mut events);
@@ -546,6 +546,15 @@ impl Stream {
     }
 
     fn reasoning_item_index(&mut self, output_index: u64, events: &mut Vec<Value>) -> usize {
+        self.reasoning_item_start(output_index, false, events)
+    }
+
+    fn reasoning_item_start(
+        &mut self,
+        output_index: u64,
+        redacted: bool,
+        events: &mut Vec<Value>,
+    ) -> usize {
         if let Some(&(index, _)) = self.reasoning_items.get(&output_index) {
             return index;
         }
@@ -555,7 +564,11 @@ impl Stream {
             .as_array_mut()
             .expect("assistant blocks");
         let index = blocks.len();
-        blocks.push(json!({"type":"thinking","thinking":""}));
+        blocks.push(if redacted {
+            json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
+        } else {
+            json!({"type":"thinking","thinking":""})
+        });
         self.reasoning_items.insert(output_index, (index, false));
         self.update(
             json!({"type":"thinking_start","contentIndex":index}),
@@ -566,7 +579,9 @@ impl Stream {
 
     fn reasoning_item_delta(&mut self, output_index: u64, delta: &str, events: &mut Vec<Value>) {
         let index = self.reasoning_item_index(output_index, events);
-        if self.reasoning_items[&output_index].1 {
+        if self.reasoning_items[&output_index].1
+            || self.assistant["content"][index]["redacted"] == true
+        {
             return;
         }
         if let Value::String(content) = &mut self.assistant["content"][index]["thinking"] {
@@ -589,6 +604,11 @@ impl Stream {
             return;
         }
         *ended = true;
+        let content = if self.assistant["content"][index]["redacted"] == true {
+            "[Reasoning redacted]"
+        } else {
+            content
+        };
         self.assistant["content"][index]["thinking"] = json!(content);
         self.update(
             json!({"type":"thinking_end","contentIndex":index,"content":content}),
@@ -941,6 +961,108 @@ mod streaming_tool_tests {
                 .unwrap();
             assert_eq!(turn["message"], end["message"]);
         }
+    }
+
+    #[test]
+    fn redacted_reasoning_starts_with_complete_block_without_delta() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = stream.observe(
+            &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
+            &args,
+        );
+        events.extend(stream.observe(
+            &json!({"type":"reasoning_item_end", "index":4, "content":"[Reasoning redacted]"}),
+            &args,
+        ));
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thinking_start", "thinking_end"]
+        );
+        for update in updates {
+            assert_eq!(
+                update["partial"]["content"][0],
+                json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_end_keeps_placeholder_after_reasoning_budget_is_exhausted() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let large = "x".repeat(1024 * 1024);
+        stream.observe(&json!({"type":"reasoning_item_start", "index":0}), &args);
+        stream.observe(
+            &json!({"type":"reasoning_item_delta", "index":0, "delta":large}),
+            &args,
+        );
+        stream.observe(
+            &json!({"type":"reasoning_item_end", "index":0, "content":large}),
+            &args,
+        );
+        stream.observe(
+            &json!({"type":"reasoning_item_start", "index":1, "redacted":true}),
+            &args,
+        );
+        // Core's bounded fallback is empty after its delta budget is exhausted.
+        let events = stream.observe(
+            &json!({"type":"reasoning_item_end", "index":1, "content":""}),
+            &args,
+        );
+        let end = events
+            .iter()
+            .find_map(|event| event.get("assistantMessageEvent"))
+            .unwrap();
+        assert_eq!(end["type"], "thinking_end");
+        assert_eq!(end["content"], "[Reasoning redacted]");
+        assert_eq!(
+            end["partial"]["content"][1],
+            json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
+        );
+        assert_eq!(stream.assistant["content"][1], end["partial"]["content"][1]);
+    }
+
+    #[test]
+    fn cancelled_redacted_block_closes_with_placeholder() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        stream.observe(
+            &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
+            &args,
+        );
+        let events = stream.settle(true);
+        let end = events
+            .iter()
+            .filter_map(|event| event.get("assistantMessageEvent"))
+            .find(|event| event["type"] == "thinking_end")
+            .unwrap();
+        assert_eq!(end["content"], "[Reasoning redacted]");
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(message["message"]["stopReason"], "aborted");
+        assert_eq!(
+            message["message"]["content"][0],
+            json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
+        );
     }
 
     #[test]

@@ -3523,11 +3523,12 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
-payload for provider replay. The current RPC event representation emits an
-extra placeholder delta for redacted blocks and does not expose the redacted
-flag or signature in partial messages; Pi includes them at block start. RPC
-`get_messages` reconstructs signed Anthropic block order from validated replay;
-unsigned text-only responses are still collapsed into one text block.
+payload for provider replay. Live Pi RPC thinking-start partial messages include
+the redacted flag without a synthetic delta. Unlike Pi, they omit the opaque
+thinking signature. Legacy model and agent observers continue to receive the
+placeholder delta. RPC `get_messages` reconstructs signed Anthropic block order
+from validated replay, retains the redacted flag, and omits opaque signatures
+from history. Unsigned text-only responses are still collapsed into one text block.
 Unlike Pi, the native agent has separate 1 MiB cumulative budgets for reasoning
 deltas and provider-supplied finalized reasoning. When the finalized budget is
 exceeded, block-end notifications contain only that block's observed deltas;
