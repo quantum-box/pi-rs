@@ -5005,6 +5005,14 @@ fn rpc_controls_apply_while_idle_and_streaming() {
             }
         }
     };
+    for command in ["set_steering_mode", "set_follow_up_mode"] {
+        for (id, mode) in [("idle-first", "all"), ("idle-last", "one-at-a-time")] {
+            send(json!({"type":command,"id":id,"mode":mode}));
+            let response = until(&|event| event["type"] == "response" && event["id"] == id);
+            assert_eq!(response["success"], true, "{response}");
+            assert!(response.get("data").is_none(), "{response}");
+        }
+    }
     send(serde_json::json!({"type":"steer","id":"idle-steer","message":"queued while idle"}));
     let updated = until(&|event| event["type"] == "queue_update" || event["id"] == "idle-steer");
     assert_eq!(
@@ -5025,6 +5033,19 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     );
     send(serde_json::json!({"type":"prompt","message":"same input"}));
     until(&|event| event["record"]["event"]["type"] == "model_requested");
+    for command in ["set_steering_mode", "set_follow_up_mode"] {
+        for (id, mode) in [("active-first", "all"), ("active-last", "one-at-a-time")] {
+            send(json!({"type":command,"id":id,"mode":mode}));
+            let response = until(&|event| event["type"] == "response" && event["id"] == id);
+            assert_eq!(response["success"], true, "{response}");
+            assert!(response.get("data").is_none(), "{response}");
+        }
+    }
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["steeringMode"], "one-at-a-time");
+    assert_eq!(settings["followUpMode"], "one-at-a-time");
     send(serde_json::json!({"type":"set_session_name","id":"rename","name":"  Active name  "}));
     let renamed = until(&|event| event["type"] == "session_info_changed");
     assert_eq!(renamed["name"], "Active name");
