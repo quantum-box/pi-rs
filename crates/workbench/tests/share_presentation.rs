@@ -268,6 +268,8 @@ fn standalone_share_requires_successful_relevant_mcp_discovery() {
         loop {
             match listener.accept() {
                 Ok((mut socket, _)) => {
+                    // Windows may inherit nonblocking mode from the listener.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -373,6 +375,8 @@ fn failed_mcp_discovery_closes_connected_peer_before_share_returns() {
                     }
                     Err(_) => break,
                 };
+                // Windows may inherit nonblocking mode from the listener.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
