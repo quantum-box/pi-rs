@@ -1242,6 +1242,7 @@ mod tests {
             json!({"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80})
         );
         assert!(flux.get("headers").is_none());
+        assert!(flux.get("baseUrl").is_none());
         let recraft = images
             .iter()
             .find(|entry| entry.model.id == "recraft/recraft-v4.1-flash")
@@ -1268,6 +1269,7 @@ mod tests {
             .descriptor();
         assert_eq!(value["inputLimits"]["images"]["maxPerRequest"], 2);
         assert!(value.get("headers").is_none());
+        assert!(value.get("baseUrl").is_none());
     }
 
     #[test]

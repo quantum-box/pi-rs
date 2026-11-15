@@ -3922,6 +3922,8 @@ catalogues are projected from the published
 Codemode's non-chat model catalogue exposes declared image input limits and
 classifier compatibility metadata. The pinned OpenRouter image entries retain
 Pi's image resize profiles, while model request headers remain private.
+Native descriptors also omit endpoint URLs, which can contain private path
+components; unlike Pi, scripts cannot inspect `baseUrl` in these entries.
 
 Image results record their API and creation timestamp even when request
 validation fails. Response IDs and measured usage survive malformed choices,
