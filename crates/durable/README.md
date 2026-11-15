@@ -1481,6 +1481,25 @@ synchronous task-handler API for `TaskTool`, not general `executeTool` support;
 its child runs the registered task handler rather than the ordinary nested tool
 hook pipeline, and starting it does not dispatch until the handler commits.
 
+New TaskTool tasks persist their adapter type. When a TaskTool succeeds, fails,
+returns a handler error, or is interrupted, it holds its outcome and atomically
+marks all live direct nested TaskTool children and their foreground descendants
+for abort. The parent waits for owned foreground work to finish before its
+outcome becomes terminal. Abort handlers must be registered and perform their
+own external cleanup; an abort handler's `Step::Fail`, `Err`, unwinding panic,
+or nonterminal step settles that child as failed and lets sibling cleanup
+continue. A process death or a failure to commit that outcome can still cause
+the abort handler to run again on reopen, so its effects must be replay-safe.
+Panics configured to abort the process cannot be caught. Generic
+children are not marked by normal TaskTool settlement, even if they share a
+handler kind, and generic task success still waits for its children naturally.
+An explicit parent abort retains its broader ownership semantics. Handler errors
+and `Step::Fail` discard children staged in that same uncommitted invocation.
+Records written before the adapter type was added lack it and retain generic
+semantics; existing keyed children cannot be silently upgraded. Drain or
+reconcile such work before upgrading. A commit recorded by the new runtime must
+not be resumed with an older runtime that does not enforce this type.
+
 `KeyedHost::call_keyed_batch` is a bounded pi-rs extension for at most eight
 distinct keyed calls. It admits calls in input order, durably records each
 accepted pending reference, and then polls those jobs concurrently. Results

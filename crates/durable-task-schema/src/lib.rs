@@ -20,6 +20,10 @@ macro_rules! declare_task_schema {
             1
         }
 
+        fn task_tool_is_false(value: &bool) -> bool {
+            !value
+        }
+
         /// Ownership is an immutable identity edge, not an executor lease.
         #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
         pub enum TaskOwner {
@@ -137,6 +141,9 @@ macro_rules! declare_task_schema {
             /// Conversation-owned background tasks form an ordinary abort boundary.
             #[serde(default)]
             background: bool,
+            /// Set only by the TaskTool adapter, never inferred from a task kind.
+            #[serde(default, skip_serializing_if = "task_tool_is_false")]
+            task_tool: bool,
         }
     };
 }

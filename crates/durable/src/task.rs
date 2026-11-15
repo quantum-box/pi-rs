@@ -50,6 +50,7 @@ impl Task {
             replay_safe: false,
             abort_requested: false,
             background: false,
+            task_tool: false,
         })
     }
 
@@ -67,6 +68,15 @@ impl Task {
 
     pub fn is_background(&self) -> bool {
         self.background
+    }
+
+    pub(crate) fn as_task_tool(mut self) -> Self {
+        self.task_tool = true;
+        self
+    }
+
+    pub(crate) fn is_task_tool(&self) -> bool {
+        self.task_tool
     }
 
     /// Bind a new task to a registered implementation and its persisted replay policy.

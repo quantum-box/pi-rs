@@ -8626,12 +8626,36 @@ impl Harness {
         self.abort_owned_graph_impl_with(conversation, task, receipt, background, || {})
     }
 
+    pub(crate) fn abort_nested_task_tools(&mut self, parent: Uuid) -> Result<Vec<Uuid>, Error> {
+        self.abort_owned_graph_impl_roots(None, None, None, false, Some(parent), || {})
+            .map(|(conversations, _, _)| conversations)
+    }
+
     fn abort_owned_graph_impl_with(
         &mut self,
         conversation: Option<Uuid>,
         task: Option<Uuid>,
         receipt: Option<(Vec<u8>, Vec<u8>)>,
         background: bool,
+        before_commit: impl FnMut(),
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
+        self.abort_owned_graph_impl_roots(
+            conversation,
+            task,
+            receipt,
+            background,
+            None,
+            before_commit,
+        )
+    }
+
+    fn abort_owned_graph_impl_roots(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+        receipt: Option<(Vec<u8>, Vec<u8>)>,
+        background: bool,
+        nested_parent: Option<Uuid>,
         mut before_commit: impl FnMut(),
     ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
@@ -8668,6 +8692,20 @@ impl Harness {
             }
             if let Some(id) = task {
                 tq.push_back(id);
+            }
+            if let Some(parent) = nested_parent {
+                let record = by_id.get(&parent).ok_or(Error::NotFound)?;
+                if !record.task.is_task_tool() || !record.task.is_completing() {
+                    return Err(Error::Invalid("task tool parent is not completing".into()));
+                }
+                for child in &records {
+                    if child.task.owner() == &TaskOwner::Task(parent)
+                        && child.task.is_task_tool()
+                        && !child.task.is_terminal()
+                    {
+                        tq.push_back(child.task.id());
+                    }
+                }
             }
             let mut states = Vec::new();
             let mut edge_checks = Vec::new();
@@ -8820,6 +8858,12 @@ impl Harness {
                 });
             }
             batch.checks.extend(edge_checks);
+            if let Some(parent) = nested_parent {
+                batch.checks.push(Check {
+                    key: crate::task_store::key(parent),
+                    expected: Expected::Version(by_id[&parent].version),
+                });
+            }
             for owner in tasks
                 .iter()
                 .copied()

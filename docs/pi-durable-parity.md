@@ -537,9 +537,30 @@ run the ordinary nested tool pipeline or provide an asynchronous result wait.
 It does not change normal `KeyedHost` calls or introduce independent ordinary
 tool executors.
 
-Upstream §7.3 aborts live nested calls before parent settlement and waits for
-them. The generic TaskTool scheduler currently waits for live owned children
-to end naturally on successful parent settlement; a parked child may therefore
-hold settlement indefinitely. Explicit parent abort does drain them. TaskTool
-parking occurs inside the handler and does not dispatch ordinary nested-tool
-hooks, so hook parity for independently parked ordinary tools is still absent.
+Upstream §7.3 aborts all live nested calls before parent settlement and waits
+for cleanup. Newly admitted TaskTool parents and nested TaskTool children now
+carry a durable adapter type. A completing TaskTool atomically marks all its
+live direct nested TaskTool children and their foreground ownership subgraphs
+for abort; it waits for owned foreground work before becoming terminal. Generic
+owned tasks, including tasks of the same registered kind, are not selected by
+this normal settlement cleanup. Generic task success remains unchanged. The
+stored outcome and abort marks survive restart. A TaskTool handler error enters
+this failure path; a panic or process death is governed by interrupted-task
+recovery. A child cleanup failure is terminal and does not replace the held
+parent result. As in upstream's fault rule, an abort handler's error, unwinding
+panic or nonterminal return becomes a failed child; a failed outcome commit or
+process death can still require cleanup replay. External effects require the
+registered abort handler to clean up and cannot be guaranteed cancelled by an abort mark alone. Cleanup of owned
+conversation subgraphs requires an attached conversation harness; the standalone
+scheduler fails closed when it encounters a foreground conversation edge.
+
+Legacy task records have no adapter type and remain generic; legacy keyed child
+identities are not silently upgraded. Drain or reconcile old work before using
+this behavior, and do not reopen new records with an older scheduler. In contrast
+to upstream, child admissions staged by a handler that returns `Step::Fail` or
+an error are discarded, generic owned foreground work also delays the parent's
+settlement, and an explicit abort arriving during `Completing` preserves its
+held outcome. Ordinary nested-tool hooks, autonomous ordinary Tool dispatch,
+and cancellation of a running synchronous handler remain unsupported.
+
+**Shared task schema integration:** The persisted TaskTool marker is part of the schema shared by the runtime and store. True survives task updates and document retirement; explicit false and missing legacy fields both decode as false, and false is omitted on serialization to retain the previous JSON shape. Legacy records without the marker cannot safely be identified as TaskTools.

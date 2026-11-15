@@ -45,6 +45,8 @@ struct Identity {
     task_version: u32,
     initial_checkpoint: crate::task::Checkpoint,
     restart_limit: u32,
+    #[serde(default)]
+    task_tool: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,6 +241,7 @@ pub(crate) fn prepare(
         task_version: child.definition_version(),
         initial_checkpoint: child.checkpoint().clone(),
         restart_limit: child.restart_limit(),
+        task_tool: child.is_task_tool(),
     };
     let key = record_key(parent.task.id(), key);
     let parent_key = crate::task_store::key(parent.task.id());
@@ -252,7 +255,9 @@ pub(crate) fn prepare(
             return Err(Error::IdentityMismatch);
         }
         let existing = tasks.load(record.child)?.ok_or(Error::InvalidStoredChild)?;
-        if existing.task.owner() != &TaskOwner::Task(parent.task.id()) {
+        if existing.task.owner() != &TaskOwner::Task(parent.task.id())
+            || existing.task.is_task_tool() != identity.task_tool
+        {
             return Err(Error::InvalidStoredChild);
         }
         return Ok(Prepared {
