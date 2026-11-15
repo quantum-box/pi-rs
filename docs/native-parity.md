@@ -154,6 +154,11 @@ The secret option is saved as supplied in `mcp.json`. Quote a reference such
 as `'${CLIENT_SECRET}'` or use `!command` to resolve the secret during login
 without storing its value in that configuration file.
 
+Local package sources expand `~` using a nonempty `HOME` or the platform
+home-directory fallback, including `~\` on Windows. On Unix an explicitly
+empty `HOME` remains empty. Relative home values resolve from the source
+settings scope, matching Pi.
+
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 For remote packages with a single settings scope, an invalid file URL in a
