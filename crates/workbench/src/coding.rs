@@ -6140,7 +6140,7 @@ mod tests {
     #[tokio::test]
     async fn shell_keeps_draining_active_descendants_after_exit() {
         let root = tempfile::tempdir().unwrap();
-        let command = r#"(touch ready; i=0; while [ $i -lt 12 ]; do printf 'out%s\n' "$i"; printf 'err%s\n' "$i" >&2; sleep 0.04; i=$((i+1)); done) & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
+        let command = r#"parent=$$; (touch ready; while kill -0 "$parent" 2>/dev/null; do sleep .005; done; i=0; while [ $i -lt 12 ]; do printf 'out%s\n' "$i"; printf 'err%s\n' "$i" >&2; sleep 0.04; i=$((i+1)); done) & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
         let local = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: true,
@@ -6213,10 +6213,10 @@ mod tests {
         };
         // The child escapes the shell's process group and continues writing after
         // the shell exits, so killing the group cannot close its inherited pipe.
-        let command = "python3 -c 'import os,time; os.setsid(); open(\"ready\",\"w\").close(); [(print(i,flush=True),time.sleep(.02)) for i in range(100)]' & while [ ! -f ready ]; do sleep .01; done; exit 0";
+        let command = "python3 -c 'import os,time; parent=os.getppid(); os.setsid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.005)\nopen(\"active\",\"w\").close(); [(print(i,flush=True),time.sleep(.02)) for i in range(100)]' & while [ ! -f ready ]; do sleep .01; done; exit 0";
         let cancellation = pi_rs::CancellationToken::new();
         let cancel = cancellation.clone();
-        let ready = root.path().join("ready");
+        let ready = root.path().join("active");
         let task = tokio::spawn(async move {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6237,6 +6237,7 @@ mod tests {
             "unexpected cancellation result: {error:?}"
         );
         std::fs::remove_file(root.path().join("ready")).unwrap();
+        std::fs::remove_file(root.path().join("active")).unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(3),
             tool.shell(
