@@ -239,6 +239,7 @@ mod tests {
         );
         let billed = usage(entry, &json!({"input_tokens":300000,"output_tokens":0})).unwrap();
         assert!((billed["cost"]["total"].as_f64().unwrap() - 0.06).abs() < 1e-12);
+        assert_eq!(billed["cost"]["totalFromProvider"], false);
         let image_config = json!({"relay":{"baseUrl":"http://127.0.0.1:1", "models":[{
             "type":"image", "id":"fixture", "api":"openrouter-images",
             "cost":{"input":1.0,"cacheRead":1.0,"tiers":[{"inputTokensAbove":100,"input":2.0,"cacheRead":2.0}]}

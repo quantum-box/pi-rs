@@ -324,14 +324,11 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
         tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read as f64 / 1_000_000.0;
     let write_cost =
         tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write as f64 / 1_000_000.0;
-    let mut result = json!({
+    let result = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":input+output+cache_read+cache_write,
         "cost":{"input":input_cost,"output":output_cost,"cacheRead":read_cost,"cacheWrite":write_cost,
-            "total":input_cost+output_cost+read_cost+write_cost},
+            "total":input_cost+output_cost+read_cost+write_cost,"totalFromProvider":false},
     });
-    if matches!(entry.api, Api::OpenRouterImages) {
-        result["cost"]["totalFromProvider"] = json!(false);
-    }
     Some(result)
 }

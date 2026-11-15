@@ -1234,7 +1234,8 @@ Non-chat model APIs and remaining execution-limit differences remain open.
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
-endpoint-bound credentials continue to apply.
+endpoint-bound credentials continue to apply. Classifier usage identifies its
+calculated costs as estimates with `totalFromProvider: false`.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
 `Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
