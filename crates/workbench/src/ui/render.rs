@@ -1521,6 +1521,7 @@ fn markdown_at_depth(
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
+    let mut last_rule_separator = None;
     let protected_text = protect_bare_links(text, options);
     let mut events = super::strike::events(text, &protected_text, options)
         .into_iter()
@@ -1966,7 +1967,18 @@ fn markdown_at_depth(
             Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
             Event::Rule => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if lists.is_empty()
+                    && let Some(end) = previous_paragraph_end.take()
+                    && end <= range.start
+                    && text[end..range.start].trim().is_empty()
+                {
+                    lines.push(Line::default());
+                }
                 lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
+                if lists.is_empty() {
+                    last_rule_separator = Some(lines.len());
+                    lines.push(Line::default());
+                }
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "[x] " } else { "[ ] " };
@@ -1988,6 +2000,9 @@ fn markdown_at_depth(
         lines.pop();
     }
     if last_code_separator == lines.len().checked_sub(1) && last_code_separator.is_some() {
+        lines.pop();
+    }
+    if last_rule_separator == lines.len().checked_sub(1) && last_rule_separator.is_some() {
         lines.pop();
     }
     lines
@@ -2026,6 +2041,30 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_dividers_separate_following_blocks_without_a_trailing_blank() {
+        let theme = Theme::system();
+        let render = |text: &str| {
+            markdown(text, &theme, 8)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            render("before\n\n---\n\nafter"),
+            ["before", "", "────────", "", "after"]
+        );
+        assert_eq!(render("---\nafter"), ["────────", "", "after"]);
+        assert_eq!(render("---\n- item"), ["────────", "", "- item"]);
+        assert_eq!(render("---"), ["────────"]);
+        assert_eq!(render("before\n***"), ["before", "", "────────"]);
+    }
+
     #[test]
     fn marked_strike_normalizes_list_and_quote_continuations() {
         let theme = Theme::system();
