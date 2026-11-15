@@ -471,6 +471,12 @@ is active cannot yet execute immediately. A model turn returns
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
+`toolcall_start` includes the ID and tool name available at that point. Native
+does not yet expose Pi's top-level live usage in `message_update`; provider
+usage currently reaches the stream only on completion. Native retains the cumulative
+`message` and `partial` snapshots as extensions; unlike Pi's compact wire
+format, update size therefore grows with streamed content. Fragmented provider
+IDs or names can be incomplete in `toolcall_start`; the final call is authoritative.
 Failed live assistant messages include a fixed `errorMessage` based on the
 native failure classification, including cancellation and retryable failures.
 Unlike Pi, native live failures do not retain provider error text in the journal
