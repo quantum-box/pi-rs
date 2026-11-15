@@ -7020,6 +7020,36 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 }
 
 #[test]
+fn chatgpt_auth_check_no_refresh_uses_saved_credential() {
+    let root = tempfile::tempdir().unwrap();
+    let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":1,"scopes":["chatgpt.tokens.use.direct"]});
+    let auth = root.path().join("auth.json");
+    let original = json!({"openai-chatgpt":{"type":"oauth","credential":credential}}).to_string();
+    std::fs::write(&auth, &original).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--provider",
+            "openai-chatgpt",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "ready");
+    assert_eq!(std::fs::read_to_string(auth).unwrap(), original);
+}
+
+#[test]
 fn chatgpt_access_and_account_login_wait_for_shared_auth_lock() {
     for login in [false, true] {
         let root = tempfile::tempdir().unwrap();

@@ -113,6 +113,12 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
+minimum lifetime for bearer-token export. A refreshed credential is saved
+before a short lifetime is reported, preserving refresh-token rotation. A
+single live inference with an existing account succeeded; interactive login and
+live refresh acceptance remain open.
+
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
 with `--bearer-token-env-var` unless an Authorization header is already present.
