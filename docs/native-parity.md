@@ -4253,6 +4253,15 @@ Explicit request headers retain precedence. Loopback checks verified
 both APIs, command-resolved credentials, journal reopening, distinct
 sessions, and header overrides.
 
+### Chat tool strict-mode capabilities
+
+The bundled Pi v1.5.0 Chat Completions entries retain their per-model
+`supportsStrictMode` flags. Models declaring support send `strict: false` on
+ordinary function tools; models declaring no support omit the field. Built-in
+model flags override provider defaults, while an explicit model override can
+replace the flag. User-defined models continue to use their configured or
+provider compatibility settings.
+
 ### Chat catalog pricing checkpoint
 
 The bundled chat entries retain the input, output, cache-read, and
