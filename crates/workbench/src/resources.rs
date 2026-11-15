@@ -1803,7 +1803,7 @@ mod tests {
             assert!(
                 Resources::load(&args)
                     .err()
-                    .unwrap()
+                    .unwrap_or_else(|| panic!("pattern {pattern:?} unexpectedly resolved"))
                     .to_string()
                     .contains("matched no files"),
                 "pattern {pattern:?} should not resolve"

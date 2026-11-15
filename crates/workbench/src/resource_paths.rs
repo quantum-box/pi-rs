@@ -355,14 +355,35 @@ fn absolute(base: &Path, value: &str) -> PathBuf {
     if let Some(relative) = value.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
     {
-        return PathBuf::from(home).join(relative);
+        return join_resource_path(&PathBuf::from(home), Path::new(relative));
     }
     let path = PathBuf::from(value);
     if path.is_absolute() {
         path
     } else {
-        base.join(path)
+        join_resource_path(base, &path)
     }
+}
+fn join_resource_path(base: &Path, path: &Path) -> PathBuf {
+    // `PathBuf::push` normalizes `..` on Windows verbatim bases. Keep glob
+    // components intact until the pattern has been expanded.
+    if cfg!(windows)
+        && path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+        && path.components().any(|component| matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy())))
+    {
+        let mut joined = base.as_os_str().to_os_string();
+        joined.push(std::path::MAIN_SEPARATOR_STR);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::{OsStrExt, OsStringExt};
+            let separators = path.as_os_str().encode_wide().map(|ch| if ch == b'/' as u16 { b'\\' as u16 } else { ch }).collect::<Vec<_>>();
+            joined.push(std::ffi::OsString::from_wide(&separators));
+        }
+        #[cfg(not(windows))]
+        joined.push(path.as_os_str());
+        return PathBuf::from(joined);
+    }
+    base.join(path)
 }
 fn expand(
     path: &Path,
@@ -735,5 +756,22 @@ mod glob_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    #[test]
+    fn verbatim_workspace_join_preserves_glob_before_parent() {
+        let base = std::path::Path::new(r"\\?\C:\workspace");
+        for relative in [r"no-match-*\..\valid.md", "no-match-*/../valid.md"] {
+            let joined = super::join_resource_path(base, std::path::Path::new(relative));
+            assert!(joined.to_string_lossy().contains(r"no-match-*\..\valid.md"));
+            assert!(
+                joined
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            );
+        }
     }
 }
