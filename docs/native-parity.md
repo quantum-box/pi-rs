@@ -3682,7 +3682,14 @@ actual request limits, and updated configuration in a real terminal picker.
 The core exposes strict tool-schema conversion and a tool declaration type
 matching the current Pi schema subset. Tool-level constrained sampling and
 its provider request, fallback, and grammar paths are not yet wired through
-the native agent. As a temporary safety difference, strict-schema resolution
+the native agent. The OpenAI Responses SDK can send explicitly supplied tool
+declarations with JSON Schema constraints when its caller supplies the model's
+strict capability; callers must normalize returned arguments before validation.
+Grammar declarations on this SDK path currently fall back to function tools.
+Responses accepts initial and finalized argument fragments that extend the
+streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
+tool arguments rather than revising already emitted deltas.
+As a temporary safety difference, strict-schema resolution
 falls back or fails for dynamic references or nested Schema dialects that the
 argument normalizer cannot safely evaluate.
 
