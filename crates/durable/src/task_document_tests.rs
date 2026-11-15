@@ -19,27 +19,68 @@ fn task_tool_marker_survives_owned_document_updates_and_legacy_records() {
     use durable_store::{Expected, Store};
     let db = Store::memory().unwrap();
     let ts = TaskStore::new(&db);
-    let root = task(42, TaskOwner::Conversation(Uuid::from_u128(9)), "job", true, 4).as_task_tool();
+    let root = task(
+        42,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    )
+    .as_task_tool();
     ts.save(&[Save::Create(&root)]).unwrap();
-    let address = Address { scope: "marker".into(), name: "owned".into(), key: "".into() };
+    let address = Address {
+        scope: "marker".into(),
+        name: "owned".into(),
+        key: "".into(),
+    };
     let mut tx = Transaction::new();
     tx.acquire_task_document(&address, root.id()).unwrap();
-    tx.put(&address, Expected::Missing, json!({"v":1}).as_object().unwrap()).unwrap();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v":1}).as_object().unwrap(),
+    )
+    .unwrap();
     tx.commit(&db).unwrap();
     let stored = ts.load(root.id()).unwrap().unwrap();
-    ts.update(&stored, |task| { task.start()?; task.yield_ready() }).unwrap();
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.yield_ready()
+    })
+    .unwrap();
     let stored = ts.load(root.id()).unwrap().unwrap();
     assert!(stored.task.is_task_tool());
-    assert_eq!(serde_json::to_value(&stored.task).unwrap()["task_tool"], true);
-    ts.update(&stored, |task| { task.start()?; task.succeed(json!(null)) }).unwrap();
+    assert_eq!(
+        serde_json::to_value(&stored.task).unwrap()["task_tool"],
+        true
+    );
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.succeed(json!(null))
+    })
+    .unwrap();
     assert!(ts.load(root.id()).unwrap().unwrap().task.is_task_tool());
     assert!(Documents::new(&db).get(&address).unwrap().is_none());
-    let generic = task(43, TaskOwner::Conversation(Uuid::from_u128(9)), "job", true, 4);
+    let generic = task(
+        43,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
     let mut legacy = serde_json::to_value(&generic).unwrap();
     assert!(legacy.get("task_tool").is_none());
-    assert!(!serde_json::from_value::<Task>(legacy.clone()).unwrap().is_task_tool());
+    assert!(
+        !serde_json::from_value::<Task>(legacy.clone())
+            .unwrap()
+            .is_task_tool()
+    );
     legacy["task_tool"] = json!(false);
-    assert!(!serde_json::from_value::<Task>(legacy).unwrap().is_task_tool());
+    assert!(
+        !serde_json::from_value::<Task>(legacy)
+            .unwrap()
+            .is_task_tool()
+    );
 }
 
 #[test]
