@@ -2004,6 +2004,14 @@ impl AgentSession {
         }
         Ok(())
     }
+    /// The host-configured base prompt used when preparing future requests.
+    /// Extension context hooks can change the actual prompt for each request;
+    /// this accessor does not execute hooks or report their effective output.
+    /// Forks copy the configured value and can subsequently change it independently.
+    pub fn configured_system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         self.system_prompt = prompt.into();
@@ -3097,14 +3105,52 @@ impl AgentSession {
         self.run_input(input, None, run_id, false, false, observer)
             .await
     }
+    /// Run with ordered provider text and reasoning item events.
+    pub async fn run_with_events(
+        &mut self,
+        input: Option<String>,
+        run_id: Uuid,
+        observer: &mut crate::AgentObserver<'_>,
+    ) -> Result<String> {
+        self.run_input_with_events(input, None, run_id, false, false, observer)
+            .await
+    }
+
     async fn run_input(
+        &mut self,
+        input: Option<String>,
+        images: Option<Vec<crate::ImageContent>>,
+        run_id: Uuid,
+        prepare: bool,
+        already_started: bool,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: crate::AgentEvent<'_>| match event {
+            crate::AgentEvent::Notification(event) => observer(event),
+            crate::AgentEvent::TextDelta { delta, .. } => observer(Notification::Text(delta)),
+            crate::AgentEvent::ReasoningDelta { delta, .. } => {
+                observer(Notification::Reasoning(delta))
+            }
+            _ => {}
+        };
+        self.run_input_with_events(
+            input,
+            images,
+            run_id,
+            prepare,
+            already_started,
+            &mut adapter,
+        )
+        .await
+    }
+    async fn run_input_with_events(
         &mut self,
         mut input: Option<String>,
         mut images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
         prepare: bool,
         already_started: bool,
-        observer: &mut Observer<'_>,
+        observer: &mut crate::AgentObserver<'_>,
     ) -> Result<String> {
         if !already_started {
             self.start().await?;
@@ -3125,10 +3171,26 @@ impl AgentSession {
         let mut input_queue = input_owner.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
-        let mut observe = |event: Notification<'_>| {
-            self.control.observe(&event);
-            emit(&events, &event);
+        let observe_event = std::sync::Mutex::new(|event: crate::AgentEvent<'_>| {
+            match &event {
+                crate::AgentEvent::Notification(notification) => {
+                    self.control.observe(notification);
+                    emit(&events, notification);
+                }
+                crate::AgentEvent::TextDelta { delta, .. } => {
+                    emit(&events, &Notification::Text(delta))
+                }
+                crate::AgentEvent::ReasoningDelta { delta, .. } => {
+                    emit(&events, &Notification::Reasoning(delta))
+                }
+                _ => {}
+            }
             observer(event);
+        });
+        let mut observe = |event: Notification<'_>| {
+            (observe_event.lock().expect("agent event observer"))(crate::AgentEvent::Notification(
+                event,
+            ))
         };
         let config = self
             .control
@@ -3172,13 +3234,15 @@ impl AgentSession {
                 let pending_trigger = journal.pending_custom_trigger();
                 if let Some(trigger_id) = pending_trigger {
                     agent
-                        .run_correlated(
+                        .run_correlated_with_events(
                             &mut journal,
                             trigger_id,
                             None,
                             &mut input_queue,
                             &active.token,
-                            &mut observe,
+                            &mut |event: crate::AgentEvent<'_>| {
+                                (observe_event.lock().expect("agent event observer"))(event)
+                            },
                         )
                         .await?;
                 }
@@ -3202,13 +3266,15 @@ impl AgentSession {
                 ));
             }
             agent
-                .run_correlated(
+                .run_correlated_with_events(
                     &mut journal,
                     run_id,
                     input,
                     &mut input_queue,
                     &active.token,
-                    &mut observe,
+                    &mut |event: crate::AgentEvent<'_>| {
+                        (observe_event.lock().expect("agent event observer"))(event)
+                    },
                 )
                 .await
         }
@@ -3702,7 +3768,18 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         },
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
-        Notification::Reasoning(text) => SessionEvent::Reasoning((*text).into()),
+        Notification::Reasoning(text) => {
+            if matches!(
+                crate::reasoning_event_metadata(),
+                Some(
+                    crate::ReasoningEventMetadata::Start { .. }
+                        | crate::ReasoningEventMetadata::End { .. }
+                )
+            ) {
+                return;
+            }
+            SessionEvent::Reasoning((*text).into())
+        }
         Notification::ToolCallDelta(delta) => SessionEvent::ToolCallDelta((*delta).clone()),
         Notification::ExtensionLifecycleError {
             extension,
@@ -3918,6 +3995,24 @@ mod tests {
         assert!(after_shutdown.token.is_cancelled());
         drop(after_shutdown);
         assert!(session.prompt("after shutdown").await.is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_prompt_tracks_changes_and_forks_independently() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .system_prompt("initial")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.configured_system_prompt(), "initial");
+        session.set_system_prompt("updated").unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.configured_system_prompt(), "updated");
+        fork.set_system_prompt("fork prompt").unwrap();
+        assert_eq!(session.configured_system_prompt(), "updated");
+        assert_eq!(fork.configured_system_prompt(), "fork prompt");
+        fork.close().await.unwrap();
         session.close().await.unwrap();
     }
 

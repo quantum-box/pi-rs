@@ -780,7 +780,7 @@ struct View {
     tree_navigation: Option<(u64, bool)>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
-    widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
+    widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
@@ -795,6 +795,10 @@ struct View {
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
     thinking: String,
+    thinking_items: std::collections::BTreeMap<u64, String>,
+    text_items: std::collections::BTreeMap<u64, String>,
+    thinking_items_consistent: bool,
+    text_items_consistent: bool,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
@@ -831,6 +835,26 @@ struct View {
     shell_running: bool,
     restoring_queue: bool,
 }
+fn append_indexed(
+    items: &mut std::collections::BTreeMap<u64, String>,
+    combined: &mut String,
+    consistent: &mut bool,
+    index: u64,
+    delta: &str,
+) {
+    let append = *consistent
+        && items
+            .last_key_value()
+            .is_none_or(|(&last, _)| index >= last);
+    items.entry(index).or_default().push_str(delta);
+    if append {
+        combined.push_str(delta);
+    } else {
+        *combined = items.values().cloned().collect();
+        *consistent = true;
+    }
+}
+
 impl View {
     fn invalidate_model_catalog(&mut self) {
         self.available_models.clear();
@@ -929,13 +953,15 @@ impl View {
                 lines,
                 placement,
             } => {
-                if lines.is_some() && !self.widgets.contains_key(&key) && self.widgets.len() >= 64 {
+                if lines.is_some()
+                    && !self.widgets.iter().any(|(existing, _, _)| existing == &key)
+                    && self.widgets.len() >= 64
+                {
                     return Err(Error::Config("too many extension widgets".into()));
                 }
+                self.widgets.retain(|(existing, _, _)| existing != &key);
                 if let Some(lines) = lines {
-                    self.widgets.insert(key, (lines, placement));
-                } else {
-                    self.widgets.remove(&key);
+                    self.widgets.push((key, lines, placement));
                 }
             }
             pi_rs::UiRequest::SetTitle { title } => execute!(
@@ -969,9 +995,9 @@ impl View {
         placement: pi_rs::WidgetPlacement,
     ) -> Vec<Line> {
         self.widgets
-            .values()
-            .filter(|(_, location)| *location == placement)
-            .flat_map(|(lines, _)| lines.iter())
+            .iter()
+            .filter(|(_, _, location)| *location == placement)
+            .flat_map(|(_, lines, _)| lines.iter())
             .flat_map(|text| {
                 Entry::Notice(text.clone()).render(
                     theme,
@@ -1377,8 +1403,10 @@ impl View {
         self.scrollbar_activity = None;
         self.flash = None;
         self.streaming.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         self.thinking.clear();
+        self.thinking_items.clear();
         self.draft_images.clear();
         self.clipboard = None;
         self.dialogs.clear();
@@ -1703,7 +1731,9 @@ impl View {
             Some("summary_request_start") => {
                 self.summarizing = true;
                 self.thinking.clear();
+                self.thinking_items.clear();
                 self.streaming.clear();
+                self.text_items.clear();
                 self.streaming_tools.clear();
             }
             Some("tool_call_delta") if !self.summarizing => {
@@ -1716,12 +1746,43 @@ impl View {
                     self.phase = Some("ツール呼出し準備中");
                 }
             }
-            Some("reasoning_delta") if !self.summarizing => self
-                .thinking
-                .push_str(value["delta"].as_str().unwrap_or_default()),
-            Some("text_delta") if !self.summarizing => self
-                .streaming
-                .push_str(value["delta"].as_str().unwrap_or_default()),
+            Some("reasoning_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["reasoningIndex"].as_u64() {
+                    append_indexed(&mut self.thinking_items, &mut self.thinking, &mut self.thinking_items_consistent, index, delta);
+                } else { self.thinking.push_str(delta); self.thinking_items_consistent = false; }
+            }
+            Some("reasoning_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.thinking_items.entry(index).or_default(); }
+            }
+            Some("reasoning_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.thinking_items.insert(index, content.to_owned());
+                    self.thinking = self.thinking_items.values().cloned().collect();
+                    self.thinking_items_consistent = true;
+                }
+            }
+            Some("text_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.text_items.entry(index).or_default(); }
+            }
+            Some("text_item_delta") if !self.summarizing => {
+                if let (Some(index), Some(delta)) = (value["index"].as_u64(), value["delta"].as_str()) {
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                }
+            }
+            Some("text_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.text_items.insert(index, content.to_owned());
+                    self.streaming = self.text_items.values().cloned().collect();
+                    self.text_items_consistent = true;
+                }
+            }
+            Some("text_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["textIndex"].as_u64() {
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
+            }
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -1756,7 +1817,9 @@ impl View {
                     Some("assistant") => {
                         self.streaming_tools.clear();
                         self.streaming.clear();
+                        self.text_items.clear();
                         let thinking = std::mem::take(&mut self.thinking);
+                        self.thinking_items.clear();
                         if !thinking.is_empty() {
                             self.lines.push(Entry::Thinking(thinking));
                         }
@@ -1832,6 +1895,8 @@ impl View {
     }
     fn settle(&mut self) {
         self.summarizing = false;
+        self.thinking_items.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
             self.lines
@@ -4062,7 +4127,15 @@ pub(super) async fn run(
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
                     match value["type"].as_str() {
-                        Some("text_delta" | "reasoning_delta") => continue,
+                        Some(
+                            "text_delta"
+                            | "reasoning_delta"
+                            | "reasoning_item_start"
+                            | "reasoning_item_end"
+                            | "text_item_start"
+                            | "text_item_delta"
+                            | "text_item_end",
+                        ) => continue,
                         Some("error") => {
                             view.branch_error = value["message"].as_str().map(str::to_owned)
                         }
@@ -7536,6 +7609,59 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn indexed_delta_append_handles_interleaving_and_legacy_text() {
+        let mut items = std::collections::BTreeMap::new();
+        let mut combined = String::new();
+        let mut consistent = false;
+        for (index, delta, expected) in [
+            (0, "a", "a"),
+            (1, "b", "ab"),
+            (0, "c", "acb"),
+            (1, "d", "acbd"),
+        ] {
+            super::append_indexed(&mut items, &mut combined, &mut consistent, index, delta);
+            assert_eq!(combined, expected);
+        }
+        combined.push_str("legacy");
+        consistent = false;
+        super::append_indexed(&mut items, &mut combined, &mut consistent, 1, "e");
+        assert_eq!(combined, "acbde");
+    }
+    #[test]
+    fn indexed_text_finalization_keeps_item_order() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"text_item_start","index":0}),
+            serde_json::json!({"type":"text_item_delta","index":0,"delta":"a"}),
+            serde_json::json!({"type":"text_item_start","index":2}),
+            serde_json::json!({"type":"text_item_delta","index":2,"delta":"b"}),
+            serde_json::json!({"type":"text_item_end","index":0,"content":"A"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.streaming, "Ab");
+        view.settle();
+        assert!(view.text_items.is_empty());
+    }
+
+    #[test]
+    fn indexed_reasoning_finalization_replaces_streamed_text() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"reasoning_item_start","index":0}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"raw"}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"summary"}),
+            serde_json::json!({"type":"reasoning_item_end","index":0,"content":"summary"}),
+            serde_json::json!({"type":"reasoning_item_start","index":2}),
+            serde_json::json!({"type":"reasoning_item_end","index":2,"content":"other"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.thinking, "summaryother");
+        view.settle();
+        assert!(view.thinking_items.is_empty());
+    }
+    #[test]
     fn external_editor_selects_first_nonempty_command() {
         assert_eq!(
             super::external_editor_command(
@@ -9127,6 +9253,80 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn extension_widgets_follow_registration_and_replacement_order() {
+        let mut view = super::View::default();
+        let set = |view: &mut super::View, key: &str, lines: Option<Vec<&str>>, placement: &str| {
+            assert!(
+                view.ui_request(&json!({
+                    "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": key,
+                    "widgetLines": lines, "widgetPlacement": placement,
+                }))
+                .unwrap()
+                .is_none()
+            );
+        };
+        let theme =
+            super::Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let rendered = |view: &super::View, placement| {
+            view.widget_lines(&theme, 80, placement)
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+                .collect::<String>()
+        };
+        set(&mut view, "z", Some(vec!["first"]), "aboveEditor");
+        set(&mut view, "a", Some(vec!["second"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "firstsecond"
+        );
+        set(&mut view, "z", Some(vec!["updated"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "secondupdated"
+        );
+        set(&mut view, "a", Some(vec!["moved"]), "belowEditor");
+        set(&mut view, "z", Some(vec!["later"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "movedlater"
+        );
+        set(&mut view, "a", None, "aboveEditor");
+        set(&mut view, "a", Some(vec!["readded"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "laterreadded"
+        );
+        assert!(rendered(&view, pi_rs::WidgetPlacement::AboveEditor).is_empty());
+
+        let mut full = super::View::default();
+        for index in 0..64 {
+            set(
+                &mut full,
+                &format!("widget-{index}"),
+                Some(vec!["x"]),
+                "aboveEditor",
+            );
+        }
+        let rejected = full.ui_request(&json!({
+            "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": "overflow",
+            "widgetLines": ["x"], "widgetPlacement": "aboveEditor",
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.first().unwrap().0, "widget-0");
+        set(
+            &mut full,
+            "widget-0",
+            Some(vec!["replacement"]),
+            "belowEditor",
+        );
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.last().unwrap().0, "widget-0");
+        set(&mut full, "widget-0", None, "aboveEditor");
+        assert_eq!(full.widgets.len(), 63);
     }
 
     #[test]

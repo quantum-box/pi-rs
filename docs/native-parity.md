@@ -22,6 +22,14 @@ Single-line extension input dialogs remove pasted line breaks and expand tabs
 to four spaces, while multiline editor dialogs retain pasted newlines. The
 native one MiB response limit applies after paste sanitization and expansion.
 
+OpenAI Responses streams both reasoning text and reasoning summary text as
+thinking deltas. Completed reasoning items retain their summary when present,
+otherwise their content or streamed text, in the completed turn metadata.
+The native RPC stream preserves reasoning item boundaries and final text.
+The additive enriched model stream carries those boundaries through the built-in
+workbench and budget wrappers; third-party wrappers using the legacy stream
+continue to receive deltas without item boundaries.
+
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
 and is used only for endpoints declared by that profile; keys with an explicit
@@ -109,13 +117,26 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
+minimum lifetime for bearer-token export. A refreshed credential is saved
+before a short lifetime is reported, preserving refresh-token rotation. A
+single live inference with an existing account succeeded; interactive login and
+live refresh acceptance remain open.
+
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
 with `--bearer-token-env-var` unless an Authorization header is already present.
+`--env` is restricted to stdio and requires nonempty names; bearer-token
+environment variables apply to HTTP servers.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
-Invalid file URLs do not match a resource; upstream instead reports a URL error.
+For remote packages with a single settings scope, an invalid file URL in a
+package settings filter reports an error when evaluated. Layered package
+settings, local packages, and other resource filter paths still treat invalid
+URLs as non-matches. Pi evaluates the scopes separately and stops processing
+a local package when an error is reached. Package resources are evaluated in
+settings order, with project sources first.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
@@ -360,6 +381,8 @@ a context extension. Expanding it would exceed a host or extension limit;
 there is no separate answer budget and headroom to expand. Raising both
 `--max-output-tokens` and `--output-budget` permits a larger thinking budget
 within those limits.
+Adaptive Messages requests also explicitly request summarized thinking, as Pi
+does, including for providers whose default display differs.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable
@@ -389,7 +412,12 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance follows input and command validation. A prompt
-that runs an extension command returns `handled`. A model turn returns
+that runs an extension command returns `handled`. Idle extension commands
+take precedence over valid attached images in RPC; the
+attachments are not sent to the model even when the command triggers a turn.
+RPC validates images before command dispatch. Unlike Pi, a command that
+triggers a model turn reports `started`, and commands submitted while a turn
+is active cannot yet execute immediately. A model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
@@ -415,6 +443,8 @@ remain in progress.
 `get_commands` identifies discovered skills and prompt templates with their
 extension source, temporary scope, resolved file path, and executable base
 directory. Resource provenance in other surfaces remains in progress.
+Discovered resources identify inline and built-in extensions separately as
+`extension:inline:<id>` and `extension:builtin:<id>`.
 Extension-provided relative paths resolve from the session working directory;
 home-relative paths and local file URLs are accepted. A missing resource is
 reported without preventing other discovered resources from loading.
@@ -440,7 +470,12 @@ During manual compaction, an RPC `abort` response waits for the compaction
 command to finish, even if an internal agent-settled event arrives first.
 
 Unknown RPC commands return `Unknown command: <type>` and preserve the
-request ID when present. Malformed JSON produces a `parse` response with a
+request ID and original type when present. Object, array and numeric types use
+JavaScript string conversion in the diagnostic, including null array elements.
+The echoed JSON value retains Rust's parsed integer precision, which can differ
+from JavaScript for integers outside the safe range; out-of-range JSON numbers
+such as `1e400` are rejected by the native parser.
+Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
@@ -651,6 +686,12 @@ expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
 
+`pi mcp logout NAME --local` requires a server defined in the trusted project
+configuration and removes credentials for that server URL. A partial project
+override retains the global server's scope and does not satisfy `--local`.
+Credentials are keyed by server name and normalized URL, so a project server
+with the same name and URL as a global server shares its credentials.
+
 `pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
 `mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for
 stdio and streamable HTTP. It exposes namespaced server tools and resource
@@ -840,6 +881,8 @@ while scanning a single long line. Directory listing runs off the async
 runtime and checks for cancellation during enumeration and metadata reads.
 It sorts lowercased filenames with Unicode collation, using the process
 locale for language-specific ordering before applying the entry limit.
+On Unix, an unrestricted directory listing denied by the operating system
+reports Pi's `EACCES` scandir message with the requested absolute path.
 Local and injected `ls` select the locale in Node's environment order:
 `LC_ALL`, `LC_MESSAGES`, then `LANG`, including an explicitly empty value.
 
@@ -1074,6 +1117,9 @@ files are not rewritten. Tests cover discovery, invocation and the size limit.
 Skill invocation uses the same replacement decoding as discovery. Skill and
 prompt frontmatter each strip one leading BOM and use ECMAScript whitespace
 when trimming a delimited body, matching Pi.
+Skill discovery keeps the selected symlink path for the skill name, displayed
+location and relative references. Canonical paths are still used to deduplicate
+aliases to the same file.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -1183,6 +1229,17 @@ policies, and preserve uncertainty after cancellation. Tests cover denied and
 invalid calls, concurrent reads and blocked replay after interruption. This is
 the execution boundary for the pending codemode sandbox.
 
+### Codemode OpenAI Decisions checkpoint
+
+Codemode supports OpenAI Decisions classifier models, including the pinned
+GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
+and the Decisions-specific 504 retry exclusion. Native image validation and
+endpoint-bound credentials continue to apply. Classifier usage identifies its
+calculated costs as estimates with `totalFromProvider: false`.
+An OpenAI key explicitly saved for `/v1/responses`, including by the provider
+key UI, does not authorize `/v1/decisions`; use an endpointless Pi auth entry or
+`OPENAI_API_KEY` for the official Decisions endpoint.
+
 ### Native codemode checkpoint
 
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
@@ -1228,6 +1285,13 @@ script line numbers. The native JSON code argument differs from Pi's
 provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
+Classifier results include their API and invocation timestamp even if the
+request fails early or is cancelled, as they do on successful requests.
+
+Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
+`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
+server-delay cap still applies to the parsed value.
+
 ### Resource selection checkpoint
 
 `--no-skills`, `--no-prompt-templates`, `--no-context-files`, `--no-themes`,
@@ -1259,6 +1323,11 @@ including branch topology, completed tool results, reasoning, usage, names,
 labels, compaction boundaries and branch-local codemode store values. User and tool-result images reach the model
 adapter as image content. Previously completed tools remain recorded results;
 unfinished imported calls remain uncertain and require reconciliation.
+A source entry with a missing parent is recovered as a separate native branch;
+its original parent ID remains in the retained source entry, while RPC presents
+it as a root. Missing ancestors may contain unrecoverable state or tool calls;
+orphan tool results and compactions involving orphaned branches are still rejected.
+Forward parent references are also rejected.
 
 Context edits are projected onto future model context while the imported raw
 entries remain available. Remaining specialized message variants and system
@@ -1459,7 +1528,9 @@ scripts and errors to direct callers.
 Fractional explicit timeouts retain output already received. Shell execution
 has no separate default timeout, while the caller's configured tool deadline
 continues to apply. A shell that exits while descendants hold its output pipes
-returns after a bounded drain period. Unit and CLI fixtures cover line/byte
+returns after both pipes close or 100 ms without further output. Output from
+an active descendant resets that idle period. Unlike Pi, pi-rs also caps the
+post-exit drain at two seconds to bound continuously writing descendants. Unit and CLI fixtures cover line/byte
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
 ### Text paging checkpoint
@@ -1758,6 +1829,10 @@ interface. Embedded applications supply an `ExtensionUi` through the registry
 or `SessionBuilder::ui`. Native executable extensions use the same correlated
 host protocol for select, confirm, input and multiline editor dialogs, notices,
 status entries, above/below-editor widgets, window titles and editor text.
+Widgets appear in registration order within each position; replacing or moving
+a widget places it last at its destination, as in Pi.
+Native widgets retain the existing 64-widget and 128-line limits, and do not
+yet match Pi's ten-line truncation, text styling, or fixed fullscreen placement.
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
@@ -2983,8 +3058,11 @@ Full workspace tests and all-target Clippy pass.
 
 An unrestricted local `read` of a missing path now reports the resolved path
 in Pi's `ENOENT: no such file or directory, access '…'` diagnostic. This also
-identifies the requested file when a parent directory is missing. Other I/O
-errors and restricted workspace path checks retain their existing behavior.
+identifies the requested file when a parent directory is missing. On Unix, a
+non-directory parent reports Pi's `ENOTDIR` access diagnostic with the requested
+path. An inaccessible file or parent reports the requested path in Pi's
+`EACCES` access diagnostic. Other I/O errors and restricted workspace path
+checks retain their existing behavior.
 
 ### Write and edit result checkpoint
 
@@ -3240,6 +3318,9 @@ fullscreen and regular modes.
 
 ### Native Anthropic provider checkpoint
 
+An Anthropic fallback marker before output is accepted; a fallback after any
+text, thinking, or tool block fails the attempt, as in Pi.
+
 `--provider anthropic` or an `anthropic/<model>` reference selects the native
 Messages API. The standard endpoint reads `ANTHROPIC_API_KEY`. An explicit
 `--api-key` or host-provided model token can be used with a custom endpoint.
@@ -3485,6 +3566,8 @@ Bearer-token export checks its requested minimum validity after refresh; a
 token that falls short is persisted before the command fails, preserving any
 rotated refresh token. Ordinary model, MCP and sharing requests accept a
 successfully refreshed token without imposing that export requirement.
+Normal Radius access refreshes credentials within five minutes of expiry,
+matching the upstream OAuth resolver's minimum refresh window.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
@@ -3718,6 +3801,14 @@ uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
 APIs do not have a session owner; hosts that need message delivery use their
 session-owned counterparts.
+Discovery callbacks invoked through `Registry::discover_resources_in_session`
+can also use `ToolHost::append_entry` to persist branch-local custom entries.
+Both in-process and executable extensions receive this capability. The callback
+is acknowledged after the entry is committed; the entry does not enter model
+context. Other callbacks do not yet support this API.
+Discovery callbacks do not yet have a branch-entry read API for restoring
+previously stored custom data. An executable request already dispatched when
+its callback ends can still commit; queued requests are rejected after closure.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message
@@ -4174,8 +4265,9 @@ For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
 supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
 overrides can disable long retention. Summary requests remove configured cache
 fields and, for explicit-mode models, request explicit caching with no
-breakpoints. ChatGPT plan requests omit these API-specific options. The
-Responses adapter does not yet send Pi's session-derived prompt cache key.
+breakpoints. ChatGPT plan requests omit these API-specific options. Responses requests use the active session ID as their prompt cache key,
+clamped to 64 Unicode characters, and omit it for summary requests. Pi’s
+Responses session-routing headers remain unsupported.
 
 ### Native Messages cache control checkpoint
 
@@ -4449,6 +4541,8 @@ pinning the catalog's default endpoint.
 
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.
+Redacted Bedrock reasoning emits Pi's fixed placeholder once per block while
+retaining the opaque payload for replay.
 Signed and redacted reasoning is replayed in its original order only when the
 provider, model, text and tool calls still match, including the journal's
 normalization of malformed arguments. For application inference profile ARNs
@@ -4656,6 +4750,11 @@ timed-out inspection falls back to the existing transient classification. Provid
 returned. Bedrock typed SDK errors and non-chat operations retain their separate
 policies.
 
+Native SDK hosts can inspect the configured base system prompt with
+`AgentSession::configured_system_prompt`. Forks copy that value. This accessor
+does not run extension hooks and is not Pi's effective `systemPrompt`; hooks may
+modify individual requests after the configured prompt is read.
+
 ### Native SDK prompt resource factory
 
 `pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
@@ -4701,3 +4800,8 @@ loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.
+
+The SDK model catalog can enumerate its host-registered provider/model identities
+in deterministic order for host model pickers. This lists the immutable catalog
+snapshot, not Pi's discovered model registry or a live credential availability
+check. The host remains responsible for rebuilding it when authorization changes.

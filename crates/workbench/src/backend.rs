@@ -991,13 +991,19 @@ async fn run_worker(
                     if session.pending_custom_trigger() != Some(run_id) {
                         return Err(Error::Session("custom trigger is no longer pending".into()));
                     }
-                    let answer = Box::pin(agent.run_correlated(
+                    let answer = Box::pin(agent.run_correlated_with_events(
                         session,
                         run_id,
                         None,
                         &mut queued,
                         &cancel,
-                        &mut observer,
+                        &mut |event| match event {
+                            pi_rs::AgentEvent::Notification(event) => observer(event),
+                            event if args.trace => output(super::trace_agent_event_json(
+                                super::reasoning_event_json(event),
+                            )),
+                            _ => {}
+                        },
                     ))
                     .await?;
                     output(json!({"type":"answer","content":answer}));
@@ -1012,8 +1018,7 @@ async fn run_worker(
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
                     }
-                    if images.is_empty()
-                        && let Some(input) = content.as_deref()
+                    if let Some(input) = content.as_deref()
                         && let Some(trigger) = agent.try_extension_command_with_trigger(
                             session,
                             input,
@@ -1024,6 +1029,7 @@ async fn run_worker(
                             return Ok(());
                         }
                         content = None;
+                        images.clear();
                     }
                     if runtime.registry.has_input_hooks()
                         && (content.is_some() || !images.is_empty())
@@ -1085,13 +1091,19 @@ async fn run_worker(
                             session.records().last().expect("appended user input"),
                         ));
                     }
-                    let answer = Box::pin(agent.run_correlated(
+                    let answer = Box::pin(agent.run_correlated_with_events(
                         session,
                         run_id,
                         content,
                         &mut queued,
                         &cancel,
-                        &mut observer,
+                        &mut |event| match event {
+                            pi_rs::AgentEvent::Notification(event) => observer(event),
+                            event if args.trace => output(super::trace_agent_event_json(
+                                super::reasoning_event_json(event),
+                            )),
+                            _ => {}
+                        },
                     ))
                     .await?;
                     output(json!({"type":"answer","content":answer}));
@@ -1117,13 +1129,19 @@ async fn run_worker(
                             } => result?,
                         }
                         let agent = runtime.agent(&args, session);
-                        let answer = Box::pin(agent.run_correlated(
+                        let answer = Box::pin(agent.run_correlated_with_events(
                             session,
                             Uuid::new_v4(),
                             None,
                             &mut queued,
                             &cancel,
-                            &mut observer,
+                            &mut |event| match event {
+                                pi_rs::AgentEvent::Notification(event) => observer(event),
+                                event if args.trace => output(super::trace_agent_event_json(
+                                    super::reasoning_event_json(event),
+                                )),
+                                _ => {}
+                            },
                         ))
                         .await?;
                         output(json!({"type":"answer","content":answer}));

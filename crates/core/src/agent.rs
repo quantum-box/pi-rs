@@ -17,11 +17,11 @@ use uuid::Uuid;
 use crate::extension::{RegisteredTool, hook};
 use crate::journal::{conversation_entries, ensure_settled};
 use crate::{
-    AgentInput, CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind,
-    Invocation, Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest,
-    OperationState, Outcome, QueuedMessage, Record, RecordedReply, Registry, RequestPurpose,
-    Result, RunState, Session, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage,
-    UsageReport,
+    AgentInput, CancellationToken, Compaction, Decision, EnrichedModelEvent, Error, Event,
+    ExtensionStates, InputKind, Invocation, Message, Model, ModelEvent, ModelFailure,
+    ModelMetadata, ModelRequest, OperationState, Outcome, QueuedMessage, Record, RecordedReply,
+    Registry, RequestPurpose, Result, RunState, Session, ToolContext, ToolExecution, ToolHost,
+    ToolReply, ToolSpec, Usage, UsageReport,
 };
 
 // Provider replay may contain private thinking and opaque signatures. Hooks and
@@ -237,6 +237,86 @@ pub enum Notification<'a> {
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
 
+/// An ordered agent notification or a provider reasoning item event.
+/// Reasoning item events are transient and are not journal records.
+pub enum AgentEvent<'a> {
+    Notification(Notification<'a>),
+    TextStart { index: u64 },
+    TextDelta { index: u64, delta: &'a str },
+    TextEnd { index: u64, content: &'a str },
+    ReasoningStart { index: u64 },
+    ReasoningDelta { index: u64, delta: &'a str },
+    ReasoningEnd { index: u64, content: &'a str },
+}
+
+pub type AgentObserver<'a> = dyn for<'event> FnMut(AgentEvent<'event>) + Send + 'a;
+
+// The metadata is scoped to the synchronous call, never across an await. The
+// internal adapter preserves all non-reasoning notifications and their order.
+fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_>) {
+    if let Notification::Text(delta) = &event {
+        match text_event_metadata() {
+            Some(TextEventMetadata::Start { index }) => {
+                observer(AgentEvent::TextStart { index });
+                return;
+            }
+            Some(TextEventMetadata::Delta { index }) => {
+                observer(AgentEvent::TextDelta { index, delta });
+                return;
+            }
+            Some(TextEventMetadata::End { index, content }) => {
+                observer(AgentEvent::TextEnd {
+                    index,
+                    content: &content,
+                });
+                return;
+            }
+            None => {}
+        }
+    }
+    if let Notification::Reasoning(delta) = &event {
+        match reasoning_event_metadata() {
+            Some(ReasoningEventMetadata::Start { index }) => {
+                observer(AgentEvent::ReasoningStart { index });
+                return;
+            }
+            Some(ReasoningEventMetadata::Delta { index }) => {
+                observer(AgentEvent::ReasoningDelta { index, delta });
+                return;
+            }
+            Some(ReasoningEventMetadata::End { index, content }) => {
+                observer(AgentEvent::ReasoningEnd {
+                    index,
+                    content: &content,
+                });
+                return;
+            }
+            None => {}
+        }
+    }
+    observer(AgentEvent::Notification(event));
+}
+
+fn dispatch_legacy_event(event: Notification<'_>, observer: &mut Observer<'_>) {
+    if matches!(&event, Notification::Text(_))
+        && matches!(
+            text_event_metadata(),
+            Some(TextEventMetadata::Start { .. } | TextEventMetadata::End { .. })
+        )
+    {
+        return;
+    }
+    if matches!(&event, Notification::Reasoning(_))
+        && matches!(
+            reasoning_event_metadata(),
+            Some(ReasoningEventMetadata::Start { .. } | ReasoningEventMetadata::End { .. })
+        )
+    {
+        return;
+    }
+    observer(event);
+}
+
 fn finish_tree_handoff(
     session: &mut Session,
     return_to: u64,
@@ -324,7 +404,48 @@ impl Agent<'_> {
 
     /// A repeated initial submission never starts a second run. Passing no
     /// input is an explicit resume request authorized by the host.
+    /// Run with explicit, ordered reasoning item events.
+    pub async fn run_with_events(
+        &self,
+        session: &mut Session,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<String>,
+        cancel: &CancellationToken,
+        observer: &mut AgentObserver<'_>,
+    ) -> Result<String> {
+        self.run_correlated_with_events(session, Uuid::new_v4(), input, followups, cancel, observer)
+            .await
+    }
+
+    pub async fn run_correlated_with_events<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<T>,
+        cancel: &CancellationToken,
+        observer: &mut AgentObserver<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: Notification<'_>| dispatch_agent_event(event, observer);
+        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
+            .await
+    }
+
     pub async fn run_correlated<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<T>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
+        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
+            .await
+    }
+
+    async fn run_correlated_inner<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -2600,15 +2721,22 @@ impl Agent<'_> {
         )?;
         observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-        let mut content = String::new();
         let mut metadata = ModelMetadata::default();
         let mut tool_delta_bytes = 0_usize;
         let mut reasoning_delta_bytes = 0_usize;
+        let mut text_item_ids = std::collections::HashMap::<u64, usize>::new();
+        let mut text_parts = Vec::<String>::new();
+        let mut legacy_text_slot = None;
+        let mut text_len = 0usize;
+        let mut text_delta_bytes = 0usize;
+        let mut text_final_bytes = 0usize;
+        let mut reasoning_item_ids = HashSet::new();
+        let mut reasoning_final_bytes = 0_usize;
         let collect = async {
             let session_id = session.session_id();
             let external_id = session.external_session_id();
             let opening = if retain_reply {
-                self.model.stream_in_session_with_identity(
+                self.model.stream_enriched_in_session_with_identity(
                     request_id,
                     session_id,
                     &external_id,
@@ -2616,7 +2744,7 @@ impl Agent<'_> {
                 )
             } else {
                 self.model
-                    .stream_for_summary(request_id, session_id, request)
+                    .stream_enriched_for_summary(request_id, session_id, request)
             };
             tokio::pin!(opening);
             let mut stream = loop {
@@ -2637,20 +2765,150 @@ impl Agent<'_> {
                     break;
                 };
                 match event? {
-                    ModelEvent::Text(delta) => {
-                        if content.len() + delta.len() > MAX_RESPONSE_BYTES {
+                    EnrichedModelEvent::Legacy(ModelEvent::Text(delta)) => {
+                        text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
+                        if text_delta_bytes > MAX_RESPONSE_BYTES
+                            || text_len.saturating_add(delta.len()) > MAX_RESPONSE_BYTES
+                        {
                             return Err(Error::Model("response exceeds size limit".into()));
                         }
                         observer(Notification::Text(&delta));
-                        content.push_str(&delta);
+                        text_len += delta.len();
+                        let slot = match legacy_text_slot {
+                            Some(slot) => slot,
+                            None => {
+                                if text_parts.len() >= 128 {
+                                    return Err(Error::Model("too many text segments".into()));
+                                }
+                                let slot = text_parts.len();
+                                text_parts.push(String::new());
+                                legacy_text_slot = Some(slot);
+                                slot
+                            }
+                        };
+                        text_parts[slot].push_str(&delta);
                     }
-                    ModelEvent::Reasoning(delta) => {
+                    EnrichedModelEvent::TextStart { index } => {
+                        legacy_text_slot = None;
+                        if !text_item_ids.contains_key(&index) {
+                            if text_item_ids.len() >= 64 {
+                                return Err(Error::Model("too many text items".into()));
+                            }
+                            text_item_ids.insert(index, text_parts.len());
+                            text_parts.push(String::new());
+                        }
+                        with_text_event_metadata(TextEventMetadata::Start { index }, || {
+                            observer(Notification::Text(""))
+                        });
+                    }
+                    EnrichedModelEvent::TextDelta { index, delta } => {
+                        legacy_text_slot = None;
+                        text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
+                        if text_delta_bytes > MAX_RESPONSE_BYTES {
+                            return Err(Error::Model("response exceeds size limit".into()));
+                        }
+                        let slot = match text_item_ids.get(&index) {
+                            Some(slot) => *slot,
+                            None => {
+                                if text_item_ids.len() >= 64 {
+                                    return Err(Error::Model("too many text items".into()));
+                                }
+                                let slot = text_parts.len();
+                                text_parts.push(String::new());
+                                text_item_ids.insert(index, slot);
+                                slot
+                            }
+                        };
+                        if text_len.saturating_add(delta.len()) > MAX_RESPONSE_BYTES {
+                            return Err(Error::Model("response exceeds size limit".into()));
+                        }
+                        text_parts[slot].push_str(&delta);
+                        text_len += delta.len();
+                        with_text_event_metadata(TextEventMetadata::Delta { index }, || {
+                            observer(Notification::Text(&delta))
+                        });
+                    }
+                    EnrichedModelEvent::TextEnd {
+                        index,
+                        content: final_content,
+                    } => {
+                        legacy_text_slot = None;
+                        text_final_bytes = text_final_bytes.saturating_add(final_content.len());
+                        if text_final_bytes > MAX_RESPONSE_BYTES {
+                            return Err(Error::Model("text items exceed size limit".into()));
+                        }
+                        let slot = match text_item_ids.get(&index) {
+                            Some(slot) => *slot,
+                            None => {
+                                if text_item_ids.len() >= 64 {
+                                    return Err(Error::Model("too many text items".into()));
+                                }
+                                let slot = text_parts.len();
+                                text_parts.push(String::new());
+                                text_item_ids.insert(index, slot);
+                                slot
+                            }
+                        };
+                        if text_len
+                            .saturating_sub(text_parts[slot].len())
+                            .saturating_add(final_content.len())
+                            > MAX_RESPONSE_BYTES
+                        {
+                            return Err(Error::Model("response exceeds size limit".into()));
+                        }
+                        text_len = text_len - text_parts[slot].len() + final_content.len();
+                        text_parts[slot] = final_content.clone();
+                        with_text_event_metadata(
+                            TextEventMetadata::End {
+                                index,
+                                content: final_content,
+                            },
+                            || observer(Notification::Text("")),
+                        );
+                    }
+                    EnrichedModelEvent::Legacy(ModelEvent::Reasoning(delta)) => {
                         reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
                         if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
                             observer(Notification::Reasoning(&delta));
                         }
                     }
-                    ModelEvent::ToolCallDelta(delta) => {
+                    EnrichedModelEvent::ReasoningDelta { index, delta } => {
+                        reasoning_item_ids.insert(index);
+                        if reasoning_item_ids.len() > 64 {
+                            return Err(Error::Model("too many reasoning items".into()));
+                        }
+                        reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
+                        if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            with_reasoning_event_metadata(
+                                ReasoningEventMetadata::Delta { index },
+                                || observer(Notification::Reasoning(&delta)),
+                            );
+                        }
+                    }
+                    EnrichedModelEvent::ReasoningStart { index } => {
+                        reasoning_item_ids.insert(index);
+                        if reasoning_item_ids.len() > 64 {
+                            return Err(Error::Model("too many reasoning items".into()));
+                        }
+                        with_reasoning_event_metadata(
+                            ReasoningEventMetadata::Start { index },
+                            || observer(Notification::Reasoning("")),
+                        );
+                    }
+                    EnrichedModelEvent::ReasoningEnd { index, content } => {
+                        reasoning_item_ids.insert(index);
+                        reasoning_final_bytes = reasoning_final_bytes.saturating_add(content.len());
+                        if reasoning_item_ids.len() > 64
+                            || reasoning_final_bytes > MAX_RESPONSE_BYTES
+                        {
+                            return Err(Error::Model("reasoning items exceed size limit".into()));
+                        }
+                        with_reasoning_event_metadata(
+                            ReasoningEventMetadata::End { index, content },
+                            || observer(Notification::Reasoning("")),
+                        );
+                    }
+                    EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(delta)) => {
                         tool_delta_bytes = tool_delta_bytes.saturating_add(
                             std::mem::size_of_val(&delta.index)
                                 + delta.id.len()
@@ -2661,8 +2919,8 @@ impl Agent<'_> {
                             observer(Notification::ToolCallDelta(&delta));
                         }
                     }
-                    ModelEvent::Metadata(update) => metadata = update,
-                    ModelEvent::Complete { calls, usage } => {
+                    EnrichedModelEvent::Legacy(ModelEvent::Metadata(update)) => metadata = update,
+                    EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, usage }) => {
                         let mut seen = HashSet::new();
                         let mut invocations = Vec::with_capacity(calls.len());
                         if calls.len() > 64 {
@@ -2684,7 +2942,7 @@ impl Agent<'_> {
                         }
                         return Ok(Reply {
                             request_id,
-                            content: std::mem::take(&mut content),
+                            content: text_parts.concat(),
                             invocations,
                             usage,
                             truncated: metadata.finish_reason.as_deref() == Some("length"),
@@ -2699,6 +2957,11 @@ impl Agent<'_> {
             _ = cancel.cancelled() => Err(Error::Cancelled),
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
+        };
+        let content = if result.is_ok() {
+            String::new()
+        } else {
+            text_parts.concat()
         };
         if retain_reply && result.is_err() {
             let is_overflow = matches!(&result,
@@ -3439,11 +3702,12 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
         self.summarize_selected(
             session,
             Some(keep_turns),
             cancel,
-            observer,
+            &mut adapter,
             inputs,
             instructions,
         )
@@ -3459,7 +3723,8 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
-        self.summarize_selected(session, None, cancel, observer, inputs, instructions)
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
+        self.summarize_selected(session, None, cancel, &mut adapter, inputs, instructions)
             .await
     }
 
@@ -3522,6 +3787,27 @@ impl Agent<'_> {
     }
 
     pub(crate) async fn navigate_tree_with_resolution(
+        &self,
+        session: &mut Session,
+        selected: u64,
+        options: TreeNavigationOptions<'_>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        resolution: Option<TreeModelResolution>,
+    ) -> Result<()> {
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
+        self.navigate_tree_with_resolution_inner(
+            session,
+            selected,
+            options,
+            cancel,
+            &mut adapter,
+            resolution,
+        )
+        .await
+    }
+
+    async fn navigate_tree_with_resolution_inner(
         &self,
         session: &mut Session,
         selected: u64,
@@ -5886,6 +6172,60 @@ fn branch_excerpt(entry: Message) -> String {
 thread_local! {
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REASONING_EVENT_METADATA: std::cell::RefCell<Vec<ReasoningEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TextEventMetadata {
+    Start { index: u64 },
+    Delta { index: u64 },
+    End { index: u64, content: String },
+}
+
+fn text_event_metadata() -> Option<TextEventMetadata> {
+    TEXT_EVENT_METADATA.with(|stack| stack.borrow().last().cloned())
+}
+
+fn with_text_event_metadata<T>(value: TextEventMetadata, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            TEXT_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    TEXT_EVENT_METADATA.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
+}
+
+/// Optional item identity associated with the current reasoning notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasoningEventMetadata {
+    Start { index: u64 },
+    Delta { index: u64 },
+    End { index: u64, content: String },
+}
+
+/// Returns item metadata only during the current synchronous observer call.
+pub fn reasoning_event_metadata() -> Option<ReasoningEventMetadata> {
+    REASONING_EVENT_METADATA.with(|stack| stack.borrow().last().cloned())
+}
+
+fn with_reasoning_event_metadata<T>(value: ReasoningEventMetadata, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            REASONING_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    REASONING_EVENT_METADATA.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
 }
 
 /// Metadata associated with the committed record currently being observed.
@@ -5952,6 +6292,75 @@ fn with_tool_result_event_metadata<T>(
 #[cfg(test)]
 mod metadata_scope_tests {
     use super::*;
+
+    #[test]
+    fn item_events_project_to_legacy_deltas_only() {
+        let mut legacy = Vec::new();
+        let mut observer = |event: Notification<'_>| match event {
+            Notification::Text(text) | Notification::Reasoning(text) => {
+                legacy.push(text.to_owned())
+            }
+            _ => {}
+        };
+        with_text_event_metadata(TextEventMetadata::Start { index: 0 }, || {
+            dispatch_legacy_event(Notification::Text(""), &mut observer)
+        });
+        with_text_event_metadata(TextEventMetadata::Delta { index: 0 }, || {
+            dispatch_legacy_event(Notification::Text("a"), &mut observer)
+        });
+        with_text_event_metadata(
+            TextEventMetadata::End {
+                index: 0,
+                content: "ab".into(),
+            },
+            || dispatch_legacy_event(Notification::Text(""), &mut observer),
+        );
+        with_reasoning_event_metadata(ReasoningEventMetadata::Start { index: 1 }, || {
+            dispatch_legacy_event(Notification::Reasoning(""), &mut observer)
+        });
+        with_reasoning_event_metadata(ReasoningEventMetadata::Delta { index: 1 }, || {
+            dispatch_legacy_event(Notification::Reasoning("b"), &mut observer)
+        });
+        with_reasoning_event_metadata(
+            ReasoningEventMetadata::End {
+                index: 1,
+                content: "bc".into(),
+            },
+            || dispatch_legacy_event(Notification::Reasoning(""), &mut observer),
+        );
+        assert_eq!(legacy, ["a", "b"]);
+    }
+
+    #[test]
+    fn reasoning_metadata_is_nested_and_observer_scoped() {
+        assert_eq!(reasoning_event_metadata(), None);
+        with_reasoning_event_metadata(ReasoningEventMetadata::Delta { index: 2 }, || {
+            assert_eq!(
+                reasoning_event_metadata(),
+                Some(ReasoningEventMetadata::Delta { index: 2 })
+            );
+            with_reasoning_event_metadata(
+                ReasoningEventMetadata::End {
+                    index: 3,
+                    content: "done".into(),
+                },
+                || {
+                    assert_eq!(
+                        reasoning_event_metadata(),
+                        Some(ReasoningEventMetadata::End {
+                            index: 3,
+                            content: "done".into()
+                        })
+                    );
+                },
+            );
+            assert_eq!(
+                reasoning_event_metadata(),
+                Some(ReasoningEventMetadata::Delta { index: 2 })
+            );
+        });
+        assert_eq!(reasoning_event_metadata(), None);
+    }
 
     #[test]
     fn committed_compaction_exposes_only_its_metadata_to_live_observer() {

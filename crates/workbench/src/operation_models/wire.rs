@@ -50,7 +50,7 @@ fn image_parts(values: &Value) -> Result<Vec<pi_rs::ImageContent>> {
     values.iter().map(parse_image).collect()
 }
 
-fn parse_image(value: &Value) -> Result<pi_rs::ImageContent> {
+pub(super) fn parse_image(value: &Value) -> Result<pi_rs::ImageContent> {
     let image: pi_rs::ImageContent = serde_json::from_value(value.clone())
         .map_err(|_| Error::Config("invalid model image block".into()))?;
     if !matches!(
@@ -286,7 +286,7 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             .min(u64::from(u32::MAX))
     };
     let (input, output, cache_read, cache_write) = match entry.api {
-        Api::SystemOne | Api::WorkersAiSystemOne => {
+        Api::SystemOne | Api::WorkersAiSystemOne | Api::OpenAiDecisions => {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;
             }
@@ -313,18 +313,22 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
         }
     };
     let cost = &entry.model.cost;
-    let input_cost = cost.input * input as f64 / 1_000_000.0;
-    let output_cost = cost.output * output as f64 / 1_000_000.0;
-    let read_cost = cost.cache_read * cache_read as f64 / 1_000_000.0;
-    let write_cost = cost.cache_write * cache_write as f64 / 1_000_000.0;
-    let mut result = json!({
+    let tier = cost
+        .tiers
+        .iter()
+        .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above)
+        .max_by_key(|tier| tier.input_tokens_above);
+    let input_cost = tier.map_or(cost.input, |tier| tier.input) * input as f64 / 1_000_000.0;
+    let output_cost = tier.map_or(cost.output, |tier| tier.output) * output as f64 / 1_000_000.0;
+    let read_cost =
+        tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read as f64 / 1_000_000.0;
+    let write_cost =
+        tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write as f64 / 1_000_000.0;
+    let result = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":input+output+cache_read+cache_write,
         "cost":{"input":input_cost,"output":output_cost,"cacheRead":read_cost,"cacheWrite":write_cost,
-            "total":input_cost+output_cost+read_cost+write_cost},
+            "total":input_cost+output_cost+read_cost+write_cost,"totalFromProvider":false},
     });
-    if matches!(entry.api, Api::OpenRouterImages) {
-        result["cost"]["totalFromProvider"] = json!(false);
-    }
     Some(result)
 }

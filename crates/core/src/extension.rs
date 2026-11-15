@@ -272,6 +272,48 @@ pub struct ExtensionResources {
     pub resources: DiscoveredResources,
 }
 
+struct ResourceDiscoveryHost {
+    messages: Arc<dyn ToolHost>,
+    entries: tokio::sync::mpsc::Sender<(
+        CustomEntry,
+        tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+    )>,
+}
+
+#[async_trait::async_trait]
+impl ToolHost for ResourceDiscoveryHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.messages.tools()
+    }
+    async fn call(&self, name: &str, arguments: Value) -> Outcome {
+        self.messages.call(name, arguments).await
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.messages.supports_custom_messages()
+    }
+    async fn send_message(
+        &self,
+        message: CustomMessage,
+        delivery: CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        self.messages.send_message(message, delivery).await
+    }
+    fn supports_custom_entries(&self) -> bool {
+        true
+    }
+    async fn append_entry(&self, entry: CustomEntry) -> ExtensionResult<()> {
+        crate::journal::validate_custom_entry(&entry).map_err(|error| error.to_string())?;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.entries
+            .send((entry, reply))
+            .await
+            .map_err(|_| "resource discovery has finished".to_owned())?;
+        response
+            .await
+            .map_err(|_| "custom entry acknowledgement was lost".to_owned())?
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheWarmingAction {
@@ -367,6 +409,22 @@ pub trait ToolHost: Send + Sync {
         _delivery: CustomMessageDelivery,
     ) -> ExtensionResult<()> {
         Err("custom message delivery is unavailable".into())
+    }
+    /// Whether this callback can persist non-message custom entries.
+    fn supports_custom_entries(&self) -> bool {
+        false
+    }
+    /// Close a callback's custom-entry transport after its handler returns.
+    #[doc(hidden)]
+    fn close_custom_entry_scope(&self) {}
+    /// Persist a branch-local entry that is excluded from model context.
+    /// Dropping this future does not guarantee cancellation of an already
+    /// dispatched request, especially across an executable extension boundary.
+    /// An executable request is dispatched once it has acquired its transport
+    /// lock and passed the callback-lifetime check; it can commit after the
+    /// callback returns.
+    async fn append_entry(&self, _entry: CustomEntry) -> ExtensionResult<()> {
+        Err("custom entry persistence is unavailable".into())
     }
     /// Whether stable, extension-supplied message keys are supported here.
     fn supports_keyed_messages(&self) -> bool {
@@ -1657,6 +1715,13 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Whether a registered extension without a source path is a host built-in.
+    pub fn extension_source_is_builtin(&self, id: &str) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.id() == id && extension.source_is_builtin())
+    }
+
     /// Register a model instance for recovery on a branch that selected it.
     pub fn register_branch_model(
         &self,
@@ -2051,7 +2116,21 @@ impl Registry {
             .filter(|item| item.handles_resource_discovery())
         {
             let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
-            let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+            let (entry_sender, mut entries) = tokio::sync::mpsc::channel(32);
+            let host = Arc::new(ResourceDiscoveryHost {
+                messages: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+                entries: entry_sender,
+            });
+            enum Request {
+                Entry(
+                    CustomEntry,
+                    tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+                ),
+                Message(
+                    crate::QueuedCustomMessage,
+                    tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+                ),
+            }
             let outcome = {
                 let future = platform_time::timeout(
                     timeout,
@@ -2061,15 +2140,31 @@ impl Registry {
                 loop {
                     tokio::select! {
                         biased;
-                        Some((input, reply)) = incoming.recv() => {
+                        result = &mut future => break result,
+                        request = async {
+                            tokio::select! {
+                                Some((entry, reply)) = entries.recv() => Request::Entry(entry, reply),
+                                Some((message, reply)) = incoming.recv() => Request::Message(message, reply),
+                                else => std::future::pending().await,
+                            }
+                        } => match request {
+                        Request::Entry(entry, reply) => {
+                            if reply.is_closed() { continue; }
+                            if let Err(error) = session.ensure_settled() {
+                                let _ = reply.send(Err(error.to_string()));
+                                continue;
+                            }
+                            let persisted = session.append_custom_entry(entry).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom entry"))));
+                            match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                        }
+                        Request::Message(input, reply) => {
                             let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
                                 crate::agent::queue_custom_message(session, input, observer)
                             } else {
                                 session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
                             };
                             match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                        }
-                        result = &mut future => break result,
+                        }}
                     }
                 }
             };
@@ -3014,6 +3109,396 @@ mod replacement_tests {
                 ..Default::default()
             })
         }
+    }
+
+    struct ResourceEntryHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceEntryHook {
+        fn id(&self) -> &str {
+            "resource-entry"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            assert!(host.supports_custom_entries());
+            host.append_entry(CustomEntry {
+                custom_type: "index".into(),
+                data: Some(json!({"count": 2})),
+            })
+            .await?;
+            host.append_entry(CustomEntry {
+                custom_type: "x".repeat(8 * 1024 * 1024),
+                data: None,
+            })
+            .await
+            .unwrap_err();
+            host.send_message(
+                CustomMessage {
+                    custom_type: "context".into(),
+                    content: crate::ContextContent::Text("hello".into()),
+                    display: false,
+                    details: None,
+                },
+                CustomMessageDelivery::AfterTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_persists_custom_entries_before_acknowledgement() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceEntryHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let mut committed = Vec::new();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |event| {
+                    if let crate::Notification::Committed(record) = event {
+                        committed.push(record.event.clone());
+                    }
+                },
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&committed[..], [crate::Event::CustomEntry { entry }, crate::Event::CustomMessage { .. }] if entry.custom_type == "index")
+        );
+        let restored = crate::Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.branch().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.data == Some(json!({"count":2})))));
+        let context =
+            crate::journal::conversation_entries(&restored.branch(), restored.operations());
+        assert!(
+            matches!(&context[..], [(_, crate::Message::User { content })] if content == "hello")
+        );
+    }
+
+    struct ResourceRejectHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceRejectHook {
+        fn id(&self) -> &str {
+            "resource-reject"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            let error = host
+                .append_entry(CustomEntry {
+                    custom_type: "index".into(),
+                    data: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(!error.is_empty());
+            Ok(DiscoveredResources {
+                prompt_paths: vec!["still-available.md".into()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_can_handle_entry_rejection_while_operation_is_unsettled() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceRejectHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        session
+            .append(crate::Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(crate::Event::ToolStarted { operation_id })
+            .unwrap();
+        let before = session.records().len();
+        let resources = registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resources[0].resources.prompt_paths,
+            [std::path::PathBuf::from("still-available.md")]
+        );
+        assert_eq!(session.records().len(), before);
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_propagates_custom_entry_store_failure() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        let mut session =
+            crate::Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceEntryHook)).unwrap();
+        let result = registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |_, _| {},
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fixture write failed")
+        );
+        assert!(
+            session
+                .append_custom_entry(CustomEntry {
+                    custom_type: "later".into(),
+                    data: None
+                })
+                .is_err()
+        );
+    }
+
+    struct ResourceBackgroundEntryHook(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+    #[async_trait::async_trait]
+    impl Extension for ResourceBackgroundEntryHook {
+        fn id(&self) -> &str {
+            "resource-background"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            let done = self.0.lock().unwrap().take().unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = started.send(());
+                while host
+                    .append_entry(CustomEntry {
+                        custom_type: "background".into(),
+                        data: None,
+                    })
+                    .await
+                    .is_ok()
+                {}
+                let _ = done.send(());
+            });
+            ready.await.map_err(|error| error.to_string())?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_closes_background_entry_requests_after_callback() {
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ResourceBackgroundEntryHook(
+                std::sync::Mutex::new(Some(done)),
+            )))
+            .unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        platform_time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(1),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(1), stopped)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    struct ResourceCancelledEntryHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceCancelledEntryHook {
+        fn id(&self) -> &str {
+            "resource-cancelled"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            let mut entry = Box::pin(host.append_entry(CustomEntry {
+                custom_type: "cancelled".into(),
+                data: None,
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(entry.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(entry);
+            host.send_message(
+                CustomMessage {
+                    custom_type: "continued".into(),
+                    content: crate::ContextContent::Text("ok".into()),
+                    display: false,
+                    details: None,
+                },
+                CustomMessageDelivery::AfterTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_discards_cancelled_queued_entries() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ResourceCancelledEntryHook))
+            .unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert!(!session.records().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.custom_type == "cancelled")));
+        assert!(session.records().iter().any(|record| matches!(&record.event, crate::Event::CustomMessage { message } if message.custom_type == "continued")));
+    }
+
+    struct ResourceFairnessHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceFairnessHook {
+        fn id(&self) -> &str {
+            "resource-fair"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            for _ in 0..48 {
+                let host = host.clone();
+                tokio::spawn(async move {
+                    while host
+                        .append_entry(CustomEntry {
+                            custom_type: "producer".into(),
+                            data: None,
+                        })
+                        .await
+                        .is_ok()
+                    {}
+                });
+            }
+            tokio::task::yield_now().await;
+            host.send_message(
+                CustomMessage {
+                    custom_type: "fair".into(),
+                    content: crate::ContextContent::Text("ok".into()),
+                    display: false,
+                    details: None,
+                },
+                CustomMessageDelivery::AfterTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_services_messages_amid_entry_producers() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceFairnessHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event, crate::Event::CustomMessage { message } if message.custom_type == "fair")));
     }
     #[tokio::test]
     async fn resource_discovery_journals_trigger_before_acknowledging_callback() {
