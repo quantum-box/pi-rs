@@ -1846,6 +1846,8 @@ unordered list markers and escaped punctuation. Task-list markers and wrapped
 continuations use Pi's bracketed form and indentation.
 Recursive quote rendering stops at 32 levels and preserves deeper content as text.
 Horizontal rules use the reference 80-column maximum.
+Top-level horizontal rules separate following blocks with one blank line and
+do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
 block quotes; hard line breaks do not add paragraph spacing.
 
