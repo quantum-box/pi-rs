@@ -1669,7 +1669,7 @@ mod tests {
         let child_cancellation = cancellation.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let login = tokio::spawn(async move {
+        let mut login = tokio::spawn(async move {
             deadline_login_with_commit(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(60),
                 staged,
@@ -1690,7 +1690,11 @@ mod tests {
         cancellation.cancel();
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
-        assert!(!login.is_finished());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut login)
+                .await
+                .is_err()
+        );
         assert!(!path.exists());
         tokio::time::resume();
         release_tx.send(()).unwrap();
