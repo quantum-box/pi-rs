@@ -300,3 +300,87 @@ fn operation_frames_preserve_commit_order_and_resume_after_reopen() {
     assert!(resumed.poll_operations(0).is_err());
     assert_eq!(resumed.cursor(), cursor);
 }
+
+fn apply_chord(mut value: serde_json::Value, ops: &[serde_json::Value]) -> serde_json::Value {
+    for op in ops {
+        let op = op.as_array().unwrap();
+        match op[0].as_str().unwrap() {
+            "r" => value = op[1].clone(),
+            "s" => {
+                let key = op[1][0].as_str().unwrap();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key.into(), op[2].clone());
+            }
+            "d" => {
+                let key = op[1][0].as_str().unwrap();
+                value.as_object_mut().unwrap().remove(key);
+            }
+            "p" => {
+                let key = op[1][0].as_str().unwrap();
+                let array = value[key].as_array_mut().unwrap();
+                let start = op[2].as_u64().unwrap() as usize;
+                let count = op[3].as_u64().unwrap() as usize;
+                array.splice(start..start + count, op[4].as_array().unwrap().clone());
+            }
+            other => panic!("unsupported operation {other}"),
+        }
+    }
+    value
+}
+
+#[test]
+fn incremental_document_operations_apply_and_resume_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("incremental.db");
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let (initial, mut watch) = docs.watch(&address()).unwrap();
+    assert!(initial.document.is_none());
+    let mut tx = Transaction::new();
+    tx.put(
+        &address(),
+        Expected::Missing,
+        json!({"stable":"x".repeat(2000), "items":[1], "remove":1})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    let first = watch.poll_incremental_operations(1).unwrap();
+    assert_eq!(first[0].ops[0][0], "r");
+    let mut value = apply_chord(serde_json::Value::Null, &first[0].ops);
+    let version = first[0].document.as_ref().unwrap().version;
+    let saved = watch.cursor();
+    let mut tx = Transaction::new();
+    tx.put(
+        &address(),
+        Expected::Version(version),
+        json!({"stable":"x".repeat(2000), "items":[1,2], "added":true})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let mut watch = docs.resume_watch(&address(), saved).unwrap();
+    let next = watch.poll_incremental_operations(1).unwrap();
+    assert!(next[0].ops.iter().any(|op| op[0] == "p"));
+    assert!(next[0].ops.iter().any(|op| op[0] == "d"));
+    assert!(next[0].ops.iter().any(|op| op[0] == "s"));
+    value = apply_chord(value, &next[0].ops);
+    assert_eq!(value, json!(next[0].document.as_ref().unwrap().value));
+    let version = next[0].document.as_ref().unwrap().version;
+    let mut tx = Transaction::new();
+    tx.delete(&address(), version).unwrap();
+    tx.commit(&store).unwrap();
+    let deleted = watch.poll_incremental_operations(1).unwrap();
+    assert!(deleted[0].retired && deleted[0].ops.is_empty());
+    put(&store, 7);
+    let recreated = watch.poll_incremental_operations(1).unwrap();
+    assert_eq!(recreated[0].ops[0][0], "r");
+    assert_eq!(apply_chord(value, &recreated[0].ops), json!({"n":7}));
+}

@@ -47,7 +47,7 @@ pub struct Address {
     pub key: String,
 }
 impl Address {
-    fn storage_key(&self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn storage_key(&self) -> Result<Vec<u8>, Error> {
         let mut result = PREFIX.to_vec();
         result.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(result)
@@ -178,6 +178,43 @@ impl DocumentWatch<'_> {
                 }
             })
             .collect())
+    }
+
+    /// Derive incremental Chord operations from successive immutable document
+    /// states. Replacements are used for creation or unsafe/large diffs.
+    /// The caller must retain the value at the input cursor. On error the
+    /// cursor is unchanged; deletions remain retirement frames.
+    pub fn poll_incremental_operations(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<DocumentOperationFrame>, Error> {
+        let mut previous = Documents::decode(self.store.document_at(&self.key, self.cursor)?)?;
+        let changes = self.store.document_changes(&self.key, self.cursor, limit)?;
+        let mut frames = Vec::with_capacity(changes.len());
+        for (revision, entry) in changes {
+            let document = Documents::decode(entry)?;
+            let ops = match (&previous, &document) {
+                (Some(old), Some(new)) => crate::chord_ops::diff(
+                    &Value::Object(old.value.clone()),
+                    &Value::Object(new.value.clone()),
+                ),
+                (None, Some(new)) => {
+                    crate::chord_ops::replacement(&Value::Object(new.value.clone()))
+                }
+                (_, None) => Vec::new(),
+            };
+            frames.push(DocumentOperationFrame {
+                revision,
+                retired: document.is_none(),
+                document: document.clone(),
+                ops,
+            });
+            previous = document;
+        }
+        if let Some(last) = frames.last() {
+            self.cursor = last.revision;
+        }
+        Ok(frames)
     }
 
     /// Return at most `limit` changes (1..=256), without waiting.

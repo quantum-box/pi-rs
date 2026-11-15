@@ -193,6 +193,32 @@ impl Store {
             )
             .optional()?)
     }
+    /// Document revision written by a tracked store transaction, if any.
+    pub fn document_revision_for_commit(&self, sequence: u64) -> Result<Option<u64>, Error> {
+        if sequence > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT revision FROM durable_document_commit_sequences WHERE sequence=?1",
+                [sequence],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    /// Revision of the latest retained history row at a given boundary.
+    pub fn document_last_revision(&self, key: &[u8], through: u64) -> Result<Option<u64>, Error> {
+        if !key.starts_with(b"durable/document/") || through > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT MAX(revision) FROM durable_document_history WHERE key=?1 AND revision<=?2",
+            params![key, through],
+            |r| r.get(0),
+        )?)
+    }
     /// Next complete scoped document revision after a forward-only cursor.
     /// Missing tracking for a matching revision is an error, not a gap.
     pub fn next_scoped_document_commit(

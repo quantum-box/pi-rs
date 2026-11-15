@@ -1406,6 +1406,29 @@ impl MergedSourceSignal {
     }
 }
 
+/// A document change and the proven predecessor used for its operations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergedDocumentOperations {
+    pub address: crate::document::Address,
+    pub previous: Option<crate::document::Document>,
+    pub ops: Vec<serde_json::Value>,
+    pub retired: bool,
+}
+/// One complete merged transaction with derived Chord operations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncrementalMergedFrame {
+    pub frame: MergedProgressFrame,
+    /// Present only when a predecessor was verified; otherwise ops replace root.
+    pub observation_previous: Option<serde_json::Value>,
+    pub documents: Vec<MergedDocumentOperations>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncrementalMergedPage {
+    pub frames: Vec<IncrementalMergedFrame>,
+    pub next: MergedProgressCursor,
+    pub has_more: bool,
+}
+
 /// A resumable pull watch over complete merged commit frames. The cursor
 /// advances only when a page is returned; persist it after processing the page.
 pub struct MergedProgressWatch {
@@ -1466,6 +1489,28 @@ impl MergedProgressWatch {
             }
         }
     }
+    /// Like `next`, but derive operations only from proven predecessor states.
+    /// A failed conversion restores the input cursor and ends the watch.
+    pub async fn next_operations(&mut self) -> Result<Option<IncrementalMergedPage>, Error> {
+        let before = self.cursor.clone();
+        let Some(page) = self.next().await? else {
+            return Ok(None);
+        };
+        let result = self
+            .reader
+            .as_ref()
+            .expect("reader remains open for a returned page")
+            .incremental_merged_page(page);
+        match result {
+            Ok(page) => Ok(Some(page)),
+            Err(error) => {
+                self.cursor = before;
+                self.end_with(ViewWatchEnd::Failed(error.to_string()));
+                Err(error)
+            }
+        }
+    }
+
     /// An explicitly cancelled token ends the watch as aborted.
     pub async fn next_with_cancel(
         &mut self,
@@ -6041,6 +6086,96 @@ impl Harness {
             next,
         )))
     }
+    fn incremental_merged_page(
+        &self,
+        page: MergedProgressPage,
+    ) -> Result<IncrementalMergedPage, Error> {
+        let store = self.owner.store();
+        let mut frames = Vec::with_capacity(page.frames.len());
+        for mut frame in page.frames {
+            let mut observation_previous = None;
+            if let Some(observation) = &mut frame.observation {
+                let position = observation.cursor.position;
+                if position > 1 {
+                    match self.committed_view_frame(observation.cursor.conversation, position - 1) {
+                        Ok(previous) => {
+                            observation.ops =
+                                crate::chord_ops::diff(&previous.value, &observation.value);
+                            observation_previous = Some(previous.value);
+                        }
+                        Err(error @ Error::Storage(_)) | Err(error @ Error::Observer(_)) => {
+                            return Err(error);
+                        }
+                        Err(_) => {} // The proven current snapshot remains a safe root replacement.
+                    }
+                }
+            }
+            let mut documents = Vec::with_capacity(frame.documents.len());
+            if !frame.documents.is_empty() {
+                let revision = store
+                    .document_revision_for_commit(frame.commit_sequence)?
+                    .ok_or_else(|| Error::Invalid("missing document commit revision".into()))?;
+                let prior_boundary = revision
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::Invalid("invalid document revision".into()))?;
+                let tracking_boundary = store.document_commit_boundary()?.0;
+                let docs = crate::document::Documents::new(store);
+                for change in &frame.documents {
+                    if docs.get_at(&change.address, revision)? != change.document {
+                        return Err(Error::Invalid("document commit changed".into()));
+                    }
+                    let previous = docs.get_at(&change.address, prior_boundary)?;
+                    let key = change.address.storage_key()?;
+                    let previous_revision = store.document_last_revision(&key, prior_boundary)?;
+                    let proven = match (&previous, previous_revision) {
+                        (Some(document), Some(previous_revision))
+                            if previous_revision > tracking_boundary =>
+                        {
+                            let seq = store.document_commit_sequence(previous_revision)?;
+                            seq.is_some()
+                                && seq == store.commit_for_version(&key, document.version)?
+                        }
+                        _ => false,
+                    };
+                    let ops = match (&previous, &change.document) {
+                        (Some(old), Some(new)) if proven => crate::chord_ops::diff(
+                            &serde_json::Value::Object(old.value.clone()),
+                            &serde_json::Value::Object(new.value.clone()),
+                        ),
+                        (_, Some(new)) => crate::chord_ops::replacement(
+                            &serde_json::Value::Object(new.value.clone()),
+                        ),
+                        (_, None) => Vec::new(),
+                    };
+                    documents.push(MergedDocumentOperations {
+                        address: change.address.clone(),
+                        previous: if proven { previous } else { None },
+                        ops,
+                        retired: change.document.is_none(),
+                    });
+                }
+            }
+            frames.push(IncrementalMergedFrame {
+                frame,
+                observation_previous,
+                documents,
+            });
+        }
+        Ok(IncrementalMergedPage {
+            frames,
+            next: page.next,
+            has_more: page.has_more,
+        })
+    }
+    /// Page committed transactions with derived incremental operations.
+    pub fn merged_progress_operations(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<IncrementalMergedPage, Error> {
+        self.incremental_merged_page(self.merged_progress(cursor, limit)?)
+    }
+
     /// Page complete transactions after a saved cursor. Each page captures one
     /// store boundary so a racing commit cannot be split across sources.
     pub fn merged_progress(
@@ -11228,6 +11363,13 @@ impl Scheduler {
     ) -> Result<MergedProgressWatch, Error> {
         self.harness
             .watch_merged_progress_handle(conversation, after, limit, interval)
+    }
+    pub fn merged_progress_operations(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<IncrementalMergedPage, Error> {
+        self.harness.merged_progress_operations(cursor, limit)
     }
     pub fn merged_progress_from_now(
         &self,

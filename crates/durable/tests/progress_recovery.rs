@@ -1853,3 +1853,179 @@ async fn merged_listener_drains_to_automatic_close_after_inflight_ack() {
             .is_err()
     );
 }
+
+fn apply_derived_ops(mut value: serde_json::Value, ops: &[serde_json::Value]) -> serde_json::Value {
+    for op in ops {
+        let op = op.as_array().unwrap();
+        match op[0].as_str().unwrap() {
+            "r" => value = op[1].clone(),
+            "s" => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(op[1][0].as_str().unwrap().into(), op[2].clone());
+            }
+            "d" => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(op[1][0].as_str().unwrap());
+            }
+            "p" => {
+                let array = value[op[1][0].as_str().unwrap()].as_array_mut().unwrap();
+                let start = op[2].as_u64().unwrap() as usize;
+                let count = op[3].as_u64().unwrap() as usize;
+                array.splice(start..start + count, op[4].as_array().unwrap().clone());
+            }
+            other => panic!("unexpected operation {other}"),
+        }
+    }
+    value
+}
+
+#[tokio::test]
+async fn merged_incremental_watch_applies_atomic_frames_and_reopens() {
+    use pi_rs_durable::{
+        document::{Address, Documents, Transaction},
+        runtime::{AdmissionOptions, ViewWatchEnd},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ops.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "note".into(),
+        key: "".into(),
+    };
+    let mut watch = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let initial_cursor = watch.cursor().clone();
+    h.submit_with_documents(
+        id,
+        None,
+        "x".repeat(2000),
+        AdmissionOptions::default(),
+        |docs| {
+            docs.get(&address)?;
+            docs.put(
+                &address,
+                serde_json::json!({"stable":"z".repeat(2000),"items":[1],"old":1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        },
+    )
+    .unwrap();
+    let replay = h
+        .merged_progress_operations(&initial_cursor, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(watch.cursor(), &initial_cursor);
+    let first = watch.next_operations().await.unwrap().unwrap();
+    assert_eq!(first, replay);
+    let frame = &first.frames[0];
+    assert!(frame.frame.observation.is_some());
+    assert_eq!(frame.documents.len(), 1);
+    assert_eq!(frame.documents[0].ops[0][0], "r");
+    let store = durable_store::Store::open(&path).unwrap();
+    let version = Documents::new(&store)
+        .get(&address)
+        .unwrap()
+        .unwrap()
+        .version;
+    let mut tx = Transaction::new();
+    tx.put(
+        &address,
+        durable_store::Expected::Version(version),
+        serde_json::json!({"stable":"z".repeat(2000),"items":[1,2],"new":true})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    h.submit(id, None, "second".into()).unwrap();
+    let mut found_doc = false;
+    let mut found_observation = false;
+    for _ in 0..2 {
+        let page = tokio::time::timeout(Duration::from_secs(5), watch.next_operations())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for item in &page.frames {
+            if let Some(observation) = &item.frame.observation
+                && let Some(previous) = &item.observation_previous
+            {
+                assert_eq!(
+                    apply_derived_ops(previous.clone(), &observation.ops),
+                    observation.value
+                );
+                found_observation |= observation.ops.iter().any(|op| op[0] != "r");
+            }
+            for (patch, change) in item.documents.iter().zip(&item.frame.documents) {
+                let previous = patch.previous.as_ref().unwrap();
+                let after = change.document.as_ref().unwrap();
+                assert_eq!(
+                    apply_derived_ops(serde_json::json!(previous.value), &patch.ops),
+                    serde_json::json!(after.value)
+                );
+                assert!(patch.ops.iter().any(|op| op[0] == "p"));
+                found_doc = true;
+            }
+        }
+    }
+    assert!(found_doc && found_observation);
+    let saved = watch.cursor().clone();
+    drop(h);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), watch.next_operations())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Ended));
+    drop(store);
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut resumed = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let version = Documents::new(&store)
+        .get(&address)
+        .unwrap()
+        .unwrap()
+        .version;
+    let mut tx = Transaction::new();
+    tx.delete(&address, version).unwrap();
+    tx.commit(&store).unwrap();
+    loop {
+        let page = tokio::time::timeout(Duration::from_secs(5), resumed.next_operations())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Some(patch) = page
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.documents)
+            .find(|patch| patch.address == address)
+        {
+            assert!(patch.retired && patch.ops.is_empty());
+            break;
+        }
+    }
+}

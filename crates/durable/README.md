@@ -275,6 +275,20 @@ close. Dropping `run` can interrupt a callback and replays its unacknowledged pa
 so effects need idempotency. This pull-driven API has no background callback
 queue, upstream listener context or recoverable error frames; total page bytes remain subject to the merged stream's existing limits.
 
+`merged_progress_operations` and `MergedProgressWatch::next_operations` are
+opt-in derived-operation variants over the same cursor and atomic frames. They
+compare validated observation predecessors and tracked document predecessors,
+emitting top-level Chord `s`/`d` operations and append-only array `p` operations
+when smaller than a root replacement. Missing or unproven predecessors, unsafe
+Chord path segments, excessive changes and non-beneficial patches fall back to
+`["r", value]`. Document deletions are retirement frames with no operations;
+creation and recreation use root replacements. The incremental frame supplies
+its verified predecessor where available so a consumer can apply the operations
+only to that state. Progress remains replacement-state data. These are derived
+state transitions, not original upstream operation batches; observation and
+record sizes remain subject to the existing merged-watch limits. Conversion
+errors do not advance the watch cursor.
+
 `progress_history_from_now` captures a versioned, conversation-scoped exclusive
 cursor. `progress_history` and `watch_progress_history` page committed generation
 and tool progress records after that boundary. Runtime checkpoints and terminal
@@ -847,6 +861,11 @@ the number of commits. A commit without document mutations is not emitted.
 The stream records final states, not mutation order, intermediate writes, or
 non-document parts of a store transaction. It includes every document scope;
 callers must apply their own access control and filtering.
+
+`DocumentWatch::poll_incremental_operations` derives the same bounded Chord
+operations from successive immutable states, resuming from the existing document
+cursor. The caller must retain the value at that cursor; creation/recreation
+falls back to replacement and deletion is a retirement frame.
 
 `DocumentWatch::poll_operations` also returns one frame per committed state:
 a put produces a Chord root replacement `["r", value]`, and a delete produces
