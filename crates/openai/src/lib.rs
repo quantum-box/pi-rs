@@ -67,6 +67,7 @@ pub enum SessionAffinityFormat {
 pub struct OpenAiResponses {
     client: Client,
     endpoint: Url,
+    endpoint_source: String,
     token: String,
     thinking: Option<String>,
     provider: String,
@@ -120,6 +121,7 @@ impl OpenAiResponses {
     }
 
     fn create(endpoint: &str, token: String, plan: bool) -> Result<Self> {
+        let endpoint_source = endpoint.to_owned();
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("invalid OpenAI Responses endpoint".into()))?;
         let secure = endpoint.as_str() == DEFAULT_ENDPOINT
@@ -149,6 +151,7 @@ impl OpenAiResponses {
         Ok(Self {
             client,
             endpoint,
+            endpoint_source,
             token,
             thinking: None,
             identity_safe_transport: true,
@@ -195,7 +198,7 @@ impl OpenAiResponses {
             return Ok(self);
         }
         let format = self.session_affinity_format.unwrap_or_else(|| {
-            if self.provider == "openrouter" || self.endpoint.as_str().contains("openrouter.ai") {
+            if self.provider == "openrouter" || self.endpoint_source.contains("openrouter.ai") {
                 SessionAffinityFormat::OpenRouter
             } else {
                 SessionAffinityFormat::OpenAi
@@ -582,6 +585,20 @@ impl Model for OpenAiResponses {
                     self.explicit_cache_mode,
                 ))
             };
+        let base = if self.session_affinity_format.is_none()
+            && self.provider != "openrouter"
+            && self.endpoint_source.contains("openrouter.ai")
+                != self.endpoint.as_str().contains("openrouter.ai")
+        {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    self.endpoint_source.contains("openrouter.ai"),
+                ))
+            })
+        } else {
+            base
+        };
         match self.session_affinity_format {
             None => base,
             Some(format) => base.and_then(|base| {
@@ -1858,6 +1875,24 @@ mod tests {
         .with_session_routing("id")
         .unwrap();
         assert_eq!(subdomain.headers["x-session-id"], "id");
+        let uppercase = OpenAiResponses::new_api_provider(
+            "https://OPENROUTER.AI/v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(uppercase.headers["session_id"], "id");
+        let path = OpenAiResponses::new_api_provider(
+            "https://example.com/openrouter.ai/../v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(path.headers["x-session-id"], "id");
         assert!(
             model
                 .clone()
