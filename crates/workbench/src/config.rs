@@ -2231,7 +2231,10 @@ mod tests {
         let other = root.path().join("other");
         let initial = Settings::default();
         let snapshot = Settings {
-            resource_layers: vec![(root.path().to_owned(), json!({"skills":["new"]}))],
+            resource_layers: vec![
+                (root.path().to_owned(), json!({"skills":["new"]})),
+                (workspace.join(".pi"), json!({"privateProject":"secret"})),
+            ],
             ..Settings::default()
         };
         initial.remember_worker_snapshot(&workspace, true, &snapshot);
@@ -2246,6 +2249,10 @@ mod tests {
             reloaded.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
             "new"
         );
+        assert_eq!(
+            reloaded.worker_fallback(&workspace, true).unwrap().value()["privateProject"],
+            "secret"
+        );
         for fallback in [
             reloaded.worker_fallback(&workspace, false),
             reloaded.worker_fallback(&other, true),
@@ -2253,6 +2260,7 @@ mod tests {
             let fallback = fallback.unwrap();
             assert_eq!(fallback.value()["skills"][0], "new");
             assert_eq!(fallback.resource_layers.len(), 1);
+            assert!(fallback.value().get("privateProject").is_none());
         }
         let mut staged = reloaded.clone();
         staged.fork_worker_history();
