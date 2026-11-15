@@ -664,8 +664,12 @@ async fn yield_blocks_reopen_and_dispatch_in_order() {
         Status::Done { .. }
     ));
     assert_eq!(hook.seen.lock().unwrap().len(), 2);
-    assert!(h.fork(id).is_err());
-    assert!(h.request_manual_compaction(id, 0, None).is_err());
+    let fork = h.fork(id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks,
+        h.conversation(id).unwrap().content_blocks
+    );
+    assert!(h.request_manual_compaction(id, 0, None).is_ok());
     thread.join().unwrap();
 }
 
