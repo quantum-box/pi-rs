@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "httpProxy": { "type": "string" },
-    "httpIdleTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "const": "disabled" }] },
+    "httpIdleTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "string" }] },
     "fullscreenExitOutput": { "enum": ["transcript", "resume-hint"] },
     "fullscreenScrollbar": { "enum": ["auto", "always", "hidden"] },
     "fullscreenCopyOnSelect": { "type": "boolean" },
