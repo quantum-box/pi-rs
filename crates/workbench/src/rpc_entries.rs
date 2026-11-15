@@ -646,6 +646,7 @@ impl Cursor {
             Event::Compacted {
                 summary,
                 retain_from,
+                system_prompt,
                 ..
             } => {
                 let first = retain_from
@@ -655,6 +656,34 @@ impl Cursor {
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
                     "tokensBefore":compaction_tokens(records, record, session)
                 });
+                if let Some(system) = system_prompt {
+                    let mut sections: Vec<Option<(String, Option<String>)>> = Vec::new();
+                    let mut section_indices = HashMap::new();
+                    for (name, value) in &system.sections {
+                        match (section_indices.get(name).copied(), value) {
+                            (Some(index), Some(value)) => {
+                                sections[index] = Some((name.clone(), Some(value.clone())))
+                            }
+                            (Some(index), None) => {
+                                sections[index] = None;
+                                section_indices.remove(name);
+                            }
+                            (None, Some(value)) => {
+                                section_indices.insert(name.clone(), sections.len());
+                                sections.push(Some((name.clone(), Some(value.clone()))));
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                    let sections: Vec<_> = sections.into_iter().flatten().collect();
+                    entry["systemMessage"] = super::rpc_messages::system_value(
+                        record,
+                        &system.content,
+                        &sections,
+                        &system.tools,
+                        &[],
+                    );
+                }
                 if let Some(metadata) = live_metadata
                     .or_else(|| session.and_then(|session| session.record_metadata(record.id)))
                 {
@@ -891,6 +920,88 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_compaction_system_prompt_survives_pi_projection_and_import() {
+        use super::*;
+        let base = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let prompt = pi_rs::CompactedSystemPrompt {
+            content: "saved instructions".into(),
+            sections: vec![
+                ("first".into(), Some("old".into())),
+                ("rules".into(), Some("saved rules".into())),
+                ("first".into(), None),
+                ("first".into(), Some("new".into())),
+            ],
+            tools: vec![pi_rs::ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type":"object"}),
+            }],
+        };
+        let mut records = base.records().to_vec();
+        let id = records.len() as u64 + 1;
+        records.push(Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id,
+            parent: Some(id - 1),
+            event: Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: Some(Box::new(prompt.clone())),
+                retain_from: None,
+                tokens_before: Some(42),
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let entries = Entries::new(&session).after(None).unwrap();
+        let projected = &entries["entries"][0]["systemMessage"];
+        assert_eq!(projected["role"], "system");
+        assert_eq!(
+            projected["sections"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["rules", "first"]
+        );
+        assert_eq!(projected["toolsAdded"][0]["name"], "read");
+        let share = Entries::new(&session)
+            .write_share_branch(&session, std::path::Path::new("."))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("share.jsonl");
+        std::fs::write(&path, share).unwrap();
+        let imported = super::super::session_import::read(&path).unwrap();
+        let restored = imported
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Compacted {
+                    system_prompt: Some(value),
+                    ..
+                } => Some(value.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored.content, prompt.content);
+        assert_eq!(restored.tools, prompt.tools);
+        assert_eq!(
+            restored.sections,
+            [
+                ("rules".into(), Some("saved rules".into())),
+                ("first".into(), Some("new".into()))
+            ]
+        );
+        assert_eq!(
+            imported.effective_system_context("fallback", prompt.tools.clone()),
+            session.effective_system_context("fallback", prompt.tools.clone())
+        );
+    }
+
     #[test]
     fn live_compaction_entry_projects_supplied_metadata() {
         use super::*;

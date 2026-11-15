@@ -207,7 +207,7 @@ fn normalize_system_message(message: &Value, record: &Record) -> Value {
     value
 }
 
-fn system_value(
+pub(super) fn system_value(
     record: &Record,
     content: &str,
     sections: &[(String, Option<String>)],
