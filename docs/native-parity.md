@@ -3825,9 +3825,11 @@ can also use `ToolHost::append_entry` to persist branch-local custom entries.
 Both in-process and executable extensions receive this capability. The callback
 is acknowledged after the entry is committed; the entry does not enter model
 context. Other callbacks do not yet support this API.
-Discovery callbacks do not yet have a branch-entry read API for restoring
-previously stored custom data. An executable request already dispatched when
-its callback ends can still commit; queued requests are rejected after closure.
+The same callbacks can read active-branch custom entries, optionally filtered
+by type, including entries appended earlier in the callback. Responses over
+8 MiB are rejected; other callbacks do not yet expose this lookup. An executable
+request already dispatched when its callback ends can still commit; queued
+requests are rejected after closure.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message
