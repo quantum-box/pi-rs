@@ -4229,9 +4229,12 @@ headers. The default format sends `session-id` and `x-client-request-id`;
 OpenRouter sends `x-session-id`, and a model or provider can select the
 OpenAI format without `session-id`. Explicit headers take precedence, and
 summary requests omit automatic routing headers. The existing native
-`sendSessionAffinityHeaders` override can disable them. ChatGPT sign-in and
-direct use of the standalone Responses adapter do not yet receive these
-routing headers automatically.
+`sendSessionAffinityHeaders` override can disable them.
+
+The standalone API-key Responses adapter also adds session routing headers
+through the session-aware model interface. SDK hosts can select an OpenAI,
+OpenAI without session ID, OpenRouter, or disabled format. ChatGPT sign-in
+uses a separate provider path and remains outside this checkpoint.
 
 ### Model session affinity checkpoint
 
