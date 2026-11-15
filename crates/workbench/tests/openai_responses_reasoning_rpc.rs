@@ -24,6 +24,8 @@ fn responses_reasoning_item_survives_rpc_stream_and_finalization() {
                 Err(e) => panic!("waiting for Responses request: {e}"),
             }
         };
+        // macOS can inherit O_NONBLOCK from the listener on accept.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
