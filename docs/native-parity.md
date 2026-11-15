@@ -843,6 +843,8 @@ custom operations. User-shell extension operations remain separate.
 
 `create_local_bash_operations` exposes the local execution backend for hosts
 that wrap shell operations. Backend injection and factories for grep, find and ls are still incomplete.
+The local model-facing bash paths report Pi's missing-working-directory
+diagnostic before attempting to spawn a command.
 
 When both operations are installed on one `CodingTools`, its read tool can page
 the host-side full-output transcripts produced by its shell tool. Independent

@@ -1613,6 +1613,20 @@ struct LocalBashOperations {
     shell: ShellConfig,
 }
 
+async fn check_local_shell_cwd(
+    cwd: &Path,
+    shell_name: &str,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = tokio::fs::metadata(cwd) => result.map(|_| ()).map_err(|_| {
+            Error::Config(format!("Working directory does not exist: {}\nCannot execute {shell_name} commands.", cwd.display()))
+        }),
+    }
+}
+
 const SHELL_POST_EXIT_IDLE: Duration = Duration::from_millis(100);
 // Bound completion even when a descendant writes continuously without a timeout.
 const SHELL_POST_EXIT_MAX: Duration = Duration::from_secs(2);
@@ -1639,6 +1653,7 @@ impl BashOperations for LocalBashOperations {
         } = self
             .shell
             .launch(&context.cwd, false, true, &context.command, false)?;
+        check_local_shell_cwd(&cwd, "bash", &cancellation).await?;
         command
             .current_dir(cwd)
             .env_clear()
@@ -1797,7 +1812,7 @@ impl RemoteShellTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<RemoteShellResult> {
         if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
+            return Err(Error::Config("Command aborted".into()));
         }
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
@@ -1891,7 +1906,19 @@ impl RemoteShellTool {
             )));
         }
         let code = code
-            .map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?
+            .map_err(|error| {
+                let message = match error {
+                    Error::Config(message)
+                        if self.operations.is_local()
+                            && message.starts_with("Working directory does not exist: ") =>
+                    {
+                        message
+                    }
+                    Error::Cancelled if self.operations.is_local() => "Command aborted".into(),
+                    error => error.to_string(),
+                };
+                Error::Config(shell_status(&output.display, &message))
+            })?
             .ok_or_else(|| {
                 Error::Config(shell_status(
                     &output.result_display(),
@@ -3055,7 +3082,11 @@ impl CodingTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
+            return if self.unrestricted {
+                Err(Error::Config("Command aborted".into()))
+            } else {
+                Err(Error::Cancelled)
+            };
         }
         let result = self
             .shell_stream(args, cancellation, &mut |_| {}, false, host)
@@ -3096,6 +3127,19 @@ impl CodingTool {
             string(args, "command")?,
             !sanitize_user_output,
         )?;
+        if self.unrestricted && !sanitize_user_output {
+            let shell_name = if matches!(self.kind, Kind::PowerShell) {
+                "PowerShell"
+            } else {
+                "bash"
+            };
+            check_local_shell_cwd(&cwd, shell_name, cancellation)
+                .await
+                .map_err(|error| match error {
+                    Error::Cancelled => Error::Config("Command aborted".into()),
+                    error => error,
+                })?;
+        }
         command
             .current_dir(cwd)
             .stdin(if input.is_some() {
@@ -6483,6 +6527,83 @@ mod tests {
         .unwrap();
         assert_eq!(result.output.script, "done");
         assert!(result.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_bash_reports_missing_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let direct = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let factory = create_bash_tool(
+            &root,
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let expected = format!(
+            "Working directory does not exist: {}\nCannot execute bash commands.",
+            root.display()
+        );
+        for result in [
+            direct.invoke(json!({"command":"true"}), context()).await,
+            factory.invoke(json!({"command":"true"}), context()).await,
+        ] {
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == &expected),
+                "{result:?}"
+            );
+        }
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let result = direct
+            .shell_stream(
+                &json!({"command":"true"}),
+                &cancellation,
+                &mut |_| {},
+                false,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Config(message)) if message == "Command aborted"));
+        let result = factory
+            .invoke(
+                json!({"command":"true"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation,
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Failed(message) if message == "Command aborted"));
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_check_preserves_powershell_wording_and_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let token = pi_rs::CancellationToken::new();
+        let result = check_local_shell_cwd(&missing, "PowerShell", &token).await;
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message == format!(
+                "Working directory does not exist: {}\nCannot execute PowerShell commands.", missing.display()
+            ))
+        );
+        token.cancel();
+        assert!(matches!(
+            check_local_shell_cwd(&missing, "PowerShell", &token).await,
+            Err(Error::Cancelled)
+        ));
     }
 
     #[cfg(unix)]
