@@ -33,6 +33,7 @@ pub struct Worker {
 /// may still exist. This is not an onWake value or a durable task listing.
 struct State {
     workers: HashMap<Uuid, Worker>,
+    revision: u128,
     updates: tokio::sync::watch::Sender<Vec<Worker>>,
 }
 
@@ -43,7 +44,8 @@ impl State {
         workers
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         if self.updates.receiver_count() != 0 {
             self.updates.send_replace(self.snapshot());
         }
@@ -58,6 +60,7 @@ impl Default for WorkerActivity {
         let (updates, _) = tokio::sync::watch::channel(Vec::new());
         Self(Arc::new(Mutex::new(State {
             workers: HashMap::new(),
+            revision: 0,
             updates,
         })))
     }
@@ -65,6 +68,13 @@ impl Default for WorkerActivity {
 impl WorkerActivity {
     pub fn snapshot(&self) -> Vec<Worker> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
+    }
+    /// Read the local change revision and worker snapshot under the same lock.
+    /// The revision also advances for definition changes that leave the worker
+    /// list unchanged. It is process-local and wraps after `u128::MAX` changes.
+    pub fn snapshot_with_revision(&self) -> (u128, Vec<Worker>) {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (state.revision, state.snapshot())
     }
     /// Subscribe to coalesced process-local lifecycle snapshots. The initial
     /// value is current at attachment; slow subscribers may skip transitions.
@@ -184,5 +194,30 @@ mod tests {
         drop(guard);
         let mut later = activity.subscribe();
         assert!(later.current().is_empty());
+    }
+
+    #[test]
+    fn revision_tracks_unobserved_changes_and_definition_notifications() {
+        let activity = WorkerActivity::default();
+        let (initial, workers) = activity.snapshot_with_revision();
+        assert!(workers.is_empty());
+        let guard = activity.enter(WorkerKind::Task, Uuid::new_v4());
+        let (running, workers) = activity.snapshot_with_revision();
+        assert_ne!(initial, running);
+        assert_eq!(workers.len(), 1);
+        guard.set(WorkerPhase::Running);
+        assert_eq!(activity.snapshot_with_revision().0, running);
+        guard.set(WorkerPhase::Waiting);
+        let (waiting, workers) = activity.snapshot_with_revision();
+        assert_ne!(running, waiting);
+        assert_eq!(workers[0].phase, WorkerPhase::Waiting);
+        activity.notify();
+        let (definition, unchanged) = activity.snapshot_with_revision();
+        assert_ne!(waiting, definition);
+        assert_eq!(unchanged, workers);
+        drop(guard);
+        let (done, workers) = activity.snapshot_with_revision();
+        assert_ne!(definition, done);
+        assert!(workers.is_empty());
     }
 }
