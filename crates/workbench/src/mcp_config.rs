@@ -51,21 +51,8 @@ pub enum McpCommand {
         /// Authenticate with credentials saved by mcp login.
         #[arg(long)]
         oauth: bool,
-        /// Pre-registered OAuth client ID.
-        #[arg(long)]
-        oauth_client_id: Option<String>,
-        /// OAuth client secret or reference such as '${CLIENT_SECRET}' or '!command'.
-        #[arg(long)]
-        oauth_client_secret: Option<String>,
-        /// Fixed loopback OAuth callback port.
-        #[arg(long)]
-        oauth_callback_port: Option<u16>,
-        /// Client name sent during dynamic registration.
-        #[arg(long)]
-        oauth_client_name: Option<String>,
-        /// OAuth client registration mode.
-        #[arg(long, value_parser = ["auto", "cimd", "dcr"])]
-        oauth_client_registration: Option<String>,
+        #[command(flatten)]
+        oauth_client: Box<McpOAuthAddOptions>,
         #[arg(long, value_parser = ["direct", "deferred", "codemode", "hidden"])]
         exposure: Option<String>,
         #[arg(long = "env")]
@@ -78,6 +65,25 @@ pub enum McpCommand {
         #[arg(short = 'l', long)]
         local: bool,
     },
+}
+
+#[derive(Clone, clap::Args)]
+pub struct McpOAuthAddOptions {
+    /// Pre-registered OAuth client ID.
+    #[arg(long)]
+    oauth_client_id: Option<String>,
+    /// OAuth client secret or reference such as '${CLIENT_SECRET}' or '!command'.
+    #[arg(long)]
+    oauth_client_secret: Option<String>,
+    /// Fixed loopback OAuth callback port.
+    #[arg(long)]
+    oauth_callback_port: Option<u16>,
+    /// Client name sent during dynamic registration.
+    #[arg(long)]
+    oauth_client_name: Option<String>,
+    /// OAuth client registration mode.
+    #[arg(long, value_parser = ["auto", "cimd", "dcr"])]
+    oauth_client_registration: Option<String>,
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
@@ -423,15 +429,18 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             description,
             bearer_token_env_var,
             oauth,
-            oauth_client_id,
-            oauth_client_secret,
-            oauth_callback_port,
-            oauth_client_name,
-            oauth_client_registration,
+            oauth_client,
             exposure,
             environment,
             command,
         } => {
+            let McpOAuthAddOptions {
+                oauth_client_id,
+                oauth_client_secret,
+                oauth_callback_port,
+                oauth_client_name,
+                oauth_client_registration,
+            } = *oauth_client;
             if name.is_empty()
                 || !name
                     .bytes()
