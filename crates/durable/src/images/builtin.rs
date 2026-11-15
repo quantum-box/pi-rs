@@ -69,10 +69,18 @@ fn prepare(bytes: &[u8], mime: &str, limits: ImageLimits) -> Option<PreparedImag
     {
         return None;
     }
-    let orientation = if matches!(format, ImageFormat::Jpeg | ImageFormat::WebP) {
-        decoder.orientation().unwrap_or(Orientation::NoTransforms)
-    } else {
-        Orientation::NoTransforms
+    let orientation = match format {
+        ImageFormat::WebP => decoder
+            .exif_metadata()
+            .ok()
+            .flatten()
+            .and_then(|exif| {
+                let tiff = exif.strip_prefix(b"Exif\0\0").unwrap_or(&exif);
+                Orientation::from_exif_chunk(tiff)
+            })
+            .unwrap_or(Orientation::NoTransforms),
+        ImageFormat::Jpeg => decoder.orientation().unwrap_or(Orientation::NoTransforms),
+        _ => Orientation::NoTransforms,
     };
     let mut image = DynamicImage::from_decoder(decoder).ok()?;
     if orientation == Orientation::NoTransforms
