@@ -34,6 +34,8 @@ struct Record {
     name: String,
     arguments: Value,
     prepared: Value,
+    #[serde(default)]
+    before_pending: bool,
     policy: ReplayPolicy,
     operation_id: Uuid,
     outcome: Option<Outcome>,
@@ -956,7 +958,7 @@ impl NestedHost {
             Some(v) => v,
             None => return self.fail(format!("nested tool unavailable: {name}")),
         };
-        let (record, _version) = if let Some(entry) = entry {
+        let (mut record, _version) = if let Some(entry) = entry {
             let record: Record = match serde_json::from_slice(&entry.value) {
                 Ok(v) => v,
                 Err(e) => return self.fail(format!("invalid nested record: {e}")),
@@ -973,7 +975,9 @@ impl NestedHost {
             if record.staged_outcome.is_some() {
                 return self.finish_staged(&key, record).await;
             }
-            if record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe {
+            if !record.before_pending
+                && (record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe)
+            {
                 return self.fail("interrupted unsafe nested call requires reconciliation");
             }
             (record, entry.version)
@@ -1007,6 +1011,7 @@ impl NestedHost {
                 name: name.into(),
                 arguments,
                 prepared: prepared.arguments().clone(),
+                before_pending: self.shared.hooks.is_some(),
                 policy: reg.replay,
                 operation_id: invocation.operation_id,
                 outcome: None,
@@ -1044,6 +1049,15 @@ impl NestedHost {
             };
             (record, entry.version)
         };
+        if record.before_pending {
+            record = match self.before_nested(&key, record, reg, &call_id).await {
+                Ok(record) => record,
+                Err(outcome) => return outcome,
+            };
+            if record.staged_outcome.is_some() {
+                return self.finish_staged(&key, record).await;
+            }
+        }
         let invocation = Invocation {
             operation_id: record.operation_id,
             call: ToolCall {
@@ -1195,6 +1209,107 @@ impl NestedHost {
         }
         Ok(())
     }
+    async fn before_nested(
+        &self,
+        key: &[u8],
+        mut record: Record,
+        reg: &RegisteredTool,
+        call_id: &str,
+    ) -> Result<Record, Outcome> {
+        let Some(hooks) = &self.shared.hooks else {
+            return Err(self.fail("nested before-tool hooks unavailable"));
+        };
+        let memo = crate::extension::DurableMemo::new(
+            self.shared.owner.clone(),
+            record.operation_id,
+            hooks.storage_failed.clone(),
+        );
+        let context = crate::extension::Context {
+            snapshot: &hooks.snapshot,
+            memo: &memo,
+        };
+        let call = crate::extension::ToolCall {
+            name: record.name.clone(),
+            arguments: record.prepared.clone(),
+        };
+        let (rewritten, decision, reports) = hooks.selected.before_tool(call, &context).await;
+        if let Err(error) =
+            self.record_hook_reports(hooks, record.operation_id, "before_tool", reports)
+        {
+            return Err(self.fail(error));
+        }
+        if self.shared.cancellation.is_cancelled() {
+            return Err(self.fail("nested before-tool hooks cancelled"));
+        }
+        if matches!(decision, crate::extension::BeforeTool::Sleep(_)) {
+            return Err(self.fail("nested before-tool sleep is unsupported"));
+        }
+        record.prepared = rewritten.arguments;
+        let invocation = Invocation {
+            operation_id: record.operation_id,
+            call: ToolCall {
+                id: call_id.into(),
+                name: record.name.clone(),
+                arguments: record.arguments.to_string(),
+            },
+        };
+        let rejection = match decision {
+            crate::extension::BeforeTool::Block(reason) => {
+                Some(("blocked", format!("Tool call blocked: {reason}")))
+            }
+            crate::extension::BeforeTool::Pass => match crate::tool::restore(
+                reg.tool.as_ref(),
+                &invocation,
+                record.prepared.clone(),
+                |schema, args| jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(args)),
+            ) {
+                Ok(_) => None,
+                Err(outcome) => Some(("invalid_arguments", outcome.tool_content())),
+            },
+            _ => return Err(self.fail("invalid nested before-tool decision")),
+        };
+        record.before_pending = false;
+        if let Some((code, message)) = rejection {
+            record.diagnostics.push(crate::runtime::ToolDiagnostic {
+                severity: crate::runtime::DiagnosticSeverity::Error,
+                code: Some(code.into()),
+                message: message.clone(),
+            });
+            record.staged_outcome = Some(Outcome::Failed(message));
+        }
+        let entry = match self.shared.owner.store().get(key) {
+            Ok(Some(entry)) => entry,
+            _ => return Err(self.fail("nested before-tool intent missing")),
+        };
+        let current: Record = match serde_json::from_slice(&entry.value) {
+            Ok(current) => current,
+            Err(error) => return Err(self.fail(error.to_string())),
+        };
+        if current.operation_id != record.operation_id
+            || !current.before_pending
+            || current.outcome.is_some()
+            || current.staged_outcome.is_some()
+        {
+            return Err(self.fail("nested before-tool intent changed"));
+        }
+        let value = match serde_json::to_vec(&record) {
+            Ok(value) => value,
+            Err(error) => return Err(self.fail(error.to_string())),
+        };
+        if let Err(error) = self.shared.owner.store().commit(
+            &[Check {
+                key: key.to_vec(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key: key.to_vec(),
+                value,
+            }],
+        ) {
+            return Err(self.fail(format!("nested before-tool commit: {error}")));
+        }
+        Ok(record)
+    }
 
     async fn finish_staged(&self, key: &[u8], mut record: Record) -> Outcome {
         let Some(hooks) = &self.shared.hooks else {
@@ -1205,7 +1320,7 @@ impl NestedHost {
         };
         let call = crate::extension::ToolCall {
             name: record.name.clone(),
-            arguments: record.arguments.clone(),
+            arguments: record.prepared.clone(),
         };
         let memo = crate::extension::DurableMemo::new(
             self.shared.owner.clone(),
@@ -1513,6 +1628,7 @@ mod tests {
             name: "job".into(),
             arguments: serde_json::json!({}),
             prepared: serde_json::json!({}),
+            before_pending: false,
             policy: ReplayPolicy::Unsafe,
             operation_id: operation,
             outcome: Some(Outcome::Pending {

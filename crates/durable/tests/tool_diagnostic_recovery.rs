@@ -487,6 +487,269 @@ struct Structured(Arc<AtomicUsize>);
 struct NestedRewrite {
     cancel: Option<CancellationToken>,
 }
+
+struct NestedBeforeChild(Arc<std::sync::Mutex<Vec<Value>>>);
+#[async_trait::async_trait]
+impl KeyedTool for NestedBeforeChild {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "child".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}),
+        }
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        self.0.lock().unwrap().push(args);
+        Outcome::Succeeded("child done".into()).into()
+    }
+}
+struct NestedBeforeParent(Arc<std::sync::Mutex<Vec<pi_rs_durable::nested::KeyedResult>>>);
+#[async_trait::async_trait]
+impl KeyedTool for NestedBeforeParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        for _ in 0..2 {
+            let result = host
+                .call_keyed_with_diagnostics("same", "child", json!({"n":1}))
+                .await;
+            self.0.lock().unwrap().push(result);
+        }
+        Outcome::Succeeded("parent done".into()).into()
+    }
+}
+struct NestedBeforeHook {
+    mode: &'static str,
+    before: Arc<AtomicUsize>,
+    after: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+#[async_trait::async_trait]
+impl Hook for NestedBeforeHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        use pi_rs_durable::extension::BeforeTool;
+        if call.name != "child" {
+            return Ok(BeforeTool::Pass);
+        }
+        self.before.fetch_add(1, Ordering::SeqCst);
+        if self.mode == "error" {
+            return Err("hook failure".into());
+        }
+        Ok(match self.mode {
+            "rewrite" => BeforeTool::Rewrite(json!({"n":9})),
+            "invalid" => BeforeTool::Rewrite(json!({"n":"bad"})),
+            "block" => BeforeTool::Block("policy".into()),
+            "sleep" => BeforeTool::Sleep(pi_rs_durable::extension::Sleep {
+                signals: vec!["wait".into()],
+                until_millis: None,
+            }),
+            _ => BeforeTool::Pass,
+        })
+    }
+    async fn after_tool_result(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        self.after.lock().unwrap().push(call.arguments.clone());
+        if self.mode == "block" || self.mode == "invalid" || self.mode == "error" {
+            assert!(result.is_error);
+            assert_eq!(
+                result.diagnostics[0].code.as_deref(),
+                Some(if self.mode == "block" || self.mode == "error" {
+                    "blocked"
+                } else {
+                    "invalid_arguments"
+                })
+            );
+        }
+        Ok(None)
+    }
+}
+#[tokio::test]
+async fn nested_before_tool_rewrites_or_rejects_once_and_after_tool_observes_decision() {
+    for mode in ["pass", "rewrite", "block", "invalid", "error"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = || Options {
+            model: Arc::new(FakeModel("parent")),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(NestedBeforeParent(observed.clone())))
+                    .register(ReplayPolicy::Safe),
+                Arc::new(KeyedToolAdapter::new(NestedBeforeChild(invoked.clone())))
+                    .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(Extension {
+            name: "nested-before".into(),
+            hooks: vec![Arc::new(NestedBeforeHook {
+                mode,
+                before: before.clone(),
+                after: after.clone(),
+            })],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["nested-before".into()])
+            .unwrap();
+        h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(before.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(after.lock().unwrap().len(), 1, "{mode}");
+        if mode == "error" {
+            assert!(
+                h.extension_reports()
+                    .unwrap()
+                    .iter()
+                    .any(|batch| batch.phase == "before_tool")
+            );
+        }
+        let expected_args = match mode {
+            "rewrite" => json!({"n":9}),
+            "invalid" => json!({"n":"bad"}),
+            _ => json!({"n":1}),
+        };
+        assert_eq!(after.lock().unwrap()[0], expected_args);
+        let results = observed.lock().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results[1]);
+        if mode == "block" || mode == "invalid" || mode == "error" {
+            assert!(invoked.lock().unwrap().is_empty());
+            assert!(matches!(results[0].outcome, Outcome::Failed(_)));
+        } else {
+            assert_eq!(*invoked.lock().unwrap(), vec![expected_args]);
+            assert_eq!(results[0].outcome, Outcome::Succeeded("child done".into()));
+        }
+        drop(results);
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(h.conversation(id).unwrap().submissions.len(), 1);
+    }
+}
+
+struct CancelNestedBefore(CancellationToken);
+#[async_trait::async_trait]
+impl Hook for CancelNestedBefore {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        if call.name == "child" {
+            self.0.cancel();
+            std::future::pending::<()>().await;
+        }
+        Ok(pi_rs_durable::extension::BeforeTool::Pass)
+    }
+}
+#[tokio::test]
+async fn interrupted_nested_before_tool_never_dispatches_unsafe_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(NestedBeforeParent(observed.clone())))
+                .register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(NestedBeforeChild(invoked.clone())))
+                .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(Extension {
+            name: "cancel-before".into(),
+            hooks: vec![Arc::new(CancelNestedBefore(cancel.clone()))],
+            ..Default::default()
+        })
+        .unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["cancel-before".into()])
+            .unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &cancel)
+                .await
+                .is_err()
+        );
+    }
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert!(invoked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn nested_before_tool_sleep_fails_closed_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let invoked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let options = Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(NestedBeforeParent(observed)))
+                .register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(NestedBeforeChild(invoked.clone())))
+                .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    h.install_extension(Extension {
+        name: "sleep".into(),
+        hooks: vec![Arc::new(NestedBeforeHook {
+            mode: "sleep",
+            before: Arc::new(AtomicUsize::new(0)),
+            after: Arc::default(),
+        })],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["sleep".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(h.blocked(id).unwrap().is_some());
+    assert!(invoked.lock().unwrap().is_empty());
+}
 #[async_trait::async_trait]
 impl Hook for NestedRewrite {
     async fn after_tool_result(

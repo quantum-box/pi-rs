@@ -364,7 +364,8 @@ The runtime persists it with the outcome and ends the run without another model
 request only when every result in the nonempty tool round requests termination.
 The last defined handoff in model call order (including empty text) appends a reset after after-tools tasks and before queued boundary items. It starts a new model context while preserving history. Controls are persisted with tool outcomes and survive reopen; nested calls do not control their caller’s round.
 
-Selected extensions may provide tools and before/after-tool hooks. The runtime
+Selected extensions may provide tools and before/after-tool hooks. Nested calls with a resolved, valid tool run before-tool hooks before dispatch; pass, rewrites and blocks are durably recorded, rewritten arguments are revalidated, and rejected calls pass through after-tool hooks. A nested before-tool sleep fails closed because nested gate suspension is not supported. Preparation failures and unavailable nested tools still require reconciliation rather than entering the result-hook path. Interrupted hooks may replay and must make effects idempotent.
+The runtime
 commits terminal tool output and state before invoking after-tool hooks; a crash
 replays the hook with the same operation memo, not the completed tool. Hook
 callbacks can run more than once and must memoize or make external effects
