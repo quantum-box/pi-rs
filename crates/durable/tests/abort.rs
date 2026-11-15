@@ -462,9 +462,21 @@ async fn abort_withdraws_inputs_but_retains_queued_reset() {
     s.submit(id, None, "hold".into()).unwrap();
     wait_permit(&model.started).await;
     let reset = s.reset(id, Some("handoff".into())).unwrap();
+    let write = s
+        .submit_write(id, None, "notice".into(), Some(json!({"value": 1})))
+        .unwrap();
     s.submit(id, None, "withdraw".into()).unwrap();
-    s.abort_and_wait(id).await.unwrap();
+    let result = s.abort_and_wait_withdrawn(id).await.unwrap();
+    assert_eq!(result.withdrawn.len(), 1);
+    assert_eq!(result.withdrawn[0].submission.content, "withdraw");
     let state = s.conversation(id).unwrap();
+    let write = state
+        .application_writes
+        .iter()
+        .find(|entry| entry.id == write)
+        .unwrap();
+    assert!(write.placed);
+    assert!(!write.withdrawn);
     assert_eq!(state.resets.len(), 1);
     assert_eq!(state.resets[0].id, reset);
     assert_eq!(
