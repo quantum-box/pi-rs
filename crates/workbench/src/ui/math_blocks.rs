@@ -4,6 +4,7 @@
 use super::math_tokenizer::{self, MathToken};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MathBlock {
@@ -16,6 +17,7 @@ pub(super) fn top_level(source: &str) -> Vec<MathBlock> {
     if source.len() > 256 * 1024 {
         return Vec::new();
     }
+    let deadline = Instant::now() + Duration::from_millis(20);
     let parser = Parser::new_ext(source, Options::ENABLE_TABLES);
     let mut protected: Vec<Range<usize>> = parser
         .reference_definitions()
@@ -40,20 +42,32 @@ pub(super) fn top_level(source: &str) -> Vec<MathBlock> {
         }
     }
     protected.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in protected {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
     let mut out = Vec::new();
     let mut line = 0;
     let mut blocked = 0;
     while line < source.len() {
-        while blocked < protected.len() && protected[blocked].end <= line {
+        if Instant::now() >= deadline {
+            return Vec::new();
+        }
+        while blocked < merged.len() && merged[blocked].end <= line {
             blocked += 1;
         }
         let limit = source[line..]
             .find('\n')
             .map_or(source.len(), |offset| line + offset + 1);
-        let overlaps = protected[blocked..]
-            .iter()
-            .take_while(|range| range.start < limit)
-            .any(|range| range.end > line);
+        let overlaps = merged
+            .get(blocked)
+            .is_some_and(|range| range.start < limit && range.end > line);
         if !overlaps
             && let Some(MathToken {
                 raw_len,
