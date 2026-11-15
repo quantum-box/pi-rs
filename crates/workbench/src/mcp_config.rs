@@ -212,8 +212,6 @@ fn valid_exposure(value: &Value) -> bool {
 }
 
 fn valid_oauth(value: &Value) -> bool {
-    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
-
     // Serde treats null in an optional member as absent, but Pi validates
     // explicitly supplied OAuth fields and rejects null values.
     if value
@@ -222,6 +220,11 @@ fn valid_oauth(value: &Value) -> bool {
     {
         return false;
     }
+    valid_inherited_oauth(value)
+}
+
+fn valid_inherited_oauth(value: &Value) -> bool {
+    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
     match serde_json::from_value::<OAuthSetting>(value.clone()) {
         Ok(OAuthSetting::Enabled(_)) => true,
         Ok(OAuthSetting::Client(client)) => validate_oauth_client_settings(&client).is_ok(),
@@ -640,6 +643,12 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 if !project_definitions.contains(&name)
                     && matches!(key, "enabled" | "exposure" | "oauth")
                     && value.get(key).is_some_and(Value::is_null)
+                {
+                    continue;
+                }
+                if key == "oauth"
+                    && !project_definitions.contains(&name)
+                    && value.get(key).is_some_and(valid_inherited_oauth)
                 {
                     continue;
                 }
