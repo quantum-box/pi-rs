@@ -350,6 +350,11 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
+### OpenCode Zen classifiers
+
+OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
+using its official System One endpoint and `OPENCODE_API_KEY`.
+
 ### Vercel AI Gateway checkpoint
 
 Vercel AI Gateway exposes the 303 chat models and 14 classifier models from the
