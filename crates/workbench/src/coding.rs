@@ -2159,7 +2159,8 @@ impl Tool for CodingTool {
                 if self.unrestricted
                     && matches!(self.kind, Kind::Read { .. })
                     && (message.starts_with("ENOENT: no such file or directory, access '")
-                        || message.starts_with("ENOTDIR: not a directory, access '")) =>
+                        || message.starts_with("ENOTDIR: not a directory, access '")
+                        || message.starts_with("EACCES: permission denied, access '")) =>
             {
                 Outcome::Failed(message)
             }
@@ -2277,6 +2278,16 @@ fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
+fn is_unix_access_denied(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EACCES)
+}
+
+#[cfg(not(unix))]
+fn is_unix_access_denied(_error: &std::io::Error) -> bool {
+    false
+}
+
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
@@ -2309,6 +2320,14 @@ impl CodingTool {
             {
                 Error::Config(format!(
                     "ENOTDIR: not a directory, access '{}'",
+                    path.display()
+                ))
+            } else if self.unrestricted
+                && is_unix_access_denied(&error)
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "EACCES: permission denied, access '{}'",
                     path.display()
                 ))
             } else if error.kind() == std::io::ErrorKind::NotFound
@@ -2565,6 +2584,27 @@ impl CodingTool {
         }
         let display_path = string(args, "path")?;
         let path = self.path(display_path)?;
+        #[cfg(unix)]
+        if self.unrestricted {
+            use std::os::unix::ffi::OsStrExt;
+            let access_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|error| Error::Config(error.to_string()))?;
+            if unsafe { libc::access(access_path.as_ptr(), libc::R_OK) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EACCES) {
+                    let requested =
+                        crate::coding_paths::read_variant(crate::coding_paths::resolve(
+                            &self.root,
+                            &crate::coding_paths::normalize(display_path)?,
+                        ));
+                    return Err(Error::Config(format!(
+                        "EACCES: permission denied, access '{}'",
+                        requested.display()
+                    )));
+                }
+                return Err(error.into());
+            }
+        }
         if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
             if self.unrestricted
                 && matches!(
@@ -4544,6 +4584,94 @@ mod tests {
             if message == &format!("ENOTDIR: not a directory, access '{}'", root.join("alias/child").display())),
             "{result:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_access_denied_with_requested_symlink_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        assert!(is_unix_access_denied(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!is_unix_access_denied(&std::io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("private");
+        let link = root.join("alias");
+        std::fs::write(&path, "contents").unwrap();
+        symlink("private", &link).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"alias"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Outcome::Failed(message)
+                if message == format!("EACCES: permission denied, access '{}'", link.display())));
+        } else {
+            assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        let path = parent.join("file");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&path, "contents").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Outcome::Failed(message)
+                if message == format!("EACCES: permission denied, access '{}'", path.display())));
+        } else {
+            assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
+        }
     }
 
     #[cfg(unix)]
