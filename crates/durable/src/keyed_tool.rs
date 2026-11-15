@@ -172,6 +172,8 @@ impl KeyedHost {
         self.nested.suspend_pending()
     }
     /// Invoke a keyed child and read its durable diagnostics with the outcome.
+    /// Fails closed when ordered output would be lost; use `call_keyed_with_blocks`
+    /// to consume changed block output.
     pub async fn call_keyed_with_diagnostics(
         &self,
         key: &str,
@@ -180,6 +182,30 @@ impl KeyedHost {
     ) -> crate::nested::KeyedResult {
         self.nested
             .call_keyed_with_diagnostics(key, name, arguments)
+            .await
+    }
+    /// Invoke a keyed child and retain ordered output blocks, if any. When
+    /// `output_blocks` is absent, `outcome` contains the ordinary result.
+    pub async fn call_keyed_with_blocks(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> crate::nested::KeyedResult {
+        self.nested
+            .call_keyed_result(key, name, arguments, true)
+            .await
+    }
+
+    /// Dispatch without polling and retain ordered output blocks, if any.
+    pub async fn call_keyed_unpolled_with_blocks(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> crate::nested::KeyedResult {
+        self.nested
+            .call_keyed_result(key, name, arguments, false)
             .await
     }
     /// Admit distinct keyed calls in order and poll accepted jobs concurrently.

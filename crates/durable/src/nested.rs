@@ -47,6 +47,8 @@ struct Record {
     hooks_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hook_snapshot: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_blocks: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<crate::runtime::ToolDiagnostic>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -66,6 +68,8 @@ struct BeforeGate {
 pub struct KeyedResult {
     pub outcome: Outcome,
     pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    /// Ordered output when a block-aware hook changed the ordinary text result.
+    pub output_blocks: Option<Vec<Value>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -708,7 +712,26 @@ impl NestedHost {
         name: &str,
         arguments: Value,
     ) -> KeyedResult {
-        let outcome = self.call_keyed(key, name, arguments.clone()).await;
+        let mut result = self.call_keyed_result(key, name, arguments, true).await;
+        if result.output_blocks.take().is_some() {
+            result.outcome =
+                self.fail("nested result contains ordered blocks; use a block-aware keyed result");
+        }
+        result
+    }
+    pub(crate) async fn call_keyed_result(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+        poll: bool,
+    ) -> KeyedResult {
+        let outcome = if valid_key(key) {
+            self.call_inner_raw(Some(key), name, arguments.clone(), false, poll)
+                .await
+        } else {
+            self.fail("invalid nested call key")
+        };
         // Keep the invocation open while reading its private checkpoint. A
         // detached caller must not read diagnostics after the host is sealed.
         let lifecycle = match self.shared.lifecycle.lock() {
@@ -719,9 +742,11 @@ impl NestedHost {
                 return KeyedResult {
                     outcome: self.fail("nested host sealed or failed"),
                     diagnostics: Vec::new(),
+                    output_blocks: None,
                 };
             }
         };
+        let mut output_blocks = None;
         let mut diagnostics = if valid_key(key) {
             match self
                 .shared
@@ -733,8 +758,28 @@ impl NestedHost {
                     Ok(record)
                         if record.name == name
                             && record.arguments == arguments
-                            && record.outcome.is_some() =>
+                            && record.outcome.as_ref() == Some(&outcome)
+                            && !matches!(
+                                outcome,
+                                Outcome::Unknown(_) | Outcome::Pending { .. }
+                            ) =>
                     {
+                        if record.output_blocks.as_ref().is_some_and(|blocks| {
+                            crate::content::UserContent::from_yield(
+                                Value::Array(blocks.clone()),
+                                false,
+                            )
+                            .is_none()
+                                || !serde_json::to_vec(blocks)
+                                    .is_ok_and(|bytes| bytes.len() <= 8 * 1024 * 1024)
+                        }) {
+                            return KeyedResult {
+                                outcome: self.fail("invalid persisted nested output blocks"),
+                                diagnostics: Vec::new(),
+                                output_blocks: None,
+                            };
+                        }
+                        output_blocks = record.output_blocks;
                         record.diagnostics
                     }
                     Ok(_) => Vec::new(),
@@ -742,6 +787,7 @@ impl NestedHost {
                         return KeyedResult {
                             outcome: self.fail(format!("nested diagnostic record: {error}")),
                             diagnostics: Vec::new(),
+                            output_blocks: None,
                         };
                     }
                 },
@@ -750,6 +796,7 @@ impl NestedHost {
                     return KeyedResult {
                         outcome: self.fail(format!("nested diagnostic read: {error}")),
                         diagnostics: Vec::new(),
+                        output_blocks: None,
                     };
                 }
             }
@@ -778,6 +825,7 @@ impl NestedHost {
         KeyedResult {
             outcome,
             diagnostics,
+            output_blocks,
         }
     }
     /// Admit up to eight distinct keyed calls in order, then poll their persisted
@@ -849,8 +897,10 @@ impl NestedHost {
                 if record.outcome != Some(outcome) {
                     return self.fail("nested pending record changed");
                 }
-                self.poll_pending(&storage_key, record, entry.version, reg)
-                    .await
+                let outcome = self
+                    .poll_pending(&storage_key, record, entry.version, reg)
+                    .await;
+                self.legacy_outcome(&storage_key, outcome)
             },
         ))
         .await
@@ -986,7 +1036,46 @@ impl NestedHost {
         }
         Ok(())
     }
+    fn legacy_outcome(&self, key: &[u8], outcome: Outcome) -> Outcome {
+        if matches!(outcome, Outcome::Unknown(_) | Outcome::Pending { .. }) {
+            return outcome;
+        }
+        match self.shared.owner.store().get(key) {
+            Ok(Some(entry)) => match serde_json::from_slice::<Record>(&entry.value) {
+                Ok(record) if record.output_blocks.is_some() => self
+                    .fail("nested result contains ordered blocks; use a block-aware keyed result"),
+                Ok(_) => outcome,
+                Err(error) => self.fail(error.to_string()),
+            },
+            Ok(None) => outcome,
+            Err(error) => self.fail(error.to_string()),
+        }
+    }
+
     async fn call_inner(
+        &self,
+        explicit: Option<&str>,
+        name: &str,
+        arguments: Value,
+        serial_held: bool,
+        poll: bool,
+    ) -> Outcome {
+        let key = if let Some(member) = explicit {
+            self.explicit_key(self.parent, member)
+        } else {
+            let index = match self.shared.lifecycle.lock() {
+                Ok(lifecycle) => *lifecycle.counts.get(&self.parent).unwrap_or(&0),
+                Err(_) => return self.fail("nested lifecycle lock poisoned"),
+            };
+            self.key(self.parent, index)
+        };
+        let outcome = self
+            .call_inner_raw(explicit, name, arguments, serial_held, poll)
+            .await;
+        self.legacy_outcome(&key, outcome)
+    }
+
+    async fn call_inner_raw(
         &self,
         explicit: Option<&str>,
         name: &str,
@@ -1101,6 +1190,7 @@ impl NestedHost {
                     .hooks
                     .as_ref()
                     .map(|hooks| hooks.snapshot.clone()),
+                output_blocks: None,
                 diagnostics: Vec::new(),
                 diagnostic_keys: Default::default(),
                 resolution: None,
@@ -1549,21 +1639,88 @@ impl NestedHost {
         let outcome = if !rewritten && !rich_rewritten {
             original
         } else if result.is_error {
-            Outcome::Failed(result.output)
-        } else if let Some(data) = result.structured_output {
+            Outcome::Failed(result.output.clone())
+        } else if let Some(data) = result.structured_output.clone() {
             Outcome::Structured {
                 data,
-                attachments: result.attachments,
+                attachments: result.attachments.clone(),
             }
-        } else if let Some(details) = result.details {
+        } else if let Some(details) = result.details.clone() {
             Outcome::SucceededWithDetails {
-                output: result.output,
+                output: result.output.clone(),
                 details,
             }
         } else {
-            Outcome::Succeeded(result.output)
+            Outcome::Succeeded(result.output.clone())
         };
         let outcome = validate_nested_output(&self.shared.output_schemas, &record.name, outcome);
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "isError".into(),
+            serde_json::json!(matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_))),
+        );
+        if let Outcome::SucceededWithDetails { details, .. } = &outcome {
+            extra.insert("details".into(), details.clone());
+        }
+        if let Outcome::Structured { data, .. } = &outcome {
+            extra.insert("structuredOutput".into(), data.clone());
+        }
+        let attachments = match &outcome {
+            Outcome::Structured { attachments, .. } => attachments.clone(),
+            _ => Vec::new(),
+        };
+        extra.insert(
+            "attachments".into(),
+            match serde_json::to_value(attachments) {
+                Ok(value) => value,
+                Err(error) => return self.fail(error.to_string()),
+            },
+        );
+        let block_result = crate::extension::ToolBlockResult {
+            output: vec![serde_json::json!({"type":"text", "text": result.output})],
+            diagnostics: result.diagnostics.clone(),
+            extra,
+        };
+        let original_blocks = block_result.clone();
+        let (blocks, reports) = match hooks
+            .selected
+            .runtime_after_tool_blocks(&call, block_result, true, &context)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return self.fail(error),
+        };
+        if let Err(error) = self.record_hook_reports(
+            hooks,
+            record.operation_id,
+            "after_tool_blocks",
+            reports.clone(),
+        ) {
+            return self.fail(error);
+        }
+        if !reports.is_empty() || self.shared.cancellation.is_cancelled() {
+            return self.fail("nested block result hook failed or was cancelled");
+        }
+        let bounded = blocks.diagnostics.len() <= 32
+            && blocks.diagnostics.iter().all(|diagnostic| {
+                diagnostic.message.len() <= 4096
+                    && diagnostic
+                        .code
+                        .as_ref()
+                        .is_none_or(|code| code.len() <= 256)
+            })
+            && serde_json::to_vec(&blocks.diagnostics).is_ok_and(|bytes| bytes.len() <= 65_536)
+            && serde_json::to_vec(&blocks.output).is_ok_and(|bytes| bytes.len() <= 8 * 1024 * 1024)
+            && serde_json::to_vec(&(
+                &result.details,
+                &result.structured_output,
+                &result.attachments,
+                &blocks.diagnostics,
+            ))
+            .is_ok_and(|bytes| bytes.len() <= 65_536);
+        if blocks != original_blocks && !bounded {
+            return self.fail("nested block result exceeds limits");
+        }
         let entry = match self.shared.owner.store().get(key) {
             Ok(Some(entry)) => entry,
             _ => return self.fail("nested staged result missing"),
@@ -1581,7 +1738,8 @@ impl NestedHost {
         record = current;
         record.staged_outcome = None;
         record.outcome = Some(outcome.clone());
-        record.diagnostics = result.diagnostics;
+        record.output_blocks = (blocks.output != original_blocks.output).then_some(blocks.output);
+        record.diagnostics = blocks.diagnostics;
         record.diagnostic_keys.clear();
         let value = match serde_json::to_vec(&record) {
             Ok(value) => value,
@@ -1803,6 +1961,7 @@ mod tests {
             staged_outcome: None,
             hooks_required: false,
             hook_snapshot: None,
+            output_blocks: None,
             diagnostics: Vec::new(),
             diagnostic_keys: Default::default(),
             resolution: None,

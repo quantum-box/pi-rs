@@ -11218,7 +11218,12 @@ impl Harness {
                     };
                     let original_block_result = block_result.clone();
                     let (block_result, reports) = fenced_poll(
-                        selected.runtime_after_tool_blocks(&hook_call, block_result, &context),
+                        selected.runtime_after_tool_blocks(
+                            &hook_call,
+                            block_result,
+                            false,
+                            &context,
+                        ),
                         self.execution_gate.as_ref(),
                         cancel,
                     )

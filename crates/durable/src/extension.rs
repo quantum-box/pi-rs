@@ -780,6 +780,7 @@ impl Resolved {
         &self,
         call: &ToolCall,
         mut result: ToolBlockResult,
+        nested: bool,
         ctx: &Context<'_>,
     ) -> Result<(ToolBlockResult, Vec<Report>), String> {
         if !result.valid() {
@@ -790,7 +791,7 @@ impl Resolved {
             for hook in &extension.hooks {
                 match protect(async {
                     if hook.supports_runtime_tool_blocks() {
-                        hook.after_tool_blocks(call, &result, false, ctx).await
+                        hook.after_tool_blocks(call, &result, nested, ctx).await
                     } else {
                         Ok(None)
                     }

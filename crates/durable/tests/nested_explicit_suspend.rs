@@ -1329,3 +1329,571 @@ async fn selected_extension_override_fences_parent_replay() {
     assert_eq!(override_calls.load(Ordering::SeqCst), 0);
     scheduler.shutdown().await.unwrap();
 }
+
+struct NestedBlocks(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for NestedBlocks {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool_blocks(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolBlockResult,
+        nested: bool,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        assert!(nested);
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("block-hooks"))
+                .unwrap(),
+            "hook"
+        )
+        .unwrap();
+        if self.0.join("pause-block-hook").exists() && !self.0.join("release-block-hook").exists() {
+            std::fs::write(self.0.join("block-hook-ready"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        let mut result = result.clone();
+        result.output = vec![
+            json!({"type":"text","text":"before"}),
+            json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+            json!({"type":"text","text":"after"}),
+        ];
+        Ok(Some(result))
+    }
+}
+struct BlockParent(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for BlockParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let result = host
+            .call_keyed_unpolled_with_blocks("child-key", "child", json!({}))
+            .await;
+        if matches!(result.outcome, Outcome::Pending { .. }) {
+            host.suspend_pending().unwrap();
+            return Outcome::Succeeded("discarded".into()).into();
+        }
+        assert_eq!(
+            result.output_blocks,
+            Some(vec![
+                json!({"type":"text","text":"before"}),
+                json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                json!({"type":"text","text":"after"})
+            ])
+        );
+        if !self.0.join("release-block-parent").exists() {
+            std::fs::write(self.0.join("block-parent-ready"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        Outcome::Succeeded("received ordered image".into()).into()
+    }
+}
+fn block_parent_options(root: &std::path::Path) -> Options {
+    let parent = Arc::new(KeyedToolAdapter::new(BlockParent(root.into())));
+    file_options(parent, root)
+}
+#[tokio::test]
+async fn nested_block_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_BLOCK_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let registry = hook_registry(Arc::new(NestedBlocks(root.clone())));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), block_parent_options(&root), registry)
+            .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn nested_image_blocks_survive_kill_and_reach_parent_in_order() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_block_kill_worker"])
+            .env("PI_NESTED_BLOCK_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("block-parent-ready").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("release-block-parent"), b"ready").unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        block_parent_options(root),
+        hook_registry(Arc::new(NestedBlocks(root.into()))),
+    )
+    .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("block-hooks"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "received ordered image"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn legacy_nested_caller_cannot_silently_drop_image_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(Arc::new(AtomicUsize::new(0)))));
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        file_options(parent, root),
+        hook_registry(Arc::new(NestedBlocks(root.into()))),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_some());
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct ImageChild;
+#[async_trait]
+impl Tool for ImageChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        Outcome::Structured {
+            data: json!({"blocks":[{"type":"text","text":"before"},{"type":"image","data":"aGk=","mimeType":"image/png"},{"type":"text","text":"after"}]}),
+            attachments: vec![],
+        }
+    }
+}
+struct StructuredBlocks;
+#[async_trait]
+impl pi_rs_durable::extension::Hook for StructuredBlocks {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool_blocks(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolBlockResult,
+        nested: bool,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        assert!(nested);
+        let mut result = result.clone();
+        result.output = result.extra["structuredOutput"]["blocks"]
+            .as_array()
+            .unwrap()
+            .clone();
+        Ok(Some(result))
+    }
+}
+#[tokio::test]
+async fn nested_structured_image_is_exposed_as_ordered_blocks_to_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("release-block-parent"), b"ready").unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(BlockParent(root.into())));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(ImageChild),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        options,
+        hook_registry(Arc::new(StructuredBlocks)),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "received ordered image"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn killed_nested_block_hook_replays_without_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("pause-block-hook"), b"ready").unwrap();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_block_kill_worker"])
+            .env("PI_NESTED_BLOCK_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("block-hook-ready").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("release-block-hook"), b"ready").unwrap();
+    std::fs::write(root.join("release-block-parent"), b"ready").unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        block_parent_options(root),
+        hook_registry(Arc::new(NestedBlocks(root.into()))),
+    )
+    .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("block-hooks"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "received ordered image"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_during_nested_block_hook_does_not_publish_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    std::fs::write(root.join("pause-block-hook"), b"ready").unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        block_parent_options(root),
+        hook_registry(Arc::new(NestedBlocks(root.into()))),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| root.join("block-hook-ready").exists()).await;
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(!root.join("block-parent-ready").exists());
+    assert!(scheduler.conversation(id).unwrap().abort_requested);
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct InvalidBlocks;
+#[async_trait]
+impl pi_rs_durable::extension::Hook for InvalidBlocks {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool_blocks(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolBlockResult,
+        _: bool,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        let mut result = result.clone();
+        result.output = vec![json!({"type":"image"})];
+        Ok(Some(result))
+    }
+}
+struct IgnoreBadBlocks;
+#[async_trait]
+impl KeyedTool for IgnoreBadBlocks {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let _ = host
+            .call_keyed_with_blocks("child-key", "child", json!({}))
+            .await;
+        Outcome::Succeeded("ignored".into()).into()
+    }
+}
+#[tokio::test]
+async fn invalid_nested_block_hook_cannot_be_hidden_by_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(IgnoreBadBlocks));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(ImageChild),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open_with_extensions(
+        dir.path().join("db"),
+        options,
+        hook_registry(Arc::new(InvalidBlocks)),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_some());
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "ignored"))
+    );
+    assert!(!scheduler.extension_reports().unwrap().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
+
+struct CompleteBlockChain(Arc<std::sync::Mutex<Vec<&'static str>>>);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for CompleteBlockChain {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name == "child" {
+            self.0.lock().unwrap().push("legacy");
+        }
+        Ok(None)
+    }
+    async fn after_tool_result(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::ToolResult,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if call.name == "child" {
+            self.0.lock().unwrap().push("rich");
+        }
+        Ok(None)
+    }
+    async fn after_tool_blocks(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolBlockResult,
+        nested: bool,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        assert!(nested);
+        self.0.lock().unwrap().push("blocks");
+        let mut result = result.clone();
+        result.output = result.extra["structuredOutput"]["blocks"]
+            .as_array()
+            .unwrap()
+            .clone();
+        Ok(Some(result))
+    }
+}
+#[tokio::test]
+async fn nested_result_hook_chain_runs_once_in_order_before_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("release-block-parent"), b"ready").unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(BlockParent(root.into())));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(ImageChild),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        options,
+        hook_registry(Arc::new(CompleteBlockChain(order.clone()))),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(*order.lock().unwrap(), vec!["legacy", "rich", "blocks"]);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "received ordered image"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
