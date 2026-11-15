@@ -21,5 +21,9 @@ spec:
         nodeVersion: "22"
       watchPaths:
         - examples/browser-preview/**
+        - crates/browser-sdk/**
+        - crates/browser-fetch/**
+        - crates/core/**
+        - crates/tool-arguments/**
         - tachyon.yml
       envVars: []
