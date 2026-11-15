@@ -107,7 +107,8 @@ without `defaultProvider` are still accepted.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
-Invalid file URLs do not match a resource; upstream instead reports a URL error.
+Invalid file URLs in package settings filters report a URL error when evaluated.
+Invalid URLs in other resource filter paths still behave as non-matches.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;

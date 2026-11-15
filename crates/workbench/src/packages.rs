@@ -235,8 +235,10 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
             for path in paths {
                 let base_enabled = inherited
                     .as_ref()
-                    .is_some_and(|filter| filter.includes(path, &package.root, false));
-                if filter.includes(path, &package.root, base_enabled) && !target.contains(path) {
+                    .map(|filter| filter.includes(path, &package.root, false))
+                    .transpose()?
+                    .unwrap_or(false);
+                if filter.includes(path, &package.root, base_enabled)? && !target.contains(path) {
                     target.push(path.clone());
                 }
             }
@@ -333,8 +335,11 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
         for path in package.resources.themes {
             let inherited_enabled = inherited
                 .as_ref()
-                .is_some_and(|filter| filter.includes(&path, &package.root, false));
-            if filter.includes(&path, &package.root, inherited_enabled) && !themes.contains(&path) {
+                .map(|filter| filter.includes(&path, &package.root, false))
+                .transpose()?
+                .unwrap_or(false);
+            if filter.includes(&path, &package.root, inherited_enabled)? && !themes.contains(&path)
+            {
                 themes.push(path);
             }
         }
@@ -595,17 +600,27 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
-    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> bool {
-        if self.autoload {
-            return self
-                .patterns
-                .as_ref()
-                .is_none_or(|patterns| selected(path, root, patterns));
-        }
-        self.patterns
-            .iter()
-            .flatten()
-            .fold(inherited, |enabled, pattern| {
+    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
+        let Some(patterns) = &self.patterns else {
+            return Ok(self.autoload || inherited);
+        };
+        let matches = |pattern: &str, exact: bool| -> Result<bool> {
+            let normalized = if exact {
+                pattern
+                    .strip_prefix("./")
+                    .or_else(|| pattern.strip_prefix(".\\"))
+                    .unwrap_or(pattern)
+            } else {
+                pattern
+            };
+            if normalized.starts_with("file://") {
+                pi_rs_file_url::to_file_path(normalized).map_err(Error::Config)?;
+            }
+            Ok(resource_matches(path, root, pattern, exact, false))
+        };
+        if !self.autoload {
+            let mut enabled = inherited;
+            for pattern in patterns {
                 let prefix = pattern.chars().next();
                 let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
                 let target = if override_pattern {
@@ -613,12 +628,43 @@ impl ResourceFilter {
                 } else {
                     pattern.as_str()
                 };
-                if resource_matches(path, root, target, matches!(prefix, Some('+' | '-')), false) {
-                    !matches!(prefix, Some('-' | '!'))
-                } else {
-                    enabled
+                if matches(target, matches!(prefix, Some('+' | '-')))? {
+                    enabled = !matches!(prefix, Some('-' | '!'));
                 }
-            })
+            }
+            return Ok(enabled);
+        }
+        if patterns.is_empty() {
+            return Ok(false);
+        }
+        let any = |prefix: Option<char>, exact: bool| -> Result<bool> {
+            for pattern in patterns {
+                let target = match prefix {
+                    Some(prefix) => match pattern.strip_prefix(prefix) {
+                        Some(target) => target,
+                        None => continue,
+                    },
+                    None if !pattern.starts_with(['!', '+', '-']) => pattern.as_str(),
+                    None => continue,
+                };
+                if matches(target, exact)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let has_plain = patterns.iter().any(|p| !p.starts_with(['!', '+', '-']));
+        let mut enabled = !has_plain || any(None, false)?;
+        if enabled && any(Some('!'), false)? {
+            enabled = false;
+        }
+        if !enabled && any(Some('+'), true)? {
+            enabled = true;
+        }
+        if enabled && any(Some('-'), true)? {
+            enabled = false;
+        }
+        Ok(enabled)
     }
 }
 
@@ -2325,13 +2371,13 @@ mod tests {
         assert!(!selected(&path, &root, &[format!("-{url}")]));
         let filter =
             ResourceFilter::new(&json!({"prompts": [format!("-{url}")]}), "prompts").unwrap();
-        assert!(!filter.includes(&path, &root, true));
+        assert!(!filter.includes(&path, &root, true).unwrap());
         let filter = ResourceFilter::new(
             &json!({"autoload": false, "prompts": [format!("+{url}")]}),
             "prompts",
         )
         .unwrap();
-        assert!(filter.includes(&path, &root, false));
+        assert!(filter.includes(&path, &root, false).unwrap());
 
         if let Some(home) = filter_home_dir() {
             let path = home.join("pi-filter-test").join("prompt.md");
@@ -2412,7 +2458,7 @@ mod tests {
                     "prompts",
                 )
                 .unwrap();
-                assert!(filter.includes(path, &root, false));
+                assert!(filter.includes(path, &root, false).unwrap());
             }
             // Upstream removes exactly one prefix, not an arbitrary number.
             assert!(selected(path, &root, &[format!("-././{pattern}")]));
@@ -2492,6 +2538,40 @@ mod tests {
         assert!(!resource_matches(&path, &root, &invalid, true, false));
         assert!(!resource_matches(&path, &root, &invalid, false, false));
         assert!(selected(&path, &root, &[format!("-{invalid}")]));
+    }
+
+    #[test]
+    fn package_filter_reports_invalid_file_urls_when_evaluated() {
+        let root = std::env::temp_dir();
+        let path = root.join("prompts/review.md");
+        let invalid = format!(
+            "{}prompts%2Freview.md",
+            reqwest::Url::from_directory_path(&root).unwrap()
+        );
+        for prefix in ["", "!", "+", "-", "+./", "-./"] {
+            let filters = if prefix.starts_with('+') {
+                vec!["no-match".to_owned(), format!("{prefix}{invalid}")]
+            } else {
+                vec![format!("{prefix}{invalid}")]
+            };
+            let filter = ResourceFilter::new(&json!({"prompts": filters}), "prompts").unwrap();
+            assert!(
+                filter
+                    .includes(&path, &root, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("encoded"),
+                "{prefix}"
+            );
+        }
+        let filter = ResourceFilter::new(
+            &json!({"autoload": false, "prompts": [format!("-{invalid}")]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(filter.includes(&path, &root, true).is_err());
+        let filter = ResourceFilter::new(&json!({"prompts": ["**", invalid]}), "prompts").unwrap();
+        assert!(filter.includes(&path, &root, false).unwrap());
     }
 
     #[cfg(windows)]
@@ -3648,20 +3728,24 @@ mod tests {
         let root = Path::new("/package");
         let path = root.join("prompts/keep.md");
         let empty = ResourceFilter::new(&json!({"autoload":false}), "prompts").unwrap();
-        assert!(!empty.includes(&path, root, false));
-        assert!(empty.includes(&path, root, true));
+        assert!(!empty.includes(&path, root, false).unwrap());
+        assert!(empty.includes(&path, root, true).unwrap());
         let filter = ResourceFilter::new(&json!({"autoload":false,"prompts":["prompts/*.md","-prompts/keep.md","+prompts/keep.md"]}), "prompts").unwrap();
-        assert!(filter.includes(&path, root, false));
-        assert!(!filter.includes(&root.join("other.md"), root, false));
+        assert!(filter.includes(&path, root, false).unwrap());
+        assert!(
+            !filter
+                .includes(&root.join("other.md"), root, false)
+                .unwrap()
+        );
         let filter = ResourceFilter::new(
             &json!({"autoload":false,"prompts":["!prompts/*.md"]}),
             "prompts",
         )
         .unwrap();
-        assert!(!filter.includes(&path, root, true));
-        assert!(filter.includes(&root.join("other.md"), root, true));
+        assert!(!filter.includes(&path, root, true).unwrap());
+        assert!(filter.includes(&root.join("other.md"), root, true).unwrap());
         let normal = ResourceFilter::new(&json!({"prompts":[]}), "prompts").unwrap();
-        assert!(!normal.includes(&path, root, true));
+        assert!(!normal.includes(&path, root, true).unwrap());
     }
 
     #[test]
