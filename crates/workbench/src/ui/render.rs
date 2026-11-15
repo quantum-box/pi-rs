@@ -470,9 +470,25 @@ impl Entry {
                 if !show_thinking {
                     return vec![];
                 }
-                let mut span = Span::themed(text, theme, "thinkingText");
-                span.italic = true;
-                let mut lines = wrap(&[span], inner);
+                // Pi renders thinking as Markdown, but deliberately excludes it
+                // from the Mermaid transformer. Only default text inherits the
+                // thinking style; explicit Markdown roles keep their colors.
+                let mut lines = markdown_at_depth(
+                    text,
+                    theme,
+                    inner,
+                    0,
+                    super::mermaid::Mermaid::Off,
+                    *HYPERLINKS,
+                    false,
+                );
+                for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+                    if span.base_text {
+                        span.color = theme.color("thinkingText");
+                        span.dim = theme.is_dim("thinkingText");
+                        span.italic = true;
+                    }
+                }
                 lines.push(Line::default());
                 lines
             }
@@ -2886,6 +2902,39 @@ mod tests {
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
+    }
+
+    #[test]
+    fn thinking_renders_markdown_with_thinking_style_and_no_mermaid_transform() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
+        json["colors"]["mdCode"] = json["colors"]["text"].clone();
+        json["colors"]["thinkingText"] = serde_json::json!("#ff0000");
+        let theme = Theme::parse(&json.to_string(), None).unwrap();
+        let entry = Entry::Thinking(
+            "plain **bold** `code`\n\n```mermaid\nflowchart LR\nA --> B\n```".into(),
+        );
+        let options = TranscriptOptions {
+            mermaid: super::super::mermaid::Mermaid::Final,
+            ..Default::default()
+        };
+        assert!(entry.render(&theme, 80, false, false, options).is_empty());
+        let lines = entry.render(&theme, 80, false, true, options);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(spans.iter().any(|s| s.text.contains("plain")
+            && s.italic
+            && s.color == theme.color("thinkingText")));
+        assert!(spans.iter().any(|s| s.text == "bold"
+            && s.bold
+            && s.italic
+            && s.color == theme.color("thinkingText")));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "code" && s.color == theme.color("mdCode"))
+        );
+        assert!(spans.iter().any(|s| s.text.contains("```mermaid")));
+        assert!(spans.iter().any(|s| s.text.contains("A --> B")));
     }
 
     #[test]

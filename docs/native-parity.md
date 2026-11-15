@@ -18,6 +18,10 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Visible thinking blocks render Markdown with the thinking text style and
+preserve the Markdown theme's explicit colors. As in Pi, Mermaid fences in
+thinking remain code rather than being transformed into diagrams.
+
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
 and is used only for endpoints declared by that profile; keys with an explicit
