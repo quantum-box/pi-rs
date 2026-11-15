@@ -816,7 +816,8 @@ fn detect_hyperlinks(get: impl Fn(&str) -> Option<String>, tmux: impl Fn() -> bo
         _ => {}
     }
     let term = get("TERM").unwrap_or_default().to_lowercase();
-    if get("TMUX").is_some() || term.starts_with("tmux") {
+    let present = |key| get(key).is_some_and(|value| !value.is_empty());
+    if present("TMUX") || term.starts_with("tmux") {
         return tmux();
     }
     if term.starts_with("screen") {
@@ -852,7 +853,7 @@ fn detect_hyperlinks(get: impl Fn(&str) -> Option<String>, tmux: impl Fn() -> bo
             "WT_SESSION",
         ]
         .iter()
-        .any(|name| get(name).is_some())
+        .any(|name| present(name))
 }
 
 fn tmux_hyperlinks() -> bool {
@@ -4090,6 +4091,21 @@ mod tests {
             true
         ));
         assert!(!detect(&[], false));
+        for key in [
+            "KITTY_WINDOW_ID",
+            "GHOSTTY_RESOURCES_DIR",
+            "WEZTERM_PANE",
+            "WARP_SESSION_ID",
+            "WARP_TERMINAL_SESSION_UUID",
+            "ITERM_SESSION_ID",
+            "WT_SESSION",
+        ] {
+            assert!(!detect(&[(key, "")], false), "{key}");
+        }
+        assert!(detect(
+            &[("TMUX", ""), ("TERM_PROGRAM", "iTerm.app")],
+            false
+        ));
     }
     #[test]
     fn wraps_styles_without_splitting_graphemes_or_allowing_escapes() {
