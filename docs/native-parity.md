@@ -154,6 +154,11 @@ are retained as compaction `details` on metadata-capable stores and carried
 forward from earlier model-generated compactions. Extension-provided summaries
 and their details are preserved as supplied. Imported nested-call metadata not
 represented as native operations is not yet included.
+If appending the complete file listing would exceed the native 64 KiB summary
+limit, native omits the listing from the summary but retains it in `details`
+on metadata-capable stores. A legacy hook that edits a generated summary retains
+the native file history across journal reopen; Pi exports still expose it as a
+hook-originated compaction.
 For the Cerebras Chat Completions provider, a fully received, empty HTTP 400
 response is treated as context overflow, matching Pi's bodyless-error rule.
 Other providers and nonempty 400 bodies retain their normal classification;

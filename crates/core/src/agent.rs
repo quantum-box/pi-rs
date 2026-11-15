@@ -4393,14 +4393,9 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<bool> {
-        let file_details = if extension_result.is_none() {
+        let file_operations = if extension_result.is_none() {
             minimum_retention.map(|retention| {
-                let files =
-                    crate::compaction_files::FileOperations::collect(session, retention.boundary);
-                if !compaction.summary.trim().is_empty() {
-                    compaction.summary.push_str(&files.suffix());
-                }
-                files.details()
+                crate::compaction_files::FileOperations::collect(session, retention.boundary)
             })
         } else {
             None
@@ -4430,6 +4425,15 @@ impl Agent<'_> {
                     id: extension.id().into(),
                     message: reason,
                 });
+            }
+        }
+        let from_extension = extension_result.is_some() || original_summary != compaction.summary;
+        if !compaction.summary.trim().is_empty()
+            && let Some(files) = &file_operations
+        {
+            let suffix = files.suffix();
+            if compaction.summary.len().saturating_add(suffix.len()) <= 64 * 1024 {
+                compaction.summary.push_str(&suffix);
             }
         }
         if compaction.summary.trim().is_empty() || compaction.summary.len() > 64 * 1024 {
@@ -4492,9 +4496,9 @@ impl Agent<'_> {
             || session.context_usage_estimate().tokens,
             |result| result.tokens_before,
         );
-        let from_extension = extension_result.is_some() || original_summary != compaction.summary;
         let persist_metadata = (from_extension && extension_result.is_some())
-            || (session.supports_record_metadata() && (from_extension || file_details.is_some()));
+            || (session.supports_record_metadata()
+                && (from_extension || file_operations.is_some()));
         commit_compaction_record(
             session,
             Event::Compacted {
@@ -4511,9 +4515,12 @@ impl Agent<'_> {
                 if from_extension {
                     metadata["fromExtension"] = true.into();
                 }
+                if from_extension && file_operations.is_some() {
+                    metadata["nativeGeneratedFileDetails"] = true.into();
+                }
                 if let Some(details) = extension_result
                     .and_then(|result| result.details.clone())
-                    .or_else(|| (!from_extension).then_some(file_details).flatten())
+                    .or_else(|| file_operations.as_ref().map(|files| files.details()))
                 {
                     metadata["details"] = details;
                 }
@@ -7017,7 +7024,12 @@ mod tree_tests {
             hook_session.record_metadata(hook_record.id).unwrap()["details"],
             serde_json::json!({"origin":"hook"})
         );
-        let registry = Registry::default();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(LegacyCompaction(Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            )))))
+            .unwrap();
         let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
         let agent = Agent {
             model: &model,
@@ -7037,7 +7049,11 @@ mod tree_tests {
             .unwrap();
         let id = record.id;
         assert!(
-            matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer\n\n<read-files>\nread.txt\n</read-files>\n\n<modified-files>\nwritten.txt\n</modified-files>")
+            matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer [legacy]\n\n<read-files>\nread.txt\n</read-files>\n\n<modified-files>\nwritten.txt\n</modified-files>")
+        );
+        assert_eq!(
+            session.record_metadata(id).unwrap()["nativeGeneratedFileDetails"],
+            true
         );
         assert_eq!(
             session.record_metadata(id).unwrap()["details"],
@@ -7091,6 +7107,70 @@ mod tree_tests {
         assert_eq!(
             reopened.record_metadata(second.id).unwrap()["details"],
             serde_json::json!({"readFiles":[], "modifiedFiles":["read.txt", "written.txt"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_file_suffix_does_not_fail_generated_compaction() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let path = "x".repeat(70 * 1024);
+        let read = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path":path}).to_string(),
+            },
+        };
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![read.clone()],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: read.operation_id,
+                outcome: Outcome::Succeeded("ok".into()),
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let record = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert!(matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer"));
+        assert_eq!(
+            session.record_metadata(record.id).unwrap()["details"]["readFiles"][0],
+            path
         );
     }
 

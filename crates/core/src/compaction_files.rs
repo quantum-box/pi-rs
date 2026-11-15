@@ -34,7 +34,7 @@ impl FileOperations {
             .rev()
             .find(|record| matches!(record.event, Event::Compacted { .. }))
             && let Some(metadata) = session.record_metadata(previous.id)
-            && metadata["fromExtension"] != true
+            && (metadata["fromExtension"] != true || metadata["nativeGeneratedFileDetails"] == true)
         {
             for (key, target) in [
                 ("readFiles", &mut files.read),
