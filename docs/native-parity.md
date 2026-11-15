@@ -3684,7 +3684,11 @@ session-owned counterparts.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message
-renderers are unsupported.
+renderers are unsupported. The default terminal rendering uses Pi's `[type]`
+label, custom-message theme and Markdown, joining text blocks with newlines;
+both immediate and delivered queued messages appear live and on session reopen.
+Hidden messages and their details remain undisplayed. Native additionally keeps
+its existing inline-image display for image blocks when graphics are enabled.
 
 ### Rust extension lifecycle observation
 
