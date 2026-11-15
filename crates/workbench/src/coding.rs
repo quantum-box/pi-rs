@@ -4621,7 +4621,8 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         let path = root.join("readonly.txt");
         std::fs::write(&path, "before").unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         std::fs::set_permissions(&path, permissions).unwrap();
         let tool = CodingTool {
@@ -4639,9 +4640,7 @@ mod tests {
                 },
             )
             .await;
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::set_permissions(&path, original_permissions).unwrap();
         assert!(
             matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EPERM.")
         );
