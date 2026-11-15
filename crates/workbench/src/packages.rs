@@ -700,7 +700,23 @@ pub(crate) fn resource_matches(
     let path = dunce::simplified(path);
     let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
-    let pattern = pattern.replace('\\', "/");
+    // Pi normalizes home-relative paths and file URLs before matching both
+    // ordinary patterns and exact +/- overrides.
+    let expanded = if pattern == "~" || pattern.starts_with("~/") {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|home| PathBuf::from(home).join(pattern.strip_prefix("~/").unwrap_or("")))
+    } else if pattern.starts_with("file://") {
+        reqwest::Url::parse(pattern)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+    } else {
+        None
+    };
+    let pattern = expanded
+        .as_deref()
+        .map(normalize)
+        .unwrap_or_else(|| pattern.replace('\\', "/"));
     let pattern = pattern.trim_start_matches("./").to_owned();
     let mut candidates = vec![
         normalize(path),
@@ -2202,6 +2218,39 @@ mod tests {
     async fn cancelling_package_command_after_parent_exit_terminates_pipe_holder() {
         check_package_process_tree(true).await;
     }
+    #[test]
+    fn resource_filters_expand_home_and_file_urls() {
+        let root = std::env::temp_dir().join("pi filter root");
+        let path = root.join("prompts").join("sample prompt.md");
+        let url = reqwest::Url::from_file_path(&path).unwrap().to_string();
+        assert!(resource_matches(&path, &root, &url, true, false));
+        assert!(!selected(&path, &root, &[format!("-{url}")]));
+
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            let home = PathBuf::from(home);
+            let path = home.join("pi-filter-test").join("prompt.md");
+            assert!(resource_matches(
+                &path,
+                &root,
+                "~/pi-filter-test/prompt.md",
+                true,
+                false
+            ));
+            assert!(resource_matches(
+                &path,
+                &root,
+                "~/pi-filter-test/*.md",
+                false,
+                false
+            ));
+            assert!(!selected(
+                &path,
+                &root,
+                &["-~/pi-filter-test/prompt.md".into()]
+            ));
+        }
+    }
+
     #[test]
     fn extension_manifest_applies_includes_and_exclusions_together() {
         let root = Path::new("/package");

@@ -105,6 +105,9 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Package resource filters expand home-relative paths and local `file://` URLs
+before matching, including exact `+` and `-` overrides, as in upstream Pi.
+
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
 custom IDs are preserved across native export and reopen and used for
