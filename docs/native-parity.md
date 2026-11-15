@@ -1082,6 +1082,11 @@ This is a native embedding control rather than an upstream Pi API.
 
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
+The Tauri mock fixture also accepts a host-built session, including a persistent
+journal and host-supplied system prompt. Its close operation survives cancellation
+of the requesting IPC call, shares its result with later callers, and releases its
+session after completed shutdown. It does not provide resource discovery or live
+session replacement.
 
 Owned SDK sessions expose configured extension command names, collision-resolved
 invocations, descriptions, and source provenance for host command pickers. Hosts

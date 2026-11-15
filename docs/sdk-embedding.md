@@ -83,11 +83,17 @@ The fixture's `configure` installs one invoke handler and replaces any handler
 already set on the builder. To integrate with other application commands, use
 the fixture's public `session_state` and `commands` in one handler, as exercised
 by [the composition test](../fixtures/tauri-sdk/tests/composition.rs).
+To use a host-configured session, construct it with `SessionBuilder` and pass it
+to `session_state_from_session`. The host owns the choice and authorization of
+its journal, resources, model and extensions; the IPC commands do not accept
+those settings. This constructor neither reloads resources nor switches sessions.
 Closing requests SDK shutdown before waiting for the session lock. The SDK
 cancels the active run and makes later run tokens inherit cancellation; ordinary
 `abort` still affects only the current run. The fixture rejects queued prompts
-and waits for an admitted prompt to settle so SDK cleanup can finish. Close can
-wait if startup itself never settles. This example uses an in-memory session
+and waits for an admitted prompt to settle so SDK cleanup can finish. After SDK
+close completes, the state drops its owned session and releases its journal
+handle; another owner may then reopen it. Close can wait if startup itself never
+settles. This example uses an in-memory session
 without extension hooks or tools; cancellation cannot undo work already begun.
 
 ```rust
