@@ -4,9 +4,9 @@
 //! under development; it does not yet provide a complete agent harness.
 
 pub mod application_entry;
+mod chord_ops;
 #[cfg(feature = "coding-tools")]
 pub mod coding_tools;
-mod chord_ops;
 pub mod compact;
 pub mod content;
 pub mod conversation;
