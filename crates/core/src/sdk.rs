@@ -1374,18 +1374,23 @@ impl SessionBuilder {
         }
         // Registered historical models must be active even before startup
         // hooks run: synchronous checkout and fork can be called immediately.
-        if let Some((provider, name, _)) = session.model_identity_at(session.head())
-            && let Some(client) = branch_client(
+        let model_identity_resolved = match session.model_identity_at(session.head()) {
+            Some((provider, name, _)) => match branch_client(
                 &self.registry,
                 session.session_id(),
                 provider.as_deref(),
                 &name,
-            )
-        {
-            self.model = client;
-            self.model_name = name;
-            self.model_provider = provider;
-        }
+            ) {
+                Some(client) => {
+                    self.model = client;
+                    self.model_name = name;
+                    self.model_provider = provider;
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        };
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
@@ -1416,6 +1421,7 @@ impl SessionBuilder {
             model: self.model,
             model_name: self.model_name,
             model_provider: self.model_provider,
+            model_identity_resolved,
             system_prompt: self.system_prompt,
             registry,
             limits: self.limits,
@@ -1451,6 +1457,7 @@ pub struct AgentSession {
     model: Arc<dyn Model>,
     model_name: String,
     model_provider: Option<String>,
+    model_identity_resolved: bool,
     system_prompt: String,
     registry: Arc<Registry>,
     limits: Limits,
@@ -1494,6 +1501,11 @@ impl AgentSession {
     }
     fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
         let Some((provider, name, _)) = journal.model_identity_at(target) else {
+            if !self.model_identity_resolved {
+                return Err(Error::Config(
+                    "current session model is not registered".into(),
+                ));
+            }
             if let Some(provider) = &self.model_provider {
                 let client = branch_client(
                     &self.registry,
@@ -1562,6 +1574,7 @@ impl AgentSession {
         self.model = model;
         self.model_name = name;
         self.model_provider = provider.map(str::to_owned);
+        self.model_identity_resolved = true;
         self.refresh_run_config();
         Ok(())
     }
@@ -1775,7 +1788,18 @@ impl AgentSession {
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
         let count = journal.records().len();
-        journal.select_provider_model(provider, &name, None)?;
+        let replaces_selected_client =
+            journal.model_identity_at(journal.head()).is_some_and(
+                |(selected_provider, selected_name, _)| {
+                    selected_provider.as_deref() == provider && selected_name == name
+                },
+            ) && branch_client(&self.registry, self.session_id, provider, &name)
+                .is_some_and(|existing| !Arc::ptr_eq(&existing, &model));
+        if replaces_selected_client && let Some(provider) = provider {
+            journal.select_provider_model_atomic(provider, &name)?;
+        } else {
+            journal.select_provider_model(provider, &name, None)?;
+        }
         if let Some(provider) = provider {
             self.registry.register_session_provider_model(
                 self.session_id,
@@ -1798,6 +1822,7 @@ impl AgentSession {
         self.model = model;
         self.model_name = name;
         self.model_provider = provider.map(str::to_owned);
+        self.model_identity_resolved = true;
         self.refresh_run_config();
         Ok(())
     }
@@ -2019,6 +2044,7 @@ impl AgentSession {
             self.model = client;
             self.model_name = model;
             self.model_provider = provider;
+            self.model_identity_resolved = true;
             self.refresh_run_config();
         }
         emit(
@@ -2036,21 +2062,27 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.ensure_open()?;
-        {
+        let (initial_target, initial_resolution) = {
             let journal = self.session.lock().await;
-            if let Some(target) = journal.tree_navigation_target(selected)?
-                && journal.model_identity_at(target).is_some()
-            {
-                self.resolve_branch_model(&journal, target)?;
-            }
-        }
+            let target = journal.tree_navigation_target(selected)?;
+            let resolution = match target {
+                Some(target) if journal.model_identity_at(target).is_some() => {
+                    Some(self.resolve_branch_model(&journal, target)?)
+                }
+                _ => None,
+            };
+            (target, resolution)
+        };
         self.start().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
         let target = journal.tree_navigation_target(selected)?;
-        let resolution = match target {
-            Some(target) => self.resolve_branch_model(&journal, target)?,
-            None => BranchResolution::Registered,
+        let resolution = match (target == initial_target, initial_resolution) {
+            (true, Some(resolution)) => resolution,
+            _ => match target {
+                Some(target) => self.resolve_branch_model(&journal, target)?,
+                None => BranchResolution::Registered,
+            },
         };
         let first_record = journal.records().len();
         let editor_text = {
@@ -2285,6 +2317,7 @@ impl AgentSession {
                 self.model = model;
                 self.model_name = replacement;
                 self.model_provider = replacement_provider;
+                self.model_identity_resolved = true;
                 self.refresh_run_config();
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
             } else {
@@ -2572,9 +2605,11 @@ impl AgentSession {
         };
         let target = journal.fork_target_after_handoff(target)?;
         let snapshot = journal.fork_session_after_handoff(target)?;
-        if snapshot.model_identity_at(snapshot.head()).is_some() {
-            self.resolve_branch_model(&snapshot, snapshot.head())?;
-        }
+        let initial_resolution = if snapshot.model_identity_at(snapshot.head()).is_some() {
+            Some(self.resolve_branch_model(&snapshot, snapshot.head())?)
+        } else {
+            None
+        };
         drop(journal);
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
@@ -2598,7 +2633,10 @@ impl AgentSession {
             }
         }
         let snapshot = self.journal()?.fork_session_after_handoff(target)?;
-        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
+        let resolution = match initial_resolution {
+            Some(resolution) => resolution,
+            None => self.resolve_branch_model(&snapshot, snapshot.head())?,
+        };
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
@@ -4858,6 +4896,38 @@ mod tests {
         assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
         assert_eq!(session.prompt("one").await.unwrap(), "b");
         assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_historical_model_cannot_silently_inherit_default() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("missing"), "shared", None)
+            .unwrap();
+        let original_head = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+            .provider("default")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(session.journal().unwrap().head(), original_head);
+        assert_eq!(session.journal().unwrap().model_provider(), Some("missing"));
         session.close().await.unwrap();
     }
 
