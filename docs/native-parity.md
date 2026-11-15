@@ -1502,6 +1502,12 @@ explicit overrides, project template precedence and live theme updates.
 
 ### CLI export and transient credentials
 
+Interactive `/export <path>.jsonl` writes the complete native journal, including
+messages and other records on branches that are not currently selected. It is
+not an upstream Pi branch-only JSONL export; review the entire file before
+sharing it. Selected-branch content can itself include sensitive information.
+Core and SDK JSONL exports also publish complete native journals.
+
 `--export <input> [output]` exports native or imported Pi sessions to HTML and
 exits. The default destination is `pi-session-<input-basename>.html` in the
 invocation directory. An explicit destination can use any extension and replace
