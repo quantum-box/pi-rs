@@ -1655,6 +1655,24 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn failed_snapshot_releases_the_configuration_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().join("gate.lock");
+        let result = with_config_gate(mcp_write_guard_at(&gate, None, None), || {
+            Err::<(), _>(Error::Config("invalid fixture configuration".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mcp_write_guard_at(&gate, None, None),
+        )
+        .await
+        .expect("failed snapshot retained its gate")
+        .unwrap();
+    }
+
     #[test]
     fn login_finish_refuses_authentication_or_scope_changes() {
         for change in ["url", "oauth", "authorization", "definition"] {
