@@ -178,23 +178,19 @@ impl Query {
 // dotall behavior and avoid rewriting patterns with user bracket expressions.
 fn js_regex_dots(pattern: &str, original: &str) -> String {
     let mut escaped = false;
-    for ch in original.chars() {
+    for (offset, ch) in original.char_indices() {
         if escaped {
             escaped = false;
         } else if ch == '\\' {
             escaped = true;
         } else if ch == '[' {
             return pattern.to_owned();
-        }
-    }
-    for (_, flags) in original
-        .match_indices("(?")
-        .map(|(i, _)| (i, &original[i + 2..]))
-    {
-        if flags
-            .chars()
-            .take_while(|c| "imsUx-".contains(*c))
-            .any(|c| c == 's')
+        } else if ch == '('
+            && let Some(flags) = original[offset..].strip_prefix("(?")
+            && flags
+                .chars()
+                .take_while(|c| "imsUx-".contains(*c))
+                .any(|c| c == 's')
         {
             return pattern.to_owned();
         }
@@ -433,6 +429,13 @@ mod tests {
         assert_eq!(js_regex_dots("(?s:.)", "(?s:.)"), "(?s:.)");
         assert_eq!(js_regex_dots("[.]", "[.]"), "[.]");
         assert!(Query::new(r"re:(?s)^.$").score(&doc("\n")).is_some());
+        for text in ["s\r", "(s\r"] {
+            assert!(Query::new(r"re:\(?s.").score(&doc(text)).is_none());
+        }
+        for text in ["sX", "(sX"] {
+            assert!(Query::new(r"re:\(?s.").score(&doc(text)).is_some());
+        }
+        assert_eq!(js_regex_dots(r"\\(?s:.)", r"\\(?s:.)"), r"\\(?s:.)");
         let long = format!("{}z", "a".repeat(50_000));
         assert!(Query::new(r"re:^.*z(?=$)").score(&doc(&long)).is_some());
     }
