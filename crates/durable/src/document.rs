@@ -1341,8 +1341,9 @@ impl<'a> TaskDocuments<'a> {
         self.writes.insert(address.clone(), value);
         Ok(())
     }
-    /// Stage distinct typed deliveries before document or entry writes. The returned
-    /// outcome is provisional until this task's checkpoint commits. A conflict
+    /// Stage typed deliveries before entry writes. Document writes may already
+    /// be staged. The outcome is provisional until the task checkpoint commits.
+    /// A conflict
     /// replays only registered replay-safe handlers. Supply a fresh clock value
     /// on replay; elapsed monotonic time is checked at the storage commit boundary.
     /// Clock jumps after staging are not observed. Repeating a delivered or
@@ -1358,7 +1359,7 @@ impl<'a> TaskDocuments<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
-        if !self.writes.is_empty() || self.entries.as_ref().is_some_and(|entries| entries.4) {
+        if self.entries.as_ref().is_some_and(|entries| entries.4) {
             return Err(Error::ReadAfterWrite);
         }
         let identity = (task_id, token.name().to_owned(), key.to_owned());

@@ -1167,3 +1167,164 @@ fn repeated_expired_is_fenced_against_concurrent_delivery() {
         true
     );
 }
+
+struct SignalAfterDocument {
+    path: std::path::PathBuf,
+    mode: u8,
+    attempts: Arc<Mutex<Vec<Vec<SignalResult>>>>,
+}
+impl Handler for SignalAfterDocument {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "done" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        let attempt = self.attempts.lock().unwrap().len();
+        let old = docs.get(&addr()).unwrap();
+        let count = old
+            .as_ref()
+            .and_then(|d| d.value.get("count"))
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        docs.put(
+            &addr(),
+            json!({"count":count + 1}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        if self.mode == 1 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            let mut tx = pi_rs_durable::document::Transaction::new();
+            tx.put(
+                &addr(),
+                durable_store::Expected::Missing,
+                json!({"count":5}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(&db).unwrap();
+        }
+        let token = SignalToken::new("answer", 1).unwrap();
+        let target = Uuid::from_u128(2);
+        let first = docs.signal_at(target, &token, "a", json!(1), 99).unwrap();
+        let repeated = docs.signal_at(target, &token, "a", json!(2), 99).unwrap();
+        self.attempts.lock().unwrap().push(vec![first, repeated]);
+        if self.mode == 2 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            assert_eq!(
+                TaskStore::new(&db)
+                    .deliver_signal_at(target, &token, "a", json!(7), 99)
+                    .unwrap(),
+                SignalResult::Delivered
+            );
+        }
+        if self.mode == 3 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            let mut key = b"durable/task/".to_vec();
+            key.extend_from_slice(task.id().as_bytes());
+            let entry = db.get(&key).unwrap().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            value["abort_requested"] = json!(true);
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        }
+        if self.mode == 4 {
+            return Ok(Step::Fail("discard".into()));
+        }
+        Ok(Step::Continue(cp("done")))
+    }
+}
+
+#[test]
+fn document_write_before_signal_is_atomic_and_replays_conflicts() {
+    for mode in 0..=4 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        setup(&path, None);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry.register(
+            "sender",
+            true,
+            SignalAfterDocument {
+                path: path.clone(),
+                mode,
+                attempts: attempts.clone(),
+            },
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        scheduler.submit(&task(1, "sender")).unwrap();
+        assert!(scheduler.tick(99).unwrap());
+        assert_eq!(
+            attempts.lock().unwrap()[0],
+            vec![SignalResult::Delivered, SignalResult::Duplicate]
+        );
+        if mode == 1 || mode == 2 {
+            let db = Store::open(&path).unwrap();
+            let doc = Documents::new(&db).get(&addr()).unwrap();
+            if mode == 1 {
+                assert_eq!(doc.unwrap().value["count"], 5);
+            } else {
+                assert!(doc.is_none());
+            }
+            assert_eq!(
+                signal_value(&path, 2, "a"),
+                if mode == 2 { Some(json!(7)) } else { None }
+            );
+            drop(db);
+            for _ in 0..4 {
+                if attempts.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                scheduler.tick(99).unwrap();
+            }
+            assert_eq!(
+                attempts.lock().unwrap()[1],
+                vec![
+                    if mode == 2 {
+                        SignalResult::Duplicate
+                    } else {
+                        SignalResult::Delivered
+                    },
+                    SignalResult::Duplicate
+                ]
+            );
+        }
+        drop(scheduler);
+        let db = Store::open(&path).unwrap();
+        let doc = Documents::new(&db).get(&addr()).unwrap();
+        if mode >= 3 {
+            assert!(doc.is_none());
+            assert_eq!(signal_value(&path, 2, "a"), None);
+        } else {
+            assert_eq!(doc.unwrap().value["count"], if mode == 1 { 6 } else { 1 });
+            assert_eq!(
+                signal_value(&path, 2, "a"),
+                Some(if mode == 2 { json!(7) } else { json!(1) })
+            );
+            assert_eq!(
+                TaskStore::new(&db)
+                    .load(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .checkpoint()
+                    .phase,
+                "done"
+            );
+        }
+    }
+}

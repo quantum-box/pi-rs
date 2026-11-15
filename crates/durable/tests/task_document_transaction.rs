@@ -775,3 +775,64 @@ fn append_across_steps_with_nested_authors_and_reject_reserved_kinds() {
             .is_empty()
     );
 }
+
+#[test]
+fn signal_after_application_entry_remains_fail_closed() {
+    use pi_rs_durable::task_store::SignalToken;
+    struct EntryBeforeSignal;
+    impl Handler for EntryBeforeSignal {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            task: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            docs.get(&address("write")).unwrap();
+            docs.put(
+                &address("write"),
+                json!({"n":9}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+            docs.append_entry("app.record", json!(1)).unwrap();
+            let token = SignalToken::new("answer", 1).unwrap();
+            assert!(matches!(
+                docs.signal_at(task.id(), &token, "a", json!(1), 0),
+                Err(pi_rs_durable::document::Error::ReadAfterWrite)
+            ));
+            Ok(Step::Continue(cp("done")))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    initialize(&path);
+    let mut registry = Registry::default();
+    registry.register("parent", true, EntryBeforeSignal);
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    scheduler.submit(&parent()).unwrap();
+    scheduler.tick(0).unwrap();
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    let token = SignalToken::new("answer", 1).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .read_typed_signal(parent().id(), &token, "a")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        application_entry::list(&db, Uuid::from_u128(2))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        Documents::new(&db)
+            .get(&address("write"))
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        9
+    );
+}

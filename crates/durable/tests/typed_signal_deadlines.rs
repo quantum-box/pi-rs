@@ -49,7 +49,7 @@ fn expiry_and_early_values_survive_reopen() {
             if early {
                 assert_eq!(
                     store
-                        .deliver_signal_at(id, &token, "b", json!(7), 99)
+                        .deliver_signal_at(id, &token, "b", json!(7), 0)
                         .unwrap(),
                     SignalResult::Delivered
                 );
@@ -189,7 +189,7 @@ fn first_listed_value_wins_and_consumed_or_expired_keys_reject_waits() {
     for key in ["b", "a"] {
         assert_eq!(
             store
-                .deliver_signal_at(id, &token, key, json!(key), 99)
+                .deliver_signal_at(id, &token, key, json!(key), 0)
                 .unwrap(),
             SignalResult::Delivered
         );

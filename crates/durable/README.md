@@ -467,7 +467,8 @@ Current limits and differences from upstream Pi Durable:
   hosts should use `deliver_signal_at` with the same clock as scheduler ticks.
 - Opt-in task handlers using `TaskDocuments::signal_at` can stage multiple distinct typed
   signals to existing or missing tasks, including the running task and distinct
-  keys on one task, before document/entry writes.
+  keys on one task, before or after staging document writes. Signal delivery
+  after an application-entry write remains unsupported.
   Its status is provisional: the target task version and signal revision are
   checked with the handler's checkpoint and documents, and a conflict rolls
   back all of them. Replay-safe handlers are retried; other handlers require
