@@ -1328,6 +1328,47 @@ pub trait EditOperations: Send + Sync {
 /// Local Pi-style edit operations; the default local tool retains atomic writes.
 pub struct LocalEditOperations;
 
+#[cfg(unix)]
+fn local_edit_access(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unix_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.raw_os_error() {
+        Some(libc::EACCES) => "EACCES",
+        Some(libc::ENOENT) => "ENOENT",
+        Some(libc::ENOTDIR) => "ENOTDIR",
+        Some(libc::ELOOP) => "ELOOP",
+        Some(libc::EROFS) => "EROFS",
+        Some(libc::EPERM) => "EPERM",
+        Some(libc::ENAMETOOLONG) => "ENAMETOOLONG",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
+#[cfg(windows)]
+fn windows_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
 fn open_local_edit_file(path: &Path) -> Result<std::fs::File> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(Error::Config("expected a regular file".into()));
@@ -2718,6 +2759,10 @@ impl CodingTool {
         check_mutation_cancelled(cancellation)?;
         let display_path = string(args, "path")?;
         let path = self.path(display_path).map_err(|error| match error {
+            #[cfg(unix)]
+            Error::Io(cause) if self.unrestricted => unix_edit_access_error(cause, display_path),
+            #[cfg(windows)]
+            Error::Io(cause) if self.unrestricted => windows_edit_access_error(cause, display_path),
             Error::Io(ref cause)
                 if self.unrestricted && cause.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -2729,6 +2774,21 @@ impl CodingTool {
         })?;
         let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
+        #[cfg(unix)]
+        if self.unrestricted {
+            local_edit_access(&path)
+                .map_err(|error| unix_edit_access_error(error, display_path))?;
+        }
+        #[cfg(windows)]
+        if self.unrestricted {
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| windows_edit_access_error(error, display_path))?;
+            if metadata.permissions().readonly() {
+                return Err(Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: EPERM."
+                )));
+            }
+        }
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
         if !self.unrestricted && output.len() as u64 > MAX_FILE_BYTES {
@@ -2863,7 +2923,21 @@ impl CodingTool {
         let mut grep = if is_find {
             None
         } else {
-            let grep = crate::file_search::Grep::new(args, limit)?;
+            let grep = crate::file_search::Grep::new(args, limit).map_err(|error| match error {
+                Error::Config(message)
+                    if self.unrestricted && message.starts_with("regex parse error:") =>
+                {
+                    let advice = if message.contains("look-around")
+                        || message.contains("backreferences")
+                    {
+                        "\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."
+                    } else {
+                        ""
+                    };
+                    Error::Config(format!("rg: {message}{advice}"))
+                }
+                error => error,
+            })?;
             Some(if base.is_file() {
                 grep.with_explicit_file()
             } else {
@@ -4567,6 +4641,80 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn grep_reports_ripgrep_regex_parse_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "text").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let result = tool
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(
+                json!({"pattern":"(?=a)","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:(?=a))\n       ^^^\nerror: look-around, including look-ahead and look-behind, is not supported\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."),
+            "{result:?}"
+        );
+        for pattern in [r"\1", "backreferences["] {
+            let result = tool
+                .invoke(
+                    json!({"pattern":pattern,"path":"file.txt"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Failed(message)
+                if message.ends_with("\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around.")),
+                "{result:?}"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: regex parse error:")),
+            "{result:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn read_reports_non_directory_parent_with_requested_path() {
@@ -4686,6 +4834,153 @@ mod tests {
         } else {
             assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_rejects_read_only_file_even_with_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let probe = local_edit_access(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
+            );
+            assert_eq!(content, "before\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        std::fs::create_dir(&parent).unwrap();
+        let file = parent.join("file");
+        std::fs::write(&file, "before").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = local_edit_access(&file);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: private/file. Error code: EACCES.")
+            );
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_formats_unix_access_codes() {
+        for (errno, code) in [
+            (libc::EROFS, "EROFS"),
+            (libc::ENOTDIR, "ENOTDIR"),
+            (libc::ELOOP, "ELOOP"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+        ] {
+            assert!(
+                matches!(unix_edit_access_error(std::io::Error::from_raw_os_error(errno), "name"),
+                Error::Config(message) if message == format!("Could not edit file: name. Error code: {code}."))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_oversized_path_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = "a".repeat(4096);
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":name,"edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == format!("Could not edit file: {name}. Error code: ENAMETOOLONG."))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn edit_rejects_windows_readonly_file_before_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before").unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"missing","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EPERM.")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
     }
 
     #[cfg(unix)]

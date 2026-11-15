@@ -96,6 +96,7 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
                 event("contentBlockStop",json!({"contentBlockIndex":0})),
                 event("contentBlockDelta",json!({"contentBlockIndex":1,"delta":{"text":"answer"}})),
                 event("contentBlockStop",json!({"contentBlockIndex":1})),
+                event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":""}}})),
                 event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AQI="}}})),
                 event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AwQ="}}})),
                 event("contentBlockStop",json!({"contentBlockIndex":2})),
@@ -151,6 +152,7 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
             .iter()
             .any(|e| matches!(e,ModelEvent::Reasoning(text) if text=="think"))
     );
+    assert_eq!(events.iter().filter(|event| matches!(event, ModelEvent::Reasoning(text) if text == "[Reasoning redacted]")).count(), 1);
     let metadata = events
         .into_iter()
         .find_map(|event| match event {
@@ -158,6 +160,10 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
             _ => None,
         })
         .unwrap();
+    assert_eq!(
+        metadata.reasoning.as_deref(),
+        Some("think[Reasoning redacted]")
+    );
     let session = Session::with_store(MemoryStore::default()).unwrap();
     let request_id = uuid::Uuid::new_v4();
     let mut records = session.records().to_vec();

@@ -916,12 +916,11 @@ mod tests {
                 .contains("Existing prompt: world")
         );
         assert!(resources.themes.contains(&theme.canonicalize().unwrap()));
-        assert!(
-            resources
-                .warnings
-                .iter()
-                .any(|warning| warning.contains(&missing.display().to_string()))
-        );
+        assert!(resources.warnings.iter().any(|warning| {
+            warning
+                .replace('\\', "/")
+                .contains(&missing.to_string_lossy().replace('\\', "/"))
+        }));
     }
     use super::*;
     #[test]
@@ -1077,8 +1076,8 @@ mod tests {
                 || warning.contains(&format!("using {}", prompt_b.display()))
         }));
 
-        // A missing path triggers individual-load recovery; both later files
-        // must still report the winner from the original resource set.
+        // A missing path is diagnosed while the later files still report the
+        // winner from the original resource set.
         let mut recovered = discovered.clone();
         recovered.skill_paths.push(root.join("missing/SKILL.md"));
         let resources = Resources::load_with_discovered(&args, &recovered).unwrap();
@@ -1243,6 +1242,248 @@ mod tests {
                 .any(|message| message.contains("exceeds 1024"))
         );
         assert!(warnings.iter().all(|message| message.contains("SKILL.md")));
+    }
+
+    #[test]
+    fn explicit_skill_paths_reject_non_markdown_files_without_hiding_valid_skills() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let invalid = directory.path().join("instruction.txt");
+        let valid = directory.path().join("valid.md");
+        std::fs::write(
+            &invalid,
+            "---\nname: rejected\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            &valid,
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().to_owned();
+        args.skill = vec![
+            invalid.to_string_lossy().into(),
+            valid.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(!resources.skills.contains_key("rejected"));
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(resources.warnings.iter().any(|warning| {
+            warning.contains("skill path is not a markdown file")
+                && warning.contains("instruction.txt")
+        }));
+    }
+
+    #[test]
+    fn missing_explicit_skill_warns_and_preserves_other_resources() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
+        let valid = directory.path().join("valid.md");
+        std::fs::write(
+            &valid,
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().to_owned();
+        args.skill = vec![
+            missing.to_string_lossy().into(),
+            valid.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing.md")
+                    && warning.contains("skill path does not exist"))
+        );
+        args.skill = vec![directory.path().join("none-*.md").to_string_lossy().into()];
+        assert!(Resources::load(&args).is_err());
+    }
+
+    #[test]
+    fn missing_skill_under_workspace_with_glob_characters_is_not_a_glob() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace[1]");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("valid.md"),
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.skill = vec!["missing/file.md".into(), "valid.md".into()];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skill path does not exist"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_skill_suffix_is_checked_before_following_symlinks() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let non_markdown = root.join("target.txt");
+        let markdown = root.join("target.md");
+        let accepted = root.join("accepted.md");
+        let rejected = root.join("rejected.txt");
+        std::fs::write(
+            &non_markdown,
+            "---\nname: shared\ndescription: from alias\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            &markdown,
+            "---\nname: shared\ndescription: later\n---\nbody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&non_markdown, &accepted).unwrap();
+        std::os::unix::fs::symlink(&markdown, &rejected).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root.to_owned();
+        args.skill = vec![
+            rejected.to_string_lossy().into(),
+            accepted.to_string_lossy().into(),
+            markdown.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["shared"].description, "from alias");
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("rejected.txt")
+                    && warning.contains("skill path is not a markdown file"))
+        );
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate skill shared"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_skill_alias_uses_its_name_and_declared_file_status() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let source = root.join("source.txt");
+        let alias = root.join("alias/entry.md");
+        let declared = root.join("declared/SKILL.md");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(declared.parent().unwrap()).unwrap();
+        std::fs::write(&source, "---\ndescription: example\n---\nbody").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        std::os::unix::fs::symlink(&source, &declared).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        args.skill = vec![alias.to_string_lossy().into()];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["alias"].path, alias);
+        std::fs::write(&source, "---\nname: invalid--name\n---\nbody").unwrap();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.warnings.is_empty());
+        args.skill = vec![declared.to_string_lossy().into()];
+        let resources = Resources::load(&args).unwrap();
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("description is required"))
+        );
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("consecutive hyphens"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_skill_suffix_checks_lexically_normalized_path() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let target = root.join("other/deep");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        std::fs::write(
+            root.join("instruction.txt"),
+            "---\nname: rejected\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root.clone();
+        args.skill = vec![
+            root.join("link/../instruction.txt")
+                .to_string_lossy()
+                .into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.is_empty());
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skill path is not a markdown file"))
+        );
     }
 
     #[test]
