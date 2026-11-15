@@ -4263,6 +4263,7 @@ ordinary function tools; models declaring no support omit the field. Built-in
 model flags override built-in provider defaults. An explicit provider setting
 overrides bundled model flags, and a model override takes precedence over both.
 User-defined models use their own compatibility settings over provider settings.
+Nested `chatTemplateArgs` merge by key across these layers.
 
 ### Chat catalog pricing checkpoint
 
