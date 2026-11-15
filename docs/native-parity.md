@@ -131,6 +131,10 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Package list emits native JSON events for every configured entry in user then
+trusted-project order, including duplicates, with `scope` and `filtered` fields.
+Transient `-e` sources are excluded, as in Pi's configured-package list.
+
 Local package `file://` sources ignore URL query and fragment components and
 reject malformed path escapes and encoded separators, as Pi does.
 

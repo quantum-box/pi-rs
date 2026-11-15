@@ -151,22 +151,14 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
         }
         PackageCommand::List => {
             let index = index()?;
-            let mut configured = declarations(args)?;
-            // Pi lists user packages before project packages, while resource
-            // resolution gives project packages precedence.
-            configured.sort_by_key(|entry| match entry.scope_order {
-                1 => 0,
-                0 => 1,
-                _ => 2,
-            });
-            for declaration in configured {
+            for (declaration, filtered) in configured_packages(args)? {
                 let installed = index
                     .get(&key(&declaration.source))
                     .cloned()
                     .map(serde_json::from_value::<Installed>)
                     .transpose()?;
                 output(
-                    json!({"type":"package","source":display_source(&declaration.source),"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
+                    json!({"type":"package","source":display_source(&declaration.source),"scope":if declaration.scope_order == 1 { "user" } else { "project" },"filtered":filtered,"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
                 );
             }
         }
@@ -1123,6 +1115,45 @@ fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
     }
     Ok(sources)
 }
+fn configured_packages(args: &Cli) -> Result<Vec<(Declaration, bool)>> {
+    let mut files = vec![(
+        config::agent_dir().join("settings.json"),
+        config::agent_dir(),
+        1,
+    )];
+    if args.trusted {
+        files.push((
+            args.workspace.join(".pi/settings.json"),
+            args.workspace.join(".pi"),
+            0,
+        ));
+    }
+    let mut result = Vec::new();
+    for (file, base, scope_order) in files {
+        let document = config::read_object(&file)?;
+        if let Some(packages) = document.get("packages") {
+            for value in packages
+                .as_array()
+                .ok_or_else(|| Error::Config("packages must be an array".into()))?
+            {
+                let source = source_field(value)
+                    .ok_or_else(|| Error::Config("package needs a source".into()))?;
+                result.push((
+                    Declaration {
+                        source: normalize(source, &base)?,
+                        value: value.clone(),
+                        inherited: None,
+                        transient: false,
+                        scope_order,
+                    },
+                    value.is_object(),
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
     let mut global = BTreeMap::new();

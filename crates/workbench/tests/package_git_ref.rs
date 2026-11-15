@@ -2,6 +2,53 @@
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn list_keeps_configured_entries_and_excludes_transient_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("agent");
+    let project = directory.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let source = "git:https://example.invalid/repo#v1";
+    let other = "git:https://example.invalid/other";
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"packages":[source, {"source":source,"prompts":[]}]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("settings.json"),
+        serde_json::json!({"packages":[source]}).to_string(),
+    )
+    .unwrap();
+    for (trust, expected) in [("--no-trust", 2), ("--trust", 3)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .args([trust, "-e", other, "list"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), expected);
+        assert!(lines.iter().all(|line| line["source"] == source));
+        assert_eq!(lines[0]["scope"], "user");
+        assert_eq!(lines[0]["filtered"], false);
+        assert_eq!(lines[1]["filtered"], true);
+        if expected == 3 {
+            assert_eq!(lines[2]["scope"], "project");
+        }
+    }
+}
+
 fn git(directory: &Path, args: &[&str]) -> String {
     let result = Command::new("git")
         .current_dir(directory)
@@ -396,8 +443,20 @@ fn invalid_remote_filters_follow_package_settings_order() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(lines[0]["source"], sources[1]);
-    assert_eq!(lines[1]["source"], sources[0]);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["source"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![sources[1].as_str(), sources[0].as_str()]
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["scope"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user", "project"]
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(directory.path())
         .env("PI_RS_HOME", &home)
