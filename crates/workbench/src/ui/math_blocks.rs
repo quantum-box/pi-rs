@@ -14,7 +14,7 @@ pub(super) struct MathBlock {
 }
 
 pub(super) fn top_level(source: &str) -> Vec<MathBlock> {
-    if source.len() > 256 * 1024 {
+    if source.len() > 256 * 1024 || (!source.contains("$$") && !source.contains("\\[")) {
         return Vec::new();
     }
     let deadline = Instant::now() + Duration::from_millis(20);

@@ -24,7 +24,7 @@ fn lookup<'a>(table: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
 fn js_whitespace(ch: char) -> bool {
     (ch.is_whitespace() && ch != '\u{85}') || ch == '\u{feff}'
 }
-fn trim_js(s: &str) -> &str {
+pub(super) fn trim_js(s: &str) -> &str {
     s.trim_matches(js_whitespace)
 }
 fn trim_end_js(s: &str) -> &str {

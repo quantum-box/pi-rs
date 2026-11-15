@@ -5,6 +5,7 @@ mod editor_layout;
 pub mod images;
 pub mod input;
 pub mod keys;
+mod math_blocks;
 mod math_data;
 mod math_layout;
 mod math_parser;

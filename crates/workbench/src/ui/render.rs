@@ -1502,6 +1502,118 @@ fn markdown_at_depth(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
+    let blocks = super::math_blocks::top_level(text);
+    if blocks.is_empty()
+        || blocks.len() > 64
+        || text.len().saturating_mul(blocks.len() + 1) > 1024 * 1024
+    {
+        return markdown_plain_at_depth(
+            text,
+            text,
+            theme,
+            width,
+            depth,
+            mermaid,
+            hyperlinks,
+            preserve_source,
+        );
+    }
+    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS);
+    let definitions: Vec<_> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, definition)| definition.span.clone())
+        .filter(|range| {
+            !blocks
+                .iter()
+                .any(|block| range.start < block.source.end && block.source.start < range.end)
+        })
+        .collect();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for block in &blocks {
+        let segment = masked_math_segment(text, start..block.source.start, &definitions);
+        let before = markdown_plain_at_depth(
+            text,
+            &segment,
+            theme,
+            width,
+            depth,
+            mermaid,
+            hyperlinks,
+            preserve_source,
+        );
+        append_math_section(&mut lines, before);
+        let raw = &text[block.source.clone()];
+        let expression = super::math_parser::trim_js(&text[block.content.clone()]);
+        let rendered = (!block.pending)
+            .then(|| super::math_parser::render(expression, true))
+            .flatten()
+            .filter(|value| {
+                value
+                    .lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= width)
+            })
+            .unwrap_or_else(|| super::math_parser::trim_js(raw).to_owned());
+        append_math_section(
+            &mut lines,
+            wrap(&[Span::themed(rendered, theme, "text")], width),
+        );
+        start = block.source.end;
+    }
+    let segment = masked_math_segment(text, start..text.len(), &definitions);
+    let after = markdown_plain_at_depth(
+        text,
+        &segment,
+        theme,
+        width,
+        depth,
+        mermaid,
+        hyperlinks,
+        preserve_source,
+    );
+    append_math_section(&mut lines, after);
+    lines
+}
+
+// Preserve offsets into the original message and retain all reference
+// definitions, so links resolve across display-math boundaries.
+fn masked_math_segment(text: &str, segment: Range<usize>, definitions: &[Range<usize>]) -> String {
+    let mut bytes: Vec<_> = text
+        .bytes()
+        .map(|b| if matches!(b, b'\n' | b'\r') { b } else { b' ' })
+        .collect();
+    bytes[segment.clone()].copy_from_slice(&text.as_bytes()[segment]);
+    for range in definitions {
+        bytes[range.clone()].copy_from_slice(&text.as_bytes()[range.clone()]);
+    }
+    String::from_utf8(bytes).expect("masks preserve UTF-8 boundaries")
+}
+
+fn append_math_section(output: &mut Vec<Line>, mut next: Vec<Line>) {
+    if next.is_empty() {
+        return;
+    }
+    if !output.is_empty()
+        && output
+            .last()
+            .is_some_and(|line| line.spans.iter().any(|span| !span.text.is_empty()))
+    {
+        output.push(Line::default());
+    }
+    output.append(&mut next);
+}
+
+fn markdown_plain_at_depth(
+    text: &str,
+    parsed: &str,
+    theme: &Theme,
+    width: usize,
+    depth: usize,
+    mermaid: super::mermaid::Mermaid,
+    hyperlinks: bool,
+    preserve_source: bool,
+) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut bold = 0usize;
@@ -1521,8 +1633,8 @@ fn markdown_at_depth(
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
-    let protected_text = protect_bare_links(text, options);
-    let mut events = super::strike::events(text, &protected_text, options)
+    let protected_text = protect_bare_links(parsed, options);
+    let mut events = super::strike::events(parsed, &protected_text, options)
         .into_iter()
         .peekable();
     while let Some((event, mut range)) = events.next() {
@@ -2092,6 +2204,43 @@ mod tests {
         );
         let table = rendered("| Value |\n| --- |\n| $\\mathbb{C}^3$ |").join("\n");
         assert!(table.contains("ℂ³"), "{table}");
+    }
+
+    #[test]
+    fn display_math_preserves_links_code_and_width_fallback() {
+        let theme = Theme::system();
+        let rendered = |source: &str, width: usize| {
+            markdown(source, &theme, width)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let source =
+            "[before][ref]\n\n$$\\frac{1}{2}$$\n\n[after][ref]\n\n[ref]: https://example.org";
+        let lines = rendered(source, 120);
+        assert_eq!(
+            lines,
+            [
+                "before (https://example.org)",
+                "",
+                "1",
+                "─",
+                "2",
+                "",
+                "after (https://example.org)"
+            ]
+        );
+        let source = "```text\n$$x^2$$\n```\n\n$$x^2$$";
+        let lines = rendered(source, 120);
+        assert!(lines.iter().any(|line| line.contains("$$x^2$$")));
+        assert_eq!(lines.last().unwrap(), "x²");
+        let source = "$$\\frac{123456789}{123456789}$$";
+        assert!(rendered(source, 8).join("\n").contains("$$"));
     }
 
     #[test]
