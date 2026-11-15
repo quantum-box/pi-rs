@@ -148,7 +148,9 @@ async fn model_requests_use_authorized_routes_without_metadata_probes() {
         );
         let request = ModelRequest {
             model: "test-model".into(),
-            messages: vec![],
+            messages: vec![pi_rs::Message::User {
+                content: "hello".into(),
+            }],
             tools: vec![],
             max_output_tokens: 16,
         };
