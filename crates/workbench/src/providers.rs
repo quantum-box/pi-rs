@@ -770,7 +770,14 @@ impl Client {
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();
-                Self::Ollama(client.with_sampling(sampling)?)
+                Self::Ollama(
+                    client
+                        .with_thinking_budgets(
+                            thinking,
+                            args.settings.value().get("thinkingBudgets").cloned(),
+                        )
+                        .with_sampling(sampling)?,
+                )
             }
             Self::Anthropic(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
