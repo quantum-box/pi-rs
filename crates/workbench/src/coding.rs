@@ -1812,7 +1812,11 @@ impl RemoteShellTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<RemoteShellResult> {
         if cancellation.is_cancelled() {
-            return Err(Error::Config("Command aborted".into()));
+            return if self.operations.is_local() {
+                Err(Error::Config("Command aborted".into()))
+            } else {
+                Err(Error::Cancelled)
+            };
         }
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
