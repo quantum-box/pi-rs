@@ -669,7 +669,8 @@ async fn yield_blocks_reopen_and_dispatch_in_order() {
         h.conversation(fork).unwrap().content_blocks,
         h.conversation(id).unwrap().content_blocks
     );
-    assert!(h.request_manual_compaction(id, 0, None).is_ok());
+    // This fixture's extension has not declared block-aware compaction support.
+    assert!(h.request_manual_compaction(id, 0, None).is_err());
     thread.join().unwrap();
 }
 
