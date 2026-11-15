@@ -152,10 +152,11 @@ async fn hooks_fit_in_order_preserve_metadata_and_exclude_nested() {
     assert_eq!(fitted.extra, original.extra);
     assert_eq!(fitted.diagnostics[0], original.diagnostics[0]);
     assert_eq!(fitted.diagnostics[1], ToolDiagnostic { severity: DiagnosticSeverity::Info, code: Some("image".into()), message: "Resized from 400x100 to 100x25. Multiply coordinates by 4.00 to map them to the original. An image (image/png) cannot be prepared for the model and was left out.".into() });
-    let seen = observations.lock().unwrap();
-    assert_eq!(seen[0], original.output);
-    assert_eq!(seen[1], fitted.output);
-    drop(seen);
+    {
+        let seen = observations.lock().unwrap();
+        assert_eq!(seen[0], original.output);
+        assert_eq!(seen[1], fitted.output);
+    }
     assert_eq!(
         processor.0.lock().unwrap().as_slice(),
         &[ImageLimits {
