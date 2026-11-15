@@ -3314,6 +3314,9 @@ fullscreen and regular modes.
 
 ### Native Anthropic provider checkpoint
 
+An Anthropic fallback marker before output is accepted; a fallback after any
+text, thinking, or tool block fails the attempt, as in Pi.
+
 `--provider anthropic` or an `anthropic/<model>` reference selects the native
 Messages API. The standard endpoint reads `ANTHROPIC_API_KEY`. An explicit
 `--api-key` or host-provided model token can be used with a custom endpoint.

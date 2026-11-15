@@ -1308,8 +1308,16 @@ impl Model for Anthropic {
                         input_transformations = AnthropicInputTransformations::from_value(&message["input_transformations"]);
                     }
                     Some("content_block_start") if started => {
-                        let index = block_index(&value)?;
                         let block = &value["content_block"];
+                        if block["type"] == "fallback" {
+                            if !calls.is_empty() || blocks.values().any(|block| matches!(block.raw["type"].as_str(), Some("text" | "thinking" | "redacted_thinking"))) {
+                                Err(Error::Model("Anthropic performed an unsupported mid-output model fallback".into()))?;
+                            }
+                            // Pi ignores unknown blocks; they must not cross the fallback boundary in replay.
+                            blocks.clear();
+                            continue;
+                        }
+                        let index = block_index(&value)?;
                         if blocks.contains_key(&index) || calls.contains_key(&index)
                             || blocks.len().saturating_add(calls.len()) >= 256
                         {
@@ -1515,6 +1523,91 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn fallback_is_only_allowed_before_output_blocks() {
+        use std::io::{Read, Write};
+        for block in [
+            None,
+            Some(json!({"type":"future_block"})),
+            Some(json!({"type":"text","text":""})),
+            Some(json!({"type":"thinking","thinking":""})),
+            Some(json!({"type":"redacted_thinking","data":"opaque"})),
+            Some(json!({"type":"tool_use","id":"call","name":"read","input":{}})),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let unknown = block
+                .as_ref()
+                .is_some_and(|block| block["type"] == "future_block");
+            let expect_error = block.is_some() && !unknown;
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let mut events = vec![
+                    json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                ];
+                if let Some(block) = block {
+                    events.push(
+                        json!({"type":"content_block_start","index":0,"content_block":block}),
+                    );
+                }
+                events.push(json!({"type":"content_block_start","index":1,"content_block":{"type":"fallback"}}));
+                if unknown {
+                    events.push(json!({"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"thought","signature":"sig"}}));
+                    events.push(json!({"type":"content_block_stop","index":2}));
+                }
+                events.push(
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+                );
+                events.push(json!({"type":"message_stop"}));
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false);
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = model.stream(request).await.unwrap();
+            let mut completed = false;
+            let mut fallback_error = false;
+            let mut replay = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(ModelEvent::Complete { .. }) => completed = true,
+                    Ok(ModelEvent::Metadata(metadata)) if metadata.replay.is_some() => {
+                        replay = metadata.replay
+                    }
+                    Err(Error::Model(message))
+                        if message.contains("unsupported mid-output model fallback") =>
+                    {
+                        fallback_error = true
+                    }
+                    Err(error) => panic!("unexpected error: {error}"),
+                    _ => {}
+                }
+            }
+            worker.join().unwrap();
+            assert_eq!(fallback_error, expect_error);
+            assert_eq!(completed, !expect_error);
+            if unknown {
+                let replay = replay.expect("signed thinking replay");
+                assert_eq!(replay.blocks.len(), 1);
+                assert_eq!(replay.blocks[0]["type"], "thinking");
+            }
+        }
+    }
+
     #[test]
     fn overflow_http_classification_is_bounded_and_hides_credentials() {
         use std::io::{Read, Write};
