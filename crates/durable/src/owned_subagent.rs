@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn external_wait_rejects_cycle_through_owned_conversation() {
         use crate::task::WaitFor;
-        use crate::task_scheduler::{Error as TaskError, Registry, Step};
+        use crate::task_scheduler::{Registry, Step};
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
         let conversation = h.create_conversation(config()).unwrap();
@@ -547,13 +547,18 @@ mod tests {
             })
         });
         let mut scheduler = h.attach_tasks(registry).unwrap();
-        assert!(matches!(scheduler.tick(0), Err(TaskError::Ownership)));
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            matches!(scheduler.get(waiter.id()).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("invalid task wait"))
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.get(root.id()).unwrap().unwrap().is_terminal());
     }
 
     #[test]
     fn external_wait_rejects_cycle_through_terminal_owner_and_conversation() {
         use crate::task::WaitFor;
-        use crate::task_scheduler::{Error as TaskError, Registry, Step};
+        use crate::task_scheduler::{Registry, Step};
         let dir = tempfile::tempdir().unwrap();
         let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
         let conversation = h.create_conversation(config()).unwrap();
@@ -622,7 +627,12 @@ mod tests {
             })
         });
         let mut scheduler = h.attach_tasks(registry).unwrap();
-        assert!(matches!(scheduler.tick(0), Err(TaskError::Ownership)));
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            matches!(scheduler.get(waiter.id()).unwrap().unwrap().state(), crate::task::TaskState::Failed(reason) if reason.contains("invalid task wait"))
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.get(root.id()).unwrap().unwrap().is_terminal());
     }
 
     #[test]

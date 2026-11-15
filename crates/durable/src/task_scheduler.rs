@@ -1073,16 +1073,18 @@ impl Scheduler {
                     let mut seen = std::collections::HashSet::new();
                     for id in waiting {
                         if *id == next.task.id() || !seen.insert(*id) {
-                            return Err(Error::Ownership);
+                            return self.reject_invalid_wait(&running);
                         }
                         if !children.iter().any(|c| c.id() == *id)
                             && !staged.iter().any(|(_, _, p)| p.child == *id)
                         {
-                            let child = self.ts().load(*id)?.ok_or(Error::Ownership)?;
+                            let Some(child) = self.ts().load(*id)? else {
+                                return self.reject_invalid_wait(&running);
+                            };
                             if matches!(condition, WaitFor::TasksFailFast(_))
                                 && child.task.owner() != &TaskOwner::Task(next.task.id())
                             {
-                                return Err(Error::Ownership);
+                                return self.reject_invalid_wait(&running);
                             }
                         }
                     }
@@ -1096,7 +1098,12 @@ impl Scheduler {
                                 .map(|(_, child, p)| (p.child, child)),
                         )
                         .collect();
-                    validate_wait_graph(owner.store(), next.task.id(), waiting, &new_children)?;
+                    match validate_wait_graph(owner.store(), next.task.id(), waiting, &new_children)
+                    {
+                        Ok(()) => (),
+                        Err(Error::Ownership) => return self.reject_invalid_wait(&running),
+                        Err(error) => return Err(error),
+                    }
                 }
                 next.task.wait(condition).map_err(Error::Transition)?;
             }
@@ -1112,6 +1119,28 @@ impl Scheduler {
                 }
             }
             Step::Fail(_) => unreachable!(),
+        }
+        // A newly admitted child can adopt legacy orphans even if this step
+        // does not wait for it. Such adoption must not create a cycle with
+        // the live owner or its durable waits.
+        let new_children: HashMap<_, _> = children
+            .iter()
+            .map(|child| (child.id(), child))
+            .chain(
+                staged
+                    .iter()
+                    .filter(|(_, _, p)| !p.mutations.is_empty())
+                    .map(|(_, child, p)| (p.child, child)),
+            )
+            .collect();
+        if !new_children.is_empty() {
+            wait_graph_fence = true;
+            let targets: Vec<_> = new_children.keys().copied().collect();
+            match validate_wait_graph(owner.store(), next.task.id(), &targets, &new_children) {
+                Ok(()) => (),
+                Err(Error::Ownership) => return self.reject_invalid_wait(&running),
+                Err(error) => return Err(error),
+            }
         }
         next.task
             .record_completed_attempt(&running.task)
@@ -1348,6 +1377,12 @@ impl Scheduler {
         reason: String,
     ) -> Result<(), Error> {
         self.finish_failed_inner(parent, reason, true)
+    }
+
+    fn reject_invalid_wait(&mut self, parent: &task_store::StoredTask) -> Result<bool, Error> {
+        self.finish_failed_completed(parent, "invalid task wait or ownership cycle".into())?;
+        self.poisoned = false;
+        Ok(true)
     }
     fn finish_failed(&self, parent: &task_store::StoredTask, reason: String) -> Result<(), Error> {
         self.finish_failed_inner(parent, reason, false)
@@ -1805,7 +1840,18 @@ mod tests {
             .submit(&task(1, owner.clone(), "waiter", true, 3))
             .unwrap();
         scheduler.submit(&task(2, owner, "other", true, 3)).unwrap();
-        assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            matches!(scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("invalid task wait"))
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            scheduler
+                .get(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+        );
     }
 
     #[test]
@@ -1882,23 +1928,88 @@ mod tests {
                 .ts()
                 .save(&[Save::Create(&waiter), Save::Create(&other)])
                 .unwrap();
-            assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
+            assert!(scheduler.tick(0).unwrap());
+            assert!(
+                matches!(scheduler.get(waiter.id()).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("invalid task wait"))
+            );
+            assert!(scheduler.tick(0).unwrap());
+            assert!(scheduler.get(other.id()).unwrap().unwrap().is_terminal());
         }
     }
 
     #[test]
     fn new_waited_child_cannot_adopt_an_orphan_cycle() {
+        for wait_for_child in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            registry.register("waiter", true, move |parent: &Task| {
+                let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
+                let on = if wait_for_child {
+                    vec![child.id()]
+                } else {
+                    vec![]
+                };
+                Ok(Step::Wait {
+                    checkpoint: cp("wait"),
+                    condition: WaitFor::TasksAny(on),
+                    children: vec![child],
+                })
+            });
+            registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            registry.register("orphan", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            registry.register("independent", true, |_: &Task| {
+                Ok(Step::Succeed(json!("ok")))
+            });
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+            let waiter = task(1, owner.clone(), "waiter", true, 3);
+            let mut orphan = task(3, TaskOwner::Task(Uuid::from_u128(2)), "orphan", true, 3);
+            let independent = task(4, owner, "independent", true, 3);
+            orphan.start().unwrap();
+            orphan.wait(WaitFor::TasksAny(vec![waiter.id()])).unwrap();
+            scheduler
+                .ts()
+                .save(&[
+                    Save::Create(&waiter),
+                    Save::Create(&orphan),
+                    Save::Create(&independent),
+                ])
+                .unwrap();
+            assert!(scheduler.tick(0).unwrap());
+            assert!(
+                matches!(scheduler.get(waiter.id()).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("invalid task wait"))
+            );
+            assert!(scheduler.get(Uuid::from_u128(2)).unwrap().is_none());
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(
+                scheduler.get(independent.id()).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("ok"))
+            );
+        }
+    }
+
+    #[test]
+    fn staged_child_cannot_adopt_an_orphan_cycle_on_success() {
+        struct Parent(Arc<dyn Handler>);
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                parent: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
+                docs.stage_task_tool_child("key", "tool", &json!({}), child, self.0.clone())?;
+                Ok(Step::Succeed(json!("not committed")))
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
+        let child_handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!(null))));
         let mut registry = Registry::default();
-        registry.register("waiter", true, |parent: &Task| {
-            let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
-            Ok(Step::Wait {
-                checkpoint: cp("wait"),
-                condition: WaitFor::TasksAny(vec![child.id()]),
-                children: vec![child],
-            })
-        });
-        registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register("waiter", true, Parent(child_handler.clone()));
+        registry.register_shared("child", true, child_handler);
         registry.register("orphan", true, |_: &Task| Ok(Step::Succeed(json!(null))));
         let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
         let waiter = task(
@@ -1915,7 +2026,11 @@ mod tests {
             .ts()
             .save(&[Save::Create(&waiter), Save::Create(&orphan)])
             .unwrap();
-        assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            matches!(scheduler.get(waiter.id()).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("invalid task wait"))
+        );
+        assert!(scheduler.get(Uuid::from_u128(2)).unwrap().is_none());
     }
     #[test]
     fn completing_survives_reopen_without_parent_definition_and_wakes_child() {
