@@ -418,8 +418,12 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`, `get_commands`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
-success flag. Prompt acceptance follows input and command validation. A prompt
-that runs an extension command returns `handled`. Idle extension commands
+success flag. Prompt acceptance follows input and command validation. Explicitly
+empty or whitespace-only text reaches input hooks before native
+empty-input validation, allowing a hook to handle or replace it. Unhandled empty
+input remains invalid; unlike Pi, a busy `prompt` without `streamingBehavior`
+is rejected before its hook runs. A prompt that runs an extension command returns `handled`.
+Idle extension commands
 take precedence over valid attached images in RPC; the
 attachments are not sent to the model even when the command triggers a turn.
 RPC validates images before command dispatch. Unlike Pi, a command that

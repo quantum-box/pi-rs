@@ -1653,6 +1653,170 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[cfg(unix)]
 #[test]
+fn rpc_input_hooks_receive_empty_and_whitespace_messages() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("empty-input.py");
+    std::fs::write(
+        &extension,
+        r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'empty-input', 'dependencies':[], 'commands':[], 'tools':[], 'input_hook':True}
+elif request['type'] == 'input':
+    event = request['event']
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'input-events.jsonl'), 'a') as log:
+        log.write(json.dumps(event) + '\n')
+    if event['text'] in ('', ' '):
+        result = {'action':'handled'}
+    elif event['text'] in ('\t', '\n'):
+        result = {'action':'transform', 'text':'same input'}
+    else:
+        result = {'action':'continue'}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (endpoint, server) = model_fixture();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "rpc",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for request in [
+        json!({"type":"prompt","id":"missing"}),
+        json!({"type":"prompt","id":"null","message":null}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let response = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(response["id"], request["id"]);
+        assert_eq!(response["success"], false, "{response}");
+    }
+    for (id, text, disposition) in [
+        ("empty", "", Some("handled")),
+        ("space", " ", Some("handled")),
+        ("tab", "\t", Some("started")),
+        ("newline", "\n", Some("started")),
+        ("unhandled", "  ", None),
+    ] {
+        writeln!(input, "{}", json!({"type":"prompt","id":id,"message":text})).unwrap();
+        input.flush().unwrap();
+        let mut response = None;
+        let mut ended = None;
+        let mut observed = Vec::new();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == id {
+                response = Some(event.clone());
+            }
+            if event["type"] == "agent_end" {
+                ended = Some(event.clone());
+            }
+            observed.push(event.clone());
+            if event["type"] == "agent_settled" {
+                break;
+            }
+        }
+        let response = response.expect("prompt response");
+        if let Some(disposition) = disposition {
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["data"]["disposition"], disposition, "{response}");
+            if disposition == "started" {
+                let ended = ended.expect("agent_end for transformed input");
+                assert_eq!(ended["success"], true, "{ended}; events: {observed:?}");
+            }
+        } else {
+            assert_eq!(response["success"], false, "{response}");
+        }
+    }
+    for command in ["steer", "follow_up"] {
+        writeln!(
+            input,
+            "{}",
+            json!({"type":command,"id":command,"message":""})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC queued input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == command {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    server.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let events: Vec<Value> = std::fs::read_to_string(root.path().join("input-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["", " ", "\t", "\n", "  ", "", ""]
+    );
+    assert!(events.iter().all(|event| event["source"] == "rpc"));
+}
+
+#[cfg(unix)]
+#[test]
 fn extension_command_can_trigger_model_in_print_and_json_modes() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
