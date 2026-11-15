@@ -70,7 +70,7 @@ impl Task {
         self.background
     }
 
-    pub(crate) fn as_task_tool(mut self) -> Self {
+    pub(crate) fn into_task_tool(mut self) -> Self {
         self.task_tool = true;
         self
     }

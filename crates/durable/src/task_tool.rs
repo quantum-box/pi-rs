@@ -153,7 +153,7 @@ impl TaskTool {
             )
         })
         .map_err(|error| format!("task creation: {error:?}"))?
-        .as_task_tool();
+        .into_task_tool();
         documents.stage_task_tool_child(key, &identity, &input, child, self.handler.clone())
     }
 }
@@ -222,7 +222,7 @@ impl TaskTool {
                 input,
             )
         })
-        .map(|task| task.as_task_tool())
+        .map(|task| task.into_task_tool())
         .map_err(|e| format!("task creation: {e:?}"))
     }
     pub(crate) fn handler(&self) -> Arc<dyn crate::task_scheduler::Handler> {

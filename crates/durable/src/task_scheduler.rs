@@ -1851,14 +1851,14 @@ mod tests {
                 true,
                 4,
             )
-            .as_task_tool();
+            .into_task_tool();
             let children: Vec<_> = ["err", "panic", "invalid", "ok"]
                 .into_iter()
                 .enumerate()
                 .map(|(i, kind)| {
                     let mut child =
                         task(i as u128 + 2, TaskOwner::Task(parent.id()), kind, true, 4)
-                            .as_task_tool();
+                            .into_task_tool();
                     child.start().unwrap();
                     child.wait(WaitFor::Signal("hold".into())).unwrap();
                     child
@@ -1984,7 +1984,7 @@ mod tests {
             true,
             4,
         )
-        .as_task_tool();
+        .into_task_tool();
         scheduler.submit(&parent).unwrap();
         assert!(scheduler.tick(0).unwrap());
         let child = id.lock().unwrap().unwrap();
@@ -2041,11 +2041,11 @@ mod tests {
                 false,
                 4,
             )
-            .as_task_tool();
+            .into_task_tool();
             if scenario == "interrupted" {
                 parent.start().unwrap();
             }
-            let mut a = task(2, TaskOwner::Task(parent.id()), "child", true, 4).as_task_tool();
+            let mut a = task(2, TaskOwner::Task(parent.id()), "child", true, 4).into_task_tool();
             let mut b = task(
                 3,
                 TaskOwner::Task(parent.id()),
@@ -2053,7 +2053,7 @@ mod tests {
                 true,
                 4,
             )
-            .as_task_tool();
+            .into_task_tool();
             // Same handler kind as nested children, but generic: never identify by kind.
             let mut generic = task(4, TaskOwner::Task(parent.id()), "child", true, 4);
             let mut external = task(

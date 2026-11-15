@@ -26,7 +26,7 @@ fn task_tool_marker_survives_owned_document_updates_and_legacy_records() {
         true,
         4,
     )
-    .as_task_tool();
+    .into_task_tool();
     ts.save(&[Save::Create(&root)]).unwrap();
     let address = Address {
         scope: "marker".into(),
