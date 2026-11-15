@@ -18,6 +18,10 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Single-line extension input dialogs remove pasted line breaks and expand tabs
+to four spaces, while multiline editor dialogs normalize CRLF and CR to newlines.
+The native one MiB response limit applies after paste sanitization and expansion.
+
 Visible thinking blocks render Markdown with the thinking text style and
 preserve the Markdown theme's explicit colors. As in Pi, Mermaid fences in
 thinking remain code rather than being transformed into diagrams.
