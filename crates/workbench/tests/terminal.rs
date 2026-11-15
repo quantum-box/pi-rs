@@ -1254,14 +1254,29 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
             0
         );
         let current = unsafe { current.assume_init() };
-        if current.c_lflag == initial_termios.c_lflag
+        // PENDIN is a transient kernel typeahead flag on macOS and Linux.
+        if current.c_lflag & !libc::PENDIN == initial_termios.c_lflag & !libc::PENDIN
             && current.c_iflag == initial_termios.c_iflag
             && current.c_oflag == initial_termios.c_oflag
+            && current.c_cflag == initial_termios.c_cflag
             && current.c_cc == initial_termios.c_cc
         {
             break;
         }
-        assert!(Instant::now() < deadline, "terminal was not restored");
+        assert!(
+            Instant::now() < deadline,
+            "terminal was not restored: lflag={:#x}/{:#x}, iflag={:#x}/{:#x}, oflag={:#x}/{:#x}, cflag={:#x}/{:#x}, cc={:?}/{:?}",
+            current.c_lflag,
+            initial_termios.c_lflag,
+            current.c_iflag,
+            initial_termios.c_iflag,
+            current.c_oflag,
+            initial_termios.c_oflag,
+            current.c_cflag,
+            initial_termios.c_cflag,
+            current.c_cc,
+            initial_termios.c_cc,
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
@@ -1269,11 +1284,25 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
         unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
-    let mut queued = [0; 128];
-    let count = slave
-        .read(&mut queued)
-        .expect("next owner's terminal input");
-    assert_eq!(&queued[..count], b"next shell command\n");
+    let expected = b"next shell command\n";
+    let mut queued = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while queued.len() < expected.len() {
+        let mut buffer = [0; 128];
+        match slave.read(&mut buffer) {
+            Ok(0) => panic!("terminal closed before handoff input"),
+            Ok(count) => queued.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => panic!("next owner's terminal input: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "incomplete handoff input: {queued:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(queued, expected);
     process
         .0
         .stdin
