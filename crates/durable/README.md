@@ -1664,3 +1664,26 @@ never refitted after a model change. These are pi-rs extensions: upstream
 exposes `fitImages` for the host to call before submit, not a general
 user-admission hook. Installing a tool-result fit extension alone does not
 select these APIs.
+
+### Explicit task document ownership
+
+`TaskDocuments::acquire_owned` acquires a currently absent address for the
+executing task; `Transaction::acquire_task_document` stages the same explicit
+association in a checked transaction. Existing unowned documents cannot be
+implicitly acquired, and metadata is permanent: choose an unused address.
+Unregistered addresses and their arbitrary host scopes keep their former
+behavior. Registered addresses are checked against the candidate task inside
+the store's transaction, including writes made through raw `Store::commit`.
+Completing retains the document. Terminal settlement retires the live document
+in the same commit; a new document staged in that terminal commit never becomes
+live. Owner records cannot be deleted or resurrected once a document is owned.
+
+`Documents::watch_task_document` and `resume_task_document_watch` expose a
+pull watch with `ended()`. Retirement carries the last delivered value and no
+operations; the watch ends after its terminal retirement is consumed. If the
+document was already absent, it ends after the available changes are drained.
+This does not implement upstream document definitions, incarnation semantics,
+observer lifecycle, or automatic wakeups. Raw writes to ownership metadata are
+internal protocol operations. Direct SQLite writes bypass this protocol. Each
+store commit currently scans ownership metadata, so large deployments should
+account for its cost.

@@ -88,6 +88,49 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
+/// Metadata key for explicit ownership of one exact document storage key.
+/// This namespace is internal to the task-document protocol.
+pub fn task_document_owner_key(document_key: &[u8]) -> Result<Vec<u8>, Error> {
+    if !document_key.starts_with(b"durable/document/") {
+        return Err(Error::InvalidSnapshot);
+    }
+    let mut key = b"durable/task-document-owner/".to_vec();
+    key.extend_from_slice(document_key);
+    Ok(key)
+}
+
+fn task_terminal(value: &[u8]) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_slice(value).ok()?;
+    let state = value.get("state")?;
+    if let Some(name) = state.as_str() {
+        return match name {
+            "Cancelled" => Some(true),
+            "Ready" | "Running" => Some(false),
+            _ => None,
+        };
+    }
+    let state = state.as_object()?;
+    if state.len() != 1 {
+        return None;
+    }
+    let (name, payload) = state.iter().next()?;
+    match name.as_str() {
+        "Succeeded" => Some(true),
+        "Failed" if payload.is_string() => Some(true),
+        "Waiting" | "Completing" => Some(false),
+        "CompletingFailed" if payload.is_string() => Some(false),
+        _ => None,
+    }
+}
+
+fn task_id_matches(value: &[u8], owner: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(value)
+        .ok()
+        .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
+        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+        .is_some_and(|id| id.as_bytes().as_slice() == owner)
+}
+
 /// A single connection, safe to share between threads. Different instances
 /// opening the same database coordinate through SQLite's write lock.
 pub struct Store {
@@ -982,6 +1025,178 @@ impl Store {
                 });
             }
         }
+        // Ownership is explicit metadata keyed by the exact document key. No
+        // existing scope string is interpreted as a task scope. All validation,
+        // candidate resolution, and retirement happen under this write lock.
+        let marker_prefix = b"durable/task-document-owner/";
+        let mut owners = std::collections::HashMap::<Vec<u8>, Vec<u8>>::new();
+        {
+            let end = prefix_end(marker_prefix).ok_or(Error::InvalidSnapshot)?;
+            let mut stmt =
+                tx.prepare("SELECT key,value FROM durable_store_entries WHERE key>=?1 AND key<?2")?;
+            let rows = stmt.query_map(params![marker_prefix.as_slice(), end], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (marker, owner) = row?;
+                let doc = marker
+                    .strip_prefix(marker_prefix)
+                    .ok_or(Error::InvalidSnapshot)?
+                    .to_vec();
+                if !doc.starts_with(b"durable/document/") || owner.len() != 16 {
+                    return Err(Error::InvalidSnapshot);
+                }
+                owners.insert(doc, owner);
+            }
+        }
+        for mutation in mutations {
+            let (key, value) = match mutation {
+                Mutation::Put { key, value } => (key, Some(value)),
+                Mutation::Delete { key } => (key, None),
+            };
+            if let Some(doc) = key.strip_prefix(marker_prefix) {
+                let value = value.ok_or(Error::InvalidSnapshot)?;
+                if !doc.starts_with(b"durable/document/") || value.len() != 16 {
+                    return Err(Error::InvalidSnapshot);
+                }
+                if owners.contains_key(doc) {
+                    return Err(Error::Conflict { key: key.clone() });
+                }
+                // Explicit acquisition never silently takes over an existing host document.
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+                    [doc],
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    return Err(Error::Conflict { key: doc.to_vec() });
+                }
+                owners.insert(doc.to_vec(), value.clone());
+            }
+        }
+        let mut task_candidates = std::collections::HashMap::<Vec<u8>, Option<Vec<u8>>>::new();
+        for mutation in mutations {
+            let (key, value) = match mutation {
+                Mutation::Put { key, value } => (key, Some(value.clone())),
+                Mutation::Delete { key } => (key, None),
+            };
+            if let Some(id) = key.strip_prefix(b"durable/task/") {
+                if id.len() == 16 && owners.values().any(|owner| owner.as_slice() == id) {
+                    if task_candidates.insert(id.to_vec(), value).is_some() {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                }
+            }
+        }
+        let mut states = std::collections::HashMap::<Vec<u8>, bool>::new();
+        for owner in owners.values() {
+            if states.contains_key(owner) {
+                continue;
+            }
+            let mut key = b"durable/task/".to_vec();
+            key.extend_from_slice(owner);
+            let value = match task_candidates.get(owner) {
+                Some(value) => value.clone(),
+                None => tx
+                    .query_row(
+                        "SELECT value FROM durable_store_entries WHERE key=?1",
+                        [&key],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
+            };
+            let state = value
+                .as_deref()
+                .filter(|value| task_id_matches(value, owner))
+                .and_then(task_terminal)
+                .ok_or_else(|| Error::Conflict { key: key.clone() })?;
+            states.insert(owner.clone(), state);
+        }
+        // Once a task with acquired documents is terminal, a raw task write
+        // cannot resurrect it and thereby reopen its document addresses.
+        let mut settling = std::collections::HashSet::new();
+        for (owner, candidate) in &task_candidates {
+            let mut task_key = b"durable/task/".to_vec();
+            task_key.extend_from_slice(owner);
+            let previous: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM durable_store_entries WHERE key=?1",
+                    [&task_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let previous_terminal = previous.as_deref().and_then(task_terminal);
+            if candidate.as_deref().and_then(task_terminal) == Some(true)
+                && (previous.is_none() || previous_terminal == Some(false))
+            {
+                settling.insert(owner.clone());
+            }
+            if previous_terminal == Some(true)
+                && candidate.as_deref().and_then(task_terminal) != Some(true)
+            {
+                return Err(Error::Conflict { key: task_key });
+            }
+        }
+        for mutation in mutations {
+            if let Mutation::Put { key, value: owner } = mutation {
+                if key.starts_with(marker_prefix) && states[owner] {
+                    let mut task_key = b"durable/task/".to_vec();
+                    task_key.extend_from_slice(owner);
+                    let previous: Option<Vec<u8>> = tx
+                        .query_row(
+                            "SELECT value FROM durable_store_entries WHERE key=?1",
+                            [&task_key],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    // A terminal candidate is allowed only when this commit
+                    // actually settles a previously live (or newly created) task.
+                    if !task_candidates.contains_key(owner)
+                        || previous
+                            .as_deref()
+                            .is_some_and(|value| task_terminal(value) != Some(false))
+                    {
+                        return Err(Error::Conflict { key: task_key });
+                    }
+                }
+            }
+        }
+        let mut effective = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            let key = match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+            };
+            let policy_document = key.strip_prefix(b"durable/document-policy/").map(|suffix| {
+                let mut document = b"durable/document/".to_vec();
+                document.extend_from_slice(suffix);
+                document
+            });
+            if let Some(owner) = owners
+                .get(key)
+                .or_else(|| policy_document.as_ref().and_then(|doc| owners.get(doc)))
+            {
+                if states[owner] {
+                    if !settling.contains(owner) {
+                        return Err(Error::Conflict { key: key.clone() });
+                    }
+                    continue; // terminal candidate retires both prior and staged content
+                }
+            }
+            effective.push(mutation.clone());
+        }
+        for (doc, owner) in &owners {
+            if states[owner] && task_candidates.contains_key(owner) {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+                    [doc],
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    effective.push(Mutation::Delete { key: doc.clone() });
+                }
+            }
+        }
+        let mutations = effective.as_slice();
         let sequence = if mutations.is_empty() {
             None
         } else {

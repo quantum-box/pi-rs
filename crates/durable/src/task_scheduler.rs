@@ -1713,6 +1713,10 @@ fn request_abort_subtree_with(
 }
 
 #[cfg(test)]
+#[path = "task_document_tests.rs"]
+mod task_document_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -529,6 +529,59 @@ impl DocumentWatch<'_> {
     }
 }
 
+/// Pull watch for an explicitly acquired task document. It ends after the
+/// terminal commit's retirement has been delivered (or after all changes have
+/// been drained if the document was already absent).
+pub struct TaskDocumentWatch<'a> {
+    inner: DocumentWatch<'a>,
+    owner: uuid::Uuid,
+    last: Option<Document>,
+    ended: bool,
+}
+impl TaskDocumentWatch<'_> {
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+    pub fn cursor(&self) -> u64 {
+        self.inner.cursor()
+    }
+    pub fn poll(&mut self, limit: usize) -> Result<Vec<DocumentOperationFrame>, Error> {
+        if self.ended {
+            return Ok(Vec::new());
+        }
+        let boundary = self.inner.store.commit_sequence()?;
+        let stored = crate::task_store::TaskStore::new(self.inner.store).load(self.owner)?;
+        let terminal = if let Some(stored) = stored.filter(|s| s.task.is_terminal()) {
+            let key = crate::task_store::key(self.owner);
+            match self.inner.store.commit_for_version(&key, stored.version)? {
+                Some(seq) if seq <= boundary => {
+                    Some(self.inner.store.document_revision_for_commit(seq)?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut frames = self.inner.poll_operations(limit)?;
+        for frame in &mut frames {
+            if frame.retired {
+                frame.document = self.last.clone();
+            } else {
+                self.last = frame.document.clone();
+            }
+        }
+        if let Some(revision) = terminal {
+            let terminal_frame = frames
+                .iter()
+                .any(|frame| frame.retired && Some(frame.revision) == revision);
+            if terminal_frame || frames.len() < limit {
+                self.ended = true;
+            }
+        }
+        Ok(frames)
+    }
+}
+
 /// Invalid configuration for a document listener.
 #[derive(Debug, thiserror::Error)]
 #[error("document listener interval must be nonzero")]
@@ -764,6 +817,46 @@ impl<'a> Documents<'a> {
                 cursor: revision,
             },
         ))
+    }
+
+    /// Attach a pull watch to an explicitly task-owned document.
+    pub fn watch_task_document(
+        &self,
+        address: &Address,
+    ) -> Result<(DocumentRevision, TaskDocumentWatch<'a>), Error> {
+        let marker = durable_store::task_document_owner_key(&address.storage_key()?)?;
+        let entry = self.store.get(&marker)?.ok_or(Error::InvalidBatch)?;
+        let owner = uuid::Uuid::from_slice(&entry.value).map_err(|_| Error::InvalidBatch)?;
+        let (initial, inner) = self.watch(address)?;
+        let last = initial.document.clone();
+        Ok((
+            initial,
+            TaskDocumentWatch {
+                inner,
+                owner,
+                last,
+                ended: false,
+            },
+        ))
+    }
+
+    /// Resume a task-document watch from a consumed document revision.
+    pub fn resume_task_document_watch(
+        &self,
+        address: &Address,
+        cursor: u64,
+    ) -> Result<TaskDocumentWatch<'a>, Error> {
+        let marker = durable_store::task_document_owner_key(&address.storage_key()?)?;
+        let entry = self.store.get(&marker)?.ok_or(Error::InvalidBatch)?;
+        let owner = uuid::Uuid::from_slice(&entry.value).map_err(|_| Error::InvalidBatch)?;
+        let last = self.get_at(address, cursor)?;
+        let inner = self.resume_watch(address, cursor)?;
+        Ok(TaskDocumentWatch {
+            inner,
+            owner,
+            last,
+            ended: false,
+        })
     }
 
     /// Resume after a previously consumed cursor in the same database.
@@ -1042,6 +1135,27 @@ impl Transaction {
             mutations: vec![Mutation::Put {
                 key,
                 value: serde_json::to_vec(value)?,
+            }],
+        })
+    }
+    /// Explicitly acquire an absent address for a task. Acquisition and any
+    /// document write are committed atomically. Existing host documents cannot
+    /// be silently converted; ownership is permanent for this address.
+    pub fn acquire_task_document(
+        &mut self,
+        address: &Address,
+        task: uuid::Uuid,
+    ) -> Result<(), Error> {
+        let doc = address.storage_key()?;
+        let marker = durable_store::task_document_owner_key(&doc)?;
+        self.append(OwnedBatch {
+            checks: vec![Check {
+                key: marker.clone(),
+                expected: Expected::Missing,
+            }],
+            mutations: vec![Mutation::Put {
+                key: marker,
+                value: task.as_bytes().to_vec(),
             }],
         })
     }
@@ -1479,6 +1593,7 @@ pub struct TaskDocuments<'a> {
     revision: u64,
     reads: HashMap<Address, Option<Document>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
+    acquired: HashSet<Address>,
     task: crate::task::Task,
     entries: Option<PendingEntries>,
     entry_initial_len: usize,
@@ -1499,6 +1614,7 @@ impl<'a> TaskDocuments<'a> {
         Ok(Self {
             store,
             task: task.clone(),
+            acquired: HashSet::new(),
             entries: None,
             entry_initial_len: 0,
             runtime_cut: None,
@@ -1608,6 +1724,25 @@ impl<'a> TaskDocuments<'a> {
         Ok(child.task.clone())
     }
 
+    /// Read a task-owned document, acquiring an absent address for this task.
+    /// Existing owned addresses may be reacquired by the same task; an
+    /// unowned existing document is never implicitly taken over.
+    pub fn acquire_owned(&mut self, address: &Address) -> Result<Option<Document>, Error> {
+        if self.acquired.contains(address) {
+            return self.get(address);
+        }
+        let doc = self.get(address)?;
+        let key = durable_store::task_document_owner_key(&address.storage_key()?)?;
+        match self.store.get(&key)? {
+            Some(entry) if entry.value == self.task.id().as_bytes() => {}
+            Some(_) => return Err(Error::InvalidBatch),
+            None if doc.is_none() => {
+                self.acquired.insert(address.clone());
+            }
+            None => return Err(Error::InvalidBatch),
+        }
+        Ok(doc)
+    }
     pub fn get(&mut self, address: &Address) -> Result<Option<Document>, Error> {
         if let Some(value) = self.writes.get(address) {
             return Ok(value.as_ref().map(|value| Document {
@@ -1808,6 +1943,17 @@ impl<'a> TaskDocuments<'a> {
             checks: Vec::new(),
             mutations: Vec::new(),
         };
+        for address in &self.acquired {
+            let key = durable_store::task_document_owner_key(&address.storage_key()?)?;
+            batch.checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            });
+            batch.mutations.push(Mutation::Put {
+                key,
+                value: self.task.id().as_bytes().to_vec(),
+            });
+        }
         for address in self.reads.keys() {
             let key = address.storage_key()?;
             batch.checks.push(Check {
