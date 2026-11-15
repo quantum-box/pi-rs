@@ -18,6 +18,9 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
+using its official System One endpoint and `OPENCODE_API_KEY`.
+
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
 and is used only for endpoints declared by that profile; keys with an explicit

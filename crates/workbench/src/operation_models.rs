@@ -599,6 +599,7 @@ pub(super) fn official_base(provider: &str) -> Option<&'static str> {
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "vercel-ai-gateway" => Some("https://ai-gateway.vercel.sh/typesafe/v1"),
         "cloudflare-workers-ai" => Some(CLOUDFLARE_TEMPLATE),
+        "opencode" => Some("https://opencode.ai/inference/systemone/v1"),
         _ => None,
     }
 }
@@ -768,6 +769,7 @@ impl Entry {
                 ("openrouter", true) => "OPENROUTER_API_KEY",
                 ("vercel-ai-gateway", true) => "AI_GATEWAY_API_KEY",
                 ("cloudflare-workers-ai", true) => "CLOUDFLARE_API_KEY",
+                ("opencode", true) => "OPENCODE_API_KEY",
                 _ => return None,
             };
             env(key)
@@ -1182,6 +1184,54 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_classifier_catalogue_uses_endpoint_bound_credentials() {
+        let catalog = Catalogue::parse(&Map::new()).unwrap();
+        let models: Vec<_> = catalog
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "opencode")
+            .collect();
+        assert_eq!(models.len(), 2);
+        let paid = models
+            .iter()
+            .find(|entry| entry.model.id == "jev-1.13")
+            .unwrap();
+        let free = models
+            .iter()
+            .find(|entry| entry.model.id == "jev-1.13-free")
+            .unwrap();
+        assert_eq!(
+            paid.endpoint.as_str(),
+            "https://opencode.ai/inference/systemone/v1/systemone"
+        );
+        assert_eq!(paid.descriptor()["contextWindow"], 32000);
+        assert_eq!(paid.descriptor()["input"], json!(["text"]));
+        assert_eq!(paid.descriptor()["cost"]["input"], 0.042);
+        assert_eq!(free.descriptor()["cost"]["input"].as_f64(), Some(0.0));
+        let empty = Keys::parse(&json!({}));
+        let env = |name: &str| (name == "OPENCODE_API_KEY").then(|| "fixture-key".to_owned());
+        assert_eq!(
+            paid.credential_with_env(&empty, env).unwrap().literal(),
+            Some("fixture-key")
+        );
+        let saved = Keys::parse(&json!({"opencode":{"type":"api_key","key":"saved-key"}}));
+        assert_eq!(
+            paid.credential_with_env(&saved, |_| None)
+                .unwrap()
+                .literal(),
+            Some("saved-key")
+        );
+        let config = json!({"opencode":{"baseUrl":"http://127.0.0.1:1"}});
+        let custom = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let model = custom
+            .0
+            .iter()
+            .find(|entry| entry.provider == "opencode")
+            .unwrap();
+        assert!(model.credential_with_env(&saved, env).is_none());
+    }
 
     #[test]
     fn vercel_builtin_classifier_catalogue_is_endpoint_bound() {
