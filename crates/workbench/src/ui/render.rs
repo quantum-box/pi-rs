@@ -26,6 +26,7 @@ pub struct Span {
     // Search-only text may retain U+0085; `text` is always terminal-safe.
     search_text: Option<String>,
     base_text: bool,
+    thinking_link: bool,
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
@@ -44,6 +45,7 @@ impl Span {
             text: clean(&text),
             search_text,
             base_text: false,
+            thinking_link: false,
             color,
             background: None,
             bold: false,
@@ -486,6 +488,8 @@ impl Entry {
                     if span.base_text {
                         span.color = theme.color("thinkingText");
                         span.dim = theme.is_dim("thinkingText");
+                        span.italic = true;
+                    } else if span.thinking_link {
                         span.italic = true;
                     }
                 }
@@ -1684,11 +1688,13 @@ fn markdown_at_depth(
                                             .checked_sub(1)
                                             .and_then(|index| SYNTAX_ROLES.get(index))
                                             .map_or("text", |(_, role)| *role);
-                                        Span::themed(
+                                        let mut span = Span::themed(
                                             text.strip_suffix('\n').unwrap_or(text),
                                             theme,
                                             role,
-                                        )
+                                        );
+                                        span.base_text = false;
+                                        span
                                     })
                                     .collect::<Vec<_>>()
                             })
@@ -1859,6 +1865,7 @@ fn markdown_at_depth(
                         (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
                     });
                     span.italic = italic > 0;
+                    span.thinking_link = heading == 0 && !links.is_empty();
                     span.strikethrough = strikethrough > 0;
                     if is_text
                         && links.is_empty()
@@ -1899,6 +1906,7 @@ fn markdown_at_depth(
                             link.set_source(&label);
                             link.color = theme.color("mdLink");
                             link.base_text = false;
+                            link.thinking_link = heading == 0;
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
                             link.hyperlink =
@@ -2912,7 +2920,7 @@ mod tests {
         json["colors"]["thinkingText"] = serde_json::json!("#ff0000");
         let theme = Theme::parse(&json.to_string(), None).unwrap();
         let entry = Entry::Thinking(
-            "plain **bold** `code`\n\n```mermaid\nflowchart LR\nA --> B\n```".into(),
+            "plain **bold** `code` [label](https://example.org) https://example.com\n\n```rust\nlet value = 42;\n```\n\n```mermaid\nflowchart LR\nA --> B\n```".into(),
         );
         let options = TranscriptOptions {
             mermaid: super::super::mermaid::Mermaid::Final,
@@ -2935,6 +2943,17 @@ mod tests {
         );
         assert!(spans.iter().any(|s| s.text.contains("```mermaid")));
         assert!(spans.iter().any(|s| s.text.contains("A --> B")));
+        for label in ["label", "https://example.com"] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.text == label && s.italic && s.color == theme.color("mdLink")),
+                "{label}"
+            );
+        }
+        assert!(spans.iter().any(|s| s.text.contains("value")
+            && !s.italic
+            && s.color != theme.color("thinkingText")));
     }
 
     #[test]
