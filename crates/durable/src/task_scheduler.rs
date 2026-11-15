@@ -1086,14 +1086,14 @@ impl Scheduler {
                             }
                         }
                     }
-                    let new_children: HashSet<_> = children
+                    let new_children: HashMap<_, _> = children
                         .iter()
-                        .map(Task::id)
+                        .map(|child| (child.id(), child))
                         .chain(
                             staged
                                 .iter()
                                 .filter(|(_, _, p)| !p.mutations.is_empty())
-                                .map(|(_, _, p)| p.child),
+                                .map(|(_, child, p)| (p.child, child)),
                         )
                         .collect();
                     validate_wait_graph(owner.store(), next.task.id(), waiting, &new_children)?;
@@ -1427,7 +1427,7 @@ fn validate_wait_graph(
     store: &durable_store::Store,
     waiter: Uuid,
     targets: &[Uuid],
-    new_children: &HashSet<Uuid>,
+    new_children: &HashMap<Uuid, &Task>,
 ) -> Result<(), Error> {
     let tasks = TaskStore::new(store).list()?;
     let by_id: HashMap<_, _> = tasks
@@ -1441,10 +1441,13 @@ fn validate_wait_graph(
         if id == waiter {
             return Err(Error::Ownership);
         }
-        if new_children.contains(&id) {
-            continue;
-        }
-        let task = by_id.get(&id).ok_or(Error::Ownership)?;
+        // A newly created task can acquire pre-existing orphan descendants;
+        // inspect them too instead of assuming a fresh ID has no graph edges.
+        let task = by_id
+            .get(&id)
+            .copied()
+            .or_else(|| new_children.get(&id).copied())
+            .ok_or(Error::Ownership)?;
         // A terminal wait target is already settled, but a terminal task
         // reached through ownership can lead to an owned conversation with
         // newly admitted live work.
@@ -1881,6 +1884,38 @@ mod tests {
                 .unwrap();
             assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
         }
+    }
+
+    #[test]
+    fn new_waited_child_cannot_adopt_an_orphan_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("waiter", true, |parent: &Task| {
+            let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
+            Ok(Step::Wait {
+                checkpoint: cp("wait"),
+                condition: WaitFor::TasksAny(vec![child.id()]),
+                children: vec![child],
+            })
+        });
+        registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register("orphan", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let waiter = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "waiter",
+            true,
+            3,
+        );
+        let mut orphan = task(3, TaskOwner::Task(Uuid::from_u128(2)), "orphan", true, 3);
+        orphan.start().unwrap();
+        orphan.wait(WaitFor::TasksAny(vec![waiter.id()])).unwrap();
+        scheduler
+            .ts()
+            .save(&[Save::Create(&waiter), Save::Create(&orphan)])
+            .unwrap();
+        assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
     }
     #[test]
     fn completing_survives_reopen_without_parent_definition_and_wakes_child() {
