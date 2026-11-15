@@ -186,6 +186,12 @@ impl OpenAiResponses {
 
     fn apply_cache(&self, body: &mut Value) {
         if self.provider == "openai-chatgpt" {
+            let object = body.as_object_mut().expect("Responses request object");
+            object.remove("prompt_cache_retention");
+            object.remove("prompt_cache_options");
+            if self.cache_retention == CacheRetention::None {
+                object.remove("prompt_cache_key");
+            }
             return;
         }
         if self.cache_retention == CacheRetention::None {
@@ -1339,6 +1345,10 @@ mod tests {
         let mut body = json!({});
         plan.with_cache_retention(CacheRetention::Long, true)
             .apply_cache(&mut body);
+        assert_eq!(body, json!({}));
+        let plan = OpenAiResponses::new("http://localhost/responses", "token".into()).unwrap();
+        let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
+        plan.without_cache().apply_cache(&mut body);
         assert_eq!(body, json!({}));
     }
 
