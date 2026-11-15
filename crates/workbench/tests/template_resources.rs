@@ -106,6 +106,15 @@ fn directory_grants_load_only_sorted_direct_markdown_files() {
             .collect::<Vec<_>>(),
         ["explicit", ".hidden", "", "a", "z"]
     );
+    let dot_md = TemplateReadGrants {
+        files: vec![directory.join(".md")],
+    }
+    .load()
+    .unwrap();
+    assert_eq!(
+        (dot_md[0].name.as_str(), dot_md[0].body.as_str()),
+        ("", "empty name")
+    );
     assert!(
         grants
             .load_with_directories(&[directory, root.path().join("missing")])
