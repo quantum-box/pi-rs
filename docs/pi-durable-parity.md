@@ -387,7 +387,7 @@ scheduler provides the same view. Unlike upstream
 notifications are hints rather than changes to `{active, at}`; polling continues,
 conversation scheduling is excluded. The driver snapshot uses a separately published definition view and the task gate, so it does not wait for a running handler; it still can wait for a task commit or migration under that gate.
 Scheduler and driver signal delivery is fenced with inspection; direct TaskStore
-writes are outside that protocol. Satisfied waits count as active even when their definition is blocked, and abort
+writes are outside that protocol. Satisfied waits with blocked definitions do not count as active; abort
 cleanup candidates may still depend on conversations. Fail-fast sibling cleanup
 is not independently represented. See [snapshot tests](../crates/durable/tests/task_wake_snapshot.rs).
 

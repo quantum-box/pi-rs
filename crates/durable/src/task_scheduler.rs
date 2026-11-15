@@ -345,9 +345,17 @@ impl WakeReader {
                         | WaitFor::TypedSleep { until_millis, .. } => *until_millis,
                         _ => None,
                     };
-                    if ts.wait_ready(item, now_millis)? {
+                    let ready = ts.wait_ready(item, now_millis)?;
+                    if ready
+                        && ((reason.is_none() && definitions.ancestors_available(task, &tasks))
+                            || (task.abort_requested()
+                                && !tasks.iter().any(|child| {
+                                    child.task.owner() == &TaskOwner::Task(task.id())
+                                        && !child.task.is_terminal()
+                                })))
+                    {
                         result.active = true;
-                    } else if let Some(at) = deadline.filter(|at| *at > now_millis) {
+                    } else if !ready && let Some(at) = deadline.filter(|at| *at > now_millis) {
                         result.at = Some(result.at.map_or(at, |old| old.min(at)));
                     }
                 }

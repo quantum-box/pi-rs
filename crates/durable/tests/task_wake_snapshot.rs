@@ -75,6 +75,9 @@ fn clock_reopen_and_registry_snapshot_do_not_run_handlers() {
             .iter()
             .all(|b| b.reason == BlockedReason::MissingTask)
     );
+    let due_but_unregistered = scheduler.wake_snapshot(100).unwrap();
+    assert!(!due_but_unregistered.active);
+    assert_eq!(due_but_unregistered.at, Some(200));
     scheduler.replace_registry(registry(calls.clone())).unwrap();
     assert!(scheduler.wake_snapshot(99).unwrap().blocked.is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -122,13 +125,19 @@ fn inspecting_a_signalled_wait_does_not_consume_it() {
             children: vec![],
         })
     });
-    let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+    let mut scheduler = Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
     let task = task(3, "signal");
     scheduler.submit(&task).unwrap();
     scheduler.tick(0).unwrap();
     assert_eq!(scheduler.wake_snapshot(0).unwrap().at, Some(100));
     let signal = Signal::new(Uuid::new_v4(), task.id(), "go".into(), json!(1));
     scheduler.signal(&signal).unwrap();
+    scheduler.replace_registry(Registry::default()).unwrap();
+    let blocked = scheduler.wake_snapshot(0).unwrap();
+    assert!(!blocked.active);
+    assert_eq!(blocked.at, None);
+    assert_eq!(blocked.blocked.len(), 1);
+    scheduler.replace_registry(registry).unwrap();
     for _ in 0..2 {
         let snap = scheduler.wake_snapshot(0).unwrap();
         assert!(snap.active);

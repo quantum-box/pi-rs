@@ -1338,14 +1338,14 @@ initially signaled and later hints coalesce; notifications may be spurious and
 close on shutdown or failure. After a hint, `Driver::wake_snapshot(now_millis)`
 reads the task state and registry at a scheduling boundary without invoking
 handlers or migrations. `active` reports ready executable tasks, running work,
-abort cleanup candidates and waits that can be polled now. `at` is the earliest
+abort cleanup candidates and executable waits that can be polled now. `at` is the earliest
 future durable task deadline; `blocked` lists live definition failures. The
-explicit clock is Unix milliseconds. A satisfied wait counts as active even if
-its definition is blocked, because the scheduler can still persist its wake.
+explicit clock is Unix milliseconds. A satisfied wait with a blocked definition
+does not count as active until that definition becomes executable.
 The standalone task scheduler exposes the same inspection method.
 
-Inspection waits for an in-flight synchronous handler and can become stale as
-soon as it returns. Signal and child wait evaluation reads additional records;
+Inspection does not wait for an in-flight synchronous handler, but can wait for
+a task commit and become stale as soon as it returns. Signal and child wait evaluation reads additional records;
 driver and scheduler signal delivery is fenced by the task gate; direct unfenced
 TaskStore writers are outside the consistency protocol. Abort
 cleanup may still depend on foreground conversations, and fail-fast sibling
