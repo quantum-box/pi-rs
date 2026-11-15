@@ -86,9 +86,38 @@ impl Drop for WorkerPermit {
 fn worker_limit() -> usize {
     std::env::var("PI_CODEMODE_MAX_WORKERS")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0 && *value <= 1024)
+        .and_then(|value| parse_worker_limit(&value))
         .unwrap_or(2)
+}
+
+fn parse_worker_limit(value: &str) -> Option<usize> {
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let radix_number = |digits: &str, radix| {
+        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
+            .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
+            .flatten()
+    };
+    // Pi uses JavaScript Number(), which also accepts unsigned radix prefixes.
+    let number = if let Some(digits) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        radix_number(digits, 16)?
+    } else if let Some(digits) = value
+        .strip_prefix("0o")
+        .or_else(|| value.strip_prefix("0O"))
+    {
+        radix_number(digits, 8)?
+    } else if let Some(digits) = value
+        .strip_prefix("0b")
+        .or_else(|| value.strip_prefix("0B"))
+    {
+        radix_number(digits, 2)?
+    } else {
+        value.parse::<f64>().ok()?
+    };
+    (number.is_finite() && number.fract() == 0.0 && number > 0.0 && number <= 1024.0)
+        .then_some(number as usize)
 }
 
 async fn acquire_worker(
@@ -1303,6 +1332,18 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
+        for value in ["3", " 3 ", "3.0", "3e0", "+3", "0x3", "0o3", "0b11"] {
+            assert_eq!(parse_worker_limit(value), Some(3), "{value:?}");
+        }
+        for value in [
+            "", "0", "-1", "1.5", "NaN", "Infinity", "1025", "3workers", "+0x3", "0x+3",
+        ] {
+            assert_eq!(parse_worker_limit(value), None, "{value:?}");
+        }
+    }
 
     #[tokio::test]
     async fn worker_admission_is_bounded_and_cancellable_without_leaking_permits() {

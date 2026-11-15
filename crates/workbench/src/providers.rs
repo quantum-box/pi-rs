@@ -1,4 +1,5 @@
 //! Provider selection and shared workbench catalog and progress controls.
+use futures_util::StreamExt;
 use std::collections::BTreeMap;
 
 use pi_rs::anthropic::Anthropic;
@@ -563,6 +564,7 @@ impl Client {
         request: ModelRequest,
         defaults: &HeaderMap,
         cache_disabled: bool,
+        session_cache_key: Option<&str>,
     ) -> Result<ModelStream> {
         match self {
             Self::Ollama(client) if cache_disabled => {
@@ -578,6 +580,16 @@ impl Client {
                     .with_default_headers(defaults)
                     .stream(request)
                     .await
+            }
+            Self::OpenAi(client) => {
+                let client = if cache_disabled {
+                    client.clone().without_cache()
+                } else if let Some(key) = session_cache_key {
+                    client.clone().with_session_cache_key(key)
+                } else {
+                    client.clone()
+                };
+                client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
@@ -608,10 +620,63 @@ impl Client {
                     request,
                     defaults,
                     cache_disabled,
+                    session_cache_key,
                 ))
                 .await
             }
             _ => self.stream(request).await,
+        }
+    }
+
+    pub async fn stream_enriched_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        match self {
+            Self::OpenAi(client) => {
+                if cache_disabled {
+                    client
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else if let Some(key) = session_cache_key {
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            key,
+                            request,
+                        )
+                        .await
+                } else {
+                    let stream = client.stream(request).await?;
+                    Ok(Box::pin(
+                        stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                    ))
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => {
+                let stream = self
+                    .stream_with_headers(request, defaults, cache_disabled, session_cache_key)
+                    .await?;
+                Ok(Box::pin(
+                    stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                ))
+            }
         }
     }
 
@@ -909,7 +974,11 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
+                let (supports_long, explicit_cache) = args
+                    .model_profiles
+                    .responses_cache_support(&args.provider, metadata.as_ref());
                 let client = client
+                    .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_thinking(thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
@@ -1066,7 +1135,7 @@ impl Model for Client {
             Self::OpenAi(client) => client.stream(request).await,
             Self::Bedrock(client) => client.stream(request).await,
             Self::Deferred(_) => {
-                self.stream_with_headers(request, &HeaderMap::new(), false)
+                self.stream_with_headers(request, &HeaderMap::new(), false, None)
                     .await
             }
         }
@@ -2056,7 +2125,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), true)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), true, None)
                 .await
                 .unwrap();
             args.model = "anthropic.claude-opus-4-8".into();
@@ -2065,7 +2134,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             for (model, level) in [
@@ -2079,7 +2148,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2095,7 +2164,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2106,7 +2175,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.model_profiles = super::super::model_profiles::Profiles::parse(
@@ -2129,7 +2198,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2140,7 +2209,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                     .await
                     .unwrap();
             }
@@ -2152,7 +2221,7 @@ mod bedrock_tests {
                         .with_model_options(&args, false)
                         .unwrap();
                     let _stream = client
-                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                         .await
                         .unwrap();
                 }
@@ -2173,7 +2242,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let _stream = client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.thinking = Some("low".into());
@@ -2183,7 +2252,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let error = match client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
             {
                 Ok(_) => panic!("invalid selected budget accepted"),

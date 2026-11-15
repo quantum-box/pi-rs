@@ -116,6 +116,13 @@ impl Resources {
         };
         for additional in additions {
             for (name, skill) in additional.skills {
+                if resources
+                    .skills
+                    .values()
+                    .any(|existing| same_resource_file(&existing.path, &skill.path))
+                {
+                    continue;
+                }
                 match resources.skills.entry(name.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(skill);
@@ -476,7 +483,7 @@ impl Resources {
         if let Some(command) = input.strip_prefix("/skill:") {
             let (name, arguments) = command.split_once(' ').unwrap_or((command, ""));
             if let Some(skill) = self.skills.get(name) {
-                match read_without_bom(&skill.path).and_then(|text| frontmatter(&text)) {
+                match read_resource(&skill.path).and_then(|text| frontmatter(&text)) {
                     Ok((_, body)) => {
                         let location = skill.path.display();
                         let directory = skill.path.parent().unwrap_or(Path::new(".")).display();
@@ -590,7 +597,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
         .or_else(|| path.parent()?.file_name()?.to_str().map(str::to_owned))
         .ok_or_else(|| Error::Config("skill name is required".into()))?;
     let skill = Skill {
-        path: path.canonicalize()?,
+        path: path.to_owned(),
         description: description.clone().unwrap_or_default(),
         automatic: !metadata.manual,
     };
@@ -599,7 +606,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 }
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
-    let (metadata, body) = frontmatter_with_trim(&read_resource(path)?, true)?;
+    let (metadata, body) = frontmatter(&read_resource(path)?)?;
     let mut fallback_surrogate = None;
     let description = metadata
         .description
@@ -634,15 +641,7 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
 }
 
 fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
-    frontmatter_with_trim(text, false)
-}
-
-fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, String)> {
-    let text = if prompt {
-        text.strip_prefix('\u{feff}').unwrap_or(text)
-    } else {
-        text.trim_start_matches('\u{feff}')
-    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let Some(end) = normalized
         .strip_prefix("---")
@@ -673,15 +672,7 @@ fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, Strin
             == Some(true),
     };
     let body = &normalized[end + 4..];
-    Ok((
-        metadata,
-        if prompt {
-            body.trim_matches(is_prompt_space)
-        } else {
-            body.trim()
-        }
-        .into(),
-    ))
+    Ok((metadata, body.trim_matches(is_prompt_space).into()))
 }
 fn context_file(
     directory: &Path,
@@ -974,9 +965,9 @@ mod tests {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let skill_a = root.join("first/SKILL.md");
-        let skill_b = root.join("second/SKILL.md");
-        let skill_c = root.join("third/SKILL.md");
+        let skill_a = root.join("first").join("SKILL.md");
+        let skill_b = root.join("second").join("SKILL.md");
+        let skill_c = root.join("third").join("SKILL.md");
         let prompt_a = root.join("first/greet.md");
         let prompt_b = root.join("second/greet.md");
         let prompt_c = root.join("third/greet.md");
@@ -1018,9 +1009,6 @@ mod tests {
         ];
         args.prompt_template = vec![prompt_a.clone(), prompt_b.clone()];
         let resources = Resources::load(&args).unwrap();
-        let skill_a = skill_a.canonicalize().unwrap();
-        let skill_b = skill_b.canonicalize().unwrap();
-        let skill_c = skill_c.canonicalize().unwrap();
         let skill_warning = format!(
             "Duplicate skill shared at {}; using {}",
             skill_b.display(),
@@ -1137,6 +1125,102 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("Duplicate prompt greet"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_symlink_keeps_its_location_and_deduplicates_the_target() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let root = dunce::simplified(&canonical).to_owned();
+        let target = root.join("target/SKILL.md");
+        let alias = root.join("alias/SKILL.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            "---\ndescription: example\n---\nRead reference.txt",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        args.skill = vec![
+            alias.to_string_lossy().into(),
+            target.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills.len(), 1);
+        assert_eq!(resources.skills["alias"].path, alias);
+        let expanded = resources.expand("/skill:alias").unwrap();
+        assert!(expanded.contains(&format!("location=\"{}\"", alias.display())));
+        assert!(expanded.contains(&format!(
+            "References are relative to {}.",
+            alias.parent().unwrap().display()
+        )));
+        assert!(
+            !resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate skill"))
+        );
+        let discovered = pi_rs::DiscoveredResources {
+            skill_paths: vec![target],
+            ..Default::default()
+        };
+        let resources = Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert_eq!(resources.skills.len(), 1);
+        assert_eq!(resources.skills["alias"].path, alias);
+    }
+
+    #[test]
+    fn skill_path_normalizes_dot_components_without_resolving_symlinks() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let root = canonical.clone();
+        let path = root.join("example/SKILL.md");
+        std::fs::create_dir_all(root.join("example/child")).unwrap();
+        std::fs::write(&path, "---\ndescription: example\n---\nbody").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        #[cfg(not(windows))]
+        let explicit = path
+            .parent()
+            .unwrap()
+            .join("child/../SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let explicit = format!(r"{}\example\child\..\SKILL.md", canonical.display());
+        args.skill = vec![explicit];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["example"].path, path);
+        #[cfg(not(windows))]
+        let pattern = canonical
+            .join("example/child/../*")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let pattern = format!(r"{}\example\child\..\*", canonical.display());
+        args.skill = vec![pattern];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["example"].path, path);
     }
 
     #[test]
@@ -1750,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_frontmatter_body_uses_ecmascript_trim_without_changing_skill_trim() {
+    fn frontmatter_body_uses_ecmascript_trim() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("review.md");
         for (input, body, description) in [
@@ -1774,7 +1858,7 @@ mod tests {
             frontmatter("---\nother: value\n---\n\u{0085}body\u{0085}")
                 .unwrap()
                 .1,
-            "body"
+            "\u{0085}body\u{0085}"
         );
     }
 
@@ -1800,8 +1884,51 @@ mod tests {
             assert_eq!(prompt.body, body);
             assert_eq!(prompt.description, description);
         }
-        // Keep existing non-prompt callers' BOM behavior.
-        assert_eq!(frontmatter("\u{feff}\u{feff}body").unwrap().1, "body");
+        assert_eq!(
+            frontmatter("\u{feff}\u{feff}body").unwrap().1,
+            "\u{feff}body"
+        );
+    }
+
+    #[test]
+    fn discovered_skill_expands_lossy_utf8_and_ecmascript_whitespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("SKILL.md");
+        let mut bytes = b"---\nname: fixture\ndescription: example\n---\n".to_vec();
+        bytes.extend_from_slice("\u{0085}".as_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice("\u{0085}".as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let (name, skill) = parse_skill(&path, &mut Vec::new()).unwrap().unwrap();
+        let resources = Resources {
+            skills: BTreeMap::from([(name, skill)]),
+            ..Resources::default()
+        };
+        let expanded = resources.expand("/skill:fixture").unwrap();
+        assert!(
+            expanded.contains("\n\n\u{0085}\u{fffd}\u{0085}\n</skill>"),
+            "{expanded:?}"
+        );
+    }
+
+    #[test]
+    fn skill_discovery_and_invocation_strip_only_one_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("SKILL.md");
+        let content = "---\nname: fixture\ndescription: example\n---\nbody";
+        std::fs::write(&path, format!("\u{feff}{content}")).unwrap();
+        let (name, skill) = parse_skill(&path, &mut Vec::new()).unwrap().unwrap();
+        let resources = Resources {
+            skills: BTreeMap::from([(name, skill)]),
+            ..Resources::default()
+        };
+        std::fs::write(&path, format!("\u{feff}\u{feff}{content}")).unwrap();
+        assert!(parse_skill(&path, &mut Vec::new()).unwrap().is_none());
+        let expanded = resources.expand("/skill:fixture").unwrap();
+        assert!(
+            expanded.contains(&format!("\n\n{content}\n</skill>")),
+            "{expanded:?}"
+        );
     }
 
     #[test]
