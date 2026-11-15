@@ -672,7 +672,7 @@ impl Model for OpenAiResponses {
         Ok(Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
-            let mut reasoning = String::new();
+            let mut reasoning: BTreeMap<u64, String> = BTreeMap::new();
             while let Some(item) = source.next().await {
                 let item = item.map_err(|error| match error {
                     EventStreamError::Transport(RawStreamError::LimitExceeded) => Error::Model("OpenAI stream exceeds 32 MiB".into()),
@@ -685,7 +685,15 @@ impl Model for OpenAiResponses {
                 started |= recognized_response_event(kind);
                 match kind {
                     "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
-                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => { let text = field(&event,"delta")?; reasoning.entry(event["output_index"].as_u64().unwrap_or_default()).or_default().push_str(text); yield ModelEvent::Reasoning(text.into()); },
+                    "response.output_item.done" if event["item"]["type"] == "reasoning" => {
+                        let item = &event["item"];
+                        let text = |key: &str| item[key].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n\n")).unwrap_or_default();
+                        let summary = text("summary");
+                        let content = text("content");
+                        let finalized = if summary.is_empty() { content } else { summary };
+                        if !finalized.is_empty() { reasoning.insert(event["output_index"].as_u64().unwrap_or_default(), finalized); }
+                    }
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
@@ -718,6 +726,7 @@ impl Model for OpenAiResponses {
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
+                        let reasoning: String = reasoning.into_values().collect();
                         yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
@@ -755,52 +764,77 @@ mod tests {
     #[tokio::test]
     async fn streams_reasoning_text_and_retains_it_in_metadata() {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut request = [0; 8192];
-            let _ = socket.read(&mut request).unwrap();
-            let events = [
-                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
-                json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"Consider "}),
-                json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"this."}),
-                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"Consider this."}]}]}}),
-            ];
-            let body: String = events
-                .iter()
-                .map(|event| format!("data: {event}\n\n"))
-                .collect();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-        });
-        let model = OpenAiResponses::new_api_provider(
-            &format!("http://{address}"),
-            "key".into(),
-            "fixture",
-        )
-        .unwrap();
-        let request = ModelRequest {
-            model: "m".into(),
-            messages: vec![],
-            tools: vec![],
-            max_output_tokens: 16,
-        };
-        let mut stream = model.stream(request).await.unwrap();
-        let mut deltas = Vec::new();
-        let mut reasoning = None;
-        let mut complete = false;
-        while let Some(event) = stream.next().await {
-            match event.unwrap() {
-                ModelEvent::Reasoning(delta) => deltas.push(delta),
-                ModelEvent::Metadata(metadata) => reasoning = metadata.reasoning,
-                ModelEvent::Complete { .. } => complete = true,
-                _ => {}
+        for mixed in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let mut events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"Consider "}),
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"this."}),
+                ];
+                let summary = if mixed {
+                    json!([{"text":"Short summary"}])
+                } else {
+                    json!([])
+                };
+                if mixed {
+                    events.push(json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Short summary"}));
+                }
+                let item = json!({"type":"reasoning","id":"rs_1","summary":summary,"content":[{"type":"reasoning_text","text":"Consider this."}]});
+                events
+                    .push(json!({"type":"response.output_item.done","output_index":0,"item":item}));
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[item]}}));
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "key".into(),
+                "fixture",
+            )
+            .unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = model.stream(request).await.unwrap();
+            let mut deltas = Vec::new();
+            let mut reasoning = None;
+            let mut complete = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::Reasoning(delta) => deltas.push(delta),
+                    ModelEvent::Metadata(metadata) => reasoning = metadata.reasoning,
+                    ModelEvent::Complete { .. } => complete = true,
+                    _ => {}
+                }
             }
+            worker.join().unwrap();
+            let expected_deltas = if mixed {
+                vec!["Consider ", "this.", "Short summary"]
+            } else {
+                vec!["Consider ", "this."]
+            };
+            assert_eq!(deltas, expected_deltas);
+            assert_eq!(
+                reasoning.as_deref(),
+                Some(if mixed {
+                    "Short summary"
+                } else {
+                    "Consider this."
+                })
+            );
+            assert!(complete);
         }
-        worker.join().unwrap();
-        assert_eq!(deltas, ["Consider ", "this."]);
-        assert_eq!(reasoning.as_deref(), Some("Consider this."));
-        assert!(complete);
     }
 
     #[tokio::test]

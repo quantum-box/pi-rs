@@ -19,7 +19,8 @@ Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
 OpenAI Responses streams both reasoning text and reasoning summary text as
-thinking deltas and retains the combined text in the completed turn metadata.
+thinking deltas. Completed reasoning items retain their summary when present,
+otherwise their content or streamed text, in the completed turn metadata.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
