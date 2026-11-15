@@ -93,8 +93,9 @@ cancels the active run and makes later run tokens inherit cancellation; ordinary
 and waits for an admitted prompt to settle so SDK cleanup can finish. After SDK
 close completes, the state drops its owned session and releases its journal
 handle; another owner may then reopen it. Close can wait if startup itself never
-settles. This example uses an in-memory session
-without extension hooks or tools; cancellation cannot undo work already begun.
+settles. The following minimal sketch uses an in-memory session without extension hooks
+or tools; it does not implement the fixture's supervised close lifecycle.
+Cancellation cannot undo work already begun.
 
 ```rust
 use std::sync::Arc;
