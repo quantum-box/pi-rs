@@ -593,59 +593,25 @@ fn host_staged_signal_atomically_wakes_single_key_and_reopens() {
 }
 
 #[test]
-fn host_staged_wake_rejects_unsupported_waits_and_preserves_delivery() {
+fn host_wake_rejects_when_no_eligible_signal_without_mutating_transaction() {
     let store = Store::memory().unwrap();
-    let id = setup(&store, None); // two-key wait
+    let id = setup(&store, None);
     let mut tx = HostTransaction::new(&store);
-    assert!(matches!(
-        tx.wake_with_staged_signal(id),
-        Err(Error::SignalComposition)
-    ));
+    assert!(tx.wake_with_signal(id).is_err());
     assert_eq!(
         tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
         SignalResult::Delivered
     );
-    assert!(tx.wake_with_staged_signal(id).is_err());
+    tx.wake_with_signal(id).unwrap();
     tx.commit().unwrap();
     let ts = TaskStore::new(&store);
-    assert!(matches!(
+    assert_eq!(
         ts.load(id).unwrap().unwrap().task.state(),
-        pi_rs_durable::task::TaskState::Waiting(_)
-    ));
+        &pi_rs_durable::task::TaskState::Ready
+    );
     assert_eq!(
         ts.read_typed_signal(id, &token(), "a").unwrap(),
         Some(json!(1))
-    );
-    // A committed duplicate is not a newly staged receipt and cannot be used.
-    let mut tx = HostTransaction::new(&store);
-    assert_eq!(
-        tx.signal_at(id, &token(), "a", json!(2), 0).unwrap(),
-        SignalResult::Duplicate
-    );
-    assert!(tx.wake_with_staged_signal(id).is_err());
-
-    let store = Store::memory().unwrap();
-    let single = setup_single(&store, None);
-    let ts = TaskStore::new(&store);
-    assert_eq!(
-        ts.deliver_signal_at(single, &token(), "a", json!(4), 0)
-            .unwrap(),
-        SignalResult::Delivered
-    );
-    let mut tx = HostTransaction::new(&store);
-    assert_eq!(
-        tx.signal_at(single, &token(), "a", json!(5), 0).unwrap(),
-        SignalResult::Duplicate
-    );
-    assert!(tx.wake_with_staged_signal(single).is_err());
-    tx.commit().unwrap();
-    assert!(matches!(
-        ts.load(single).unwrap().unwrap().task.state(),
-        pi_rs_durable::task::TaskState::Waiting(_)
-    ));
-    assert_eq!(
-        ts.read_typed_signal(single, &token(), "a").unwrap(),
-        Some(json!(4))
     );
 }
 
@@ -866,4 +832,228 @@ fn host_staged_wake_reconciles_prior_stale_task_read() {
         pi_rs_durable::task::TaskState::Waiting(_)
     ));
     assert_eq!(ts.read_typed_signal(id, &token(), "a").unwrap(), None);
+}
+
+#[test]
+fn host_wake_chooses_first_wait_key_across_committed_and_staged_signals() {
+    use pi_rs_durable::task::{TaskState, TypedWake};
+    for mode in 0..=2 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let id = setup(&store, None);
+        let ts = TaskStore::new(&store);
+        let committed = if mode == 0 { "b" } else { "a" };
+        assert_eq!(
+            ts.deliver_signal_at(id, &token(), committed, json!(7), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        let mut tx = HostTransaction::new(&store);
+        put(&mut tx, 1);
+        if mode != 2 {
+            let staged = if mode == 0 { "a" } else { "b" };
+            assert_eq!(
+                tx.signal_at(id, &token(), staged, json!(8), 0).unwrap(),
+                SignalResult::Delivered
+            );
+        }
+        tx.wake_with_signal(id).unwrap();
+        tx.commit().unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&store);
+        let task = ts.load(id).unwrap().unwrap().task;
+        assert_eq!(task.state(), &TaskState::Ready);
+        assert_eq!(
+            task.typed_wake(),
+            Some(&TypedWake::Signal(token().key("a").unwrap()))
+        );
+        let receipt = ts
+            .signal(id, task.delivered_signal().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.payload, if mode == 0 { json!(8) } else { json!(7) });
+        assert!(receipt.is_consumed());
+        if mode != 2 {
+            assert_eq!(
+                ts.read_typed_signal(id, &token(), "b").unwrap(),
+                Some(if mode == 0 { json!(7) } else { json!(8) })
+            );
+            let mut prefix = b"durable/signal/".to_vec();
+            prefix.extend_from_slice(id.as_bytes());
+            let remaining: Vec<pi_rs_durable::task_store::Signal> = store
+                .list(&prefix)
+                .unwrap()
+                .into_iter()
+                .map(|(_, entry)| serde_json::from_slice(&entry.value).unwrap())
+                .filter(|signal: &pi_rs_durable::task_store::Signal| {
+                    signal.typed_key() == Some(&token().key("b").unwrap())
+                })
+                .collect();
+            assert_eq!(remaining.len(), 1);
+            assert!(!remaining[0].is_consumed());
+        }
+        assert_eq!(
+            Documents::new(&store)
+                .get(&address())
+                .unwrap()
+                .unwrap()
+                .value["n"],
+            1
+        );
+    }
+}
+
+#[test]
+fn two_host_wakes_compete_for_existing_receipt_without_partial_writes() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let id = setup(&store, None);
+    assert_eq!(
+        TaskStore::new(&store)
+            .deliver_signal_at(id, &token(), "a", json!(7), 0)
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    let mut revision_key = b"durable/signal-revision/".to_vec();
+    revision_key.extend_from_slice(id.as_bytes());
+    let old_revision = store.get(&revision_key).unwrap().unwrap().version;
+    drop(store);
+    let barrier = Arc::new(Barrier::new(3));
+    let threads: Vec<_> = (1..=2)
+        .map(|n| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let store = Store::open(path).unwrap();
+                let mut tx = HostTransaction::new(&store);
+                put(&mut tx, n);
+                tx.wake_with_signal(id).unwrap();
+                barrier.wait();
+                tx.commit()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let outcomes: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(Error::Store(durable_store::Error::Conflict { .. }))
+            ))
+            .count(),
+        1
+    );
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let task = ts.load(id).unwrap().unwrap().task;
+    assert_eq!(task.state(), &pi_rs_durable::task::TaskState::Ready);
+    assert!(
+        ts.signal(id, task.delivered_signal().unwrap())
+            .unwrap()
+            .unwrap()
+            .is_consumed()
+    );
+    assert_eq!(
+        ts.read_typed_signal(id, &token(), "a").unwrap(),
+        Some(json!(7))
+    );
+    assert!(store.get(&revision_key).unwrap().unwrap().version > old_revision);
+    let n = Documents::new(&store)
+        .get(&address())
+        .unwrap()
+        .unwrap()
+        .value["n"]
+        .as_i64()
+        .unwrap();
+    assert!(n == 1 || n == 2);
+}
+
+#[test]
+fn host_multi_key_wake_uses_wait_order_not_staging_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let id = setup(&store, None);
+    let mut tx = HostTransaction::new(&store);
+    assert_eq!(
+        tx.signal_at(id, &token(), "b", json!(2), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    assert_eq!(
+        tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.wake_with_signal(id).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let task = ts.load(id).unwrap().unwrap().task;
+    assert_eq!(
+        task.typed_wake(),
+        Some(&pi_rs_durable::task::TypedWake::Signal(
+            token().key("a").unwrap()
+        ))
+    );
+    let selected = ts
+        .signal(id, task.delivered_signal().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.payload, json!(1));
+    assert!(selected.is_consumed());
+    let mut prefix = b"durable/signal/".to_vec();
+    prefix.extend_from_slice(id.as_bytes());
+    let rest: Vec<pi_rs_durable::task_store::Signal> = store
+        .list(&prefix)
+        .unwrap()
+        .into_iter()
+        .map(|(_, entry)| serde_json::from_slice(&entry.value).unwrap())
+        .filter(|signal: &pi_rs_durable::task_store::Signal| {
+            signal.typed_key() == Some(&token().key("b").unwrap())
+        })
+        .collect();
+    assert_eq!(rest.len(), 1);
+    assert!(!rest[0].is_consumed());
+}
+
+#[test]
+fn host_wakes_committed_signal_and_scheduler_resumes_after_reopen() {
+    use pi_rs_durable::task::{
+        TaskState, TypedWake,
+        scheduler::{Registry, Scheduler, Step},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let id = setup_single(&store, None);
+    assert_eq!(
+        TaskStore::new(&store)
+            .deliver_signal_at(id, &token(), "a", json!(7), 0)
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    let mut tx = HostTransaction::new(&store);
+    tx.wake_with_signal(id).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+    let mut registry = Registry::default();
+    registry.register("host-wake", true, |task: &Task| {
+        assert_eq!(
+            task.typed_wake(),
+            Some(&TypedWake::Signal(token().key("a").unwrap()))
+        );
+        Ok(Step::Succeed(json!("resumed")))
+    });
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    assert!(
+        matches!(scheduler.get(id).unwrap().unwrap().state(), TaskState::Succeeded(value) if *value == json!("resumed"))
+    );
 }

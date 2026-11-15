@@ -1176,7 +1176,7 @@ impl Transaction {
 }
 
 /// A store-bound checked host transaction with provisional typed deliveries.
-/// It supports multiple typed deliveries and an explicit single-key wake;
+/// It supports multiple typed deliveries and an explicit typed-signal wake;
 /// arbitrary task writes for delivery targets remain excluded.
 pub struct HostTransaction<'a> {
     store: &'a Store,
@@ -1221,7 +1221,7 @@ impl<'a> HostTransaction<'a> {
     }
     /// Stage typed deliveries. Results remain provisional until commit.
     /// Raw target task writes cannot be composed in either order; the
-    /// supported transition is `wake_with_staged_signal`.
+    /// supported transition is `wake_with_signal`.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1240,12 +1240,12 @@ impl<'a> HostTransaction<'a> {
         self.signal_targets.insert(target);
         Ok(result)
     }
-    /// Atomically consume a newly staged delivery and wake its waiting task.
-    /// Only a single-key typed wait is supported. Further signal or raw task
-    /// writes to that target are rejected after staging this transition.
-    pub fn wake_with_staged_signal(&mut self, task_id: uuid::Uuid) -> Result<(), Error> {
+    /// Wake a typed wait using committed and staged signals, choosing the first
+    /// available key in wait order. The transition and consumption are atomic.
+    /// This does not perform time-only or deadline-expiration wakes.
+    pub fn wake_with_signal(&mut self, task_id: uuid::Uuid) -> Result<(), Error> {
         let target = crate::task_store::key(task_id);
-        if !self.signal_targets.contains(&target) || self.transaction.written.contains(&target) {
+        if self.transaction.written.contains(&target) {
             return Err(Error::SignalComposition);
         }
         // Prepare in private copies so a failed validation cannot alter a
@@ -1273,7 +1273,12 @@ impl<'a> HostTransaction<'a> {
         transaction.append(graph)?;
         self.signals.batch = signals;
         self.transaction = transaction;
+        self.signal_targets.insert(target);
         Ok(())
+    }
+    /// Backward-compatible name for `wake_with_signal`.
+    pub fn wake_with_staged_signal(&mut self, task_id: uuid::Uuid) -> Result<(), Error> {
+        self.wake_with_signal(task_id)
     }
     pub fn commit(mut self) -> Result<(), Error> {
         let mut existing = OwnedBatch {

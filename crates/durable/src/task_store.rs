@@ -840,9 +840,8 @@ impl<'a> TaskStore<'a> {
         ))
     }
 
-    /// Prepare a wake from a newly staged delivery for a single-key typed wait.
-    /// The caller must commit the modified signal batch and returned task batch
-    /// together, reconciling their task and signal-revision fences.
+    /// Prepare a typed wake against both committed and staged receipts. The
+    /// caller must atomically commit the resulting task and signal batches.
     pub(crate) fn prepare_staged_signal_wake(
         &self,
         task_id: Uuid,
@@ -852,15 +851,28 @@ impl<'a> TaskStore<'a> {
         if snapshot.task.abort_requested() || snapshot.task.is_terminal() {
             return Err(Error::SignalTargetClosed);
         }
-        let (key, typed_sleep) = match snapshot.task.state() {
-            TaskState::Waiting(WaitFor::TypedSignal(key)) => (key, false),
-            TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) if signals.len() == 1 => {
-                (&signals[0], true)
+        let (keys, typed_sleep) = match snapshot.task.state() {
+            TaskState::Waiting(WaitFor::TypedSignal(key)) => (std::slice::from_ref(key), false),
+            TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) if !signals.is_empty() => {
+                (signals.as_slice(), true)
             }
             _ => return Err(Error::InvalidOwnedBatch),
         };
+        let revision_key = signal_revision_key(task_id);
+        let revision = self.store.get(&revision_key)?;
         let prefix = signal_task_prefix(task_id);
-        let mut found: Option<(usize, Signal)> = None;
+        // A candidate has a staged mutation index, or a committed key/version.
+        type Candidate = (Option<usize>, Vec<u8>, Option<u64>, Signal);
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (stored_key, entry) in self.store.list(&prefix)? {
+            let signal: Signal = serde_json::from_slice(&entry.value)?;
+            if signal.task_id != task_id || stored_key != signal_key(task_id, signal.id) {
+                return Err(Error::InvalidOwnedBatch);
+            }
+            if signal.typed_key().is_some_and(|key| keys.contains(key)) {
+                candidates.push((None, stored_key, Some(entry.version), signal));
+            }
+        }
         for (index, mutation) in signals.mutations.iter().enumerate() {
             if let Mutation::Put {
                 key: stored_key,
@@ -869,30 +881,73 @@ impl<'a> TaskStore<'a> {
                 && stored_key.starts_with(&prefix)
             {
                 let signal: Signal = serde_json::from_slice(value)?;
-                if signal.task_id != task_id {
+                if signal.task_id != task_id || *stored_key != signal_key(task_id, signal.id) {
                     return Err(Error::InvalidOwnedBatch);
                 }
-                if signal.typed_key() == Some(key) {
-                    if signal.consumed || signal.expired || found.is_some() {
-                        return Err(Error::InvalidOwnedBatch);
-                    }
-                    found = Some((index, signal));
+                if signal.typed_key().is_some_and(|key| keys.contains(key)) {
+                    candidates.push((Some(index), stored_key.clone(), None, signal));
                 }
             }
         }
-        let (index, mut signal) = found.ok_or(Error::InvalidOwnedBatch)?;
+        for (index, (_, _, _, signal)) in candidates.iter().enumerate() {
+            if signal.consumed || (!typed_sleep && signal.expired) {
+                return Err(Error::SignalKeyConsumed);
+            }
+            if candidates[..index]
+                .iter()
+                .any(|(_, _, _, previous)| previous.typed_key() == signal.typed_key())
+            {
+                return Err(Error::SignalKeyMismatch);
+            }
+        }
+        let selected = keys
+            .iter()
+            .find_map(|key| {
+                candidates.iter().position(|(_, _, _, signal)| {
+                    !signal.expired && signal.typed_key() == Some(key)
+                })
+            })
+            .ok_or(Error::InvalidOwnedBatch)?;
+        let (index, stored_key, version, mut signal) = candidates.swap_remove(selected);
+        let selected_key = signal.typed_key().ok_or(Error::InvalidOwnedBatch)?.clone();
         let mut next = snapshot.clone();
         next.task
             .wake_with_signal(signal.id)
             .map_err(Error::Transition)?;
         if typed_sleep {
             next.task
-                .set_typed_wake(crate::task::TypedWake::Signal(key.clone()));
+                .set_typed_wake(crate::task::TypedWake::Signal(selected_key));
         }
-        let batch = self.prepare_save(&[Save::Update(&next)])?;
+        let mut batch = self.prepare_save(&[Save::Update(&next)])?;
+        batch.checks.push(Check {
+            key: revision_key.clone(),
+            expected: revision.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+        });
         signal.consumed = true;
-        if let Mutation::Put { value, .. } = &mut signals.mutations[index] {
-            *value = serde_json::to_vec(&signal)?;
+        let value = serde_json::to_vec(&signal)?;
+        if let Some(index) = index {
+            if let Mutation::Put { value: staged, .. } = &mut signals.mutations[index] {
+                *staged = value;
+            }
+        } else {
+            batch.checks.push(Check {
+                key: stored_key.clone(),
+                expected: Expected::Version(version.ok_or(Error::InvalidOwnedBatch)?),
+            });
+            batch.mutations.push(Mutation::Put {
+                key: stored_key,
+                value,
+            });
+            // Consumption is also a signal-state change. Reuse the staged bump
+            // if present; otherwise add one under the revision fence.
+            if !signals.mutations.iter().any(
+                |mutation| matches!(mutation, Mutation::Put { key, .. } if *key == revision_key),
+            ) {
+                batch.mutations.push(Mutation::Put {
+                    key: revision_key,
+                    value: vec![],
+                });
+            }
         }
         Ok(batch)
     }
