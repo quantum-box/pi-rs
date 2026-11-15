@@ -3372,9 +3372,7 @@ mod tests {
                     .unwrap();
             }
         });
-        assert!(
-            matches!(result, Err(Error::Store(task_store::Error::Store(durable_store::Error::Conflict { key }))) if key == task_store::key(parent.id()))
-        );
+        assert!(matches!(result, Err(Error::PendingAbort(id)) if id == parent.id()));
         assert_eq!(calls, 1);
         let current = scheduler.get(parent.id()).unwrap().unwrap();
         assert!(current.abort_requested());
@@ -6102,15 +6100,26 @@ mod tests {
             s.get(parent.id()).unwrap().unwrap().state(),
             TaskState::CompletingFailed(_)
         ));
+        // Recovery stays deferred until the parent's failure cascade is marked.
         assert_eq!(
             s.get(child.id()).unwrap().unwrap().state(),
-            &TaskState::Ready
+            &TaskState::Running
         );
         s.tick(0).unwrap();
         assert!(s.get(child.id()).unwrap().unwrap().abort_requested());
-        s.tick(0).unwrap();
+        for _ in 0..4 {
+            if s.get(child.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            s.tick(0).unwrap();
+        }
         assert!(s.get(child.id()).unwrap().unwrap().is_terminal());
-        s.tick(0).unwrap();
+        for _ in 0..4 {
+            if s.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            s.tick(0).unwrap();
+        }
         assert!(matches!(
             s.get(parent.id()).unwrap().unwrap().state(),
             TaskState::Failed(_)
