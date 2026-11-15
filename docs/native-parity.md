@@ -3688,6 +3688,8 @@ strict capability, including through the declaration-aware detailed model
 stream; callers must normalize returned arguments before validation. Legacy
 model implementations reject required constraints and can fall back for
 preferred constraints.
+The Responses SDK can also prepare a request once and inspect the effective
+strict-or-fallback decision bound to its wire tools before dispatch.
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier

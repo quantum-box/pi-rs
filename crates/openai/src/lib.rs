@@ -82,7 +82,62 @@ pub struct OpenAiResponses {
     strict_tool_support: bool,
 }
 
+/// A Responses request whose wire tools and effective sampling are fixed.
+pub struct PreparedResponsesRequest {
+    client: OpenAiResponses,
+    request: ModelRequest,
+    wire_tools: Vec<Value>,
+    effective_tools: Vec<pi_rs_core::EffectiveToolDeclaration>,
+}
+
+impl PreparedResponsesRequest {
+    /// The exact per-tool decisions associated with this prepared request.
+    pub fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.effective_tools
+    }
+
+    /// Dispatch using an external session identity.
+    pub async fn stream_in_session(
+        self,
+        external_id: &str,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let client = self
+            .client
+            .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?;
+        let stream = client
+            .stream_enriched_with_tools(self.request, Some(self.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
+
+    /// Dispatch as a summary without reusing the session cache.
+    pub async fn stream_for_summary(self) -> Result<pi_rs_core::DetailedModelStream> {
+        let stream = self
+            .client
+            .without_cache()
+            .stream_enriched_with_tools(self.request, Some(self.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
+}
+
 impl OpenAiResponses {
+    /// Resolve tool constraints once and bind their decisions to this request.
+    pub fn prepare_tool_request(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<PreparedResponsesRequest> {
+        let (wire_tools, effective_tools) =
+            resolved_constrained_tools(&request, declarations, self.strict_tool_support)?;
+        Ok(PreparedResponsesRequest {
+            client: self.clone(),
+            request,
+            wire_tools,
+            effective_tools,
+        })
+    }
     pub fn with_http_options(
         mut self,
         timeout: Option<std::time::Duration>,
@@ -534,11 +589,11 @@ fn payload(request: &ModelRequest, provider: &str, edited_scope: &str) -> Value 
     body
 }
 
-fn constrained_tools(
+fn resolved_constrained_tools(
     request: &ModelRequest,
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
-) -> Result<Vec<Value>> {
+) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
     if request.tools.len() != declarations.len()
         || request
             .tools
@@ -550,11 +605,21 @@ fn constrained_tools(
             "tool declarations do not match the effective request".into(),
         ));
     }
-    declarations.iter().map(|declaration| {
+    let mut wire = Vec::with_capacity(declarations.len());
+    let mut effective = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
         let spec = &declaration.spec;
         let strict_schema = match &declaration.constrained_sampling {
-            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => pi_rs_core::resolve_strict_tool_schema(&spec.name, &spec.parameters, *strict, supports_strict, |_, _| false)
-                .map_err(|error| Error::Config(error.to_string()))?,
+            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+                pi_rs_core::resolve_strict_tool_schema(
+                    &spec.name,
+                    &spec.parameters,
+                    *strict,
+                    supports_strict,
+                    |_, _| false,
+                )
+                .map_err(|error| Error::Config(error.to_string()))?
+            }
             // Grammar is sent as an ordinary function until custom tool streaming
             // and replay are supported by this path.
             _ => None,
@@ -563,8 +628,29 @@ fn constrained_tools(
         if supports_strict {
             tool["strict"] = json!(strict_schema.is_some());
         }
-        Ok(tool)
-    }).collect()
+        let sampling = if strict_schema.is_some() {
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+            }
+        } else {
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        };
+        wire.push(tool);
+        effective.push(pi_rs_core::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling,
+        });
+    }
+    Ok((wire, effective))
+}
+
+fn constrained_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supports_strict: bool,
+) -> Result<Vec<Value>> {
+    resolved_constrained_tools(request, declarations, supports_strict).map(|(wire, _)| wire)
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -1825,6 +1911,119 @@ mod tests {
         assert!(constrained_tools(&req, &[declaration], true).is_err());
     }
 
+    #[test]
+    fn prepared_request_exposes_actual_strict_and_fallback_decisions() {
+        let req = request();
+        let mut declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api("https://example.test/responses", "fixture".into()).unwrap();
+        let fallback = model
+            .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+            .unwrap();
+        assert!(matches!(
+            fallback.effective_tools()[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        let supported = model.with_strict_tool_support(true);
+        let prepared = supported
+            .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+            .unwrap();
+        assert!(
+            matches!(&prepared.effective_tools()[0].sampling, pi_rs_core::EffectiveToolSampling::StrictJsonSchema { original_schema, normalization_version:1 } if original_schema == &req.tools[0].parameters)
+        );
+        declaration.spec.name = "changed".into();
+        assert!(supported.prepare_tool_request(req, &[declaration]).is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_fallback_session_sends_the_reported_unconstrained_tool() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let end = loop {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+                if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + length {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            (headers, body)
+        });
+        let req = request();
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap();
+        let prepared = model
+            .prepare_tool_request(req.clone(), &[declaration])
+            .unwrap();
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        let _ = prepared.stream_in_session("prepared-session").await;
+        let (headers, body) = server.join().unwrap();
+        assert!(
+            headers
+                .lines()
+                .any(|line| line == "session-id: prepared-session")
+        );
+        assert_eq!(body["prompt_cache_key"], "prepared-session");
+        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(body["tools"][0]["parameters"], req.tools[0].parameters);
+    }
+
     #[tokio::test]
     async fn declaration_stream_defaults_to_unsupported_and_changes_identity_when_enabled() {
         let model =
@@ -1935,14 +2134,12 @@ mod tests {
                 .unwrap()
                 .with_strict_tool_support(true)
                 .with_session_cache_key("prior-session");
-        let _ = model
-            .stream_detailed_summary_with_tool_declarations(
-                uuid::Uuid::nil(),
-                uuid::Uuid::nil(),
-                req,
-                &[declaration],
-            )
-            .await;
+        let prepared = model.prepare_tool_request(req, &[declaration]).unwrap();
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+        ));
+        let _ = prepared.stream_for_summary().await;
         let body = server.join().unwrap();
         assert_eq!(body["tools"][0]["strict"], true);
         assert!(body.get("prompt_cache_key").is_none());

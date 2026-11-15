@@ -44,6 +44,7 @@ pub use retry::*;
 pub use sdk::*;
 pub use statistics::{ContextUsage, SessionStats, TokenTotals};
 pub use strict_tool_schema::{
+    EffectiveToolDeclaration, EffectiveToolSampling, STRICT_TOOL_NORMALIZATION_VERSION,
     StrictSchemaError, StrictToolPolicy, ToolConstraint, ToolDeclaration, ToolGrammarVariants,
     normalize_strict_tool_arguments, resolve_strict_tool_schema, strict_tool_schema,
 };

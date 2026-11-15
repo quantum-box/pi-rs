@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 #[error("{0}")]
 pub struct StrictSchemaError(String);
 
+/// Version of the strict-tool argument normalization rules.
+pub const STRICT_TOOL_NORMALIZATION_VERSION: u32 = 1;
+
 /// Whether strict tool sampling may fall back to ordinary tool calling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +86,24 @@ pub struct ToolDeclaration {
         deserialize_with = "deserialize_constraint"
     )]
     pub constrained_sampling: Option<ToolConstraint>,
+}
+
+/// The actual sampling decision for one advertised tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EffectiveToolSampling {
+    Unconstrained,
+    StrictJsonSchema {
+        original_schema: Value,
+        normalization_version: u32,
+    },
+}
+
+/// A tool definition bound to the sampling actually used for its request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveToolDeclaration {
+    pub spec: crate::ToolSpec,
+    pub sampling: EffectiveToolSampling,
 }
 
 fn deserialize_constraint<'de, D: Deserializer<'de>>(
