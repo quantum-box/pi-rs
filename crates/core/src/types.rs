@@ -655,6 +655,21 @@ pub struct ToolCallDelta {
 
 pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEvent>>;
 
+/// Model events with optional provider reasoning item boundaries and identity.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum EnrichedModelEvent {
+    Legacy(ModelEvent),
+    TextStart { index: u64 },
+    TextDelta { index: u64, delta: String },
+    TextEnd { index: u64, content: String },
+    ReasoningStart { index: u64 },
+    ReasoningDelta { index: u64, delta: String },
+    ReasoningEnd { index: u64, content: String },
+}
+
+pub type EnrichedModelStream = futures_util::stream::BoxStream<'static, Result<EnrichedModelEvent>>;
+
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
     /// Resolve a request-specific adapter once for estimation and dispatch.
@@ -735,6 +750,37 @@ pub trait Model: Send + Sync {
     ) -> Result<ModelStream> {
         self.stream_in_session(request_id, session_id, request)
             .await
+    }
+
+    /// Stream with item-level reasoning events, defaulting to the legacy session stream.
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_in_session_with_identity(request_id, session_id, external_id, request)
+            .await?
+            .map(|event| event.map(EnrichedModelEvent::Legacy))
+            .boxed())
+    }
+
+    /// Stream a summary with item-level reasoning events, defaulting to the legacy summary stream.
+    async fn stream_enriched_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_for_summary(request_id, session_id, request)
+            .await?
+            .map(|event| event.map(EnrichedModelEvent::Legacy))
+            .boxed())
     }
 
     /// Called after the usage record is durable and before tools or another request.

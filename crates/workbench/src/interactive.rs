@@ -795,6 +795,8 @@ struct View {
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
     thinking: String,
+    thinking_items: std::collections::BTreeMap<u64, String>,
+    text_items: std::collections::BTreeMap<u64, String>,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
@@ -1377,8 +1379,10 @@ impl View {
         self.scrollbar_activity = None;
         self.flash = None;
         self.streaming.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         self.thinking.clear();
+        self.thinking_items.clear();
         self.draft_images.clear();
         self.clipboard = None;
         self.dialogs.clear();
@@ -1703,7 +1707,9 @@ impl View {
             Some("summary_request_start") => {
                 self.summarizing = true;
                 self.thinking.clear();
+                self.thinking_items.clear();
                 self.streaming.clear();
+                self.text_items.clear();
                 self.streaming_tools.clear();
             }
             Some("tool_call_delta") if !self.summarizing => {
@@ -1716,12 +1722,44 @@ impl View {
                     self.phase = Some("ツール呼出し準備中");
                 }
             }
-            Some("reasoning_delta") if !self.summarizing => self
-                .thinking
-                .push_str(value["delta"].as_str().unwrap_or_default()),
-            Some("text_delta") if !self.summarizing => self
-                .streaming
-                .push_str(value["delta"].as_str().unwrap_or_default()),
+            Some("reasoning_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["reasoningIndex"].as_u64() {
+                    self.thinking_items.entry(index).or_default().push_str(delta);
+                    self.thinking = self.thinking_items.values().cloned().collect();
+                } else { self.thinking.push_str(delta); }
+            }
+            Some("reasoning_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.thinking_items.entry(index).or_default(); }
+            }
+            Some("reasoning_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.thinking_items.insert(index, content.to_owned());
+                    self.thinking = self.thinking_items.values().cloned().collect();
+                }
+            }
+            Some("text_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.text_items.entry(index).or_default(); }
+            }
+            Some("text_item_delta") if !self.summarizing => {
+                if let (Some(index), Some(delta)) = (value["index"].as_u64(), value["delta"].as_str()) {
+                    self.text_items.entry(index).or_default().push_str(delta);
+                    self.streaming = self.text_items.values().cloned().collect();
+                }
+            }
+            Some("text_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.text_items.insert(index, content.to_owned());
+                    self.streaming = self.text_items.values().cloned().collect();
+                }
+            }
+            Some("text_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["textIndex"].as_u64() {
+                    self.text_items.entry(index).or_default().push_str(delta);
+                    self.streaming = self.text_items.values().cloned().collect();
+                } else { self.streaming.push_str(delta); }
+            }
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -1756,7 +1794,9 @@ impl View {
                     Some("assistant") => {
                         self.streaming_tools.clear();
                         self.streaming.clear();
+                        self.text_items.clear();
                         let thinking = std::mem::take(&mut self.thinking);
+                        self.thinking_items.clear();
                         if !thinking.is_empty() {
                             self.lines.push(Entry::Thinking(thinking));
                         }
@@ -1832,6 +1872,8 @@ impl View {
     }
     fn settle(&mut self) {
         self.summarizing = false;
+        self.thinking_items.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
             self.lines
@@ -4062,7 +4104,15 @@ pub(super) async fn run(
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
                     match value["type"].as_str() {
-                        Some("text_delta" | "reasoning_delta") => continue,
+                        Some(
+                            "text_delta"
+                            | "reasoning_delta"
+                            | "reasoning_item_start"
+                            | "reasoning_item_end"
+                            | "text_item_start"
+                            | "text_item_delta"
+                            | "text_item_end",
+                        ) => continue,
                         Some("error") => {
                             view.branch_error = value["message"].as_str().map(str::to_owned)
                         }
@@ -7535,6 +7585,40 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexed_text_finalization_keeps_item_order() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"text_item_start","index":0}),
+            serde_json::json!({"type":"text_item_delta","index":0,"delta":"a"}),
+            serde_json::json!({"type":"text_item_start","index":2}),
+            serde_json::json!({"type":"text_item_delta","index":2,"delta":"b"}),
+            serde_json::json!({"type":"text_item_end","index":0,"content":"A"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.streaming, "Ab");
+        view.settle();
+        assert!(view.text_items.is_empty());
+    }
+
+    #[test]
+    fn indexed_reasoning_finalization_replaces_streamed_text() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"reasoning_item_start","index":0}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"raw"}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"summary"}),
+            serde_json::json!({"type":"reasoning_item_end","index":0,"content":"summary"}),
+            serde_json::json!({"type":"reasoning_item_start","index":2}),
+            serde_json::json!({"type":"reasoning_item_end","index":2,"content":"other"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.thinking, "summaryother");
+        view.settle();
+        assert!(view.thinking_items.is_empty());
+    }
     #[test]
     fn external_editor_selects_first_nonempty_command() {
         assert_eq!(

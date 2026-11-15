@@ -2211,13 +2211,24 @@ fn forward_event(
             Ok(())
         }
         _ => {
+            let suppress_summary_record = stream.suppress_summary_record(&event);
             for mapped in stream.observe(&event, args) {
                 emit(mapped)?;
+            }
+            if suppress_summary_record {
+                return Ok(());
             }
             if matches!(
                 event["type"].as_str(),
                 Some(
                     "text_delta"
+                        | "reasoning_delta"
+                        | "text_item_start"
+                        | "text_item_delta"
+                        | "text_item_end"
+                        | "reasoning_item_start"
+                        | "reasoning_item_delta"
+                        | "reasoning_item_end"
                         | "tool_call_delta"
                         | "summary_request_start"
                         | "internal_tool_result_metadata"

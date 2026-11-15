@@ -21,6 +21,10 @@ remaining acceptance work for that surface.
 OpenAI Responses streams both reasoning text and reasoning summary text as
 thinking deltas. Completed reasoning items retain their summary when present,
 otherwise their content or streamed text, in the completed turn metadata.
+The native RPC stream preserves reasoning item boundaries and final text.
+The additive enriched model stream carries those boundaries through the built-in
+workbench and budget wrappers; third-party wrappers using the legacy stream
+continue to receive deltas without item boundaries.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
