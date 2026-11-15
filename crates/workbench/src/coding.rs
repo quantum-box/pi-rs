@@ -2292,6 +2292,16 @@ impl CodingTool {
     }
 
     fn read_image_inner(&self, path: &Path, infer_extension: bool) -> Result<Option<Value>> {
+        self.read_image_cancellable(path, infer_extension, None)
+    }
+
+    fn read_image_cancellable(
+        &self,
+        path: &Path,
+        infer_extension: bool,
+        cancellation: Option<&pi_rs::CancellationToken>,
+    ) -> Result<Option<Value>> {
+        crate::image_profile::check_cancelled(cancellation)?;
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
@@ -2301,13 +2311,15 @@ impl CodingTool {
             image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path)?))
         }
         .with_guessed_format()?;
+        crate::image_profile::check_cancelled(cancellation)?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
-        self.process_image(path, reader, format, None).map(Some)
+        self.process_image(path, reader, format, cancellation)
+            .map(Some)
     }
 
     fn process_image<R: std::io::BufRead + std::io::Seek>(
@@ -2472,7 +2484,7 @@ impl CodingTool {
                 prepared.output,
             )
         } else {
-            let prepared = normalize_image(reader)?;
+            let prepared = normalize_image_cancellable(reader, cancellation)?;
             (
                 prepared.png,
                 "image/png",
@@ -2505,7 +2517,7 @@ impl CodingTool {
         }
         let display_path = string(args, "path")?;
         let path = self.path(display_path)?;
-        if let Some(mut data) = self.read_image(&path)? {
+        if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
             if self.unrestricted
                 && matches!(
                     self.kind,
@@ -3136,15 +3148,24 @@ pub struct PreparedImage {
 }
 /// Normalize supported image readers under the shared decoding and output limits.
 pub fn normalize_image<R: std::io::BufRead + std::io::Seek>(
-    mut reader: image::ImageReader<R>,
+    reader: image::ImageReader<R>,
 ) -> Result<PreparedImage> {
+    normalize_image_cancellable(reader, None)
+}
+
+fn normalize_image_cancellable<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+    cancellation: Option<&pi_rs::CancellationToken>,
+) -> Result<PreparedImage> {
+    crate::image_profile::check_cancelled(cancellation)?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
-    let original = reader
-        .decode()
-        .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
-    prepare_image(original)
+    let original = reader.decode();
+    crate::image_profile::check_cancelled(cancellation)?;
+    let original =
+        original.map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+    prepare_image_with_resize_cancellable(original, true, cancellation)
 }
 
 /// Normalize a decoded image under the same limits as file and clipboard input.
@@ -3157,6 +3178,41 @@ pub fn prepare_image_with_resize(
     original: image::DynamicImage,
     resize: bool,
 ) -> Result<PreparedImage> {
+    prepare_image_with_resize_cancellable(original, resize, None)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageCheckpoint {
+    Thumbnail,
+    Png,
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMAGE_CANCEL_AT: std::cell::RefCell<Option<(ImageCheckpoint, pi_rs::CancellationToken)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cancel_at_image_checkpoint(checkpoint: ImageCheckpoint) {
+    IMAGE_CANCEL_AT.with(|slot| {
+        let pending = slot.borrow_mut().take();
+        if let Some((target, token)) = pending {
+            if target == checkpoint {
+                token.cancel();
+            } else {
+                *slot.borrow_mut() = Some((target, token));
+            }
+        }
+    });
+}
+
+fn prepare_image_with_resize_cancellable(
+    original: image::DynamicImage,
+    resize: bool,
+    cancellation: Option<&pi_rs::CancellationToken>,
+) -> Result<PreparedImage> {
+    crate::image_profile::check_cancelled(cancellation)?;
     let source_width = original.width();
     let source_height = original.height();
     let mut resized = if resize && (source_width > 2000 || source_height > 2000) {
@@ -3164,6 +3220,9 @@ pub fn prepare_image_with_resize(
     } else {
         original
     };
+    #[cfg(test)]
+    cancel_at_image_checkpoint(ImageCheckpoint::Thumbnail);
+    crate::image_profile::check_cancelled(cancellation)?;
     let limit = if resize {
         512 * 1024
     } else {
@@ -3172,9 +3231,12 @@ pub fn prepare_image_with_resize(
     let mut png = Vec::new();
     loop {
         png.clear();
-        resized
-            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-            .map_err(|error| Error::Config(error.to_string()))?;
+        crate::image_profile::check_cancelled(cancellation)?;
+        let encoded = resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png);
+        #[cfg(test)]
+        cancel_at_image_checkpoint(ImageCheckpoint::Png);
+        crate::image_profile::check_cancelled(cancellation)?;
+        encoded.map_err(|error| Error::Config(error.to_string()))?;
         if png.len() <= limit {
             break;
         }
@@ -3189,6 +3251,7 @@ pub fn prepare_image_with_resize(
             return Err(Error::Config("image cannot fit the output limit".into()));
         }
         resized = resized.thumbnail(width, height);
+        crate::image_profile::check_cancelled(cancellation)?;
     }
     Ok(PreparedImage {
         png,
@@ -3523,6 +3586,143 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_image_read_honors_cancellation_before_processing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert!(
+            tool.read_image_cancellable(&path, true, Some(&token))
+                .unwrap()
+                .is_some()
+        );
+        token.cancel();
+        assert!(matches!(
+            tool.read_image_cancellable(&path, true, Some(&token)),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            tool.read(&json!({"path": "image.png"}), &token),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn image_processing_stops_when_cancelled_during_input_read() {
+        use std::io::{BufRead, Read, Seek, SeekFrom};
+
+        struct CancelOnRead {
+            data: std::io::Cursor<Vec<u8>>,
+            token: pi_rs::CancellationToken,
+        }
+        impl Read for CancelOnRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.token.cancel();
+                Read::read(&mut self.data, buf)
+            }
+        }
+        impl BufRead for CancelOnRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.token.cancel();
+                self.data.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.data.consume(amount);
+            }
+        }
+        impl Seek for CancelOnRead {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        for unrestricted in [true, false] {
+            let tool = CodingTool {
+                root: dir.path().to_path_buf(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize: true,
+                    profile: None,
+                    model_supports_images: None,
+                },
+            };
+            let token = pi_rs::CancellationToken::new();
+            let reader = CancelOnRead {
+                data: std::io::Cursor::new(std::fs::read(&path).unwrap()),
+                token: token.clone(),
+            };
+            let reader = image::ImageReader::with_format(reader, image::ImageFormat::Png);
+            assert!(matches!(
+                tool.process_image(&path, reader, image::ImageFormat::Png, Some(&token)),
+                Err(Error::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn restricted_image_cancels_after_thumbnail_and_png_encoding() {
+        let image = image::DynamicImage::new_rgb8(2001, 2);
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        for checkpoint in [ImageCheckpoint::Thumbnail, ImageCheckpoint::Png] {
+            let token = pi_rs::CancellationToken::new();
+            IMAGE_CANCEL_AT.with(|slot| *slot.borrow_mut() = Some((checkpoint, token.clone())));
+            let reader = image::ImageReader::with_format(
+                Cursor::new(encoded.clone()),
+                image::ImageFormat::Png,
+            );
+            assert!(matches!(
+                normalize_image_cancellable(reader, Some(&token)),
+                Err(Error::Cancelled)
+            ));
+            assert!(token.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn restricted_image_preserves_dimensions_pixels_and_decode_errors() {
+        let pixels = image::RgbImage::from_pixel(4000, 2000, image::Rgb([12, 34, 56]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let reader = image::ImageReader::with_format(
+            Cursor::new(bytes.into_inner()),
+            image::ImageFormat::Png,
+        );
+        let token = pi_rs::CancellationToken::new();
+        let actual = normalize_image_cancellable(reader, Some(&token)).unwrap();
+        assert_eq!((actual.source_width, actual.source_height), (4000, 2000));
+        assert_eq!((actual.width, actual.height), (2000, 1000));
+        let decoded = image::load_from_memory(&actual.png).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2000, 1000));
+        assert_eq!(*decoded.get_pixel(0, 0), image::Rgb([12, 34, 56]));
+        assert_eq!(*decoded.get_pixel(1000, 500), image::Rgb([12, 34, 56]));
+
+        let invalid =
+            image::ImageReader::with_format(Cursor::new(vec![0u8; 8]), image::ImageFormat::Png);
+        assert!(matches!(normalize_image_cancellable(invalid, Some(&token)),
+            Err(Error::Config(message)) if message.starts_with("cannot decode image:") && message.contains("PNG")));
+    }
+
     #[test]
     fn image_read_structured_projection_uses_first_text_and_image() {
         use pi_rs::{AttachmentRef, Outcome};

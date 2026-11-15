@@ -4652,3 +4652,12 @@ are errors. Unix file opens are nonblocking and validate the opened handle befor
 reading, so a FIFO is rejected. The host supplies the default prompt and any Pi-specific context
 formatting; `compose` joins nonempty appendices with blank lines. Existing CLI
 loading remains independent.
+
+### Local image read cancellation
+
+Local `read` passes its cancellation token through image detection, decoding,
+resizing and conversion. Cancelling a read returns `Operation aborted` and
+allows the blocking worker to stop at the image processing cancellation checks,
+matching Pi's aborted read behavior. The restricted no-profile image path also checks cancellation after decoding,
+thumbnailing and each PNG encoding attempt. Individual image operations remain
+synchronous and are interrupted at their checkpoints.
