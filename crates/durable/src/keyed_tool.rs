@@ -43,16 +43,18 @@ pub(crate) async fn scope<F: std::future::Future>(
     .await
 }
 
+type OutputChannels = (
+    Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
+    Option<Arc<dyn StreamSink>>,
+);
+
 pub(crate) async fn scope_with_control<F: std::future::Future>(
     nested: Arc<NestedHost>,
     tool: Arc<dyn Tool>,
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
     control: Arc<Mutex<crate::reset::ToolControl>>,
-    (diagnostics, stream): (
-        Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
-        Option<Arc<dyn StreamSink>>,
-    ),
+    (diagnostics, stream): OutputChannels,
     future: F,
 ) -> F::Output {
     let _invocation_scope = crate::nested::InvocationScope(nested.clone());
