@@ -149,6 +149,33 @@ async fn scheduler_change_subscription_observes_commits_and_workers() {
 }
 
 #[tokio::test]
+async fn scheduler_change_subscription_observes_task_registry_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(HoldingModel {
+        entered: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let owner = pi_rs_durable::runtime::RuntimeOwner::open(
+        dir.path().join("db"),
+        options(model),
+        Default::default(),
+        Registry::default(),
+    )
+    .unwrap();
+    let mut changes = owner.scheduler().subscribe_changes().unwrap();
+    let initial = changes.current();
+    let mut registry = Registry::default();
+    registry.register("work", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    owner.tasks().replace_registry(registry).unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed, initial);
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn shared_activity_tracks_concurrent_workers_abort_and_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(HoldingModel {

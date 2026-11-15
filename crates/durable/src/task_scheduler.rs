@@ -530,6 +530,7 @@ impl Scheduler {
         }
         self.registry = registry;
         self.publish_wake_definitions()?;
+        self.activity.notify();
         self.reconcile()
     }
     /// Inspect compatibility without executing migration code.

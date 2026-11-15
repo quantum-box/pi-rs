@@ -81,6 +81,10 @@ impl WorkerActivity {
     pub(crate) fn enter(&self, kind: WorkerKind, id: Uuid) -> Guard {
         self.enter_at(kind, id, WorkerPhase::Running)
     }
+    /// Wake observers when scheduling definitions change without a store write.
+    pub(crate) fn notify(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).publish();
+    }
     pub(crate) fn enter_at(&self, kind: WorkerKind, id: Uuid, phase: WorkerPhase) -> Guard {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let token = loop {
