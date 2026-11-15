@@ -197,11 +197,14 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if bearer
+                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                    Anthropic::with_oauth_token(endpoint, &token)?
+                } else if bearer
                     || matches!(
                         self.id(),
                         "fireworks" | "openrouter" | "minimax" | "minimax-cn"
-                    ) {
+                    )
+                {
                     Anthropic::with_bearer_token(endpoint, &token)?
                 } else {
                     Anthropic::new(endpoint, &token)?
@@ -360,6 +363,14 @@ impl Deferred {
     ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
+            Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
+                super::anthropic_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    None,
+                    false,
+                )
+                .await?,
+            ),
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
