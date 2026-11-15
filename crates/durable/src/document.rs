@@ -1176,12 +1176,13 @@ impl Transaction {
 }
 
 /// A store-bound checked host transaction with provisional typed deliveries.
-/// It supports at most one signal call per target and rejects task writes for
-/// those targets, regardless of staging order.
+/// It supports multiple typed deliveries and rejects task writes for their
+/// targets, regardless of staging order.
 pub struct HostTransaction<'a> {
     store: &'a Store,
     transaction: Transaction,
     signal_targets: HashSet<Vec<u8>>,
+    signals: StagedSignals,
 }
 impl<'a> HostTransaction<'a> {
     pub fn new(store: &'a Store) -> Self {
@@ -1189,6 +1190,7 @@ impl<'a> HostTransaction<'a> {
             store,
             transaction: Transaction::new(),
             signal_targets: HashSet::new(),
+            signals: StagedSignals::new(),
         }
     }
     pub fn put(
@@ -1217,8 +1219,8 @@ impl<'a> HostTransaction<'a> {
         }
         self.transaction.append(batch)
     }
-    /// Stage one typed delivery per target. Results remain provisional until
-    /// commit. Target task writes cannot be composed in either order.
+    /// Stage typed deliveries. Results remain provisional until commit.
+    /// Target task writes cannot be composed in either order.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1228,21 +1230,23 @@ impl<'a> HostTransaction<'a> {
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
         let target = crate::task_store::key(task_id);
-        if self.transaction.written.contains(&target) || self.signal_targets.contains(&target) {
+        if self.transaction.written.contains(&target) {
             return Err(Error::SignalComposition);
         }
-        let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
-            task_id,
-            token,
-            key,
-            value,
-            || now_millis,
-        )?;
-        self.transaction.append(batch)?;
+        let result = self
+            .signals
+            .signal_at(self.store, task_id, token, key, value, now_millis)?;
         self.signal_targets.insert(target);
         Ok(result)
     }
-    pub fn commit(self) -> Result<(), Error> {
+    pub fn commit(mut self) -> Result<(), Error> {
+        let mut existing = OwnedBatch {
+            checks: std::mem::take(&mut self.transaction.checks),
+            mutations: Vec::new(),
+        };
+        reconcile_task_checks(&mut self.signals.batch, &mut existing);
+        self.transaction.checks = existing.checks;
+        self.transaction.append(self.signals.batch)?;
         self.transaction.commit(self.store)
     }
 }
@@ -1274,6 +1278,133 @@ enum StagedSignalStatus {
     Present,
 }
 
+struct StagedSignals {
+    batch: OwnedBatch,
+    keys: HashMap<(uuid::Uuid, String, String), StagedSignalStatus>,
+}
+impl StagedSignals {
+    fn new() -> Self {
+        Self {
+            batch: OwnedBatch {
+                checks: Vec::new(),
+                mutations: Vec::new(),
+            },
+            keys: HashMap::new(),
+        }
+    }
+    fn signal_at(
+        &mut self,
+        store: &Store,
+        task_id: uuid::Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+    ) -> Result<crate::task_store::SignalResult, Error> {
+        let identity = (task_id, token.name().to_owned(), key.to_owned());
+        if let Some(previous) = self.keys.get(&identity).copied() {
+            match previous {
+                StagedSignalStatus::NotFound => {
+                    return Ok(crate::task_store::SignalResult::NotFound);
+                }
+                StagedSignalStatus::ClosedTarget => {
+                    return Ok(crate::task_store::SignalResult::Closed);
+                }
+                StagedSignalStatus::Present | StagedSignalStatus::ClosedKey => {
+                    return match crate::task_store::Signal::new_typed(
+                        uuid::Uuid::nil(),
+                        task_id,
+                        token,
+                        key,
+                        value,
+                    ) {
+                        Ok(_) => Ok(match previous {
+                            StagedSignalStatus::Present => {
+                                crate::task_store::SignalResult::Duplicate
+                            }
+                            StagedSignalStatus::ClosedKey => {
+                                crate::task_store::SignalResult::Closed
+                            }
+                            _ => unreachable!(),
+                        }),
+                        Err(crate::task_store::Error::InvalidSignalPayload) => {
+                            Ok(crate::task_store::SignalResult::Invalid)
+                        }
+                        Err(error) => Err(error.into()),
+                    };
+                }
+                StagedSignalStatus::Invalid => {}
+            }
+        }
+        let (result, batch) = crate::task_store::TaskStore::new(store).prepare_signal_at(
+            task_id,
+            token,
+            key,
+            value,
+            || now_millis,
+        )?;
+        let staged_status = match result {
+            crate::task_store::SignalResult::Invalid => StagedSignalStatus::Invalid,
+            crate::task_store::SignalResult::NotFound => StagedSignalStatus::NotFound,
+            crate::task_store::SignalResult::Delivered
+            | crate::task_store::SignalResult::Duplicate => StagedSignalStatus::Present,
+            crate::task_store::SignalResult::Closed
+                if batch
+                    .checks
+                    .iter()
+                    .any(|check| check.key == crate::task_store::signal_revision_key(task_id)) =>
+            {
+                StagedSignalStatus::ClosedKey
+            }
+            crate::task_store::SignalResult::Closed => StagedSignalStatus::ClosedTarget,
+        };
+        // Only the target and its revision may be shared between deliveries.
+        // Other overlaps remain errors when the complete transaction is composed.
+        let shared = [
+            crate::task_store::key(task_id),
+            crate::task_store::signal_revision_key(task_id),
+        ];
+        for check in batch.checks {
+            if shared.contains(&check.key)
+                && let Some(existing) = self.batch.checks.iter_mut().find(|c| c.key == check.key)
+            {
+                existing.expected = match (&existing.expected, &check.expected) {
+                    (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
+                        Expected::VersionBefore(*a, (*x).min(*y))
+                    }
+                    (Expected::Version(a), Expected::VersionBefore(b, x))
+                    | (Expected::VersionBefore(b, x), Expected::Version(a))
+                        if a == b =>
+                    {
+                        Expected::VersionBefore(*a, *x)
+                    }
+                    (a, b) if a == b => a.clone(),
+                    // Observations disagreed during staging. Force a commit conflict
+                    // so the normal replay-safe retry policy handles the race.
+                    _ => Expected::VersionBefore(0, std::time::Instant::now()),
+                };
+                continue;
+            }
+            self.batch.checks.push(check);
+        }
+        for mutation in batch.mutations {
+            if let Mutation::Put { key, .. } = &mutation
+                && *key == shared[1]
+                && self
+                    .batch
+                    .mutations
+                    .iter()
+                    .any(|m| matches!(m, Mutation::Put { key: k, .. } if k == key))
+            {
+                continue;
+            }
+            self.batch.mutations.push(mutation);
+        }
+        self.keys.insert(identity, staged_status);
+        Ok(result)
+    }
+}
+
 /// Checked document operations at one invocation-wide immutable revision.
 /// Staged values are visible to later reads. A staged new document has version
 /// zero; existing staged documents retain their original version until commit.
@@ -1287,8 +1418,7 @@ pub struct TaskDocuments<'a> {
     entry_initial_len: usize,
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
-    signal: OwnedBatch,
-    signal_keys: HashMap<(uuid::Uuid, String, String), StagedSignalStatus>,
+    signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
 }
@@ -1305,11 +1435,7 @@ impl<'a> TaskDocuments<'a> {
             entry_initial_len: 0,
             runtime_cut: None,
             runtime_config: None,
-            signal: OwnedBatch {
-                checks: Vec::new(),
-                mutations: Vec::new(),
-            },
-            signal_keys: HashMap::new(),
+            signals: StagedSignals::new(),
             child_reads: HashMap::new(),
             keyed_children: Vec::new(),
             revision: store.document_snapshot()?,
@@ -1362,7 +1488,7 @@ impl<'a> TaskDocuments<'a> {
                 .as_ref()
                 .map_or(Expected::Missing, |child| Expected::Version(child.version));
             let key = crate::task_store::key(id);
-            if let Some(check) = self.signal.checks.iter_mut().find(|c| c.key == key) {
+            if let Some(check) = self.signals.batch.checks.iter_mut().find(|c| c.key == key) {
                 let compatible = match (&check.expected, &expected) {
                     (Expected::Version(a), Expected::Version(b))
                     | (Expected::VersionBefore(a, _), Expected::Version(b)) => a == b,
@@ -1373,7 +1499,7 @@ impl<'a> TaskDocuments<'a> {
                     check.expected = Expected::VersionBefore(0, std::time::Instant::now());
                 }
             } else {
-                self.signal.checks.push(Check { key, expected });
+                self.signals.batch.checks.push(Check { key, expected });
             }
             self.child_reads.insert(id, child);
         }
@@ -1430,107 +1556,8 @@ impl<'a> TaskDocuments<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
-        let identity = (task_id, token.name().to_owned(), key.to_owned());
-        if let Some(previous) = self.signal_keys.get(&identity).copied() {
-            match previous {
-                StagedSignalStatus::NotFound => {
-                    return Ok(crate::task_store::SignalResult::NotFound);
-                }
-                StagedSignalStatus::ClosedTarget => {
-                    return Ok(crate::task_store::SignalResult::Closed);
-                }
-                StagedSignalStatus::Present | StagedSignalStatus::ClosedKey => {
-                    return match crate::task_store::Signal::new_typed(
-                        uuid::Uuid::nil(),
-                        task_id,
-                        token,
-                        key,
-                        value,
-                    ) {
-                        Ok(_) => Ok(match previous {
-                            StagedSignalStatus::Present => {
-                                crate::task_store::SignalResult::Duplicate
-                            }
-                            StagedSignalStatus::ClosedKey => {
-                                crate::task_store::SignalResult::Closed
-                            }
-                            _ => unreachable!(),
-                        }),
-                        Err(crate::task_store::Error::InvalidSignalPayload) => {
-                            Ok(crate::task_store::SignalResult::Invalid)
-                        }
-                        Err(error) => Err(error.into()),
-                    };
-                }
-                StagedSignalStatus::Invalid => {}
-            }
-        }
-        let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
-            task_id,
-            token,
-            key,
-            value,
-            || now_millis,
-        )?;
-        let staged_status = match result {
-            crate::task_store::SignalResult::Invalid => StagedSignalStatus::Invalid,
-            crate::task_store::SignalResult::NotFound => StagedSignalStatus::NotFound,
-            crate::task_store::SignalResult::Delivered
-            | crate::task_store::SignalResult::Duplicate => StagedSignalStatus::Present,
-            crate::task_store::SignalResult::Closed
-                if batch
-                    .checks
-                    .iter()
-                    .any(|check| check.key == crate::task_store::signal_revision_key(task_id)) =>
-            {
-                StagedSignalStatus::ClosedKey
-            }
-            crate::task_store::SignalResult::Closed => StagedSignalStatus::ClosedTarget,
-        };
-        // Only the target and its revision may be shared between deliveries.
-        // Other overlaps remain errors when the complete transaction is composed.
-        let shared = [
-            crate::task_store::key(task_id),
-            crate::task_store::signal_revision_key(task_id),
-        ];
-        for check in batch.checks {
-            if shared.contains(&check.key)
-                && let Some(existing) = self.signal.checks.iter_mut().find(|c| c.key == check.key)
-            {
-                existing.expected = match (&existing.expected, &check.expected) {
-                    (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
-                        Expected::VersionBefore(*a, (*x).min(*y))
-                    }
-                    (Expected::Version(a), Expected::VersionBefore(b, x))
-                    | (Expected::VersionBefore(b, x), Expected::Version(a))
-                        if a == b =>
-                    {
-                        Expected::VersionBefore(*a, *x)
-                    }
-                    (a, b) if a == b => a.clone(),
-                    // Observations disagreed during staging. Force a commit conflict
-                    // so the normal replay-safe retry policy handles the race.
-                    _ => Expected::VersionBefore(0, std::time::Instant::now()),
-                };
-                continue;
-            }
-            self.signal.checks.push(check);
-        }
-        for mutation in batch.mutations {
-            if let Mutation::Put { key, .. } = &mutation
-                && *key == shared[1]
-                && self
-                    .signal
-                    .mutations
-                    .iter()
-                    .any(|m| matches!(m, Mutation::Put { key: k, .. } if k == key))
-            {
-                continue;
-            }
-            self.signal.mutations.push(mutation);
-        }
-        self.signal_keys.insert(identity, staged_status);
-        Ok(result)
+        self.signals
+            .signal_at(self.store, task_id, token, key, value, now_millis)
     }
 
     /// Stage an immutable application record with this task as its author.
@@ -1701,8 +1728,8 @@ impl<'a> TaskDocuments<'a> {
                 });
             }
         }
-        batch.checks.extend(self.signal.checks);
-        batch.mutations.extend(self.signal.mutations);
+        batch.checks.extend(self.signals.batch.checks);
+        batch.mutations.extend(self.signals.batch.mutations);
         if let Some((conversation, version, entries, checks, dirty)) = self.entries {
             if let Some(index) = self.runtime_cut {
                 let cut = crate::runtime::prepare_ordered_task_checkpoint(

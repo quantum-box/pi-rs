@@ -494,10 +494,13 @@ Current limits and differences from upstream Pi Durable:
 - `document::HostTransaction::new(&store)` offers a store-bound host transaction
   for checked document writes, typed signals and checked host batches. A signal
   result is provisional until commit; conflicts roll back all writes. It allows
-  at most one signal call per target and rejects target task writes in either
-  order, and raw signal-namespace writes are rejected. Callers retry the entire
-  transaction with a fresh clock after conflicts. This is narrower than upstream
-  `tx.signal` and does not create or transition a signalled task in that commit.
+  multiple keys and repeated calls per target; repeated keys validate the new
+  value and preserve the first accepted receipt. Calls remain provisional until
+  commit, and the earliest deadline and all target/revision fences are enforced.
+  Target task writes in either order and raw signal-namespace writes are rejected.
+  Callers retry the entire transaction with a fresh clock after conflicts. Unlike
+  upstream `Tx`, sequential signal calls remain allowed after a staged delivery;
+  this API does not create or transition a signalled task in that commit.
   Storage errors can have uncertain outcomes. Same-ID retries remain successful
   after task termination,
   while a new ID is rejected for a terminal task. Existing stores with
