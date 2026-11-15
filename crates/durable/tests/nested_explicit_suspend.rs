@@ -2791,3 +2791,182 @@ async fn checkpoint_wake_lists_all_original_pending_operations() {
     );
     scheduler.shutdown().await.unwrap();
 }
+
+struct WakeThenGateParent {
+    root: std::path::PathBuf,
+    stop_at_gate: bool,
+}
+#[async_trait]
+impl KeyedTool for WakeThenGateParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let wake = host.pending_wake();
+        let remote = host
+            .call_keyed_unpolled_with_id("remote-key", "remote", json!({}))
+            .await
+            .unwrap();
+        if matches!(remote.outcome, Outcome::Pending { .. }) {
+            assert!(wake.is_none());
+            host.suspend_pending_with_checkpoint(
+                json!({"saved": 42, "remote": remote.operation_id}),
+            )
+            .unwrap();
+            std::fs::write(self.root.join("checkpoint-requested"), b"ready").unwrap();
+            return Outcome::Succeeded("park".into()).into();
+        }
+        let Some(wake) = wake else {
+            return Outcome::Failed("checkpoint wake lost after nested gate recovery".into())
+                .into();
+        };
+        if wake.checkpoint != json!({"saved": 42, "remote": remote.operation_id})
+            || wake.ended != vec![remote.operation_id]
+        {
+            return Outcome::Failed("checkpoint wake changed after nested gate recovery".into())
+                .into();
+        }
+        match host
+            .call_keyed_unpolled("gate-key", "gate_a", json!({}))
+            .await
+        {
+            Outcome::Pending { .. } => {
+                if self.stop_at_gate {
+                    std::fs::write(self.root.join("gate-persisted-with-wake"), b"ready").unwrap();
+                    std::future::pending::<()>().await;
+                }
+                host.suspend_pending().unwrap();
+                Outcome::Succeeded("gate park".into()).into()
+            }
+            Outcome::Succeeded(value) if value == "gate_a" => {
+                Outcome::Succeeded("checkpoint-and-gate-recovered".into()).into()
+            }
+            outcome => Outcome::Failed(format!("unexpected gate outcome: {outcome:?}")).into(),
+        }
+    }
+}
+
+fn wake_then_gate_options(root: &std::path::Path, stop_at_gate: bool) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(WakeThenGateParent {
+                root: root.into(),
+                stop_at_gate,
+            }))
+            .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiGateTool {
+                    root: root.into(),
+                    name: "remote",
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: Arc::new(MultiGateTool {
+                    root: root.into(),
+                    name: "gate_a",
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_wake_then_gate_kill_worker() {
+    let Some(root) = std::env::var_os("PI_WAKE_THEN_GATE_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        wake_then_gate_options(&root, true),
+        hook_registry(Arc::new(MultiGateHook(root.clone()))),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("wake-gate-conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn killed_after_checkpoint_wake_and_new_gate_retains_wake_on_reopen() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpoint_wake_then_gate_kill_worker"])
+            .env("PI_WAKE_THEN_GATE_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("checkpoint-requested").exists()).await;
+    std::fs::write(root.join("remote-ready"), b"ready").unwrap();
+    until(|| root.join("gate-persisted-with-wake").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    assert!(!root.join("gate_a-invocations").exists());
+    let id = std::fs::read_to_string(root.join("wake-gate-conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        wake_then_gate_options(root, false),
+        hook_registry(Arc::new(MultiGateHook(root.into()))),
+    )
+    .unwrap();
+    until(|| scheduler.conversation(id).unwrap().nested_suspended()).await;
+    scheduler
+        .send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+            uuid::Uuid::new_v4(),
+            id,
+            "gate_a".into(),
+            json!("release"),
+        ))
+        .unwrap();
+    scheduler.schedule(id);
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(
+        |message| matches!(message, Message::Tool {content, ..} if content == "checkpoint-and-gate-recovered")
+    ));
+    for name in ["remote", "gate_a"] {
+        assert_eq!(
+            std::fs::read_to_string(root.join(format!("{name}-invocations")))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "{name} redispatched"
+        );
+    }
+    scheduler.shutdown().await.unwrap();
+}

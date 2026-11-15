@@ -9046,12 +9046,20 @@ impl Harness {
                         && restarts.saturating_add(1) < self.options.restart_limit
                         && crate::nested::recoverable_gate_intent(self.owner.store(), operation_id)?
                     {
+                        // A replay may have already received a checkpoint wake
+                        // before committing another nested gate. Keep that wake
+                        // across recovery, but never carry it across operations.
+                        let pending_wake = c
+                            .nested_resume
+                            .as_ref()
+                            .filter(|resume| resume.operation_id == operation_id)
+                            .and_then(|resume| resume.pending_wake.clone());
                         c.nested_resume = Some(NestedResume {
                             operation_id,
                             restarts,
                             dispatch_identity: DispatchIdentity::Other,
                             explicit_suspend: true,
-                            pending_wake: None,
+                            pending_wake,
                         });
                         c.phase = Phase::Blocked {
                             tool_panicked: false,

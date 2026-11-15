@@ -571,8 +571,9 @@ and cancellation of a running synchronous handler remain unsupported.
 operation ID and `suspend_pending_with_checkpoint` persists a bounded JSON
 checkpoint with the parent suspension. Once all captured pending jobs settle,
 `pending_wake()` supplies the checkpoint and ended operation IDs to the replayed
-root invocation. The same wake survives a process death during that replay;
-the parent must be replay-safe. Process-kill and abort tests cover the ordinary
+root invocation. The same wake survives a process death during that replay,
+including after the replay commits another child's before-tool gate; recovery
+retains it only for the same operation. The parent must be replay-safe. Process-kill and abort tests cover the ordinary
 `KeyedTool` / nested `Tool` execution path without re-dispatching the child.
 
 This is a bounded extension of the existing external-pending path, not upstream
