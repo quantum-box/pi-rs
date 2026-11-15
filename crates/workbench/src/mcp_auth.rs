@@ -603,6 +603,28 @@ async fn deadline_login<F>(
 where
     F: std::future::Future<Output = Result<()>>,
 {
+    deadline_login_with_commit(
+        deadline,
+        staged,
+        cancellation,
+        prepare,
+        |store, credentials| async move { store.save(credentials).await.map_err(auth_error) },
+    )
+    .await
+}
+
+async fn deadline_login_with_commit<F, C, Fut>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+    commit: C,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    C: FnOnce(FileCredentials, StoredCredentials) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     // Acquiring the lock is preparation too: expiry must never leave a queued
     // writer that can replace credentials later.
     let ready = async {
@@ -630,7 +652,7 @@ where
     let result = match ready {
         Ok((store, credentials, _guard)) if tokio::time::Instant::now() < deadline => {
             // The blocking write retains the lease even if the caller is dropped.
-            store.save(credentials).await.map_err(auth_error)
+            commit(store, credentials).await
         }
         Ok(_) => Err(Error::Config("MCP login timed out".into())),
         Err(error) => Err(error),
@@ -1636,6 +1658,49 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadline_do_not_interrupt_started_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let cancellation = pi_rs::CancellationToken::new();
+        let child_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let login = tokio::spawn(async move {
+            deadline_login_with_commit(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                staged,
+                &child_cancellation,
+                async move { stage_fixture(&store).await },
+                |store, credentials| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    store.save(credentials).await.map_err(auth_error)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+            .await
+            .expect("commit did not start")
+            .unwrap();
+        cancellation.cancel();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        assert!(!login.is_finished());
+        assert!(!path.exists());
+        tokio::time::resume();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), login)
+            .await
+            .expect("commit did not complete")
+            .unwrap()
+            .unwrap();
+        let saved: Envelope = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.credentials.client_id, "fixture");
     }
 
     #[tokio::test]
