@@ -173,6 +173,89 @@ fn held_outcomes_resume_after_process_death() {
     }
 }
 
+#[test]
+fn external_wait_child() {
+    let Ok(path) = std::env::var("PI_EXTERNAL_WAIT_DB") else {
+        return;
+    };
+    let mut registry = Registry::default();
+    registry.register("waiter", true, |_: &Task| {
+        Ok(Step::Wait {
+            checkpoint: checkpoint("second"),
+            condition: WaitFor::TasksAny(vec![FAST_CHILD]),
+            children: vec![],
+        })
+    });
+    registry.register("other", true, |_: &Task| {
+        panic!("other must not run before kill")
+    });
+    let mut scheduler = Scheduler::open(path, registry).unwrap();
+    let waiter = Task::new(TASK, TaskOwner::Conversation(OWNER), checkpoint("first"), 3)
+        .unwrap()
+        .registered("waiter".into(), true);
+    let other = Task::new(
+        FAST_CHILD,
+        TaskOwner::Conversation(OWNER),
+        checkpoint("first"),
+        3,
+    )
+    .unwrap()
+    .registered("other".into(), true);
+    scheduler.submit(&waiter).unwrap();
+    scheduler.submit(&other).unwrap();
+    scheduler.tick(0).unwrap();
+    assert_eq!(
+        scheduler.get(TASK).unwrap().unwrap().state(),
+        &TaskState::Waiting(WaitFor::TasksAny(vec![FAST_CHILD]))
+    );
+    println!("EXTERNAL_WAIT_COMMITTED");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn external_wait_recovers_after_process_death() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.db");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "external_wait_child", "--nocapture"])
+        .env("PI_EXTERNAL_WAIT_DB", &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = KillOnDrop(command.spawn().unwrap());
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line.unwrap().contains("EXTERNAL_WAIT_COMMITTED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("external wait not committed");
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+    let mut registry = Registry::default();
+    registry.register("waiter", true, |task: &Task| {
+        assert_eq!(task.checkpoint(), &checkpoint("second"));
+        assert_eq!(task.ended_children(), Some(&[FAST_CHILD][..]));
+        Ok(Step::Succeed(json!("woken")))
+    });
+    registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!("done"))));
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    assert!(scheduler.tick(0).unwrap());
+    assert_eq!(
+        scheduler.get(TASK).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!("woken"))
+    );
+}
+
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
