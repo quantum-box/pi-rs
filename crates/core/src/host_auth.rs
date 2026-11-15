@@ -123,6 +123,13 @@ mod tests {
         assert!(!format!("{credential:?}").contains("private-fixture"));
         assert!(HostCredential::new(HostCredentialKind::Bearer, " ").is_err());
         let mut builder = HostAuthBuilder::new();
+        let invalid = HostCredential::new(HostCredentialKind::Bearer, "key").unwrap();
+        assert!(
+            builder
+                .register("", "https://api.example/v1", invalid.clone())
+                .is_err()
+        );
+        assert!(builder.register("provider", " ", invalid).is_err());
         builder
             .register("provider", "https://api.example/v1", credential)
             .unwrap();
@@ -148,6 +155,19 @@ mod tests {
             HostAuthSnapshot::default()
                 .get("provider", "https://api.example/v1")
                 .is_none()
+        );
+        let replacement = HostAuthBuilder::new().build();
+        assert!(
+            replacement
+                .get("provider", "https://api.example/v1")
+                .is_none()
+        );
+        assert_eq!(
+            clone
+                .get("provider", "https://api.example/v1")
+                .unwrap()
+                .secret(),
+            "private-fixture"
         );
     }
 }
