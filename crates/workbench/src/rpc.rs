@@ -2058,6 +2058,7 @@ fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
 }
 
 fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
+    args.settings.fork_worker_history();
     args.refresh_workspace_selection();
     args.session = if args.no_session {
         args.session

@@ -111,7 +111,14 @@ impl Settings {
         fallback.resource_layers = if same && *old_trusted == trusted {
             layers.clone()
         } else {
-            layers.first().cloned().into_iter().collect()
+            let mut available: Vec<_> = layers.first().cloned().into_iter().collect();
+            let project = workspace.join(".pi");
+            if trusted && let Some(layer) = self.resource_layers.iter().skip(1).find(|(base, _)| {
+                base == &project || matches!((base.canonicalize(), project.canonicalize()), (Ok(a), Ok(b)) if a == b)
+            }) {
+                available.push(layer.clone());
+            }
+            available
         };
         fallback.refresh_effective();
         Some(fallback)
@@ -172,6 +179,25 @@ impl Settings {
                     object.insert(key.into(), value.clone());
                 } else {
                     object.remove(key);
+                }
+            }
+        }
+        if let Ok(mut history) = self.worker_history.lock()
+            && let Some((_, _, layers)) = history.as_mut()
+        {
+            for (base, layer) in layers {
+                let Some((_, incoming)) = reloaded.resource_layers.iter().find(|(path, _)| {
+                    path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b)
+                }) else { continue; };
+                let Some(object) = layer.as_object_mut() else {
+                    continue;
+                };
+                for key in ["steeringMode", "followUpMode"] {
+                    if let Some(value) = incoming.get(key) {
+                        object.insert(key.into(), value.clone());
+                    } else {
+                        object.remove(key);
+                    }
                 }
             }
         }
@@ -1428,6 +1454,7 @@ mod tests {
         )
         .unwrap();
         let mut settings = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        settings.remember_worker_snapshot(&workspace, false, &settings);
         std::fs::write(&user, r#"{"defaultModel":"new","steeringMode":"all"}"#).unwrap();
         let reloaded = super::Settings::load_from_paths_with_previous(
             &workspace,
@@ -1436,7 +1463,20 @@ mod tests {
             Some(&settings),
         )
         .unwrap();
+        let mut staged = settings.clone();
+        staged.fork_worker_history();
+        staged.apply_queue_reload(&reloaded);
+        assert_eq!(
+            settings
+                .worker_fallback(&workspace, false)
+                .unwrap()
+                .string("steeringMode"),
+            Some("one-at-a-time")
+        );
         settings.apply_queue_reload(&reloaded);
+        let history = settings.worker_fallback(&workspace, false).unwrap();
+        assert_eq!(history.string("defaultModel"), Some("old"));
+        assert_eq!(history.string("steeringMode"), Some("all"));
         assert_eq!(settings.string("defaultModel"), Some("old"));
         assert_eq!(settings.string("steeringMode"), Some("all"));
         std::fs::write(&user, "{").unwrap();
@@ -2293,6 +2333,15 @@ mod tests {
             assert_eq!(fallback.resource_layers.len(), 1);
             assert!(fallback.value().get("privateProject").is_none());
         }
+        let mut target = reloaded.clone();
+        target.resource_layers = vec![
+            (root.path().to_owned(), json!({"skills":["frontend"]})),
+            (other.join(".pi"), json!({"targetProject":"target"})),
+        ];
+        let target_fallback = target.worker_fallback(&other, true).unwrap();
+        assert_eq!(target_fallback.value()["skills"][0], "new");
+        assert_eq!(target_fallback.value()["targetProject"], "target");
+        assert!(target_fallback.value().get("privateProject").is_none());
         let mut staged = reloaded.clone();
         staged.fork_worker_history();
         let newer = Settings {
