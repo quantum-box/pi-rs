@@ -111,7 +111,9 @@ For remote packages with a single settings scope, an invalid file URL in a
 package settings filter reports an error when evaluated. Layered package
 settings, local packages, and other resource filter paths still treat invalid
 URLs as non-matches. Pi evaluates the scopes separately and stops processing
-a local package when an error is reached.
+a local package when an error is reached. When multiple packages have invalid
+filters, native reports the first in package identity order; Pi uses settings
+order, with project sources first.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
