@@ -6249,7 +6249,7 @@ mod tests {
         .expect("timed out shell kept draining");
         let error = result.err();
         assert!(
-            matches!(&error, Some(Error::Config(message)) if message.contains("timed out")),
+            matches!(&error, Some(Error::Config(message)) if message.starts_with("0\n") && message.contains("timed out")),
             "unexpected timeout result: {error:?}"
         );
     }
