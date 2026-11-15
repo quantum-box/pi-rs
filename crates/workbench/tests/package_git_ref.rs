@@ -380,6 +380,24 @@ fn invalid_remote_filters_follow_package_settings_order() {
             .to_string(),
     )
     .unwrap();
+    let listed = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--trust", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(listed.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["source"], sources[1]);
+    assert_eq!(lines[1]["source"], sources[0]);
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(directory.path())
         .env("PI_RS_HOME", &home)

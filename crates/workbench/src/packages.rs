@@ -62,6 +62,7 @@ struct Declaration {
     value: Value,
     inherited: Option<Value>,
     transient: bool,
+    scope_order: u8,
 }
 
 pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
@@ -150,7 +151,15 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
         }
         PackageCommand::List => {
             let index = index()?;
-            for declaration in declarations(args)? {
+            let mut configured = declarations(args)?;
+            // Pi lists user packages before project packages, while resource
+            // resolution gives project packages precedence.
+            configured.sort_by_key(|entry| match entry.scope_order {
+                1 => 0,
+                0 => 1,
+                _ => 2,
+            });
+            for declaration in configured {
                 let installed = index
                     .get(&key(&declaration.source))
                     .cloned()
@@ -1088,6 +1097,7 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                         value: value.clone(),
                         inherited,
                         transient: false,
+                        scope_order: scope,
                     },
                 );
             }
@@ -1112,6 +1122,7 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 source,
                 inherited: None,
                 transient: true,
+                scope_order: 2,
             },
         );
     }
