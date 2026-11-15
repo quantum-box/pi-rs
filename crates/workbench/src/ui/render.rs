@@ -2433,6 +2433,26 @@ mod tests {
     }
 
     #[test]
+    fn math_like_mailbox_keeps_link_and_following_formatting() {
+        let theme = Theme::system();
+        let lines = markdown("a$foo_bar@example.com after **bold**", &theme, 120);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "a$foo_bar@example.com after bold"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "a$foo_bar@example.com" && span.underline)
+        );
+        assert!(spans.iter().any(|span| span.text == "bold" && span.bold));
+    }
+
+    #[test]
     fn display_math_preserves_links_code_and_width_fallback() {
         let theme = Theme::system();
         let rendered = |source: &str, width: usize| {

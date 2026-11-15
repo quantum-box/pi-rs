@@ -217,7 +217,7 @@ fn unescape_with_offsets(source: &str, escaped: &[u8]) -> (String, Vec<usize>) {
 // Marked can split a mailbox into plain text plus a link to only its suffix.
 // Rejoin only native-validated mailboxes whose entire extent consists of
 // unchanged text and bare email tokens, never across formatting boundaries.
-fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
+fn repair_split_mail(tokens: &[Value], source: &str, refs: &RefDefs<'_>) -> Option<Vec<Value>> {
     if frame_expired() {
         return None;
     }
@@ -262,7 +262,11 @@ fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
                     // An unclosed dollar inside a valid local part can be
                     // classified as pending math by Marked. The whole token
                     // belongs to the mailbox, so restore the validated link.
-                    "latex" if cursor >= range.start && end <= range.end => {
+                    "latex"
+                        if cursor >= range.start
+                            && (end <= range.end
+                                || token.get("pending").and_then(Value::as_bool) == Some(true)) =>
+                    {
                         split_link = true;
                     }
                     _ => valid = false,
@@ -286,7 +290,17 @@ fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
             "tokens":[{"type":"text", "raw":raw, "text":raw}]}));
         if range.end < end {
             let raw = source.get(range.end..end)?;
-            replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+            if tokens[last].get("type").and_then(Value::as_str) == Some("latex") {
+                let suffix = LEXER.with(|lexer| {
+                    lexer
+                        .borrow()
+                        .as_ref()
+                        .and_then(|lexer| lexer.tokens(raw, refs))
+                })?;
+                replacement.extend(suffix);
+            } else {
+                replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
+            }
         }
         tokens.splice(first..=last, replacement);
     }
@@ -300,10 +314,11 @@ fn token_nodes(
     whole: &str,
     run_start: usize,
     cell_end: Option<usize>,
+    refs: &RefDefs<'_>,
 ) -> Option<Vec<Node>> {
     let mut result = Vec::new();
     let mut cursor = 0usize;
-    let tokens = repair_split_mail(tokens, source)?;
+    let tokens = repair_split_mail(tokens, source, refs)?;
     for token in &tokens {
         if frame_expired() {
             return None;
@@ -337,7 +352,15 @@ fn token_nodes(
                 .iter()
                 .map(|offset| offsets.get(cursor + offset).copied())
                 .collect::<Option<Vec<_>>>()?;
-            token_nodes(children, text, &child_offsets, whole, run_start, cell_end)
+            token_nodes(
+                children,
+                text,
+                &child_offsets,
+                whole,
+                run_start,
+                cell_end,
+                refs,
+            )
         };
         let group = match kind {
             "del" => Some((Tag::Strikethrough, TagEnd::Strikethrough)),
@@ -620,7 +643,7 @@ fn inline_run(
             .and_then(|lexer| lexer.tokens(&source, refs))
     });
     tokens
-        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end))
+        .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end, refs))
         .unwrap_or(nodes)
 }
 
