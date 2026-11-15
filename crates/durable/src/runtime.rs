@@ -10974,6 +10974,7 @@ impl Harness {
                 Phase::HookTasksWaiting { children, turns } => {
                     let store = crate::task_store::TaskStore::new(self.owner.store());
                     let mut terminate = false;
+                    let mut completed = Vec::with_capacity(children.len());
                     for id in children {
                         let task = store
                             .load(id)
@@ -10986,6 +10987,9 @@ impl Harness {
                         if !task.is_terminal() {
                             return Ok(());
                         }
+                        completed.push((id, task));
+                    }
+                    for (id, task) in completed {
                         if let crate::task::TaskState::Failed(reason) = task.state() {
                             let kind = task.kind().unwrap_or("unknown");
                             let selected = self.selected_extensions(&c)?;
@@ -11007,6 +11011,30 @@ impl Harness {
                                     object.len() == 1 && object.get("terminate") == Some(&serde_json::Value::Bool(true))))
                         {
                             terminate = true;
+                        }
+                        if turns.is_some()
+                            && let crate::task::TaskState::Succeeded(value) = task.state()
+                            && !value.is_null()
+                            && !value.as_object().is_some_and(|object| {
+                                object.is_empty()
+                                    || (object.len() == 1
+                                        && object.get("terminate")
+                                            == Some(&serde_json::Value::Bool(true)))
+                            })
+                        {
+                            let kind = task.kind().unwrap_or("unknown");
+                            let selected = self.selected_extensions(&c)?;
+                            let owner = selected.task_owner(kind).unwrap_or("unknown");
+                            self.record_extension_reports(
+                                c.id,
+                                id,
+                                "after_tools_invalid_decision",
+                                vec![crate::extension::Report {
+                                    extension: owner.into(),
+                                    operation: "after_tools_invalid_decision".into(),
+                                    error: format!("afterTools task {id} ({kind}) completed with no AfterToolsDecision"),
+                                }],
+                            )?;
                         }
                     }
                     c.phase = if terminate

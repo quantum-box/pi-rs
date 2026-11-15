@@ -1855,6 +1855,151 @@ async fn gate_deadline_and_early_signal_survive_restart() {
 struct TerminateRoundHook {
     after_run: Arc<Mutex<Vec<Value>>>,
 }
+
+struct InvalidRoundHooks;
+#[async_trait]
+impl Hook for InvalidRoundHooks {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent, HookTask};
+        if event == GenerationEvent::AfterTools {
+            Ok(GenerationDecision::Tasks(
+                (0..2)
+                    .map(|n| HookTask {
+                        name: "invalid".into(),
+                        input: json!(n),
+                    })
+                    .collect(),
+            ))
+        } else {
+            Ok(GenerationDecision::Pass)
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_after_tools_reports_wait_for_all_children_and_follow_creation_order() {
+    use pi_rs_durable::{
+        task::{Checkpoint, Task, TaskState, WaitFor},
+        task_scheduler::{Handler, Registry, Step},
+        task_store::Signal,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let handler: Arc<dyn Handler> = Arc::new(|task: &Task| {
+        if task.delivered_signal().is_some() {
+            Ok(Step::Succeed(json!(false)))
+        } else {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "wait".into(),
+                    data: json!(null),
+                },
+                condition: WaitFor::Signal("go".into()),
+                children: vec![],
+            })
+        }
+    });
+    let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+    h.install_extension(Extension {
+        name: "owner".into(),
+        hooks: vec![Arc::new(InvalidRoundHooks)],
+        tasks: vec![("invalid".into(), handler.clone())],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("invalid", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["owner".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let state = serde_json::to_value(h.conversation(id).unwrap()).unwrap();
+    let children: Vec<Uuid> = state["phase"]["HookTasksWaiting"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(children.len(), 2);
+    for child in children.iter().rev() {
+        for _ in 0..200 {
+            if matches!(
+                driver.get(*child).unwrap().unwrap().state(),
+                TaskState::Waiting(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        driver
+            .signal(&Signal::new(
+                Uuid::new_v4(),
+                *child,
+                "go".into(),
+                json!(null),
+            ))
+            .unwrap();
+        for _ in 0..200 {
+            if driver.get(*child).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(driver.get(*child).unwrap().unwrap().is_terminal());
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        if *child == children[1] {
+            assert!(h.extension_reports().unwrap().is_empty());
+        }
+    }
+    let reports = h
+        .subscribe_extension_reports()
+        .unwrap()
+        .read(0, 100)
+        .unwrap();
+    assert_eq!(
+        reports
+            .iter()
+            .map(|r| r.batch.operation_id)
+            .collect::<Vec<_>>(),
+        children
+    );
+    assert!(
+        reports
+            .iter()
+            .all(|r| r.batch.reports[0].extension == "owner")
+    );
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.subscribe_extension_reports()
+            .unwrap()
+            .read(0, 100)
+            .unwrap(),
+        reports
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options(model, tool)).unwrap();
+    assert_eq!(
+        h.subscribe_extension_reports()
+            .unwrap()
+            .read(0, 100)
+            .unwrap(),
+        reports
+    );
+}
 #[async_trait]
 impl Hook for TerminateRoundHook {
     async fn generation(
@@ -1886,11 +2031,14 @@ async fn after_tools_termination_settles_before_after_run_and_recovers_queued_in
         task_scheduler::{Handler, Registry, Step},
         task_store::Signal,
     };
-    for (decision, terminates) in [
-        (json!({"terminate": true}), true),
-        (json!({"terminate": true, "extra": 1}), false),
-        (json!({"terminate": false}), false),
-        (json!(null), false),
+    for (decision, terminates, invalid) in [
+        (json!({"terminate": true}), true, false),
+        (json!({"terminate": true, "extra": 1}), false, true),
+        (json!({"terminate": false}), false, true),
+        (json!(null), false, false),
+        (json!({}), false, false),
+        (json!([]), false, true),
+        (json!(true), false, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -2004,8 +2152,46 @@ async fn after_tools_termination_settles_before_after_run_and_recovers_queued_in
                 assert!(!snapshots.is_empty());
             }
             assert_eq!(tool.0.lock().unwrap().len(), 1);
+            let reports = h
+                .subscribe_extension_reports()
+                .unwrap()
+                .read(0, 100)
+                .unwrap();
+            assert_eq!(reports.len(), usize::from(invalid));
+            if invalid {
+                let batch = &reports[0].batch;
+                assert_eq!(batch.conversation_id, id);
+                assert_eq!(batch.operation_id, child);
+                assert_eq!(batch.phase, "after_tools_invalid_decision");
+                assert_eq!(batch.reports[0].extension, "decision");
+                assert_eq!(
+                    batch.reports[0].error,
+                    format!(
+                        "afterTools task {child} (decision) completed with no AfterToolsDecision"
+                    )
+                );
+            }
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                h.subscribe_extension_reports()
+                    .unwrap()
+                    .read(0, 100)
+                    .unwrap(),
+                reports
+            );
             driver.shutdown().unwrap();
         }
+        let h = Harness::open_paused(&path, options(model, tool)).unwrap();
+        assert_eq!(
+            h.subscribe_extension_reports()
+                .unwrap()
+                .read(0, 100)
+                .unwrap()
+                .len(),
+            usize::from(invalid)
+        );
     }
 }
 
