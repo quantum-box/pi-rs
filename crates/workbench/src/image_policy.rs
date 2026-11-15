@@ -560,7 +560,14 @@ mod tests {
     #[tokio::test]
     async fn responses_session_headers_respect_explicit_values_and_summary_boundary() {
         use std::io::{Read, Write};
-        for (summary, explicit) in [(false, false), (false, true), (true, false)] {
+        for (summary, explicit, enriched) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+        ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -606,19 +613,37 @@ mod tests {
                 tools: vec![],
                 max_output_tokens: 1,
             };
-            if summary {
-                let _ = model
-                    .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
-                    .await;
-            } else {
-                let _ = model
-                    .stream_in_session_with_identity(
-                        Uuid::new_v4(),
-                        Uuid::new_v4(),
-                        "session-one",
-                        request,
-                    )
-                    .await;
+            match (summary, enriched) {
+                (true, true) => {
+                    let _ = model
+                        .stream_enriched_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                }
+                (true, false) => {
+                    let _ = model
+                        .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                }
+                (false, true) => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            "session-one",
+                            request,
+                        )
+                        .await;
+                }
+                (false, false) => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            "session-one",
+                            request,
+                        )
+                        .await;
+                }
             }
             let headers = server.join().unwrap();
             assert_eq!(
