@@ -37,6 +37,8 @@ continue to receive deltas without item boundaries.
 Chat Completions providers configured with `requiresThinkingAsText` retain
 streamed reasoning and replay it as text before the answer for the same model.
 
+Gemini streaming retains the first nonempty, bounded response ID for the turn.
+
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
 and is used only for endpoints declared by that profile; keys with an explicit

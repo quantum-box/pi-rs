@@ -903,7 +903,8 @@ impl Model for Google {
                         Error::Model("Google Gemini returned a stream error".into())
                     })?;
                 }
-                if let Some(id) = value["responseId"].as_str().filter(|id| id.len() <= 160) {
+                if let Some(id) = value["responseId"].as_str().filter(|id| !id.is_empty() && id.len() <= 160)
+                    && metadata.provider_request_id.is_none() {
                     metadata.provider_request_id = Some(id.into());
                 }
                 if let Some(version) = value["modelVersion"].as_str().filter(|version| valid_model_id(version)) {
@@ -1011,6 +1012,52 @@ fn report_progress(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn keeps_first_valid_nonempty_response_id() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let events = [
+                json!({"responseId":""}),
+                json!({"responseId":"x".repeat(161)}),
+                json!({"responseId":"first"}),
+                json!({"responseId":""}),
+                json!({"responseId":"later","candidates":[{"index":0,"finishReason":"STOP"}]}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let mut stream = model.stream(request).await.unwrap();
+        let mut id = None;
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Metadata(metadata) => id = metadata.provider_request_id,
+                ModelEvent::Complete { .. } => completed = true,
+                _ => {}
+            }
+        }
+        worker.join().unwrap();
+        assert_eq!(id.as_deref(), Some("first"));
+        assert!(completed);
+    }
+
     #[tokio::test]
     async fn code_less_stream_errors_use_transient_classifier() {
         use std::io::{Read, Write};
