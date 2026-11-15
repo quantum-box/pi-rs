@@ -1542,6 +1542,10 @@ models return `None`, preserving the previous behavior; Ollama discovery is
 not wired to this catalog. Core `Model` does not expose modality or resize limits,
 so the core-only model path cannot resolve them automatically.
 
+Google's `set_model_descriptor` overrides catalog input capability for the
+same model (with or without the `models/` prefix), while retaining catalog
+limits. The descriptor is host configuration and must be reinstalled on reopen.
+
 For a known text-only model, durable replaces user and tool images with upstream
 placeholder text in the outgoing request copy, including images in legacy tool
 JSON. Ordered image runs collapse to one placeholder. The stored transcript and

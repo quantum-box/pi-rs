@@ -19,9 +19,14 @@ following user message for older Gemini models. Whitespace-only text becomes
 text/image interleaving only in the provider request; persisted blocks remain
 unchanged. Hosts may call `set_model_descriptor(model, &json!({"input":
 ["text", "image"]}))` before installing the adapter. A descriptor whose input
-contains only `text` omits tool-result images as upstream does; unknown models
-retain the historical image-capable default. Descriptors are host configuration,
-not persisted, and must be supplied again on reopen. The durable runtime passes
+contains only `text` replaces user and tool-result image runs with upstream
+placeholders before encoding. Its input capability takes precedence over the
+bundled durable model catalog; catalog limits still apply. Google model names
+with or without `models/` identify the same descriptor. Without an explicit
+descriptor the catalog applies, and unknown models retain the historical
+image-capable default. Descriptors are host configuration, not persisted, and
+must be supplied again on reopen. Switching a fork to another model resolves
+that model's capability anew; stored image blocks and result status do not change. The durable runtime passes
 committed tool error status to this adapter, which emits `error` rather than
 `output`. Legacy results without metadata use `output`; ambiguous reused call
 IDs without provable occurrence bindings fail closed. New text-only results are

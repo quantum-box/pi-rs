@@ -669,8 +669,9 @@ fn project_blocks(blocks: &mut Vec<Value>, placeholder: &str) {
     *blocks = projected;
 }
 
-/// Project only the outgoing copy. Transcript bindings and raw history stay intact.
-pub(crate) fn project_nonvision_request(
+/// Replace images on an outgoing request and its bindings with upstream
+/// placeholders. Callers must pass copies when original history must be kept.
+pub fn project_nonvision_request(
     request: &mut pi_rs_core::ModelRequest,
     blocks: &mut std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
     tool_blocks: &mut std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,

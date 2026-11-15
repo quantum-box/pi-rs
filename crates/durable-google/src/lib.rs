@@ -75,19 +75,23 @@ impl GoogleAdapter {
             .get("input")
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Config("model descriptor requires input array".into()))?;
-        if model.is_empty()
+        if model_id(&model).is_empty()
             || inputs
                 .iter()
                 .any(|v| !matches!(v.as_str(), Some("text" | "image")))
         {
             return Err(Error::Config("invalid model input descriptor".into()));
         }
-        self.model_images
-            .insert(model, inputs.iter().any(|v| v == "image"));
+        self.model_images.insert(
+            model_id(&model).to_owned(),
+            inputs.iter().any(|v| v == "image"),
+        );
         Ok(())
     }
     fn accepts_tool_images(&self, model: &str) -> bool {
-        self.model_images.get(model).copied().unwrap_or(true)
+        self.image_profile(model)
+            .map(|profile| profile.supports_images)
+            .unwrap_or(true)
     }
     /// Use ordered JSON references for tool blocks instead of upstream's
     /// text-and-images projection. This mode has a distinct persisted adapter ID.
@@ -292,6 +296,43 @@ fn wire_request_with_blocks(
     options: (bool, Option<&BTreeMap<usize, bool>>, bool),
 ) -> Result<Value> {
     let (ordered_tool_blocks, tool_errors, image_input) = options;
+    if !image_input {
+        let mut projected_request = request.clone();
+        let mut projected_durable = durable.cloned();
+        let mut projected_tools = tools.cloned();
+        let mut blocks = projected_durable
+            .as_ref()
+            .map(|d| d.blocks.clone())
+            .unwrap_or_default();
+        let mut tool_blocks = projected_tools
+            .as_ref()
+            .map(|t| t.tool_blocks.clone())
+            .unwrap_or_default();
+        pi_rs_durable::images::project_nonvision_request(
+            &mut projected_request,
+            &mut blocks,
+            &mut tool_blocks,
+        );
+        if let Some(durable) = projected_durable.as_mut() {
+            durable.request = projected_request.clone();
+            durable.blocks = blocks;
+        }
+        if let Some(tools) = projected_tools.as_mut() {
+            tools.request.request = projected_request.clone();
+            if let Some(durable) = &projected_durable {
+                tools.request.blocks = durable.blocks.clone();
+            }
+            tools.tool_blocks = tool_blocks;
+        }
+        return wire_request_with_blocks(
+            &projected_request,
+            thinking,
+            replay_scope,
+            projected_durable.as_ref(),
+            projected_tools.as_ref(),
+            (ordered_tool_blocks, tool_errors, true),
+        );
+    }
     if let Some(durable) = durable {
         let mut ids = BTreeSet::new();
         if durable.blocks.iter().any(|(index, binding)| {
@@ -654,6 +695,16 @@ fn valid_content(body: &Value) -> bool {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for GoogleAdapter {
+    fn image_profile(&self, model: &str) -> Option<pi_rs_durable::images::ModelImageProfile> {
+        let catalog = pi_rs_durable::images::builtin_model_image_profile(self.id(), model);
+        match self.model_images.get(model_id(model)) {
+            Some(&supports_images) => Some(pi_rs_durable::images::ModelImageProfile {
+                supports_images,
+                limits: catalog.map(|profile| profile.limits).unwrap_or_default(),
+            }),
+            None => catalog,
+        }
+    }
     fn supports_tool_result_metadata(&self) -> bool {
         true
     }

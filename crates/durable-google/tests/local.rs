@@ -761,7 +761,11 @@ async fn tool_status_also_applies_to_plain_results_and_ordered_mode() {
         .unwrap();
     assert_eq!(
         body["contents"][2]["parts"][0]["functionResponse"]["response"]["error"],
-        json!(["first", "last"])
+        json!([
+            "first",
+            "(tool image omitted: model does not support images)",
+            "last"
+        ])
     );
     assert!(!body.to_string().contains("aGk="));
     let mut plain = request.clone();
@@ -909,7 +913,7 @@ async fn failed_tool_result_reopens_and_reaches_google_http() {
             let mut adapter = GoogleAdapter::new(endpoint, "secret-key").unwrap();
             if !images_allowed {
                 adapter
-                    .set_model_descriptor("gemini-3-flash", &json!({"input":["text"]}))
+                    .set_model_descriptor("gemini-3-flash-preview", &json!({"input":["text"]}))
                     .unwrap();
             }
             Arc::new(adapter)
@@ -919,7 +923,7 @@ async fn failed_tool_result_reopens_and_reaches_google_http() {
         h.install_extension(extension()).unwrap();
         let id = h
             .create_conversation(Config {
-                model: "gemini-3-flash".into(),
+                model: "models/gemini-3-flash-preview".into(),
                 system_prompt: String::new(),
                 max_output_tokens: 100,
             })
@@ -951,6 +955,8 @@ async fn failed_tool_result_reopens_and_reaches_google_http() {
             .unwrap();
         let expected_text = if plain {
             binding.blocks[0]["text"].as_str().unwrap().to_owned()
+        } else if !images_allowed {
+            "first\n(tool image omitted: model does not support images)\nlast".to_owned()
         } else {
             "first\nlast".to_owned()
         };
@@ -1001,9 +1007,203 @@ async fn failed_tool_result_reopens_and_reaches_google_http() {
             .unwrap();
         assert_eq!(forked_meta.content_block_id, Some(occurrence_id));
         assert_eq!(forked_meta.is_error, !flip);
-        drop(h);
+        if !plain && !images_allowed {
+            use pi_rs_durable::task::{Checkpoint, Task, TaskOwner, scheduler::Registry};
+            let mut registry = Registry::default();
+            registry.register("switch-image-model", true, SwitchImageModel);
+            let mut scheduler = h.attach_tasks(registry).unwrap();
+            let task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(fork),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!(null),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("switch-image-model".into(), true);
+            scheduler.submit(&task).unwrap();
+            scheduler.tick(0).unwrap();
+            drop(scheduler);
+            assert_eq!(
+                h.conversation(fork).unwrap().config.model,
+                "gemini-3.5-flash"
+            );
+            assert_eq!(
+                h.conversation(id).unwrap().config.model,
+                "models/gemini-3-flash-preview"
+            );
+            drop(h);
+            let (url, server3) = server(final_response, false).await;
+            let mut h2 = Harness::open_paused(&path, options()).unwrap();
+            h2.install_provider_adapter(adapter(&url)).unwrap();
+            h2.install_extension(extension()).unwrap();
+            assert!(
+                h2.model_image_profile(fork)
+                    .unwrap()
+                    .unwrap()
+                    .supports_images
+            );
+            assert!(!h2.model_image_profile(id).unwrap().unwrap().supports_images);
+            assert_eq!(h2.conversation(fork).unwrap().content_blocks, before);
+            h2.submit_and_run(fork, None, "again".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+            let bytes = server3.await.unwrap();
+            let split = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let sent: Value = serde_json::from_slice(&bytes[split + 4..]).unwrap();
+            let response = sent["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|x| x["parts"].as_array().unwrap())
+                .find_map(|x| x.get("functionResponse"))
+                .unwrap();
+            assert_eq!(response["response"]["error"], "first\nlast");
+            assert_eq!(response["parts"][0]["inlineData"]["data"], "aGk=");
+            assert_eq!(h2.conversation(id).unwrap().content_blocks, before);
+            drop(h2);
+        } else {
+            drop(h);
+        }
         for suffix in ["", "-wal", "-shm", ".owner"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+}
+
+struct SwitchImageModel;
+impl pi_rs_durable::task::scheduler::Handler for SwitchImageModel {
+    fn run(
+        &self,
+        _: &pi_rs_durable::task::Task,
+    ) -> Result<pi_rs_durable::task::scheduler::Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        _: &pi_rs_durable::task::Task,
+        docs: &mut pi_rs_durable::document::TaskDocuments<'_>,
+    ) -> Result<pi_rs_durable::task::scheduler::Step, String> {
+        docs.append_entry("model.switch", json!(null)).unwrap();
+        docs.configure_runtime_at_checkpoint(pi_rs_durable::runtime::Config {
+            model: "gemini-3.5-flash".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+        Ok(pi_rs_durable::task::scheduler::Step::Succeed(json!(null)))
+    }
+}
+
+#[test]
+fn google_explicit_image_profile_precedes_catalog_and_normalizes_model_prefix() {
+    let mut adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
+    let model = "gemini-3-flash-preview";
+    assert!(adapter.image_profile(model).unwrap().supports_images);
+    let catalog_limits = adapter.image_profile(model).unwrap().limits;
+    adapter
+        .set_model_descriptor(format!("models/{model}"), &json!({"input":["text"]}))
+        .unwrap();
+    assert!(!adapter.image_profile(model).unwrap().supports_images);
+    assert!(
+        !adapter
+            .image_profile(&format!("models/{model}"))
+            .unwrap()
+            .supports_images
+    );
+    assert_eq!(adapter.image_profile(model).unwrap().limits, catalog_limits);
+    adapter
+        .set_model_descriptor(model, &json!({"input":["text", "image"]}))
+        .unwrap();
+    assert!(
+        adapter
+            .image_profile(&format!("models/{model}"))
+            .unwrap()
+            .supports_images
+    );
+    assert!(adapter.image_profile("unlisted-model").is_none());
+    adapter
+        .set_model_descriptor("unlisted-model", &json!({"input":["text"]}))
+        .unwrap();
+    assert!(
+        !adapter
+            .image_profile("unlisted-model")
+            .unwrap()
+            .supports_images
+    );
+}
+
+#[tokio::test]
+async fn nonvision_projects_user_and_failed_tool_images_for_both_google_modes() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    for ordered in [false, true] {
+        let mut adapter = if ordered {
+            GoogleAdapter::new_ordered_tool_blocks("http://127.0.0.1:1", "key").unwrap()
+        } else {
+            GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap()
+        };
+        adapter
+            .set_model_descriptor("models/gemini-3-flash-preview", &json!({"input":["text"]}))
+            .unwrap();
+        let mut req = ordered_tool_request();
+        req.request.request.model = "gemini-3-flash-preview".into();
+        req.request.request.messages[0] = Message::User {
+            content: String::new(),
+        };
+        req.request.blocks.insert(
+            0,
+            MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text", "text":"look"}),
+                    json!({"type":"image", "data":"aGk=", "mimeType":"image/png"}),
+                ],
+            },
+        );
+        let original = req.clone();
+        let result = ProviderResultRequest {
+            request: req,
+            tool_errors: [(2, true)].into_iter().collect(),
+        };
+        let a = attempt();
+        let mut body = adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap();
+        assert_eq!(
+            body["contents"][0]["parts"][1]["text"],
+            "(image omitted: model does not support images)"
+        );
+        let error = &body["contents"][2]["parts"][0]["functionResponse"]["response"]["error"];
+        if ordered {
+            assert_eq!(
+                error,
+                &json!([
+                    "first",
+                    "(tool image omitted: model does not support images)",
+                    "last"
+                ])
+            );
+        } else {
+            assert_eq!(
+                error,
+                "first\n(tool image omitted: model does not support images)\nlast"
+            );
+        }
+        assert!(!body.to_string().contains("aGk="));
+        assert_eq!(result.request.request.blocks, original.request.blocks);
+        assert_eq!(result.request.tool_blocks, original.tool_blocks);
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .unwrap();
+        body["contents"][2]["parts"][0]["functionResponse"]["response"] =
+            json!({"output":"replaced"});
+        assert!(
+            adapter
+                .validate_with_result_metadata(&a, &result, &body)
+                .is_err()
+        );
     }
 }
