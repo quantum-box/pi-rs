@@ -491,4 +491,3 @@ mod tests {
         assert_eq!(detect_image_mime_type(&png), None);
     }
 }
-
