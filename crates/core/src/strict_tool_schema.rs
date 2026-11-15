@@ -14,14 +14,29 @@ pub fn strict_tool_schema(
     schema: &Value,
     unsupported: impl Fn(&str, &Value) -> bool,
 ) -> Result<Value, StrictSchemaError> {
-    if schema.get("type").and_then(Value::as_str) != Some("object") {
+    if !schema.is_object() {
         return Err(StrictSchemaError(
             "root schema must have type object".into(),
         ));
     }
     let mut result = schema.clone();
     make_strict(&mut result, &unsupported)?;
+    if result.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(StrictSchemaError(
+            "root schema must have type object".into(),
+        ));
+    }
     Ok(result)
+}
+
+fn js_order(names: &mut [String]) {
+    // JavaScript enumerates canonical array indices before other keys.
+    names.sort_by_key(|name| {
+        name.parse::<u32>()
+            .ok()
+            .filter(|index| *index != u32::MAX && index.to_string() == *name)
+            .map_or((1, 0), |index| (0, index))
+    });
 }
 
 fn structured(value: &Value) -> bool {
@@ -88,7 +103,10 @@ fn make_strict(
             return Err(StrictSchemaError(format!("{key} schemas are unsupported")));
         }
     }
-    for (key, value) in schema.iter() {
+    let mut schema_keys: Vec<_> = schema.keys().cloned().collect();
+    js_order(&mut schema_keys);
+    for key in &schema_keys {
+        let value = &schema[key];
         if unsupported(key, value) {
             return Err(StrictSchemaError(format!("{key}: {value} is unsupported")));
         }
@@ -133,6 +151,14 @@ fn make_strict(
             "schema-valued or true additionalProperties is unsupported".into(),
         ));
     }
+    if schema
+        .get("properties")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(StrictSchemaError(
+            "object properties must be a schema map".into(),
+        ));
+    }
     let required = match schema.get("required") {
         None => Vec::new(),
         Some(Value::Array(items)) if items.iter().all(Value::is_string) => items
@@ -165,26 +191,16 @@ fn make_strict(
             "required contains an unknown property".into(),
         ));
     }
-    for (key, property) in properties.iter_mut() {
-        make_strict(property, unsupported)?;
-        if !required.contains(key) && !allows_null(property) {
-            *property = json!({"anyOf":[property.clone(),{"type":"null"}]});
-        }
-    }
     let mut names: Vec<_> = properties.keys().cloned().collect();
-    // JavaScript enumerates array-index object keys before other keys.
-    names.sort_by_key(|name| {
-        name.parse::<u32>()
-            .ok()
-            .filter(|index| *index != u32::MAX && index.to_string() == *name)
-            .map_or((1, 0), |index| (0, index))
-    });
+    js_order(&mut names);
     let mut ordered = serde_json::Map::new();
     for name in &names {
-        ordered.insert(
-            name.clone(),
-            properties.remove(name).expect("known property"),
-        );
+        let mut property = properties.remove(name).expect("known property");
+        make_strict(&mut property, unsupported)?;
+        if !required.contains(name) && !allows_null(&property) {
+            property = json!({"anyOf":[property,{"type":"null"}]});
+        }
+        ordered.insert(name.clone(), property);
     }
     *properties = ordered;
     schema.insert("required".into(), json!(names));
@@ -242,10 +258,15 @@ mod tests {
     #[test]
     fn follows_javascript_property_enumeration_and_typed_nodes() {
         let schema = json!({"type":"object","properties":{
-            "10":{"type":"string"},"2":{"enum":[1,2]},"other":{"type":"string"}
+            "4294967295":{"type":"string"},"10":{"type":"string"},
+            "01":{"type":"string"},"2":{"enum":[1,2]},"0":{"type":"string"},
+            "4294967294":{"type":"string"},"other":{"type":"string"}
         }});
         let result = strict_tool_schema(&schema, |_, _| false).unwrap();
-        assert_eq!(result["required"], json!(["2", "10", "other"]));
+        assert_eq!(
+            result["required"],
+            json!(["0", "2", "10", "4294967294", "4294967295", "01", "other"])
+        );
         for value in [
             json!({}),
             json!({"type":"array","items":{}}),
