@@ -5072,6 +5072,20 @@ returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
 
+### Native SDK theme snapshots
+
+`pi_rs_workbench::theme_resources::ThemeReadGrants` loads an ordered snapshot
+from explicitly granted files only. It shares schema validation and color
+resolution with the interactive frontend and exposes each name, source path and
+resolved color roles without selecting a theme or probing the terminal. Reads
+are synchronous, bounded, follow symlinks, and are not a filesystem sandbox.
+A grant includes the symlink target. Reloading creates an independent snapshot.
+Missing, invalid, duplicate-name, oversized or excessive inputs fail atomically;
+variable chains have a depth limit. Unlike Pi's resource loader, this API does
+not discover directories, packages, settings or built-in themes, detect terminal
+capabilities, or return per-file warnings and deduplicate collisions. Hosts choose
+when to apply a snapshot, and revoking a grant does not erase an existing one.
+
 ### Native SDK prompt resource factory
 
 `pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
