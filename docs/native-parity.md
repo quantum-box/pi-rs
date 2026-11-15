@@ -794,8 +794,11 @@ both configurations before saving credentials and updates the layer that supplie
 `oauth` when needed. Its MCP configuration writers share a user-directory gate;
 external editors and older versions do not honor that gate. A project lock file is
 needed only when the project configuration must be updated. Configuration and
-credentials are separate files: if credential persistence fails after a config
-update, the config update remains.
+credentials are separate files. If credential persistence reports failure after
+a config update, pi-rs attempts to restore the prior OAuth setting while holding
+its locks, provided authentication configuration has not changed. A rollback
+can itself fail, and a crash or an error after a file replacement can leave an
+uncertain result; such errors are reported instead of claiming atomicity.
 
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project

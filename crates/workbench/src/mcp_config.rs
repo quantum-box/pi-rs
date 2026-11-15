@@ -498,7 +498,7 @@ fn finish_login(
     name: &str,
     local: bool,
     before: &LoginSnapshot,
-) -> Result<()> {
+) -> Result<Option<pi_rs_workbench::mcp_auth::LoginConfigRollback>> {
     let mut user = config::read_object(user_path)?;
     let mut project = project_path.map(config::read_object).transpose()?;
     let after = login_snapshot(&user, project.as_ref(), name, local).map_err(|_| {
@@ -520,17 +520,77 @@ fn finish_login(
             .get_mut("mcpServers")
             .and_then(|servers| servers.get_mut(name))
             .ok_or_else(|| Error::Config("MCP configuration changed during login".into()))?;
+        let previous_oauth = entry.get("oauth").cloned();
         entry["oauth"] = json!(true);
-        config::write_json(
+        let expected = login_snapshot(&user, project.as_ref(), name, local)?;
+        let rollback_user_path = user_path.to_owned();
+        let rollback_project_path = project_path.map(std::path::Path::to_path_buf);
+        let rollback_name = name.to_owned();
+        let before = before.clone();
+        let rollback: pi_rs_workbench::mcp_auth::LoginConfigRollback = Box::new(move || {
+            let user_path = rollback_user_path;
+            let project_path = rollback_project_path;
+            let name = rollback_name;
+            let mut user = config::read_object(&user_path)?;
+            let mut project = project_path
+                .as_deref()
+                .map(config::read_object)
+                .transpose()?;
+            let current = login_snapshot(&user, project.as_ref(), &name, local)?;
+            if same_login_auth(&before, &current) {
+                return Ok(());
+            }
+            if !same_login_auth(&expected, &current) {
+                return Err(Error::Config(
+                    "MCP configuration changed before rollback".into(),
+                ));
+            }
+            let target = if target_project {
+                project.as_mut().expect("trusted project")
+            } else {
+                &mut user
+            };
+            let entry = target
+                .get_mut("mcpServers")
+                .and_then(|entries| entries.get_mut(&name))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| Error::Config("MCP configuration changed before rollback".into()))?;
+            if let Some(previous_oauth) = previous_oauth {
+                entry.insert("oauth".into(), previous_oauth);
+            } else {
+                entry.remove("oauth");
+            }
+            config::write_json(
+                if target_project {
+                    project_path.as_deref().expect("trusted project")
+                } else {
+                    &user_path
+                },
+                target,
+            )
+        });
+        let target = if target_project {
+            project.as_ref().expect("trusted project")
+        } else {
+            &user
+        };
+        let result = config::write_json(
             if target_project {
                 project_path.expect("trusted project")
             } else {
                 user_path
             },
             target,
-        )?;
+        );
+        if let Err(error) = result {
+            if rollback().is_err() {
+                return Err(Error::Config("MCP configuration update failed and rollback failed; inspect the MCP configuration".into()));
+            }
+            return Err(error);
+        }
+        return Ok(Some(rollback));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn valid_override_value(key: &str, value: &Value) -> bool {
@@ -1395,6 +1455,50 @@ mod tests {
         finish_login(&user_path, Some(&project_path), "service", false, &before).unwrap();
         assert_eq!(config::read_object(&user_path).unwrap(), user);
         assert_eq!(config::read_object(&project_path).unwrap(), project);
+    }
+
+    #[test]
+    fn failed_login_rollback_restores_oauth_without_losing_unrelated_edits() {
+        for original in [None, Some(json!(false))] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("mcp.json");
+            let mut user = json!({"mcpServers":{"service":{"url":"https://example.test/mcp"}}});
+            if let Some(value) = &original {
+                user["mcpServers"]["service"]["oauth"] = value.clone();
+            }
+            let before = login_snapshot(&user, None, "service", false).unwrap();
+            config::write_json(&path, &user).unwrap();
+            let undo = finish_login(&path, None, "service", false, &before)
+                .unwrap()
+                .unwrap();
+            let mut changed = config::read_object(&path).unwrap();
+            changed["unrelated"] = json!("retained");
+            config::write_json(&path, &changed).unwrap();
+            undo().unwrap();
+            let restored = config::read_object(&path).unwrap();
+            assert_eq!(restored["unrelated"], "retained");
+            assert_eq!(
+                restored["mcpServers"]["service"].get("oauth"),
+                original.as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_login_rollback_refuses_changed_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mcp.json");
+        let user = json!({"mcpServers":{"service":{"url":"https://example.test/mcp"}}});
+        let before = login_snapshot(&user, None, "service", false).unwrap();
+        config::write_json(&path, &user).unwrap();
+        let undo = finish_login(&path, None, "service", false, &before)
+            .unwrap()
+            .unwrap();
+        let mut changed = config::read_object(&path).unwrap();
+        changed["mcpServers"]["service"]["url"] = json!("https://changed.test/mcp");
+        config::write_json(&path, &changed).unwrap();
+        assert!(undo().is_err());
+        assert_eq!(config::read_object(&path).unwrap(), changed);
     }
 
     #[tokio::test]

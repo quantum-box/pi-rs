@@ -361,7 +361,14 @@ impl FileCredentials {
         }
         Ok(Some(envelope))
     }
-    fn write(&self, mut credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
+    fn write(&self, credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
+        self.write_with_publish_state(credentials, &mut false)
+    }
+    fn write_with_publish_state(
+        &self,
+        mut credentials: StoredCredentials,
+        published: &mut bool,
+    ) -> std::result::Result<(), AuthError> {
         let current = if self.new_login && self.upgrade.is_none() {
             None
         } else {
@@ -430,6 +437,7 @@ impl FileCredentials {
         file.write_all(b"\n").map_err(|_| store_error())?;
         file.as_file().sync_all().map_err(|_| store_error())?;
         file.persist(&self.path).map_err(|_| store_error())?;
+        *published = true;
         #[cfg(unix)]
         std::fs::File::open(parent)
             .and_then(|file| file.sync_all())
@@ -459,6 +467,14 @@ fn auth_error(error: AuthError) -> Error {
         _ => "MCP OAuth operation failed",
     };
     Error::Config(message.into())
+}
+
+fn credential_write_error(error: AuthError, published: bool) -> Error {
+    if published {
+        Error::Config("MCP credential save reported an error after replacing the credential file; the stored credentials may have changed".into())
+    } else {
+        auth_error(error)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1050,7 +1066,7 @@ async fn commit_login_transaction<G, C>(
 ) -> Result<()>
 where
     G: Send + 'static,
-    C: FnOnce(&G) -> Result<()> + Send + 'static,
+    C: FnOnce(&G) -> Result<Option<LoginConfigRollback>> + Send + 'static,
 {
     let lease = store
         .lease
@@ -1059,14 +1075,23 @@ where
         .upgrade();
     tokio::task::spawn_blocking(move || {
         let _lease = lease;
-        update_config(&guard)?;
-        let result = store.write(credentials).map_err(auth_error);
+        let rollback = update_config(&guard)?;
+        let mut published = false;
+        let result = store.write_with_publish_state(credentials, &mut published).map_err(|error| credential_write_error(error, published));
+        let result = if result.is_err() && rollback.is_some_and(|undo| undo().is_err()) {
+            Err(Error::Config(
+                "MCP credential save failed and configuration rollback failed; the stored credentials may have changed; inspect the MCP configuration".into(),
+            ))
+        } else { result };
         drop(guard);
         result
     })
     .await
     .map_err(|_| Error::Config("MCP login finalization failed".into()))?
 }
+
+/// Undo a configuration change while its caller still holds the write guard.
+pub type LoginConfigRollback = Box<dyn FnOnce() -> Result<()> + Send>;
 
 /// Prepare OAuth credentials, acquire the caller's guard within the deadline,
 /// then validate/update its configuration and save credentials under that guard.
@@ -1087,7 +1112,7 @@ where
     G: Send + 'static,
     P: FnOnce(PathBuf) -> PFut,
     PFut: std::future::Future<Output = Result<G>>,
-    C: FnOnce(&G) -> Result<()> + Send + 'static,
+    C: FnOnce(&G) -> Result<Option<LoginConfigRollback>> + Send + 'static,
 {
     let staged = Staging::default();
     let prepare = async {
@@ -1754,6 +1779,20 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn credential_error_reports_possible_replacement() {
+        assert!(
+            !credential_write_error(store_error(), false)
+                .to_string()
+                .contains("may have changed")
+        );
+        assert!(
+            credential_write_error(store_error(), true)
+                .to_string()
+                .contains("may have changed")
+        );
+    }
+
     async fn stage_fixture(store: &StagedCredentials) -> Result<()> {
         let guard = store
             .store
@@ -1868,7 +1907,7 @@ mod tests {
             move |_| {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                Ok(())
+                Ok(None)
             },
         ));
         started_rx.await.unwrap();
@@ -1892,7 +1931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_error_preserves_credentials_and_store_error_keeps_config_update() {
+    async fn config_error_preserves_credentials_and_store_error_rolls_back_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.json");
         std::fs::write(&path, "old").unwrap();
@@ -1908,14 +1947,34 @@ mod tests {
         std::fs::write(&not_directory, "file").unwrap();
         let (store, _) = staged_fixture(not_directory.join("credentials.json"));
         let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, "old").unwrap();
         let updated_path = config_path.clone();
         let result = commit_login_transaction(store.store, fixture_credentials(), (), move |_| {
-            std::fs::write(updated_path, "updated")?;
-            Ok(())
+            std::fs::write(&updated_path, "updated")?;
+            Ok(Some(Box::new(move || {
+                std::fs::write(updated_path, "old")?;
+                Ok(())
+            })))
         })
         .await;
         assert!(result.is_err());
-        assert_eq!(std::fs::read_to_string(config_path).unwrap(), "updated");
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-directory");
+        std::fs::write(&parent, "file").unwrap();
+        let (store, _) = staged_fixture(parent.join("credentials.json"));
+        let error = commit_login_transaction(store.store, fixture_credentials(), (), |_| {
+            Ok(Some(Box::new(|| {
+                Err(Error::Config("rollback error".into()))
+            })))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("configuration rollback failed"));
     }
 
     #[tokio::test]
