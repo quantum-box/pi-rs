@@ -1622,6 +1622,16 @@ and byte limits. Large text files remain searchable. Overlapping context ranges
 are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
 radius is limited to 1,000 lines.
 
+Unrestricted local `find` and `ls` accept positive integer limits representable as `u64`
+(and clamp them to `usize::MAX` on narrower hosts); scoped tools retain the
+100,000-entry cap. Their incremental output formatter retains at most 50 KiB
+plus one byte while counting the complete output. Directory enumeration and
+locale sorting still retain all directory entries in memory. `find` uses the
+serial walker's sibling-sorted depth-first traversal, which has the same
+component-wise `Path` order as sorting selected full paths; it no longer retains
+the selected result list. The walker itself buffers directory entries for
+sorting, so its total traversal memory can grow with directory size.
+
 `find` uses a 1,000-result default and reports result limits. `ls` sorts names
 case-insensitively, identifies linked directories, reports entry limits and
 labels empty directories. Head truncation preserves complete lines where they
