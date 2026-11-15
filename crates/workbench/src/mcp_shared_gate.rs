@@ -356,7 +356,11 @@ mod tests {
 }
 
 /// Experimental Windows mutex gate. It is deliberately not wired to `open`.
-/// The caller must inspect `abandoned` and recover persistent state before use.
+/// A same-SID low-integrity process can hold the gate and delay higher-IL
+/// processes; the DACL is not a boundary between integrity levels of one user.
+/// AppContainer and restricted tokens may still fail additional access checks.
+/// Windows behavior has not been tested. Name squatting and durable crash
+/// recovery remain unresolved. Inspect `abandoned` and recover before use.
 #[cfg(windows)]
 pub(crate) mod windows_mutex {
     use std::{
@@ -478,7 +482,7 @@ pub(crate) mod windows_mutex {
     fn descriptor(user: &User) -> io::Result<Local> {
         // One explicit ACE, no inheritance, granting only requested rights.
         let sddl = wide(&format!(
-            "O:{}D:P(A;;0x{:08x};;;{})S:(ML;;NW;;;ME)",
+            "O:{}D:P(A;;0x{:08x};;;{})S:(ML;;NW;;;LW)",
             user.text, RIGHTS, user.text
         ));
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
@@ -566,14 +570,14 @@ pub(crate) mod windows_mutex {
         if unsafe { EqualSid(ace_sid.cast(), user.sid) } == 0 {
             return Err(denied("mutex ACE SID does not match user"));
         }
-        validate_medium_label(sd.0)?;
+        validate_low_label(sd.0)?;
         Ok(())
     }
 
-    // Require exactly one medium integrity label with NO_WRITE_UP. Missing or
+    // Require exactly one low integrity label with NO_WRITE_UP. Missing or
     // higher labels are rejected even when this process can open the object:
-    // another same-user process at medium integrity must be able to use it.
-    fn validate_medium_label(sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
+    // another same-user process at low integrity must be able to use it.
+    fn validate_low_label(sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
         let mut present = 0;
         let mut defaulted = 0;
         let mut sacl: *mut ACL = null_mut();
@@ -597,15 +601,14 @@ pub(crate) mod windows_mutex {
         {
             return Err(denied("unexpected mutex integrity label"));
         }
-        let mut medium: PSID = null_mut();
-        if unsafe { ConvertStringSidToSidW(wide("S-1-16-8192").as_ptr(), &mut medium) } == 0 {
+        let mut low: PSID = null_mut();
+        if unsafe { ConvertStringSidToSidW(wide("S-1-16-4096").as_ptr(), &mut low) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let medium = Local(medium);
+        let low = Local(low);
         let label_sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<u8>() };
-        if unsafe { *label_sid.add(1) } != 1 || unsafe { EqualSid(label_sid.cast(), medium.0) } == 0
-        {
-            return Err(denied("mutex integrity level is not medium"));
+        if unsafe { *label_sid.add(1) } != 1 || unsafe { EqualSid(label_sid.cast(), low.0) } == 0 {
+            return Err(denied("mutex integrity level is not low"));
         }
         Ok(())
     }
@@ -631,20 +634,16 @@ pub(crate) mod windows_mutex {
         }
 
         #[test]
-        fn only_medium_no_write_up_label_is_accepted() {
+        fn only_low_no_write_up_label_is_accepted() {
             for (sddl, accepted) in [
-                ("S:(ML;;NW;;;ME)", true),
+                ("S:(ML;;NW;;;ME)", false),
                 ("S:(ML;;NW;;;HI)", false),
-                ("S:(ML;;NW;;;LW)", false),
-                ("S:(ML;;NR;;;ME)", false),
+                ("S:(ML;;NW;;;LW)", true),
+                ("S:(ML;;NR;;;LW)", false),
                 ("D:(A;;GA;;;SY)", false),
             ] {
                 let descriptor = parse(sddl);
-                assert_eq!(
-                    validate_medium_label(descriptor.0).is_ok(),
-                    accepted,
-                    "{sddl}"
-                );
+                assert_eq!(validate_low_label(descriptor.0).is_ok(), accepted, "{sddl}");
             }
         }
     }
