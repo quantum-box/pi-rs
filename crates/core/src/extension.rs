@@ -1716,6 +1716,30 @@ impl Registry {
         model: Arc<dyn crate::Model>,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<(T, bool)> {
+        self.commit_session_model(session_id, provider, name, model, false, commit)
+    }
+
+    /// Reserve an already authorized binding; never recreate one after removal.
+    pub(crate) fn commit_existing_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        self.commit_session_model(session_id, provider, name, model, true, commit)
+    }
+
+    fn commit_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        require_existing: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
         if provider.trim().is_empty() || name.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
         }
@@ -1726,14 +1750,12 @@ impl Registry {
                 .branch_reservations
                 .write()
                 .expect("branch reservations");
+            let models = self.branch_models.read().expect("branch models");
+            let existing = models.get(&key);
             if reservations.contains_key(&reservation_key)
                 || reservations.contains_key(&(session_id, String::new(), String::new()))
-                || self
-                    .branch_models
-                    .read()
-                    .expect("branch models")
-                    .get(&key)
-                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
+                || existing.is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
+                || (require_existing && existing.is_none())
             {
                 return Err(Error::Config(format!(
                     "model client changed while resolving {provider}/{name}"

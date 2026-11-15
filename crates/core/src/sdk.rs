@@ -1481,10 +1481,23 @@ impl AgentSession {
     fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
         let Some((provider, name, _)) = journal.model_identity_at(target) else {
             if let Some(provider) = &self.model_provider {
+                let client = branch_client(
+                    &self.registry,
+                    self.session_id,
+                    Some(provider),
+                    &self.model_name,
+                )
+                .filter(|client| Arc::ptr_eq(client, &self.model))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "session branch requires registered model {}",
+                        self.model_name
+                    ))
+                })?;
                 return Ok(BranchResolution::Inherited {
                     provider: provider.clone(),
                     model: self.model_name.clone(),
-                    client: self.model.clone(),
+                    client,
                 });
             }
             return Ok(BranchResolution::Registered);
@@ -1909,8 +1922,18 @@ impl AgentSession {
                     provider,
                     model,
                     client,
+                } => {
+                    self.registry
+                        .commit_existing_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout_provider_model_atomic(record, provider, model),
+                        )?
+                        .1
                 }
-                | BranchResolution::Fallback {
+                BranchResolution::Fallback {
                     provider,
                     model,
                     client,
@@ -1999,25 +2022,22 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.ensure_open()?;
-        let (initial_target, mut resolution) = {
+        {
             let journal = self.session.lock().await;
-            let target = journal.tree_navigation_target(selected)?;
-            let resolution = match target {
-                Some(target) => self.resolve_branch_model(&journal, target)?,
-                None => BranchResolution::Registered,
-            };
-            (target, resolution)
-        };
+            if let Some(target) = journal.tree_navigation_target(selected)?
+                && journal.model_identity_at(target).is_some()
+            {
+                self.resolve_branch_model(&journal, target)?;
+            }
+        }
         self.start().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
         let target = journal.tree_navigation_target(selected)?;
-        if target != initial_target {
-            resolution = match target {
-                Some(target) => self.resolve_branch_model(&journal, target)?,
-                None => BranchResolution::Registered,
-            };
-        }
+        let resolution = match target {
+            Some(target) => self.resolve_branch_model(&journal, target)?,
+            None => BranchResolution::Registered,
+        };
         let first_record = journal.records().len();
         let editor_text = {
             journal
@@ -2058,6 +2078,7 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: true,
+                require_existing: true,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Historical {
@@ -2069,6 +2090,7 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: false,
+                require_existing: false,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Fallback {
@@ -2081,6 +2103,7 @@ impl AgentSession {
                 model: model.clone(),
                 client: client.clone(),
                 fallback: true,
+                require_existing: false,
                 revoked: revoked.clone(),
             }),
         };
@@ -2462,6 +2485,26 @@ impl AgentSession {
         {
             session.select_provider_model_atomic(provider, model)?;
         }
+        if let BranchResolution::Inherited {
+            provider,
+            model,
+            client,
+        } = &resolution
+        {
+            let (fork, revoked) = self.registry.commit_existing_session_model(
+                self.session_id,
+                provider,
+                model,
+                client.clone(),
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
         self.fork_session(session, resolution)
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
@@ -2515,7 +2558,9 @@ impl AgentSession {
         };
         let target = journal.fork_target_after_handoff(target)?;
         let snapshot = journal.fork_session_after_handoff(target)?;
-        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
+        if snapshot.model_identity_at(snapshot.head()).is_some() {
+            self.resolve_branch_model(&snapshot, snapshot.head())?;
+        }
         drop(journal);
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
@@ -2539,6 +2584,7 @@ impl AgentSession {
             }
         }
         let snapshot = self.journal()?.fork_session_after_handoff(target)?;
+        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
         match destination {
             Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
             None => self.fork_snapshot(snapshot, resolution),
@@ -2576,11 +2622,18 @@ impl AgentSession {
         } else {
             // A fork before the first model selection still uses the source's
             // active client. Preserve its qualified identity when it is known.
-            (
-                self.model_provider.clone(),
-                self.model_name.clone(),
-                self.model.clone(),
-            )
+            match &resolution {
+                BranchResolution::Inherited {
+                    provider,
+                    model,
+                    client,
+                } => (Some(provider.clone()), model.clone(), client.clone()),
+                _ => (
+                    self.model_provider.clone(),
+                    self.model_name.clone(),
+                    self.model.clone(),
+                ),
+            }
         };
         session
             .auto_compaction_control()
@@ -4673,6 +4726,129 @@ mod tests {
             self.records.lock().unwrap().push(record.clone());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn inherited_model_cannot_restore_a_revoked_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            branch_client(&session.registry, session.session_id, Some("a"), "shared").is_none()
+        );
+    }
+
+    #[test]
+    fn inherited_model_reservation_does_not_restore_concurrently_revoked_binding() {
+        let registry = Arc::new(Registry::default());
+        let id = Uuid::new_v4();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("a"));
+        registry
+            .register_session_provider_model(id, "a", "shared", client.clone())
+            .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let worker_registry = registry.clone();
+        let worker_client = client.clone();
+        let worker = std::thread::spawn(move || {
+            worker_registry.commit_existing_session_model(id, "a", "shared", worker_client, || {
+                ready_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        ready_rx.recv().unwrap();
+        registry.remove_session_branch_models(id);
+        continue_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap().1);
+        assert!(branch_client(&registry, id, Some("a"), "shared").is_none());
+        assert!(
+            registry
+                .commit_existing_session_model(id, "a", "shared", client, || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_inherits_the_model_restored_during_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(old, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(session.prompt("one").await.unwrap(), "b");
+        assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooked_fork_reserves_the_model_restored_during_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut fork = session
+            .fork_with_hooks(old, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert_eq!(fork.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(fork.prompt("one").await.unwrap(), "b");
+        assert_eq!(fork.prompt("two").await.unwrap(), "b");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
     }
 
     #[test]
