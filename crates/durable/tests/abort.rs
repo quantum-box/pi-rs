@@ -144,6 +144,97 @@ async fn abort_only_one_conversation_and_withdraw_existing_queue() {
     s.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn abort_result_includes_owned_foreground_inputs_and_skips_background() {
+    use pi_rs_durable::{
+        ownership_edge::Mode,
+        task::{Checkpoint, Task, TaskOwner, WaitFor},
+        task_scheduler::{Registry, Step},
+    };
+    use uuid::Uuid;
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ModelBarrier {
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut scheduler =
+        Scheduler::open(dir.path().join("db"), opts(model.clone(), vec![])).unwrap();
+    let parent = scheduler.create_conversation(config()).unwrap();
+    let owner = TaskOwner::Conversation(parent);
+    let task = Task::new(
+        Uuid::new_v4(),
+        owner.clone(),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("root".into(), true);
+    let mut registry = Registry::default();
+    registry.register_with_abort(
+        "root",
+        true,
+        |_: &Task| {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "sleep".into(),
+                    data: json!(null),
+                },
+                condition: WaitFor::DeadlineMillis(i64::MAX),
+                children: vec![],
+            })
+        },
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+    );
+    let driver = scheduler.start_tasks(registry).unwrap();
+    driver.submit(&task).unwrap();
+    let foreground = scheduler
+        .ensure_task_owned_subagent(task.id(), owner.clone(), "fg", config(), Mode::Foreground)
+        .unwrap()
+        .child;
+    let background = scheduler
+        .ensure_task_owned_subagent(task.id(), owner, "bg", config(), Mode::Background)
+        .unwrap()
+        .child;
+    for id in [parent, foreground, background] {
+        scheduler.submit(id, None, "hold".into()).unwrap();
+    }
+    for _ in 0..3 {
+        wait_permit(&model.started).await;
+    }
+    for id in [parent, foreground, background] {
+        scheduler.submit(id, None, format!("queued-{id}")).unwrap();
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.abort_and_wait_withdrawn(parent),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.withdrawn.len(), 2);
+    for id in [parent, foreground] {
+        assert!(
+            result
+                .withdrawn
+                .iter()
+                .any(|input| input.conversation_id == id
+                    && input.submission.content == format!("queued-{id}"))
+        );
+    }
+    assert_eq!(
+        scheduler.conversation(background).unwrap().submissions[1].status,
+        Status::Queued
+    );
+    scheduler.shutdown().await.unwrap();
+    tokio::task::spawn_blocking(move || driver.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 struct CallModel;
 #[async_trait]
 impl Model for CallModel {
