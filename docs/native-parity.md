@@ -2845,7 +2845,10 @@ match. Quoted phrases normalize whitespace. `re:` queries use a case-insensitive
 native regular-expression engine with a bounded backtracking limit, including
 lookaround support. Invalid expressions produce no matches. Remaining JavaScript
 regular-expression edge compatibility has not been declared complete. In
-patterns without bracket expressions that the linear regex engine accepts,
+patterns without bracket expressions or explicit native dotall flags, `.`
+excludes JavaScript's four line terminators in both regex engines. JavaScript
+UTF-16 code-unit matching for supplementary characters remains different.
+In patterns without bracket expressions that the linear regex engine accepts,
 `\d`, `\D`, `\w`, `\W`, `\b`, and `\B` use JavaScript's ASCII classes
 and word boundaries. Single-shorthand bracket expressions such as `[\d]`,
 `[^\w]`, and `[\D]` also use those ASCII classes, including their negations;
