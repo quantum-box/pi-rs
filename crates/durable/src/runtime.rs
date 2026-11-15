@@ -10497,32 +10497,83 @@ impl Harness {
                         return Err(Error::Interrupted);
                     }
                     if let crate::extension::BeforeTool::Sleep(sleep) = &decision {
-                        if (sleep.until_millis.is_none() && sleep.signals.is_empty())
+                        let invalid_shape = (sleep.until_millis.is_none()
+                            && sleep.signals.is_empty())
                             || sleep.until_millis.is_some_and(|time| time < 0)
-                            || sleep.signals.iter().any(String::is_empty)
-                        {
-                            return Err(Error::Invalid("invalid extension sleep".into()));
+                            || sleep.signals.iter().any(String::is_empty);
+                        let wait = if invalid_shape {
+                            None
+                        } else {
+                            match crate::conversation_signal::Inbox::new(self.owner.store())
+                                .prepare_wait(id, &sleep.signals)
+                            {
+                                Ok(wait) => Some(wait),
+                                Err(crate::conversation_signal::Error::InvalidWait) => None,
+                                Err(error) => return Err(error.into()),
+                            }
+                        };
+                        if let Some(wait) = wait {
+                            c.phase = Phase::ToolGateSleeping {
+                                turns,
+                                calls,
+                                index,
+                                operation_id,
+                                until_millis: sleep.until_millis,
+                                signals: sleep.signals.clone(),
+                            };
+                            let merge = self.merge_admissions;
+                            self.merge_admissions = false;
+                            let result =
+                                self.save_with_wake(&c, Expected::Version(version), Some(&wait));
+                            self.merge_admissions = merge;
+                            match result {
+                                Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                    continue;
+                                }
+                                other => other?,
+                            }
+                            return Ok(());
                         }
-                        let wait = crate::conversation_signal::Inbox::new(self.owner.store())
-                            .prepare_wait(id, &sleep.signals)?;
-                        c.phase = Phase::ToolGateSleeping {
+                        self.record_extension_reports(c.id, operation_id, "before_tool", reports)?;
+                        let message = format!(
+                            "Tool call {} cannot wait at its gates: {}",
+                            call.id,
+                            if invalid_shape {
+                                "invalid extension sleep"
+                            } else {
+                                "signal key was already consumed or expired"
+                            }
+                        );
+                        record_tool_result(
+                            &mut c,
+                            &calls,
+                            index,
+                            operation_id,
+                            &Outcome::Failed(message.clone()),
+                            Vec::new(),
+                        )?;
+                        if let Some(diagnostic) = c
+                            .tool_results
+                            .iter_mut()
+                            .find(|metadata| metadata.operation_id == operation_id)
+                            .and_then(|metadata| {
+                                metadata.diagnostics.iter_mut().find(|diagnostic| {
+                                    diagnostic.code.as_deref() == Some("tool_failed")
+                                })
+                            })
+                        {
+                            diagnostic.code = Some("invalid_park".into());
+                        }
+                        c.phase = Phase::ToolFinished {
                             turns,
                             calls,
                             index,
                             operation_id,
-                            until_millis: sleep.until_millis,
-                            signals: sleep.signals.clone(),
+                            arguments: rewritten.arguments,
+                            content: message,
                         };
-                        let merge = self.merge_admissions;
-                        self.merge_admissions = false;
-                        let result =
-                            self.save_with_wake(&c, Expected::Version(version), Some(&wait));
-                        self.merge_admissions = merge;
-                        match result {
-                            Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
-                            other => other?,
-                        }
-                        return Ok(());
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
                     }
                     self.record_extension_reports(
                         c.id,

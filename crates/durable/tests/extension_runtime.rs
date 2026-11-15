@@ -196,6 +196,134 @@ async fn block_and_invalid_rewrite_never_dispatch() {
     }
 }
 
+struct InvalidSleep {
+    case: &'static str,
+    cancel: Option<CancellationToken>,
+    after: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait]
+impl Hook for InvalidSleep {
+    async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+        Ok(BeforeTool::Sleep(match self.case {
+            "empty" => Sleep {
+                signals: vec![],
+                until_millis: None,
+            },
+            "negative" => Sleep {
+                signals: vec![],
+                until_millis: Some(-1),
+            },
+            "empty-name" => Sleep {
+                signals: vec!["".into()],
+                until_millis: None,
+            },
+            "expired" => Sleep {
+                signals: vec!["once".into()],
+                until_millis: Some(0),
+            },
+            _ => Sleep {
+                signals: vec!["once".into()],
+                until_millis: None,
+            },
+        }))
+    }
+    async fn after_tool_result(
+        &self,
+        _: &HookCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        assert!(result.is_error);
+        assert_eq!(result.diagnostics[0].code.as_deref(), Some("invalid_park"));
+        self.after.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+        let mut safe = result.clone();
+        safe.output = "invalid gate handled".into();
+        Ok(Some(safe))
+    }
+}
+
+#[tokio::test]
+async fn invalid_sleep_is_a_hooked_tool_result_and_does_not_dispatch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for case in ["empty", "negative", "empty-name", "consumed", "expired"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(FakeModel::default());
+        let tool = Arc::new(FakeTool::default());
+        let after = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let interrupted = case == "empty";
+        let id;
+        {
+            let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+            h.install_extension(ext(
+                "gate",
+                "p",
+                Arc::new(InvalidSleep {
+                    case,
+                    cancel: interrupted.then(|| cancel.clone()),
+                    after: after.clone(),
+                }),
+            ))
+            .unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["gate".into()]).unwrap();
+            if case == "consumed" {
+                h.send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+                    Uuid::new_v4(),
+                    id,
+                    "once".into(),
+                    json!(1),
+                ))
+                .unwrap();
+            }
+            let result = h.submit_and_run(id, None, "go".into(), &cancel).await;
+            if interrupted {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                if case == "consumed" || case == "expired" {
+                    h.resume_conversation(id, &CancellationToken::new())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let mut h = Harness::open_paused(&path, options(model, tool.clone())).unwrap();
+        if interrupted {
+            assert!(h.conversation(id).unwrap().tool_results.is_empty());
+        }
+        h.install_extension(ext(
+            "gate",
+            "p",
+            Arc::new(InvalidSleep {
+                case,
+                cancel: None,
+                after: after.clone(),
+            }),
+        ))
+        .unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(tool_message(&c), "invalid gate handled");
+        assert!(c.tool_results[0].is_error);
+        assert_eq!(
+            c.tool_results[0].diagnostics[0].code.as_deref(),
+            Some("invalid_park")
+        );
+        assert_eq!(
+            after.load(Ordering::SeqCst),
+            if interrupted { 2 } else { 1 }
+        );
+        assert!(tool.0.lock().unwrap().is_empty());
+    }
+}
+
 struct SignalGate;
 #[async_trait]
 impl Hook for SignalGate {
