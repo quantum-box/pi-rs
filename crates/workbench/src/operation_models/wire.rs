@@ -316,7 +316,7 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
     let tier = cost
         .tiers
         .iter()
-        .filter(|tier| input > tier.input_tokens_above)
+        .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above)
         .max_by_key(|tier| tier.input_tokens_above);
     let input_cost = tier.map_or(cost.input, |tier| tier.input) * input as f64 / 1_000_000.0;
     let output_cost = tier.map_or(cost.output, |tier| tier.output) * output as f64 / 1_000_000.0;

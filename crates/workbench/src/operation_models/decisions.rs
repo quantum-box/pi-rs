@@ -71,7 +71,7 @@ pub(super) fn payload(entry: &Entry, context: &Value) -> Result<Value> {
     }
     let state = serde_json::to_string(state)?;
     let input = match context.get("images") {
-        None => json!(state),
+        None | Some(Value::Null) => json!(state),
         Some(value) => {
             let images = value
                 .as_array()
@@ -207,6 +207,12 @@ mod tests {
             "score":{"type":"score","instructions":"how?","criteria":["low","high"]}
         },"images":[{"type":"image","mimeType":"image/png","data":"YQ=="}]});
         let request = payload(entry, &context).unwrap();
+        let mut no_images = context.clone();
+        no_images["images"] = Value::Null;
+        assert_eq!(
+            payload(entry, &no_images).unwrap()["input"],
+            "{\"message\":\"hello\"}"
+        );
         assert_eq!(
             request["input"][0]["content"][1]["image_url"],
             "data:image/png;base64,YQ=="
@@ -233,6 +239,22 @@ mod tests {
         );
         let billed = usage(entry, &json!({"input_tokens":300000,"output_tokens":0})).unwrap();
         assert!((billed["cost"]["total"].as_f64().unwrap() - 0.06).abs() < 1e-12);
+        let image_config = json!({"relay":{"baseUrl":"http://127.0.0.1:1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images",
+            "cost":{"input":1.0,"cacheRead":1.0,"tiers":[{"inputTokensAbove":100,"input":2.0,"cacheRead":2.0}]}
+        }]}});
+        let image_catalog = Catalogue::parse(image_config.as_object().unwrap()).unwrap();
+        let image_entry = image_catalog
+            .0
+            .iter()
+            .find(|e| e.provider == "relay")
+            .unwrap();
+        let billed = usage(
+            image_entry,
+            &json!({"prompt_tokens":120,"prompt_tokens_details":{"cached_tokens":80}}),
+        )
+        .unwrap();
+        assert!((billed["cost"]["total"].as_f64().unwrap() - 0.00024).abs() < 1e-12);
         let mut too_many = context.clone();
         too_many["images"] = json!(vec![
             json!({"type":"image","mimeType":"image/png","data":"YQ=="});
