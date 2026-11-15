@@ -2524,7 +2524,7 @@ mod tests {
         std::fs::write(
             directory.join("first/package.json"),
             json!({"pi":{
-                "prompts":["prompts/demo.md"], "themes":["themes"]
+                "prompts":["./prompts/*.md"], "themes":["themes"]
             }})
             .to_string(),
         )

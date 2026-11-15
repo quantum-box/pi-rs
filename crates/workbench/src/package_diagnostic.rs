@@ -115,7 +115,8 @@ impl Scanner {
     }
     fn glob(&mut self, root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
         // Keep discovery within the package and avoid walking through symlinked trees.
-        let path = Path::new(pattern);
+        let pattern = pattern.replace('\\', "/");
+        let path = Path::new(&pattern);
         if path.is_absolute()
             || path
                 .components()
@@ -123,7 +124,12 @@ impl Scanner {
         {
             return None;
         }
-        let matcher = globset::GlobBuilder::new(&pattern.replace('\\', "/"))
+        let normalized = pattern
+            .split('/')
+            .filter(|part| *part != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let matcher = globset::GlobBuilder::new(&normalized)
             .literal_separator(true)
             .backslash_escape(false)
             .build()
@@ -384,6 +390,24 @@ fn extension_entry(dir: &Path, count: &mut usize) -> Option<Option<Vec<PathBuf>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_globs_resolve_relative_dot_components() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("prompts")).unwrap();
+        std::fs::write(root.path().join("prompts/demo.md"), "prompt").unwrap();
+        for pattern in ["./prompts/*.md", "prompts/./*.md"] {
+            std::fs::write(
+                root.path().join("package.json"),
+                serde_json::json!({"pi":{"prompts":[pattern]}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
+                vec![root.path().join("prompts/demo.md")]
+            );
+        }
+    }
 
     #[test]
     fn candidates_follow_pi_manifest_without_loading_resources() {
