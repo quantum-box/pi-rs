@@ -18,6 +18,14 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+OpenAI Responses streams both reasoning text and reasoning summary text as
+thinking deltas. Completed reasoning items retain their summary when present,
+otherwise their content or streamed text, in the completed turn metadata.
+The native RPC stream preserves reasoning item boundaries and final text.
+The additive enriched model stream carries those boundaries through the built-in
+workbench and budget wrappers; third-party wrappers using the legacy stream
+continue to receive deltas without item boundaries.
+
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
 and is used only for endpoints declared by that profile; keys with an explicit
@@ -105,13 +113,26 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
+minimum lifetime for bearer-token export. A refreshed credential is saved
+before a short lifetime is reported, preserving refresh-token rotation. A
+single live inference with an existing account succeeded; interactive login and
+live refresh acceptance remain open.
+
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
 with `--bearer-token-env-var` unless an Authorization header is already present.
+`--env` is restricted to stdio and requires nonempty names; bearer-token
+environment variables apply to HTTP servers.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
-Invalid file URLs do not match a resource; upstream instead reports a URL error.
+For remote packages with a single settings scope, an invalid file URL in a
+package settings filter reports an error when evaluated. Layered package
+settings, local packages, and other resource filter paths still treat invalid
+URLs as non-matches. Pi evaluates the scopes separately and stops processing
+a local package when an error is reached. Package resources are evaluated in
+settings order, with project sources first.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
@@ -443,7 +464,12 @@ During manual compaction, an RPC `abort` response waits for the compaction
 command to finish, even if an internal agent-settled event arrives first.
 
 Unknown RPC commands return `Unknown command: <type>` and preserve the
-request ID when present. Malformed JSON produces a `parse` response with a
+request ID and original type when present. Object, array and numeric types use
+JavaScript string conversion in the diagnostic, including null array elements.
+The echoed JSON value retains Rust's parsed integer precision, which can differ
+from JavaScript for integers outside the safe range; out-of-range JSON numbers
+such as `1e400` are rejected by the native parser.
+Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
@@ -657,6 +683,12 @@ expanding a quoted prompt argument before the model request.
 `pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
 default is 300 seconds. Once credential persistence starts, it is allowed to
 finish even if the deadline passes, so its outcome can be reported reliably.
+
+`pi mcp logout NAME --local` requires a server defined in the trusted project
+configuration and removes credentials for that server URL. A partial project
+override retains the global server's scope and does not satisfy `--local`.
+Credentials are keyed by server name and normalized URL, so a project server
+with the same name and URL as a global server shares its credentials.
 
 `pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
 `mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for
@@ -1081,6 +1113,9 @@ files are not rewritten. Tests cover discovery, invocation and the size limit.
 Skill invocation uses the same replacement decoding as discovery. Skill and
 prompt frontmatter each strip one leading BOM and use ECMAScript whitespace
 when trimming a delimited body, matching Pi.
+Skill discovery keeps the selected symlink path for the skill name, displayed
+location and relative references. Canonical paths are still used to deduplicate
+aliases to the same file.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -1235,6 +1270,9 @@ script line numbers. The native JSON code argument differs from Pi's
 provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
+Classifier results include their API and invocation timestamp even if the
+request fails early or is cancelled, as they do on successful requests.
+
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
 `Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
 server-delay cap still applies to the parsed value.
@@ -1270,6 +1308,11 @@ including branch topology, completed tool results, reasoning, usage, names,
 labels, compaction boundaries and branch-local codemode store values. User and tool-result images reach the model
 adapter as image content. Previously completed tools remain recorded results;
 unfinished imported calls remain uncertain and require reconciliation.
+A source entry with a missing parent is recovered as a separate native branch;
+its original parent ID remains in the retained source entry, while RPC presents
+it as a root. Missing ancestors may contain unrecoverable state or tool calls;
+orphan tool results and compactions involving orphaned branches are still rejected.
+Forward parent references are also rejected.
 
 Context edits are projected onto future model context while the imported raw
 entries remain available. Remaining specialized message variants and system
@@ -1470,7 +1513,9 @@ scripts and errors to direct callers.
 Fractional explicit timeouts retain output already received. Shell execution
 has no separate default timeout, while the caller's configured tool deadline
 continues to apply. A shell that exits while descendants hold its output pipes
-returns after a bounded drain period. Unit and CLI fixtures cover line/byte
+returns after both pipes close or 100 ms without further output. Output from
+an active descendant resets that idle period. Unlike Pi, pi-rs also caps the
+post-exit drain at two seconds to bound continuously writing descendants. Unit and CLI fixtures cover line/byte
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
 ### Text paging checkpoint
@@ -1769,6 +1814,10 @@ interface. Embedded applications supply an `ExtensionUi` through the registry
 or `SessionBuilder::ui`. Native executable extensions use the same correlated
 host protocol for select, confirm, input and multiline editor dialogs, notices,
 status entries, above/below-editor widgets, window titles and editor text.
+Widgets appear in registration order within each position; replacing or moving
+a widget places it last at its destination, as in Pi.
+Native widgets retain the existing 64-widget and 128-line limits, and do not
+yet match Pi's ten-line truncation, text styling, or fixed fullscreen placement.
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
@@ -2994,8 +3043,10 @@ Full workspace tests and all-target Clippy pass.
 
 An unrestricted local `read` of a missing path now reports the resolved path
 in Pi's `ENOENT: no such file or directory, access '…'` diagnostic. This also
-identifies the requested file when a parent directory is missing. Other I/O
-errors and restricted workspace path checks retain their existing behavior.
+identifies the requested file when a parent directory is missing. On Unix, a
+non-directory parent reports Pi's `ENOTDIR` access diagnostic with the requested
+path. Other I/O errors and restricted workspace path checks retain their existing
+behavior.
 
 ### Write and edit result checkpoint
 

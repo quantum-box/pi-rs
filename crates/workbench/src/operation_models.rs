@@ -992,7 +992,7 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
-        initialize_image_result(model, &mut data);
+        initialize_result(model, &mut data);
         let result = if has_images && self.args.settings.block_model_images() {
             Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
         } else {
@@ -1018,8 +1018,8 @@ impl Tool for Operations {
     }
 }
 
-fn initialize_image_result(entry: &Entry, data: &mut Value) {
-    if matches!(entry.api, Api::OpenRouterImages) && data.get("timestamp").is_none() {
+fn initialize_result(entry: &Entry, data: &mut Value) {
+    if data.get("timestamp").is_none() {
         data["api"] = json!(entry.api);
         data["timestamp"] = json!(
             std::time::SystemTime::now()
@@ -1092,7 +1092,7 @@ impl Operations {
     ) -> Result<()> {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
-        initialize_image_result(entry, data);
+        initialize_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
@@ -1142,15 +1142,6 @@ impl Operations {
         let body = send_model_request(&self.client, request, entry.api).await?;
         let body: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
-        if !matches!(entry.api, Api::OpenRouterImages) {
-            data["api"] = json!(entry.api);
-            data["timestamp"] = json!(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            );
-        }
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -2048,6 +2039,52 @@ mod tests {
         assert_eq!(data["api"], "openrouter-images");
         assert!(data["timestamp"].as_u64().unwrap() > 0);
         assert_eq!(data["output"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn classifier_early_failure_and_cancellation_keep_result_identity() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one", "input":["text"]
+        }]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let entry = operation
+            .args
+            .model_profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let mut data = json!({"answers":{}});
+        assert!(operation.perform(entry, &json!({"state":{},"questions":{"q":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}}), &Keys::parse(&json!({})), &mut data).await.is_err());
+        assert_eq!(data["api"], "typesafe-system-one");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["answers"], json!({}));
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = operation
+            .invoke(
+                json!({"action":"classify","provider":"relay","id":"fixture","context":{}}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation,
+                },
+            )
+            .await;
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("expected structured result")
+        };
+        assert_eq!(data["stopReason"], "aborted");
+        assert_eq!(data["api"], "typesafe-system-one");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["answers"], json!({}));
     }
 
     #[test]

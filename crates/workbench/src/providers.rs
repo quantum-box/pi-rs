@@ -1,4 +1,5 @@
 //! Provider selection and shared workbench catalog and progress controls.
+use futures_util::StreamExt;
 use std::collections::BTreeMap;
 
 use pi_rs::anthropic::Anthropic;
@@ -624,6 +625,58 @@ impl Client {
                 .await
             }
             _ => self.stream(request).await,
+        }
+    }
+
+    pub async fn stream_enriched_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        match self {
+            Self::OpenAi(client) => {
+                if cache_disabled {
+                    client
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else if let Some(key) = session_cache_key {
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            key,
+                            request,
+                        )
+                        .await
+                } else {
+                    let stream = client.stream(request).await?;
+                    Ok(Box::pin(
+                        stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                    ))
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => {
+                let stream = self
+                    .stream_with_headers(request, defaults, cache_disabled, session_cache_key)
+                    .await?;
+                Ok(Box::pin(
+                    stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                ))
+            }
         }
     }
 

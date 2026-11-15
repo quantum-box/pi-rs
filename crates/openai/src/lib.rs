@@ -566,6 +566,50 @@ impl Model for OpenAiResponses {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        let stream = self.stream_enriched(request).await?;
+        Ok(Box::pin(stream.filter_map(|event| async move {
+            match event {
+                Ok(pi_rs_core::EnrichedModelEvent::Legacy(event)) => Some(Ok(event)),
+                Ok(pi_rs_core::EnrichedModelEvent::TextDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Text(delta)))
+                }
+                Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Reasoning(delta)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })))
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        self.clone()
+            .with_session_cache_key(external_id)
+            .stream_enriched(request)
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        self.clone().without_cache().stream_enriched(request).await
+    }
+}
+
+impl OpenAiResponses {
+    async fn stream_enriched(
+        &self,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
         let model = request.model.clone();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
@@ -672,7 +716,8 @@ impl Model for OpenAiResponses {
         Ok(Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
-            let mut reasoning = String::new();
+            let mut reasoning: BTreeMap<u64, String> = BTreeMap::new();
+            let mut text_items: BTreeMap<u64, String> = BTreeMap::new();
             while let Some(item) = source.next().await {
                 let item = item.map_err(|error| match error {
                     EventStreamError::Transport(RawStreamError::LimitExceeded) => Error::Model("OpenAI stream exceeds 32 MiB".into()),
@@ -684,21 +729,65 @@ impl Model for OpenAiResponses {
                 let kind = field(&event, "type")?;
                 started |= recognized_response_event(kind);
                 match kind {
-                    "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
-                    "response.reasoning_summary_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
+                    "response.output_item.added" if event["item"]["type"] == "reasoning" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?;
+                        yield pi_rs_core::EnrichedModelEvent::ReasoningStart { index };
+                    }
+                    "response.output_item.added" if event["item"]["type"] == "message" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI text index".into()))?;
+                        text_items.entry(index).or_default();
+                        yield pi_rs_core::EnrichedModelEvent::TextStart { index };
+                    }
+                    "response.output_text.delta" | "response.refusal.delta" => {
+                        let delta = field(&event,"delta")?;
+                        if let Some(index) = event["output_index"].as_u64() {
+                            text_items.entry(index).or_default().push_str(delta);
+                            yield pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: delta.into() };
+                        } else {
+                            yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Text(delta.into()));
+                        }
+                    }
+                    "response.output_item.done" if event["item"]["type"] == "message" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI text index".into()))?;
+                        let content = event["item"]["content"].as_array().map(|parts| parts.iter().filter_map(|part| match part["type"].as_str() {
+                            Some("output_text") => part["text"].as_str(),
+                            Some("refusal") => part["refusal"].as_str(),
+                            _ => None,
+                        }).collect::<String>()).unwrap_or_else(|| text_items.get(&index).cloned().unwrap_or_default());
+                        yield pi_rs_core::EnrichedModelEvent::TextEnd { index, content };
+                    }
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => { let text = field(&event,"delta")?; let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?; reasoning.entry(index).or_default().push_str(text); yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta:text.into() }; },
+                    "response.reasoning_summary_part.done" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?;
+                        if let Some(text) = reasoning.get_mut(&index) {
+                            text.push_str("\n\n");
+                            yield pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta:"\n\n".into() };
+                        }
+                    }
+                    "response.output_item.done" if event["item"]["type"] == "reasoning" => {
+                        let item = &event["item"];
+                        let text = |key: &str| item[key].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n\n")).unwrap_or_default();
+                        let summary = text("summary");
+                        let content = text("content");
+                        let finalized = if summary.is_empty() { content } else { summary };
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI reasoning index".into()))?;
+                        let content = if finalized.is_empty() { reasoning.get(&index).cloned().unwrap_or_default() } else { finalized };
+                        reasoning.insert(index, content.clone());
+                        yield pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content };
+                    }
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
                         if provider == "openai-chatgpt" && item["namespace"] != NAMESPACE { Err(Error::Model("unexpected OpenAI tool namespace".into()))?; }
                         let call = ToolCall { id:field(item,"call_id")?.into(), name:field(item,"name")?.into(), arguments:String::new() };
                         if calls.insert(index, call.clone()).is_some() { Err(Error::Model("duplicate OpenAI tool index".into()))?; }
-                        yield ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:String::new() });
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:String::new() }));
                     }
                     "response.function_call_arguments.delta" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let delta = field(&event,"delta")?;
                         calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?.arguments.push_str(delta);
-                        yield ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() });
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() }));
                     }
                     "response.completed" | "response.incomplete" => {
                         let response = &event["response"];
@@ -718,8 +807,9 @@ impl Model for OpenAiResponses {
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
-                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
-                        yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
+                        let reasoning: String = reasoning.into_values().collect();
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() }));
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
                     "response.failed" | "error" => {
@@ -752,6 +842,211 @@ impl Model for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn interleaved_text_items_have_boundaries_and_legacy_projection() {
+        use std::io::{Read, Write};
+        for legacy in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _ = socket.read(&mut [0; 8192]).unwrap();
+                let events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"a"}),
+                    json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning"}}),
+                    json!({"type":"response.reasoning_text.delta","output_index":1,"delta":"r"}),
+                    json!({"type":"response.output_item.added","output_index":2,"item":{"type":"message"}}),
+                    json!({"type":"response.refusal.delta","output_index":2,"delta":"b"}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"c"}),
+                    json!({"type":"response.output_item.done","output_index":2,"item":{"type":"message","content":[{"type":"refusal","refusal":"B"}]}}),
+                    json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","content":[{"text":"R"}]}}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"AC"}]}}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "key".into(),
+                "fixture",
+            )
+            .unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream: pi_rs_core::EnrichedModelStream = if legacy {
+                Box::pin(
+                    model
+                        .stream(request)
+                        .await
+                        .unwrap()
+                        .map(|event| event.map(pi_rs_core::EnrichedModelEvent::Legacy)),
+                )
+            } else {
+                model.stream_enriched(request).await.unwrap()
+            };
+            let mut seen = Vec::new();
+            while let Some(event) = stream.next().await {
+                use pi_rs_core::EnrichedModelEvent::*;
+                match event.unwrap() {
+                    TextStart { index } => seen.push(format!("start:{index}")),
+                    TextDelta { index, delta } => seen.push(format!("delta:{index}:{delta}")),
+                    TextEnd { index, content } => seen.push(format!("end:{index}:{content}")),
+                    ReasoningStart { index } => seen.push(format!("reasoning-start:{index}")),
+                    ReasoningDelta { index, delta } => {
+                        seen.push(format!("reasoning-delta:{index}:{delta}"))
+                    }
+                    ReasoningEnd { index, content } => {
+                        seen.push(format!("reasoning-end:{index}:{content}"))
+                    }
+                    Legacy(ModelEvent::Text(delta)) => seen.push(format!("text:{delta}")),
+                    Legacy(ModelEvent::Reasoning(delta)) => seen.push(format!("reasoning:{delta}")),
+                    _ => {}
+                }
+            }
+            worker.join().unwrap();
+            let expected = if legacy {
+                vec!["text:a", "reasoning:r", "text:b", "text:c"]
+            } else {
+                vec![
+                    "start:0",
+                    "delta:0:a",
+                    "reasoning-start:1",
+                    "reasoning-delta:1:r",
+                    "start:2",
+                    "delta:2:b",
+                    "delta:0:c",
+                    "end:2:B",
+                    "reasoning-end:1:R",
+                    "end:0:AC",
+                ]
+            };
+            assert_eq!(seen, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_text_and_retains_it_in_metadata() {
+        use std::io::{Read, Write};
+        for (mixed, legacy) in [(false, false), (true, false), (false, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let mut events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"Consider "}),
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"this."}),
+                ];
+                let summary = if mixed {
+                    json!([{"text":"Short summary"}])
+                } else {
+                    json!([])
+                };
+                if mixed {
+                    events.push(json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Short summary"}));
+                    events.push(
+                        json!({"type":"response.reasoning_summary_part.done","output_index":0}),
+                    );
+                }
+                let item = json!({"type":"reasoning","id":"rs_1","summary":summary,"content":[{"type":"reasoning_text","text":"Consider this."}]});
+                events
+                    .push(json!({"type":"response.output_item.done","output_index":0,"item":item}));
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[item]}}));
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = OpenAiResponses::new_api_provider(
+                &format!("http://{address}"),
+                "key".into(),
+                "fixture",
+            )
+            .unwrap();
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream: pi_rs_core::EnrichedModelStream = if legacy {
+                Box::pin(
+                    model
+                        .stream(request)
+                        .await
+                        .unwrap()
+                        .map(|event| event.map(pi_rs_core::EnrichedModelEvent::Legacy)),
+                )
+            } else {
+                model.stream_enriched(request).await.unwrap()
+            };
+            let mut deltas = Vec::new();
+            let mut ended = None;
+            let mut reasoning = None;
+            let mut complete = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    pi_rs_core::EnrichedModelEvent::ReasoningDelta { delta, .. } => {
+                        deltas.push(delta)
+                    }
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Reasoning(delta)) => {
+                        deltas.push(delta)
+                    }
+                    pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content } => {
+                        ended = Some((index, content))
+                    }
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) => {
+                        reasoning = metadata.reasoning
+                    }
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { .. }) => {
+                        complete = true
+                    }
+                    _ => {}
+                }
+            }
+            worker.join().unwrap();
+            let expected_deltas = if mixed {
+                vec!["Consider ", "this.", "Short summary", "\n\n"]
+            } else {
+                vec!["Consider ", "this."]
+            };
+            assert_eq!(deltas, expected_deltas);
+            assert_eq!(
+                reasoning.as_deref(),
+                Some(if mixed {
+                    "Short summary"
+                } else {
+                    "Consider this."
+                })
+            );
+            assert_eq!(
+                ended,
+                (!legacy).then(|| (
+                    0,
+                    if mixed {
+                        "Short summary"
+                    } else {
+                        "Consider this."
+                    }
+                    .to_owned()
+                ))
+            );
+            assert!(complete);
+        }
+    }
+
     #[tokio::test]
     async fn http_400_does_not_classify_echoed_credential_as_subscription_code() {
         use std::io::{Read, Write};
