@@ -769,14 +769,13 @@ async fn task_backed_second_call_waits_across_reopen_before_summary_placement() 
     s.submit(id, None, "third".into()).unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Some(attempt) = s.conversation(id).unwrap().tool_attempt() {
-                if driver
+            if let Some(attempt) = s.conversation(id).unwrap().tool_attempt()
+                && driver
                     .get(attempt.operation_id)
                     .unwrap()
                     .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
-                {
-                    break attempt.operation_id;
-                }
+            {
+                break attempt.operation_id;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -793,15 +792,14 @@ async fn task_backed_second_call_waits_across_reopen_before_summary_placement() 
         .unwrap();
     let second = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Some(attempt) = s.conversation(id).unwrap().tool_attempt() {
-                if attempt.operation_id != first
-                    && driver
-                        .get(attempt.operation_id)
-                        .unwrap()
-                        .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
-                {
-                    break attempt.operation_id;
-                }
+            if let Some(attempt) = s.conversation(id).unwrap().tool_attempt()
+                && attempt.operation_id != first
+                && driver
+                    .get(attempt.operation_id)
+                    .unwrap()
+                    .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
+            {
+                break attempt.operation_id;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
