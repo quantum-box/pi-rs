@@ -3663,12 +3663,15 @@ async fn dispatch_inner(
             }
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            if host.supports_custom_messages() {
-                encode(
-                    extension
-                        .lifecycle_with_host(&event, state.as_ref(), host)
-                        .await,
-                )
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .lifecycle_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
             } else {
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }

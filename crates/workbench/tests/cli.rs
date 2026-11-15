@@ -6107,6 +6107,136 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
 
 #[cfg(unix)]
 #[test]
+fn single_command_session_lifecycle_persists_custom_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("lifecycle.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'lifecycle','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    event=frame['request']['event']['type']
+    if event in ('session_start','session_shutdown'):
+        assert frame['has_custom_entries'] and frame['has_custom_entry_read']
+        print(json.dumps({'type':'list_custom_entries','custom_type':'lifecycle'}),flush=True)
+        previous=json.loads(sys.stdin.readline())['Ok']
+        assert len(previous)==(0 if event=='session_start' else 1)
+        print(json.dumps({'type':'append_entry','entry':{'customType':'lifecycle','data':{'event':event}}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("model fixture accept failed: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut length = 0;
+            let mut metadata_request = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                metadata_request |= line.starts_with("GET /api/ps ");
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if metadata_request {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                !serde_json::to_string(&request["messages"])
+                    .unwrap()
+                    .contains("session_start")
+            );
+            let response = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+            break;
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--print", "same input"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(session_path).unwrap();
+    let entries: Vec<_> = session
+        .branch()
+        .iter()
+        .filter_map(|record| match &record.event {
+            pi_rs::Event::CustomEntry { entry } if entry.custom_type == "lifecycle" => {
+                entry.data.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            json!({"event":"session_start"}),
+            json!({"event":"session_shutdown"})
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn resource_discovery_trigger_runs_before_print_prompt() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();

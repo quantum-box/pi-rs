@@ -279,12 +279,12 @@ pub struct ExtensionResources {
     pub resources: DiscoveredResources,
 }
 
-struct SessionEntryHost {
-    messages: Arc<dyn ToolHost>,
-    entries: tokio::sync::mpsc::Sender<SessionEntryRequest>,
+pub(crate) struct SessionEntryHost {
+    pub(crate) messages: Arc<dyn ToolHost>,
+    pub(crate) entries: tokio::sync::mpsc::Sender<SessionEntryRequest>,
 }
 
-enum SessionEntryRequest {
+pub(crate) enum SessionEntryRequest {
     Append(
         CustomEntry,
         tokio::sync::oneshot::Sender<ExtensionResult<()>>,
@@ -295,7 +295,7 @@ enum SessionEntryRequest {
     ),
 }
 
-async fn branch_custom_entries(
+pub(crate) async fn branch_custom_entries(
     session: &mut crate::Session,
     custom_type: Option<&str>,
 ) -> ExtensionResult<Vec<CustomEntryRecord>> {
