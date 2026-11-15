@@ -15,8 +15,14 @@ pub fn load(
     let Some(entry) = store.get(&key(attempt))? else {
         return Ok(None);
     };
+    decode(entry).map(Some)
+}
+
+pub(crate) fn decode(
+    entry: durable_store::Entry,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if entry.value.len() > crate::keyed_tool::MAX_STREAMED_OUTPUT_BYTES {
         return Err("streamed output exceeds byte limit".into());
     }
-    Ok(Some(String::from_utf8(entry.value)?))
+    Ok(String::from_utf8(entry.value)?)
 }

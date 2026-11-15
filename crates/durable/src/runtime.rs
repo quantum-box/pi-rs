@@ -9043,8 +9043,16 @@ impl Harness {
         Ok(())
     }
     fn recover_conversation(&mut self, id: Uuid) -> Result<(), Error> {
-        {
+        self.recover_conversation_with(id, || {})
+    }
+    fn recover_conversation_with(
+        &mut self,
+        id: Uuid,
+        mut after_stream_read: impl FnMut(),
+    ) -> Result<(), Error> {
+        loop {
             let (mut c, version) = self.load(id)?;
+            let mut stream_check = None;
             self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
                 return Ok(());
@@ -9303,8 +9311,15 @@ impl Harness {
                             // eligible; progress and earlier attempts are not
                             // evidence of what this invocation emitted.
                             let output = match c.tool_attempt().filter(|a| a.operation_id == operation_id) {
-                                Some(attempt) => crate::streamed_output::load(self.owner.store(), attempt.attempt_id)
-                                    .map_err(|error| Error::Invalid(format!("interrupted tool output: {error}")))?,
+                                Some(attempt) => {
+                                    let key = crate::streamed_output::key(attempt.attempt_id);
+                                    let entry = self.owner.store().get(&key)?;
+                                    stream_check = Some(Check { key, expected: entry.as_ref().map_or(Expected::Missing, |entry| Expected::Version(entry.version)) });
+                                    let output = entry.map(crate::streamed_output::decode).transpose()
+                                        .map_err(|error| Error::Invalid(format!("interrupted tool output: {error}")))?;
+                                    after_stream_read();
+                                    output
+                                },
                                 None => None,
                             };
                             let content = match output.filter(|text| !text.is_empty()) {
@@ -9327,9 +9342,30 @@ impl Harness {
                 _ => return Ok(()),
             }
             self.recovering = true;
-            let result = self.save(&c, Expected::Version(version));
+            let batch = stream_check
+                .as_ref()
+                .map(|check| crate::task_store::OwnedBatch {
+                    checks: vec![check.clone()],
+                    mutations: vec![],
+                });
+            let result = self.save_composed_locked(
+                &c,
+                Expected::Version(version),
+                None,
+                &[],
+                &[],
+                batch.as_ref(),
+            );
             self.recovering = false;
-            result?;
+            match result {
+                Err(Error::Storage(durable_store::Error::Conflict { key }))
+                    if stream_check.as_ref().is_some_and(|check| check.key == key) =>
+                {
+                    continue;
+                }
+                other => other?,
+            }
+            break;
         }
         Ok(())
     }

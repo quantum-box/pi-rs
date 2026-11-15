@@ -24,6 +24,84 @@ fn options() -> Options {
 }
 
 #[test]
+fn interrupted_recovery_retries_racing_stream_append() {
+    for initial in [None, Some("first")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        let operation_id = Uuid::new_v4();
+        let attempt = ToolAttempt {
+            operation_id,
+            attempt_id: Uuid::new_v4(),
+        };
+        state.tool_attempt = Some(attempt);
+        state.phase = Phase::ToolRunning {
+            turns: 0,
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            }],
+            index: 0,
+            operation_id,
+            replay: ReplayPolicy::Unsafe,
+            arguments: serde_json::json!({}),
+            restarts: 0,
+            replay_ready: false,
+            dispatch_identity: Some(DispatchIdentity::Other),
+        };
+        h.save(&state, Expected::Version(version)).unwrap();
+        let key = crate::streamed_output::key(attempt.attempt_id);
+        if let Some(initial) = initial {
+            h.owner
+                .store()
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: key.clone(),
+                        value: initial.as_bytes().to_vec(),
+                    }],
+                )
+                .unwrap();
+        }
+        let owner = h.owner.clone();
+        let mut injected = false;
+        h.recover_conversation_with(id, || {
+            if !injected {
+                injected = true;
+                let entry = owner.store().get(&Harness::key(id)).unwrap().unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: Harness::key(id),
+                            expected: Expected::Version(entry.version),
+                        }],
+                        &[Mutation::Put {
+                            key: key.clone(),
+                            value: b"latest".to_vec(),
+                        }],
+                    )
+                    .unwrap();
+            }
+        })
+        .unwrap();
+        assert!(injected);
+        let (recovered, _) = h.load(id).unwrap();
+        assert!(
+            matches!(recovered.phase, Phase::ToolFinished { ref content, .. } if content == "latest\ntool interrupted and may have partially run")
+        );
+    }
+}
+
+#[test]
 fn abort_returns_queued_inputs_across_foreground_and_background_boundaries() {
     use crate::ownership_edge::Mode;
     use crate::task::{Checkpoint, Task, TaskOwner};
