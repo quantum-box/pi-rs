@@ -1213,6 +1213,10 @@ script line numbers. The native JSON code argument differs from Pi's
 provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
+Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
+`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
+server-delay cap still applies to the parsed value.
+
 ### Resource selection checkpoint
 
 `--no-skills`, `--no-prompt-templates`, `--no-context-files`, `--no-themes`,

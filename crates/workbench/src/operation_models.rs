@@ -74,6 +74,44 @@ fn retryable_classifier_response(response: &reqwest::Response) -> bool {
     matches!(response.status().as_u16(), 408 | 409 | 429 | 500..=599)
 }
 
+// JavaScript's parseFloat consumes the longest valid numeric prefix, including
+// an incomplete exponent only up to the preceding mantissa.
+fn retry_number(value: &str) -> Option<f64> {
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+        digits += 1;
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    let mantissa_end = i;
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let exponent_start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == exponent_start {
+            i = mantissa_end;
+        }
+    }
+    value[..i].parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
 fn classifier_retry_delay(
     headers: &HeaderMap,
     retry_index: usize,
@@ -83,8 +121,7 @@ fn classifier_retry_delay(
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|value| value.is_finite())
+            .and_then(retry_number)
     };
     let delay_ms = numeric("retry-after-ms").or_else(|| {
         numeric("retry-after")
@@ -2652,6 +2689,22 @@ mod tests {
         );
         headers.insert("retry-after-ms", HeaderValue::from_static("60001"));
         assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        headers.insert("retry-after-ms", HeaderValue::from_static("60001ms"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        headers.insert("retry-after-ms", HeaderValue::from_static(" 12.5ms"));
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_micros(12500)
+        );
+        headers.remove("retry-after-ms");
+        headers.insert("retry-after", HeaderValue::from_static("1.5, 1.5"));
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(retry_number("1e+seconds"), Some(1.0));
+        assert_eq!(retry_number(".25e2 seconds"), Some(25.0));
+        assert_eq!(retry_number("Wed, 21 Oct 2015 07:28:05 GMT"), None);
     }
 
     #[tokio::test]
