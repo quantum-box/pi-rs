@@ -192,19 +192,12 @@ async fn result_details_diagnostics_and_search_survive_hook_interruption_history
                 .is_err()
         );
         assert_eq!(effects.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            snapshots.lock().unwrap()[0][0]["diagnostics"][0]["message"],
-            "private warning"
-        );
+        assert!(snapshots.lock().unwrap()[0].is_null());
     }
     let mut h = Harness::open_paused(&path, opts(model.clone(), effects.clone())).unwrap();
     install(&h, snapshots.clone(), None);
     let prior = h.conversation(id).unwrap();
-    assert_eq!(prior.tool_results.len(), 1);
-    assert_eq!(
-        prior.tool_results[0].details.as_ref().unwrap()["secret"],
-        "private details"
-    );
+    assert!(prior.tool_results.is_empty());
     h.resume_conversation(id, &CancellationToken::new())
         .await
         .unwrap();

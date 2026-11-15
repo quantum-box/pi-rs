@@ -658,6 +658,8 @@ pub struct Conversation {
     /// Durable metadata for terminal tool operations, independent of model messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<ToolResultMetadata>,
+    #[serde(skip)]
+    pending_tool_result: Option<ToolResultMetadata>,
     pub messages: Vec<Message>,
     /// Lossless block arrays indexed by their active message position.
     /// Reconstructed from the transcript; never serialized in the snapshot.
@@ -747,14 +749,32 @@ pub struct ToolResultMetadata {
     pub call_id: String,
     pub tool: String,
     pub is_error: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub metadata_truncated: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_json"
+    )]
     pub details: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_json"
+    )]
     pub structured_output: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<pi_rs_core::AttachmentRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<ToolDiagnostic>,
+}
+
+fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 fn record_tool_result(
@@ -802,7 +822,8 @@ fn record_tool_result(
     }
     let size = serde_json::to_vec(&(&details, &structured_output, &attachments, &diagnostics))
         .map_or(usize::MAX, |v| v.len());
-    if size > 65_536 {
+    let metadata_truncated = size > 65_536;
+    if metadata_truncated {
         details = None;
         structured_output = None;
         attachments.clear();
@@ -818,12 +839,93 @@ fn record_tool_result(
         call_id: call.id.clone(),
         tool: call.name.clone(),
         is_error: matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_)),
+        redacted: false,
+        metadata_truncated,
         details,
         structured_output,
         attachments,
         diagnostics,
     });
     Ok(())
+}
+
+pub(crate) fn local_schema_references(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().all(|(key, value)| {
+            if key == "$ref" || key == "$dynamicRef" {
+                value
+                    .as_str()
+                    .is_some_and(|reference| reference.starts_with('#'))
+            } else {
+                local_schema_references(value)
+            }
+        }),
+        serde_json::Value::Array(values) => values.iter().all(local_schema_references),
+        _ => true,
+    }
+}
+
+fn validate_tool_metadata(filters: &ToolFilters, metadata: &mut ToolResultMetadata) {
+    if metadata.redacted || metadata.metadata_truncated {
+        return;
+    }
+    let Some(schema) = filters.output_schemas.get(&metadata.tool) else {
+        return;
+    };
+    let broken = match &metadata.structured_output {
+        None if metadata.is_error => false,
+        None => true,
+        Some(value) => {
+            !local_schema_references(schema)
+                || jsonschema::validator_for(schema)
+                    .map_or(true, |validator| !validator.is_valid(value))
+        }
+    };
+    if broken {
+        metadata.structured_output = None;
+        metadata.attachments.clear();
+        metadata.diagnostics.push(ToolDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            code: Some("invalid_structured_output".into()),
+            message: "structured output missing or does not match the configured schema".into(),
+        });
+    }
+}
+
+fn model_tool_content(
+    filters: &ToolFilters,
+    calls: &[ToolCall],
+    index: usize,
+    outcome: &Outcome,
+) -> String {
+    if matches!(outcome, Outcome::Structured { .. })
+        && calls
+            .get(index)
+            .is_some_and(|call| filters.output_schemas.contains_key(&call.name))
+    {
+        String::new()
+    } else {
+        outcome.tool_content()
+    }
+}
+
+fn hide_pending_tool_output(state: &mut Conversation) {
+    if let Phase::ToolFinished { content, .. } = &mut state.phase {
+        content.clear();
+    }
+}
+
+fn redact_tool_metadata(metadata: &mut ToolResultMetadata, code: &str, message: &str) {
+    metadata.details = None;
+    metadata.structured_output = None;
+    metadata.attachments.clear();
+    metadata.diagnostics.clear();
+    metadata.redacted = true;
+    metadata.diagnostics.push(ToolDiagnostic {
+        severity: DiagnosticSeverity::Info,
+        code: Some(code.into()),
+        message: message.into(),
+    });
 }
 
 /// Name-based filter metadata. Deferred names affect model exposure only.
@@ -836,6 +938,9 @@ pub struct ToolFilters {
     /// Overrides by tool name. Missing names permit both caller kinds.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub callers: std::collections::BTreeMap<String, ToolCallers>,
+    /// Optional structured result schemas keyed by registered tool name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub output_schemas: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Caller kinds permitted to invoke an enabled tool.
@@ -2637,6 +2742,46 @@ impl Harness {
         }
         self.save(&c, Expected::Version(version))
     }
+    /// Persist an optional JSON schema for a registered tool's structured output.
+    pub fn set_tool_output_schema(
+        &mut self,
+        id: Uuid,
+        name: String,
+        schema: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "tool schema selection requires a settled conversation".into(),
+            ));
+        }
+        if name.is_empty()
+            || (!self.tools.contains_key(&name)
+                && !self
+                    .selected_extensions(&c)?
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.spec().name == name))
+        {
+            return Err(Error::Invalid(
+                "tool schema selection requires a registered tool".into(),
+            ));
+        }
+        if let Some(schema) = schema {
+            if serde_json::to_vec(&schema)?.len() > 65_536
+                || !local_schema_references(&schema)
+                || jsonschema::validator_for(&schema).is_err()
+            {
+                return Err(Error::Invalid(
+                    "invalid or oversized tool output schema".into(),
+                ));
+            }
+            c.tool_filters.output_schemas.insert(name, schema);
+        } else {
+            c.tool_filters.output_schemas.remove(&name);
+        }
+        self.save(&c, Expected::Version(version))
+    }
     /// Select installed names for a settled conversation, preserving their order.
     pub fn select_extensions(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
         let (mut c, version) = self.load(id)?;
@@ -2771,6 +2916,15 @@ impl Harness {
         Ok((state, entry.version))
     }
     fn hydrate(&self, state: &mut Conversation) -> Result<(), Error> {
+        if let Phase::ToolFinished { operation_id, .. } = &state.phase {
+            let key = format!("runtime/tool-result-pending/{}/{}", state.id, operation_id);
+            state.pending_tool_result = self
+                .owner
+                .store()
+                .get(key.as_bytes())?
+                .map(|entry| serde_json::from_slice(&entry.value))
+                .transpose()?;
+        }
         if let Some(cursor) = &state.transcript {
             let (messages, blocks) = self.read_transcript_blocks(state.id, cursor.clone())?;
             state.messages = messages;
@@ -3216,6 +3370,35 @@ impl Harness {
             .as_ref()
             .filter(|(v, _)| expected == Expected::Version(*v))
             .map(|(_, s)| s);
+        // Tool outcomes are checkpointed privately before hooks; only the
+        // finalized metadata is published in observations and fork snapshots.
+        if let Phase::ToolFinished { operation_id, .. } = &state.phase
+            && state.pending_tool_result.is_none()
+            && let Some(position) = state
+                .tool_results
+                .iter()
+                .position(|r| r.operation_id == *operation_id)
+            && old.is_none_or(|prior| {
+                !prior
+                    .tool_results
+                    .iter()
+                    .any(|r| r.operation_id == *operation_id)
+            })
+        {
+            state.pending_tool_result = Some(state.tool_results.remove(position));
+        }
+        if !matches!(state.phase, Phase::ToolFinished { .. }) {
+            for metadata in &mut state.tool_results {
+                if old.is_none_or(|prior| {
+                    !prior
+                        .tool_results
+                        .iter()
+                        .any(|r| r.operation_id == metadata.operation_id)
+                }) {
+                    validate_tool_metadata(&state.tool_filters, metadata);
+                }
+            }
+        }
         let mut append = crate::observer::Observer::new(self.owner.store(), state.id)
             .prepare_append(&serde_json::json!({}))?;
         let commit = append.cursor.0;
@@ -3744,6 +3927,42 @@ impl Harness {
             key: key.clone(),
             value,
         }];
+        let old_pending = old.and_then(|prior| prior.pending_tool_result.as_ref());
+        let new_pending = state.pending_tool_result.as_ref();
+        if old_pending != new_pending {
+            if let Some(previous) = old_pending {
+                let pending_key = format!(
+                    "runtime/tool-result-pending/{}/{}",
+                    state.id, previous.operation_id
+                )
+                .into_bytes();
+                let entry = self
+                    .owner
+                    .store()
+                    .get(&pending_key)?
+                    .ok_or_else(|| Error::Invalid("pending tool result missing".into()))?;
+                checks.push(Check {
+                    key: pending_key.clone(),
+                    expected: Expected::Version(entry.version),
+                });
+                mutations.push(Mutation::Delete { key: pending_key });
+            }
+            if let Some(current) = new_pending {
+                let pending_key = format!(
+                    "runtime/tool-result-pending/{}/{}",
+                    state.id, current.operation_id
+                )
+                .into_bytes();
+                checks.push(Check {
+                    key: pending_key.clone(),
+                    expected: Expected::Missing,
+                });
+                mutations.push(Mutation::Put {
+                    key: pending_key,
+                    value: serde_json::to_vec(current)?,
+                });
+            }
+        }
         mutations.extend(transcript_mutations);
         mutations.extend(append.mutations);
         mutations.push(Mutation::Put {
@@ -4039,6 +4258,7 @@ impl Harness {
             model_tools: None,
             tool_filters: ToolFilters::default(),
             tool_results: Vec::new(),
+            pending_tool_result: None,
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,
@@ -4326,6 +4546,7 @@ impl Harness {
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default(),
+            pending_tool_result: None,
             messages: point.messages,
             content_blocks: blocks,
             block_reset_proof: None,
@@ -5071,7 +5292,11 @@ impl Harness {
         }
     }
     pub fn conversation(&self, id: Uuid) -> Result<Conversation, Error> {
-        self.load(id).map(|x| x.0)
+        self.load(id).map(|x| {
+            let mut state = x.0;
+            hide_pending_tool_output(&mut state);
+            state
+        })
     }
     /// Read the latest committed application document under this store owner.
     pub fn document(
@@ -5139,6 +5364,7 @@ impl Harness {
             )
         })?;
         state.messages.clear();
+        hide_pending_tool_output(&mut state);
         let page = self.view_page(
             id,
             ViewCursor {
@@ -8138,7 +8364,8 @@ impl Harness {
                     };
                 } else {
                     record_tool_result(&mut c, &calls, index, operation_id, &outcome, Vec::new())?;
-                    append_tool(&mut c, &calls, index, outcome.tool_content())?;
+                    let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
+                    append_tool(&mut c, &calls, index, content)?;
                     for i in index + 1..calls.len() {
                         append_tool(
                             &mut c,
@@ -8173,9 +8400,20 @@ impl Harness {
             Phase::ToolFinished {
                 calls,
                 index,
-                content,
+                mut content,
                 ..
             } => {
+                if let Some(mut metadata) = c.pending_tool_result.take() {
+                    if !c.extensions.is_empty() {
+                        content = "tool result unavailable after abort before hooks".into();
+                        redact_tool_metadata(
+                            &mut metadata,
+                            "hook_not_completed",
+                            "tool result metadata withheld because after-tool hooks did not complete",
+                        );
+                    }
+                    c.tool_results.push(metadata);
+                }
                 // The effect already committed; retain its result even if an
                 // after-tool hook was interrupted by the abort.
                 append_tool(&mut c, &calls, index, content)?;
@@ -10126,7 +10364,7 @@ impl Harness {
                             valid_schema,
                         ) {
                             Ok(prepared) => {
-                                match crate::nested::NestedHost::new(
+                                match crate::nested::NestedHost::new_with_schemas(
                                     self.owner.clone(),
                                     operation_id,
                                     tools
@@ -10140,6 +10378,7 @@ impl Harness {
                                     cancel.child_token(),
                                     Duration::from_secs(120),
                                     8,
+                                    c.tool_filters.output_schemas.clone(),
                                 ) {
                                     Ok(host) => {
                                         let scope = c.tool_attempt().map(|attempt| {
@@ -10375,13 +10614,15 @@ impl Harness {
                             c.round_terminates[index] = control.terminate;
                             c.round_handoffs[index] = control.handoff.clone();
                             c.round_added_tools[index] = control.add_tools.clone();
+                            let content =
+                                model_tool_content(&c.tool_filters, &calls, index, &other);
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
                                 index,
                                 operation_id,
                                 arguments,
-                                content: other.tool_content(),
+                                content,
                             };
                         }
                     }
@@ -10426,7 +10667,32 @@ impl Harness {
                         return Err(Error::Interrupted);
                     }
                     self.record_extension_reports(c.id, operation_id, "after_tool", reports)?;
+                    let replaced = result.as_str().is_some_and(|value| value != content);
                     let content = result.as_str().unwrap_or(&content).to_owned();
+                    if let Some(mut metadata) = c.pending_tool_result.take() {
+                        if replaced {
+                            redact_tool_metadata(
+                                &mut metadata,
+                                "output_redacted",
+                                "tool metadata withheld after output replacement",
+                            );
+                        }
+                        c.tool_results.push(metadata);
+                    } else if let Some(metadata) = c
+                        .tool_results
+                        .iter_mut()
+                        .find(|metadata| metadata.operation_id == operation_id)
+                    {
+                        if replaced {
+                            redact_tool_metadata(
+                                metadata,
+                                "output_redacted",
+                                "tool metadata withheld after output replacement",
+                            );
+                        } else {
+                            validate_tool_metadata(&c.tool_filters, metadata);
+                        }
+                    }
                     append_tool(&mut c, &calls, index, content)?;
                     c.phase = Phase::Tools {
                         turns,
@@ -10467,13 +10733,14 @@ impl Harness {
                             &outcome,
                             Vec::new(),
                         )?;
+                        let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
                         Phase::ToolFinished {
                             turns,
                             calls,
                             index,
                             operation_id,
                             arguments,
-                            content: outcome.tool_content(),
+                            content,
                         }
                     };
                     self.save(&c, Expected::Version(version))?;
@@ -10541,6 +10808,8 @@ impl Harness {
                                 &outcome,
                                 Vec::new(),
                             )?;
+                            let content =
+                                model_tool_content(&c.tool_filters, &calls, index, &outcome);
                             let arguments = arguments.unwrap_or_else(|| {
                                 pi_rs_core::parse_tool_arguments(&calls[index].arguments)
                                     .unwrap_or(serde_json::Value::Null)
@@ -10551,7 +10820,7 @@ impl Harness {
                                 index,
                                 operation_id,
                                 arguments,
-                                content: outcome.tool_content(),
+                                content,
                             };
                         }
                         crate::poll::PollResult::Cancelled => return Err(Error::Interrupted),
@@ -11560,6 +11829,14 @@ impl Scheduler {
         callers: Option<ToolCallers>,
     ) -> Result<(), Error> {
         self.harness.set_tool_callers(id, name, callers)
+    }
+    pub fn set_tool_output_schema(
+        &mut self,
+        id: Uuid,
+        name: String,
+        schema: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        self.harness.set_tool_output_schema(id, name, schema)
     }
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)
@@ -17038,6 +17315,7 @@ mod scheduler_tests {
             model_tools: None,
             tool_filters: ToolFilters::default(),
             tool_results: Vec::new(),
+            pending_tool_result: None,
             messages: vec![],
             content_blocks: Default::default(),
             block_reset_proof: None,

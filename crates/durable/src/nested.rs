@@ -194,6 +194,7 @@ struct Shared {
     owner: Arc<OwnedStore>,
     root: Uuid,
     tools: HashMap<String, RegisteredTool>,
+    output_schemas: std::collections::BTreeMap<String, Value>,
     cancellation: CancellationToken,
     timeout: Duration,
     max_depth: usize,
@@ -278,6 +279,25 @@ impl NestedHost {
         timeout: Duration,
         max_depth: usize,
     ) -> Result<Arc<Self>, InspectionError> {
+        Self::new_with_schemas(
+            owner,
+            parent,
+            tools,
+            cancellation,
+            timeout,
+            max_depth,
+            Default::default(),
+        )
+    }
+    pub(crate) fn new_with_schemas(
+        owner: Arc<OwnedStore>,
+        parent: Uuid,
+        tools: Vec<RegisteredTool>,
+        cancellation: CancellationToken,
+        timeout: Duration,
+        max_depth: usize,
+        output_schemas: std::collections::BTreeMap<String, Value>,
+    ) -> Result<Arc<Self>, InspectionError> {
         let mut registry = HashMap::new();
         for tool in tools {
             let name = tool.tool.spec().name;
@@ -294,6 +314,7 @@ impl NestedHost {
                 owner,
                 root: parent,
                 tools: registry,
+                output_schemas,
                 cancellation,
                 timeout,
                 max_depth,
@@ -592,7 +613,7 @@ impl NestedHost {
                 if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
                     return self.poll_pending(&key, record, entry.version, reg).await;
                 }
-                return outcome.clone();
+                return validate_nested_output(&self.shared.output_schemas, name, outcome.clone());
             }
             if record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe {
                 return self.fail("interrupted unsafe nested call requires reconciliation");
@@ -704,7 +725,7 @@ impl NestedHost {
         let outcome = if has_state {
             Outcome::Unknown("nested extension state requires reconciliation".into())
         } else {
-            reply.outcome
+            validate_nested_output(&self.shared.output_schemas, name, reply.outcome)
         };
         // An uncertain descendant poisons the ancestor even if a tool ignored it.
         if self.shared.failed.load(Ordering::Acquire) && !has_state {
@@ -784,6 +805,8 @@ impl NestedHost {
                     "nested polling returned an uncertain outcome; pending reference retained",
                 );
             }
+            let outcome =
+                validate_nested_output(&self.shared.output_schemas, &record.name, outcome);
             record.outcome = Some(outcome.clone());
             let value = match serde_json::to_vec(&record) {
                 Ok(value) => value,
@@ -813,6 +836,31 @@ impl NestedHost {
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
+    }
+}
+fn validate_nested_output(
+    schemas: &std::collections::BTreeMap<String, Value>,
+    name: &str,
+    outcome: Outcome,
+) -> Outcome {
+    let Some(schema) = schemas.get(name) else {
+        return outcome;
+    };
+    let invalid = match &outcome {
+        Outcome::Structured { data, .. } => {
+            !crate::runtime::local_schema_references(schema)
+                || jsonschema::validator_for(schema)
+                    .map_or(true, |validator| !validator.is_valid(data))
+        }
+        Outcome::Succeeded(_)
+        | Outcome::SucceededWithDetails { .. }
+        | Outcome::Truncated { .. } => true,
+        _ => false,
+    };
+    if invalid {
+        Outcome::Failed("invalid_structured_output: structured output missing or does not match the configured schema".into())
+    } else {
+        outcome
     }
 }
 fn valid_key(key: &str) -> bool {
