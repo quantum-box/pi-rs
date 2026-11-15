@@ -1788,6 +1788,8 @@ pub(crate) struct PreparedTaskDocuments {
 impl DetachedTaskDocuments {
     /// Prepare only against the same unchanged running attempt. Same-value
     /// reservation rewrites may advance its version, as in the scheduler.
+    /// The eventual atomic commit fences the supplied version; re-reading here
+    /// would discard a completed invocation before the scheduler can rebase it.
     pub(crate) fn prepare(
         self,
         current: &crate::task_store::StoredTask,
@@ -1795,10 +1797,6 @@ impl DetachedTaskDocuments {
         if current.task != self.reservation.task
             || current.task.state() != &crate::task::TaskState::Running
             || current.task.abort_requested()
-            || crate::task_store::TaskStore::new(self.owner.store())
-                .load(current.task.id())?
-                .as_ref()
-                != Some(current)
         {
             return Err(Error::Store(durable_store::Error::Conflict {
                 key: crate::task_store::key(self.reservation.task.id()),
@@ -3725,6 +3723,32 @@ mod detached_task_documents_tests {
             detached.prepare(&changed),
             Err(Error::Store(durable_store::Error::Conflict { .. }))
         ));
+    }
+
+    #[test]
+    fn detached_prepare_keeps_effects_when_reservation_version_moves() {
+        let (_dir, owner, running) = setup();
+        let docs = TaskDocuments::new(owner.store(), &running.task).unwrap();
+        let detached = docs.detach(owner.clone(), &running).unwrap();
+        let ts = TaskStore::new(owner.store());
+        ts.update(&running, |_| Ok(())).unwrap();
+        let newer = ts.load(running.task.id()).unwrap().unwrap();
+        assert_ne!(newer.version, running.version);
+        let prepared = detached.prepare(&running).unwrap();
+        let mut next = prepared.reservation;
+        next.task.succeed(json!("done")).unwrap();
+        let mut tx = prepared.transaction;
+        tx.append(prepared.document_batch).unwrap();
+        tx.append(ts.prepare_save(&[Save::Update(&next)]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            tx.commit(owner.store()),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(
+            ts.load(running.task.id()).unwrap().unwrap().task,
+            running.task
+        );
     }
 
     #[test]
