@@ -8,11 +8,16 @@ pub fn agent_dir() -> PathBuf {
     pi_rs_workbench::agent_dir()
 }
 
+type WorkerHistory =
+    std::sync::Arc<std::sync::Mutex<Option<(PathBuf, bool, Vec<(PathBuf, Value)>)>>>;
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     value: Value,
     resource_layers: Vec<(PathBuf, Value)>,
     diagnostics: Vec<String>,
+    #[serde(skip)]
+    worker_history: WorkerHistory,
     // Live controls override merged settings only for this running session.
     live_auto_retry: Option<bool>,
     live_auto_compaction: Option<bool>,
@@ -64,8 +69,63 @@ impl Settings {
         Self::load_from_paths(workspace, trusted, &user_path)
     }
     pub fn reload(&self, workspace: &Path, trusted: bool) -> Result<Self> {
+        self.reload_with_fallback(workspace, trusted, self)
+    }
+    pub(super) fn reload_latest(&self, workspace: &Path, trusted: bool) -> Result<Self> {
+        let fallback = self.worker_fallback(workspace, trusted);
+        let settings =
+            self.reload_with_fallback(workspace, trusted, fallback.as_ref().unwrap_or(self))?;
+        self.remember_worker_snapshot(workspace, trusted, &settings);
+        Ok(settings)
+    }
+    pub(super) fn reload_with_fallback(
+        &self,
+        workspace: &Path,
+        trusted: bool,
+        fallback: &Self,
+    ) -> Result<Self> {
         let user_path = agent_dir().join("settings.json");
-        Self::load_from_paths_with_previous(workspace, trusted, &user_path, Some(self))
+        let mut settings =
+            Self::load_from_paths_with_previous(workspace, trusted, &user_path, Some(fallback))?;
+        settings.worker_history = self.worker_history.clone();
+        settings.live_auto_retry = self.live_auto_retry;
+        settings.live_auto_compaction = self.live_auto_compaction;
+        Ok(settings)
+    }
+    pub(super) fn fork_worker_history(&mut self) {
+        let snapshot = self
+            .worker_history
+            .lock()
+            .ok()
+            .and_then(|history| history.clone());
+        self.worker_history = std::sync::Arc::new(std::sync::Mutex::new(snapshot));
+    }
+    pub(super) fn worker_fallback(&self, workspace: &Path, trusted: bool) -> Option<Self> {
+        let history = self.worker_history.lock().ok()?;
+        let (old_workspace, old_trusted, layers) = history.as_ref()?;
+        let same = old_workspace == workspace
+            || matches!((old_workspace.canonicalize(), workspace.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        if !same || *old_trusted != trusted {
+            return None;
+        }
+        let mut fallback = self.clone();
+        fallback.resource_layers = layers.clone();
+        fallback.refresh_effective();
+        Some(fallback)
+    }
+    pub(super) fn remember_worker_snapshot(
+        &self,
+        workspace: &Path,
+        trusted: bool,
+        snapshot: &Self,
+    ) {
+        if let Ok(mut history) = self.worker_history.lock() {
+            *history = Some((
+                workspace.to_owned(),
+                trusted,
+                snapshot.resource_layers.clone(),
+            ));
+        }
     }
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
@@ -170,6 +230,9 @@ impl Settings {
             value,
             resource_layers,
             diagnostics,
+            worker_history: previous
+                .map(|settings| settings.worker_history.clone())
+                .unwrap_or_default(),
             live_auto_retry: previous.and_then(|settings| settings.live_auto_retry),
             live_auto_compaction: previous.and_then(|settings| settings.live_auto_compaction),
         })
@@ -2025,6 +2088,47 @@ mod tests {
             let error = validate_settings(&invalid, path).unwrap_err().to_string();
             assert!(error.contains("settings.json/"), "{error}");
         }
+    }
+
+    #[test]
+    fn worker_snapshot_survives_reload_but_respects_workspace_and_trust() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let other = root.path().join("other");
+        let initial = Settings::default();
+        let snapshot = Settings {
+            resource_layers: vec![(root.path().to_owned(), json!({"skills":["new"]}))],
+            ..Settings::default()
+        };
+        initial.remember_worker_snapshot(&workspace, true, &snapshot);
+        let reloaded = Settings::load_from_paths_with_previous(
+            &workspace,
+            true,
+            &root.path().join("settings.json"),
+            Some(&initial),
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
+            "new"
+        );
+        assert!(reloaded.worker_fallback(&workspace, false).is_none());
+        assert!(reloaded.worker_fallback(&other, true).is_none());
+        let mut staged = reloaded.clone();
+        staged.fork_worker_history();
+        let newer = Settings {
+            resource_layers: vec![(root.path().to_owned(), json!({"skills":["staged"]}))],
+            ..Settings::default()
+        };
+        staged.remember_worker_snapshot(&workspace, true, &newer);
+        assert_eq!(
+            staged.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
+            "staged"
+        );
+        assert_eq!(
+            reloaded.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
+            "new"
+        );
     }
 
     #[test]

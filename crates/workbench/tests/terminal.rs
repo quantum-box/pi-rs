@@ -2327,15 +2327,26 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let skill = root.path().join("special/SKILL.md");
+    let previous = root.path().join("previous/SKILL.md");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::write(
+        &previous,
+        "---\nname: previous-fixture-skill\ndescription: previous-skill-description\n---\nbody",
+    )
+    .unwrap();
     std::fs::write(
         &skill,
         "---\nname: special-fixture-skill\ndescription: unique-reload-skill-description\n---\nbody",
     )
     .unwrap();
     let settings = home.join("settings.json");
-    std::fs::write(&settings, serde_json::json!({"skills":[skill]}).to_string()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::json!({"skills":[previous]}).to_string(),
+    )
+    .unwrap();
     std::fs::write(
         home.join("models.json"),
         br#"{"providers":{"ollama":{"models":[{"id":"test-fixture"}]}}}"#,
@@ -2349,7 +2360,8 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
     );
     let (sender, receiver) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut requests = 0;
         while Instant::now() < deadline {
             let (mut socket, _) = match listener.accept() {
                 Ok(connection) => connection,
@@ -2387,7 +2399,10 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
                 .send(String::from_utf8_lossy(&body).into_owned())
                 .unwrap();
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
-            return;
+            requests += 1;
+            if requests == 2 {
+                return;
+            }
         }
     });
     let mut master_fd = -1;
@@ -2425,6 +2440,7 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
             .args([
                 "--no-trust",
                 "--no-mcp",
+                "--no-extensions",
                 "--offline",
                 "--coding-tools",
                 "--provider",
@@ -2443,11 +2459,35 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
+    std::fs::write(&settings, serde_json::json!({"skills":[skill]}).to_string()).unwrap();
+    master.write_all(b"first request\r").unwrap();
+    let first = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    assert!(first.contains("unique-reload-skill-description"), "{first}");
+    output_until(&mut master, |text| text.contains("done"));
+    std::thread::sleep(Duration::from_secs(1));
     std::fs::write(&settings, "{").unwrap();
     master.write_all(b"/reload\r").unwrap();
     output_until(&mut master, |text| text.contains("Reloaded settings"));
+    std::thread::sleep(Duration::from_secs(1));
     master.write_all(b"hello\r").unwrap();
-    let body = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        if let Ok(body) = receiver.try_recv() {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "second request timed out");
+        let mut buffer = [0; 8192];
+        match master.read(&mut buffer) {
+            Ok(_) => (),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                ()
+            }
+            Err(error) => panic!("terminal read failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     assert!(body.contains("unique-reload-skill-description"), "{body}");
     server.join().unwrap();
 }

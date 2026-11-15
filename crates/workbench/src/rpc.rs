@@ -2098,6 +2098,7 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
     }
     drop(session);
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     next.session = path.to_path_buf();
     interactive::restore_workspace(&mut next)?;
     for warning in next.settings.diagnostics() {
@@ -2162,6 +2163,10 @@ fn forward_event(
 ) -> Result<()> {
     let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
+        Some("warning") => {
+            eprintln!("{}", event["message"].as_str().unwrap_or_default());
+            Ok(())
+        }
         Some("response") if event["command"] == "get_commands" => emit_command_catalog(event),
         Some("response")
             if matches!(
