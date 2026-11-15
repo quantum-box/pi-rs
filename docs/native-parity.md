@@ -2843,7 +2843,9 @@ and word boundaries. Single-shorthand bracket expressions such as `[\d]`,
 shorthands outside complex brackets are translated independently. Patterns
 requiring lookaround or backreferences retain the existing bounded engine and
 Unicode class behavior; mixed bracket expressions and other Unicode case
-folding differences remain open.
+folding differences remain open. The native engine matches Unicode scalar
+values rather than JavaScript's non-Unicode UTF-16 code units: for example,
+`^[\D]$` matches an emoji natively but not in Pi.
 
 Name and working-directory fields support Pi's fuzzy alignment and letter/digit
 swap. Message text and IDs use literal matching. Relevance sorting uses the same
