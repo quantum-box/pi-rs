@@ -4222,6 +4222,17 @@ the readable portion remains visible. Like Pi v1.5.0’s
 `grok-mermaid` parser, a class name immediately followed by an undirected link
 without whitespace can consume part of that link and render an incomplete graph.
 
+### Responses session routing checkpoint
+
+API-key Responses requests in the workbench send Pi's session routing
+headers. The default format sends `session-id` and `x-client-request-id`;
+OpenRouter sends `x-session-id`, and a model or provider can select the
+OpenAI format without `session-id`. Explicit headers take precedence, and
+summary requests omit automatic routing headers. The existing native
+`sendSessionAffinityHeaders` override can disable them. ChatGPT sign-in and
+direct use of the standalone Responses adapter do not yet receive these
+routing headers automatically.
+
 ### Model session affinity checkpoint
 
 The model adapter receives the durable session UUID for each agent
