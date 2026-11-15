@@ -670,3 +670,159 @@ fn explicit_legacy_migration_is_atomic_preserves_keys_and_restores_retirement() 
     assert!(frames[0].retired && watch.ended());
     assert!(Documents::new(&db).get(&address).unwrap().is_none());
 }
+
+#[test]
+fn task_watch_retirement_ends_after_terminal_resave_and_reopen() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::{Expected, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resave.db");
+    let db = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&db);
+    let root = task(
+        101,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    ts.save(&[Save::Create(&root)]).unwrap();
+    let address = Address {
+        scope: "watch".into(),
+        name: "resave".into(),
+        key: "".into(),
+    };
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&address, root.id()).unwrap();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v": 1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let (_, watch) = Documents::new(&db).watch_task_document(&address).unwrap();
+    let cursor = watch.cursor();
+    let stored = ts.load(root.id()).unwrap().unwrap();
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.succeed(json!(0))
+    })
+    .unwrap();
+    let terminal = ts.load(root.id()).unwrap().unwrap();
+    ts.save(&[Save::Update(&terminal)]).unwrap();
+    drop(watch);
+    drop(db);
+    let db = Store::open(&path).unwrap();
+    let mut watch = Documents::new(&db)
+        .resume_task_document_watch(&address, cursor)
+        .unwrap();
+    let frames = watch.poll(1).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].retired);
+    assert!(watch.ended());
+}
+
+#[test]
+fn task_watch_ends_when_terminal_commit_arrives_after_boundary() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::{Expected, Store};
+    let db = Store::memory().unwrap();
+    let ts = TaskStore::new(&db);
+    let root = task(
+        102,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    ts.save(&[Save::Create(&root)]).unwrap();
+    let address = Address {
+        scope: "watch".into(),
+        name: "race".into(),
+        key: "".into(),
+    };
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&address, root.id()).unwrap();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v": 1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let (_, mut watch) = Documents::new(&db).watch_task_document(&address).unwrap();
+    let stored = ts.load(root.id()).unwrap().unwrap();
+    let frames = watch
+        .poll_after_boundary(1, || {
+            ts.update(&stored, |task| {
+                task.start()?;
+                task.succeed(json!(0))
+            })
+            .unwrap();
+        })
+        .unwrap();
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].retired);
+    assert!(watch.ended());
+}
+
+#[test]
+fn task_watch_does_not_end_before_queued_recreation_and_retirement() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::{Expected, Store};
+    let db = Store::memory().unwrap();
+    let ts = TaskStore::new(&db);
+    let root = task(
+        103,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    ts.save(&[Save::Create(&root)]).unwrap();
+    let address = Address {
+        scope: "watch".into(),
+        name: "queued".into(),
+        key: "".into(),
+    };
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&address, root.id()).unwrap();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v": 1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let docs = Documents::new(&db);
+    let (initial, mut watch) = docs.watch_task_document(&address).unwrap();
+    let mut tx = Transaction::new();
+    tx.delete(&address, initial.document.unwrap().version)
+        .unwrap();
+    tx.commit(&db).unwrap();
+    let mut tx = Transaction::new();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v": 2}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let stored = ts.load(root.id()).unwrap().unwrap();
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.succeed(json!(0))
+    })
+    .unwrap();
+    assert!(watch.poll(1).unwrap()[0].retired);
+    assert!(!watch.ended());
+    assert_eq!(
+        watch.poll(1).unwrap()[0].document.as_ref().unwrap().value["v"],
+        2
+    );
+    assert!(!watch.ended());
+    let last = watch.poll(1).unwrap();
+    assert!(last[0].retired);
+    assert!(watch.ended());
+}

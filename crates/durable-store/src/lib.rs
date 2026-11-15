@@ -1263,13 +1263,11 @@ impl Store {
                 .get(key)
                 .or_else(|| policy_document.as_ref().and_then(|doc| owners.get(doc)))
             {
-                if states[owner] {
-                    if !settling.contains(owner) {
-                        return Err(Error::Conflict { key: key.clone() });
-                    }
-                    // Keep the mutation in order; a retirement appended below
-                    // makes the final document state absent in this transaction.
+                if states[owner] && !settling.contains(owner) {
+                    return Err(Error::Conflict { key: key.clone() });
                 }
+                // Keep the mutation in order; a retirement appended below
+                // makes the final document state absent in this transaction.
             }
             effective.push(mutation.clone());
         }

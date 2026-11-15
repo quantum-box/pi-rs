@@ -546,39 +546,62 @@ impl TaskDocumentWatch<'_> {
         self.inner.cursor()
     }
     pub fn poll(&mut self, limit: usize) -> Result<Vec<DocumentOperationFrame>, Error> {
+        self.poll_inner(limit, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_after_boundary<F: FnOnce()>(
+        &mut self,
+        limit: usize,
+        after_boundary: F,
+    ) -> Result<Vec<DocumentOperationFrame>, Error> {
+        // Model a commit arriving immediately after the former boundary read.
+        self.inner.store.commit_sequence()?;
+        self.poll_inner(limit, after_boundary)
+    }
+
+    fn poll_inner<F: FnOnce()>(
+        &mut self,
+        limit: usize,
+        before_fetch: F,
+    ) -> Result<Vec<DocumentOperationFrame>, Error> {
         if self.ended {
             return Ok(Vec::new());
         }
-        let boundary = self.inner.store.commit_sequence()?;
-        let stored = crate::task_store::TaskStore::new(self.inner.store).load(self.owner)?;
-        let terminal = if let Some(stored) = stored.filter(|s| s.task.is_terminal()) {
-            let key = crate::task_store::key(self.owner);
-            match self.inner.store.commit_for_version(&key, stored.version)? {
-                Some(seq) if seq <= boundary => {
-                    Some(self.inner.store.document_revision_for_commit(seq)?)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let mut frames = self.inner.poll_operations(limit)?;
-        for frame in &mut frames {
-            if frame.retired {
-                frame.document = self.last.clone();
+        let cursor = self.inner.cursor;
+        before_fetch();
+        let result = (|| {
+            let mut frames = self.inner.poll_operations(limit)?;
+            // Read the task *after* the page. A terminal task cannot admit a
+            // later document mutation, so a subsequent empty lookahead proves
+            // this page contains the final change even after terminal re-saves.
+            let terminal = crate::task_store::TaskStore::new(self.inner.store)
+                .load(self.owner)?
+                .is_some_and(|stored| stored.task.is_terminal());
+            let drained = if terminal {
+                self.inner
+                    .store
+                    .document_changes(&self.inner.key, self.inner.cursor, 1)?
+                    .is_empty()
             } else {
-                self.last = frame.document.clone();
+                false
+            };
+            let mut last = self.last.clone();
+            for frame in &mut frames {
+                if frame.retired {
+                    frame.document = last.clone();
+                } else {
+                    last = frame.document.clone();
+                }
             }
+            self.last = last;
+            self.ended = terminal && drained;
+            Ok(frames)
+        })();
+        if result.is_err() {
+            self.inner.cursor = cursor;
         }
-        if let Some(revision) = terminal {
-            let terminal_frame = frames
-                .iter()
-                .any(|frame| frame.retired && Some(frame.revision) == revision);
-            if terminal_frame || frames.len() < limit {
-                self.ended = true;
-            }
-        }
-        Ok(frames)
+        result
     }
 }
 
