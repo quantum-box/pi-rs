@@ -137,3 +137,35 @@ impl Drop for Guard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn subscribers_coalesce_and_close_after_last_owner() {
+        let activity = WorkerActivity::default();
+        let mut first = activity.subscribe();
+        let mut second = activity.subscribe();
+        let id = Uuid::new_v4();
+        let guard = activity.enter(WorkerKind::Task, id);
+        guard.set(WorkerPhase::Waiting);
+        let seen = first.changed().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].phase, WorkerPhase::Waiting);
+        assert_eq!(second.changed().await.unwrap(), seen);
+        guard.set(WorkerPhase::Waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), first.changed())
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(first.changed().await.unwrap().is_empty());
+        assert!(second.changed().await.unwrap().is_empty());
+        drop(activity);
+        assert!(first.changed().await.is_err());
+        assert!(second.changed().await.is_err());
+    }
+}
