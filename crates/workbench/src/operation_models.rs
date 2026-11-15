@@ -1218,61 +1218,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
-        let catalog = Catalogue::parse(&Map::new()).unwrap();
-        let images: Vec<_> = catalog
-            .0
-            .iter()
-            .filter(|entry| entry.provider == "openrouter" && entry.api.kind() == Kind::Image)
-            .collect();
-        assert_eq!(
-            images
-                .iter()
-                .filter(|entry| entry.descriptor().get("inputLimits").is_some())
-                .count(),
-            63
-        );
-        let flux = images
-            .iter()
-            .find(|entry| entry.model.id == "black-forest-labs/flux-3-image")
-            .unwrap()
-            .descriptor();
-        assert_eq!(
-            flux["inputLimits"]["images"]["resize"],
-            json!({"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80})
-        );
-        assert!(flux.get("headers").is_none());
-        assert!(flux.get("baseUrl").is_none());
-        let recraft = images
-            .iter()
-            .find(|entry| entry.model.id == "recraft/recraft-v4.1-flash")
-            .unwrap()
-            .descriptor();
-        assert!(recraft.get("inputLimits").is_none());
-        let classifier = catalog
-            .0
-            .iter()
-            .find(|entry| entry.provider == "openrouter" && entry.model.id == "~liquid/d1-latest")
-            .unwrap()
-            .descriptor();
-        assert_eq!(
-            classifier["compat"],
-            json!({"imageInput":"state-image-urls","sendImageOptInHeader":false})
-        );
-        let configured = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"type":"image","id":"custom","api":"openrouter-images","headers":{"x-secret":"hidden"},"inputLimits":{"images":{"maxPerRequest":2}}}]}});
-        let custom = Catalogue::parse(configured.as_object().unwrap()).unwrap();
-        let value = custom
-            .0
-            .iter()
-            .find(|entry| entry.provider == "relay")
-            .unwrap()
-            .descriptor();
-        assert_eq!(value["inputLimits"]["images"]["maxPerRequest"], 2);
-        assert!(value.get("headers").is_none());
-        assert!(value.get("baseUrl").is_none());
-    }
-
-    #[test]
     fn vercel_builtin_classifier_catalogue_is_endpoint_bound() {
         let catalogue = Catalogue::parse(&Map::new()).unwrap();
         let models: Vec<_> = catalogue
@@ -2660,6 +2605,61 @@ mod tests {
         let (body, opt_in) = classifier_payload(entry, &without_image).unwrap();
         assert_eq!(body["input"]["state"], json!({"text":"test"}));
         assert!(!opt_in);
+    }
+
+    #[test]
+    fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
+        let catalog = Catalogue::parse(&Map::new()).unwrap();
+        let images: Vec<_> = catalog
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "openrouter" && entry.api.kind() == Kind::Image)
+            .collect();
+        assert_eq!(
+            images
+                .iter()
+                .filter(|entry| entry.descriptor().get("inputLimits").is_some())
+                .count(),
+            63
+        );
+        let flux = images
+            .iter()
+            .find(|entry| entry.model.id == "black-forest-labs/flux-3-image")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            flux["inputLimits"]["images"]["resize"],
+            json!({"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80})
+        );
+        assert!(flux.get("headers").is_none());
+        assert!(flux.get("baseUrl").is_none());
+        let recraft = images
+            .iter()
+            .find(|entry| entry.model.id == "recraft/recraft-v4.1-flash")
+            .unwrap()
+            .descriptor();
+        assert!(recraft.get("inputLimits").is_none());
+        let classifier = catalog
+            .0
+            .iter()
+            .find(|entry| entry.provider == "openrouter" && entry.model.id == "~liquid/d1-latest")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            classifier["compat"],
+            json!({"imageInput":"state-image-urls","sendImageOptInHeader":false})
+        );
+        let configured = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"type":"image","id":"custom","api":"openrouter-images","headers":{"x-secret":"hidden"},"inputLimits":{"images":{"maxPerRequest":2}}}]}});
+        let custom = Catalogue::parse(configured.as_object().unwrap()).unwrap();
+        let value = custom
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap()
+            .descriptor();
+        assert_eq!(value["inputLimits"]["images"]["maxPerRequest"], 2);
+        assert!(value.get("headers").is_none());
+        assert!(value.get("baseUrl").is_none());
     }
 
     #[test]
