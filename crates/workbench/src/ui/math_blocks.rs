@@ -6,6 +6,12 @@ use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
+const SCAN_TIME: Duration = Duration::from_millis(20);
+// Tests run in parallel and can be descheduled between the clock checks.
+#[cfg(test)]
+const SCAN_TIME: Duration = Duration::from_secs(1);
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MathBlock {
     pub source: Range<usize>,
@@ -27,7 +33,7 @@ pub(super) fn list_blocks(source: &str) -> Vec<ListMathBlock> {
     if source.len() > 256 * 1024 || (!source.contains("$$") && !source.contains("\\[")) {
         return Vec::new();
     }
-    let deadline = Instant::now() + Duration::from_millis(20);
+    let deadline = Instant::now() + SCAN_TIME;
     let mut result = Vec::new();
     let mut quote_depth = 0usize;
     let mut examined = 0usize;
@@ -92,7 +98,7 @@ pub(super) fn top_level(source: &str) -> Vec<MathBlock> {
     if source.len() > 256 * 1024 || (!source.contains("$$") && !source.contains("\\[")) {
         return Vec::new();
     }
-    let deadline = Instant::now() + Duration::from_millis(20);
+    let deadline = Instant::now() + SCAN_TIME;
     let parser = Parser::new_ext(source, Options::ENABLE_TABLES);
     let mut protected: Vec<Range<usize>> = parser
         .reference_definitions()

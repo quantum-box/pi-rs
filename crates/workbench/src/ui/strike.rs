@@ -259,6 +259,12 @@ fn repair_split_mail(tokens: &[Value], source: &str) -> Option<Vec<Value>> {
                     {
                         split_link |= cursor != range.start || end != range.end;
                     }
+                    // An unclosed dollar inside a valid local part can be
+                    // classified as pending math by Marked. The whole token
+                    // belongs to the mailbox, so restore the validated link.
+                    "latex" if cursor >= range.start && end <= range.end => {
+                        split_link = true;
+                    }
                     _ => valid = false,
                 }
             }
@@ -622,9 +628,40 @@ fn needs_inline_lexer(source: &str) -> bool {
     if source.contains("~~") {
         return true;
     }
-    source.char_indices().any(|(index, c)| {
-        matches!(c, '$' | '\\') && super::math_tokenizer::inline(&source[index..]).is_some()
-    })
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut probes = 0;
+    while index < bytes.len() {
+        if frame_expired() {
+            return false;
+        }
+        if bytes[index] == b'\\' {
+            let start = index;
+            while bytes.get(index) == Some(&b'\\') {
+                index += 1;
+            }
+            if (index - start) % 2 == 1 && matches!(bytes.get(index), Some(b'(' | b'[')) {
+                return true;
+            }
+            if (index - start) % 2 == 1 && bytes.get(index) == Some(&b'$') {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'$' {
+            // A fixed number of bounded suffix probes keeps the pre-scan
+            // linear even when many candidate delimiters have no match.
+            if probes == 8 {
+                return true;
+            }
+            probes += 1;
+            if super::math_tokenizer::inline(&source[index..]).is_some() {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 fn rewrite(
     nodes: Vec<Node>,
@@ -718,6 +755,13 @@ pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Span
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn math_probe_skips_escaped_dollars_in_linear_time() {
+        let escaped = r"\$".repeat(32_000);
+        assert!(!needs_inline_lexer(&escaped));
+        assert!(needs_inline_lexer(&(escaped + " $x^2$")));
+    }
 
     #[test]
     fn expanded_tab_offsets_remain_bounded_and_point_to_source() {

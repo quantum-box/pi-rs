@@ -1512,6 +1512,20 @@ fn markdown_at_depth(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
+    // Marked normalizes line endings before invoking the block extension. Keep
+    // all offsets local to this normalized document, including list contents.
+    if text.contains('\r') && (text.contains("$$") || text.contains("\\[")) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        return markdown_at_depth(
+            &normalized,
+            theme,
+            width,
+            depth,
+            mermaid,
+            hyperlinks,
+            preserve_source,
+        );
+    }
     let blocks = super::math_blocks::top_level(text);
     if blocks.is_empty()
         || blocks.len() > 64
@@ -1803,9 +1817,16 @@ fn markdown_plain_at_depth(
                 if let Some((url, label, raw_label)) = links.pop() {
                     let label = raw_label.as_deref().unwrap_or(&label);
                     let comparable_url = url.strip_prefix("mailto:").unwrap_or(&url);
+                    let is_bare_mail = url.starts_with("mailto:")
+                        && bare_links(label).iter().any(|(range, destination)| {
+                            range.start == 0
+                                && range.end == label.len()
+                                && destination.as_deref() == Some(url.as_str())
+                        });
                     if (!hyperlinks || !safe_hyperlink(&url))
                         && label != url
                         && label != comparable_url
+                        && !is_bare_mail
                     {
                         let mut suffix = Span::themed(format!(" ({url})"), theme, "mdLinkUrl");
                         suffix.strikethrough = strikethrough > 0;
@@ -2391,6 +2412,10 @@ mod tests {
             ["Costs $5 and $10; use $x$ and $HOME/$USER."]
         );
         assert_eq!(
+            rendered("a!#$%&'*+-/=?^_`{|}~.z@example.com and $x^2$"),
+            ["a!#$%&'*+-/=?^_`{|}~.z@example.com and x²"]
+        );
+        assert_eq!(
             rendered(r"Unknown $x + \unknown{y}$ and \(x^2"),
             [r"Unknown $x + \unknown{y}$ and \(x^2"]
         );
@@ -2449,6 +2474,10 @@ mod tests {
         assert_eq!(rendered("$$x$$\n$$y$$", 80), ["x", "", "y"]);
         assert_eq!(rendered("\\[\nx^2", 80), ["\\[", "x^2"]);
         assert_eq!(rendered("$$\\unknown{x}$$", 80), ["$$\\unknown{x}$$"]);
+        for newline in ["\r\n", "\r"] {
+            let source = format!("before{newline}$${newline}x^2{newline}$${newline}after");
+            assert_eq!(rendered(&source, 80), ["before", "", "x²", "", "after"]);
+        }
     }
 
     #[test]
@@ -2485,6 +2514,10 @@ mod tests {
             ("- $$\\unknown{x}$$", vec!["- $$\\unknown{x}$$"]),
             ("- \\[\n  x^2", vec!["- \\[", "  x^2"]),
             ("> - $$\\frac{1}{2}$$", vec!["│ - 1", "│   ─", "│   2"]),
+            (
+                "- item\r\n  $$\r\n  x^2\r\n  $$\r\n  after",
+                vec!["- item", "  x²", "  after"],
+            ),
         ] {
             let actual: Vec<_> = markdown(source, &theme, 80)
                 .into_iter()
