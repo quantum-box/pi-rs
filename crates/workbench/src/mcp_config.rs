@@ -127,7 +127,21 @@ async fn configurations_with_project_scope(
     }
     // Do not observe a configuration between OAuth enablement and credential
     // persistence. Release the gate before connecting or acquiring credentials.
-    let _guard = mcp_write_guard(None, None).await?;
+    with_config_gate(mcp_write_guard(None, None), || {
+        read_configurations(args, strict)
+    })
+    .await
+}
+
+async fn with_config_gate<T>(
+    gate: impl std::future::Future<Output = Result<McpWriteGuard>>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _guard = gate.await?;
+    read()
+}
+
+fn read_configurations(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
     let mut configuration_errors = Vec::new();
     let user_path = config::agent_dir().join("mcp.json");
     let user = match config::read_object(&user_path) {
@@ -1599,6 +1613,46 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_snapshot_waits_for_final_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().join("gate.lock");
+        let config = root.path().join("mcp.json");
+        std::fs::write(&config, "intermediate").unwrap();
+        let held = mcp_write_guard_at(&gate, None, None).await.unwrap();
+        let gate_for_reader = gate.clone();
+        let config_for_reader = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut reader = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            with_config_gate(mcp_write_guard_at(&gate_for_reader, None, None), || {
+                Ok(std::fs::read_to_string(config_for_reader)?)
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut reader)
+                .await
+                .is_err()
+        );
+        std::fs::write(&config, "final").unwrap();
+        drop(held);
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, "final");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mcp_write_guard_at(&gate, None, None),
+        )
+        .await
+        .expect("snapshot retained its gate")
+        .unwrap();
     }
 
     #[test]
