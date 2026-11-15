@@ -92,6 +92,24 @@ impl From<rusqlite::Error> for Error {
 /// opening the same database coordinate through SQLite's write lock.
 pub struct Store {
     connection: Mutex<Connection>,
+    commits: tokio::sync::watch::Sender<u64>,
+}
+
+/// Coalesced commit notifications from one Store instance.
+pub struct CommitUpdates {
+    receiver: tokio::sync::watch::Receiver<u64>,
+}
+impl CommitUpdates {
+    /// Return the latest observed commit sequence and mark it observed.
+    pub fn current(&mut self) -> u64 {
+        *self.receiver.borrow_and_update()
+    }
+
+    /// Wait for a later local commit. Intermediate commits can coalesce.
+    pub async fn changed(&mut self) -> Result<u64, tokio::sync::watch::error::RecvError> {
+        self.receiver.changed().await?;
+        Ok(self.current())
+    }
 }
 impl Store {
     pub fn memory() -> Result<Self, Error> {
@@ -151,8 +169,32 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_document_commit_sequences (revision INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE);
             INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
             COMMIT;")?;
+        let sequence = conn.query_row(
+            "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let (commits, _) = tokio::sync::watch::channel(sequence);
         Ok(Self {
             connection: Mutex::new(conn),
+            commits,
+        })
+    }
+    /// Subscribe at a store sequence without racing a commit on this instance.
+    /// Writes through another connection do not generate notifications here.
+    pub fn subscribe_commits(&self) -> Result<CommitUpdates, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let sequence = conn.query_row(
+            "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let previous = *self.commits.borrow();
+        if previous != sequence {
+            self.commits.send_replace(sequence);
+        }
+        Ok(CommitUpdates {
+            receiver: self.commits.subscribe(),
         })
     }
     /// Current store-wide sequence. Zero is the migration boundary; only
@@ -1036,6 +1078,9 @@ impl Store {
             }
         }
         tx.commit()?;
+        if let Some(sequence) = sequence {
+            self.commits.send_replace(sequence as u64);
+        }
         Ok(())
     }
 }

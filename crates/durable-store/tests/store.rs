@@ -13,6 +13,55 @@ fn check(key: &[u8], expected: Expected) -> Check {
         expected,
     }
 }
+
+#[tokio::test]
+async fn commit_updates_follow_committed_batches_and_reopen() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path).unwrap();
+    let mut updates = store.subscribe_commits().unwrap();
+    let initial = updates.current();
+    store.commit(&[], &[put(b"a", b"one")]).unwrap();
+    assert_eq!(updates.changed().await.unwrap(), initial + 1);
+    assert!(store
+        .commit(&[check(b"a", Expected::Missing)], &[put(b"b", b"bad")])
+        .is_err());
+    store.commit(&[], &[]).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), updates.changed())
+            .await
+            .is_err()
+    );
+    store
+        .commit(&[], &[Mutation::Delete { key: b"a".to_vec() }])
+        .unwrap();
+    let deleted = updates.changed().await.unwrap();
+    assert_eq!(deleted, initial + 2);
+    drop(store);
+    assert!(updates.changed().await.is_err());
+    let reopened = Store::open(&path).unwrap();
+    let mut resumed = reopened.subscribe_commits().unwrap();
+    assert_eq!(resumed.current(), deleted);
+    reopened.commit(&[], &[put(b"c", b"ok")]).unwrap();
+    assert_eq!(resumed.changed().await.unwrap(), deleted + 1);
+}
+
+#[tokio::test]
+async fn commit_subscription_starts_from_current_cross_connection_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    second.commit(&[], &[put(b"other", b"value")]).unwrap();
+    let mut updates = first.subscribe_commits().unwrap();
+    assert_eq!(updates.current(), second.commit_sequence().unwrap());
+    first.commit(&[], &[put(b"local", b"value")]).unwrap();
+    assert_eq!(
+        updates.changed().await.unwrap(),
+        first.commit_sequence().unwrap()
+    );
+}
 fn exercise(store: &Store) {
     store
         .commit(

@@ -15,6 +15,14 @@ not reset the counter. Versions are positive and limited to `i64::MAX`.
 `get` after a successful commit can observe a later concurrent commit; it is
 not a receipt for the committed version.
 
+`subscribe_commits` attaches to the current store-wide commit sequence and
+delivers coalesced notifications after successful local commits containing
+mutations, including deletes. Failed or read-only batches do not notify. The
+subscription returns owned sequence values rather than lock guards; slow readers
+can skip intermediate commits. It observes only writes through that `Store`
+instance, not writes by another SQLite connection. Reattaching reads the
+current database sequence, including any intervening external writes.
+
 SQLite uses an immediate write transaction, WAL, and FULL synchronization. A
 successful return means SQLite has committed, subject to the filesystem and
 hardware honoring synchronization. A storage error during commit may leave its
