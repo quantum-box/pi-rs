@@ -181,7 +181,7 @@ impl Settings {
     pub(super) fn stored_layer(&self, base: &Path) -> Option<&Value> {
         self.resource_layers
             .iter()
-            .find(|(path, _)| path == base)
+            .find(|(path, _)| path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b))
             .map(|(_, value)| value)
     }
     fn load_from_paths(workspace: &Path, trusted: bool, user_path: &Path) -> Result<Self> {
@@ -199,7 +199,7 @@ impl Settings {
                 settings
                     .resource_layers
                     .iter()
-                    .find(|(path, _)| path == base)
+                    .find(|(path, _)| path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b))
                     .map(|(_, value)| value)
             })
         };
@@ -539,6 +539,7 @@ fn read_settings_layer(
     diagnostics: &mut Vec<String>,
 ) -> Value {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let absolute = absolute.canonicalize().unwrap_or(absolute);
     match read_object(&absolute) {
         Ok(value) => value,
         Err(error) => {
@@ -2088,6 +2089,24 @@ mod tests {
             let error = validate_settings(&invalid, path).unwrap_err().to_string();
             assert!(error.contains("settings.json/"), "{error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_settings_diagnostic_is_stable_across_workspace_aliases() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        let alias = root.path().join("alias");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        symlink(&workspace, &alias).unwrap();
+        std::fs::write(workspace.join(".pi/settings.json"), "{").unwrap();
+        let user = root.path().join("settings.json");
+        let first = Settings::load_from_paths(&alias, true, &user).unwrap();
+        let second =
+            Settings::load_from_paths_with_previous(&workspace, true, &user, Some(&first)).unwrap();
+        assert_eq!(first.diagnostics(), second.diagnostics());
+        assert!(second.stored_layer(&alias.join(".pi")).is_some());
     }
 
     #[test]
