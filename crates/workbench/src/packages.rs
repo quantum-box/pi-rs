@@ -2225,6 +2225,15 @@ mod tests {
         let url = reqwest::Url::from_file_path(&path).unwrap().to_string();
         assert!(resource_matches(&path, &root, &url, true, false));
         assert!(!selected(&path, &root, &[format!("-{url}")]));
+        let filter =
+            ResourceFilter::new(&json!({"prompts": [format!("-{url}")]}), "prompts").unwrap();
+        assert!(!filter.includes(&path, &root, true));
+        let filter = ResourceFilter::new(
+            &json!({"autoload": false, "prompts": [format!("+{url}")]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(filter.includes(&path, &root, false));
 
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             let home = PathBuf::from(home);
