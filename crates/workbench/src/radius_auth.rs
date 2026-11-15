@@ -239,6 +239,16 @@ impl Gateway {
         path: PathBuf,
         min_validity: Duration,
     ) -> Result<Option<(String, String)>> {
+        self.access_with_login_at_before_barrier(path, min_validity, || {})
+            .await
+    }
+
+    async fn access_with_login_at_before_barrier(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+        before_barrier: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<(String, String)>> {
         let value = super::config::read_auth_object(&path).await?;
         let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
@@ -258,9 +268,12 @@ impl Gateway {
             return Ok(Some(credential.access()));
         }
         let gateway = self.clone();
+        let cancellation = RefreshCancellation::new();
+        let state = cancellation.0.clone();
         tokio::task::spawn_blocking(move || {
             let _radius_guard = radius_guard;
-            let _barrier = super::process::refresh_barrier()?;
+            before_barrier();
+            let _barrier = RefreshCancellation::enter(&state)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -476,6 +489,36 @@ impl Gateway {
     }
 }
 
+// Dropping the caller cancels a queued exchange, but an admitted exchange
+// owns the refresh and its locks until the rotated credential is persisted.
+struct RefreshCancellation(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl RefreshCancellation {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+
+    fn enter(state: &std::sync::atomic::AtomicU8) -> Result<super::process::RefreshBarrier> {
+        use std::sync::atomic::Ordering;
+        let barrier =
+            super::process::refresh_barrier_cancellable(|| state.load(Ordering::SeqCst) == 2)?
+                .ok_or(Error::Cancelled)?;
+        state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::Cancelled)?;
+        Ok(barrier)
+    }
+}
+
+impl Drop for RefreshCancellation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 pub(super) fn model_endpoint(origin: &Url) -> Url {
     let path = if origin.as_str() == DEFAULT_GATEWAY {
         "/v1/messages"
@@ -660,6 +703,52 @@ mod tests {
                 .contains("refresh_token=fixture-refresh")
         );
     }
+    #[tokio::test]
+    async fn cancelled_queued_refresh_never_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let original = serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string();
+        std::fs::write(&path, &original).unwrap();
+        let barrier = super::super::process::stop_new_refreshes();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn({
+            let path = path.clone();
+            async move {
+                gateway
+                    .access_with_login_at_before_barrier(path, Duration::ZERO, || {
+                        let _ = started.send(());
+                    })
+                    .await
+            }
+        });
+        // The blocking worker has started and owns auth.json, but the barrier
+        // prevents admission until after cancellation.
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        drop(barrier);
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::auth_lock::acquire_async(&path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn rotating_refresh_holds_shared_store_lock_until_persisted() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

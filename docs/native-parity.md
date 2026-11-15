@@ -3457,6 +3457,14 @@ origin. Radius sharing refreshes expiring credentials, serializes
 concurrent refreshes and saves rotated refresh tokens. A local OAuth
 fixture exercised both login methods, a rejected callback, cancellation,
 concurrent refresh, endpoint isolation, authenticated share and logout.
+If a caller cancels while a Radius refresh is queued at the refresh barrier,
+the exchange is discarded. Once admitted, it continues through credential
+persistence even if the caller is cancelled. Admission can precede the actual
+network request; this does not provide a separate refresh broker or a bounded
+standalone-share shutdown.
+Upstream's [OAuth resolver](https://github.com/earendil-works/pi/blob/main/packages/ai/src/auth/resolve.ts)
+also rechecks and persists refreshes under the credential-store lock; its
+abortable exchange differs from this pi-rs rotation-preserving admission rule.
 
 ### Pi Messages connections
 
