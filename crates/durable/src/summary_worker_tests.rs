@@ -233,6 +233,12 @@ async fn public_idle_compaction_becomes_stale_after_a_new_write() {
         .unwrap()
         .unwrap();
     started(&model).await;
+    let activity = scheduler.worker_activity();
+    assert!(activity.snapshot().iter().any(|worker| {
+        worker.kind == crate::worker_activity::WorkerKind::Summary
+            && worker.id == id
+            && worker.phase == crate::worker_activity::WorkerPhase::Running
+    }));
     let before = scheduler.conversation(conversation).unwrap().messages;
     scheduler
         .submit_write(conversation, None, "note".into(), None)
@@ -242,6 +248,7 @@ async fn public_idle_compaction_becomes_stale_after_a_new_write() {
         scheduler.wait_independent_compaction(id).await.unwrap(),
         IndependentCompactionStatus::Stale
     );
+    assert!(!activity.snapshot().iter().any(|worker| worker.id == id));
     assert_eq!(
         scheduler.conversation(conversation).unwrap().messages,
         before

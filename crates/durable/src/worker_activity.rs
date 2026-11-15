@@ -10,6 +10,8 @@ use uuid::Uuid;
 pub enum WorkerKind {
     Task,
     Conversation,
+    /// An independent compaction worker, identified by its operation ID.
+    Summary,
 }
 /// Whether an executor is driving work or is parked between polls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

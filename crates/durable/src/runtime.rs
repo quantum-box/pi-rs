@@ -13591,7 +13591,12 @@ impl Scheduler {
             .summary_provider
             .clone()
             .expect("summary recovery requires a provider identity");
+        let activity = self
+            .harness
+            .activity
+            .enter(crate::worker_activity::WorkerKind::Summary, id);
         let join = tokio::spawn(async move {
+            let _activity = activity;
             let result = async {
                 crate::summary_worker::run(
                     owner.clone(),
