@@ -52,4 +52,5 @@ pub mod tool_progress;
 pub mod tool_projection;
 pub mod tool_search;
 pub mod transcript;
+pub mod wake_delivery;
 pub mod worker_activity;

@@ -498,3 +498,5 @@ support conversation-scoped request deduplication; host `onYield` hooks may
 explicitly prepare continuations against the lifecycle model profile. Upstream
 instead asks the host to call `fitImages` before submit; other pi-rs input
 paths remain unchanged.
+
+**Standalone wake callback delivery:** [`wake_delivery`](../crates/durable/src/wake_delivery.rs) provides a Tokio-scheduled, coalescing callback lane for host-supplied `{ active, at }` values. It suppresses only successful equal deliveries, retries failures on a later publication or kick, and permits callback reentry and nonblocking shutdown. A callback already claimed by the delivery task may start or finish after shutdown; the supplied runtime must remain running. This is a delivery primitive only: it is not connected to the harness, conversation or task wake calculation, scheduler notifications, built-in timers, or upstream host reports. Integrators must publish an initial combined value and every relevant change and report callback failures themselves. See [delivery tests](../crates/durable/tests/wake_delivery.rs).
