@@ -235,10 +235,10 @@ impl CleanupGraph {
             if node == target {
                 return true;
             }
-            if seen.insert(node) {
-                if let Some(children) = self.children.get(&node) {
-                    pending.extend(children.iter().copied());
-                }
+            if seen.insert(node)
+                && let Some(children) = self.children.get(&node)
+            {
+                pending.extend(children.iter().copied());
             }
         }
         false
