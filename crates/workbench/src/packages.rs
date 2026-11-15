@@ -690,6 +690,82 @@ fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool
     }
     included
 }
+
+// Match Node's os.homedir(): the platform-specific environment variable takes
+// precedence even when empty; otherwise query the current account.
+fn filter_home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        if let Some(home) = std::env::var_os("HOME") {
+            return Some(home.into());
+        }
+        let mut size = 1024;
+        loop {
+            let mut buffer = vec![0u8; size];
+            let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+            // getpwuid_r owns no returned memory: pw_dir points into buffer.
+            let status = unsafe {
+                libc::getpwuid_r(
+                    libc::geteuid(),
+                    entry.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if status == libc::ERANGE && size < 1024 * 1024 {
+                size *= 2;
+                continue;
+            }
+            if status != 0 || result.is_null() {
+                return None;
+            }
+            let dir = unsafe { std::ffi::CStr::from_ptr((*result).pw_dir) };
+            return Some(std::ffi::OsString::from_vec(dir.to_bytes().to_vec()).into());
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return Some(home.into());
+        }
+        // On Windows std uses GetUserProfileDirectoryW as its fallback.
+        #[allow(deprecated)]
+        std::env::home_dir()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+fn normalize_filter_home(home: &Path, suffix: &str) -> PathBuf {
+    use std::path::Component;
+    // Node's path.join does not let a later absolute component replace home.
+    let joined = if home.as_os_str().is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{}/{suffix}", home.to_string_lossy())
+    };
+    let mut result = PathBuf::new();
+    for component in Path::new(&joined).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(result.components().next_back(), Some(Component::Normal(_))) {
+                    result.pop();
+                } else if !result.has_root() {
+                    result.push("..");
+                }
+            }
+            component => result.push(component.as_os_str()),
+        }
+    }
+    result
+}
+
 pub(crate) fn resource_matches(
     path: &Path,
     root: &Path,
@@ -700,8 +776,46 @@ pub(crate) fn resource_matches(
     let path = dunce::simplified(path);
     let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
-    let pattern = pattern.replace('\\', "/");
-    let pattern = pattern.trim_start_matches("./").to_owned();
+    // Upstream removes one leading ./ or .\ from exact overrides before
+    // expanding a tilde or converting a file URL.
+    let pattern = if exact {
+        pattern
+            .strip_prefix("./")
+            .or_else(|| pattern.strip_prefix(".\\"))
+            .unwrap_or(pattern)
+    } else {
+        pattern
+    };
+    // Pi normalizes home-relative paths and file URLs before matching both
+    // ordinary patterns and exact +/- overrides.
+    let expanded = if pattern == "~"
+        || pattern.starts_with("~/")
+        || (cfg!(windows) && pattern.starts_with("~\\"))
+    {
+        filter_home_dir().map(|home| {
+            if pattern == "~" {
+                home
+            } else {
+                normalize_filter_home(&home, &pattern[2..])
+            }
+        })
+    } else if pattern.starts_with("file://") {
+        match pi_rs_file_url::to_file_path(pattern) {
+            Ok(path) => Some(path),
+            Err(_) => return false,
+        }
+    } else {
+        None
+    };
+    let pattern = expanded
+        .as_deref()
+        .map(normalize)
+        .unwrap_or_else(|| pattern.replace('\\', "/"));
+    let pattern = if exact {
+        pattern
+    } else {
+        pattern.trim_start_matches("./").to_owned()
+    };
     let mut candidates = vec![
         normalize(path),
         normalize(path.strip_prefix(root).unwrap_or(path)),
@@ -2202,6 +2316,213 @@ mod tests {
     async fn cancelling_package_command_after_parent_exit_terminates_pipe_holder() {
         check_package_process_tree(true).await;
     }
+    #[test]
+    fn resource_filters_expand_home_and_file_urls() {
+        let root = std::env::temp_dir().join("pi filter root");
+        let path = root.join("prompts").join("sample prompt.md");
+        let url = reqwest::Url::from_file_path(&path).unwrap().to_string();
+        assert!(resource_matches(&path, &root, &url, true, false));
+        assert!(!selected(&path, &root, &[format!("-{url}")]));
+        let filter =
+            ResourceFilter::new(&json!({"prompts": [format!("-{url}")]}), "prompts").unwrap();
+        assert!(!filter.includes(&path, &root, true));
+        let filter = ResourceFilter::new(
+            &json!({"autoload": false, "prompts": [format!("+{url}")]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(filter.includes(&path, &root, false));
+
+        if let Some(home) = filter_home_dir() {
+            let path = home.join("pi-filter-test").join("prompt.md");
+            assert!(resource_matches(
+                &path,
+                &root,
+                "~/pi-filter-test/prompt.md",
+                true,
+                false
+            ));
+            assert!(resource_matches(
+                &path,
+                &root,
+                "~/pi-filter-test/*.md",
+                false,
+                false
+            ));
+            assert!(!selected(
+                &path,
+                &root,
+                &["-~/pi-filter-test/prompt.md".into()]
+            ));
+        }
+    }
+
+    #[test]
+    fn resource_filter_home_paths_normalize_components() {
+        let home = filter_home_dir().expect("account home");
+        let path = normalize_filter_home(&home, "prompts/review.md");
+        let root = path.parent().unwrap();
+        for pattern in [
+            "~/prompts/../prompts/./review.md",
+            "~/prompts/../prompts/*.md",
+        ] {
+            assert!(
+                resource_matches(&path, root, pattern, false, false),
+                "{pattern}"
+            );
+        }
+        assert!(!selected(
+            &path,
+            root,
+            &["-~/prompts/../prompts/./review.md".into()]
+        ));
+        assert!(selected(
+            &path,
+            root,
+            &["!*.md".into(), "+~/prompts/../prompts/review.md".into()]
+        ));
+        assert_eq!(
+            normalize_filter_home(Path::new(""), "a/../b"),
+            PathBuf::from("b")
+        );
+    }
+
+    #[test]
+    fn exact_resource_overrides_expand_after_one_relative_prefix() {
+        let home = filter_home_dir().expect("account home");
+        let home_path = normalize_filter_home(&home, "pi-filter-test/prompt.md");
+        let root = std::env::temp_dir();
+        let url_path = root.join("pi-filter-test").join("prompt space.md");
+        let url = reqwest::Url::from_file_path(&url_path).unwrap().to_string();
+
+        for (path, pattern) in [
+            (&home_path, "~/pi-filter-test/prompt.md".to_owned()),
+            (&url_path, url),
+        ] {
+            for prefix in ["./", ".\\"] {
+                let target = format!("{prefix}{pattern}");
+                assert!(!selected(path, &root, &[format!("-{target}")]));
+                assert!(selected(
+                    path,
+                    &root,
+                    &["!*.md".into(), format!("+{target}")]
+                ));
+                let filter = ResourceFilter::new(
+                    &json!({"autoload": false, "prompts": [format!("+{target}")]}),
+                    "prompts",
+                )
+                .unwrap();
+                assert!(filter.includes(path, &root, false));
+            }
+            // Upstream removes exactly one prefix, not an arbitrary number.
+            assert!(selected(path, &root, &[format!("-././{pattern}")]));
+        }
+    }
+
+    #[test]
+    fn resource_filter_home_uses_platform_environment_and_account_fallback() {
+        const CHILD: &str = "PI_RS_FILTER_HOME_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let home = filter_home_dir().expect("account home");
+            let decoy = PathBuf::from("pi-filter-wrong-platform-home");
+            if mode == "fallback" {
+                assert_ne!(home, decoy);
+                assert!(!home.as_os_str().is_empty());
+            } else if mode == "empty" {
+                assert!(home.as_os_str().is_empty());
+            } else {
+                assert_eq!(home, PathBuf::from("pi-filter-home"));
+            }
+            let path = normalize_filter_home(&home, "prompts/review.md");
+            assert!(!selected(&path, &home, &["-~/prompts/review.md".into()]));
+            return;
+        }
+        for mode in ["fallback", "environment", "empty"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "packages::tests::resource_filter_home_uses_platform_environment_and_account_fallback", "--nocapture"])
+                .env(CHILD, mode);
+            #[cfg(unix)]
+            {
+                command.env("USERPROFILE", "pi-filter-wrong-platform-home");
+                if mode == "fallback" {
+                    command.env_remove("HOME");
+                } else {
+                    command.env(
+                        "HOME",
+                        if mode == "empty" {
+                            ""
+                        } else {
+                            "pi-filter-home"
+                        },
+                    );
+                }
+            }
+            #[cfg(windows)]
+            {
+                command.env("HOME", "pi-filter-wrong-platform-home");
+                if mode == "fallback" {
+                    command.env_remove("USERPROFILE");
+                } else {
+                    command.env(
+                        "USERPROFILE",
+                        if mode == "empty" {
+                            ""
+                        } else {
+                            "pi-filter-home"
+                        },
+                    );
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
+    #[test]
+    fn resource_filter_file_urls_validate_before_matching() {
+        let root = std::env::temp_dir();
+        let path = root.join("prompts").join("review.md");
+        let base = reqwest::Url::from_directory_path(&root).unwrap();
+        let invalid = format!("{base}prompts%2Freview.md");
+        assert!(!resource_matches(&path, &root, &invalid, true, false));
+        assert!(!resource_matches(&path, &root, &invalid, false, false));
+        assert!(selected(&path, &root, &[format!("-{invalid}")]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resource_filters_accept_windows_home_and_unicode_unc() {
+        let home = filter_home_dir().unwrap();
+        let path = normalize_filter_home(&home, r"prompts\review.md");
+        assert!(resource_matches(
+            &path,
+            &home,
+            r"~\prompts\*.md",
+            false,
+            false
+        ));
+        assert!(!selected(&path, &home, &[r"-~\prompts\review.md".into()]));
+        let unc = Path::new(r"\\☃\share\review.md");
+        let url = "file://xn--n3h/share/review.md";
+        assert!(resource_matches(
+            unc,
+            Path::new(r"\\☃\share"),
+            url,
+            true,
+            false
+        ));
+        assert!(!selected(
+            unc,
+            Path::new(r"\\☃\share"),
+            &[format!("-{url}")]
+        ));
+    }
+
     #[test]
     fn extension_manifest_applies_includes_and_exclusions_together() {
         let root = Path::new("/package");
