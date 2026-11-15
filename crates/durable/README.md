@@ -418,7 +418,7 @@ still reject foreground conversation children because they cannot drive or cance
 their workers. A blocked uncertain operation requires reconciliation, and a task
 driver must be running to drain tasks.
 
-`abort_and_wait_withdrawn` returns the queued inputs withdrawn by its abort
+As a pi-rs extension, `abort_and_wait_withdrawn` returns the queued inputs withdrawn by its abort
 commit, including each conversation, original mode and submission. The
 `abort_and_wait_with_background_withdrawn` variant crosses background boundaries.
 Queued writes are not withdrawn and may be placed during cleanup; repeated aborts
