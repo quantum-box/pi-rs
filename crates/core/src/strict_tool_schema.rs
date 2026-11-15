@@ -1,4 +1,5 @@
 //! Conversion of tool schemas to the strict subset used by model providers.
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
 /// A tool schema cannot be represented in the provider's strict subset.
@@ -7,12 +8,87 @@ use serde_json::{Value, json};
 pub struct StrictSchemaError(String);
 
 /// Whether strict tool sampling may fall back to ordinary tool calling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StrictToolPolicy {
     /// Use strict mode only when the provider and schema support it.
     Prefer,
     /// Fail rather than send an unconstrained tool.
     Require,
+}
+
+/// Provider-specific grammar alternatives for constrained tool sampling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolGrammarVariants {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_lark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_regex: Option<String>,
+}
+
+/// An optional tool constraint; `Disabled` preserves Pi's explicit `false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolConstraint {
+    Disabled,
+    JsonSchema { strict: StrictToolPolicy },
+    Grammar { variants: ToolGrammarVariants },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConstraintObject {
+    JsonSchema { strict: StrictToolPolicy },
+    Grammar { variants: ToolGrammarVariants },
+}
+
+impl Serialize for ToolConstraint {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => serializer.serialize_bool(false),
+            Self::JsonSchema { strict } => {
+                ConstraintObject::JsonSchema { strict: *strict }.serialize(serializer)
+            }
+            Self::Grammar { variants } => ConstraintObject::Grammar {
+                variants: variants.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolConstraint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if value == Value::Bool(false) {
+            return Ok(Self::Disabled);
+        }
+        let object: ConstraintObject =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(match object {
+            ConstraintObject::JsonSchema { strict } => Self::JsonSchema { strict },
+            ConstraintObject::Grammar { variants } => Self::Grammar { variants },
+        })
+    }
+}
+
+/// A tool definition and its optional sampling constraint, in Pi's wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDeclaration {
+    #[serde(flatten)]
+    pub spec: crate::ToolSpec,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_constraint"
+    )]
+    pub constrained_sampling: Option<ToolConstraint>,
+}
+
+fn deserialize_constraint<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ToolConstraint>, D::Error> {
+    ToolConstraint::deserialize(deserializer).map(Some)
 }
 
 /// Resolve a strict schema for a tool, applying its fallback policy.
@@ -244,6 +320,35 @@ fn make_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declarations_preserve_pi_constraint_shapes() {
+        for constraint in [
+            Value::Bool(false),
+            json!({"type":"json_schema","strict":"prefer"}),
+            json!({"type":"json_schema","strict":"require"}),
+            json!({"type":"grammar","variants":{"openai_lark":"start: /x/"}}),
+            json!({"type":"grammar","variants":{"openai_lark":"lark","openai_regex":"regex"}}),
+            json!({"type":"grammar","variants":{}}),
+        ] {
+            let input = json!({"name":"read","description":"read a file","parameters":{"type":"object"},"constrainedSampling":constraint});
+            let declaration: ToolDeclaration = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(declaration).unwrap(), input);
+        }
+        let input =
+            json!({"name":"read","description":"read a file","parameters":{"type":"object"}});
+        let declaration: ToolDeclaration = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(declaration).unwrap(), input);
+        assert!(serde_json::from_value::<ToolConstraint>(Value::Bool(true)).is_err());
+        for invalid in [
+            Value::Null,
+            json!({"type":"json_schema","strict":"unknown"}),
+            json!({"type":"unknown"}),
+        ] {
+            let input = json!({"name":"read","description":"read a file","parameters":{"type":"object"},"constrainedSampling":invalid});
+            assert!(serde_json::from_value::<ToolDeclaration>(input).is_err());
+        }
+    }
 
     #[test]
     fn strict_policy_falls_back_only_when_preferred() {

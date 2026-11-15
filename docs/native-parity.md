@@ -3679,9 +3679,10 @@ actual request limits, and updated configuration in a real terminal picker.
 
 ### Compatible model sampling
 
-The core exposes strict tool-schema conversion matching the current Pi schema
-subset. Tool-level constrained sampling and its provider request, fallback,
-and grammar paths are not yet wired through the native agent.
+The core exposes strict tool-schema conversion and a tool declaration type
+matching the current Pi schema subset. Tool-level constrained sampling and
+its provider request, fallback, and grammar paths are not yet wired through
+the native agent.
 
 The chat-completions and OpenAI Responses adapters apply `samplingParams` and the effective
 thinking level's `samplingParamsByThinkingLevel`. Model overrides merge

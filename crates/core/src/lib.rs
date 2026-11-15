@@ -44,7 +44,8 @@ pub use retry::*;
 pub use sdk::*;
 pub use statistics::{ContextUsage, SessionStats, TokenTotals};
 pub use strict_tool_schema::{
-    StrictSchemaError, StrictToolPolicy, resolve_strict_tool_schema, strict_tool_schema,
+    StrictSchemaError, StrictToolPolicy, ToolConstraint, ToolDeclaration, ToolGrammarVariants,
+    resolve_strict_tool_schema, strict_tool_schema,
 };
 pub use tokens::{
     ContextUsageEstimate, estimate_message_tokens, estimate_replay_tokens, estimate_request_tokens,
