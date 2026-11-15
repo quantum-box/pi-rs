@@ -1406,6 +1406,10 @@ session ID validation remain in force, and arguments after `--` remain prompt
 text. Parser regressions cover these cases; a CLI fixture verifies that only
 the last named session is created.
 
+Repeated `--tools` and `-t` selections also use the last value. Unlike Pi,
+native validates the effective tool selection at startup, so an invalid
+earlier selection overwritten by a later one is not diagnosed.
+
 ### Regular-mode redraw checkpoint
 
 Regular mode replays committed entries when visibility settings, theme colors

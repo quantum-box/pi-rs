@@ -23,6 +23,7 @@ pub(super) fn parse(
         "name",
         "use-theme",
         "system-prompt",
+        "tools",
         "exclude-tools",
         "mode",
         "tui-mode",
@@ -459,6 +460,18 @@ mod tests {
             ][..],
         ] {
             assert!(parse(args.iter().map(OsString::from)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_tool_selections_keep_the_last_value() {
+        for arguments in [
+            &["pi", "--tools", "read", "--tools", "bash"][..],
+            &["pi", "-t", "read", "--tools", "bash"][..],
+            &["pi", "--tools=read", "-t", "bash"][..],
+        ] {
+            let args = cli(arguments);
+            assert_eq!(args.tools.as_deref(), Some("bash"));
         }
     }
 
