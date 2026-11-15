@@ -201,6 +201,12 @@ impl Terminal {
             execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
             guard.colors.query_terminal_colors(&mut std::io::stdout())?;
         }
+        // Reentry disables color queries, so no DA1 will trigger the usual
+        // Xterm keyboard fallback. A later Kitty reply can still upgrade it.
+        #[cfg(unix)]
+        if guard.colors.disabled {
+            guard.keyboard_reply(false)?;
+        }
         Ok(guard)
     }
 
