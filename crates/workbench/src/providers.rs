@@ -563,6 +563,7 @@ impl Client {
         request: ModelRequest,
         defaults: &HeaderMap,
         cache_disabled: bool,
+        session_cache_key: Option<&str>,
     ) -> Result<ModelStream> {
         match self {
             Self::Ollama(client) if cache_disabled => {
@@ -581,6 +582,13 @@ impl Client {
             }
             Self::OpenAi(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
+            }
+            Self::OpenAi(client) if session_cache_key.is_some() => {
+                client
+                    .clone()
+                    .with_session_cache_key(session_cache_key.unwrap())
+                    .stream(request)
+                    .await
             }
             Self::Anthropic(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
@@ -611,6 +619,7 @@ impl Client {
                     request,
                     defaults,
                     cache_disabled,
+                    session_cache_key,
                 ))
                 .await
             }
@@ -1073,7 +1082,7 @@ impl Model for Client {
             Self::OpenAi(client) => client.stream(request).await,
             Self::Bedrock(client) => client.stream(request).await,
             Self::Deferred(_) => {
-                self.stream_with_headers(request, &HeaderMap::new(), false)
+                self.stream_with_headers(request, &HeaderMap::new(), false, None)
                     .await
             }
         }
@@ -2063,7 +2072,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), true)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), true, None)
                 .await
                 .unwrap();
             args.model = "anthropic.claude-opus-4-8".into();
@@ -2072,7 +2081,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             for (model, level) in [
@@ -2086,7 +2095,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2102,7 +2111,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2113,7 +2122,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.model_profiles = super::super::model_profiles::Profiles::parse(
@@ -2136,7 +2145,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2147,7 +2156,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                     .await
                     .unwrap();
             }
@@ -2159,7 +2168,7 @@ mod bedrock_tests {
                         .with_model_options(&args, false)
                         .unwrap();
                     let _stream = client
-                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                         .await
                         .unwrap();
                 }
@@ -2180,7 +2189,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let _stream = client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.thinking = Some("low".into());
@@ -2190,7 +2199,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let error = match client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
             {
                 Ok(_) => panic!("invalid selected budget accepted"),

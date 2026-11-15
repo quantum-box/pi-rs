@@ -66,6 +66,7 @@ pub struct OpenAiResponses {
     identity_safe_transport: bool,
     cache_retention: CacheRetention,
     explicit_cache_mode: bool,
+    session_cache_key: Option<String>,
 }
 
 impl OpenAiResponses {
@@ -146,6 +147,7 @@ impl OpenAiResponses {
             sampling: BTreeMap::new(),
             cache_retention: CacheRetention::Short,
             explicit_cache_mode: false,
+            session_cache_key: None,
         })
     }
 
@@ -158,6 +160,13 @@ impl OpenAiResponses {
     pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
         self.cache_retention = retention;
         self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Set the Pi session identity used for prompt cache affinity.
+    pub fn with_session_cache_key(mut self, session_id: &str) -> Self {
+        self.session_cache_key =
+            (!session_id.is_empty()).then(|| session_id.chars().take(64).collect());
         self
     }
 
@@ -185,6 +194,14 @@ impl OpenAiResponses {
     }
 
     fn apply_cache(&self, body: &mut Value) {
+        if self.cache_retention != CacheRetention::None {
+            if let Some(key) = &self.session_cache_key {
+                body.as_object_mut()
+                    .expect("Responses request object")
+                    .entry("prompt_cache_key")
+                    .or_insert_with(|| json!(key));
+            }
+        }
         if self.provider == "openai-chatgpt" {
             let object = body.as_object_mut().expect("Responses request object");
             object.remove("prompt_cache_retention");
@@ -512,6 +529,40 @@ impl Model for OpenAiResponses {
             }
             _ => pi_rs_core::estimate_message_tokens(message),
         }
+    }
+
+    async fn stream_in_session(
+        &self,
+        _request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone()
+            .with_session_cache_key(&session_id.to_string())
+            .stream(request)
+            .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone()
+            .with_session_cache_key(external_id)
+            .stream(request)
+            .await
+    }
+
+    async fn stream_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone().without_cache().stream(request).await
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
@@ -1380,6 +1431,37 @@ mod tests {
         let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
         plan.without_cache().apply_cache(&mut body);
         assert_eq!(body, json!({}));
+    }
+
+    #[test]
+    fn session_cache_keys_are_clamped_and_respect_explicit_keys() {
+        let model =
+            OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
+        let identity = format!("{}tail", "猫".repeat(64));
+        let mut body = json!({});
+        model
+            .clone()
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "猫".repeat(64));
+        let mut body = json!({"prompt_cache_key":"configured"});
+        model
+            .clone()
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "configured");
+        let mut body = json!({});
+        model
+            .clone()
+            .with_session_cache_key("")
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+        let mut body = json!({});
+        model
+            .with_session_cache_key(&identity)
+            .without_cache()
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]
