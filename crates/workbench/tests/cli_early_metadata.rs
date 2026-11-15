@@ -536,9 +536,10 @@ fn export_rejects_output_alias_of_selected_session() {
         std::os::unix::fs::symlink(&last, &alias).unwrap();
         alias
     };
-    let mut outputs = vec![last.clone()];
     #[cfg(unix)]
-    outputs.push(alias);
+    let outputs = vec![last.clone(), alias];
+    #[cfg(not(unix))]
+    let outputs = vec![last.clone()];
     for output in outputs {
         for help in [false, true] {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
