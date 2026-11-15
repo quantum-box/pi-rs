@@ -1393,28 +1393,40 @@ impl Scheduler {
         reason: String,
         completed: bool,
     ) -> Result<(), Error> {
+        self.finish_failed_inner_with(parent, reason, completed, || {})
+    }
+
+    fn finish_failed_inner_with(
+        &self,
+        parent: &task_store::StoredTask,
+        reason: String,
+        completed: bool,
+        mut before_commit: impl FnMut(),
+    ) -> Result<(), Error> {
         let store = self.ts();
-        let graph_version = store
-            .store()
-            .put_version()
-            .map_err(task_store::Error::from)?;
-        let records = store.list()?;
-        let live = has_live_owned(store.store(), parent.task.id(), &records)?;
-        let mut next = parent.clone();
-        if live {
-            next.task.hold_failure(reason).map_err(Error::Transition)?;
-        } else {
-            next.task.fail(reason).map_err(Error::Transition)?;
-        }
-        if completed {
-            next.task
-                .record_completed_attempt(&parent.task)
-                .map_err(Error::Transition)?;
-        }
-        let batch = store.prepare_save(&[Save::Update(&next)])?;
-        store
-            .store()
-            .commit_with_prefix_put_fence(
+        for attempt in 0..32 {
+            let graph_version = store
+                .store()
+                .put_version()
+                .map_err(task_store::Error::from)?;
+            let records = store.list()?;
+            let live = has_live_owned(store.store(), parent.task.id(), &records)?;
+            let mut next = parent.clone();
+            if live {
+                next.task
+                    .hold_failure(reason.clone())
+                    .map_err(Error::Transition)?;
+            } else {
+                next.task.fail(reason.clone()).map_err(Error::Transition)?;
+            }
+            if completed {
+                next.task
+                    .record_completed_attempt(&parent.task)
+                    .map_err(Error::Transition)?;
+            }
+            let batch = store.prepare_save(&[Save::Update(&next)])?;
+            before_commit();
+            match store.store().commit_with_prefix_put_fence(
                 &batch.checks,
                 &batch.mutations,
                 &[
@@ -1423,9 +1435,28 @@ impl Scheduler {
                     b"runtime/conversation/",
                 ],
                 graph_version,
-            )
-            .map_err(task_store::Error::from)?;
-        Ok(())
+            ) {
+                Ok(()) => return Ok(()),
+                Err(durable_store::Error::Conflict { ref key })
+                    if attempt < 31
+                        && (key == task_store::PREFIX
+                            || key == crate::ownership_edge::PREFIX
+                            || key == b"runtime/conversation/") =>
+                {
+                    if store.load(parent.task.id())?.map(|current| current.version)
+                        != Some(parent.version)
+                    {
+                        return Err(task_store::Error::Store(durable_store::Error::Conflict {
+                            key: task_store::key(parent.task.id()),
+                        })
+                        .into());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(task_store::Error::from(error).into()),
+            }
+        }
+        unreachable!("last graph conflict is returned")
     }
 
     fn cancel_failed_siblings(
@@ -2187,6 +2218,77 @@ mod tests {
             scheduler.get(root.id()).unwrap().unwrap().state(),
             &TaskState::Failed("failure".into())
         );
+    }
+
+    #[test]
+    fn failed_outcome_retries_unrelated_graph_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        let mut parent = task(1, owner.clone(), "parent", true, 3);
+        parent.start_attempt(Uuid::new_v4()).unwrap();
+        let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
+        scheduler
+            .ts()
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        let running = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        let other = task(3, owner, "other", true, 3);
+        let mut injected = false;
+        scheduler
+            .finish_failed_inner_with(&running, "failed".into(), true, || {
+                if !injected {
+                    injected = true;
+                    scheduler.ts().save(&[Save::Create(&other)]).unwrap();
+                }
+            })
+            .unwrap();
+        assert!(injected);
+        assert_eq!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            &TaskState::CompletingFailed("failed".into())
+        );
+        assert_eq!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        assert_eq!(
+            scheduler.get(other.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+    }
+
+    #[test]
+    fn failed_outcome_does_not_retry_changed_parent_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            3,
+        );
+        parent.start_attempt(Uuid::new_v4()).unwrap();
+        scheduler.ts().save(&[Save::Create(&parent)]).unwrap();
+        let running = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        let mut calls = 0;
+        let result = scheduler.finish_failed_inner_with(&running, "failed".into(), true, || {
+            calls += 1;
+            if calls == 1 {
+                scheduler
+                    .ts()
+                    .update(&running, |task| task.request_abort())
+                    .unwrap();
+            }
+        });
+        assert!(
+            matches!(result, Err(Error::Store(task_store::Error::Store(durable_store::Error::Conflict { key }))) if key == task_store::key(parent.id()))
+        );
+        assert_eq!(calls, 1);
+        let current = scheduler.get(parent.id()).unwrap().unwrap();
+        assert!(current.abort_requested());
+        assert_eq!(current.state(), &TaskState::Running);
     }
 
     #[test]
