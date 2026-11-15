@@ -703,6 +703,9 @@ mod tests {
                 .contains("refresh_token=fixture-refresh")
         );
     }
+    // The barrier is deliberately held while the asynchronous caller is cancelled;
+    // only the blocking worker waits for this synchronous guard.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cancelled_queued_refresh_never_starts() {
         let dir = tempfile::tempdir().unwrap();
