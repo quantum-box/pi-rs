@@ -3056,6 +3056,7 @@ dependencies = [
  "rquickjs",
  "rustls 0.23.46",
  "ryu-js",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",

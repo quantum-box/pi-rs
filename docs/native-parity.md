@@ -785,8 +785,17 @@ reports do not expose configured credentials through connection errors.
 Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
 `pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
-default is 300 seconds. Once credential persistence starts, it is allowed to
-finish even if the deadline passes, so its outcome can be reported reliably.
+default is 300 seconds. Lock acquisition is included in that deadline. Once
+finalization starts, its configuration update and credential persistence are
+allowed to finish even if the deadline passes.
+Login selects the effective trusted-project server by default; `--local` requires
+a project definition, not a partial override. After authorization, pi-rs checks
+both configurations before saving credentials and updates the layer that supplies
+`oauth` when needed. Its MCP configuration writers share a user-directory gate;
+external editors and older versions do not honor that gate. A project lock file is
+needed only when the project configuration must be updated. Configuration and
+credentials are separate files: if credential persistence fails after a config
+update, the config update remains.
 
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project

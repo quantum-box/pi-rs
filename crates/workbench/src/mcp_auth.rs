@@ -625,6 +625,35 @@ where
     C: FnOnce(FileCredentials, StoredCredentials) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    deadline_login_with_precommit(
+        deadline,
+        staged,
+        cancellation,
+        prepare,
+        |_| async { Ok(()) },
+        |store, credentials, ()| commit(store, credentials),
+    )
+    .await
+}
+
+// Wait for all cancellable preparation, including a caller's configuration
+// lock, before entering the non-interruptible commit section. The returned
+// guard stays alive until the credential write has completed.
+async fn deadline_login_with_precommit<F, P, PFut, G, C, Fut>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+    precommit: P,
+    commit: C,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    P: FnOnce(PathBuf) -> PFut,
+    PFut: std::future::Future<Output = Result<G>>,
+    C: FnOnce(FileCredentials, StoredCredentials, G) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     // Acquiring the lock is preparation too: expiry must never leave a queued
     // writer that can replace credentials later.
     let ready = async {
@@ -641,7 +670,8 @@ where
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
-        Ok::<_, Error>((store, credentials, guard))
+        let config_guard = precommit(store.path.with_extension("lock")).await?;
+        Ok::<_, Error>((store, credentials, guard, config_guard))
     };
     let ready = tokio::select! {
         biased;
@@ -650,9 +680,11 @@ where
             result.map_err(|_| Error::Config("MCP login timed out".into())).and_then(|result| result),
     };
     let result = match ready {
-        Ok((store, credentials, _guard)) if tokio::time::Instant::now() < deadline => {
+        Ok((store, credentials, _guard, config_guard))
+            if tokio::time::Instant::now() < deadline =>
+        {
             // The blocking write retains the lease even if the caller is dropped.
-            commit(store, credentials).await
+            commit(store, credentials, config_guard).await
         }
         Ok(_) => Err(Error::Config("MCP login timed out".into())),
         Err(error) => Err(error),
@@ -996,6 +1028,126 @@ pub async fn login_configured_with_http_options_and_deadline(
             announce,
             Some(staged.clone()),
         ),
+    )
+    .await
+}
+
+/// Client selection for a CLI login that validates configuration before saving.
+pub enum CliLoginClient<'a> {
+    Secret {
+        client_id: Option<&'a str>,
+        client_secret: Option<&'a str>,
+    },
+    Metadata(&'a str),
+    Configured(Option<&'a OAuthClientSettings>),
+}
+
+async fn commit_login_transaction<G, C>(
+    store: FileCredentials,
+    credentials: StoredCredentials,
+    guard: G,
+    update_config: C,
+) -> Result<()>
+where
+    G: Send + 'static,
+    C: FnOnce(&G) -> Result<()> + Send + 'static,
+{
+    let lease = store
+        .lease
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .upgrade();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        update_config(&guard)?;
+        let result = store.write(credentials).map_err(auth_error);
+        drop(guard);
+        result
+    })
+    .await
+    .map_err(|_| Error::Config("MCP login finalization failed".into()))?
+}
+
+/// Prepare OAuth credentials, acquire the caller's guard within the deadline,
+/// then validate/update its configuration and save credentials under that guard.
+#[allow(clippy::too_many_arguments)]
+pub async fn login_cli_with_precommit<G, P, PFut, C>(
+    name: &str,
+    url: &str,
+    client: CliLoginClient<'_>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+    precommit: P,
+    update_config: C,
+) -> Result<()>
+where
+    G: Send + 'static,
+    P: FnOnce(PathBuf) -> PFut,
+    PFut: std::future::Future<Output = Result<G>>,
+    C: FnOnce(&G) -> Result<()> + Send + 'static,
+{
+    let staged = Staging::default();
+    let prepare = async {
+        match client {
+            CliLoginClient::Secret {
+                client_id,
+                client_secret,
+            } => authorize(
+                name,
+                url,
+                Registration::New(ClientOptions {
+                    client_id,
+                    client_secret,
+                    ..ClientOptions::default()
+                }),
+                scopes,
+                options,
+                announce,
+                Some(staged.clone()),
+            )
+            .await
+            .map(|_| ()),
+            CliLoginClient::Metadata(metadata_url) => authorize(
+                name,
+                url,
+                Registration::New(ClientOptions {
+                    metadata_url: Some(metadata_url),
+                    ..ClientOptions::default()
+                }),
+                scopes,
+                options,
+                announce,
+                Some(staged.clone()),
+            )
+            .await
+            .map(|_| ()),
+            CliLoginClient::Configured(settings) => {
+                login_configured_inner(
+                    name,
+                    url,
+                    settings,
+                    None,
+                    scopes,
+                    options,
+                    announce,
+                    Some(staged.clone()),
+                )
+                .await
+            }
+        }
+    };
+    deadline_login_with_precommit(
+        deadline,
+        staged.clone(),
+        cancellation,
+        prepare,
+        precommit,
+        |store, credentials, guard| {
+            commit_login_transaction(store, credentials, guard, update_config)
+        },
     )
     .await
 }
@@ -1658,6 +1810,112 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn precommit_failure_and_timeout_preserve_credentials() {
+        for timeout in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials.json");
+            std::fs::write(&path, "old").unwrap();
+            let (store, staged) = staged_fixture(path.clone());
+            let result = deadline_login_with_precommit(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async { stage_fixture(&store).await },
+                |_| async {
+                    if timeout {
+                        std::future::pending::<()>().await;
+                    }
+                    Err::<(), _>(Error::Config("configuration changed".into()))
+                },
+                |store, credentials, ()| async move {
+                    store.save(credentials).await.map_err(auth_error)
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_caller_keeps_configuration_guard_during_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let gate_path = dir.path().join("gate.lock");
+        let gate = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&gate_path)
+            .unwrap();
+        gate.lock().unwrap();
+        let competitor = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate_path)
+            .unwrap();
+        let (store, _) = staged_fixture(path.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(commit_login_transaction(
+            store.store,
+            fixture_credentials(),
+            gate,
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+        ));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(matches!(
+            competitor.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if competitor.try_lock().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn config_error_preserves_credentials_and_store_error_keeps_config_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, _) = staged_fixture(path.clone());
+        let result = commit_login_transaction(store.store, fixture_credentials(), (), |_| {
+            Err(Error::Config("configuration changed".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+
+        let not_directory = dir.path().join("not-directory");
+        std::fs::write(&not_directory, "file").unwrap();
+        let (store, _) = staged_fixture(not_directory.join("credentials.json"));
+        let config_path = dir.path().join("config.json");
+        let updated_path = config_path.clone();
+        let result = commit_login_transaction(store.store, fixture_credentials(), (), move |_| {
+            std::fs::write(updated_path, "updated")?;
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), "updated");
     }
 
     #[tokio::test]

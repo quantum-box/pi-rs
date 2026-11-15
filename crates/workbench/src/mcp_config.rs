@@ -333,6 +333,206 @@ fn merge_project_servers(
     Ok(())
 }
 
+#[derive(Clone)]
+struct LoginSnapshot {
+    server: ServerConfig,
+    project_definition: bool,
+    project_oauth_override: bool,
+}
+
+fn login_snapshot(
+    user: &Value,
+    project: Option<&Value>,
+    name: &str,
+    local: bool,
+) -> Result<LoginSnapshot> {
+    let mut servers = user
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut project_definition = false;
+    let mut project_oauth_override = false;
+    if let Some(entries) = project
+        .and_then(|value| value.get("mcpServers"))
+        .and_then(Value::as_object)
+    {
+        if let Some(entry) = entries.get(name) {
+            project_definition = ["command", "url", "type"]
+                .iter()
+                .any(|key| entry.get(*key).is_some());
+            project_oauth_override = !project_definition && entry.get("oauth").is_some();
+        }
+        merge_project_servers(&mut servers, entries)?;
+    }
+    if local && !project_definition {
+        return Err(Error::Config(format!(
+            "MCP server {name} is not configured in the trusted project"
+        )));
+    }
+    let value = servers
+        .get(name)
+        .ok_or_else(|| Error::Config("MCP server is not configured".into()))?;
+    Ok(LoginSnapshot {
+        server: serde_json::from_value(value.clone())?,
+        project_definition,
+        project_oauth_override,
+    })
+}
+
+fn same_login_auth(before: &LoginSnapshot, after: &LoginSnapshot) -> bool {
+    let a = &before.server;
+    let b = &after.server;
+    let auth_header = |server: &ServerConfig| {
+        server
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    before.project_definition == after.project_definition
+        && before.project_oauth_override == after.project_oauth_override
+        && a.url == b.url
+        && a.command == b.command
+        && a.transport == b.transport
+        && a.oauth == b.oauth
+        && a.auth == b.auth
+        && auth_header(a) == auth_header(b)
+}
+
+fn login_needs_enable(server: &ServerConfig) -> bool {
+    matches!(
+        server.oauth,
+        None | Some(pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(false))
+    )
+}
+
+struct McpWriteGuard {
+    _gate: std::fs::File,
+    _target: Option<std::fs::File>,
+}
+
+fn open_mcp_lock(path: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?)
+}
+
+async fn lock_mcp_file(file: &std::fs::File) -> Result<()> {
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+}
+
+async fn mcp_write_guard(
+    target: Option<&std::path::Path>,
+    credential_lock: Option<&std::path::Path>,
+) -> Result<McpWriteGuard> {
+    mcp_write_guard_at(
+        &config::agent_dir().join("mcp-config-gate.lock"),
+        target,
+        credential_lock,
+    )
+    .await
+}
+
+async fn mcp_write_guard_at(
+    gate_path: &std::path::Path,
+    target: Option<&std::path::Path>,
+    credential_lock: Option<&std::path::Path>,
+) -> Result<McpWriteGuard> {
+    let gate = open_mcp_lock(gate_path)?;
+    let gate_id = same_file::Handle::from_file(gate.try_clone()?)?;
+    let credential_id = credential_lock
+        .map(same_file::Handle::from_path)
+        .transpose()?;
+    if credential_id.as_ref() == Some(&gate_id) {
+        return Err(Error::Config(
+            "MCP configuration and credential locks refer to the same file".into(),
+        ));
+    }
+    lock_mcp_file(&gate).await?;
+    let target = if let Some(target) = target {
+        let lock = open_mcp_lock(&target.with_extension("lock"))?;
+        let target_id = same_file::Handle::from_file(lock.try_clone()?)?;
+        if gate_id == target_id || credential_id.as_ref() == Some(&target_id) {
+            return Err(Error::Config(
+                "MCP configuration locks refer to the same file".into(),
+            ));
+        }
+        lock_mcp_file(&lock).await?;
+        Some(lock)
+    } else {
+        None
+    };
+    Ok(McpWriteGuard {
+        _gate: gate,
+        _target: target,
+    })
+}
+
+async fn update_mcp_object(
+    path: &std::path::Path,
+    update: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    let _guard = mcp_write_guard(Some(path), None).await?;
+    let mut document = config::read_object(path)?;
+    update(document.as_object_mut().expect("config is an object"))?;
+    config::write_json(path, &document)
+}
+
+fn finish_login(
+    user_path: &std::path::Path,
+    project_path: Option<&std::path::Path>,
+    name: &str,
+    local: bool,
+    before: &LoginSnapshot,
+) -> Result<()> {
+    let mut user = config::read_object(user_path)?;
+    let mut project = project_path.map(config::read_object).transpose()?;
+    let after = login_snapshot(&user, project.as_ref(), name, local).map_err(|_| {
+        Error::Config("MCP authentication configuration changed during login".into())
+    })?;
+    if !same_login_auth(before, &after) {
+        return Err(Error::Config(
+            "MCP authentication configuration changed during login".into(),
+        ));
+    }
+    let target_project = after.project_definition || after.project_oauth_override;
+    if login_needs_enable(&after.server) {
+        let target = if target_project {
+            project.as_mut().expect("trusted project")
+        } else {
+            &mut user
+        };
+        let entry = target
+            .get_mut("mcpServers")
+            .and_then(|servers| servers.get_mut(name))
+            .ok_or_else(|| Error::Config("MCP configuration changed during login".into()))?;
+        entry["oauth"] = json!(true);
+        config::write_json(
+            if target_project {
+                project_path.expect("trusted project")
+            } else {
+                user_path
+            },
+            target,
+        )?;
+    }
+    Ok(())
+}
+
 fn valid_override_value(key: &str, value: &Value) -> bool {
     match key {
         "enabled" => value.is_boolean(),
@@ -910,7 +1110,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 value["env"] = Value::Object(env);
             }
             let path = path(args, local);
-            config::update_object(&path, |document| {
+            update_mcp_object(&path, |document| {
                 let entries = document
                     .entry("mcpServers")
                     .or_insert_with(|| json!({}))
@@ -918,7 +1118,8 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     .ok_or_else(|| Error::Config("mcpServers must be an object".into()))?;
                 entries.insert(name.clone(), value);
                 Ok(())
-            })?;
+            })
+            .await?;
             output(json!({"type":"mcp_saved","name":name,"path":path}));
         }
         McpCommand::Login {
@@ -939,11 +1140,14 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             let deadline = tokio::time::Instant::now()
                 .checked_add(timeout)
                 .ok_or_else(|| Error::Config("--timeout is too large".into()))?;
-            let path = path(args, local);
-            let document = config::read_object(&path)?;
-            let value = document.get("mcpServers").and_then(|servers| servers.get(&name))
-                .ok_or_else(|| Error::Config("MCP server is not configured in this scope; use --local for a project server".into()))?;
-            let server: ServerConfig = serde_json::from_value(value.clone())?;
+            let user = config::read_object(&path(args, false))?;
+            let project = if args.trusted {
+                Some(config::read_object(&path(args, true))?)
+            } else {
+                None
+            };
+            let snapshot = login_snapshot(&user, project.as_ref(), &name, local)?;
+            let server = &snapshot.server;
             if let Some(auth) = &server.auth {
                 return Err(Error::Config(format!(
                     "MCP {name} uses credentials from provider {}; sign in to that provider",
@@ -973,73 +1177,59 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 .transpose()?;
             let announce =
                 |url: &str| output(json!({"type":"mcp_authorization","name":name,"url":url}));
-            let server_oauth = server.oauth.clone();
             let http_options = super::http_proxy::configured_mcp(&args.settings)?;
-            if let Some(metadata_url) = client_metadata_url {
-                pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options_and_deadline(
-                    &name,
-                    url,
-                    &metadata_url,
-                    &scopes,
-                    Some(&http_options),
-                    deadline,
-                    &args.mcp_login_cancel,
-                    announce,
-                )
-                .await?;
+            use pi_rs_workbench::mcp_auth::{CliLoginClient, login_cli_with_precommit};
+            let client = if let Some(metadata_url) = client_metadata_url.as_deref() {
+                CliLoginClient::Metadata(metadata_url)
             } else if client_id.is_none() && server.oauth_client().is_some() {
-                pi_rs_workbench::mcp_auth::login_configured_with_http_options_and_deadline(
-                    &name,
-                    url,
-                    server.oauth_client(),
-                    None,
-                    &scopes,
-                    Some(&http_options),
-                    deadline,
-                    &args.mcp_login_cancel,
-                    announce,
-                )
-                .await?;
+                CliLoginClient::Configured(server.oauth_client())
             } else {
-                pi_rs_workbench::mcp_auth::login_with_secret_with_http_options_and_deadline(
-                    &name,
-                    url,
-                    client_id.as_deref(),
-                    client_secret.as_deref(),
-                    &scopes,
-                    Some(&http_options),
-                    deadline,
-                    &args.mcp_login_cancel,
-                    announce,
+                CliLoginClient::Secret {
+                    client_id: client_id.as_deref(),
+                    client_secret: client_secret.as_deref(),
+                }
+            };
+            let user_path = path(args, false);
+            let project_path = path(args, true);
+            let target = if login_needs_enable(server) {
+                Some(
+                    if snapshot.project_definition || snapshot.project_oauth_override {
+                        project_path.as_path()
+                    } else {
+                        user_path.as_path()
+                    },
                 )
-                .await?;
-            }
-            config::update_object(&path, |document| {
-                let server = document
-                    .get_mut("mcpServers")
-                    .and_then(|servers| servers.get_mut(&name))
-                    .ok_or_else(|| {
-                        Error::Config("MCP configuration changed during login".into())
-                    })?;
-                let current: ServerConfig = serde_json::from_value(server.clone())?;
-                if current.url.as_deref() != Some(url)
-                    || current.oauth != server_oauth
-                    || current.auth.is_some()
-                    || current.command.is_some()
-                    || current
-                        .headers
-                        .keys()
-                        .any(|name| name.eq_ignore_ascii_case("authorization"))
-                {
-                    return Err(Error::Config(
-                        "MCP authentication configuration changed during login".into(),
-                    ));
-                }
-                if current.oauth_client().is_none() {
-                    server["oauth"] = json!(true);
-                }
-                Ok(())
-            })?;
+            } else {
+                None
+            };
+            let guard_target = target.map(std::path::Path::to_path_buf);
+            let finish_user_path = user_path.clone();
+            let finish_project_path = args.trusted.then_some(project_path.clone());
+            let finish_name = name.clone();
+            let finish_snapshot = snapshot.clone();
+            login_cli_with_precommit(
+                &name,
+                url,
+                client,
+                &scopes,
+                Some(&http_options),
+                deadline,
+                &args.mcp_login_cancel,
+                announce,
+                move |credential_lock| async move {
+                    mcp_write_guard(guard_target.as_deref(), Some(&credential_lock)).await
+                },
+                move |_| {
+                    finish_login(
+                        &finish_user_path,
+                        finish_project_path.as_deref(),
+                        &finish_name,
+                        local,
+                        &finish_snapshot,
+                    )
+                },
+            )
+            .await?;
             output(json!({"type":"mcp_logged_in","name":name}));
         }
         McpCommand::Logout { name, local } => {
@@ -1121,7 +1311,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
         }
         McpCommand::Remove { name, local } => {
             let path = path(args, local);
-            config::update_object(&path, |document| {
+            update_mcp_object(&path, |document| {
                 document
                     .get_mut("mcpServers")
                     .and_then(Value::as_object_mut)
@@ -1130,7 +1320,8 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                         Error::Config("MCP server not found in this configuration".into())
                     })?;
                 Ok(())
-            })?;
+            })
+            .await?;
             output(json!({"type":"mcp_removed","name":name,"path":path}));
         }
     }
@@ -1147,6 +1338,188 @@ fn path(args: &Cli, local: bool) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_resolution_uses_trusted_definition_and_oauth_override() {
+        let user = json!({"mcpServers":{"service":{"url":"https://global.example/mcp"}}});
+        let project = json!({"mcpServers":{"service":{"url":"https://project.example/mcp"}}});
+        let snapshot = login_snapshot(&user, Some(&project), "service", false).unwrap();
+        assert!(snapshot.project_definition);
+        assert_eq!(
+            snapshot.server.url.as_deref(),
+            Some("https://project.example/mcp")
+        );
+        assert!(login_snapshot(&user, Some(&project), "service", true).is_ok());
+        assert!(login_snapshot(&user, None, "service", true).is_err());
+        let partial = json!({"mcpServers":{"service":{"oauth":false}}});
+        let snapshot = login_snapshot(&user, Some(&partial), "service", false).unwrap();
+        assert!(!snapshot.project_definition);
+        assert!(snapshot.project_oauth_override);
+        assert!(login_snapshot(&user, Some(&partial), "service", true).is_err());
+        assert!(matches!(
+            snapshot.server.oauth,
+            Some(pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(false))
+        ));
+    }
+
+    #[test]
+    fn login_finish_updates_override_without_losing_unrelated_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let user_path = root.path().join("user/mcp.json");
+        let project_path = root.path().join("project/mcp.json");
+        let mut user = json!({"mcpServers":{"service":{"url":"https://global.example/mcp"}}});
+        let mut project = json!({"mcpServers":{"service":{"oauth":false}}});
+        let before = login_snapshot(&user, Some(&project), "service", false).unwrap();
+        user["other"] = json!("keep user edit");
+        project["other"] = json!("keep project edit");
+        config::write_json(&user_path, &user).unwrap();
+        config::write_json(&project_path, &project).unwrap();
+        finish_login(&user_path, Some(&project_path), "service", false, &before).unwrap();
+        let actual_user = config::read_object(&user_path).unwrap();
+        let actual_project = config::read_object(&project_path).unwrap();
+        assert_eq!(actual_user, user);
+        assert_eq!(actual_project["other"], "keep project edit");
+        assert_eq!(actual_project["mcpServers"]["service"]["oauth"], true);
+    }
+
+    #[test]
+    fn login_finish_preserves_project_oauth_client_object() {
+        let root = tempfile::tempdir().unwrap();
+        let user_path = root.path().join("user/mcp.json");
+        let project_path = root.path().join("project/mcp.json");
+        let user = json!({"mcpServers":{"service":{"url":"https://global.example/mcp"}}});
+        let project = json!({"mcpServers":{"service":{"oauth":{"clientId":"fixture"}}}});
+        let before = login_snapshot(&user, Some(&project), "service", false).unwrap();
+        config::write_json(&user_path, &user).unwrap();
+        config::write_json(&project_path, &project).unwrap();
+        finish_login(&user_path, Some(&project_path), "service", false, &before).unwrap();
+        assert_eq!(config::read_object(&user_path).unwrap(), user);
+        assert_eq!(config::read_object(&project_path).unwrap(), project);
+    }
+
+    #[tokio::test]
+    async fn login_finish_detects_changes_while_waiting_for_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let user_path = root.path().join("a/mcp.json");
+        let project_path = root.path().join("z/mcp.json");
+        let user = json!({"mcpServers":{"service":{"url":"https://global.example/mcp"}}});
+        let mut project = json!({"mcpServers":{}});
+        let before = login_snapshot(&user, Some(&project), "service", false).unwrap();
+        config::write_json(&user_path, &user).unwrap();
+        config::write_json(&project_path, &project).unwrap();
+        let gate = root.path().join("gate.lock");
+        let held = mcp_write_guard_at(&gate, None, None).await.unwrap();
+        project["mcpServers"]["service"] = json!({"oauth":false});
+        config::write_json(&project_path, &project).unwrap();
+        drop(held);
+        let _guard = mcp_write_guard_at(&gate, Some(&user_path), None)
+            .await
+            .unwrap();
+        assert!(finish_login(&user_path, Some(&project_path), "service", false, &before).is_err());
+        assert_eq!(config::read_object(&user_path).unwrap(), user);
+        assert_eq!(config::read_object(&project_path).unwrap(), project);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_gate_rejects_hardlinked_target_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().join("gate.lock");
+        let target = root.path().join("mcp.json");
+        std::fs::write(&gate, "").unwrap();
+        std::fs::hard_link(&gate, target.with_extension("lock")).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mcp_write_guard_at(&gate, Some(&target), None),
+        )
+        .await;
+        assert!(result.expect("lock acquisition hung").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_gate_rejects_aliases_of_credential_lock() {
+        for alias_gate in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let credential = root.path().join("credential.lock");
+            let gate = root.path().join("gate.lock");
+            let target = root.path().join("mcp.json");
+            std::fs::write(&credential, "").unwrap();
+            std::fs::hard_link(
+                &credential,
+                if alias_gate {
+                    gate.clone()
+                } else {
+                    target.with_extension("lock")
+                },
+            )
+            .unwrap();
+            let held = open_mcp_lock(&credential).unwrap();
+            held.lock().unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                mcp_write_guard_at(&gate, Some(&target), Some(&credential)),
+            )
+            .await;
+            assert!(result.expect("lock acquisition hung").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_gate_wait_can_be_cancelled_without_project_write() {
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().join("gate.lock");
+        let project = root.path().join("project/mcp.json");
+        let held = mcp_write_guard_at(&gate, None, None).await.unwrap();
+        assert!(!project.parent().unwrap().exists());
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            mcp_write_guard_at(&gate, Some(&project), None),
+        )
+        .await;
+        assert!(waiting.is_err());
+        assert!(!project.parent().unwrap().exists());
+        drop(held);
+        assert!(
+            mcp_write_guard_at(&gate, Some(&project), None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn login_finish_refuses_authentication_or_scope_changes() {
+        for change in ["url", "oauth", "authorization", "definition"] {
+            let root = tempfile::tempdir().unwrap();
+            let user_path = root.path().join("user/mcp.json");
+            let project_path = root.path().join("project/mcp.json");
+            let mut user = json!({"mcpServers":{"service":{"url":"https://global.example/mcp"}}});
+            let mut project = json!({"mcpServers":{}});
+            let before = login_snapshot(&user, Some(&project), "service", false).unwrap();
+            match change {
+                "url" => {
+                    user["mcpServers"]["service"]["url"] = json!("https://changed.example/mcp")
+                }
+                "oauth" => project["mcpServers"]["service"] = json!({"oauth":false}),
+                "authorization" => {
+                    user["mcpServers"]["service"]["headers"] =
+                        json!({"Authorization":"Bearer changed"})
+                }
+                "definition" => {
+                    project["mcpServers"]["service"] = json!({"url":"https://project.example/mcp"})
+                }
+                _ => unreachable!(),
+            }
+            config::write_json(&user_path, &user).unwrap();
+            config::write_json(&project_path, &project).unwrap();
+            assert!(
+                finish_login(&user_path, Some(&project_path), "service", false, &before).is_err(),
+                "{change}"
+            );
+            assert_eq!(config::read_object(&user_path).unwrap(), user);
+            assert_eq!(config::read_object(&project_path).unwrap(), project);
+        }
+    }
 
     #[test]
     fn project_override_rejects_unknown_fields_before_changing_global_server() {

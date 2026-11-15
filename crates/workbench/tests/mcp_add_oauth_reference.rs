@@ -14,6 +14,20 @@ const REFERENCE: &str = "${PI_RS_OAUTH_REFERENCE_TEST_SECRET}";
 
 #[tokio::test]
 async fn add_reference_is_resolved_only_for_oauth_token_exchange() {
+    run_reference_login(false, false).await;
+}
+
+#[tokio::test]
+async fn trusted_project_login_uses_its_configured_oauth_client() {
+    run_reference_login(true, false).await;
+}
+
+#[tokio::test]
+async fn changed_project_authentication_does_not_replace_existing_credentials() {
+    run_reference_login(true, true).await;
+}
+
+async fn run_reference_login(project_scope: bool, change_during_login: bool) {
     let root = tempfile::tempdir().unwrap();
     let browser_dir = root.path().join("bin");
     std::fs::create_dir(&browser_dir).unwrap();
@@ -144,14 +158,37 @@ async fn add_reference_is_resolved_only_for_oauth_token_exchange() {
         "add failed: {}",
         String::from_utf8_lossy(&added.stderr).replace(SECRET, "[redacted]")
     );
-    let config_path = root.path().join("mcp.json");
+    let global_path = root.path().join("mcp.json");
+    let config_path = if project_scope {
+        let project_dir = root.path().join(".pi");
+        std::fs::create_dir(&project_dir).unwrap();
+        let project_path = project_dir.join("mcp.json");
+        std::fs::copy(&global_path, &project_path).unwrap();
+        std::fs::write(&global_path, json!({"mcpServers":{"fixture":{"url":"https://global.example/mcp","auth":{"provider":"fixture"}}}}).to_string()).unwrap();
+        project_path
+    } else {
+        global_path
+    };
     let before = std::fs::read(&config_path).unwrap();
     let config: Value = serde_json::from_slice(&before).unwrap();
     assert_eq!(
         config["mcpServers"]["fixture"]["oauth"]["clientSecret"],
         REFERENCE
     );
+    let credential_path = if change_during_login {
+        use sha2::{Digest, Sha256};
+        let digest =
+            Sha256::digest(serde_json::to_vec(&("fixture", format!("{base}/mcp"))).unwrap());
+        let directory = root.path().join("mcp-auth");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{digest:x}.json"));
+        std::fs::write(&path, "old credentials").unwrap();
+        Some(path)
+    } else {
+        None
+    };
     let callback_browser_url = browser_url.clone();
+    let callback_config_path = config_path.clone();
     let browser_task = tokio::spawn(async move {
         let url = loop {
             if let Ok(url) = tokio::fs::read_to_string(&callback_browser_url).await
@@ -181,25 +218,39 @@ async fn add_reference_is_resolved_only_for_oauth_token_exchange() {
             .query_pairs_mut()
             .append_pair("code", "fixture-code")
             .append_pair("state", &state);
+        if change_during_login {
+            let mut config: Value =
+                serde_json::from_slice(&std::fs::read(&callback_config_path).unwrap()).unwrap();
+            config["mcpServers"]["fixture"]["url"] = json!("https://changed.example/mcp");
+            std::fs::write(&callback_config_path, config.to_string()).unwrap();
+        }
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = timeout_at(deadline, client.get(callback).send())
             .await
             .expect("callback deadline")
             .unwrap();
-        assert!(response.status().is_success());
+        assert_eq!(response.status().is_success(), !change_during_login);
     });
-    let login = timeout_at(
-        deadline,
-        make_command().args(["mcp", "login", "fixture"]).output(),
-    )
-    .await
-    .expect("login deadline")
-    .unwrap();
-    assert!(
+    let mut command = make_command();
+    if project_scope {
+        command.arg("--trust");
+    }
+    let login = timeout_at(deadline, command.args(["mcp", "login", "fixture"]).output())
+        .await
+        .expect("login deadline")
+        .unwrap();
+    assert_eq!(
         login.status.success(),
-        "login failed: {}",
+        !change_during_login,
+        "unexpected login result: {}",
         String::from_utf8_lossy(&login.stderr).replace(SECRET, "[redacted]")
     );
+    if let Some(path) = credential_path {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old credentials");
+    }
+    if project_scope {
+        assert!(!config_path.with_extension("lock").exists());
+    }
     timeout_at(deadline, browser_task).await.unwrap().unwrap();
     let token_body = timeout_at(deadline, server).await.unwrap().unwrap();
     let form = reqwest::Url::parse(&format!(
