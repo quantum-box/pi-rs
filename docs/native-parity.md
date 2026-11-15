@@ -692,6 +692,17 @@ cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
 
 ### Resources checkpoint
 
+Native SDK hosts can explicitly load skill metadata snapshots from granted files
+and format the visible skills with Pi's reader hint and XML escaping. Relative
+paths require an explicit absolute base; parent components and non-UTF-8 paths
+are rejected so rendering cannot change the file selected by the host. Hidden
+model-invocation skills remain in the snapshot for explicit use. Reads follow
+symlinks and do not grant later file access; no directories, packages or settings
+are discovered implicitly. Each file is capped at 256 KiB. Read, parse and
+duplicate-name errors fail the entire
+load, unlike Pi's per-file warnings and continuation. Hosts own skill invocation
+and must authorize each later file read independently.
+
 Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
 files or direct children of explicitly granted directories. No directories,
 settings, or packages are discovered implicitly. Directory scans are bounded,
