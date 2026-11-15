@@ -1870,6 +1870,68 @@ mod tests {
         assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
     }
 
+    #[tokio::test]
+    async fn final_tool_arguments_can_arrive_on_item_or_completion() {
+        use std::io::{Read, Write};
+        for item_done in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let _ = socket.read(&mut [0; 8192]).unwrap();
+                let final_arguments = r#"{"path":"hello"}"#;
+                let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments});
+                let mut events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":"}}),
+                ];
+                if item_done {
+                    events.push(
+                        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    );
+                }
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[item]}}));
+                let events = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            let mut stream = model.stream(request()).await.unwrap();
+            let mut emitted = String::new();
+            let mut completed = None;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::ToolCallDelta(delta) => emitted.push_str(&delta.arguments),
+                    ModelEvent::Complete { calls, .. } => completed = Some(calls),
+                    _ => {}
+                }
+            }
+            assert_eq!(emitted, r#"{"path":"hello"}"#);
+            assert_eq!(completed.unwrap()[0].arguments, emitted);
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn sampling_rejects_responses_fields_managed_by_the_agent() {
         let client =
