@@ -79,6 +79,7 @@ pub struct OpenAiResponses {
     session_cache_key: Option<String>,
     session_affinity_format: Option<SessionAffinityFormat>,
     prompt_cache_key_enabled: bool,
+    strict_tool_support: bool,
 }
 
 impl OpenAiResponses {
@@ -164,11 +165,18 @@ impl OpenAiResponses {
             session_cache_key: None,
             session_affinity_format: None,
             prompt_cache_key_enabled: true,
+            strict_tool_support: false,
         })
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+        self
+    }
+
+    /// Set whether the selected model supports strict JSON Schema tools.
+    pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
+        self.strict_tool_support = supported;
         self
     }
 
@@ -647,12 +655,19 @@ impl Model for OpenAiResponses {
                 pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
             }),
         };
-        if self.prompt_cache_key_enabled {
+        let base = if self.prompt_cache_key_enabled {
             base
         } else {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, "prompt-cache-key-disabled"))
             })
+        };
+        if self.strict_tool_support {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "strict-tools-enabled"))
+            })
+        } else {
+            base
         }
     }
 
@@ -751,6 +766,40 @@ impl Model for OpenAiResponses {
         request: ModelRequest,
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         self.clone().without_cache().stream_enriched(request).await
+    }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let tools = constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let stream = self
+            .clone()
+            .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
+            .stream_enriched_with_tools(request, Some(tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let tools = constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let stream = self
+            .clone()
+            .without_cache()
+            .stream_enriched_with_tools(request, Some(tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
     }
 }
 
@@ -1777,6 +1826,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declaration_stream_defaults_to_unsupported_and_changes_identity_when_enabled() {
+        let model =
+            OpenAiResponses::new_api("https://example.test/responses", "fixture".into()).unwrap();
+        let req = request();
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Require,
+            }),
+        };
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    uuid::Uuid::nil(),
+                    uuid::Uuid::nil(),
+                    "s",
+                    req.clone(),
+                    &[declaration.clone()]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            model
+                .stream_detailed_summary_with_tool_declarations(
+                    uuid::Uuid::nil(),
+                    uuid::Uuid::nil(),
+                    req,
+                    &[declaration]
+                )
+                .await
+                .is_err()
+        );
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_strict_tool_support(true)
+                .context_identity()
+        );
+    }
+
+    #[tokio::test]
     async fn sdk_constrained_responses_request_sends_strict_schema() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1850,16 +1942,24 @@ mod tests {
         };
         let model =
             OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
-                .unwrap();
+                .unwrap()
+                .with_strict_tool_support(true);
         let mut stream = model
-            .stream_with_tool_declarations(req, &[declaration], true)
+            .stream_detailed_with_tool_declarations(
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                "strict-session",
+                req,
+                &[declaration],
+            )
             .await
             .unwrap();
         let mut calls = None;
         while let Some(event) = stream.next().await {
-            if let ModelEvent::Complete {
-                calls: completed, ..
-            } = event.unwrap()
+            if let pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: completed,
+                ..
+            }) = event.unwrap().event
             {
                 calls = Some(completed);
             }
@@ -1868,6 +1968,7 @@ mod tests {
         let body = server.join().unwrap();
         assert_eq!(body["tools"][0]["strict"], true);
         assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
+        assert_eq!(body["prompt_cache_key"], "strict-session");
     }
 
     #[tokio::test]

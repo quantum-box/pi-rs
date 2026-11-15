@@ -841,6 +841,34 @@ pub trait Model: Send + Sync {
             .boxed())
     }
 
+    /// Stream with a snapshot of per-tool constraints. Legacy models may fall
+    /// back for preferred constraints, but must fail closed for required ones.
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[crate::ToolDeclaration],
+    ) -> Result<DetailedModelStream> {
+        validate_legacy_tool_declarations(&request, declarations)?;
+        self.stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
+    /// Summary counterpart of the constrained detailed stream.
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+        declarations: &[crate::ToolDeclaration],
+    ) -> Result<DetailedModelStream> {
+        validate_legacy_tool_declarations(&request, declarations)?;
+        self.stream_detailed_for_summary(request_id, session_id, request)
+            .await
+    }
+
     /// Called after the usage record is durable and before tools or another request.
     async fn record_usage(&self, _request_id: Uuid, _usage: &UsageReport) -> Result<()> {
         Ok(())
@@ -855,6 +883,124 @@ pub trait Model: Send + Sync {
         _metadata: &ModelMetadata,
     ) -> Result<()> {
         self.record_usage(request_id, usage).await
+    }
+}
+
+/// Check declarations before falling back to a legacy model adapter.
+pub fn validate_legacy_tool_declarations(
+    request: &ModelRequest,
+    declarations: &[crate::ToolDeclaration],
+) -> Result<()> {
+    if request.tools.len() != declarations.len()
+        || request
+            .tools
+            .iter()
+            .zip(declarations)
+            .any(|(spec, declaration)| spec != &declaration.spec)
+    {
+        return Err(Error::Config(
+            "tool declarations do not match the effective request".into(),
+        ));
+    }
+    if let Some(declaration) = declarations.iter().find(|declaration| {
+        matches!(
+            declaration.constrained_sampling,
+            Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Require
+            })
+        )
+    }) {
+        return Err(Error::Config(format!(
+            "Tool \"{}\" requires JSON-schema constrained sampling, but strict tools are unsupported.",
+            declaration.spec.name
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod declaration_dispatch_tests {
+    use super::*;
+
+    struct LegacyModel;
+    #[async_trait::async_trait]
+    impl Model for LegacyModel {
+        async fn stream(&self, _request: ModelRequest) -> Result<ModelStream> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_models_fail_closed_for_required_tool_constraints() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let mut declaration = crate::ToolDeclaration {
+            spec,
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model = LegacyModel;
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "id",
+                    request.clone(),
+                    &[declaration.clone()]
+                )
+                .await
+                .is_ok()
+        );
+        declaration.constrained_sampling = Some(crate::ToolConstraint::JsonSchema {
+            strict: crate::StrictToolPolicy::Require,
+        });
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "id",
+                    request.clone(),
+                    &[declaration.clone()]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            model
+                .stream_detailed_summary_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    request.clone(),
+                    &[declaration.clone()]
+                )
+                .await
+                .is_err()
+        );
+        declaration.spec.name = "changed".into();
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "id",
+                    request,
+                    &[declaration]
+                )
+                .await
+                .is_err()
+        );
     }
 }
 

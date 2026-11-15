@@ -3684,7 +3684,10 @@ matching the current Pi schema subset. Tool-level constrained sampling and
 its provider request, fallback, and grammar paths are not yet wired through
 the native agent. The OpenAI Responses SDK can send explicitly supplied tool
 declarations with JSON Schema constraints when its caller supplies the model's
-strict capability; callers must normalize returned arguments before validation.
+strict capability, including through the declaration-aware detailed model
+stream; callers must normalize returned arguments before validation. Legacy
+model implementations reject required constraints and can fall back for
+preferred constraints.
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
