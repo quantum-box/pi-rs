@@ -2160,7 +2160,11 @@ impl Tool for CodingTool {
                     && matches!(self.kind, Kind::Read { .. })
                     && (message.starts_with("ENOENT: no such file or directory, access '")
                         || message.starts_with("ENOTDIR: not a directory, access '")
-                        || message.starts_with("EACCES: permission denied, access '")) =>
+                        || message.starts_with("EACCES: permission denied, access '")
+                        || message == "EISDIR: illegal operation on a directory, read"
+                        || (message.starts_with("Offset ")
+                            && message.contains(" is beyond end of file (")
+                            && message.ends_with(" lines total)"))) =>
             {
                 Outcome::Failed(message)
             }
@@ -2616,6 +2620,11 @@ impl CodingTool {
                     )));
                 }
                 return Err(error.into());
+            }
+            if path.is_dir() {
+                return Err(Error::Config(
+                    "EISDIR: illegal operation on a directory, read".into(),
+                ));
             }
         }
         if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
@@ -6830,5 +6839,67 @@ mod tests {
             "timed-out descendant must terminate"
         );
         assert!(!leaked.exists(), "timed-out descendant must not continue");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_read_reports_pi_paging_and_directory_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file"), "first\nsecond").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let result = tool
+            .invoke(json!({"path":"file","offset":2}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Succeeded(text) if text == "second"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(json!({"path":"file","offset":3}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message == "Offset 3 is beyond end of file (2 lines total)"),
+            "{result:?}"
+        );
+        std::fs::write(tool.root.join("empty"), "").unwrap();
+        let result = tool
+            .invoke(json!({"path":"empty","offset":2}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message == "Offset 2 is beyond end of file (1 lines total)"),
+            "{result:?}"
+        );
+        #[cfg(unix)]
+        {
+            let result = tool.invoke(json!({"path":"."}), context()).await;
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == "EISDIR: illegal operation on a directory, read"),
+                "{result:?}"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(json!({"path":"file","offset":4}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: Offset 4 is beyond end of file")),
+            "{result:?}"
+        );
     }
 }
