@@ -715,9 +715,10 @@ transport, tool names, per-tool exposure overrides, and resource capability.
 Invalid entries are reported in `errors`; enabled connection failures cause a
 nonzero exit. An invalid trusted project override currently fails the merged
 configuration as a whole, preserving pi-rs's existing override validation.
-Unlike Pi, JSON transport descriptions omit stdio arguments and redact URL
+Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
+Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project

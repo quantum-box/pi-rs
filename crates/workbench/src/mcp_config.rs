@@ -78,6 +78,7 @@ type ScopedConfigurations = (
     BTreeSet<String>,
     BTreeSet<String>,
     Vec<String>,
+    Vec<String>,
 );
 
 fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
@@ -87,8 +88,10 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
             BTreeSet::new(),
             BTreeSet::new(),
             Vec::new(),
+            Vec::new(),
         ));
     }
+    let mut configuration_errors = Vec::new();
     let user_path = config::agent_dir().join("mcp.json");
     let user = config::read_object(&user_path)?;
     if strict
@@ -96,16 +99,26 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
             .get("mcpServers")
             .is_some_and(|value| !value.is_object())
     {
-        return Err(Error::Config(format!(
+        configuration_errors.push(format!(
             "{}: mcpServers must be an object",
             user_path.display()
-        )));
+        ));
     }
     let mut servers = user
         .get("mcpServers")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    if strict {
+        servers.retain(|name, value| {
+            if report_server_config(value).is_none() {
+                configuration_errors.push(format!("invalid MCP server configuration for {name}"));
+                false
+            } else {
+                true
+            }
+        });
+    }
     let mut order: Vec<_> = servers.keys().cloned().collect();
     let mut project_definitions = BTreeSet::new();
     let mut project_overrides = BTreeSet::new();
@@ -117,12 +130,27 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
                 .get("mcpServers")
                 .is_some_and(|value| !value.is_object())
         {
-            return Err(Error::Config(format!(
+            configuration_errors.push(format!(
                 "{}: mcpServers must be an object",
                 project_path.display()
-            )));
+            ));
         }
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
+            let mut entries = entries.clone();
+            if strict {
+                entries.retain(|name, entry| {
+                    let full = ["command", "url", "type"]
+                        .iter()
+                        .any(|key| entry.get(*key).is_some());
+                    if !entry.is_object() || (full && report_server_config(entry).is_none()) {
+                        configuration_errors
+                            .push(format!("invalid MCP server configuration for {name}"));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             order.extend(
                 entries
                     .keys()
@@ -145,7 +173,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
                     .filter(|name| !project_definitions.contains(*name))
                     .cloned(),
             );
-            merge_project_servers(&mut servers, entries)?;
+            merge_project_servers(&mut servers, &entries)?;
         }
     }
     Ok((
@@ -153,6 +181,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
         project_definitions,
         project_overrides,
         order,
+        configuration_errors,
     ))
 }
 
@@ -444,11 +473,52 @@ fn report_exposure(value: &str) -> &str {
     }
 }
 
+fn report_server_config(value: &Value) -> Option<ServerConfig> {
+    let config: ServerConfig = serde_json::from_value(value.clone()).ok()?;
+    if config.command.is_some() == config.url.is_some()
+        || config
+            .exposure
+            .iter()
+            .chain(config.tool_exposure.values())
+            .any(|value| !valid_exposure(&json!(value)))
+        || config.oauth_client().is_some_and(|client| {
+            pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).is_err()
+        })
+        || config.command.is_some()
+            && matches!(
+                &config.oauth,
+                Some(
+                    pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(true)
+                        | pi_rs_workbench::mcp_auth::OAuthSetting::Client(_)
+                )
+            )
+        || config.command.is_some()
+            && config
+                .transport
+                .as_deref()
+                .is_some_and(|kind| kind != "stdio")
+        || config.command.is_none()
+            && config.url.is_some()
+            && config
+                .transport
+                .as_deref()
+                .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
+        || config.url.as_ref().is_some_and(|url| {
+            reqwest_mcp::Url::parse(url)
+                .ok()
+                .is_none_or(|url| !matches!(url.scheme(), "http" | "https"))
+        })
+    {
+        return None;
+    }
+    Some(config)
+}
+
 async fn list_json(args: &Cli) -> Result<()> {
     use std::io::Write;
 
     let mut errors = Vec::new();
-    let (servers, project_definitions, project_overrides, order) =
+    let (servers, project_definitions, project_overrides, order, config_errors) =
         match configurations_with_project_scope(args, true) {
             Ok(configurations) => configurations,
             Err(error) => {
@@ -458,11 +528,15 @@ async fn list_json(args: &Cli) -> Result<()> {
                     BTreeSet::new(),
                     BTreeSet::new(),
                     Vec::new(),
+                    Vec::new(),
                 )
             }
         };
+    errors.extend(config_errors);
     let global_path = config::agent_dir().join("mcp.json");
-    let project_path = args.workspace.join(".pi/mcp.json");
+    let project_path = std::fs::canonicalize(&args.workspace)
+        .unwrap_or_else(|_| args.workspace.clone())
+        .join(".pi/mcp.json");
     let mut normalized = BTreeSet::new();
     let mut pending = Vec::new();
     let mut servers = servers;
@@ -478,36 +552,13 @@ async fn list_json(args: &Cli) -> Result<()> {
             errors.push(format!("invalid MCP server name {name}"));
             continue;
         }
-        let config: ServerConfig = match serde_json::from_value(value) {
-            Ok(config) => config,
-            Err(error) => {
-                errors.push(format!("MCP server {name}: {error}"));
+        let config = match report_server_config(&value) {
+            Some(config) => config,
+            None => {
+                errors.push(format!("invalid MCP server configuration for {name}"));
                 continue;
             }
         };
-        if config
-            .exposure
-            .iter()
-            .chain(config.tool_exposure.values())
-            .any(|value| !valid_exposure(&json!(value)))
-            || config.oauth_client().is_some_and(|client| {
-                pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).is_err()
-            })
-            || config.command.is_some()
-                && config
-                    .transport
-                    .as_deref()
-                    .is_some_and(|kind| kind != "stdio")
-            || config.command.is_none()
-                && config.url.is_some()
-                && config
-                    .transport
-                    .as_deref()
-                    .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
-        {
-            errors.push(format!("invalid MCP server configuration for {name}"));
-            continue;
-        }
         let project = project_definitions.contains(&name);
         let source = if project { &project_path } else { &global_path };
         let transport = if let Some(command) = &config.command {
@@ -525,17 +576,11 @@ async fn list_json(args: &Cli) -> Result<()> {
                 errors.push(format!("invalid MCP URL for {name}"));
                 continue;
             }
-            let had_query = parsed.query().is_some();
-            let had_fragment = parsed.fragment().is_some();
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
             parsed.set_query(None);
             parsed.set_fragment(None);
-            format!(
-                "{parsed}{}{}",
-                if had_query { "?[redacted]" } else { "" },
-                if had_fragment { "#[redacted]" } else { "" }
-            )
+            format!("{}/[path omitted]", parsed.origin().ascii_serialization())
         } else {
             errors.push(format!("MCP server {name} requires a command or URL"));
             continue;
@@ -563,10 +608,14 @@ async fn list_json(args: &Cli) -> Result<()> {
                     report["tools"] = json!(tools);
                     let changes: serde_json::Map<String, Value> = tools
                         .iter()
-                        .filter_map(|tool| {
+                        .filter(|tool| {
+                            report_exposure(pi_rs_workbench::mcp::tool_exposure(&config, tool))
+                                != base_exposure
+                        })
+                        .map(|tool| {
                             let exposure =
                                 report_exposure(pi_rs_workbench::mcp::tool_exposure(&config, tool));
-                            (exposure != base_exposure).then(|| (tool.clone(), json!(exposure)))
+                            (tool.clone(), json!(exposure))
                         })
                         .collect();
                     if !changes.is_empty() {
@@ -879,7 +928,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             output(json!({"type":"mcp_logged_in","name":name}));
         }
         McpCommand::Logout { name, local } => {
-            let (servers, project_definitions, _, _) =
+            let (servers, project_definitions, _, _, _) =
                 configurations_with_project_scope(args, false)?;
             if local && !project_definitions.contains(&name) {
                 return Err(Error::Config(format!(

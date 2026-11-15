@@ -98,6 +98,8 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
             .env("PI_RS_HOME", &home)
             .env_remove("HTTP_PROXY")
             .env_remove("http_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy")
             .env_remove("ALL_PROXY")
             .env_remove("all_proxy")
             .args(["--trust", "mcp", "list", "--json"])
@@ -139,7 +141,10 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     );
     assert_eq!(
         fixture["override"],
-        project.join("mcp.json").to_string_lossy().as_ref()
+        std::fs::canonicalize(project.join("mcp.json"))
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(fixture["tools"], json!(["Public", "Private"]));
     assert_eq!(fixture["toolExposure"], json!({"Private":"hidden"}));
@@ -207,4 +212,67 @@ fn list_json_rejects_non_object_mcp_servers() {
             .unwrap()
             .contains("mcpServers must be an object")
     );
+}
+
+#[test]
+fn list_json_keeps_global_on_invalid_project_replacement_and_redacts_values() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{
+        "zeta":{"url":"https://username:password@example.invalid/private-path?key=query-secret#fragment-secret","enabled":false},
+        "same":{"command":"global-command","enabled":false},
+        "same2":{"command":"global-two","enabled":false},
+        "replaced":{"command":"ignored","enabled":"invalid"},
+        "a-b":{"command":"ignored","url":"https://example.invalid","enabled":false},
+        "a_b":{"command":"ignored","enabled":false},
+        "b-c":{"command":"ignored","url":"https://example.invalid","enabled":true},
+        "b_c":{"command":"ignored","enabled":false},
+        "bad":{"command":"ignored","enabled":"private-invalid-value"}
+    }}).to_string()).unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{
+            "same":{"command":"project-command","enabled":"invalid"},
+            "same2":null,
+            "replaced":{"command":"replacement","enabled":false},
+            "local":{"command":"ignored","enabled":false}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--trust", "mcp", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for secret in [
+        "username",
+        "password",
+        "private-path",
+        "query-secret",
+        "fragment-secret",
+        "private-invalid-value",
+    ] {
+        assert!(!stdout.contains(secret));
+    }
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let servers = data["servers"].as_array().unwrap();
+    assert_eq!(
+        servers
+            .iter()
+            .map(|server| server["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["zeta", "same", "same2", "a_b", "b_c", "replaced", "local"]
+    );
+    assert_eq!(servers[1]["scope"], "global");
+    assert_eq!(servers[1]["transport"], "global-command");
+    assert_eq!(servers[2]["transport"], "global-two");
+    assert_eq!(servers[5]["scope"], "project");
+    assert_eq!(data["errors"].as_array().unwrap().len(), 6);
 }
