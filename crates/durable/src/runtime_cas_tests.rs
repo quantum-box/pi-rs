@@ -22,6 +22,98 @@ fn options() -> Options {
         uncertain_policy: UncertainPolicy::InterruptedResult,
     }
 }
+
+#[test]
+fn abort_returns_queued_inputs_across_foreground_and_background_boundaries() {
+    use crate::ownership_edge::Mode;
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config.clone()).unwrap();
+    let owner = TaskOwner::Conversation(parent);
+    let root = Task::new(
+        Uuid::new_v4(),
+        owner.clone(),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap();
+    TaskStore::new(h.owner.store())
+        .save(&[Save::Create(&root)])
+        .unwrap();
+    let foreground = h
+        .ensure_task_owned_subagent(
+            root.id(),
+            owner.clone(),
+            "fg",
+            config.clone(),
+            Mode::Foreground,
+        )
+        .unwrap()
+        .child;
+    let background = h
+        .ensure_task_owned_subagent(root.id(), owner, "bg", config, Mode::Background)
+        .unwrap()
+        .child;
+    for id in [parent, foreground, background] {
+        h.submit(id, None, "running".into()).unwrap();
+        h.submit_with_mode(id, None, "queued".into(), InputMode::Steer)
+            .unwrap();
+    }
+    let (_, _, result) = h
+        .abort_owned_graph_impl(Some(parent), None, None, false)
+        .unwrap();
+    assert_eq!(result.withdrawn.len(), 2);
+    for id in [parent, foreground] {
+        let item = result
+            .withdrawn
+            .iter()
+            .find(|item| item.conversation_id == id)
+            .unwrap();
+        assert_eq!(item.mode, InputMode::Steer);
+        assert_eq!(item.submission.content, "queued");
+        assert_eq!(item.submission.status, Status::Queued);
+        assert_eq!(
+            h.conversation(id).unwrap().submissions[1].status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
+    }
+    assert_eq!(
+        h.conversation(background).unwrap().submissions[1].status,
+        Status::Queued
+    );
+    let (_, _, repeat) = h
+        .abort_owned_graph_impl(Some(parent), None, None, false)
+        .unwrap();
+    assert!(repeat.withdrawn.is_empty());
+    let (_, _, include_background) = h
+        .abort_owned_graph_impl(Some(parent), None, None, true)
+        .unwrap();
+    assert_eq!(include_background.withdrawn.len(), 1);
+    assert_eq!(include_background.withdrawn[0].conversation_id, background);
+    drop(h);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    for id in [parent, foreground, background] {
+        assert_eq!(
+            reopened.conversation(id).unwrap().submissions[1].status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
+    }
+}
 #[test]
 fn cas_merges_admission_and_boundary_retries_instead_of_losing_steer() {
     let dir = tempfile::tempdir().unwrap();
