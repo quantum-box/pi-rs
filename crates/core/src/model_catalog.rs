@@ -6,6 +6,31 @@ use crate::{
     Error, HistoricalModelResolution, HistoricalModelResolver, Model, Result, SessionBuilder,
 };
 
+/// Host-supplied display and capability information for a catalog model.
+/// These values are descriptive only: the catalog does not probe a provider or
+/// configure request limits, thinking, image support, costs, or authentication.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CatalogModelInfo {
+    pub display_name: Option<String>,
+    pub api: Option<crate::ModelApi>,
+    pub context_window: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub reasoning: Option<bool>,
+    pub images: Option<bool>,
+    pub cost: Option<CatalogModelCost>,
+}
+
+/// Host-supplied USD prices per million tokens, absent when unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CatalogModelCost {
+    pub input: Option<serde_json::Number>,
+    pub output: Option<serde_json::Number>,
+    pub cache_read: Option<serde_json::Number>,
+    pub cache_write: Option<serde_json::Number>,
+}
+
 /// An immutable catalog of clients constructed and authorized by the host.
 ///
 /// The provider and model names are exact, case-sensitive identities. A client
@@ -14,13 +39,18 @@ use crate::{
 /// endpoint configuration changes; existing sessions retain their snapshot.
 #[derive(Clone, Default)]
 pub struct ModelCatalog {
-    clients: Arc<BTreeMap<(String, String), Arc<dyn Model>>>,
+    clients: Arc<BTreeMap<(String, String), CatalogBinding>>,
 }
 
 /// Collects trusted model clients before publishing an immutable catalog.
 #[derive(Default)]
 pub struct ModelCatalogBuilder {
-    clients: BTreeMap<(String, String), Arc<dyn Model>>,
+    clients: BTreeMap<(String, String), CatalogBinding>,
+}
+
+struct CatalogBinding {
+    client: Arc<dyn Model>,
+    info: Option<CatalogModelInfo>,
 }
 
 impl ModelCatalogBuilder {
@@ -36,13 +66,34 @@ impl ModelCatalogBuilder {
         model: impl Into<String>,
         client: Arc<dyn Model>,
     ) -> Result<&mut Self> {
-        let (provider, model) = (provider.into(), model.into());
+        self.register_binding(provider.into(), model.into(), client, None)
+    }
+
+    /// Register a client with host-provided descriptive information. Duplicate
+    /// identities fail without changing either the old client or its metadata.
+    pub fn register_with_info(
+        &mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        client: Arc<dyn Model>,
+        info: CatalogModelInfo,
+    ) -> Result<&mut Self> {
+        self.register_binding(provider.into(), model.into(), client, Some(info))
+    }
+
+    fn register_binding(
+        &mut self,
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+        info: Option<CatalogModelInfo>,
+    ) -> Result<&mut Self> {
         if provider.trim().is_empty() || model.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
         }
         match self.clients.entry((provider, model)) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(client);
+                entry.insert(CatalogBinding { client, info });
                 Ok(self)
             }
             std::collections::btree_map::Entry::Occupied(_) => Err(Error::Config(
@@ -63,7 +114,7 @@ impl ModelCatalog {
     pub fn get(&self, provider: &str, model: &str) -> Option<Arc<dyn Model>> {
         self.clients
             .get(&(provider.to_owned(), model.to_owned()))
-            .cloned()
+            .map(|binding| binding.client.clone())
     }
 
     /// List the exact identities registered by the host, ordered by provider
@@ -73,6 +124,24 @@ impl ModelCatalog {
         self.clients
             .keys()
             .map(|(provider, model)| (provider.as_str(), model.as_str()))
+    }
+
+    /// Host-supplied information for this exact identity, if registered with it.
+    /// This is not a live capability or credential availability check.
+    pub fn info(&self, provider: &str, model: &str) -> Option<&CatalogModelInfo> {
+        self.clients
+            .get(&(provider.to_owned(), model.to_owned()))?
+            .info
+            .as_ref()
+    }
+
+    /// Ordered catalog identities and their optional host-supplied information.
+    pub fn entries(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&str, &str, Option<&CatalogModelInfo>)> + '_ {
+        self.clients.iter().map(|((provider, model), binding)| {
+            (provider.as_str(), model.as_str(), binding.info.as_ref())
+        })
     }
 
     /// Create a session builder and configure exact historical model recovery.
@@ -278,6 +347,59 @@ mod tests {
             .unwrap();
         assert_eq!(session.model_provider().unwrap(), Some("provider-b"));
         session.close().await.unwrap();
+    }
+
+    #[test]
+    fn host_model_info_is_exact_immutable_and_cannot_replace_a_binding() {
+        let mut builder = ModelCatalogBuilder::new();
+        let first: Arc<dyn Model> = Arc::new(NamedModel("first"));
+        let info = CatalogModelInfo {
+            display_name: Some("Example".into()),
+            api: Some(crate::ModelApi::OpenaiResponses),
+            context_window: Some(12345),
+            reasoning: Some(true),
+            cost: Some(CatalogModelCost {
+                input: Some(serde_json::json!(1.25).as_number().unwrap().clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        builder
+            .register_with_info("p", "m", first.clone(), info.clone())
+            .unwrap();
+        builder
+            .register("p", "other", Arc::new(NamedModel("other")))
+            .unwrap();
+        assert!(
+            builder
+                .register_with_info(
+                    "p",
+                    "m",
+                    Arc::new(NamedModel("replacement")),
+                    CatalogModelInfo::default()
+                )
+                .is_err()
+        );
+        let catalog = builder.build();
+        assert_eq!(catalog.info("p", "m"), Some(&info));
+        assert!(catalog.info("P", "m").is_none());
+        assert!(Arc::ptr_eq(&catalog.get("p", "m").unwrap(), &first));
+        assert_eq!(
+            catalog
+                .entries()
+                .map(|(p, m, i)| (p, m, i.is_some()))
+                .collect::<Vec<_>>(),
+            vec![("p", "m", true), ("p", "other", false)]
+        );
+        let cloned = catalog.clone();
+        drop(catalog);
+        assert_eq!(cloned.info("p", "m"), Some(&info));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["contextWindow"], 12345);
+        assert_eq!(
+            serde_json::from_value::<CatalogModelInfo>(json).unwrap(),
+            info
+        );
     }
 
     #[tokio::test]

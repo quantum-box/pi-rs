@@ -4871,6 +4871,9 @@ The SDK model catalog can enumerate its host-registered provider/model identitie
 in deterministic order for host model pickers. This lists the immutable catalog
 snapshot, not Pi's discovered model registry or a live credential availability
 check. The host remains responsible for rebuilding it when authorization changes.
+Hosts can optionally attach display, API, context, output, reasoning, image and
+cost metadata to an exact identity. These values are descriptive and do not
+configure the model client, enforce capabilities, or perform discovery.
 
 ### Explicit skill file diagnostics checkpoint
 
