@@ -377,6 +377,8 @@ a context extension. Expanding it would exceed a host or extension limit;
 there is no separate answer budget and headroom to expand. Raising both
 `--max-output-tokens` and `--output-budget` permits a larger thinking budget
 within those limits.
+Adaptive Messages requests also explicitly request summarized thinking, as Pi
+does, including for providers whose default display differs.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable
