@@ -84,6 +84,8 @@ pub enum Error {
     Model(#[from] pi_rs_core::Error),
     #[error("conversation not found")]
     NotFound,
+    #[error("submission settlement notifications are not yet supported")]
+    SubmissionNotificationUnsupported,
     #[error("submission not found in conversation")]
     SubmissionNotFound,
     #[error(transparent)]
@@ -271,6 +273,16 @@ pub enum WithdrawResult {
     Settled,
     NotFound,
 }
+/// Requested destination for a durable submission settlement signal.
+/// Notification admission is currently rejected until settlement and signal
+/// delivery can be committed together on every supported path.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionNotify {
+    pub task_id: Uuid,
+    pub key: String,
+}
+
 /// A persisted interrupted partial, for display only; it is never sent to a model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AbortedGeneration {
@@ -8327,6 +8339,33 @@ impl Harness {
     ) -> Result<Uuid, Error> {
         self.submit_with_mode(id, request_id, content, InputMode::FollowUp)
     }
+    /// Admit an input with an optional settlement destination. A notification
+    /// request is rejected before admission until atomic delivery is available.
+    pub fn submit_with_notify(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, Error> {
+        if notify.is_some() {
+            return Err(Error::SubmissionNotificationUnsupported);
+        }
+        self.submit_with_options(id, request_id, content, options)
+    }
+    /// Admit a continuation with an optional settlement destination.
+    pub fn submit_continue_with_notify(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, Error> {
+        if notify.is_some() {
+            return Err(Error::SubmissionNotificationUnsupported);
+        }
+        self.submit_continue(id, request_id)
+    }
     /// Persist an input; steering joins the active run at its next safe boundary.
     pub fn submit_with_mode(
         &mut self,
@@ -14601,6 +14640,34 @@ impl Scheduler {
         content: String,
     ) -> Result<Uuid, Error> {
         let submission = self.harness.submit(id, request_id, content)?;
+        self.schedule(id);
+        Ok(submission)
+    }
+    /// Admit an input with an optional settlement destination and schedule it.
+    pub fn submit_with_notify(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_with_notify(id, request_id, content, options, notify)?;
+        self.schedule(id);
+        Ok(submission)
+    }
+    /// Admit a continuation with an optional settlement destination and schedule it.
+    pub fn submit_continue_with_notify(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_continue_with_notify(id, request_id, notify)?;
         self.schedule(id);
         Ok(submission)
     }
