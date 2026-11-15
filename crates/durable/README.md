@@ -218,6 +218,23 @@ individual batches, and the retained initial snapshot are not byte-bounded.
 For an append-only cursor stream use `watch_history` instead; it covers only
 records explicitly included in that observation log.
 
+`merged_progress_from_now` captures a consistent store boundary and returns a
+versioned cursor for conversation observations and forward-only progress.
+`merged_progress` pages complete transactions in store commit order, and
+`watch_merged_progress` polls until a page is available; dropping its future
+cancels that wait without consuming the cursor. Boundary capture retries a
+bounded number of times if commits race with attachment. A frame contains the
+validated observation, progress record, or both when they shared a transaction;
+paging never splits a frame. Persist `next` only after processing the page.
+Attachment explicitly starts after the captured boundary: older overwritten
+progress is never reconstructed. Cursors are scoped to the same database and
+conversation; malformed, untracked and skipped source records fail closed.
+This is a pull stream of root-replacement observations and progress states, not
+upstream's windowed Chord diff stream. Application document commits and
+standalone progress writers are not included. Polling is synchronous, retained
+history and individual records are not globally byte-bounded, and pages contain
+at most 256 frames.
+
 `progress_history_from_now` captures a versioned, conversation-scoped exclusive
 cursor. `progress_history` and `watch_progress_history` page committed generation
 and tool progress records after that boundary. Runtime checkpoints and terminal

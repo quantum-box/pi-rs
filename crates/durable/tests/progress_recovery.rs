@@ -610,3 +610,137 @@ async fn progress_history_has_atomic_forward_boundary_and_reopens() {
     invalid.version = 2;
     assert!(h.progress_history(&invalid, NonZeroUsize::MIN).is_err());
 }
+
+#[tokio::test]
+async fn merged_progress_watch_pages_atomic_commits_and_reopens() {
+    use pi_rs_durable::{
+        progress::State,
+        runtime::{ProgressHistoryChange, Scheduler},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("merged.db");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+    });
+    let mut s = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let id = s
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let start = s.merged_progress_from_now(id).unwrap();
+    let encoded = serde_json::to_vec(&start).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<pi_rs_durable::runtime::MergedProgressCursor>(&encoded).unwrap(),
+        start
+    );
+    s.submit(id, None, "work".into()).unwrap();
+    let (first, reached_result) = tokio::join!(
+        s.watch_merged_progress(&start, NonZeroUsize::MIN, Duration::from_millis(1)),
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+    );
+    reached_result.unwrap();
+    let first = first.unwrap();
+    assert_eq!(first.frames.len(), 1);
+    let second_reader = s.merged_progress(&start, NonZeroUsize::MIN).unwrap();
+    assert_eq!(first.frames, second_reader.frames);
+    assert_eq!(first.next, second_reader.next);
+    let mut cursor = first.next;
+    let mut frames = first.frames;
+    loop {
+        let page = s.merged_progress(&cursor, NonZeroUsize::MIN).unwrap();
+        assert!(page.frames.len() <= 1);
+        cursor = page.next;
+        if page.frames.is_empty() {
+            break;
+        }
+        frames.extend(page.frames);
+    }
+    assert!(
+        frames
+            .windows(2)
+            .all(|pair| pair[0].commit_sequence < pair[1].commit_sequence)
+    );
+    assert!(frames.iter().any(|frame| frame.observation.is_some()));
+    assert!(frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|c| matches!(c, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Running(partial) if partial.text == "uncommitted partial"))))));
+    let saved = cursor.clone();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            s.watch_merged_progress(&cursor, NonZeroUsize::MIN, Duration::from_millis(1))
+        )
+        .await
+        .is_err()
+    );
+    s.abort_and_wait(id).await.unwrap();
+    s.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut cursor = saved;
+    let mut after = Vec::new();
+    loop {
+        let page = h.merged_progress(&cursor, NonZeroUsize::MIN).unwrap();
+        cursor = page.next;
+        if page.frames.is_empty() {
+            break;
+        }
+        after.extend(page.frames);
+    }
+    assert!(
+        after
+            .windows(2)
+            .all(|pair| pair[0].commit_sequence < pair[1].commit_sequence)
+    );
+    let terminal = after.iter().find(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|c| matches!(c, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Aborted(_)))))).unwrap();
+    assert!(
+        terminal.observation.is_some(),
+        "atomic abort progress must not be split"
+    );
+    assert_eq!(
+        terminal.progress.as_ref().unwrap().commit_sequence,
+        terminal.commit_sequence
+    );
+    let mut invalid = serde_json::to_value(&cursor).unwrap();
+    invalid["version"] = serde_json::json!(2);
+    let invalid = serde_json::from_value(invalid).unwrap();
+    assert!(h.merged_progress(&invalid, NonZeroUsize::MIN).is_err());
+    let mut skipped = serde_json::to_value(&cursor).unwrap();
+    skipped["progress_position"] = serde_json::json!(0);
+    let skipped = serde_json::from_value(skipped).unwrap();
+    assert!(h.merged_progress(&skipped, NonZeroUsize::MIN).is_err());
+}
+
+#[tokio::test]
+async fn merged_progress_rejects_unproven_observation_without_advancing() {
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let start = h.merged_progress_from_now(id).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let append = pi_rs_durable::observer::Observer::new(&store, id)
+        .prepare_append(&serde_json::json!({"forged":true}))
+        .unwrap();
+    store.commit(&append.checks, &append.mutations).unwrap();
+    assert!(h.merged_progress(&start, NonZeroUsize::MIN).is_err());
+    assert!(
+        h.watch_merged_progress(&start, NonZeroUsize::MIN, Duration::from_millis(1))
+            .await
+            .is_err()
+    );
+}

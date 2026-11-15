@@ -1261,6 +1261,30 @@ pub struct ProgressHistoryPage {
     pub next: ProgressHistoryCursor,
     pub has_more: bool,
 }
+/// A versioned, forward-only boundary for the merged observation/progress stream.
+/// Persist this opaque value with the same database and conversation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergedProgressCursor {
+    version: u32,
+    conversation: Uuid,
+    after_sequence: u64,
+    observation_position: u64,
+    progress_position: u64,
+}
+/// Records written in one store transaction. No ordering is implied within a frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergedProgressFrame {
+    pub commit_sequence: u64,
+    pub observation: Option<CommittedViewFrame>,
+    pub progress: Option<ProgressHistoryFrame>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergedProgressPage {
+    pub frames: Vec<MergedProgressFrame>,
+    pub next: MergedProgressCursor,
+    pub has_more: bool,
+}
+
 const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
 fn prepare_progress_history(
     store: &durable_store::Store,
@@ -5207,6 +5231,227 @@ impl Harness {
             next,
             has_more,
         })
+    }
+
+    fn merged_observation(
+        &self,
+        conversation: Uuid,
+        after: u64,
+    ) -> Result<Option<(u64, CommittedViewFrame)>, Error> {
+        let page = crate::observer::Observer::new(self.owner.store(), conversation)
+            .read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+        let Some(record) = page.records.first() else {
+            return Ok(None);
+        };
+        let frame = self.committed_view_frame(conversation, record.cursor.0)?;
+        let mut key = b"durable/observer/".to_vec();
+        key.extend_from_slice(conversation.as_bytes());
+        key.extend_from_slice(b"/r");
+        key.extend_from_slice(&record.cursor.0.to_be_bytes());
+        let entry = self
+            .owner
+            .store()
+            .get(&key)?
+            .ok_or_else(|| Error::Invalid("missing merged observation".into()))?;
+        let sequence = self
+            .owner
+            .store()
+            .commit_for_version(&key, entry.version)?
+            .ok_or_else(|| Error::Invalid("untracked merged observation".into()))?;
+        Ok(Some((sequence, frame)))
+    }
+    fn merged_progress_record(
+        &self,
+        conversation: Uuid,
+        after: u64,
+    ) -> Result<Option<ProgressHistoryFrame>, Error> {
+        let cursor = ProgressHistoryCursor {
+            version: 1,
+            conversation,
+            position: after,
+        };
+        Ok(self
+            .progress_history(&cursor, std::num::NonZeroUsize::MIN)?
+            .records
+            .into_iter()
+            .next())
+    }
+    /// Start after a consistent current store boundary. Prior progress is not
+    /// backfilled; this is explicit even in stores with no legacy metadata.
+    pub fn merged_progress_from_now(
+        &self,
+        conversation: Uuid,
+    ) -> Result<MergedProgressCursor, Error> {
+        self.load(conversation)?;
+        let store = self.owner.store();
+        for _ in 0..128 {
+            let before = store.commit_sequence()?;
+            let observation = crate::observer::Observer::new(store, conversation)
+                .head()?
+                .0;
+            let progress = crate::observer::Observer::progress_history(store, conversation)
+                .head()?
+                .0;
+            if before != store.commit_sequence()? {
+                continue;
+            }
+            let cursor = MergedProgressCursor {
+                version: 1,
+                conversation,
+                after_sequence: before,
+                observation_position: observation,
+                progress_position: progress,
+            };
+            self.validate_merged_progress_cursor(&cursor)?;
+            return Ok(cursor);
+        }
+        Err(Error::Invalid(
+            "could not capture stable merged progress boundary".into(),
+        ))
+    }
+    fn validate_merged_progress_cursor(&self, cursor: &MergedProgressCursor) -> Result<(), Error> {
+        if cursor.version != 1 || cursor.after_sequence > self.owner.store().commit_sequence()? {
+            return Err(Error::Invalid("invalid merged progress cursor".into()));
+        }
+        self.load(cursor.conversation)?;
+        if cursor.observation_position > 0 {
+            let last = self
+                .merged_observation(cursor.conversation, cursor.observation_position - 1)?
+                .ok_or_else(|| Error::Invalid("missing merged observation cursor".into()))?;
+            if last.1.cursor.position != cursor.observation_position
+                || last.0 > cursor.after_sequence
+            {
+                return Err(Error::Invalid(
+                    "inconsistent merged observation cursor".into(),
+                ));
+            }
+        }
+        if cursor.progress_position > 0 {
+            let last = self
+                .merged_progress_record(cursor.conversation, cursor.progress_position - 1)?
+                .ok_or_else(|| Error::Invalid("missing merged progress cursor".into()))?;
+            if last.cursor.position != cursor.progress_position
+                || last.commit_sequence > cursor.after_sequence
+            {
+                return Err(Error::Invalid("inconsistent merged progress cursor".into()));
+            }
+        }
+        Ok(())
+    }
+    fn next_merged_progress(
+        &self,
+        cursor: &MergedProgressCursor,
+        through: u64,
+    ) -> Result<Option<(MergedProgressFrame, MergedProgressCursor)>, Error> {
+        let observation =
+            self.merged_observation(cursor.conversation, cursor.observation_position)?;
+        let progress =
+            self.merged_progress_record(cursor.conversation, cursor.progress_position)?;
+        if observation
+            .as_ref()
+            .is_some_and(|(sequence, _)| *sequence <= cursor.after_sequence)
+            || progress
+                .as_ref()
+                .is_some_and(|frame| frame.commit_sequence <= cursor.after_sequence)
+        {
+            return Err(Error::Invalid(
+                "merged cursor skips a committed record".into(),
+            ));
+        }
+        let sequence = observation
+            .as_ref()
+            .map(|v| v.0)
+            .into_iter()
+            .chain(progress.as_ref().map(|v| v.commit_sequence))
+            .min();
+        let Some(sequence) = sequence.filter(|sequence| *sequence <= through) else {
+            return Ok(None);
+        };
+        let mut next = cursor.clone();
+        next.after_sequence = sequence;
+        let observation = observation
+            .filter(|(seq, _)| *seq == sequence)
+            .map(|(_, frame)| {
+                next.observation_position = frame.cursor.position;
+                frame
+            });
+        let progress = progress
+            .filter(|frame| frame.commit_sequence == sequence)
+            .inspect(|frame| {
+                next.progress_position = frame.cursor.position;
+            });
+        // Runtime writers commit at most one record per source per transaction.
+        // If external writes violate that contract, fail instead of splitting it.
+        if observation.is_some()
+            && self
+                .merged_observation(cursor.conversation, next.observation_position)?
+                .is_some_and(|(seq, _)| seq <= sequence)
+            || progress.is_some()
+                && self
+                    .merged_progress_record(cursor.conversation, next.progress_position)?
+                    .is_some_and(|frame| frame.commit_sequence <= sequence)
+        {
+            return Err(Error::Invalid(
+                "duplicate or unordered merged transaction".into(),
+            ));
+        }
+        Ok(Some((
+            MergedProgressFrame {
+                commit_sequence: sequence,
+                observation,
+                progress,
+            },
+            next,
+        )))
+    }
+    /// Page complete transactions after a saved cursor. Each page captures one
+    /// store boundary so a racing commit cannot be split across sources.
+    pub fn merged_progress(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<MergedProgressPage, Error> {
+        if limit.get() > 256 {
+            return Err(Error::Invalid(
+                "merged progress page limit exceeds 256".into(),
+            ));
+        }
+        self.validate_merged_progress_cursor(cursor)?;
+        let through = self.owner.store().commit_sequence()?;
+        let mut next = cursor.clone();
+        let mut frames = Vec::new();
+        while frames.len() < limit.get() {
+            let Some((frame, updated)) = self.next_merged_progress(&next, through)? else {
+                break;
+            };
+            frames.push(frame);
+            next = updated;
+        }
+        let has_more = self.next_merged_progress(&next, through)?.is_some();
+        Ok(MergedProgressPage {
+            frames,
+            next,
+            has_more,
+        })
+    }
+    pub async fn watch_merged_progress(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<MergedProgressPage, Error> {
+        if interval.is_zero() {
+            return Err(Error::Invalid(
+                "merged progress watch interval must be nonzero".into(),
+            ));
+        }
+        loop {
+            let page = self.merged_progress(cursor, limit)?;
+            if !page.frames.is_empty() {
+                return Ok(page);
+            }
+            tokio::time::sleep(interval).await;
+        }
     }
 
     /// Capture an explicit forward-only boundary. Earlier overwritten progress
@@ -10280,6 +10525,29 @@ impl Scheduler {
         registry: crate::task_scheduler::Registry,
     ) -> Result<crate::task_driver::Driver, Error> {
         self.harness.start_tasks(registry)
+    }
+    pub fn merged_progress_from_now(
+        &self,
+        conversation: Uuid,
+    ) -> Result<MergedProgressCursor, Error> {
+        self.harness.merged_progress_from_now(conversation)
+    }
+    pub fn merged_progress(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<MergedProgressPage, Error> {
+        self.harness.merged_progress(cursor, limit)
+    }
+    pub async fn watch_merged_progress(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<MergedProgressPage, Error> {
+        self.harness
+            .watch_merged_progress(cursor, limit, interval)
+            .await
     }
     pub fn progress_history_from_now(
         &self,
