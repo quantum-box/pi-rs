@@ -369,6 +369,13 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
             .await,
             Outcome::Failed(_)
         ));
+        for path in ["file://xn--bad-.☃/share", "file://xn--bad-.%E2%98%83/share"] {
+            assert!(matches!(
+                tool.invoke(json!({"pattern":"*", "path":path}), context())
+                    .await,
+                Outcome::Failed(_)
+            ));
+        }
         assert_eq!(backend.exists.load(Ordering::SeqCst), 2);
         assert!(
             matches!(tool.invoke(json!({"pattern":"*", "path":format!("{base}bad%5Cname")}), context()).await, Outcome::Failed(message) if message.contains("encoded"))

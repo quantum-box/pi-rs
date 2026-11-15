@@ -221,6 +221,29 @@ mod tests {
             assert!(malformed_punycode_url(input).is_none(), "{input}");
         }
     }
+    #[test]
+    fn non_ascii_hosts_keep_strict_whatwg_validation() {
+        for input in [
+            "file://xn--bad-.☃/share",
+            "file://xn--bad-.%E2%98%83/share",
+            "file://☃.xn--bad-/share",
+            "file://xn--bad-.Ｅ/share",
+            "file://xn--bad-.☃.127/share",
+            "file://xn--bad-.☃%40evil/share",
+            "file://xn--bad-.%C0%AF/share",
+        ] {
+            assert!(url::Url::parse(input).is_err(), "{input}");
+            assert!(malformed_punycode_url(input).is_none(), "{input}");
+        }
+        for input in [
+            "file://xn--zzzzzzＥ/share",
+            "file://xn--zzzzzz%EF%BC%A5/share",
+        ] {
+            let url = url::Url::parse(input).unwrap();
+            assert_eq!(url.host_str(), Some("xn--zzzzzze"));
+            assert_eq!(idna::domain_to_unicode(url.host_str().unwrap()).0, "箥糪紡");
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn windows_file_urls_keep_unicode_unc_and_drive_paths() {
@@ -242,5 +265,10 @@ mod tests {
             to_file_path("file://%78n--bad-%2exn--n3h/share/a%20b").unwrap(),
             PathBuf::from(r"\\xn--bad-.☃\share\a b")
         );
+        assert_eq!(
+            to_file_path("file://xn--zzzzzz%EF%BC%A5/share").unwrap(),
+            PathBuf::from(r"\\箥糪紡\share")
+        );
+        assert!(to_file_path("file://xn--bad-.%E2%98%83/share").is_err());
     }
 }
