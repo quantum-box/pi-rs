@@ -19,8 +19,8 @@ Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
 Single-line extension input dialogs remove pasted line breaks and expand tabs
-to four spaces, while multiline editor dialogs retain pasted newlines. The
-native one MiB response limit applies after paste sanitization and expansion.
+to four spaces, while multiline editor dialogs normalize CRLF and CR to newlines.
+The native one MiB response limit applies after paste sanitization and expansion.
 
 OpenAI Responses streams both reasoning text and reasoning summary text as
 thinking deltas. Completed reasoning items retain their summary when present,

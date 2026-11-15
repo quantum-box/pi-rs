@@ -86,6 +86,9 @@ impl Dialog {
     pub fn paste(&mut self, text: &str) {
         let text = match self.request {
             UiRequest::Input { .. } => Cow::Owned(text.replace(['\r', '\n'], "")),
+            UiRequest::Editor { .. } if text.contains('\r') => {
+                Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+            }
             UiRequest::Editor { .. } => Cow::Borrowed(text),
             _ => return,
         };
@@ -412,8 +415,8 @@ mod tests {
                 timeout: None,
             },
         );
-        multiline.paste("a\nb\tc");
-        assert_eq!(multiline.editor.text, "a\nb    c");
+        multiline.paste("a\r\nb\rc\nd\te");
+        assert_eq!(multiline.editor.text, "a\nb\nc\nd    e");
     }
 
     #[test]
