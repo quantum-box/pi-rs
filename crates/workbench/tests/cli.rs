@@ -5577,6 +5577,13 @@ else:
 #[test]
 fn rpc_discovered_prompt_reports_extension_source() {
     use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let root = tempfile::tempdir().unwrap();
     let extension = root.path().join("fixture.js");
     let prompt = root.path().join("discovered.md");
@@ -5590,25 +5597,27 @@ else: result=None
 print(json.dumps({'version':1,'response':{'Ok':result}}))
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .current_dir(root.path())
-        .env("PI_RS_HOME", root.path().join("home"))
-        .args([
-            "--mode",
-            "rpc",
-            "--no-mcp",
-            "--no-trust",
-            "--offline",
-            "--extension",
-        ])
-        .arg(&extension)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let output = child.stdout.take().unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--mode",
+                "rpc",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
@@ -5622,8 +5631,10 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     });
     writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
     input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
     let response = loop {
-        let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver.recv_timeout(remaining).unwrap();
         if event["id"] == "commands" {
             break event;
         }
@@ -5643,13 +5654,16 @@ print(json.dumps({'version':1,'response':{'Ok':result}}))
     );
     writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
     drop(input);
-    let output = child.wait_with_output().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "RPC process did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
     reader.join().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(status.success(), "RPC process exited with {status}");
 }
 
 #[cfg(unix)]
