@@ -228,6 +228,19 @@ async fn abort_result_includes_owned_foreground_inputs_and_skips_background() {
         scheduler.conversation(background).unwrap().submissions[1].status,
         Status::Queued
     );
+    let background_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.abort_and_wait_with_background_withdrawn(parent),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(background_result.withdrawn.len(), 1);
+    assert_eq!(background_result.withdrawn[0].conversation_id, background);
+    assert_eq!(
+        background_result.withdrawn[0].submission.content,
+        format!("queued-{background}")
+    );
     scheduler.shutdown().await.unwrap();
     tokio::task::spawn_blocking(move || driver.shutdown())
         .await
