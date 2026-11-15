@@ -367,7 +367,7 @@ fn extension_entry(dir: &Path, count: &mut usize) -> Option<Option<Vec<PathBuf>>
                 return None;
             }
             if let Some(entry) = entry.as_str() {
-                let path = dir.join(entry);
+                let path = super::normalize_filter_path(&dir.join(entry));
                 if path.exists() {
                     paths.push(path);
                 }
@@ -432,6 +432,61 @@ mod tests {
                 vec![root.path().join("prompts/sub")]
             );
         }
+    }
+
+    #[test]
+    fn nested_extension_manifest_paths_are_normalized_before_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("extensions")).unwrap();
+        std::fs::write(root.path().join("entry.ts"), "extension").unwrap();
+        std::fs::write(
+            root.path().join("extensions/package.json"),
+            serde_json::json!({"pi":{"extensions":["../entry.ts"]}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"extensions":["extensions","-entry.ts"]}}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            candidates(root.path(), Kind::Extension)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_extension_manifest_preserves_non_utf8_directories() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        let extensions = root.path().join("extensions");
+        let nested = extensions.join(std::ffi::OsString::from_vec(vec![b'x', 0xff]));
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(extensions.join("entry.ts"), "extension").unwrap();
+        std::fs::write(
+            nested.join("package.json"),
+            serde_json::json!({"pi":{"extensions":["../entry.ts"]}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"extensions":["extensions","-extensions/entry.ts"]}})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(
+            candidates(root.path(), Kind::Extension)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            extension_entry(&nested, &mut 0).unwrap().unwrap(),
+            vec![extensions.join("entry.ts")]
+        );
     }
 
     #[test]

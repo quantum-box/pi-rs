@@ -992,15 +992,19 @@ fn filter_home_dir() -> Option<PathBuf> {
 }
 
 fn normalize_filter_home(home: &Path, suffix: &str) -> PathBuf {
-    use std::path::Component;
     // Node's path.join does not let a later absolute component replace home.
     let joined = if home.as_os_str().is_empty() {
         suffix.to_owned()
     } else {
         format!("{}/{suffix}", home.to_string_lossy())
     };
+    normalize_filter_path(Path::new(&joined))
+}
+
+fn normalize_filter_path(path: &Path) -> PathBuf {
+    use std::path::Component;
     let mut result = PathBuf::new();
-    for component in Path::new(&joined).components() {
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
