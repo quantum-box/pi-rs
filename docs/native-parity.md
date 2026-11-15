@@ -1933,8 +1933,13 @@ A native package declaration with `autoload: false` writes only paths matched
 by its ordered patterns. A project delta is evaluated before each matching user
 declaration, and its explicit enabled or disabled paths take precedence.
 Unmatched paths can be supplied by the user declarations. The delta resolves
-against the first matching user source, including its revision. An ordinary
-project declaration replaces the matching user selections.
+against the first usable cached user source, falling back to the first declared
+source when none is cached. This native fallback can apply a project delta to a
+later revision after an earlier revision fails to install.
+An ordinary project declaration replaces the matching user selections. Native Git and
+Cargo caches remain per source revision; for layered declarations, matching
+relative resource paths share first-writer precedence across those caches.
+Resources present only in another cached revision can therefore remain visible.
 
 Unit and CLI fixtures cover standalone explicit selection, exclusions, ordered
 re-inclusion, inherited user filters and an ordinary empty-array replacement.

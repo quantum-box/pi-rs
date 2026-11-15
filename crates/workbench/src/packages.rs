@@ -217,20 +217,40 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     resolve_package_resources(args, transient, false)
 }
 
+#[derive(PartialEq, Eq)]
+enum ResourceLocation {
+    WithinPackage(PathBuf),
+    BuiltExecutable(std::ffi::OsString),
+    External(PathBuf),
+}
 #[derive(Default)]
 struct ResourceSelections {
-    entries: Vec<(PathBuf, bool)>,
+    entries: Vec<(PathBuf, bool, String, ResourceLocation)>,
 }
 impl ResourceSelections {
-    fn insert(&mut self, path: &Path, enabled: bool) {
-        if !self.entries.iter().any(|(existing, _)| existing == path) {
-            self.entries.push((path.to_path_buf(), enabled));
+    fn insert(&mut self, path: &Path, enabled: bool, identity: &str, root: &Path, extension: bool) {
+        let relative = match path.strip_prefix(root) {
+            Ok(relative) => ResourceLocation::WithinPackage(relative.to_path_buf()),
+            Err(_) if extension => ResourceLocation::BuiltExecutable(
+                path.file_name().unwrap_or(path.as_os_str()).to_os_string(),
+            ),
+            Err(_) => ResourceLocation::External(path.to_path_buf()),
+        };
+        if !self
+            .entries
+            .iter()
+            .any(|(existing, _, prior_identity, prior_relative)| {
+                existing == path || (prior_identity == identity && prior_relative == &relative)
+            })
+        {
+            self.entries
+                .push((path.to_path_buf(), enabled, identity.to_owned(), relative));
         }
     }
     fn enabled(self) -> Vec<PathBuf> {
         self.entries
             .into_iter()
-            .filter_map(|(path, enabled)| enabled.then_some(path))
+            .filter_map(|(path, enabled, _, _)| enabled.then_some(path))
             .collect()
     }
 }
@@ -260,6 +280,7 @@ fn resolve_package_resources(
         // Single-file native sources retain their existing handling; Pi loads
         // such files directly and does not apply directory package filters.
         let legacy = local && Path::new(&declaration.source).is_file();
+        let identity = source_identity(&declaration.source);
         for (name, paths, target) in [
             ("extensions", &package.resources.extensions, &mut extensions),
             ("skills", &package.resources.skills, &mut skills),
@@ -277,7 +298,13 @@ fn resolve_package_resources(
             };
             for (path, state) in paths.iter().zip(states) {
                 if let Some(enabled) = state {
-                    target.insert(path, enabled);
+                    target.insert(
+                        path,
+                        enabled,
+                        &identity,
+                        &package.root,
+                        name == "extensions",
+                    );
                 }
             }
         }
@@ -1230,15 +1257,24 @@ fn resource_declarations(args: &Cli, transient: bool) -> Result<Vec<Declaration>
     } else {
         Vec::new()
     };
+    let cached = index()?;
     let mut plan: Vec<Declaration> = Vec::new();
     let mut projects_by_identity = BTreeMap::new();
     for mut entry in projects {
         let identity = source_identity(&entry.source);
         if entry.value["autoload"] == false {
-            if let Some(user) = users
+            let first = users
                 .iter()
-                .find(|user| source_identity(&user.source) == identity)
-            {
+                .find(|user| source_identity(&user.source) == identity);
+            let available = users.iter().find(|user| {
+                source_identity(&user.source) == identity
+                    && cached
+                        .get(&key(&user.source))
+                        .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
+                        .and_then(revalidate_cached_package)
+                        .is_some()
+            });
+            if let Some(user) = available.or(first) {
                 entry.source = user.source.clone();
             }
         }
@@ -2523,6 +2559,72 @@ mod tests {
         assert!(plan[0].source.ends_with("#user"));
         assert!(plan[1].source.ends_with("#user"));
         assert!(plan[2].source.ends_with("#other"));
+        // Different cached checkouts must not bypass the first checkout's
+        // project exclusion when Pi resolves them to one managed Git path.
+        let saved_index = std::fs::read(agent.join("packages/index.json")).unwrap();
+        let mut revision_index: serde_json::Map<String, Value> =
+            serde_json::from_slice(&saved_index).unwrap();
+        for (source, root) in [
+            ("git:https://example.com/org/repo#user", &sources[0]),
+            ("git:https://example.com/org/repo#other", &sources[1]),
+        ] {
+            let resources =
+                collect_package_resources(Path::new(root), &json!({}), Vec::new()).unwrap();
+            revision_index.insert(
+                key(source),
+                serde_json::to_value(Installed {
+                    source: source.into(),
+                    root: PathBuf::from(root),
+                    version: None,
+                    resources,
+                })
+                .unwrap(),
+            );
+        }
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(revision_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(directory.join(".pi/settings.json"), json!({"packages":[
+            {"source":"git:https://example.com/org/repo#project","autoload":false,"prompts":["-prompts/demo.md"]}
+        ]}).to_string()).unwrap();
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        // If the first source is unavailable, the later source still works.
+        let mut later_only: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(agent.join("packages/index.json")).unwrap())
+                .unwrap();
+        later_only.remove(&key("git:https://example.com/org/repo#user"));
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(later_only).to_string(),
+        )
+        .unwrap();
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        args.offline = true;
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        args.offline = false;
+        let mut broken: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(agent.join("packages/index.json")).unwrap())
+                .unwrap();
+        let unavailable = Installed {
+            source: "git:https://example.com/org/repo#user".into(),
+            root: directory.join("deleted-checkout"),
+            version: None,
+            resources: PackageResources::default(),
+        };
+        broken.insert(
+            key(&unavailable.source),
+            serde_json::to_value(unavailable).unwrap(),
+        );
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(broken).to_string(),
+        )
+        .unwrap();
+        assert!(resources_for(&args, false).unwrap().prompts.is_empty());
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::write(agent.join("packages/index.json"), saved_index).unwrap();
         // Temporary sources replace configured declarations with the same
         // identity, including when their revisions differ.
         args.extensions
@@ -2611,6 +2713,16 @@ mod tests {
         std::fs::remove_file(agent.join("packages/index.json")).unwrap();
         std::fs::remove_file(directory.join("first/prompts/demo.md")).unwrap();
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn selection_deduplicates_external_binaries_by_package_identity() {
+        let mut entries = ResourceSelections::default();
+        let first = Path::new("/cache/one/bin/tool");
+        let second = Path::new("/cache/two/bin/tool");
+        entries.insert(first, false, "cargo:example", Path::new("/src/one"), true);
+        entries.insert(second, true, "cargo:example", Path::new("/src/two"), true);
+        assert!(entries.enabled().is_empty());
     }
 
     #[test]
