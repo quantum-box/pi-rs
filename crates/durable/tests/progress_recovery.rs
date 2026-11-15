@@ -908,6 +908,8 @@ fn merged_document_watch_readers_do_not_skip_concurrent_commits() {
         cursor = page.next;
         if page.frames.is_empty() {
             if thread.is_finished() {
+                // The writer can finish after this page's snapshot was taken.
+                // Join first, then drain a page observed after the final commit.
                 break;
             }
             std::thread::yield_now();
@@ -916,6 +918,14 @@ fn merged_document_watch_readers_do_not_skip_concurrent_commits() {
         }
     }
     thread.join().unwrap();
+    loop {
+        let page = h.merged_progress(&cursor, NonZeroUsize::MIN).unwrap();
+        cursor = page.next;
+        if page.frames.is_empty() {
+            break;
+        }
+        frames.extend(page.frames);
+    }
     assert_eq!(frames.len(), 30);
     for (index, frame) in frames.iter().enumerate() {
         assert_eq!(frame.documents.len(), 1);

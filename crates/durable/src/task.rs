@@ -61,6 +61,7 @@ pub enum TaskState {
     Running,
     Waiting(WaitFor),
     Completing(Value),
+    CompletingFailed(String),
     Succeeded(Value),
     Failed(String),
     Cancelled,
@@ -443,11 +444,28 @@ impl Task {
         Ok(())
     }
 
-    pub(crate) fn finalize_success(&mut self) -> Result<(), TransitionError> {
-        let TaskState::Completing(value) = &self.state else {
-            return Err(TransitionError::InvalidState);
+    pub fn is_completing(&self) -> bool {
+        matches!(
+            self.state,
+            TaskState::Completing(_) | TaskState::CompletingFailed(_)
+        )
+    }
+
+    pub(crate) fn hold_failure(&mut self, reason: String) -> Result<(), TransitionError> {
+        self.fail(reason)?;
+        self.state = match std::mem::replace(&mut self.state, TaskState::Ready) {
+            TaskState::Failed(reason) => TaskState::CompletingFailed(reason),
+            _ => unreachable!(),
         };
-        self.state = TaskState::Succeeded(value.clone());
+        Ok(())
+    }
+
+    pub(crate) fn finalize(&mut self) -> Result<(), TransitionError> {
+        self.state = match &self.state {
+            TaskState::Completing(value) => TaskState::Succeeded(value.clone()),
+            TaskState::CompletingFailed(reason) => TaskState::Failed(reason.clone()),
+            _ => return Err(TransitionError::InvalidState),
+        };
         Ok(())
     }
 
@@ -477,6 +495,7 @@ impl Task {
         if matches!(
             self.state,
             TaskState::Completing(_)
+                | TaskState::CompletingFailed(_)
                 | TaskState::Succeeded(_)
                 | TaskState::Failed(_)
                 | TaskState::Cancelled

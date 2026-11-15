@@ -453,7 +453,7 @@ impl<'a> TaskStore<'a> {
                     }
                     if let Some(parent) = created.get(&id) {
                         if matches!(task.owner(), TaskOwner::Task(owner) if *owner == id)
-                            && matches!(parent.state(), TaskState::Completing(_))
+                            && parent.is_completing()
                         {
                             return Err(Error::InvalidOwnership);
                         }
@@ -472,7 +472,7 @@ impl<'a> TaskStore<'a> {
                         match parent {
                             Some(parent) => {
                                 if matches!(task.owner(), TaskOwner::Task(owner) if *owner == id)
-                                    && matches!(parent.task.state(), TaskState::Completing(_))
+                                    && parent.task.is_completing()
                                 {
                                     return Err(Error::InvalidOwnership);
                                 }
@@ -627,8 +627,7 @@ impl<'a> TaskStore<'a> {
             let target = self
                 .load(signal.task_id)?
                 .ok_or(Error::SignalTargetNotFound)?;
-            if target.task.is_terminal() || matches!(target.task.state(), TaskState::Completing(_))
-            {
+            if target.task.is_terminal() || target.task.is_completing() {
                 return Err(Error::SignalTargetClosed);
             }
             // The revision fences the scan against all concurrent insertions,
@@ -791,9 +790,7 @@ impl<'a> TaskStore<'a> {
         let Some(target) = target else {
             return Ok((SignalResult::NotFound, batch));
         };
-        if target.task.is_terminal()
-            || target.task.abort_requested()
-            || matches!(target.task.state(), TaskState::Completing(_))
+        if target.task.is_terminal() || target.task.abort_requested() || target.task.is_completing()
         {
             return Ok((SignalResult::Closed, batch));
         }
