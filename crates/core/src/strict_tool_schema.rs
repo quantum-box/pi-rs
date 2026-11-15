@@ -92,6 +92,9 @@ fn deserialize_constraint<'de, D: Deserializer<'de>>(
 }
 
 /// Resolve a strict schema for a tool, applying its fallback policy.
+///
+/// Schemas must also support safe argument normalization before they can be
+/// advertised as strict. Unsupported normalization falls back or fails.
 pub fn resolve_strict_tool_schema(
     name: &str,
     schema: &Value,
@@ -100,7 +103,9 @@ pub fn resolve_strict_tool_schema(
     unsupported: impl Fn(&str, &Value) -> bool,
 ) -> Result<Option<Value>, StrictSchemaError> {
     let failure = if supported {
-        match strict_tool_schema(schema, unsupported) {
+        match strict_tool_schema(schema, unsupported)
+            .and_then(|strict| null_normalization_plan(schema).map(|_| strict))
+        {
             Ok(schema) => return Ok(Some(schema)),
             Err(error) => error.0,
         }
@@ -120,18 +125,46 @@ pub fn resolve_strict_tool_schema(
 /// Strict schemas make optional fields required and nullable. A null supplied
 /// for an optional field that rejects null is treated as an omitted field. The
 /// original arguments remain available for journaling and provider replay.
-/// Only schemas accepted by [`strict_tool_schema`] are supported.
+/// Schemas must pass [`strict_tool_schema`]; dynamic references and nested
+/// dialect declarations are also rejected.
 pub fn normalize_strict_tool_arguments(
     schema: &Value,
     arguments: &Value,
 ) -> Result<Value, StrictSchemaError> {
-    strict_tool_schema(schema, |key, _| {
-        matches!(key, "$dynamicRef" | "$recursiveRef")
-    })?;
-    let plan = NullNormalizationPlan::build(schema, schema.get("$schema"))?;
+    let plan = null_normalization_plan(schema)?;
     let mut normalized = arguments.clone();
     plan.apply(&mut normalized);
     Ok(normalized)
+}
+
+fn null_normalization_plan(schema: &Value) -> Result<NullNormalizationPlan, StrictSchemaError> {
+    strict_tool_schema(schema, |key, _| {
+        matches!(key, "$dynamicRef" | "$recursiveRef")
+    })?;
+    reject_nested_dialects(schema, true)?;
+    NullNormalizationPlan::build(schema, schema.get("$schema"))
+}
+
+fn reject_nested_dialects(schema: &Value, root: bool) -> Result<(), StrictSchemaError> {
+    if !root && schema.get("$schema").is_some() {
+        return Err(StrictSchemaError(
+            "nested schema dialects are unsupported".into(),
+        ));
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for property in properties.values() {
+            reject_nested_dialects(property, false)?;
+        }
+    }
+    if let Some(item) = schema.get("items") {
+        reject_nested_dialects(item, false)?;
+    }
+    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
+        for variant in variants {
+            reject_nested_dialects(variant, false)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -441,6 +474,25 @@ mod tests {
         let dynamic =
             json!({"type":"object","properties":{"x":{"type":"string","$dynamicRef":"#node"}}});
         assert!(normalize_strict_tool_arguments(&dynamic, &json!({"x":null})).is_err());
+        let mixed = json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{
+            "x":{"$id":"https://example.test/nested","$schema":"http://json-schema.org/draft-04/schema#","type":["string","null"],"const":"x"}
+        }});
+        assert!(normalize_strict_tool_arguments(&mixed, &json!({"x":null})).is_err());
+        assert_eq!(
+            resolve_strict_tool_schema("x", &mixed, StrictToolPolicy::Prefer, true, |_, _| false)
+                .unwrap(),
+            None
+        );
+        assert!(
+            resolve_strict_tool_schema("x", &mixed, StrictToolPolicy::Require, true, |_, _| false)
+                .is_err()
+        );
+        for nested in [
+            json!({"type":"object","properties":{"x":{"type":"array","items":{"type":"string","$schema":"http://json-schema.org/draft-04/schema#"}}}}),
+            json!({"type":"object","properties":{"x":{"anyOf":[{"type":"string","$schema":"http://json-schema.org/draft-04/schema#"},{"type":"null"}]}}}),
+        ] {
+            assert!(normalize_strict_tool_arguments(&nested, &json!({})).is_err());
+        }
     }
 
     #[test]
