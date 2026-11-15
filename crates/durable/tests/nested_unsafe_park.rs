@@ -672,19 +672,47 @@ async fn reopen_rejects_same_spec_different_parent_or_child_tenant_for_safe_and_
 async fn safe_legacy_suspension_does_not_poll_after_parent_becomes_unsafe() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let (scheduler, id, _) = start_parked(
+    let (scheduler, id, operation) = start_parked(
         root,
         options_custom(
             root,
             "finish",
             Some(1),
             "parent/tenant-a",
-            None,
+            Some("child/tenant-a"),
             ReplayPolicy::Safe,
         ),
     )
     .await;
     scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(root.join("db")).unwrap();
+    let (key, entry) = store
+        .list(format!("nested/{operation}/").as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut record: Value = serde_json::from_slice(&entry.value).unwrap();
+    assert!(
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_identity")
+            .is_some()
+    );
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&record).unwrap(),
+            }],
+        )
+        .unwrap();
+    drop(store);
     let before = count(root, "child-polls");
     std::fs::write(root.join("finish"), b"ready").unwrap();
     let scheduler = Scheduler::open(
@@ -694,7 +722,7 @@ async fn safe_legacy_suspension_does_not_poll_after_parent_becomes_unsafe() {
             "finish",
             Some(1),
             "parent/tenant-a",
-            None,
+            Some("child/tenant-a"),
             ReplayPolicy::Unsafe,
         ),
     )
@@ -1293,7 +1321,9 @@ async fn safe_unbound_child_poll_holds_registered_identity_lease() {
         root: root.into(),
         handle: slot.clone(),
     });
-    *slot.lock().unwrap() = Some(pi_rs_durable::nested_identity::register(&child, None).unwrap());
+    *slot.lock().unwrap() = Some(
+        pi_rs_durable::nested_identity::register(&child, Some("child/tenant-a".into())).unwrap(),
+    );
     let opts = Options {
         model: Arc::new(ModelStub),
         tools: vec![
@@ -1317,6 +1347,67 @@ async fn safe_unbound_child_poll_holds_registered_identity_lease() {
         .unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     until(|| count(root, "child-busy") > 0).await;
+    let operation = scheduler.blocked(id).unwrap().unwrap().0;
+    scheduler.shutdown().await.unwrap();
+    let store = durable_store::Store::open(root.join("db")).unwrap();
+    let (key, entry) = store
+        .list(format!("nested/{operation}/").as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut record: Value = serde_json::from_slice(&entry.value).unwrap();
+    assert!(
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_identity")
+            .is_some()
+    );
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&record).unwrap(),
+            }],
+        )
+        .unwrap();
+    drop(store);
+    let slot = Arc::new(std::sync::Mutex::new(None));
+    let parent = Arc::new(KeyedToolAdapter::new(Parent {
+        root: root.into(),
+        stage: "finish".into(),
+        version: Some(1),
+        identity: "parent/tenant-a".into(),
+    }))
+    .register(ReplayPolicy::Safe);
+    let child: Arc<dyn Tool> = Arc::new(ReentrantChild {
+        root: root.into(),
+        handle: slot.clone(),
+    });
+    *slot.lock().unwrap() = Some(
+        pi_rs_durable::nested_identity::register(&child, Some("child/tenant-a".into())).unwrap(),
+    );
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent,
+            RegisteredTool {
+                tool: child,
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let before = count(root, "child-busy");
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    until(|| count(root, "child-busy") > before).await;
     std::fs::write(root.join("finish"), b"ready").unwrap();
     wait(&mut scheduler, id).await;
     assert!(scheduler.blocked(id).unwrap().is_none());

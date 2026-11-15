@@ -117,12 +117,6 @@ fn durable_tool_identity(tool: &std::sync::Arc<dyn pi_rs_core::Tool>) -> Option<
 }
 
 impl PendingPoll {
-    pub(crate) fn matches_identity(&self, tool: &std::sync::Arc<dyn pi_rs_core::Tool>) -> bool {
-        self.record
-            .durable_identity
-            .as_ref()
-            .is_none_or(|identity| durable_tool_identity(tool).as_ref() == Some(identity))
-    }
     pub(crate) fn expected_identity(&self) -> Option<&str> {
         self.record.durable_identity.as_deref()
     }
@@ -365,6 +359,27 @@ pub(crate) fn lease_children(
     } else {
         Ok(Ok(leases))
     }
+}
+
+pub(crate) fn children_identity_busy(
+    store: &durable_store::Store,
+    root: Uuid,
+    tools: &std::collections::HashMap<String, RegisteredTool>,
+) -> Result<bool, crate::runtime::Error> {
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if let (Some(identity), Some(reg)) =
+            (record.durable_identity.as_deref(), tools.get(&record.name))
+        {
+            if matches!(
+                crate::nested_identity::checked_lease(&reg.tool, identity),
+                Err(crate::nested_identity::LeaseFailure::Busy)
+            ) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 // Automatic replay is restricted to a root with only terminal records and at
@@ -1436,6 +1451,7 @@ impl NestedHost {
             Err(()) => return self.fail("nested tool identity is busy"),
         };
         let dispatch_identity = identity_lease.as_ref().and_then(|guard| (**guard).clone());
+        let registered_unset = identity_lease.as_ref().is_some_and(|guard| guard.is_none());
         let (mut record, _version) = if let Some(entry) = entry {
             let record: Record = match serde_json::from_slice(&entry.value) {
                 Ok(v) => v,
@@ -1460,6 +1476,9 @@ impl NestedHost {
             if record.staged_outcome.is_some() {
                 return self.finish_staged(&key, record).await;
             }
+            if registered_unset {
+                return self.fail("registered nested tool identity is unset");
+            }
             if !record.before_pending
                 && (record.policy != ReplayPolicy::Safe || reg.replay != ReplayPolicy::Safe)
             {
@@ -1467,6 +1486,9 @@ impl NestedHost {
             }
             (record, entry.version)
         } else {
+            if registered_unset {
+                return self.fail("registered nested tool identity is unset");
+            }
             let invocation = Invocation {
                 operation_id: Uuid::new_v4(),
                 call: ToolCall {
@@ -2165,7 +2187,7 @@ impl NestedHost {
                 Some(lease)
             } else {
                 match crate::nested_identity::execution_lease(&reg.tool) {
-                    Ok(Some(lease)) => Some(lease),
+                    Ok(Some(lease)) if lease.is_some() => Some(lease),
                     Ok(None) => None,
                     _ => {
                         return self.pending_failure(
@@ -2536,6 +2558,134 @@ mod tests {
             2,
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn registered_unset_child_cannot_dispatch_until_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let tool = Arc::new(Polling {
+            invoked: AtomicUsize::new(0),
+            mode: AtomicUsize::new(2),
+            ids: Mutex::new(vec![]),
+        });
+        let erased: Arc<dyn Tool> = tool.clone();
+        let handle =
+            crate::nested_identity::register(&erased, Some("test-backend:polling:v1".into()))
+                .unwrap();
+        let panicking_handle = handle.clone();
+        assert!(
+            tokio::spawn(async move {
+                panicking_handle
+                    .update(Some("changed".into()), || panic!("partial update"))
+                    .await
+            })
+            .await
+            .is_err()
+        );
+        let host = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(
+            host.call_keyed_unpolled_with_id("key", "polling", json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(tool.invoked.load(Ordering::SeqCst), 0);
+        assert!(
+            host.shared
+                .owner
+                .store()
+                .list(format!("nested/{root}/").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        drop(host);
+        handle
+            .update(Some("test-backend:polling:v1".into()), || {})
+            .await
+            .unwrap();
+        let host = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(matches!(
+            host.call_keyed_unpolled_with_id("key", "polling", json!({}))
+                .await
+                .unwrap()
+                .outcome,
+            Outcome::Pending { .. }
+        ));
+        assert_eq!(tool.invoked.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn invalidated_registered_legacy_job_cannot_poll_until_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let tool = Arc::new(Polling {
+            invoked: AtomicUsize::new(0),
+            mode: AtomicUsize::new(2),
+            ids: Mutex::new(vec![]),
+        });
+        let erased: Arc<dyn Tool> = tool.clone();
+        let handle =
+            crate::nested_identity::register(&erased, Some("test-backend:polling:v1".into()))
+                .unwrap();
+        let host = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        host.call_keyed_unpolled_with_id("key", "polling", json!({}))
+            .await
+            .unwrap();
+        let store = host.shared.owner.store();
+        let (key, entry) = store
+            .list(format!("nested/{root}/").as_bytes())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut record: Value = serde_json::from_slice(&entry.value).unwrap();
+        assert!(
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("durable_identity")
+                .is_some()
+        );
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(host);
+        let failing = handle.clone();
+        assert!(
+            tokio::spawn(async move {
+                failing
+                    .update(Some("changed".into()), || panic!("partial update"))
+                    .await
+            })
+            .await
+            .is_err()
+        );
+        let host = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(matches!(
+            host.call_keyed("key", "polling", json!({})).await,
+            Outcome::Unknown(_)
+        ));
+        assert_eq!(tool.ids.lock().unwrap().len(), 1);
+        drop(host);
+        handle
+            .update(Some("test-backend:polling:v1".into()), || {})
+            .await
+            .unwrap();
+        let host = polling_host(&path, root, tool.clone(), CancellationToken::new());
+        assert!(matches!(
+            host.call_keyed("key", "polling", json!({})).await,
+            Outcome::Succeeded(_)
+        ));
+        assert_eq!(tool.ids.lock().unwrap().len(), 2);
     }
     #[tokio::test]
     async fn checkpoint_is_bounded_and_wake_is_root_scoped_and_revoked() {

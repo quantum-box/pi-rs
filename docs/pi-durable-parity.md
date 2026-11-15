@@ -670,6 +670,10 @@ they require authoritative parent reconciliation.
 For compatibility, unbound pending jobs under replay-safe parents retain legacy
 polling; their records cannot verify the backend or tenant, so the host must
 restore the original backend. Unsafe parks never poll or resume unbound jobs.
+Registered tools whose identity is unset cannot dispatch new children or poll
+legacy jobs, including after an update panic. A temporarily busy registered
+identity causes suspended polling to retry on a bounded timer without holding
+the conversation worker lock; a changed or missing identity does not retry.
 An operator who has
 independently verified the original backend and reference can use
 `bind_nested_pending_identity` to bind a missing identity to the currently

@@ -326,6 +326,158 @@ async fn busy_identity_does_not_claim_and_leases_survive_until_commit() {
 }
 
 #[tokio::test]
+async fn suspended_poll_retries_busy_parent_and_child_without_worker_lock() {
+    for mode in ["unsafe-parent", "unsafe-child", "safe-child", "safe-legacy"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = if mode.starts_with("safe-") {
+            ReplayPolicy::Safe
+        } else {
+            ReplayPolicy::Unsafe
+        };
+        let (opts, parent, child) = options_with_handles(root, 1, false, policy);
+        let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let before = install(id, "before-suspended-poll");
+        let busy = install(id, "suspended-busy");
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), before.reached.notified())
+            .await
+            .unwrap();
+        if mode == "safe-legacy" {
+            strip_pending_identity(&scheduler, id);
+        }
+        let target = if mode == "unsafe-parent" {
+            parent
+        } else {
+            child
+        };
+        let identity = if mode == "unsafe-parent" {
+            "test-parent/tenant-a"
+        } else {
+            "test-backend:child:v1"
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(target.update(Some(identity.into()), || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        before.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), busy.reached.notified())
+            .await
+            .unwrap();
+        let lock = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .worker;
+        let guard = tokio::time::timeout(Duration::from_secs(2), lock.lock())
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(!root.join("poll-entered").exists(), "{mode}");
+        std::fs::write(root.join("release"), b"ready").unwrap();
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap().is_ok());
+        busy.release.notify_one();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none(), "{mode}");
+        assert_eq!(count(root, "wake-effects"), 1, "{mode}");
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+fn strip_pending_identity(scheduler: &Scheduler, id: Uuid) {
+    let operation = scheduler.blocked(id).unwrap().unwrap().0;
+    let store = scheduler.harness.owner.store();
+    let (key, entry) = store
+        .list(format!("nested/{operation}/").as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut record: Value = serde_json::from_slice(&entry.value).unwrap();
+    assert!(
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_identity")
+            .is_some()
+    );
+    store
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&record).unwrap(),
+            }],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn invalidated_registered_legacy_poll_does_not_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (opts, _, child) = options_with_handles(root, 1, false, ReplayPolicy::Safe);
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let before = install(id, "before-suspended-poll");
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), before.reached.notified())
+        .await
+        .unwrap();
+    strip_pending_identity(&scheduler, id);
+    let failing = child.clone();
+    assert!(
+        tokio::spawn(async move {
+            failing
+                .update(Some("changed".into()), || panic!("partial update"))
+                .await
+        })
+        .await
+        .is_err()
+    );
+    before.release.notify_one();
+    wait(&mut scheduler, id).await;
+    assert!(!root.join("poll-entered").exists());
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    child
+        .update(Some("test-backend:child:v1".into()), || {})
+        .await
+        .unwrap();
+    std::fs::write(root.join("release"), b"ready").unwrap();
+    scheduler.schedule(id);
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(count(root, "wake-effects"), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn permanent_parent_or_child_mismatch_blocks_without_claim() {
     for change_parent in [true, false] {
         let dir = tempfile::tempdir().unwrap();

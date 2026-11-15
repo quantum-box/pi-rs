@@ -392,7 +392,9 @@ handle or change it during a call.
 For compatibility, a replay-safe parent's unbound legacy job continues to poll:
 the host must restore the original backend and tenant because such a record
 cannot prove either. If that tool has an identity handle, polling holds its
-read lease even for an unbound legacy record. A bound job with missing or changed registration never
+read lease even for an unbound legacy record; an unset registered identity
+fails closed, including after an update panic. New nested dispatch also refuses
+an unset registered identity. A bound job with missing or changed registration never
 polls. An unsafe park cannot poll or resume with any unbound child. Operators can
 inspect `nested_pending_jobs`, verify the remote reference and tenant through an
 independent authoritative channel, then explicitly call

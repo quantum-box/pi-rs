@@ -16029,6 +16029,8 @@ async fn poll_suspended_nested(
     else {
         return Ok(false);
     };
+    #[cfg(test)]
+    unsafe_park_boundary_tests::checkpoint(id, "before-suspended-poll").await;
     let tools = worker.resolved_tools(&state)?;
     let unsafe_parent = if let Some(proof) = state
         .nested_resume
@@ -16041,13 +16043,32 @@ async fn poll_suspended_nested(
         let Some(reg) = tools.get(&call.name) else {
             return Ok(false);
         };
-        if reg.replay != ReplayPolicy::Unsafe
-            || state.tool_attempt() != Some(proof.attempt)
-            || crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref() != Some(&proof.identity)
-            || !crate::nested::children_match(worker.owner.store(), *operation_id, &tools, true)?
-        {
+        if reg.replay != ReplayPolicy::Unsafe || state.tool_attempt() != Some(proof.attempt) {
             return Ok(false);
         }
+        let parent_lease =
+            match crate::nested_identity::checked_lease(&reg.tool, &proof.identity.identity) {
+                Ok(lease) => lease,
+                Err(crate::nested_identity::LeaseFailure::Busy) => {
+                    #[cfg(test)]
+                    unsafe_park_boundary_tests::checkpoint(id, "suspended-busy").await;
+                    return Ok(true);
+                }
+                Err(crate::nested_identity::LeaseFailure::Mismatch) => return Ok(false),
+            };
+        if crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref() != Some(&proof.identity) {
+            return Ok(false);
+        }
+        match crate::nested::lease_children(worker.owner.store(), *operation_id, &tools)? {
+            Ok(_) => (),
+            Err(crate::nested_identity::LeaseFailure::Busy) => {
+                #[cfg(test)]
+                unsafe_park_boundary_tests::checkpoint(id, "suspended-busy").await;
+                return Ok(true);
+            }
+            Err(crate::nested_identity::LeaseFailure::Mismatch) => return Ok(false),
+        }
+        drop(parent_lease);
         Some((reg.tool.clone(), proof.identity.clone()))
     } else {
         // An unproven suspension may only use the legacy polling path while
@@ -16135,6 +16156,9 @@ async fn poll_suspended_nested(
     }
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
+        if crate::nested::children_identity_busy(worker.owner.store(), *operation_id, &tools)? {
+            return Ok(true);
+        }
         return worker.prepare_nested_resume(&mut state.clone());
     }
     let mut polls = Vec::new();
@@ -16144,7 +16168,6 @@ async fn poll_suspended_nested(
         };
         if !caller_allowed(&state, job.name(), false)
             || reg.replay != job.policy()
-            || !job.matches_identity(&reg.tool)
             || !reg.tool.can_poll()
         {
             continue;
@@ -16156,22 +16179,40 @@ async fn poll_suspended_nested(
         let unsafe_parent = unsafe_parent.clone();
         polls.push(async move {
             let identity_lease = if let Some(expected) = job.expected_identity() {
-                let Some(lease) = crate::nested_identity::lease(&tool, expected) else {
-                    return Ok(false);
+                let lease = match crate::nested_identity::checked_lease(&tool, expected) {
+                    Ok(lease) => lease,
+                    Err(crate::nested_identity::LeaseFailure::Busy) => {
+                        #[cfg(test)]
+                        unsafe_park_boundary_tests::checkpoint(id, "suspended-busy").await;
+                        return Ok(true);
+                    }
+                    Err(crate::nested_identity::LeaseFailure::Mismatch) => return Ok(false),
                 };
                 Some(lease)
             } else if unsafe_parent.is_some() {
                 return Ok(false);
             } else {
                 match crate::nested_identity::execution_lease(&tool) {
-                    Ok(Some(lease)) => Some(lease),
+                    Ok(Some(lease)) if lease.is_some() => Some(lease),
                     Ok(None) => None,
-                    _ => return Ok(false),
+                    Ok(Some(_)) => return Ok(false),
+                    Err(()) => {
+                        #[cfg(test)]
+                        unsafe_park_boundary_tests::checkpoint(id, "suspended-busy").await;
+                        return Ok(true);
+                    }
                 }
             };
             let _parent_lease = if let Some((parent, expected)) = &unsafe_parent {
-                let Some(lease) = crate::nested_identity::lease(parent, &expected.identity) else {
-                    return Ok(false);
+                let lease = match crate::nested_identity::checked_lease(parent, &expected.identity)
+                {
+                    Ok(lease) => lease,
+                    Err(crate::nested_identity::LeaseFailure::Busy) => {
+                        #[cfg(test)]
+                        unsafe_park_boundary_tests::checkpoint(id, "suspended-busy").await;
+                        return Ok(true);
+                    }
+                    Err(crate::nested_identity::LeaseFailure::Mismatch) => return Ok(false),
                 };
                 Some(lease)
             } else {
