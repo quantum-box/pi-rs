@@ -1,3 +1,4 @@
+use crate::runtime::time as platform_time;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
@@ -14,6 +15,20 @@ type BranchModels = BTreeMap<
     (Option<Uuid>, Option<String>, String),
     (Arc<dyn crate::Model>, Option<crate::Limits>),
 >;
+
+type ReservedBranchModel = (Uuid, String, String);
+struct BranchModelReservation {
+    reserved: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
+    key: ReservedBranchModel,
+}
+impl Drop for BranchModelReservation {
+    fn drop(&mut self) {
+        self.reserved
+            .write()
+            .expect("branch reservations")
+            .remove(&self.key);
+    }
+}
 
 /// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
@@ -33,7 +48,8 @@ impl ToolResultPatch {
     }
 }
 
-/// Partial text result update with an independently adjustable error status.
+/// Partial result update with an independently adjustable error status.
+/// Metadata-only patches retain structured content and attachments.
 #[derive(Clone, Debug, Default)]
 pub struct ToolResultPatchV2 {
     pub output: Option<String>,
@@ -43,6 +59,43 @@ pub struct ToolResultPatchV2 {
 
 impl ToolResultPatchV2 {
     pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
+        if let Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } = outcome
+        {
+            let existing_details = match outcome {
+                Outcome::StructuredWithDetails { details, .. } => Some(details.clone()),
+                _ => None,
+            };
+            let details = self.details.or(existing_details);
+            let is_error = self.is_error.unwrap_or_else(|| outcome.is_error());
+            if let Some(output) = self.output {
+                return Ok(Outcome::TextResult {
+                    output,
+                    details,
+                    is_error,
+                });
+            }
+            let mut data = data.clone();
+            if is_error != outcome.is_error() {
+                let object = data
+                    .as_object_mut()
+                    .ok_or("cannot change error status of non-object structured result")?;
+                object.insert("isError".into(), Value::Bool(is_error));
+            }
+            return Ok(match details {
+                Some(details) => Outcome::StructuredWithDetails {
+                    data,
+                    attachments: attachments.clone(),
+                    details,
+                },
+                None => Outcome::Structured {
+                    data,
+                    attachments: attachments.clone(),
+                },
+            });
+        }
         let (output, details, is_error) = match outcome {
             Outcome::Succeeded(output) => (output.clone(), None, false),
             Outcome::SucceededWithDetails { output, details } => {
@@ -219,6 +272,48 @@ pub struct ExtensionResources {
     pub resources: DiscoveredResources,
 }
 
+struct ResourceDiscoveryHost {
+    messages: Arc<dyn ToolHost>,
+    entries: tokio::sync::mpsc::Sender<(
+        CustomEntry,
+        tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+    )>,
+}
+
+#[async_trait::async_trait]
+impl ToolHost for ResourceDiscoveryHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.messages.tools()
+    }
+    async fn call(&self, name: &str, arguments: Value) -> Outcome {
+        self.messages.call(name, arguments).await
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.messages.supports_custom_messages()
+    }
+    async fn send_message(
+        &self,
+        message: CustomMessage,
+        delivery: CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        self.messages.send_message(message, delivery).await
+    }
+    fn supports_custom_entries(&self) -> bool {
+        true
+    }
+    async fn append_entry(&self, entry: CustomEntry) -> ExtensionResult<()> {
+        crate::journal::validate_custom_entry(&entry).map_err(|error| error.to_string())?;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.entries
+            .send((entry, reply))
+            .await
+            .map_err(|_| "resource discovery has finished".to_owned())?;
+        response
+            .await
+            .map_err(|_| "custom entry acknowledgement was lost".to_owned())?
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheWarmingAction {
@@ -315,6 +410,22 @@ pub trait ToolHost: Send + Sync {
     ) -> ExtensionResult<()> {
         Err("custom message delivery is unavailable".into())
     }
+    /// Whether this callback can persist non-message custom entries.
+    fn supports_custom_entries(&self) -> bool {
+        false
+    }
+    /// Close a callback's custom-entry transport after its handler returns.
+    #[doc(hidden)]
+    fn close_custom_entry_scope(&self) {}
+    /// Persist a branch-local entry that is excluded from model context.
+    /// Dropping this future does not guarantee cancellation of an already
+    /// dispatched request, especially across an executable extension boundary.
+    /// An executable request is dispatched once it has acquired its transport
+    /// lock and passed the callback-lifetime check; it can commit after the
+    /// callback returns.
+    async fn append_entry(&self, _entry: CustomEntry) -> ExtensionResult<()> {
+        Err("custom entry persistence is unavailable".into())
+    }
     /// Whether stable, extension-supplied message keys are supported here.
     fn supports_keyed_messages(&self) -> bool {
         false
@@ -409,6 +520,10 @@ pub trait Tool: Send + Sync {
     fn execution(&self) -> ToolExecution {
         ToolExecution::Sequential
     }
+    /// Ephemeral result metadata for event projection, separate from the SDK outcome.
+    fn event_structured_content(&self, _outcome: &Outcome) -> Option<Value> {
+        None
+    }
     /// Maximum serialized result bytes, bounded by the agent's 8 MiB ceiling.
     fn output_limit(&self) -> usize {
         1024 * 1024
@@ -493,6 +608,66 @@ pub struct Compaction {
     pub summary: String,
     /// Retain this many recent user turns, keeping complete assistant/tool groups.
     pub keep_turns: usize,
+}
+
+/// Detailed trigger for the new pre-summary compaction interface.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
+impl CompactionTrigger {
+    pub(crate) fn legacy_reason(self) -> crate::CompactionReason {
+        match self {
+            Self::Manual => crate::CompactionReason::Manual,
+            Self::Threshold | Self::Overflow => crate::CompactionReason::Threshold,
+        }
+    }
+}
+
+/// Prepared model-summary compaction, before an extension or model supplies its summary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPreparation {
+    pub branch_entries: Vec<crate::Record>,
+    pub first_kept_entry: Option<u64>,
+    pub tokens_before: u64,
+    pub reason: CompactionTrigger,
+    pub will_retry: bool,
+    pub custom_instructions: Option<String>,
+}
+
+/// An extension-provided compaction replaces the model-generated summary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCompaction {
+    pub summary: String,
+    pub first_kept_entry: Option<u64>,
+    pub tokens_before: u64,
+    pub usage: Option<crate::Usage>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_value"
+    )]
+    pub details: Option<Value>,
+}
+
+fn deserialize_present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeSummaryCompactionResult {
+    #[serde(default)]
+    pub cancel: bool,
+    pub compaction: Option<ExtensionCompaction>,
 }
 
 /// A hook's reported change status. The host tracks mutable access separately;
@@ -791,6 +966,71 @@ pub enum UserBashReplacement {
     },
 }
 
+tokio::task_local! {
+    pub(crate) static STRUCTURED_PATCH_PRESERVATION: std::cell::Cell<(Option<bool>, bool)>;
+}
+
+// Error status is metadata for structured outcomes. Compare all other data
+// and attachment references without cloning potentially large image payloads.
+fn same_tool_result_content(original: &Outcome, updated: &Outcome) -> bool {
+    fn parts(value: &Outcome) -> Option<(&Value, &[crate::AttachmentRef])> {
+        match value {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } => Some((data, attachments)),
+            _ => None,
+        }
+    }
+    if let (Some((a, aa)), Some((b, ba))) = (parts(original), parts(updated)) {
+        if aa != ba {
+            return false;
+        }
+        return match (a.as_object(), b.as_object()) {
+            (Some(a), Some(b)) => {
+                let left = a.iter().filter(|(key, _)| *key != "isError");
+                left.clone().count() == b.iter().filter(|(key, _)| *key != "isError").count()
+                    && left
+                        .into_iter()
+                        .all(|(key, value)| b.get(key) == Some(value))
+            }
+            _ => a == b,
+        };
+    }
+    if parts(original).is_some() || parts(updated).is_some() {
+        return false;
+    }
+    original.tool_content() == updated.tool_content()
+}
+
+/// Run a result hook while retaining trustworthy output-field presence.
+#[doc(hidden)]
+pub async fn track_tool_result_presence(
+    extension: &dyn Extension,
+    call: &crate::ToolCall,
+    outcome: &Outcome,
+    context: &ToolContext,
+    state: Option<&ExtensionState>,
+    host: Option<Arc<dyn ToolHost>>,
+) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+    let has_host = host.is_some();
+    STRUCTURED_PATCH_PRESERVATION
+        .scope(std::cell::Cell::new((None, false)), async {
+            let (result, explicit) = extension
+                .tool_result_update_with_presence(call, outcome, context, state, host)
+                .await?;
+            let tracking = STRUCTURED_PATCH_PRESERVATION.with(std::cell::Cell::get);
+            let preserves =
+                explicit.unwrap_or(tracking.0 == Some(true) && (!has_host || tracking.1));
+            let preserves = preserves
+                && result
+                    .as_ref()
+                    .is_none_or(|updated| same_tool_result_content(outcome, updated));
+            Ok((result, Some(preserves)))
+        })
+        .await
+}
+
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
 /// An error stops the run. A post-tool error commits the known result without state changes.
 /// Post-hooks prepare state updates and must not perform external operations.
@@ -1049,6 +1289,19 @@ pub trait Extension: Send + Sync {
         self.lifecycle(event, state).await
     }
 
+    /// Observe compaction with its detailed trigger and committed metadata.
+    /// Older extensions receive the existing lifecycle event unchanged.
+    async fn compaction_lifecycle_with_host(
+        &self,
+        event: &crate::LifecycleEvent,
+        _trigger: CompactionTrigger,
+        _metadata: Option<&Value>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.lifecycle_with_host(event, state, host).await
+    }
+
     fn handles_cache_warming(&self) -> bool {
         false
     }
@@ -1243,7 +1496,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch text results while preserving fields omitted by the handler.
+    /// Patch result fields while preserving fields omitted by the handler.
     async fn tool_result_patch(
         &self,
         _call: &crate::ToolCall,
@@ -1254,7 +1507,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch text, metadata and error status independently. The default delegates
+    /// Patch output, metadata and error status independently. The default delegates
     /// to the original partial-patch hook for source compatibility.
     async fn tool_result_patch_v2(
         &self,
@@ -1282,12 +1535,21 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
         let replacement = self.tool_result(call, outcome, context, state).await?;
+        if replacement.is_some() {
+            let _ = STRUCTURED_PATCH_PRESERVATION
+                .try_with(|state| state.set((Some(false), state.get().1)));
+        }
         let current = replacement.as_ref().unwrap_or(outcome);
         match self
             .tool_result_patch_v2(call, current, context, state)
             .await?
         {
-            Some(patch) => patch.apply(current).map(Some),
+            Some(patch) => {
+                let preserves = patch.output.is_none() && replacement.is_none();
+                let _ = STRUCTURED_PATCH_PRESERVATION
+                    .try_with(|state| state.set((Some(preserves), state.get().1)));
+                patch.apply(current).map(Some)
+            }
             None => Ok(replacement),
         }
     }
@@ -1300,7 +1562,35 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
         _host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Option<Outcome>> {
-        self.tool_result_update(call, outcome, context, state).await
+        let result = self.tool_result_update(call, outcome, context, state).await;
+        let _ = STRUCTURED_PATCH_PRESERVATION
+            .try_with(|tracking| tracking.set((tracking.get().0, true)));
+        result
+    }
+
+    /// Override to report whether a result update leaves the output field
+    /// untouched. `None` means field presence is unknown; `Some(true)` means
+    /// output was not replaced, even with identical text. Existing hooks need
+    /// not implement this method.
+    async fn tool_result_update_with_presence(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        let result = match host {
+            Some(host) => {
+                self.tool_result_update_with_host(call, outcome, context, state, host)
+                    .await?
+            }
+            None => {
+                self.tool_result_update(call, outcome, context, state)
+                    .await?
+            }
+        };
+        Ok((result, None))
     }
 
     fn after_tool(
@@ -1309,6 +1599,21 @@ pub trait Extension: Send + Sync {
         _outcome: &Outcome,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<ExtensionState>> {
+        Ok(None)
+    }
+
+    /// Whether this extension participates in pre-summary compaction.
+    fn handles_before_summary_compaction(&self) -> bool {
+        false
+    }
+
+    /// Called before requesting a model-generated summary.
+    async fn before_summary_compaction(
+        &self,
+        _preparation: &CompactionPreparation,
+        _state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<BeforeSummaryCompactionResult>> {
         Ok(None)
     }
 
@@ -1406,9 +1711,17 @@ pub struct Registry {
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
     branch_models: Arc<RwLock<BranchModels>>,
+    branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
 
 impl Registry {
+    /// Whether a registered extension without a source path is a host built-in.
+    pub fn extension_source_is_builtin(&self, id: &str) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.id() == id && extension.source_is_builtin())
+    }
+
     /// Register a model instance for recovery on a branch that selected it.
     pub fn register_branch_model(
         &self,
@@ -1418,6 +1731,15 @@ impl Registry {
         let name = name.into();
         if name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
+        }
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.keys().any(|(_, provider, reserved)| {
+            provider.is_empty() && (reserved == &name || reserved.is_empty())
+        }) {
+            return Err(Error::Config("model client is being resolved".into()));
         }
         self.branch_models
             .write()
@@ -1435,6 +1757,15 @@ impl Registry {
         if name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.contains_key(&(session_id, String::new(), String::new()))
+            || reservations.contains_key(&(session_id, String::new(), name.clone()))
+        {
+            return Err(Error::Config("session models are being resolved".into()));
+        }
         self.branch_models
             .write()
             .expect("branch models")
@@ -1451,6 +1782,189 @@ impl Registry {
     ) -> Result<()> {
         self.register_session_provider_model_with_limits(session_id, provider, name, model, None)
     }
+    /// Commit a branch transition and install its resolved client without
+    /// replacing a concurrently registered client for the same identity.
+    pub(crate) fn commit_resolved_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        self.commit_session_model(session_id, provider, name, model, false, commit)
+    }
+
+    /// Reserve an already authorized binding; never recreate one after removal.
+    pub(crate) fn commit_existing_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        self.commit_session_model(session_id, provider, name, model, true, commit)
+    }
+
+    /// Reserve the effective provider-less binding without installing a new one.
+    pub(crate) fn commit_existing_legacy_model<T>(
+        &self,
+        session_id: Uuid,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        let key = (session_id, String::new(), name.to_owned());
+        {
+            let mut reservations = self
+                .branch_reservations
+                .write()
+                .expect("branch reservations");
+            let models = self.branch_models.read().expect("branch models");
+            let existing = models
+                .get(&(Some(session_id), None, name.to_owned()))
+                .or_else(|| models.get(&(None, None, name.to_owned())));
+            if reservations.contains_key(&key)
+                || reservations.contains_key(&(session_id, String::new(), String::new()))
+                || !existing.is_some_and(|(existing, _)| Arc::ptr_eq(existing, &model))
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {name}"
+                )));
+            }
+            reservations.insert(key.clone(), false);
+        }
+        let reservation = BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key,
+        };
+        let result = commit()?;
+        let revoked = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations")
+            .get(&reservation.key)
+            == Some(&true);
+        Ok((result, revoked))
+    }
+
+    fn commit_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        require_existing: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        if provider.trim().is_empty() || name.trim().is_empty() {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let key = (Some(session_id), Some(provider.to_owned()), name.to_owned());
+        let reservation_key = (session_id, provider.to_owned(), name.to_owned());
+        {
+            let mut reservations = self
+                .branch_reservations
+                .write()
+                .expect("branch reservations");
+            let models = self.branch_models.read().expect("branch models");
+            let existing = models.get(&key);
+            if reservations.contains_key(&reservation_key)
+                || reservations.contains_key(&(session_id, String::new(), String::new()))
+                || existing.is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
+                || (require_existing && existing.is_none())
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {provider}/{name}"
+                )));
+            }
+            reservations.insert(reservation_key.clone(), false);
+        }
+        let _reservation = BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key: reservation_key,
+        };
+        let result = commit()?;
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        let revoked = reservations.get(&_reservation.key) == Some(&true);
+        if !revoked {
+            self.branch_models
+                .write()
+                .expect("branch models")
+                .entry(key)
+                .or_insert((model, None));
+        }
+        Ok((result, revoked))
+    }
+    /// Reserve the entire session while startup commits and installs its
+    /// complete staged model set. A concurrent revocation wins as a unit.
+    pub(crate) fn commit_session_model_bindings<T>(
+        &self,
+        session_id: Uuid,
+        bindings: Vec<(Option<String>, String, Arc<dyn crate::Model>)>,
+        guarded: Option<(&str, &str, &Arc<dyn crate::Model>)>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        if bindings.iter().any(|(provider, name, _)| {
+            name.trim().is_empty() || provider.as_ref().is_some_and(|p| p.trim().is_empty())
+        }) {
+            return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let key = (session_id, String::new(), String::new());
+        {
+            let mut reservations = self
+                .branch_reservations
+                .write()
+                .expect("branch reservations");
+            if reservations
+                .keys()
+                .any(|(owner, _, _)| *owner == session_id)
+            {
+                return Err(Error::Config("session models are being resolved".into()));
+            }
+            if let Some((provider, name, client)) = guarded
+                && self
+                    .branch_models
+                    .read()
+                    .expect("branch models")
+                    .get(&(Some(session_id), Some(provider.to_owned()), name.to_owned()))
+                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, client))
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {provider}/{name}"
+                )));
+            }
+            reservations.insert(key.clone(), false);
+        }
+        let _reservation = BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key,
+        };
+        let result = commit()?;
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        let revoked = reservations.get(&_reservation.key) == Some(&true);
+        if !revoked {
+            let mut models = self.branch_models.write().expect("branch models");
+            for (provider, name, client) in bindings {
+                let guarded_binding =
+                    guarded.is_some_and(|(p, n, _)| provider.as_deref() == Some(p) && name == n);
+                let key = (Some(session_id), provider, name);
+                if guarded_binding {
+                    models.entry(key).or_insert((client, None));
+                } else {
+                    models.insert(key, (client, None));
+                }
+            }
+        }
+        Ok((result, revoked))
+    }
     /// Register a session-specific provider client and its effective run limits.
     pub fn register_session_provider_model_with_limits(
         &self,
@@ -1462,6 +1976,15 @@ impl Registry {
     ) -> Result<()> {
         if provider.trim().is_empty() || name.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
+        }
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.contains_key(&(session_id, provider.to_owned(), name.to_owned()))
+            || reservations.contains_key(&(session_id, String::new(), String::new()))
+        {
+            return Err(Error::Config("model client is being resolved".into()));
         }
         self.branch_models.write().expect("branch models").insert(
             (Some(session_id), Some(provider.to_owned()), name.to_owned()),
@@ -1493,6 +2016,10 @@ impl Registry {
             .map(|(model, _)| model.clone())
     }
     pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
         let mut models = self.branch_models.write().expect("branch models");
         let copies: Vec<_> = models
             .iter()
@@ -1500,11 +2027,30 @@ impl Registry {
             .map(|((_, provider, name), model)| (provider.clone(), name.clone(), model.clone()))
             .collect();
         for (provider, name, model) in copies {
+            if reservations.contains_key(&(destination, String::new(), String::new())) {
+                continue;
+            }
+            if reservations.contains_key(&(
+                destination,
+                provider.clone().unwrap_or_default(),
+                name.clone(),
+            )) {
+                continue;
+            }
             models.insert((Some(destination), provider, name), model);
         }
     }
     /// Remove recovery clients for a session before rebuilding its host configuration.
     pub fn remove_session_branch_models(&self, session_id: Uuid) {
+        let mut reservations = self
+            .branch_reservations
+            .write()
+            .expect("branch reservations");
+        for ((owner, _, _), revoked) in reservations.iter_mut() {
+            if *owner == session_id {
+                *revoked = true;
+            }
+        }
         self.branch_models
             .write()
             .expect("branch models")
@@ -1536,7 +2082,7 @@ impl Registry {
             .iter()
             .filter(|item| item.handles_resource_discovery())
         {
-            match tokio::time::timeout(
+            match platform_time::timeout(
                 timeout,
                 extension.discover_resources(event, states.get(extension.id())),
             )
@@ -1570,9 +2116,23 @@ impl Registry {
             .filter(|item| item.handles_resource_discovery())
         {
             let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
-            let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+            let (entry_sender, mut entries) = tokio::sync::mpsc::channel(32);
+            let host = Arc::new(ResourceDiscoveryHost {
+                messages: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+                entries: entry_sender,
+            });
+            enum Request {
+                Entry(
+                    CustomEntry,
+                    tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+                ),
+                Message(
+                    crate::QueuedCustomMessage,
+                    tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+                ),
+            }
             let outcome = {
-                let future = tokio::time::timeout(
+                let future = platform_time::timeout(
                     timeout,
                     extension.discover_resources_with_host(event, states.get(extension.id()), host),
                 );
@@ -1580,15 +2140,31 @@ impl Registry {
                 loop {
                     tokio::select! {
                         biased;
-                        Some((input, reply)) = incoming.recv() => {
+                        result = &mut future => break result,
+                        request = async {
+                            tokio::select! {
+                                Some((entry, reply)) = entries.recv() => Request::Entry(entry, reply),
+                                Some((message, reply)) = incoming.recv() => Request::Message(message, reply),
+                                else => std::future::pending().await,
+                            }
+                        } => match request {
+                        Request::Entry(entry, reply) => {
+                            if reply.is_closed() { continue; }
+                            if let Err(error) = session.ensure_settled() {
+                                let _ = reply.send(Err(error.to_string()));
+                                continue;
+                            }
+                            let persisted = session.append_custom_entry(entry).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom entry"))));
+                            match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                        }
+                        Request::Message(input, reply) => {
                             let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
                                 crate::agent::queue_custom_message(session, input, observer)
                             } else {
                                 session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
                             };
                             match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                        }
-                        result = &mut future => break result,
+                        }}
                     }
                 }
             };
@@ -1642,13 +2218,13 @@ impl Registry {
         host: Option<Arc<dyn ToolHost>>,
     ) -> bool {
         let deadline =
-            tokio::time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
+            platform_time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
         for extension in self
             .extensions
             .iter()
             .filter(|extension| extension.handles_session_transitions())
         {
-            let error = match tokio::time::timeout_at(deadline, async {
+            let error = match platform_time::timeout_at(deadline, async {
                 match &host {
                     Some(host) => {
                         extension
@@ -2082,6 +2658,7 @@ impl Registry {
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
             branch_models: self.branch_models.clone(),
+            branch_reservations: self.branch_reservations.clone(),
         })
     }
 
@@ -2250,6 +2827,21 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compaction_details_preserve_missing_and_explicit_null() {
+        for details in [None, Some(Value::Null), Some(json!({"origin":"extension"}))] {
+            let mut wire =
+                json!({"summary":"summary","firstKeptEntry":1,"tokensBefore":2,"usage":null});
+            if let Some(value) = &details {
+                wire["details"] = value.clone();
+            }
+            let decoded: ExtensionCompaction = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded.details, details);
+            let encoded = serde_json::to_value(decoded).unwrap();
+            assert_eq!(encoded.get("details"), wire.get("details"));
+        }
+    }
 
     struct InputHook(&'static str);
 
@@ -2518,12 +3110,402 @@ mod replacement_tests {
             })
         }
     }
+
+    struct ResourceEntryHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceEntryHook {
+        fn id(&self) -> &str {
+            "resource-entry"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            assert!(host.supports_custom_entries());
+            host.append_entry(CustomEntry {
+                custom_type: "index".into(),
+                data: Some(json!({"count": 2})),
+            })
+            .await?;
+            host.append_entry(CustomEntry {
+                custom_type: "x".repeat(8 * 1024 * 1024),
+                data: None,
+            })
+            .await
+            .unwrap_err();
+            host.send_message(
+                CustomMessage {
+                    custom_type: "context".into(),
+                    content: crate::ContextContent::Text("hello".into()),
+                    display: false,
+                    details: None,
+                },
+                CustomMessageDelivery::AfterTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_persists_custom_entries_before_acknowledgement() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceEntryHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let mut committed = Vec::new();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |event| {
+                    if let crate::Notification::Committed(record) = event {
+                        committed.push(record.event.clone());
+                    }
+                },
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&committed[..], [crate::Event::CustomEntry { entry }, crate::Event::CustomMessage { .. }] if entry.custom_type == "index")
+        );
+        let restored = crate::Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.branch().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.data == Some(json!({"count":2})))));
+        let context =
+            crate::journal::conversation_entries(&restored.branch(), restored.operations());
+        assert!(
+            matches!(&context[..], [(_, crate::Message::User { content })] if content == "hello")
+        );
+    }
+
+    struct ResourceRejectHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceRejectHook {
+        fn id(&self) -> &str {
+            "resource-reject"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            let error = host
+                .append_entry(CustomEntry {
+                    custom_type: "index".into(),
+                    data: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(!error.is_empty());
+            Ok(DiscoveredResources {
+                prompt_paths: vec!["still-available.md".into()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_can_handle_entry_rejection_while_operation_is_unsettled() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceRejectHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        session
+            .append(crate::Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(crate::Event::ToolStarted { operation_id })
+            .unwrap();
+        let before = session.records().len();
+        let resources = registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resources[0].resources.prompt_paths,
+            [std::path::PathBuf::from("still-available.md")]
+        );
+        assert_eq!(session.records().len(), before);
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_propagates_custom_entry_store_failure() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        let mut session =
+            crate::Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceEntryHook)).unwrap();
+        let result = registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |_, _| {},
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fixture write failed")
+        );
+        assert!(
+            session
+                .append_custom_entry(CustomEntry {
+                    custom_type: "later".into(),
+                    data: None
+                })
+                .is_err()
+        );
+    }
+
+    struct ResourceBackgroundEntryHook(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+    #[async_trait::async_trait]
+    impl Extension for ResourceBackgroundEntryHook {
+        fn id(&self) -> &str {
+            "resource-background"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            let done = self.0.lock().unwrap().take().unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = started.send(());
+                while host
+                    .append_entry(CustomEntry {
+                        custom_type: "background".into(),
+                        data: None,
+                    })
+                    .await
+                    .is_ok()
+                {}
+                let _ = done.send(());
+            });
+            ready.await.map_err(|error| error.to_string())?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_closes_background_entry_requests_after_callback() {
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ResourceBackgroundEntryHook(
+                std::sync::Mutex::new(Some(done)),
+            )))
+            .unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        platform_time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(1),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(1), stopped)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    struct ResourceCancelledEntryHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceCancelledEntryHook {
+        fn id(&self) -> &str {
+            "resource-cancelled"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            let mut entry = Box::pin(host.append_entry(CustomEntry {
+                custom_type: "cancelled".into(),
+                data: None,
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(entry.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(entry);
+            host.send_message(
+                CustomMessage {
+                    custom_type: "continued".into(),
+                    content: crate::ContextContent::Text("ok".into()),
+                    display: false,
+                    details: None,
+                },
+                CustomMessageDelivery::AfterTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_discards_cancelled_queued_entries() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ResourceCancelledEntryHook))
+            .unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert!(!session.records().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.custom_type == "cancelled")));
+        assert!(session.records().iter().any(|record| matches!(&record.event, crate::Event::CustomMessage { message } if message.custom_type == "continued")));
+    }
+
+    struct ResourceFairnessHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceFairnessHook {
+        fn id(&self) -> &str {
+            "resource-fair"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            for _ in 0..48 {
+                let host = host.clone();
+                tokio::spawn(async move {
+                    while host
+                        .append_entry(CustomEntry {
+                            custom_type: "producer".into(),
+                            data: None,
+                        })
+                        .await
+                        .is_ok()
+                    {}
+                });
+            }
+            tokio::task::yield_now().await;
+            host.send_message(
+                CustomMessage {
+                    custom_type: "fair".into(),
+                    content: crate::ContextContent::Text("ok".into()),
+                    display: false,
+                    details: None,
+                },
+                CustomMessageDelivery::AfterTurn,
+            )
+            .await?;
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_services_messages_amid_entry_producers() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceFairnessHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event, crate::Event::CustomMessage { message } if message.custom_type == "fair")));
+    }
     #[tokio::test]
     async fn resource_discovery_journals_trigger_before_acknowledging_callback() {
         let mut registry = Registry::default();
         registry.register(Arc::new(ResourceMessageHook)).unwrap();
         let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(2),
             registry.discover_resources_in_session(
                 &ResourceDiscoveryEvent {

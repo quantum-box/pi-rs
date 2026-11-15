@@ -18,11 +18,81 @@ pub struct ChatCompatibility {
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
     zai_tool_stream: Option<bool>,
+    vllm_priority: Option<serde_json::Number>,
+    supports_thinking_token_budget: Option<bool>,
+    thinking_token_budget_field: Option<ThinkingBudgetField>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_thinking_budget_uses_selected_level_and_answer_room() {
+        let provider: ChatCompatibility =
+            serde_json::from_value(json!({"supportsThinkingTokenBudget":true})).unwrap();
+        let model: ChatCompatibility =
+            serde_json::from_value(json!({"thinkingTokenBudgetField":"thinking_budget"})).unwrap();
+        let compat = provider.overlay(model);
+        for (level, max, expected) in [
+            ("low", 4096, Some(1500)),
+            ("xhigh", 2000, Some(976)),
+            ("off", 4096, None),
+            ("high", 1024, None),
+        ] {
+            let mut body = json!({});
+            compat
+                .thinking_budget_options(
+                    &mut body,
+                    Some(level),
+                    Some(&json!({"low":1500})),
+                    max,
+                    Some(true),
+                )
+                .unwrap();
+            assert_eq!(
+                body.get("thinking_budget").and_then(Value::as_u64),
+                expected
+            );
+            assert!(body.get("thinking_token_budget").is_none());
+        }
+        let mut body = json!({});
+        compat
+            .thinking_budget_options(&mut body, Some("low"), None, 4096, Some(false))
+            .unwrap();
+        assert_eq!(body, json!({}));
+        let default: ChatCompatibility =
+            serde_json::from_value(json!({"supportsThinkingTokenBudget":true})).unwrap();
+        default
+            .thinking_budget_options(&mut body, Some("low"), None, 4096, Some(true))
+            .unwrap();
+        assert_eq!(body["thinking_token_budget"], 2048);
+    }
+
+    #[test]
+    fn vllm_priority_is_optional_numeric_and_overlaid_per_model() {
+        let default = ChatCompatibility::default();
+        let mut body = json!({});
+        default.request_options(&mut body, 16, false);
+        assert!(body.get("priority").is_none());
+        let provider: ChatCompatibility =
+            serde_json::from_value(json!({"vllmPriority": 5})).unwrap();
+        for (model, expected) in [
+            (json!({}), json!(5)),
+            (json!({"vllmPriority": 0}), json!(0)),
+            (json!({"vllmPriority": -2.5}), json!(-2.5)),
+        ] {
+            let compat = provider
+                .clone()
+                .overlay(serde_json::from_value(model).unwrap());
+            let mut body = json!({});
+            compat.request_options(&mut body, 16, false);
+            assert_eq!(body["priority"], expected);
+        }
+        assert!(
+            serde_json::from_value::<ChatCompatibility>(json!({"vllmPriority":"high"})).is_err()
+        );
+    }
 
     #[test]
     fn ant_ling_sends_only_explicit_reasoning_effort() {
@@ -62,6 +132,26 @@ mod tests {
             disabled,
             json!({"chat_template_args":{"enable_thinking":false},"reasoning_effort":"none"})
         );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ThinkingBudgetField {
+    #[serde(rename = "thinking_token_budget")]
+    TokenBudget,
+    #[serde(rename = "thinking_budget")]
+    Budget,
+    #[serde(rename = "thinking_budget_tokens")]
+    BudgetTokens,
+}
+impl ThinkingBudgetField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenBudget => "thinking_token_budget",
+            Self::Budget => "thinking_budget",
+            Self::BudgetTokens => "thinking_budget_tokens",
+        }
     }
 }
 
@@ -117,6 +207,13 @@ impl ChatCompatibility {
             thinking_format: model.thinking_format.or(self.thinking_format),
             chat_template_args: model.chat_template_args.or(self.chat_template_args),
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
+            vllm_priority: model.vllm_priority.or(self.vllm_priority),
+            supports_thinking_token_budget: model
+                .supports_thinking_token_budget
+                .or(self.supports_thinking_token_budget),
+            thinking_token_budget_field: model
+                .thinking_token_budget_field
+                .or(self.thinking_token_budget_field),
         }
     }
 
@@ -139,6 +236,64 @@ impl ChatCompatibility {
         if has_tools && self.zai_tool_stream == Some(true) {
             body["tool_stream"] = json!(true);
         }
+        if let Some(priority) = &self.vllm_priority {
+            body["priority"] = Value::Number(priority.clone());
+        }
+    }
+
+    pub(super) fn thinking_budget_options(
+        &self,
+        body: &mut Value,
+        level: Option<&str>,
+        budgets: Option<&Value>,
+        max_tokens: u32,
+        supported: Option<bool>,
+    ) -> pi_rs_core::Result<()> {
+        let field = self
+            .thinking_token_budget_field
+            .map(ThinkingBudgetField::as_str)
+            .or_else(|| {
+                (self.supports_thinking_token_budget == Some(true))
+                    .then_some("thinking_token_budget")
+            });
+        let Some(field) = field else {
+            return Ok(());
+        };
+        if supported != Some(true) {
+            return Ok(());
+        }
+        let (key, default) = match level {
+            Some("minimal") => ("minimal", 1024),
+            Some("low") => ("low", 2048),
+            Some("medium") => ("medium", 8192),
+            Some("high" | "xhigh" | "max") => ("high", 16384),
+            _ => return Ok(()),
+        };
+        let budget = match budgets {
+            None => default,
+            Some(value) => match value
+                .as_object()
+                .ok_or_else(|| {
+                    pi_rs_core::Error::Config("thinkingBudgets must be an object".into())
+                })?
+                .get(key)
+            {
+                None => default,
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        pi_rs_core::Error::Config(format!(
+                            "thinkingBudgets.{key} must be a nonnegative integer"
+                        ))
+                    })?,
+            },
+        }
+        .min(max_tokens.saturating_sub(1024));
+        if budget > 0 {
+            body[field] = json!(budget);
+        }
+        Ok(())
     }
 
     pub(super) fn reasoning_options(

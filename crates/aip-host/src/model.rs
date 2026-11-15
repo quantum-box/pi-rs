@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use pi_rs_core::{
-    Error, Event, Model, ModelMetadata, ModelRequest, ModelStream, Record, Result, UsageReport,
+    EnrichedModelStream, Error, Event, Model, ModelMetadata, ModelRequest, ModelStream, Record,
+    Result, UsageReport,
 };
 use uuid::Uuid;
 
@@ -87,6 +88,21 @@ impl Model for BudgetedModel<'_> {
             .await
     }
 
+    async fn stream_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.budget
+            .reserve(self.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
     async fn stream_for_summary(
         &self,
         request_id: Uuid,
@@ -98,6 +114,35 @@ impl Model for BudgetedModel<'_> {
             .await?;
         self.inner
             .stream_for_summary(request_id, session_id, request)
+            .await
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        self.budget
+            .reserve(self.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        self.budget
+            .reserve(self.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_enriched_for_summary(request_id, session_id, request)
             .await
     }
 
@@ -180,6 +225,21 @@ impl Model for PreparedBudgetedModel<'_, '_> {
             .stream_in_session(request_id, session_id, request)
             .await
     }
+    async fn stream_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
     async fn stream_for_summary(
         &self,
         request_id: Uuid,
@@ -194,6 +254,37 @@ impl Model for PreparedBudgetedModel<'_, '_> {
             .stream_for_summary(request_id, session_id, request)
             .await
     }
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_enriched_for_summary(request_id, session_id, request)
+            .await
+    }
+
     async fn record_usage(&self, request_id: Uuid, usage: &UsageReport) -> Result<()> {
         self.parent
             .budget
@@ -288,5 +379,229 @@ impl BudgetedModel<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod external_identity_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Budget {
+        reservations: Mutex<Vec<Uuid>>,
+        settlements: Mutex<Vec<(Uuid, UsageReport)>>,
+    }
+    #[async_trait::async_trait]
+    impl BudgetPort for Budget {
+        async fn reserve(&self, _: &RunScope, id: Uuid, _: &ModelRequest) -> Result<()> {
+            self.reservations.lock().unwrap().push(id);
+            Ok(())
+        }
+        async fn settle(&self, _: &RunScope, id: Uuid, usage: &UsageReport) -> Result<()> {
+            self.settlements.lock().unwrap().push((id, usage.clone()));
+            Ok(())
+        }
+    }
+    #[derive(Clone, Default)]
+    struct Inner {
+        identities: Arc<Mutex<Vec<(Uuid, Uuid, String)>>>,
+        receipts: Arc<Mutex<Vec<Uuid>>>,
+        enriched: Arc<Mutex<Vec<(Uuid, Uuid, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl Model for Inner {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            Ok(Some(Arc::new(self.clone())))
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("external identity was discarded")
+        }
+        async fn stream_in_session_with_identity(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            external_id: &str,
+            _: ModelRequest,
+        ) -> Result<ModelStream> {
+            self.identities
+                .lock()
+                .unwrap()
+                .push((request_id, session_id, external_id.into()));
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+        async fn stream_enriched_in_session_with_identity(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            external_id: &str,
+            _: ModelRequest,
+        ) -> Result<EnrichedModelStream> {
+            self.enriched
+                .lock()
+                .unwrap()
+                .push((request_id, session_id, external_id.into()));
+            Ok(Box::pin(futures_util::stream::once(async {
+                Ok(pi_rs_core::EnrichedModelEvent::ReasoningStart { index: 7 })
+            })))
+        }
+        async fn stream_enriched_for_summary(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            _: ModelRequest,
+        ) -> Result<EnrichedModelStream> {
+            self.enriched
+                .lock()
+                .unwrap()
+                .push((request_id, session_id, "summary".into()));
+            Ok(Box::pin(futures_util::stream::once(async {
+                Ok(pi_rs_core::EnrichedModelEvent::ReasoningStart { index: 8 })
+            })))
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            request_id: Uuid,
+            _: &UsageReport,
+            _: &ModelMetadata,
+        ) -> Result<()> {
+            self.receipts.lock().unwrap().push(request_id);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn prepared_and_unprepared_preserve_identity_and_budget() {
+        let scope = RunScope {
+            tenant: "t".into(),
+            actor: "a".into(),
+            workspace: "w".into(),
+            journal_run_id: Uuid::new_v4(),
+            aip_run: "r".into(),
+            parent_run: None,
+            audit_id: "audit".into(),
+        };
+        let budget = Budget::default();
+        let inner = Inner::default();
+        let wrapper = BudgetedModel {
+            scope: &scope,
+            inner: &inner,
+            budget: &budget,
+            recorded_usage: Mutex::default(),
+        };
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let session_id = Uuid::new_v4();
+        let usage = UsageReport::Measured {
+            usage: pi_rs_core::Usage {
+                input_tokens: 4,
+                output_tokens: 2,
+            },
+        };
+        let unprepared_id = Uuid::new_v4();
+        let _ = wrapper
+            .stream_in_session_with_identity(
+                unprepared_id,
+                session_id,
+                "legacy-id",
+                request.clone(),
+            )
+            .await
+            .unwrap();
+        wrapper
+            .record_usage_with_metadata(unprepared_id, &usage, &ModelMetadata::default())
+            .await
+            .unwrap();
+        let prepared = wrapper.prepare_context(&request).await.unwrap().unwrap();
+        let prepared_id = Uuid::new_v4();
+        let _ = prepared
+            .stream_in_session_with_identity(prepared_id, session_id, "legacy-id", request)
+            .await
+            .unwrap();
+        prepared
+            .record_usage_with_metadata(prepared_id, &usage, &ModelMetadata::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            *budget.reservations.lock().unwrap(),
+            vec![unprepared_id, prepared_id]
+        );
+        assert_eq!(
+            *budget.settlements.lock().unwrap(),
+            vec![(unprepared_id, usage.clone()), (prepared_id, usage)]
+        );
+        assert_eq!(
+            *inner.identities.lock().unwrap(),
+            vec![
+                (unprepared_id, session_id, "legacy-id".into()),
+                (prepared_id, session_id, "legacy-id".into())
+            ]
+        );
+        assert_eq!(
+            *inner.receipts.lock().unwrap(),
+            vec![unprepared_id, prepared_id]
+        );
+    }
+    #[tokio::test]
+    async fn enriched_streams_reserve_and_forward_for_prepared_and_unprepared_models() {
+        use futures_util::StreamExt;
+        let scope = RunScope {
+            tenant: "t".into(),
+            actor: "a".into(),
+            workspace: "w".into(),
+            journal_run_id: Uuid::new_v4(),
+            aip_run: "r".into(),
+            parent_run: None,
+            audit_id: "audit".into(),
+        };
+        let budget = Budget::default();
+        let inner = Inner::default();
+        let wrapper = BudgetedModel {
+            scope: &scope,
+            inner: &inner,
+            budget: &budget,
+            recorded_usage: Mutex::default(),
+        };
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let prepared = wrapper.prepare_context(&request).await.unwrap().unwrap();
+        let session = Uuid::new_v4();
+        let mut expected = Vec::new();
+        for model in [&wrapper as &dyn Model, prepared.as_ref()] {
+            let id = Uuid::new_v4();
+            let mut stream = model
+                .stream_enriched_in_session_with_identity(id, session, "external", request.clone())
+                .await
+                .unwrap();
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                pi_rs_core::EnrichedModelEvent::ReasoningStart { index: 7 }
+            ));
+            expected.push((id, session, "external".to_string()));
+            let id = Uuid::new_v4();
+            let mut stream = model
+                .stream_enriched_for_summary(id, session, request.clone())
+                .await
+                .unwrap();
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                pi_rs_core::EnrichedModelEvent::ReasoningStart { index: 8 }
+            ));
+            expected.push((id, session, "summary".to_string()));
+        }
+        assert_eq!(
+            *budget.reservations.lock().unwrap(),
+            expected.iter().map(|entry| entry.0).collect::<Vec<_>>()
+        );
+        assert_eq!(*inner.enriched.lock().unwrap(), expected);
     }
 }

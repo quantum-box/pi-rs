@@ -62,6 +62,7 @@ struct Declaration {
     value: Value,
     inherited: Option<Value>,
     transient: bool,
+    scope_order: u8,
 }
 
 pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
@@ -96,7 +97,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 packages.push(entry);
                 Ok(())
             })?;
-            output(json!({"type":"package_installed","source":source}));
+            output(json!({"type":"package_installed","source":display_source(&source)}));
         }
         PackageCommand::Remove { source, local } => {
             let target = normalize(&source, &args.workspace)?;
@@ -120,7 +121,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 }
                 Ok(())
             })?;
-            output(json!({"type":"package_removed","source":target}));
+            output(json!({"type":"package_removed","source":display_source(&target)}));
         }
         PackageCommand::Update { source, .. } => {
             let requested = source
@@ -144,20 +145,28 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .is_none_or(|requested| source_identity(requested) == source_identity(&source))
                 {
                     install(&source, args.offline).await?;
-                    output(json!({"type":"package_updated","source":source}));
+                    output(json!({"type":"package_updated","source":display_source(&source)}));
                 }
             }
         }
         PackageCommand::List => {
             let index = index()?;
-            for declaration in declarations(args)? {
+            let mut configured = declarations(args)?;
+            // Pi lists user packages before project packages, while resource
+            // resolution gives project packages precedence.
+            configured.sort_by_key(|entry| match entry.scope_order {
+                1 => 0,
+                0 => 1,
+                _ => 2,
+            });
+            for declaration in configured {
                 let installed = index
                     .get(&key(&declaration.source))
                     .cloned()
                     .map(serde_json::from_value::<Installed>)
                     .transpose()?;
                 output(
-                    json!({"type":"package","source":declaration.source,"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
+                    json!({"type":"package","source":display_source(&declaration.source),"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
                 );
             }
         }
@@ -172,18 +181,24 @@ pub async fn prepare(args: &Cli) -> Result<()> {
         let cached = installed.contains_key(&key(&declaration.source));
         if args.offline && remote(&declaration.source) {
             if !cached {
-                eprintln!("Package {}: skipped in offline mode", declaration.source);
+                eprintln!(
+                    "Package {}: skipped in offline mode",
+                    display_source(&declaration.source)
+                );
             }
             continue;
         }
         if declaration.transient || !cached {
-            eprintln!("Preparing native package {}", declaration.source);
+            eprintln!(
+                "Preparing native package {}",
+                display_source(&declaration.source)
+            );
             match install(&declaration.source, args.offline).await {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
                 Err(error) if declaration.transient && !cached => return Err(error),
-                Err(error) => eprintln!("Package {}: {error}", declaration.source),
+                Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),
             }
         }
     }
@@ -226,11 +241,29 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 .as_ref()
                 .map(|value| ResourceFilter::new(value, name))
                 .transpose()?;
-            for path in paths {
-                let base_enabled = inherited
-                    .as_ref()
-                    .is_some_and(|filter| filter.includes(path, &package.root, false));
-                if filter.includes(path, &package.root, base_enabled) && !target.contains(path) {
+            if !remote(&declaration.source) || inherited.is_some() {
+                for path in paths {
+                    let base = inherited
+                        .as_ref()
+                        .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
+                    if filter.includes_legacy(path, &package.root, base) && !target.contains(path) {
+                        target.push(path.clone());
+                    }
+                }
+                continue;
+            }
+            let evaluate = || -> Result<Vec<bool>> {
+                let base = match &inherited {
+                    Some(filter) => {
+                        filter.apply(paths, &package.root, &vec![false; paths.len()])?
+                    }
+                    None => vec![false; paths.len()],
+                };
+                filter.apply(paths, &package.root, &base)
+            };
+            let enabled = evaluate()?;
+            for (path, enabled) in paths.iter().zip(enabled) {
+                if enabled && !target.contains(path) {
                     target.push(path.clone());
                 }
             }
@@ -324,12 +357,29 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             .as_ref()
             .map(|value| ResourceFilter::new(value, "themes"))
             .transpose()?;
-        for path in package.resources.themes {
-            let inherited_enabled = inherited
-                .as_ref()
-                .is_some_and(|filter| filter.includes(&path, &package.root, false));
-            if filter.includes(&path, &package.root, inherited_enabled) && !themes.contains(&path) {
-                themes.push(path);
+        let paths = &package.resources.themes;
+        if !remote(&declaration.source) || inherited.is_some() {
+            for path in paths {
+                let base = inherited
+                    .as_ref()
+                    .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
+                if filter.includes_legacy(path, &package.root, base) && !themes.contains(path) {
+                    themes.push(path.clone());
+                }
+            }
+            continue;
+        }
+        let evaluate = || -> Result<Vec<bool>> {
+            let base = match &inherited {
+                Some(filter) => filter.apply(paths, &package.root, &vec![false; paths.len()])?,
+                None => vec![false; paths.len()],
+            };
+            filter.apply(paths, &package.root, &base)
+        };
+        let enabled = evaluate()?;
+        for (path, enabled) in paths.iter().zip(enabled) {
+            if enabled && !themes.contains(path) {
+                themes.push(path.clone());
             }
         }
     }
@@ -589,7 +639,9 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
-    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> bool {
+    // Local and layered packages retain the previous behavior until their
+    // separately caught errors and evaluation order can be reproduced.
+    fn includes_legacy(&self, path: &Path, root: &Path, inherited: bool) -> bool {
         if self.autoload {
             return self
                 .patterns
@@ -601,8 +653,7 @@ impl ResourceFilter {
             .flatten()
             .fold(inherited, |enabled, pattern| {
                 let prefix = pattern.chars().next();
-                let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
-                let target = if override_pattern {
+                let target = if matches!(prefix, Some('+' | '-' | '!')) {
                     &pattern[1..]
                 } else {
                     pattern.as_str()
@@ -613,6 +664,91 @@ impl ResourceFilter {
                     enabled
                 }
             })
+    }
+
+    #[cfg(test)]
+    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
+        Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])
+    }
+
+    fn apply(&self, paths: &[PathBuf], root: &Path, inherited: &[bool]) -> Result<Vec<bool>> {
+        let Some(patterns) = &self.patterns else {
+            return Ok(if self.autoload {
+                vec![true; paths.len()]
+            } else {
+                inherited.to_vec()
+            });
+        };
+        let matches = |path: &Path, pattern: &str, exact: bool| -> Result<bool> {
+            let normalized = if exact {
+                pattern
+                    .strip_prefix("./")
+                    .or_else(|| pattern.strip_prefix(".\\"))
+                    .unwrap_or(pattern)
+            } else {
+                pattern
+            };
+            if normalized.starts_with("file://") {
+                pi_rs_file_url::to_file_path(normalized).map_err(Error::Config)?;
+            }
+            Ok(resource_matches(path, root, pattern, exact, false))
+        };
+        if !self.autoload {
+            let mut enabled = inherited.to_vec();
+            for pattern in patterns {
+                let prefix = pattern.chars().next();
+                let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
+                let target = if override_pattern {
+                    &pattern[1..]
+                } else {
+                    pattern.as_str()
+                };
+                for (path, enabled) in paths.iter().zip(&mut enabled) {
+                    if matches(path, target, matches!(prefix, Some('+' | '-')))? {
+                        *enabled = !matches!(prefix, Some('-' | '!'));
+                    }
+                }
+            }
+            return Ok(enabled);
+        }
+        if patterns.is_empty() {
+            return Ok(vec![false; paths.len()]);
+        }
+        let any = |path: &Path, prefix: Option<char>, exact: bool| -> Result<bool> {
+            for pattern in patterns {
+                let target = match prefix {
+                    Some(prefix) => match pattern.strip_prefix(prefix) {
+                        Some(target) => target,
+                        None => continue,
+                    },
+                    None if !pattern.starts_with(['!', '+', '-']) => pattern.as_str(),
+                    None => continue,
+                };
+                if matches(path, target, exact)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let has_plain = patterns.iter().any(|p| !p.starts_with(['!', '+', '-']));
+        let mut enabled = vec![!has_plain; paths.len()];
+        if has_plain {
+            for (path, enabled) in paths.iter().zip(&mut enabled) {
+                *enabled = any(path, None, false)?;
+            }
+        }
+        for (prefix, exact, current, replacement) in [
+            ('!', false, true, false),
+            ('+', true, false, true),
+            ('-', true, true, false),
+        ] {
+            for (path, enabled) in paths.iter().zip(&mut enabled) {
+                if *enabled == current && any(path, Some(prefix), exact)? {
+                    *enabled = replacement;
+                }
+            }
+        }
+        Ok(enabled)
     }
 }
 
@@ -684,6 +820,82 @@ fn select_resource_with(filters: &[String], matches: impl Fn(&str, bool) -> bool
     }
     included
 }
+
+// Match Node's os.homedir(): the platform-specific environment variable takes
+// precedence even when empty; otherwise query the current account.
+fn filter_home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        if let Some(home) = std::env::var_os("HOME") {
+            return Some(home.into());
+        }
+        let mut size = 1024;
+        loop {
+            let mut buffer = vec![0u8; size];
+            let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+            // getpwuid_r owns no returned memory: pw_dir points into buffer.
+            let status = unsafe {
+                libc::getpwuid_r(
+                    libc::geteuid(),
+                    entry.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if status == libc::ERANGE && size < 1024 * 1024 {
+                size *= 2;
+                continue;
+            }
+            if status != 0 || result.is_null() {
+                return None;
+            }
+            let dir = unsafe { std::ffi::CStr::from_ptr((*result).pw_dir) };
+            return Some(std::ffi::OsString::from_vec(dir.to_bytes().to_vec()).into());
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return Some(home.into());
+        }
+        // On Windows std uses GetUserProfileDirectoryW as its fallback.
+        #[allow(deprecated)]
+        std::env::home_dir()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+fn normalize_filter_home(home: &Path, suffix: &str) -> PathBuf {
+    use std::path::Component;
+    // Node's path.join does not let a later absolute component replace home.
+    let joined = if home.as_os_str().is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{}/{suffix}", home.to_string_lossy())
+    };
+    let mut result = PathBuf::new();
+    for component in Path::new(&joined).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(result.components().next_back(), Some(Component::Normal(_))) {
+                    result.pop();
+                } else if !result.has_root() {
+                    result.push("..");
+                }
+            }
+            component => result.push(component.as_os_str()),
+        }
+    }
+    result
+}
+
 pub(crate) fn resource_matches(
     path: &Path,
     root: &Path,
@@ -694,8 +906,46 @@ pub(crate) fn resource_matches(
     let path = dunce::simplified(path);
     let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
-    let pattern = pattern.replace('\\', "/");
-    let pattern = pattern.trim_start_matches("./").to_owned();
+    // Upstream removes one leading ./ or .\ from exact overrides before
+    // expanding a tilde or converting a file URL.
+    let pattern = if exact {
+        pattern
+            .strip_prefix("./")
+            .or_else(|| pattern.strip_prefix(".\\"))
+            .unwrap_or(pattern)
+    } else {
+        pattern
+    };
+    // Pi normalizes home-relative paths and file URLs before matching both
+    // ordinary patterns and exact +/- overrides.
+    let expanded = if pattern == "~"
+        || pattern.starts_with("~/")
+        || (cfg!(windows) && pattern.starts_with("~\\"))
+    {
+        filter_home_dir().map(|home| {
+            if pattern == "~" {
+                home
+            } else {
+                normalize_filter_home(&home, &pattern[2..])
+            }
+        })
+    } else if pattern.starts_with("file://") {
+        match pi_rs_file_url::to_file_path(pattern) {
+            Ok(path) => Some(path),
+            Err(_) => return false,
+        }
+    } else {
+        None
+    };
+    let pattern = expanded
+        .as_deref()
+        .map(normalize)
+        .unwrap_or_else(|| pattern.replace('\\', "/"));
+    let pattern = if exact {
+        pattern
+    } else {
+        pattern.trim_start_matches("./").to_owned()
+    };
     let mut candidates = vec![
         normalize(path),
         normalize(path.strip_prefix(root).unwrap_or(path)),
@@ -733,6 +983,25 @@ pub(crate) fn resource_matches(
 
 fn source_field(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value.get("source")?.as_str())
+}
+
+// Git URL userinfo is rejected before invoking Git, but declarations can
+// still contain it. Never print it while reporting or listing a package.
+fn display_source(source: &str) -> String {
+    let Some(git) = source.strip_prefix("git:") else {
+        return source.to_owned();
+    };
+    let Some(scheme_end) = git.find("://") else {
+        return source.to_owned();
+    };
+    let start = "git:".len() + scheme_end + 3;
+    let end = source[start..]
+        .find(['/', '?', '#'])
+        .map_or(source.len(), |i| start + i);
+    let Some(at) = source[start..end].rfind('@') else {
+        return source.to_owned();
+    };
+    format!("{}[redacted]{}", &source[..start], &source[start + at..])
 }
 
 // Updates reconcile each configured revision, including a user declaration
@@ -775,6 +1044,7 @@ fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
     let mut global = BTreeMap::new();
+    let mut order = BTreeMap::new();
     let mut files = vec![(
         config::agent_dir().join("settings.json"),
         config::agent_dir(),
@@ -790,14 +1060,25 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     for (file, base, project) in files {
         let document = config::read_object(&file)?;
         if let Some(packages) = document.get("packages") {
-            for value in packages
+            for (position, value) in packages
                 .as_array()
                 .ok_or_else(|| Error::Config("packages must be an array".into()))?
+                .iter()
+                .enumerate()
             {
                 let source = source_field(value)
                     .ok_or_else(|| Error::Config("package needs a source".into()))?;
                 let source = normalize(source, &base)?;
                 let identity = source_identity(&source);
+                let scope = if project { 0 } else { 1 };
+                // User duplicates keep the first value; project duplicates replace
+                // that value while retaining its original position.
+                let same_scope = order
+                    .get(&identity)
+                    .is_some_and(|(seen_scope, _)| *seen_scope == scope);
+                if same_scope && !project {
+                    continue;
+                }
                 if !project {
                     global.insert(identity.clone(), value.clone());
                 }
@@ -806,6 +1087,9 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 } else {
                     None
                 };
+                if !same_scope {
+                    order.insert(identity.clone(), (scope, position));
+                }
                 result.insert(
                     identity,
                     Declaration {
@@ -813,28 +1097,41 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                         value: value.clone(),
                         inherited,
                         transient: false,
+                        scope_order: scope,
                     },
                 );
             }
         }
     }
-    for entry in args
+    for (position, entry) in args
         .extensions
         .iter()
-        .filter(|entry| is_package_source(entry, &args.workspace))
+        .enumerate()
+        .filter(|(_, entry)| is_package_source(entry, &args.workspace))
     {
         let source = normalize(entry, &args.workspace)?;
+        let identity = source_identity(&source);
+        if order.get(&identity).is_some_and(|(scope, _)| *scope == 2) {
+            continue;
+        }
+        order.insert(identity.clone(), (2, position));
         result.insert(
-            source_identity(&source),
+            identity,
             Declaration {
                 value: json!(source),
                 source,
                 inherited: None,
                 transient: true,
+                scope_order: 2,
             },
         );
     }
-    Ok(result.into_values().collect())
+    let mut entries: Vec<_> = result.into_iter().collect();
+    entries.sort_by_key(|(identity, _)| order[identity]);
+    Ok(entries
+        .into_iter()
+        .map(|(_, declaration)| declaration)
+        .collect())
 }
 pub fn is_package_source(source: &str, workspace: &Path) -> bool {
     !super::resource_paths::named_extension(source)
@@ -968,16 +1265,31 @@ fn matches_source(entry: &Value, source: &str, base: &Path) -> bool {
         .and_then(|entry| normalize(entry, base).ok())
         .is_some_and(|entry| source_identity(&entry) == source_identity(source))
 }
+fn git_path_start(source: &str) -> usize {
+    if let Some((scheme, rest)) = source.split_once("://") {
+        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
+    } else {
+        source.find(':').map_or(0, |index| index + 1)
+    }
+}
+fn ambiguous_git_reference(source: &str) -> bool {
+    !source.contains('#')
+        && source[git_path_start(source)..]
+            .bytes()
+            .filter(|byte| *byte == b'@')
+            .count()
+            > 1
+}
 fn git_reference(source: &str) -> (&str, &str) {
     if let Some(parts) = source.split_once('#') {
         return parts;
     }
-    let path_start = if let Some((scheme, rest)) = source.split_once("://") {
-        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
-    } else {
-        source.find(':').map_or(0, |index| index + 1)
-    };
-    match source.rfind('@').filter(|index| *index >= path_start) {
+    // Keep the established native interpretation for ambiguous sources.
+    // `#ref` disambiguates repositories and refs containing `@`.
+    match source
+        .rfind('@')
+        .filter(|index| *index >= git_path_start(source))
+    {
         Some(index) => (&source[..index], &source[index + 1..]),
         None => (source, "HEAD"),
     }
@@ -1001,7 +1313,8 @@ fn remote(source: &str) -> bool {
 async fn install(source: &str, offline: bool) -> Result<Installed> {
     if offline && remote(source) {
         return Err(Error::Config(format!(
-            "cannot install package in offline mode: {source}"
+            "cannot install package in offline mode: {}",
+            display_source(source)
         )));
     }
     if !remote(source) && !Path::new(source).exists() {
@@ -1052,7 +1365,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         if let Some(version) = version {
             command.args(["--version", version]);
         }
-        let artifacts = run(command).await?;
+        let artifacts = run(command, source).await?;
         root = artifacts
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
@@ -1071,6 +1384,11 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             })?;
         installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
+        if ambiguous_git_reference(specification) {
+            eprintln!(
+                "Ambiguous Git package source: using the last @ as the ref separator for compatibility; use #ref to disambiguate"
+            );
+        }
         let (url, reference) = git_reference(specification);
         if let Ok(parsed) = reqwest::Url::parse(url)
             && ((parsed.scheme() != "ssh" && !parsed.username().is_empty())
@@ -1086,20 +1404,20 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             command
                 .args(["clone", "--no-checkout", "--depth", "1", "--", url])
                 .arg(&root);
-            run(command).await?;
+            run(command, source).await?;
         }
         let mut fetch = tokio::process::Command::new("git");
         fetch
             .arg("-C")
             .arg(&root)
             .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch).await?;
+        run(fetch, source).await?;
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
             .args(["reset", "--hard", "FETCH_HEAD"]);
-        run(checkout).await?;
+        run(checkout, source).await?;
     }
     if root.is_file() {
         installed_binaries.push(root.clone());
@@ -1130,7 +1448,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
                 "--manifest-path",
             ])
             .arg(root.join("Cargo.toml"));
-        let metadata: Value = serde_json::from_slice(&run(metadata).await?)?;
+        let metadata: Value = serde_json::from_slice(&run(metadata, source).await?)?;
         let expected_manifest = root.join("Cargo.toml").canonicalize()?;
         if let Some(package) = metadata["packages"].as_array().and_then(|packages| {
             packages.iter().find(|package| {
@@ -1166,7 +1484,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
             if offline {
                 build.arg("--offline");
             }
-            let artifacts = run(build).await?;
+            let artifacts = run(build, source).await?;
             for line in artifacts.split(|byte| *byte == b'\n') {
                 if let Ok(artifact) = serde_json::from_slice::<Value>(line)
                     && artifact["reason"] == "compiler-artifact"
@@ -1778,7 +2096,39 @@ async fn capture(mut stream: impl AsyncRead + Unpin, limit: usize) -> Result<(Ve
     }
     Ok((output, overflow))
 }
-async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
+fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
+    // Subprocesses can echo the whole URL or just part of its userinfo.
+    // Keep status but never expose their stderr for such sources.
+    if display_source(source) != source {
+        Error::Config(format!(
+            "package command failed ({status}); subprocess output redacted"
+        ))
+    } else {
+        Error::Config(format!(
+            "package command failed ({status}): {}",
+            String::from_utf8_lossy(stderr)
+        ))
+    }
+}
+
+// Tokio's kill-on-drop only terminates the direct child on Unix. Keep the
+// process-wrap child so cancellation also signals its still-live group.
+struct PackageChildGuard {
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    finished: bool,
+}
+
+impl Drop for PackageChildGuard {
+    fn drop(&mut self) {
+        // Once the direct child has been reaped, its numeric process group ID
+        // can be reused. Do not signal that ID after ownership is lost.
+        if !self.finished && self.child.id().is_some() {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+async fn run(mut command: tokio::process::Command, source: &str) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1790,24 +2140,27 @@ async fn run(mut command: tokio::process::Command) -> Result<Vec<u8>> {
     #[cfg(windows)]
     wrapped.wrap(process_wrap::tokio::JobObject);
     wrapped.wrap(process_wrap::tokio::KillOnDrop);
-    let mut child = wrapped.spawn()?;
-    let stdout = child.stdout().take().expect("stdout");
-    let stderr = child.stderr().take().expect("stderr");
+    let mut child = PackageChildGuard {
+        child: wrapped.spawn()?,
+        finished: false,
+    };
+    let stdout = child.child.stdout().take().expect("stdout");
+    let stderr = child.child.stderr().take().expect("stderr");
     let (status, (stdout, overflow), (stderr, _)) =
         tokio::time::timeout(Duration::from_secs(1200), async {
-            tokio::try_join!(
-                async { child.wait().await.map_err(Error::from) },
-                capture(stdout, 8 * 1024 * 1024),
-                capture(stderr, 64 * 1024)
-            )
+            // Keep the group leader unreaped until all inherited output pipes
+            // close. Its reserved PID prevents the process group ID being
+            // reused while a descendant still holds either pipe.
+            let (stdout, stderr) =
+                tokio::try_join!(capture(stdout, 8 * 1024 * 1024), capture(stderr, 64 * 1024))?;
+            let status = child.child.wait().await.map_err(Error::from)?;
+            Ok::<_, Error>((status, stdout, stderr))
         })
         .await
         .map_err(|_| Error::Config("package command timed out".into()))??;
+    child.finished = true;
     if !status.success() {
-        return Err(Error::Config(format!(
-            "package command failed ({status}): {}",
-            String::from_utf8_lossy(&stderr)
-        )));
+        return Err(package_command_failed(source, &status.to_string(), &stderr));
     }
     if overflow {
         return Err(Error::Config("package command output exceeds limit".into()));
@@ -1874,6 +2227,508 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A private test subprocess: the child owns a connection until it exits,
+    // letting the test observe that exact process without relying on PID reuse.
+    #[test]
+    fn package_process_fixture() {
+        use std::io::{Read, Write};
+        let Ok(role) = std::env::var("PI_PACKAGE_TEST_ROLE") else {
+            return;
+        };
+        let address = std::env::var("PI_PACKAGE_TEST_ADDRESS").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(90)))
+            .unwrap();
+        writeln!(stream, "{role} {}", std::process::id()).unwrap();
+        if role == "parent" {
+            let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::package_process_fixture",
+                    "--nocapture",
+                ])
+                .env("PI_PACKAGE_TEST_ROLE", "child")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            // Reap the descendant if it finishes while this parent is alive.
+            // The parent-exits-first case deliberately ends this waiter early.
+            std::thread::spawn(move || {
+                let _ = descendant.wait();
+            });
+        }
+        let mut byte = [0];
+        // The test releases the parent, or closes the connection on cleanup.
+        let _ = stream.read(&mut byte);
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn check_package_process_tree(parent_exits: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "packages::tests::package_process_fixture",
+                "--nocapture",
+            ])
+            .env("PI_PACKAGE_TEST_ROLE", "parent")
+            .env(
+                "PI_PACKAGE_TEST_ADDRESS",
+                listener.local_addr().unwrap().to_string(),
+            );
+        let task = tokio::spawn(run(command, "test"));
+        let _cleanup = AbortOnDrop(task.abort_handle());
+        let (mut parent, parent_pid, mut child, child_pid) =
+            tokio::time::timeout(Duration::from_secs(45), async {
+                let mut parent = None;
+                let mut child = None;
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let (role, pid) = line.split_once(' ').unwrap();
+                    let pid: u32 = pid.trim().parse().unwrap();
+                    match role {
+                        "parent" => parent = Some((reader.into_inner(), pid)),
+                        "child" => child = Some((reader.into_inner(), pid)),
+                        _ => panic!("unexpected fixture role"),
+                    }
+                }
+                let (child, pid) = child.unwrap();
+                let (parent, parent_pid) = parent.unwrap();
+                (parent, parent_pid, child, pid)
+            })
+            .await
+            .expect("package process tree did not become ready");
+
+        #[cfg(windows)]
+        let (child_handle, parent_handle) = {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+                WaitForSingleObject,
+            };
+            struct Handle(HANDLE);
+            impl Drop for Handle {
+                fn drop(&mut self) {
+                    // SAFETY: this handle refers to the original child, even if its PID is reused.
+                    unsafe {
+                        if WaitForSingleObject(self.0, 0) == WAIT_TIMEOUT {
+                            TerminateProcess(self.0, 1);
+                        }
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+            // SAFETY: open the PID reported through the child's own connection.
+            let handle =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, child_pid) };
+            assert!(
+                !handle.is_null(),
+                "cannot open child: {}",
+                std::io::Error::last_os_error()
+            );
+            let handle = Handle(handle);
+            // SAFETY: handle remains owned until the end of this test.
+            assert_eq!(unsafe { WaitForSingleObject(handle.0, 0) }, WAIT_TIMEOUT);
+            // SAFETY: parent reported its own PID while blocked on its connection.
+            let parent =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, parent_pid) };
+            assert!(
+                !parent.is_null(),
+                "cannot open parent: {}",
+                std::io::Error::last_os_error()
+            );
+            let parent = Handle(parent);
+            assert_eq!(unsafe { WaitForSingleObject(parent.0, 0) }, WAIT_TIMEOUT);
+            (handle, parent)
+        };
+        #[cfg(unix)]
+        {
+            // SAFETY: signal zero only checks that the reporting process exists.
+            assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, 0);
+        }
+        if parent_exits {
+            parent.write_all(&[1]).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(15), parent.read(&mut byte))
+                    .await
+                    .expect("parent did not exit")
+                    .unwrap(),
+                0
+            );
+            #[cfg(unix)]
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    // WNOWAIT observes the original direct child without releasing its PID.
+                    // SAFETY: zeroed siginfo is valid for waitid and the pointer is writable.
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let result = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            parent_pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    assert_eq!(
+                        result,
+                        0,
+                        "parent was reaped while its descendant held a pipe: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    // SAFETY: waitid initialized siginfo; zero means the child has not exited yet.
+                    if unsafe { info.si_pid() } == parent_pid as libc::pid_t {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("parent process did not exit");
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+                use windows_sys::Win32::System::Threading::WaitForSingleObject;
+                // SAFETY: retained handle identifies the original parent process.
+                assert_eq!(
+                    unsafe { WaitForSingleObject(parent_handle.0, 15000) },
+                    WAIT_OBJECT_0,
+                    "original parent did not exit"
+                );
+            }
+            // Give an erroneously concurrent wait a chance to reap before cancellation.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            #[cfg(unix)]
+            {
+                // SAFETY: observe the still-owned child without reaping it.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        parent_pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(result, 0, "parent ownership was lost before cancellation");
+                // SAFETY: successful waitid initialized siginfo.
+                assert_eq!(unsafe { info.si_pid() }, parent_pid as libc::pid_t);
+            }
+        }
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        let mut byte = [0];
+        let connection = tokio::time::timeout(Duration::from_secs(15), child.read(&mut byte))
+            .await
+            .expect("child connection remained open after cancellation");
+        match connection {
+            Ok(0) => {}
+            // Windows can reset a socket when TerminateJobObject kills its owner.
+            // The original process handle below must still signal termination.
+            #[cfg(windows)]
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("unexpected child connection result: {other:?}"),
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            // SAFETY: the original child handle remains valid and is not PID-based.
+            assert_eq!(
+                unsafe { WaitForSingleObject(child_handle.0, 5000) },
+                WAIT_OBJECT_0,
+                "the original child process survived cancellation"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cancelling_package_command_terminates_its_running_process_group() {
+        check_package_process_tree(false).await;
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn cancelling_package_command_after_parent_exit_terminates_pipe_holder() {
+        check_package_process_tree(true).await;
+    }
+    #[test]
+    fn resource_filters_expand_home_and_file_urls() {
+        let root = std::env::temp_dir().join("pi filter root");
+        let path = root.join("prompts").join("sample prompt.md");
+        let url = reqwest::Url::from_file_path(&path).unwrap().to_string();
+        assert!(resource_matches(&path, &root, &url, true, false));
+        assert!(!selected(&path, &root, &[format!("-{url}")]));
+        let filter =
+            ResourceFilter::new(&json!({"prompts": [format!("-{url}")]}), "prompts").unwrap();
+        assert!(!filter.includes(&path, &root, true).unwrap());
+        let filter = ResourceFilter::new(
+            &json!({"autoload": false, "prompts": [format!("+{url}")]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(filter.includes(&path, &root, false).unwrap());
+
+        if let Some(home) = filter_home_dir() {
+            let path = home.join("pi-filter-test").join("prompt.md");
+            assert!(resource_matches(
+                &path,
+                &root,
+                "~/pi-filter-test/prompt.md",
+                true,
+                false
+            ));
+            assert!(resource_matches(
+                &path,
+                &root,
+                "~/pi-filter-test/*.md",
+                false,
+                false
+            ));
+            assert!(!selected(
+                &path,
+                &root,
+                &["-~/pi-filter-test/prompt.md".into()]
+            ));
+        }
+    }
+
+    #[test]
+    fn resource_filter_home_paths_normalize_components() {
+        let home = filter_home_dir().expect("account home");
+        let path = normalize_filter_home(&home, "prompts/review.md");
+        let root = path.parent().unwrap();
+        for pattern in [
+            "~/prompts/../prompts/./review.md",
+            "~/prompts/../prompts/*.md",
+        ] {
+            assert!(
+                resource_matches(&path, root, pattern, false, false),
+                "{pattern}"
+            );
+        }
+        assert!(!selected(
+            &path,
+            root,
+            &["-~/prompts/../prompts/./review.md".into()]
+        ));
+        assert!(selected(
+            &path,
+            root,
+            &["!*.md".into(), "+~/prompts/../prompts/review.md".into()]
+        ));
+        assert_eq!(
+            normalize_filter_home(Path::new(""), "a/../b"),
+            PathBuf::from("b")
+        );
+    }
+
+    #[test]
+    fn exact_resource_overrides_expand_after_one_relative_prefix() {
+        let home = filter_home_dir().expect("account home");
+        let home_path = normalize_filter_home(&home, "pi-filter-test/prompt.md");
+        let root = std::env::temp_dir();
+        let url_path = root.join("pi-filter-test").join("prompt space.md");
+        let url = reqwest::Url::from_file_path(&url_path).unwrap().to_string();
+
+        for (path, pattern) in [
+            (&home_path, "~/pi-filter-test/prompt.md".to_owned()),
+            (&url_path, url),
+        ] {
+            for prefix in ["./", ".\\"] {
+                let target = format!("{prefix}{pattern}");
+                assert!(!selected(path, &root, &[format!("-{target}")]));
+                assert!(selected(
+                    path,
+                    &root,
+                    &["!*.md".into(), format!("+{target}")]
+                ));
+                let filter = ResourceFilter::new(
+                    &json!({"autoload": false, "prompts": [format!("+{target}")]}),
+                    "prompts",
+                )
+                .unwrap();
+                assert!(filter.includes(path, &root, false).unwrap());
+            }
+            // Upstream removes exactly one prefix, not an arbitrary number.
+            assert!(selected(path, &root, &[format!("-././{pattern}")]));
+        }
+    }
+
+    #[test]
+    fn resource_filter_home_uses_platform_environment_and_account_fallback() {
+        const CHILD: &str = "PI_RS_FILTER_HOME_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let home = filter_home_dir().expect("account home");
+            let decoy = PathBuf::from("pi-filter-wrong-platform-home");
+            if mode == "fallback" {
+                assert_ne!(home, decoy);
+                assert!(!home.as_os_str().is_empty());
+            } else if mode == "empty" {
+                assert!(home.as_os_str().is_empty());
+            } else {
+                assert_eq!(home, PathBuf::from("pi-filter-home"));
+            }
+            let path = normalize_filter_home(&home, "prompts/review.md");
+            assert!(!selected(&path, &home, &["-~/prompts/review.md".into()]));
+            return;
+        }
+        for mode in ["fallback", "environment", "empty"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "packages::tests::resource_filter_home_uses_platform_environment_and_account_fallback", "--nocapture"])
+                .env(CHILD, mode);
+            #[cfg(unix)]
+            {
+                command.env("USERPROFILE", "pi-filter-wrong-platform-home");
+                if mode == "fallback" {
+                    command.env_remove("HOME");
+                } else {
+                    command.env(
+                        "HOME",
+                        if mode == "empty" {
+                            ""
+                        } else {
+                            "pi-filter-home"
+                        },
+                    );
+                }
+            }
+            #[cfg(windows)]
+            {
+                command.env("HOME", "pi-filter-wrong-platform-home");
+                if mode == "fallback" {
+                    command.env_remove("USERPROFILE");
+                } else {
+                    command.env(
+                        "USERPROFILE",
+                        if mode == "empty" {
+                            ""
+                        } else {
+                            "pi-filter-home"
+                        },
+                    );
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
+    #[test]
+    fn resource_filter_file_urls_validate_before_matching() {
+        let root = std::env::temp_dir();
+        let path = root.join("prompts").join("review.md");
+        let base = reqwest::Url::from_directory_path(&root).unwrap();
+        let invalid = format!("{base}prompts%2Freview.md");
+        assert!(!resource_matches(&path, &root, &invalid, true, false));
+        assert!(!resource_matches(&path, &root, &invalid, false, false));
+        assert!(selected(&path, &root, &[format!("-{invalid}")]));
+    }
+
+    #[test]
+    fn package_filter_reports_invalid_file_urls_when_evaluated() {
+        let root = std::env::temp_dir();
+        let path = root.join("prompts/review.md");
+        let invalid = format!(
+            "{}prompts%2Freview.md",
+            reqwest::Url::from_directory_path(&root).unwrap()
+        );
+        for prefix in ["", "!", "+", "-", "+./", "-./"] {
+            let filters = if prefix.starts_with('+') {
+                vec!["no-match".to_owned(), format!("{prefix}{invalid}")]
+            } else {
+                vec![format!("{prefix}{invalid}")]
+            };
+            let filter = ResourceFilter::new(&json!({"prompts": filters}), "prompts").unwrap();
+            assert!(
+                filter
+                    .includes(&path, &root, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("encoded"),
+                "{prefix}"
+            );
+        }
+        let filter = ResourceFilter::new(
+            &json!({"autoload": false, "prompts": [format!("-{invalid}")]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(filter.includes(&path, &root, true).is_err());
+        let filter = ResourceFilter::new(&json!({"prompts": ["**", invalid]}), "prompts").unwrap();
+        assert!(filter.includes(&path, &root, false).unwrap());
+    }
+
+    #[test]
+    fn package_filters_evaluate_all_candidates_per_stage() {
+        let root = std::env::temp_dir();
+        let base = reqwest::Url::from_directory_path(&root).unwrap();
+        let paths = vec![root.join("a.md"), root.join("b.md")];
+        let filter = ResourceFilter::new(
+            &json!({"prompts": ["a.md", format!("{base}bad%ZZ"), format!("-{base}bad%2Fpath")]}),
+            "prompts",
+        )
+        .unwrap();
+        let error = filter.apply(&paths, &root, &[false, false]).unwrap_err();
+        assert!(error.to_string().contains("URI malformed"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resource_filters_accept_windows_home_and_unicode_unc() {
+        let home = filter_home_dir().unwrap();
+        let path = normalize_filter_home(&home, r"prompts\review.md");
+        assert!(resource_matches(
+            &path,
+            &home,
+            r"~\prompts\*.md",
+            false,
+            false
+        ));
+        assert!(!selected(&path, &home, &[r"-~\prompts\review.md".into()]));
+        let unc = Path::new(r"\\☃\share\review.md");
+        let url = "file://xn--n3h/share/review.md";
+        assert!(resource_matches(
+            unc,
+            Path::new(r"\\☃\share"),
+            url,
+            true,
+            false
+        ));
+        assert!(!selected(
+            unc,
+            Path::new(r"\\☃\share"),
+            &[format!("-{url}")]
+        ));
+    }
+
     #[test]
     fn extension_manifest_applies_includes_and_exclusions_together() {
         let root = Path::new("/package");
@@ -2783,6 +3638,36 @@ mod tests {
             ),
             ("ssh://git@host/repo", "ssh://git@host/repo", "HEAD"),
             ("git@host:org/repo@v1", "git@host:org/repo", "v1"),
+            (
+                "git@host:org/repo@feature@v2",
+                "git@host:org/repo@feature",
+                "v2",
+            ),
+            (
+                "ssh://git@host/org/repo#feature@v2",
+                "ssh://git@host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://host/org/repo#feature@v2",
+                "https://host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://user:secret@host/org/repo#feature@v2",
+                "https://user:secret@host/org/repo",
+                "feature@v2",
+            ),
+            (
+                "https://host/org@team/repo@stable",
+                "https://host/org@team/repo",
+                "stable",
+            ),
+            (
+                "https://host/org@team/repo#stable",
+                "https://host/org@team/repo",
+                "stable",
+            ),
             ("git@host:org/repo", "git@host:org/repo", "HEAD"),
             (
                 "https://user@host/repo#old",
@@ -2792,6 +3677,112 @@ mod tests {
         ] {
             assert_eq!(git_reference(source), (url, reference));
         }
+        assert_eq!(
+            source_identity("git:ssh://git@host/org/repo#feature@v2"),
+            source_identity("git:https://host/org/repo@main")
+        );
+        assert!(matches_source(
+            &json!({"source":"git:https://host/org/repo#feature@v2", "prompts":["+prompts/keep.md"]}),
+            "git:ssh://git@host/org/repo@main",
+            Path::new("."),
+        ));
+        assert!(!matches_source(
+            &json!({"source":"git:https://host/org/repo#feature@v2"}),
+            "git:https://host/org/other@main",
+            Path::new("."),
+        ));
+        assert_eq!(
+            source_identity("git:https://host/org@team/repo@stable"),
+            source_identity("git:https://host/org@team/repo#stable")
+        );
+        assert!(matches_source(
+            &json!({"source":"git:https://host/org@team/repo@stable", "prompts":["+prompts/keep.md"]}),
+            "git:https://host/org@team/repo#stable",
+            Path::new(".")
+        ));
+        assert!(ambiguous_git_reference("https://host/org@team/repo@stable"));
+        assert!(!ambiguous_git_reference(
+            "https://host/org@team/repo#stable"
+        ));
+        assert!(!ambiguous_git_reference("ssh://git@host/org/repo@stable"));
+    }
+
+    #[test]
+    fn git_source_display_redacts_url_userinfo_without_changing_identity() {
+        for source in [
+            "git:https://private-user:topsecret@example.invalid/org/repo@stable",
+            "git:ssh://private-user@example.invalid/org/repo#feature@v2",
+            "git:https://private-user:topsecret@example.invalid?query@value",
+        ] {
+            let displayed = display_source(source);
+            assert!(!displayed.contains("private-user"), "{displayed}");
+            assert!(!displayed.contains("topsecret"), "{displayed}");
+            assert!(
+                displayed.contains("[redacted]@example.invalid"),
+                "{displayed}"
+            );
+        }
+        assert_eq!(
+            display_source("git:https://example.invalid/org/repo@stable"),
+            "git:https://example.invalid/org/repo@stable"
+        );
+        assert_eq!(
+            source_identity("git:https://private-user:topsecret@example.invalid/org/repo@stable"),
+            source_identity("git:https://example.invalid/org/repo#feature")
+        );
+        let error = package_command_failed(
+            "git:ssh://private-user@example.invalid/org/repo",
+            "exit status: 1",
+            b"helper echoed private-user",
+        )
+        .to_string();
+        assert!(!error.contains("private-user"), "{error}");
+        assert!(
+            error.contains("exit status: 1") && error.contains("redacted"),
+            "{error}"
+        );
+        let error = package_command_failed(
+            "git:https://example.invalid/org/repo",
+            "exit status: 1",
+            b"useful error",
+        )
+        .to_string();
+        assert!(error.contains("useful error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn git_userinfo_keeps_safe_offline_diagnostic() {
+        let source = "git:ssh://git@example.invalid/org/repo@stable";
+        let error = match install(source, true).await {
+            Ok(_) => panic!("offline install unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("cannot install package in offline mode"),
+            "{error}"
+        );
+        assert!(error.contains("[redacted]@example.invalid"), "{error}");
+        assert!(!error.contains("ssh://git@"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn git_userinfo_hides_real_subprocess_stderr() {
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "echo private-user 1>&2 & exit /b 7"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "printf private-user >&2; exit 7"]);
+            command
+        };
+        command.current_dir(std::env::temp_dir());
+        let error = run(command, "git:ssh://private-user@example.invalid/org/repo")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("subprocess output redacted"), "{error}");
+        assert!(!error.contains("private-user"), "{error}");
     }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {
@@ -2863,20 +3854,24 @@ mod tests {
         let root = Path::new("/package");
         let path = root.join("prompts/keep.md");
         let empty = ResourceFilter::new(&json!({"autoload":false}), "prompts").unwrap();
-        assert!(!empty.includes(&path, root, false));
-        assert!(empty.includes(&path, root, true));
+        assert!(!empty.includes(&path, root, false).unwrap());
+        assert!(empty.includes(&path, root, true).unwrap());
         let filter = ResourceFilter::new(&json!({"autoload":false,"prompts":["prompts/*.md","-prompts/keep.md","+prompts/keep.md"]}), "prompts").unwrap();
-        assert!(filter.includes(&path, root, false));
-        assert!(!filter.includes(&root.join("other.md"), root, false));
+        assert!(filter.includes(&path, root, false).unwrap());
+        assert!(
+            !filter
+                .includes(&root.join("other.md"), root, false)
+                .unwrap()
+        );
         let filter = ResourceFilter::new(
             &json!({"autoload":false,"prompts":["!prompts/*.md"]}),
             "prompts",
         )
         .unwrap();
-        assert!(!filter.includes(&path, root, true));
-        assert!(filter.includes(&root.join("other.md"), root, true));
+        assert!(!filter.includes(&path, root, true).unwrap());
+        assert!(filter.includes(&root.join("other.md"), root, true).unwrap());
         let normal = ResourceFilter::new(&json!({"prompts":[]}), "prompts").unwrap();
-        assert!(!normal.includes(&path, root, true));
+        assert!(!normal.includes(&path, root, true).unwrap());
     }
 
     #[test]

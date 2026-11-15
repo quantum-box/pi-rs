@@ -677,8 +677,11 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            // Pi accepts a UTF-8 BOM in MCP configuration when loading and editing it.
-            let input = if path.file_name().is_some_and(|name| name == "mcp.json") {
+            // Pi accepts a UTF-8 BOM in settings and MCP configuration when loading and editing them.
+            let input = if path
+                .file_name()
+                .is_some_and(|name| name == "mcp.json" || name == "settings.json")
+            {
                 bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)
             } else {
                 &bytes
@@ -973,15 +976,65 @@ mod tests {
         }
     }
     #[test]
-    fn bom_handling_is_limited_to_mcp_configuration() {
+    fn bom_handling_is_limited_to_settings_and_mcp_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let mcp = directory.path().join("mcp.json");
-        let other = directory.path().join("settings.json");
-        for path in [&mcp, &other] {
+        let settings = directory.path().join("settings.json");
+        let other = directory.path().join("other.json");
+        for path in [&mcp, &settings, &other] {
             std::fs::write(path, "\u{feff}{\"keep\":true}").unwrap();
         }
         assert_eq!(super::read_object(&mcp).unwrap()["keep"], true);
+        assert_eq!(super::read_object(&settings).unwrap()["keep"], true);
         assert!(super::read_object(&other).is_err());
+    }
+
+    #[test]
+    fn bom_settings_load_validate_and_update_both_layers() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("global/settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user,
+            "\u{feff}{\"theme\":\"global\",\"extension\":{\"keep\":true}}",
+        )
+        .unwrap();
+        std::fs::write(&project, "\u{feff}{\"theme\":\"project\"}").unwrap();
+        let mut settings = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(settings.string("theme"), Some("project"));
+        assert_eq!(
+            super::Settings::load_from_paths(&workspace, false, &user)
+                .unwrap()
+                .string("theme"),
+            Some("global")
+        );
+        settings
+            .set_user_values_at(&user, &[("hideThinkingBlock".into(), json!(true))])
+            .unwrap();
+        let saved = super::read_object(&user).unwrap();
+        assert_eq!(saved["extension"]["keep"], true);
+        assert_eq!(saved["hideThinkingBlock"], true);
+        assert_eq!(settings.string("theme"), Some("project"));
+
+        std::fs::write(&project, "\u{feff}{\"hideThinkingBlock\":\"invalid\"}").unwrap();
+        let error = match super::Settings::load_from_paths(&workspace, true, &user) {
+            Ok(_) => panic!("invalid project setting was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("settings.json/hideThinkingBlock"), "{error}");
+        assert!(super::Settings::load_from_paths(&workspace, false, &user).is_ok());
+        std::fs::write(&user, "\u{feff}{ broken").unwrap();
+        assert!(super::Settings::load_from_paths(&workspace, false, &user).is_err());
+        assert!(
+            settings
+                .set_user_values_at(&user, &[("theme".into(), json!("dark"))])
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), "\u{feff}{ broken");
     }
     #[tokio::test]
     async fn auth_read_waits_asynchronously_until_lock_is_released() {

@@ -38,6 +38,36 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
 
+// Shell output is displayed separately from the model-facing context framing.
+fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
+    // Finish stripping the untrusted output before adding host-generated
+    // status, so an unfinished escape cannot consume the status or path.
+    let mut output = crate::ui::render::strip_shell_ansi(&execution.output);
+    let status = if execution.cancelled {
+        Some("(cancelled)".to_owned())
+    } else {
+        execution
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("(exit {code})"))
+    };
+    if let Some(status) = status {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&status);
+    }
+    if execution.truncated
+        && let Some(path) = &execution.full_output_path
+    {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&format!("Output truncated. Full output: {path}"));
+    }
+    output
+}
+
 pub(super) fn new_session_path() -> PathBuf {
     session_path(&std::env::current_dir().unwrap_or_default(), None)
 }
@@ -108,7 +138,7 @@ struct Terminal {
     #[cfg(any(unix, windows))]
     color_requery: bool,
     #[cfg(any(unix, windows))]
-    expired_color_markers: usize,
+    completed_color_markers: usize,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -126,6 +156,7 @@ enum KeyboardProtocol {
 struct ColorQuery {
     started: Instant,
     replied: u32,
+    quarantined: bool,
 }
 
 impl Terminal {
@@ -140,7 +171,7 @@ impl Terminal {
             #[cfg(any(unix, windows))]
             color_requery: false,
             #[cfg(any(unix, windows))]
-            expired_color_markers: 0,
+            completed_color_markers: 0,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -195,18 +226,21 @@ impl Terminal {
     }
     #[cfg(any(unix, windows))]
     fn query_terminal_colors(&mut self) -> Result<()> {
-        // Serialize queries so that replies remain attributable when DA1 is absent.
+        // Never overlap an incomplete query with a new request; OSC replies
+        // contain no query identifier. A complete query may precede its DA1.
         if let Some(query) = self.color_queries.front() {
             self.color_requery = true;
             if query.replied == (1 << 18) - 1 {
-                self.expired_color_markers = self.expired_color_markers.saturating_add(1);
+                self.completed_color_markers = self.completed_color_markers.saturating_add(1);
                 return self.finish_color_query();
             }
             return Ok(());
         }
+        crate::ui::theme::begin_terminal_palette_query();
         self.color_queries.push_back(ColorQuery {
             started: Instant::now(),
             replied: 0,
+            quarantined: false,
         });
         let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
         for index in 0..16 {
@@ -219,15 +253,15 @@ impl Terminal {
 
     #[cfg(any(unix, windows))]
     fn accepts_color_reply(&mut self, target: u8) -> Result<bool> {
-        let is_latest = !self.color_requery;
         let Some(query) = self.color_queries.front_mut() else {
             return Ok(false);
         };
+        let is_latest = !self.color_requery && !query.quarantined;
         let flag = 1_u32 << target;
         let fresh = query.replied & flag == 0;
         query.replied |= flag;
         if query.replied == (1 << 18) - 1 && self.color_requery {
-            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
+            self.completed_color_markers = self.completed_color_markers.saturating_add(1);
             self.finish_color_query()?;
         }
         Ok(is_latest && fresh)
@@ -244,8 +278,8 @@ impl Terminal {
 
     #[cfg(any(unix, windows))]
     fn receive_color_marker(&mut self) -> Result<()> {
-        if self.expired_color_markers > 0 {
-            self.expired_color_markers -= 1;
+        if self.completed_color_markers > 0 {
+            self.completed_color_markers -= 1;
             Ok(())
         } else {
             self.finish_color_query()
@@ -255,13 +289,13 @@ impl Terminal {
     #[cfg(any(unix, windows))]
     fn poll_color_timeout(&mut self) -> Result<()> {
         if self.color_requery
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| query.started.elapsed() >= Duration::from_secs(2))
+            && let Some(query) = self.color_queries.front_mut()
+            && !query.quarantined
+            && query.started.elapsed() >= Duration::from_secs(2)
         {
-            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-            self.finish_color_query()?;
+            // An incomplete query remains isolated until DA1 or all targets
+            // have replied; a timeout alone cannot identify late OSC replies.
+            query.quarantined = true;
         }
         Ok(())
     }
@@ -499,8 +533,9 @@ struct ThinkingSettings {
     overrides: serde_json::Map<String, Value>,
     model_picker: Option<Picker>,
     selected: Option<String>,
-    levels: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    levels: Option<std::sync::mpsc::Receiver<(Vec<String>, Option<bool>)>>,
     available_levels: Vec<String>,
+    available_reasoning: Option<bool>,
 }
 
 struct PendingThinking {
@@ -727,7 +762,7 @@ enum TranscriptPanel {
 #[derive(Default)]
 struct StreamingTool {
     name: String,
-    arguments: crate::streaming_json::StreamingJson,
+    arguments: crate::StreamingJson,
     preview: Value,
 }
 
@@ -745,7 +780,7 @@ struct View {
     tree_navigation: Option<(u64, bool)>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
-    widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
+    widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
@@ -760,6 +795,10 @@ struct View {
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
     thinking: String,
+    thinking_items: std::collections::BTreeMap<u64, String>,
+    text_items: std::collections::BTreeMap<u64, String>,
+    thinking_items_consistent: bool,
+    text_items_consistent: bool,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
@@ -796,6 +835,26 @@ struct View {
     shell_running: bool,
     restoring_queue: bool,
 }
+fn append_indexed(
+    items: &mut std::collections::BTreeMap<u64, String>,
+    combined: &mut String,
+    consistent: &mut bool,
+    index: u64,
+    delta: &str,
+) {
+    let append = *consistent
+        && items
+            .last_key_value()
+            .is_none_or(|(&last, _)| index >= last);
+    items.entry(index).or_default().push_str(delta);
+    if append {
+        combined.push_str(delta);
+    } else {
+        *combined = items.values().cloned().collect();
+        *consistent = true;
+    }
+}
+
 impl View {
     fn invalidate_model_catalog(&mut self) {
         self.available_models.clear();
@@ -894,13 +953,15 @@ impl View {
                 lines,
                 placement,
             } => {
-                if lines.is_some() && !self.widgets.contains_key(&key) && self.widgets.len() >= 64 {
+                if lines.is_some()
+                    && !self.widgets.iter().any(|(existing, _, _)| existing == &key)
+                    && self.widgets.len() >= 64
+                {
                     return Err(Error::Config("too many extension widgets".into()));
                 }
+                self.widgets.retain(|(existing, _, _)| existing != &key);
                 if let Some(lines) = lines {
-                    self.widgets.insert(key, (lines, placement));
-                } else {
-                    self.widgets.remove(&key);
+                    self.widgets.push((key, lines, placement));
                 }
             }
             pi_rs::UiRequest::SetTitle { title } => execute!(
@@ -934,9 +995,9 @@ impl View {
         placement: pi_rs::WidgetPlacement,
     ) -> Vec<Line> {
         self.widgets
-            .values()
-            .filter(|(_, location)| *location == placement)
-            .flat_map(|(lines, _)| lines.iter())
+            .iter()
+            .filter(|(_, _, location)| *location == placement)
+            .flat_map(|(_, lines, _)| lines.iter())
             .flat_map(|text| {
                 Entry::Notice(text.clone()).render(
                     theme,
@@ -1066,7 +1127,18 @@ impl View {
         true
     }
     fn append(&mut self, text: &str) {
-        self.lines.push(Entry::Notice(clean(text)));
+        // Keep U+0085 for transcript search only. Span rendering strips it
+        // before terminal output, as it does for other control characters.
+        let text = text
+            .chars()
+            .filter(|character| {
+                !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
+            })
+            .collect();
+        self.append_entry(Entry::Notice(text));
+    }
+    fn append_entry(&mut self, entry: Entry) {
+        self.lines.push(entry);
         if self.lines.len() > 4000 {
             let removed = self.lines.len() - 4000;
             self.lines.drain(..removed);
@@ -1077,14 +1149,14 @@ impl View {
         if !message.display {
             return;
         }
-        let mut text = String::new();
+        let mut text = Vec::new();
         let mut images = Vec::new();
         match &message.content {
-            pi_rs::ContextContent::Text(value) => text.push_str(value),
+            pi_rs::ContextContent::Text(value) => text.push(value.as_str()),
             pi_rs::ContextContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        pi_rs::ContentBlock::Text { text: value, .. } => text.push_str(value),
+                        pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
                         pi_rs::ContentBlock::Image { data, mime_type } => {
                             images.push(pi_rs::ImageContent {
                                 data: data.clone(),
@@ -1096,7 +1168,10 @@ impl View {
                 }
             }
         }
-        self.append(&format!("{}: {}", message.custom_type, text));
+        self.append_entry(Entry::CustomMessage {
+            custom_type: message.custom_type.clone(),
+            text: text.join("\n"),
+        });
         if !images.is_empty() {
             self.add_images(&images);
         }
@@ -1273,6 +1348,7 @@ impl View {
                         | "compacted"
                         | "branch_summary"
                         | "custom_message"
+                        | "custom_message_delivered"
                 )
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
@@ -1327,8 +1403,10 @@ impl View {
         self.scrollbar_activity = None;
         self.flash = None;
         self.streaming.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         self.thinking.clear();
+        self.thinking_items.clear();
         self.draft_images.clear();
         self.clipboard = None;
         self.dialogs.clear();
@@ -1390,7 +1468,7 @@ impl View {
                         }
                         .into(),
                         arguments: json!({"command":execution.command}).to_string(),
-                        output: execution.context_text(),
+                        output: shell_display_output(execution),
                         failed: execution.cancelled
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
@@ -1629,8 +1707,8 @@ impl View {
             Some("bash_execution_end") => {
                 self.shell_running = false;
                 let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
-                    Ok(execution) if !execution.cancelled && execution.exit_code == Some(0) => pi_rs::Outcome::Succeeded(execution.context_text()),
-                    Ok(execution) => pi_rs::Outcome::Failed(execution.context_text()),
+                    Ok(execution) if !execution.cancelled && execution.exit_code.is_none_or(|code| code == 0) => pi_rs::Outcome::Succeeded(shell_display_output(&execution)),
+                    Ok(execution) => pi_rs::Outcome::TextResult { output: shell_display_output(&execution), details: None, is_error: true },
                     Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
                 };
                 self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
@@ -1653,7 +1731,9 @@ impl View {
             Some("summary_request_start") => {
                 self.summarizing = true;
                 self.thinking.clear();
+                self.thinking_items.clear();
                 self.streaming.clear();
+                self.text_items.clear();
                 self.streaming_tools.clear();
             }
             Some("tool_call_delta") if !self.summarizing => {
@@ -1666,12 +1746,43 @@ impl View {
                     self.phase = Some("ツール呼出し準備中");
                 }
             }
-            Some("reasoning_delta") if !self.summarizing => self
-                .thinking
-                .push_str(value["delta"].as_str().unwrap_or_default()),
-            Some("text_delta") if !self.summarizing => self
-                .streaming
-                .push_str(value["delta"].as_str().unwrap_or_default()),
+            Some("reasoning_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["reasoningIndex"].as_u64() {
+                    append_indexed(&mut self.thinking_items, &mut self.thinking, &mut self.thinking_items_consistent, index, delta);
+                } else { self.thinking.push_str(delta); self.thinking_items_consistent = false; }
+            }
+            Some("reasoning_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.thinking_items.entry(index).or_default(); }
+            }
+            Some("reasoning_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.thinking_items.insert(index, content.to_owned());
+                    self.thinking = self.thinking_items.values().cloned().collect();
+                    self.thinking_items_consistent = true;
+                }
+            }
+            Some("text_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.text_items.entry(index).or_default(); }
+            }
+            Some("text_item_delta") if !self.summarizing => {
+                if let (Some(index), Some(delta)) = (value["index"].as_u64(), value["delta"].as_str()) {
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                }
+            }
+            Some("text_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.text_items.insert(index, content.to_owned());
+                    self.streaming = self.text_items.values().cloned().collect();
+                    self.text_items_consistent = true;
+                }
+            }
+            Some("text_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["textIndex"].as_u64() {
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
+            }
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -1706,7 +1817,9 @@ impl View {
                     Some("assistant") => {
                         self.streaming_tools.clear();
                         self.streaming.clear();
+                        self.text_items.clear();
                         let thinking = std::mem::take(&mut self.thinking);
+                        self.thinking_items.clear();
                         if !thinking.is_empty() {
                             self.lines.push(Entry::Thinking(thinking));
                         }
@@ -1782,6 +1895,8 @@ impl View {
     }
     fn settle(&mut self) {
         self.summarizing = false;
+        self.thinking_items.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
             self.lines
@@ -3228,9 +3343,8 @@ fn slash(
                         let local = std::path::Path::new(cwd)
                             .canonicalize()
                             .is_ok_and(|cwd| cwd == workspace);
-                        let mut document = super::ui::session_search::Document::new(
-                            session.name().unwrap_or_default().into(),
-                            session.session_id().to_string(),
+                        let mut document = super::ui::session_search::Document::from_session(
+                            &session,
                             cwd.into(),
                             messages,
                             local,
@@ -3497,6 +3611,17 @@ fn load_resolved_theme(
     Err(error)
 }
 
+#[cfg(any(unix, windows))]
+fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
+    // A reported background remains authoritative until a newer color reply arrives.
+    let changed = crate::ui::theme::set_appearance(dark);
+    let redraw_system = changed && theme.name == "system";
+    if redraw_system {
+        *theme = Theme::system();
+    }
+    (changed, redraw_system)
+}
+
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
@@ -3699,6 +3824,7 @@ pub(super) async fn run(
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     let mut deferred_input = VecDeque::new();
+    let mut thinking_level_input = VecDeque::new();
     let mut interrupted = false;
     'interactive: loop {
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3938,18 +4064,20 @@ pub(super) async fn run(
             && let Some(receiver) = &state.levels
         {
             match receiver.try_recv() {
-                Ok(mut levels) => {
+                Ok((mut levels, reasoning)) => {
                     if levels.is_empty() {
                         levels.push("off".into());
                     }
                     levels.dedup();
                     state.available_levels = levels;
+                    state.available_reasoning = reasoning;
                     state.levels = None;
                     view.picker = Some(thinking_level_picker(state));
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     state.levels = None;
+                    thinking_level_input.clear();
                     let mut picker = state.model_picker.take().expect("model picker");
                     picker.show_feedback(Err("Thinking level discovery stopped".into()));
                     view.picker = Some(picker);
@@ -3999,7 +4127,15 @@ pub(super) async fn run(
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
                     match value["type"].as_str() {
-                        Some("text_delta" | "reasoning_delta") => continue,
+                        Some(
+                            "text_delta"
+                            | "reasoning_delta"
+                            | "reasoning_item_start"
+                            | "reasoning_item_end"
+                            | "text_item_start"
+                            | "text_item_delta"
+                            | "text_item_end",
+                        ) => continue,
                         Some("error") => {
                             view.branch_error = value["message"].as_str().map(str::to_owned)
                         }
@@ -4232,7 +4368,20 @@ pub(super) async fn run(
         } else {
             Duration::from_millis(40)
         };
-        let next_input = if let Some(event) = deferred_input.pop_front() {
+        let picker_title = view.picker.as_ref().map(|picker| picker.title.as_str());
+        let loading = picker_title == Some("Loading thinking levels");
+        let ready = picker_title.is_some_and(|title| title.starts_with("Thinking level · "));
+        let blocked =
+            view.dialog().is_some() || view.local_editor.is_some() || view.share_blocks_input();
+        let pending = if view.pending_transition.is_some() {
+            thinking_level_input.clear();
+            None
+        } else {
+            next_thinking_level_input(&mut thinking_level_input, loading, ready, blocked)
+        };
+        let next_input = if let Some(event) = pending {
+            Some(crate::ui::input::InputEvent::Event(event))
+        } else if let Some(event) = deferred_input.pop_front() {
             Some(event)
         } else {
             input.next(input_wait)?
@@ -4296,15 +4445,12 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        crate::ui::theme::reset_terminal_background();
+                        let (changed, redraw_system) = apply_terminal_appearance(&mut theme, dark);
+                        dirty |= redraw_system;
                         if let Some(terminal) = &mut _terminal {
                             terminal.query_terminal_colors()?;
                         }
-                        if theme.name == "system" {
-                            theme = Theme::system();
-                            dirty = true;
-                        }
-                        crate::ui::theme::set_appearance(dark)
+                        changed
                     }
                     crate::ui::input::InputEvent::TerminalColor {
                         foreground,
@@ -4320,7 +4466,7 @@ pub(super) async fn run(
                         };
                         let changed = accepted
                             && crate::ui::theme::set_terminal_color(foreground, red, green, blue);
-                        if accepted && !foreground && theme.name == "system" {
+                        if accepted && theme.name == "system" {
                             theme = Theme::system();
                             dirty = true;
                         }
@@ -4351,6 +4497,22 @@ pub(super) async fn run(
             }
             _ => continue,
         };
+        if view
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.title == "Loading thinking levels")
+            && view.dialog().is_none()
+            && view.local_editor.is_none()
+            && !view.share_blocks_input()
+            && view.pending_transition.is_none()
+            && buffer_thinking_level_input(
+                &mut thinking_level_input,
+                &event,
+                matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && keys.matches("tui.select.cancel", *key)),
+            )
+        {
+            continue;
+        }
         if view.pending_transition.is_some() {
             match &event {
                 Event::Key(key) if key.code == KeyCode::Esc => {
@@ -4751,6 +4913,7 @@ pub(super) async fn run(
                                         selected: None,
                                         levels: None,
                                         available_levels: Vec::new(),
+                                        available_reasoning: None,
                                     });
                                     start_model_picker(
                                         &args,
@@ -4829,6 +4992,7 @@ pub(super) async fn run(
                                             args.thinking_profile = Some((
                                                 args.model.clone(),
                                                 state.available_levels.clone(),
+                                                state.available_reasoning,
                                             ));
                                             let previous_level = view
                                                 .pending_thinking
@@ -6193,7 +6357,7 @@ fn thinking_level_picker(state: &ThinkingSettings) -> Picker {
 fn start_thinking_levels(
     args: &Cli,
     model: &str,
-) -> Result<std::sync::mpsc::Receiver<Vec<String>>> {
+) -> Result<std::sync::mpsc::Receiver<(Vec<String>, Option<bool>)>> {
     let (provider, id) = super::model_selection::qualified_model(model, &args.model_profiles)
         .ok_or_else(|| Error::Config("Unknown model provider".into()))?;
     let mut selected = args.clone();
@@ -6206,7 +6370,8 @@ fn start_thinking_levels(
             .into_iter()
             .filter(|level| super::thinking::LEVELS.contains(&level.as_str()))
             .collect();
-        let _ = sender.send(levels);
+        let reasoning = super::thinking::adopted_reasoning(&selected);
+        let _ = sender.send((levels, reasoning));
     });
     Ok(receiver)
 }
@@ -6765,7 +6930,7 @@ fn select(
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;
         }
-        Selection::Completion { range, text } => insert_completion(view, range, &text),
+        Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
@@ -6980,6 +7145,40 @@ fn select(
     Ok(())
 }
 
+// Keep typeahead in order until model-level discovery finishes. A configured
+// picker cancellation discards input intended for the abandoned picker.
+fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event, cancel: bool) -> bool {
+    match event {
+        Event::Key(_) if cancel => {
+            pending.clear();
+            false
+        }
+        Event::Key(_) | Event::Paste(_) => {
+            if pending.len() < 1024 {
+                pending.push_back(event.clone());
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn next_thinking_level_input(
+    pending: &mut VecDeque<Event>,
+    loading: bool,
+    ready: bool,
+    blocked: bool,
+) -> Option<Event> {
+    if !loading && !ready {
+        pending.clear();
+    }
+    if ready && !blocked {
+        pending.pop_front()
+    } else {
+        None
+    }
+}
+
 // A bare Escape may need the input decoder's 25 ms disambiguation window.
 // Give already-arrived input priority over committing a prepared session.
 fn queued_transition_cancel(
@@ -7140,28 +7339,44 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
 }
 
 fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
-    let command = args
-        .settings
-        .string("externalEditor")
-        .map(str::to_owned)
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "nano".into()
-            }
-        });
-    let parts = shell_words::split(&command).map_err(|error| Error::Config(error.to_string()))?;
+    let command = external_editor_command(
+        args.settings.string("externalEditor"),
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
+    run_external_editor(&command, editor)
+}
+
+fn external_editor_command(
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> String {
+    configured
+        .filter(|command| {
+            !command
+                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}')
+                .is_empty()
+        })
+        .or_else(|| visual.filter(|command| !command.is_empty()))
+        .or_else(|| editor.filter(|command| !command.is_empty()))
+        .unwrap_or(if cfg!(windows) { "notepad" } else { "nano" })
+        .to_owned()
+}
+
+fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
+    let parts = shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
     let Some((program, arguments)) = parts.split_first() else {
         return Err(Error::Config("external editor is empty".into()));
     };
-    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-    file.write_all(editor.text.as_bytes())?;
+    // Keep the directory, rather than an open file handle, alive while the
+    // editor runs. Editors on Windows may require exclusive access to the file.
+    let directory = external_editor_directory()?;
+    let path = directory.path().join("prompt.md");
+    std::fs::write(&path, editor.text.as_bytes())?;
     if !std::process::Command::new(program)
         .args(arguments)
-        .arg(file.path())
+        .arg(&path)
         .status()?
         .success()
     {
@@ -7169,11 +7384,36 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
             "external editor exited unsuccessfully".into(),
         ));
     }
-    editor.replace(std::fs::read_to_string(file.path())?);
+    let bytes = std::fs::read(&path)?;
+    editor.replace(external_editor_text(&bytes));
     Ok(())
 }
 
+fn external_editor_directory() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("pi-editor-");
+    // Match mkdtemp's private directory on Unix: the draft can contain secrets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
+fn external_editor_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    text.strip_suffix('\n').unwrap_or(text).to_owned()
+}
+
 fn complete_input(args: &Cli, view: &mut View) {
+    enum CompletionSource {
+        Builtin,
+        Skill,
+        Prompt(Option<String>),
+        Other,
+    }
     let prefix = &view.editor.text[..view.editor.cursor];
     let start = prefix
         .char_indices()
@@ -7209,7 +7449,7 @@ fn complete_input(args: &Cli, view: &mut View) {
         ]
         .into_iter()
         .filter(|name| name.starts_with(word))
-        .map(str::to_owned)
+        .map(|name| (name.to_owned(), CompletionSource::Builtin))
         .collect::<Vec<_>>()
     } else {
         let file_word = word.strip_prefix('@').unwrap_or(word);
@@ -7240,40 +7480,71 @@ fn complete_input(args: &Cli, view: &mut View) {
                 } else {
                     ""
                 };
-                Some(format!(
-                    "{}{}{suffix}",
-                    if word.starts_with('@') { "@" } else { "" },
-                    parent.join(file_name).display()
+                Some((
+                    format!(
+                        "{}{}{suffix}",
+                        if word.starts_with('@') { "@" } else { "" },
+                        parent.join(file_name).display()
+                    ),
+                    CompletionSource::Other,
                 ))
             })
             .take(100)
             .collect::<Vec<_>>()
     };
     if start == 0 && word.starts_with('/') {
-        candidates.extend(
-            view.resources
-                .prompts
-                .keys()
-                .map(|name| format!("/{name}"))
-                .filter(|name| name.starts_with(word)),
-        );
+        for (name, prompt) in &view.resources.prompts {
+            let text = format!("/{name}");
+            if text.starts_with(word) && !candidates.iter().any(|(candidate, _)| candidate == &text)
+            {
+                if name
+                    .strip_prefix("skill:")
+                    .is_some_and(|skill| view.resources.skills.contains_key(skill))
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                    continue;
+                }
+                let description = match (&prompt.argument_hint, prompt.description.is_empty()) {
+                    (Some(hint), false) => format!("{hint} — {}", prompt.description),
+                    (Some(hint), true) => hint.clone(),
+                    (None, _) => prompt.description.clone(),
+                };
+                candidates.push((
+                    text,
+                    CompletionSource::Prompt((!description.is_empty()).then_some(description)),
+                ));
+            }
+        }
         if args.settings.enable_skill_commands() {
-            candidates.extend(
-                view.resources
-                    .skills
-                    .keys()
-                    .map(|name| format!("/skill:{name}"))
-                    .filter(|name| name.starts_with(word)),
-            );
+            for name in view.resources.skills.keys() {
+                let text = format!("/skill:{name}");
+                if text.starts_with(word)
+                    && !candidates.iter().any(|(candidate, _)| candidate == &text)
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                }
+            }
         }
     }
-    candidates.sort();
-    candidates.dedup();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.dedup_by(|a, b| a.0 == b.0);
     let range = start..view.editor.cursor;
     match candidates.as_slice() {
-        [candidate] => insert_completion(view, range, candidate),
+        [(candidate, _)] => insert_completion(view, range, candidate),
         [] => {}
         _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|(text, source)| {
+                    let description = match source {
+                        CompletionSource::Prompt(description) => description,
+                        CompletionSource::Builtin
+                        | CompletionSource::Skill
+                        | CompletionSource::Other => None,
+                    };
+                    (text, description)
+                })
+                .collect();
             view.picker = Some(Picker::completion(
                 candidates,
                 range,
@@ -7337,6 +7608,183 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexed_delta_append_handles_interleaving_and_legacy_text() {
+        let mut items = std::collections::BTreeMap::new();
+        let mut combined = String::new();
+        let mut consistent = false;
+        for (index, delta, expected) in [
+            (0, "a", "a"),
+            (1, "b", "ab"),
+            (0, "c", "acb"),
+            (1, "d", "acbd"),
+        ] {
+            super::append_indexed(&mut items, &mut combined, &mut consistent, index, delta);
+            assert_eq!(combined, expected);
+        }
+        combined.push_str("legacy");
+        consistent = false;
+        super::append_indexed(&mut items, &mut combined, &mut consistent, 1, "e");
+        assert_eq!(combined, "acbde");
+    }
+    #[test]
+    fn indexed_text_finalization_keeps_item_order() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"text_item_start","index":0}),
+            serde_json::json!({"type":"text_item_delta","index":0,"delta":"a"}),
+            serde_json::json!({"type":"text_item_start","index":2}),
+            serde_json::json!({"type":"text_item_delta","index":2,"delta":"b"}),
+            serde_json::json!({"type":"text_item_end","index":0,"content":"A"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.streaming, "Ab");
+        view.settle();
+        assert!(view.text_items.is_empty());
+    }
+
+    #[test]
+    fn indexed_reasoning_finalization_replaces_streamed_text() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"reasoning_item_start","index":0}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"raw"}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"summary"}),
+            serde_json::json!({"type":"reasoning_item_end","index":0,"content":"summary"}),
+            serde_json::json!({"type":"reasoning_item_start","index":2}),
+            serde_json::json!({"type":"reasoning_item_end","index":2,"content":"other"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.thinking, "summaryother");
+        view.settle();
+        assert!(view.thinking_items.is_empty());
+    }
+    #[test]
+    fn external_editor_selects_first_nonempty_command() {
+        assert_eq!(
+            super::external_editor_command(
+                Some("  \u{feff}"),
+                Some("visual --wait"),
+                Some("editor")
+            ),
+            "visual --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(
+                Some("configured --wait"),
+                Some("visual"),
+                Some("editor")
+            ),
+            "configured --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("editor")),
+            "editor"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("")),
+            if cfg!(windows) { "notepad" } else { "nano" }
+        );
+        assert_eq!(
+            super::external_editor_command(Some("\u{0085}"), None, None),
+            "\u{0085}"
+        );
+    }
+
+    #[test]
+    fn external_editor_strips_one_bom_and_one_final_lf() {
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbfprompt\n\n"),
+            "prompt\n"
+        );
+        assert_eq!(super::external_editor_text(b"prompt\r\n"), "prompt\r");
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbf\xef\xbb\xbftext"),
+            "\u{feff}text"
+        );
+        assert_eq!(super::external_editor_text(b"bad\xff\n"), "bad\u{fffd}");
+        assert_eq!(super::external_editor_text(b""), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = super::external_editor_directory().unwrap();
+        let mode = std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_updates_only_after_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277edited\\n\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        super::run_external_editor(program.to_str().unwrap(), &mut editor).unwrap();
+        assert_eq!(editor.text, "edited\n");
+        assert_eq!(editor.cursor, editor.text.len());
+        std::fs::write(&program, "#!/bin/sh\nprintf corrupted > \"$1\"\nexit 1\n").unwrap();
+        assert!(super::run_external_editor(program.to_str().unwrap(), &mut editor).is_err());
+        assert_eq!(editor.text, "edited\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_editor_allows_exclusive_open_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("editor test.ps1");
+        let marker = dir.path().join("draft-path.txt");
+        let command = format!(
+            "powershell.exe -NoProfile -NonInteractive -File \"{}\" \"{}\"",
+            script.display(),
+            marker.display()
+        );
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        for (exit, replacement) in [(0, "edited"), (1, "corrupted")] {
+            std::fs::write(
+                &script,
+                format!(
+                    r#"param([string]$marker, [string]$draft)
+$ErrorActionPreference = 'Stop'
+[System.IO.File]::WriteAllText($marker, $draft)
+$file = [System.IO.File]::Open($draft, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {{
+    $file.SetLength(0)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("{replacement}`n")
+    $file.Write($bytes, 0, $bytes.Length)
+}} finally {{ $file.Dispose() }}
+exit {exit}
+"#
+                ),
+            )
+            .unwrap();
+            let result = super::run_external_editor(&command, &mut editor);
+            assert_eq!(result.is_ok(), exit == 0);
+            assert_eq!(editor.text, "edited");
+            let path = std::path::PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+            assert!(!path.exists(), "temporary draft survived editor exit");
+            assert!(
+                !path.parent().unwrap().exists(),
+                "temporary directory survived editor exit"
+            );
+        }
+    }
+
     #[test]
     fn live_frame_flushes_text_before_console_side_effects() {
         use std::io::Write;
@@ -7848,6 +8296,99 @@ mod tests {
     }
 
     #[test]
+    fn thinking_level_typeahead_waits_for_discovery_and_escape_discards_it() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let mut pending = VecDeque::new();
+        let typed = [
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)),
+            Event::Paste("lear".into()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        for event in &typed {
+            assert!(super::buffer_thinking_level_input(
+                &mut pending,
+                event,
+                false
+            ));
+        }
+        assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), typed);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, true, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, true),
+            None
+        );
+        for event in &typed {
+            assert_eq!(
+                super::next_thinking_level_input(&mut pending, false, true, false),
+                Some(event.clone())
+            );
+        }
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &escape,
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(super::Keys::default().matches("tui.select.cancel", ctrl_c));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Key(ctrl_c),
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Resize(80, 24),
+            false
+        ));
+    }
+
+    #[test]
+    fn thinking_typeahead_does_not_escape_an_abandoned_picker() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let extra = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut pending = VecDeque::from([enter.clone(), extra.clone()]);
+        // Enter selects a level and closes the level picker.
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            Some(enter)
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert!(pending.is_empty());
+        // A new picker must never receive input left by a cancelled discovery.
+        pending.push_back(extra);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            None
+        );
+    }
+
+    #[test]
     fn queued_escape_wins_over_ready_new_session() {
         use clap::Parser;
         use std::collections::VecDeque;
@@ -8134,6 +8675,163 @@ mod tests {
         assert_eq!(args.thinking.as_deref(), Some("high"));
     }
     #[test]
+    fn prompt_completion_displays_argument_hint_without_inserting_it() {
+        use super::*;
+        use clap::Parser;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("audit.md"),
+            "---\ndescription: Inspect changes\nargument-hint: |-\n  <path>\n  [focus]\n---\nReview $1",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("author.md"), "Write text").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/au".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().expect("multiple matching commands");
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(
+            rendered.contains("<path> [focus] — Inspect changes"),
+            "{rendered}"
+        );
+        let input = picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, .. }) if text == "/audit")
+        );
+    }
+
+    #[test]
+    fn builtin_completion_never_uses_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("model.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nText",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("models.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/mo".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/model"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/model")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_completion_wins_over_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        let skill = directory.path().join("skills/review");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review\ndescription: Review skill\n---\nSkill body",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("skill:review.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nWrong body",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("skill:reviewer.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--no-skills",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+            "--skill",
+            skill.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        assert!(
+            view.resources
+                .expand("/skill:review")
+                .unwrap()
+                .contains("Skill body")
+        );
+        view.editor.replace("/skill:rev".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/skill:review"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
+        );
+    }
+
+    #[test]
     fn patched_results_render_status_and_details_from_record_events() {
         use super::*;
         let mut view = View::default();
@@ -8147,6 +8845,274 @@ mod tests {
         assert!(
             matches!(&view.lines[1], Entry::Tool { failed: true, finished: true, output, numbered_diff: false, .. } if output == "exact")
         );
+    }
+
+    #[test]
+    fn imported_and_live_shell_display_output_without_context_framing() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"echo hi","output":"hi\n","exitCode":0,"cancelled":false,"truncated":false}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"bashExecution","command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":true,"fullOutputPath":"/tmp/output","excludeFromContext":true}}),
+            json!({"type":"message","id":"c","parentId":"b","message":{"role":"bashExecution","command":"sleep","output":"","exitCode":null,"cancelled":true,"truncated":false}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let journal = directory.path().join("native.jsonl");
+        imported.export_jsonl(&journal).unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = journal;
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let shells: Vec<_> = view
+            .lines
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool {
+                    name,
+                    output,
+                    failed,
+                    ..
+                } => Some((name.as_str(), output.as_str(), *failed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shells,
+            [
+                ("bash", "hi\n", false),
+                (
+                    "bash (excluded)",
+                    "bad\n(exit 1)\nOutput truncated. Full output: /tmp/output",
+                    true
+                ),
+                ("bash", "(cancelled)", true)
+            ]
+        );
+        let rendered = view
+            .lines
+            .iter()
+            .flat_map(|entry| {
+                entry.render(
+                    &Theme::system(),
+                    100,
+                    true,
+                    true,
+                    TranscriptOptions::default(),
+                )
+            })
+            .flat_map(|line| line.spans.into_iter().map(|span| span.text))
+            .collect::<String>();
+        assert!(rendered.contains("echo hi") && rendered.contains("hi"));
+        assert!(!rendered.contains("Ran `") && !rendered.contains("```"));
+        let original = imported
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } if execution.command == "echo hi" => {
+                    Some(execution)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(original.context_text(), "Ran `echo hi`\n```\nhi\n\n```");
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"live","command":"echo hi"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"live","data":{"command":"echo hi","output":"hi\n","exitCode":0,"cancelled":false,"truncated":false}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: false, finished: true, .. }) if output == "hi\n")
+        );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"failed","command":"false"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"failed","data":{"command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":false}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
+        );
+    }
+
+    #[test]
+    fn shell_ansi_is_removed_only_from_themed_display() {
+        use super::*;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pi.jsonl");
+        let raw_imported = "\u{1b}[31mIMPORTED\u{1b}[0m\r\nend";
+        let raw_extension = "\u{1b}]8;;https://example.invalid\u{7}EXTENSION\u{1b}]8;;\u{7}";
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"imported","output":raw_imported,"exitCode":0,"cancelled":false,"truncated":false}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = dir.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_bash_execution(pi_rs::BashExecution {
+                command: "extension".into(),
+                output: raw_extension.into(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                exclude_from_context: false,
+            })
+            .unwrap();
+        drop(session);
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path.clone();
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let theme = Theme::system();
+        let spans: Vec<_> = view
+            .lines
+            .iter()
+            .flat_map(|entry| entry.render(&theme, 100, true, true, TranscriptOptions::default()))
+            .flat_map(|line| line.spans)
+            .collect();
+        let text = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("IMPORTED") && text.contains("EXTENSION") && text.contains("end"));
+        assert!(
+            !text.contains("[31m") && !text.contains("]8;") && !text.contains("example.invalid")
+        );
+        for word in ["IMPORTED", "EXTENSION"] {
+            assert!(spans.iter().any(|span| span.text.contains(word) && span.color == theme.color("toolOutput")));
+        }
+        let reopened = Session::open(&path).unwrap();
+        let executions: Vec<_> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            executions
+                .iter()
+                .map(|e| e.output.as_str())
+                .collect::<Vec<_>>(),
+            [raw_imported, raw_extension]
+        );
+        assert!(executions[0].context_text().contains(raw_imported));
+        assert!(executions[1].context_text().contains(raw_extension));
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"stream","command":"stream"}),
+        );
+        view.receive(
+            &json!({"type":"bash_execution_update","executionId":"stream","output":"\u{1b}[3"}),
+        );
+        let rendered = view.lines.last().unwrap().render(
+            &theme,
+            100,
+            true,
+            true,
+            TranscriptOptions::default(),
+        );
+        assert!(
+            !rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("[3"))
+        );
+        view.receive(&json!({"type":"bash_execution_update","executionId":"stream","output":"1mSTREAM\u{1b}[0m"}));
+        let rendered = view.lines.last().unwrap().render(
+            &theme,
+            100,
+            true,
+            true,
+            TranscriptOptions::default(),
+        );
+        assert!(rendered.iter().flat_map(|line| &line.spans).any(|span| span.text.contains("STREAM") && span.color == theme.color("toolOutput")));
+    }
+
+    #[test]
+    fn incomplete_shell_escapes_cannot_hide_completion_status() {
+        use super::*;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pi.jsonl");
+        let imported_output = "imported\u{1b}]8;;unterminated";
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"imported","output":imported_output,"exitCode":1,"cancelled":false,"truncated":true,"fullOutputPath":"/tmp/imported-output"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = dir.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        let extension_output = "extension\u{1b}[31";
+        session
+            .append_bash_execution(pi_rs::BashExecution {
+                command: "extension".into(),
+                output: extension_output.into(),
+                exit_code: None,
+                cancelled: true,
+                truncated: true,
+                full_output_path: Some("/tmp/extension-output".into()),
+                exclude_from_context: false,
+            })
+            .unwrap();
+        drop(session);
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path.clone();
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let theme = Theme::system();
+        let text = view
+            .lines
+            .iter()
+            .flat_map(|entry| entry.render(&theme, 100, true, true, TranscriptOptions::default()))
+            .flat_map(|line| line.spans.into_iter().map(|span| span.text))
+            .collect::<String>();
+        for expected in [
+            "imported",
+            "(exit 1)",
+            "/tmp/imported-output",
+            "extension",
+            "(cancelled)",
+            "/tmp/extension-output",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        assert!(!text.contains("unterminated") && !text.contains("[31"));
+        let reopened = Session::open(&path).unwrap();
+        let executions: Vec<_> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(executions[0].output, imported_output);
+        assert_eq!(executions[1].output, extension_output);
+        assert!(executions[0].context_text().contains(imported_output));
+        assert!(executions[1].context_text().contains(extension_output));
     }
 
     #[test]
@@ -8290,6 +9256,80 @@ mod tests {
     }
 
     #[test]
+    fn extension_widgets_follow_registration_and_replacement_order() {
+        let mut view = super::View::default();
+        let set = |view: &mut super::View, key: &str, lines: Option<Vec<&str>>, placement: &str| {
+            assert!(
+                view.ui_request(&json!({
+                    "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": key,
+                    "widgetLines": lines, "widgetPlacement": placement,
+                }))
+                .unwrap()
+                .is_none()
+            );
+        };
+        let theme =
+            super::Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let rendered = |view: &super::View, placement| {
+            view.widget_lines(&theme, 80, placement)
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+                .collect::<String>()
+        };
+        set(&mut view, "z", Some(vec!["first"]), "aboveEditor");
+        set(&mut view, "a", Some(vec!["second"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "firstsecond"
+        );
+        set(&mut view, "z", Some(vec!["updated"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "secondupdated"
+        );
+        set(&mut view, "a", Some(vec!["moved"]), "belowEditor");
+        set(&mut view, "z", Some(vec!["later"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "movedlater"
+        );
+        set(&mut view, "a", None, "aboveEditor");
+        set(&mut view, "a", Some(vec!["readded"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "laterreadded"
+        );
+        assert!(rendered(&view, pi_rs::WidgetPlacement::AboveEditor).is_empty());
+
+        let mut full = super::View::default();
+        for index in 0..64 {
+            set(
+                &mut full,
+                &format!("widget-{index}"),
+                Some(vec!["x"]),
+                "aboveEditor",
+            );
+        }
+        let rejected = full.ui_request(&json!({
+            "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": "overflow",
+            "widgetLines": ["x"], "widgetPlacement": "aboveEditor",
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.first().unwrap().0, "widget-0");
+        set(
+            &mut full,
+            "widget-0",
+            Some(vec!["replacement"]),
+            "belowEditor",
+        );
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.last().unwrap().0, "widget-0");
+        set(&mut full, "widget-0", None, "aboveEditor");
+        assert_eq!(full.widgets.len(), 63);
+    }
+
+    #[test]
     fn custom_message_display_flag_controls_terminal_visibility() {
         let mut view = super::View::default();
         let mut message = pi_rs::CustomMessage {
@@ -8303,7 +9343,95 @@ mod tests {
         message.display = true;
         view.show_custom_message(&message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::Notice(text)] if text == "example: visible content")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "example" && text == "visible content")
+        );
+    }
+
+    #[test]
+    fn custom_message_blocks_are_joined_like_pi_without_rendering_details() {
+        let mut view = super::View::default();
+        let message = pi_rs::CustomMessage {
+            custom_type: "fixture".into(),
+            content: pi_rs::ContextContent::Blocks(vec![
+                pi_rs::ContentBlock::Text {
+                    text: "**first**".into(),
+                    text_signature: None,
+                },
+                pi_rs::ContentBlock::Image {
+                    data: String::new(),
+                    mime_type: "image/png".into(),
+                },
+                pi_rs::ContentBlock::Text {
+                    text: "second".into(),
+                    text_signature: None,
+                },
+            ]),
+            display: true,
+            details: Some(serde_json::json!({"secret": "not displayed"})),
+        };
+        view.show_custom_message(&message);
+        assert!(
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**first**\nsecond")
+        );
+    }
+
+    #[test]
+    fn delivered_custom_messages_are_visible_live_and_on_reopen() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = directory.path().join("session.jsonl");
+        let message = pi_rs::CustomMessage {
+            custom_type: "fixture".into(),
+            content: pi_rs::ContextContent::Text("**live**".into()),
+            display: true,
+            details: None,
+        };
+        let record = pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: 3,
+            id: 1,
+            parent: None,
+            event: pi_rs::Event::CustomMessageDelivered {
+                id: uuid::Uuid::new_v4(),
+                message: message.clone(),
+            },
+        };
+        let delivered_event = serde_json::to_value(&record.event).unwrap();
+        let mut live = super::View::default();
+        live.receive_worker(
+            serde_json::json!({"type": "record", "record": record}),
+            &mut args,
+        );
+        assert!(
+            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
+        );
+        let mut session = pi_rs::Session::open(&args.session).unwrap();
+        session.append_custom_message(message).unwrap();
+        drop(session);
+        let journal = std::fs::read_to_string(&args.session).unwrap();
+        let mut replaced = false;
+        let mut records = Vec::new();
+        for line in journal.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["event"]["type"] == "custom_message" {
+                value["event"] = delivered_event.clone();
+                replaced = true;
+            }
+            records.push(serde_json::to_string(&value).unwrap());
+        }
+        assert!(replaced);
+        std::fs::write(&args.session, format!("{}\n", records.join("\n"))).unwrap();
+        let mut restored = super::View::default();
+        restored.restore(&args).unwrap();
+        let shown: Vec<_> = restored
+            .lines
+            .iter()
+            .filter(|entry| matches!(entry, super::Entry::CustomMessage { .. }))
+            .collect();
+        assert!(
+            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
         );
     }
 
@@ -9217,49 +10345,151 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn complete_color_replies_release_queued_query_before_marker() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: ((1 << 18) - 1) & !1,
-            }]),
-            color_requery: true,
-            expired_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        assert!(!terminal.accepts_color_reply(0).unwrap());
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert_eq!(terminal.color_queries[0].replied, 0);
-        assert_eq!(terminal.expired_color_markers, 1);
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.accepts_color_reply(0).unwrap());
+    fn appearance_event_retains_colors_during_partial_requery() {
+        const CHILD: &str = "PI_RS_SYSTEM_APPEARANCE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::appearance_event_retains_colors_during_partial_requery",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            begin_terminal_palette_query, reset_terminal_background, set_terminal_color,
+            set_terminal_palette,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 10, 20);
+        }
+        let mut theme = super::Theme::system();
+        let original_accent = theme.color("accent");
+        assert!(matches!(original_accent, Color::Rgb { .. }));
+        let (_, redraw) = super::apply_terminal_appearance(&mut theme, false);
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), original_accent);
+        begin_terminal_palette_query();
+        for index in 0..8 {
+            set_terminal_palette(index, index, 30, 40);
+        }
+        assert_eq!(theme.color("accent"), original_accent);
+        set_terminal_color(false, 255, 255, 255);
+        let refreshed = super::Theme::system();
+        assert!(matches!(refreshed.color("accent"), Color::Rgb { .. }));
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn late_color_marker_does_not_complete_the_new_query() {
+    fn timed_out_color_query_quarantines_old_replies_until_marker() {
+        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now() - std::time::Duration::from_secs(3),
+                replied: 1 << 1,
+                quarantined: false,
+            }]),
+            color_requery: true,
+            completed_color_markers: 0,
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Kitty,
+        });
+        terminal.poll_color_timeout().unwrap();
+        assert_eq!(terminal.color_queries.len(), 1);
+        assert!(terminal.color_queries[0].quarantined);
+        // Late replies from the old request are never accepted into a new palette.
+        let mut accepted = Vec::new();
+        for index in 0..16 {
+            if terminal.accepts_color_reply(index).unwrap() {
+                accepted.push((index, "old"));
+            }
+        }
+        assert!(accepted.is_empty());
+        assert!(!terminal.accepts_color_reply(16).unwrap());
+        assert!(terminal.color_requery);
+        // Seventeen replies are insufficient to start the queued query.
+        assert!(terminal.color_queries[0].quarantined);
+        assert!(!terminal.accepts_color_reply(17).unwrap());
+        assert!(!terminal.color_requery);
+        assert_eq!(terminal.completed_color_markers, 1);
+        // The old marker must not finish the newly issued query.
+        terminal.receive_color_marker().unwrap();
+        assert_eq!(terminal.color_queries.len(), 1);
+        assert!(!terminal.color_requery);
+        for index in 0..18 {
+            assert!(terminal.accepts_color_reply(index).unwrap());
+            accepted.push((index, "new"));
+            assert!(!terminal.accepts_color_reply(index).unwrap());
+        }
+        assert_eq!(accepted.len(), 18);
+        assert!(accepted.iter().all(|(_, source)| *source == "new"));
+        terminal.receive_color_marker().unwrap();
+        assert!(terminal.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn complete_color_query_allows_requery_without_da1() {
         let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
             alternate: false,
             images: Default::default(),
             progress: None,
             color_queries: std::collections::VecDeque::from([super::ColorQuery {
                 started: std::time::Instant::now(),
-                replied: 0,
+                replied: (1 << 18) - 1,
+                quarantined: false,
             }]),
             color_requery: false,
-            expired_color_markers: 1,
+            completed_color_markers: 0,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Kitty,
         });
+        terminal.query_terminal_colors().unwrap();
+        assert_eq!(terminal.completed_color_markers, 1);
+        assert_eq!(terminal.color_queries[0].replied, 0);
+        // A late marker for the completed request cannot end the new query.
         terminal.receive_color_marker().unwrap();
         assert_eq!(terminal.color_queries.len(), 1);
-        assert!(terminal.accepts_color_reply(5).unwrap());
+        for index in 0..18 {
+            assert!(terminal.accepts_color_reply(index).unwrap());
+        }
         terminal.receive_color_marker().unwrap();
         assert!(terminal.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_old_color_marker_does_not_end_incomplete_new_query() {
+        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: (1 << 18) - 1,
+                quarantined: false,
+            }]),
+            color_requery: false,
+            completed_color_markers: 0,
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Kitty,
+        });
+        terminal.query_terminal_colors().unwrap();
+        assert!(terminal.accepts_color_reply(0).unwrap());
+        // The marker could belong to either request; keep the new query open.
+        terminal.receive_color_marker().unwrap();
+        assert_eq!(terminal.color_queries.len(), 1);
+        assert!(!terminal.accepts_color_reply(0).unwrap());
+        assert!(terminal.accepts_color_reply(1).unwrap());
     }
 
     #[test]

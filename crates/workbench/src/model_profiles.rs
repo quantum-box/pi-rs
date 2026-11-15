@@ -197,6 +197,7 @@ struct ModelCompatibility {
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
     supports_long_cache_retention: Option<bool>,
+    supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
     cache_control_format: Option<CacheControlFormat>,
 }
@@ -218,6 +219,9 @@ impl ModelCompatibility {
             supports_long_cache_retention: newer
                 .supports_long_cache_retention
                 .or(self.supports_long_cache_retention),
+            supports_explicit_prompt_cache_mode: newer
+                .supports_explicit_prompt_cache_mode
+                .or(self.supports_explicit_prompt_cache_mode),
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
@@ -549,9 +553,10 @@ impl ModelMetadata {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
+        // Pi exposes the default five levels for a reasoning model even when
+        // its configuration does not specify a thinkingLevelMap.
         if adapter == Adapter::Anthropic
             && self.reasoning == Some(true)
-            && self.compat.force_adaptive_thinking == Some(false)
             && self.thinking_level_map.is_empty()
         {
             return Some(
@@ -634,6 +639,10 @@ impl ModelMetadata {
 
     pub fn adaptive_thinking(&self) -> Option<bool> {
         self.compat.force_adaptive_thinking
+    }
+
+    pub fn has_thinking_level_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
     }
 
     pub fn mapped_effort(&self, level: &str) -> Option<Option<&str>> {
@@ -1072,6 +1081,18 @@ impl Profiles {
         (
             compat.supports_long_cache_retention.unwrap_or(true),
             compat.supports_cache_control_on_tools.unwrap_or(true),
+        )
+    }
+
+    pub fn responses_cache_support(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> (bool, bool) {
+        let compat = self.cache_compatibility(provider, model);
+        (
+            compat.supports_long_cache_retention.unwrap_or(true),
+            compat.supports_explicit_prompt_cache_mode.unwrap_or(false),
         )
     }
 
@@ -1583,6 +1604,32 @@ mod tests {
                 .levels(Adapter::ChatCompletions)
                 .unwrap()
                 .contains(&"off".into())
+        );
+    }
+
+    #[test]
+    fn responses_cache_compatibility_merges_provider_and_model() {
+        let profiles = Profiles::parse(&json!({"providers":{"example":{
+            "baseUrl":"https://example.com/v1", "api":"openai-responses",
+            "compat":{"supportsLongCacheRetention":false,"supportsExplicitPromptCacheMode":true},
+            "models":[{"id":"m","compat":{"supportsLongCacheRetention":true}}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("example").unwrap();
+        let model = profiles.model(&provider, "m").unwrap();
+        assert_eq!(
+            profiles.responses_cache_support(&provider, Some(&model)),
+            (true, true)
+        );
+        assert_eq!(
+            profiles.responses_cache_support(&provider, None),
+            (false, true)
+        );
+        let openai = profiles.provider("openai").unwrap();
+        let model = profiles.model(&openai, "gpt-6-sol").unwrap();
+        assert_eq!(
+            profiles.responses_cache_support(&openai, Some(&model)),
+            (true, true)
         );
     }
 

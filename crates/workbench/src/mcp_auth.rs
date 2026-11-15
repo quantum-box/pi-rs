@@ -709,6 +709,7 @@ pub async fn login_configured_with_http_options(
 ) -> Result<()> {
     let default = OAuthClientSettings::default();
     let settings = settings.unwrap_or(&default);
+    validate_oauth_client_settings(settings)?;
     let client_secret = if let Some(secret) = &settings.client_secret {
         Some(crate::mcp::resolve_value(secret).await?)
     } else {
@@ -873,12 +874,12 @@ fn metadata_document(
     Ok(base)
 }
 
-async fn callback_listener(
+fn validate_callback(
     url: Option<&str>,
     port: Option<u16>,
-) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+) -> Result<(std::net::IpAddr, reqwest_mcp::Url, Option<u16>)> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let mut callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
+    let callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
     let address = match callback.host_str() {
         Some("127.0.0.1" | "localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
         Some("[::1]") => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -897,20 +898,104 @@ async fn callback_listener(
             "invalid MCP callbackUrl or callbackPort".into(),
         ));
     }
-    if let (Some(url_port), Some(port)) = (callback.port(), port)
+    // Url normalizes an explicit default :80 away. Inspect the original
+    // authority so it remains distinct from an unspecified callback port.
+    let explicit_port = if let Some(raw) = url {
+        let (_, rest) = raw
+            .trim()
+            .split_once("://")
+            .ok_or_else(|| Error::Config("invalid MCP callbackUrl".into()))?;
+        let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+        let suffix = if authority.starts_with('[') {
+            authority
+                .split_once(']')
+                .map(|(_, suffix)| suffix)
+                .ok_or_else(|| Error::Config("invalid MCP callbackUrl".into()))?
+        } else {
+            authority.find(':').map_or("", |index| &authority[index..])
+        };
+        if suffix.is_empty() {
+            None
+        } else {
+            let digits = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| Error::Config("invalid MCP callbackUrl port".into()))?;
+            let value = digits
+                .parse::<u16>()
+                .map_err(|_| Error::Config("invalid MCP callbackUrl port".into()))?;
+            if value == 0 {
+                return Err(Error::Config("invalid MCP callbackUrl port".into()));
+            }
+            Some(value)
+        }
+    } else {
+        None
+    };
+    if let (Some(url_port), Some(port)) = (explicit_port, port)
         && url_port != port
     {
         return Err(Error::Config(
             "MCP callbackUrl and callbackPort disagree".into(),
         ));
     }
+    Ok((address, callback, explicit_port))
+}
+
+async fn callback_listener(
+    url: Option<&str>,
+    port: Option<u16>,
+) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+    let (address, mut callback, explicit_port) = validate_callback(url, port)?;
     let listener =
-        tokio::net::TcpListener::bind((address, callback.port().or(port).unwrap_or_default()))
+        tokio::net::TcpListener::bind((address, explicit_port.or(port).unwrap_or_default()))
             .await?;
     callback
         .set_port(Some(listener.local_addr()?.port()))
         .map_err(|()| Error::Config("invalid MCP callback port".into()))?;
     Ok((listener, callback))
+}
+
+/// Validate configured OAuth client settings without network or filesystem effects.
+pub fn validate_oauth_client_settings(client: &OAuthClientSettings) -> Result<()> {
+    if client.client_secret.is_some() && client.client_id.is_none() {
+        return Err(Error::Config(
+            "OAuth client secret requires a client ID".into(),
+        ));
+    }
+    if client
+        .client_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+        || client
+            .client_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(Error::Config(
+            "OAuth client ID and name must be non-empty".into(),
+        ));
+    }
+    if client.client_registration == ClientRegistrationMode::Cimd
+        && (client.client_id.is_some() || client.client_name.is_some())
+    {
+        return Err(Error::Config(
+            "OAuth cimd registration requires a metadata document without clientId or clientName"
+                .into(),
+        ));
+    }
+    validate_callback(client.callback_url.as_deref(), client.callback_port)?;
+    if let Some(url) = client.client_metadata_url.as_deref()
+        && client.client_registration != ClientRegistrationMode::Dcr
+        && safe_http_url(url)?.scheme() != "https"
+    {
+        return Err(Error::Config(
+            "OAuth clientMetadataUrl requires HTTPS".into(),
+        ));
+    }
+    if let Some(url) = client.auth_server_metadata_url.as_deref() {
+        safe_http_url(url)?;
+    }
+    Ok(())
 }
 
 async fn configured_metadata(
@@ -1211,12 +1296,253 @@ pub(crate) async fn test_oauth_client(
 mod tests {
     use super::*;
 
+    // Drain the complete HTTP request before replying. Closing a socket with
+    // unread request bytes can reset the connection and discard the response.
+    fn read_refresh_request(socket: &mut std::net::TcpStream, mut on_partial: impl FnMut(usize)) {
+        use std::io::Read as _;
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut chunk = [0; 1024];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).expect("read refresh headers");
+            assert!(count > 0, "refresh request ended before its headers");
+            data.extend_from_slice(&chunk[..count]);
+            assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if let Some(index) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+        assert!(
+            headers.starts_with("POST /token "),
+            "unexpected request line"
+        );
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("refresh request content length");
+        assert!(length <= 64 * 1024 - header_end, "refresh body too large");
+        if data.len() > header_end && data.len() < header_end + length {
+            on_partial(data.len() - header_end);
+        }
+        while data.len() < header_end + length {
+            let count = socket.read(&mut chunk).expect("read refresh body");
+            assert!(count > 0, "refresh request ended before its body");
+            data.extend_from_slice(&chunk[..count]);
+            assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if data.len() < header_end + length {
+                on_partial(data.len() - header_end);
+            }
+        }
+        let body = std::str::from_utf8(&data[header_end..header_end + length]).unwrap();
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("refresh_token=old-refresh"));
+    }
+
+    fn direct_fixture_options() -> crate::mcp::HttpOptionsWithProxyHosts {
+        crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: Vec::new(),
+                idle_timeout: None,
+            },
+            proxy_hosts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_fixture_waits_for_the_complete_request_body() {
+        use std::io::Write as _;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_refresh_request(&mut socket, |received| {
+                partial_tx.send(received).unwrap();
+            });
+            done_tx.send(()).unwrap();
+        });
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let body = "grant_type=refresh_token&refresh_token=old-refresh";
+        write!(
+            client,
+            "POST /token HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.write_all(&body.as_bytes()[..10]).unwrap();
+        let received = partial_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(received > 0 && received <= 10);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        client.write_all(&body.as_bytes()[10..]).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+    }
+
+    async fn fixture_headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<(String, Vec<String>, usize)> {
+        use tokio::io::AsyncBufReadExt;
+        tokio::time::timeout(deadline, async {
+            let mut lines = Vec::new();
+            let mut bytes = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await? == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "incomplete fixture headers",
+                    ));
+                }
+                bytes += line.len();
+                if bytes > 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture headers too large",
+                    ));
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                lines.push(line);
+            }
+            if lines.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing fixture request line",
+                ));
+            }
+            let first = lines.remove(0);
+            let mut length = 0;
+            for line in &lines {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid fixture content length",
+                        )
+                    })?;
+                }
+            }
+            if length > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture body too large",
+                ));
+            }
+            Ok((first, lines, length))
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture headers timed out")
+        })?
+    }
+
+    async fn fixture_body<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        length: usize,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut body = vec![0; length];
+        tokio::time::timeout(deadline, reader.read_exact(&mut body))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture body timed out")
+            })??;
+        Ok(body)
+    }
+
+    #[tokio::test]
+    async fn oauth_fixture_rejects_incomplete_headers_and_bounds_idle_reads() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        sender
+            .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n")
+            .await
+            .unwrap();
+        drop(sender);
+        let error = fixture_headers(
+            &mut BufReader::new(receiver),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let (_sender, receiver) = tokio::io::duplex(256);
+        let error = fixture_headers(
+            &mut BufReader::new(receiver),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        sender.write_all(b"x").await.unwrap();
+        drop(sender);
+        let error = fixture_body(
+            &mut BufReader::new(receiver),
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let (_sender, receiver) = tokio::io::duplex(256);
+        let error = fixture_body(
+            &mut BufReader::new(receiver),
+            1,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn callback_validation_preserves_explicit_default_port() {
+        for url in [
+            "http://127.0.0.1:80/callback",
+            "http://localhost:80/callback",
+            "http://[::1]:80/callback",
+        ] {
+            assert!(validate_callback(Some(url), Some(9001)).is_err());
+            assert_eq!(validate_callback(Some(url), Some(80)).unwrap().2, Some(80));
+            assert_eq!(validate_callback(Some(url), None).unwrap().2, Some(80));
+        }
+        assert_eq!(
+            validate_callback(Some("http://127.0.0.1/callback"), Some(9001))
+                .unwrap()
+                .2,
+            None
+        );
+        assert_eq!(
+            validate_callback(Some("http://127.0.0.1:9001/callback"), Some(9001))
+                .unwrap()
+                .2,
+            Some(9001)
+        );
+        assert!(validate_callback(Some("http://127.0.0.1:0/callback"), None).is_err());
+    }
+
     #[test]
     fn refresh_saves_token_and_only_dispatches_for_live_callers() {
         use rmcp::transport::streamable_http_client::{AuthRequiredError, StreamableHttpError};
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         for (reactive, cancel) in [(false, true), (true, true), (false, false), (true, false)] {
             let dir = tempfile::tempdir().unwrap();
@@ -1243,8 +1569,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let server = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                let mut request = [0; 4096];
-                assert!(socket.read(&mut request).unwrap() > 0);
+                read_refresh_request(&mut socket, |_| {});
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let body =
@@ -1263,7 +1588,8 @@ mod tests {
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let task = runtime.as_ref().unwrap().block_on(async move {
                 let url = format!("http://{address}");
-                let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+                let options = direct_fixture_options();
+                let mut manager = oauth_manager(&format!("{url}/mcp"), Some(&options)).await.unwrap();
                 manager.set_metadata(serde_json::from_value(serde_json::json!({
                     "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
                     "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
@@ -1271,6 +1597,7 @@ mod tests {
                 manager.configure_client_id("fixture").unwrap();
                 manager.set_credential_store(task_store);
                 let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager), Arc::default());
+                let manager = client.0.auth_manager.clone();
                 let task = tokio::spawn(async move {
                     let result = client.call(reactive.then(|| "old".to_owned()), |_| {
                         let index = task_calls.fetch_add(1, Ordering::SeqCst);
@@ -1285,8 +1612,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
                 }).await.unwrap();
-                task.abort_handle()
+                (task.abort_handle(), manager)
             });
+            let (task, manager) = task;
             if cancel {
                 task.abort();
                 drop(runtime.take());
@@ -1309,13 +1637,22 @@ mod tests {
                 });
             }
             drop(runtime);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !String::from_utf8_lossy(&std::fs::read(&store.path).unwrap()).contains("rotated")
-            {
-                assert!(Instant::now() < deadline, "rotated token was not saved");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            let observer = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            observer.block_on(async {
+                // Both proactive and reactive refreshes hold this mutex until
+                // their HTTP response and credential save have completed.
+                let _manager = tokio::time::timeout(Duration::from_secs(5), manager.lock())
+                    .await
+                    .expect("refresh worker did not finish");
+                assert!(
+                    String::from_utf8_lossy(&std::fs::read(&store.path).unwrap())
+                        .contains("rotated"),
+                    "refresh worker finished without saving the rotated token (reactive={reactive}, cancel={cancel})"
+                );
+            });
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 usize::from(reactive) + usize::from(!cancel),
@@ -1326,8 +1663,8 @@ mod tests {
 
     #[test]
     fn cancelled_runtime_persists_rotated_mcp_refresh_token() {
-        use std::io::{Read as _, Write as _};
-        use std::time::{Duration, Instant};
+        use std::io::Write as _;
+        use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let store = FileCredentials {
             path: directory.path().join("credentials.json"),
@@ -1351,8 +1688,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut request = [0; 4096];
-            assert!(socket.read(&mut request).unwrap() > 0);
+            read_refresh_request(&mut socket, |_| {});
             started_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let body = r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
@@ -1363,16 +1699,22 @@ mod tests {
             .build()
             .unwrap();
         let task_store = store.clone();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
         let task = runtime.block_on(async move {
             let url = format!("http://{address}");
-            let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+            let options = direct_fixture_options();
+            let mut manager = oauth_manager(&format!("{url}/mcp"), Some(&options)).await.unwrap();
             manager.set_metadata(serde_json::from_value(serde_json::json!({
                 "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
                 "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
             })).unwrap());
             manager.configure_client_id("fixture").unwrap();
             manager.set_credential_store(task_store);
-            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move { manager.refresh_token().await }).await });
+            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move {
+                let result = manager.refresh_token().await;
+                let _ = worker_tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                result
+            }).await });
             tokio::time::timeout(Duration::from_secs(5), async {
                 while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
             }).await.unwrap();
@@ -1382,18 +1724,15 @@ mod tests {
         drop(runtime);
         release_tx.send(()).unwrap();
         server.join().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let bytes = std::fs::read(&store.path).unwrap();
-            if String::from_utf8_lossy(&bytes).contains("rotated") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "rotated refresh token was not persisted"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        worker_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refresh worker did not finish")
+            .expect("refresh worker failed");
+        let bytes = std::fs::read(&store.path).unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("rotated"),
+            "refresh worker finished without persisting the rotated token"
+        );
     }
 
     #[test]
@@ -1452,8 +1791,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_manager_uses_proxy_for_registration_and_refresh() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    async fn oauth_manager_uses_proxy_for_registration_code_exchange_and_refresh() {
+        use tokio::io::{AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let options = crate::mcp::HttpOptionsWithProxyHosts {
             http: crate::mcp::HttpOptions {
@@ -1462,7 +1801,8 @@ mod tests {
                         "http://localhost:{}",
                         listener.local_addr().unwrap().port()
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .tunnel_http(true),
                 ],
                 idle_timeout: None,
             },
@@ -1473,6 +1813,7 @@ mod tests {
             for body in [
                 r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#,
                 r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#,
+                r#"{"access_token":"newer","token_type":"Bearer","refresh_token":"next2"}"#,
             ] {
                 let (socket, _) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
@@ -1480,21 +1821,26 @@ mod tests {
                         .unwrap()
                         .unwrap();
                 let mut socket = BufReader::new(socket);
-                let mut first = String::new();
-                socket.read_line(&mut first).await.unwrap();
-                let mut len = 0;
-                loop {
-                    let mut line = String::new();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = n.trim().parse().unwrap();
-                    }
-                }
-                let mut data = vec![0; len];
-                socket.read_exact(&mut data).await.unwrap();
+                let (first, _, _) = fixture_headers(&mut socket, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let (first, headers, length) =
+                    fixture_headers(&mut socket, std::time::Duration::from_secs(5))
+                        .await
+                        .unwrap();
+                assert!(headers.iter().all(|line| {
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }));
+                let data = fixture_body(&mut socket, length, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
                 requests.push((first, String::from_utf8(data).unwrap()));
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
@@ -1512,19 +1858,166 @@ mod tests {
             .await
             .unwrap();
         manager.configure_client(config).unwrap();
-        let store = rmcp::transport::auth::InMemoryCredentialStore::new();
-        let creds: StoredCredentials = serde_json::from_value(serde_json::json!({"client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}})).unwrap();
-        store.save(creds).await.unwrap();
-        manager.set_credential_store(store);
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
         manager.refresh_token().await.unwrap();
         let requests = server.await.unwrap();
+        assert!(requests[0].0.starts_with("POST /register "));
+        assert!(requests[1].0.starts_with("POST /token "));
+        assert!(requests[1].1.contains("grant_type=authorization_code"));
+        assert!(requests[1].1.contains("code=fixture-code"));
+        assert!(requests[2].0.starts_with("POST /token "));
+        assert!(requests[2].1.contains("refresh_token=next"));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_routes_oauth_discovery_metadata_registration_code_exchange_and_refresh_directly()
+     {
+        use std::time::Duration;
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", origin.local_addr().unwrap());
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!(
+                        "http://localhost:{}",
+                        proxy.local_addr().unwrap().port()
+                    ))
+                    .unwrap()
+                    .no_proxy(reqwest_mcp::NoProxy::from_string("127.0.0.1"))
+                    .tunnel_http(true),
+                ],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["localhost".into()],
+        };
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut token_requests = 0;
+            loop {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), origin.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let (first, headers, length) = fixture_headers(&mut socket, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                assert!(headers.iter().all(|line| {
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }));
+                let body = fixture_body(&mut socket, length, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                requests.push((first.clone(), String::from_utf8(body).unwrap()));
+                let (status, response) = if first.starts_with("GET /metadata ") {
+                    ("200 OK", serde_json::json!({"issuer":server_base,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if first.starts_with("POST /register ") {
+                    (
+                        "200 OK",
+                        r#"{"client_id":"fixture","redirect_uris":["http://127.0.0.1/callback"]}"#
+                            .to_owned(),
+                    )
+                } else if first.starts_with("POST /token ") {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"new","token_type":"Bearer","refresh_token":"next"}"#
+                            .to_owned(),
+                    )
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                if first.starts_with("POST /token ") {
+                    token_requests += 1;
+                    if token_requests == 2 {
+                        return requests;
+                    }
+                }
+            }
+        });
+        let resource = format!("{base}/mcp");
+        let mut manager = oauth_manager(&resource, Some(&options)).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), manager.resolve_metadata())
+            .await
+            .unwrap();
+        let metadata = configured_metadata(&format!("{base}/metadata"), &resource, Some(&options))
+            .await
+            .unwrap();
+        manager.set_metadata(metadata);
+        let config = manager
+            .register_client("fixture", "http://127.0.0.1/callback", &[])
+            .await
+            .unwrap();
+        manager.configure_client(config).unwrap();
+        manager.set_credential_store(rmcp::transport::auth::InMemoryCredentialStore::new());
+        let authorization = manager.get_authorization_url(&[]).await.unwrap();
+        let state = reqwest_mcp::Url::parse(&authorization)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        manager
+            .exchange_code_for_token("fixture-code", &state)
+            .await
+            .unwrap();
+        manager.refresh_token().await.unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            requests[0]
-                .0
-                .starts_with("POST http://127.0.0.1:1/register ")
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /.well-known/"))
         );
-        assert!(requests[1].0.starts_with("POST http://127.0.0.1:1/token "));
-        assert!(requests[1].1.contains("refresh_token=old-refresh"));
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("GET /metadata "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line.starts_with("POST /register "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("refresh_token=next"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(line, body)| line.starts_with("POST /token ")
+                    && body.contains("grant_type=authorization_code")
+                    && body.contains("code=fixture-code"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1606,25 +2099,54 @@ mod tests {
 
     #[tokio::test]
     async fn registration_redirect_to_proxy_hostname_is_rejected() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = origin.local_addr().unwrap().port();
         let target_port = destination.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = origin.accept().await.unwrap();
-            let mut buffer = [0; 4096];
-            let _ = socket.read(&mut buffer).await.unwrap();
+            let (socket, _) = origin.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            socket.read_line(&mut first).await.unwrap();
+            assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            socket.read_exact(&mut vec![0; length]).await.unwrap();
             socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{target_port}/register\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         });
         let options = crate::mcp::HttpOptionsWithProxyHosts {
             http: crate::mcp::HttpOptions {
-                proxies: vec![],
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!("http://localhost:{port}"))
+                        .unwrap()
+                        .tunnel_http(true),
+                ],
                 idle_timeout: None,
             },
             proxy_hosts: vec!["localhost".into()],
         };
-        let base = format!("http://127.0.0.1:{port}");
+        let base = "http://127.0.0.1:1".to_owned();
         let mut manager = oauth_manager(&base, Some(&options)).await.unwrap();
         manager.set_metadata(serde_json::from_value(serde_json::json!({
             "issuer":base, "authorization_endpoint":format!("{base}/authorize"),

@@ -24,14 +24,17 @@ pub(super) struct Stream {
     metadata: ModelMetadata,
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
+    result_metadata: HashMap<Uuid, Value>,
     pending_tools: HashMap<u64, PendingTool>,
+    reasoning_items: HashMap<u64, (usize, bool)>,
+    text_items: HashMap<u64, (usize, bool)>,
     aborted: bool,
     summary: bool,
 }
 
 struct PendingTool {
     content_index: usize,
-    arguments: super::streaming_json::StreamingJson,
+    arguments: super::StreamingJson,
 }
 
 impl Stream {
@@ -43,6 +46,12 @@ impl Stream {
         self.aborted
     }
 
+    pub fn suppress_summary_record(&self, event: &Value) -> bool {
+        self.summary
+            && event["type"] == "record"
+            && event["record"]["event"]["type"] == "model_finished"
+    }
+
     pub fn partial(&self, request_id: &Value) -> Option<&Value> {
         let id = request_id.as_str()?.parse::<Uuid>().ok()?;
         (self.request_id == Some(id) && self.started && !self.ended).then_some(&self.assistant)
@@ -51,6 +60,13 @@ impl Stream {
     pub fn observe(&mut self, event: &Value, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event["type"].as_str() {
+            Some("internal_tool_result_metadata") => {
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok())
+                    && let Some(content) = event.get("structuredContent")
+                {
+                    self.result_metadata.insert(id, content.clone());
+                }
+            }
             Some("summary_request_start") => {
                 self.finish_turn(&mut events);
                 self.summary = true;
@@ -64,12 +80,58 @@ impl Stream {
                 if let Some(delta) = event["delta"].as_str()
                     && !self.assistant.is_null()
                 {
-                    let kind = if event["type"] == "text_delta" {
-                        "text"
+                    if event["type"] == "reasoning_delta" {
+                        if let Some(index) = event["reasoningIndex"].as_u64() {
+                            if !self.ended {
+                                self.reasoning_item_delta(index, delta, &mut events);
+                            }
+                        } else {
+                            self.delta("thinking", delta, &mut events);
+                        }
+                    } else if let Some(index) = event["textIndex"].as_u64() {
+                        if !self.ended {
+                            self.text_item_delta(index, delta, &mut events);
+                        }
                     } else {
-                        "thinking"
-                    };
-                    self.delta(kind, delta, &mut events);
+                        self.delta("text", delta, &mut events);
+                    }
+                }
+            }
+            Some("reasoning_item_start" | "reasoning_item_delta" | "reasoning_item_end")
+                if !self.assistant.is_null() && !self.ended =>
+            {
+                if let Some(index) = event["index"].as_u64() {
+                    if event["type"] == "reasoning_item_start" {
+                        self.reasoning_item_index(index, &mut events);
+                    } else if event["type"] == "reasoning_item_delta" {
+                        if let Some(delta) = event["delta"].as_str() {
+                            self.reasoning_item_delta(index, delta, &mut events);
+                        }
+                    } else if let Some(content) = event["content"].as_str() {
+                        self.reasoning_item_end(index, content, &mut events);
+                    }
+                }
+            }
+            Some("text_item_start" | "text_item_delta" | "text_item_end")
+                if !self.assistant.is_null() && !self.ended =>
+            {
+                if let Some(index) = event["index"].as_u64() {
+                    match event["type"].as_str() {
+                        Some("text_item_start") => {
+                            self.text_item_index(index, &mut events);
+                        }
+                        Some("text_item_delta") => {
+                            if let Some(delta) = event["delta"].as_str() {
+                                self.text_item_delta(index, delta, &mut events);
+                            }
+                        }
+                        Some("text_item_end") => {
+                            if let Some(content) = event["content"].as_str() {
+                                self.text_item_end(index, content, &mut events);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Some("tool_call_delta") if !self.assistant.is_null() && !self.ended => {
@@ -89,12 +151,32 @@ impl Stream {
                 self.finish_turn(&mut events);
                 self.summary = true;
             }
-            Notification::Committed(record) => self.record(record.event.clone(), args, &mut events),
+            Notification::Committed(record) => {
+                if let Event::ToolFinished { operation_id, .. } = &record.event
+                    && let Some(content) = pi_rs::tool_result_event_metadata(*operation_id)
+                {
+                    self.result_metadata.insert(*operation_id, content);
+                }
+                self.record(record.event.clone(), args, &mut events)
+            }
             Notification::Text(delta) if !self.assistant.is_null() => {
                 self.delta("text", delta, &mut events);
             }
             Notification::Reasoning(delta) if !self.assistant.is_null() => {
-                self.delta("thinking", delta, &mut events);
+                if !self.ended {
+                    match pi_rs::reasoning_event_metadata() {
+                        Some(pi_rs::ReasoningEventMetadata::Start { index }) => {
+                            self.reasoning_item_index(index, &mut events);
+                        }
+                        Some(pi_rs::ReasoningEventMetadata::Delta { index }) => {
+                            self.reasoning_item_delta(index, delta, &mut events)
+                        }
+                        Some(pi_rs::ReasoningEventMetadata::End { index, content }) => {
+                            self.reasoning_item_end(index, &content, &mut events)
+                        }
+                        None => self.delta("thinking", delta, &mut events),
+                    }
+                }
             }
             Notification::ToolProgress(event) => {
                 events.push(serde_json::to_value(event).expect("tool progress"));
@@ -207,6 +289,8 @@ impl Stream {
                     "toolUse"
                 });
                 self.close_block(events);
+                self.finish_reasoning_items(events);
+                self.finish_text_items(events);
                 let blocks = self.assistant["content"]
                     .as_array_mut()
                     .expect("assistant blocks");
@@ -309,11 +393,15 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_event_result_value(
+                    let mut result = tool_event_result_value(
                         &outcome.tool_content(),
                         Some(&outcome),
                         Some(outcome.is_structured()),
                     );
+                    let sidecar = self.result_metadata.remove(&operation_id);
+                    if let Some(content) = &sidecar {
+                        result["structuredContent"] = content.clone();
+                    }
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
@@ -324,7 +412,9 @@ impl Stream {
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
-                        if matches!(outcome, Outcome::TextResultWithStructuredContent { .. }) {
+                        if sidecar.is_some()
+                            || matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
+                        {
                             message
                                 .as_object_mut()
                                 .expect("result object")
@@ -360,6 +450,8 @@ impl Stream {
             );
             self.tool_results.clear();
             self.pending_tools.clear();
+            self.reasoning_items.clear();
+            self.text_items.clear();
             self.assistant = Value::Null;
             self.request_id = None;
         }
@@ -392,6 +484,8 @@ impl Stream {
     fn finish_message(&mut self, content: Option<String>, events: &mut Vec<Value>) {
         self.start_message(events);
         self.close_block(events);
+        self.finish_reasoning_items(events);
+        self.finish_text_items(events);
         if let Some(content) = content {
             let blocks = self.assistant["content"]
                 .as_array_mut()
@@ -441,6 +535,133 @@ impl Stream {
         );
     }
 
+    fn reasoning_item_index(&mut self, output_index: u64, events: &mut Vec<Value>) -> usize {
+        if let Some(&(index, _)) = self.reasoning_items.get(&output_index) {
+            return index;
+        }
+        self.start_message(events);
+        self.close_block(events);
+        let blocks = self.assistant["content"]
+            .as_array_mut()
+            .expect("assistant blocks");
+        let index = blocks.len();
+        blocks.push(json!({"type":"thinking","thinking":""}));
+        self.reasoning_items.insert(output_index, (index, false));
+        self.update(
+            json!({"type":"thinking_start","contentIndex":index}),
+            events,
+        );
+        index
+    }
+
+    fn reasoning_item_delta(&mut self, output_index: u64, delta: &str, events: &mut Vec<Value>) {
+        let index = self.reasoning_item_index(output_index, events);
+        if self.reasoning_items[&output_index].1 {
+            return;
+        }
+        if let Value::String(content) = &mut self.assistant["content"][index]["thinking"] {
+            content.push_str(delta);
+        }
+        self.update(
+            json!({"type":"thinking_delta","contentIndex":index,"delta":delta}),
+            events,
+        );
+    }
+
+    fn reasoning_item_end(&mut self, output_index: u64, content: &str, events: &mut Vec<Value>) {
+        let index = self.reasoning_item_index(output_index, events);
+        let ended = &mut self
+            .reasoning_items
+            .get_mut(&output_index)
+            .expect("reasoning item")
+            .1;
+        if *ended {
+            return;
+        }
+        *ended = true;
+        self.assistant["content"][index]["thinking"] = json!(content);
+        self.update(
+            json!({"type":"thinking_end","contentIndex":index,"content":content}),
+            events,
+        );
+    }
+
+    fn finish_reasoning_items(&mut self, events: &mut Vec<Value>) {
+        let mut pending: Vec<_> = self
+            .reasoning_items
+            .iter()
+            .filter_map(|(&output, &(index, ended))| (!ended).then_some((index, output)))
+            .collect();
+        pending.sort_unstable();
+        for (index, output) in pending {
+            let content = self.assistant["content"][index]["thinking"]
+                .as_str()
+                .expect("thinking block")
+                .to_owned();
+            self.reasoning_item_end(output, &content, events);
+        }
+    }
+
+    fn text_item_index(&mut self, output_index: u64, events: &mut Vec<Value>) -> usize {
+        if let Some(&(index, _)) = self.text_items.get(&output_index) {
+            return index;
+        }
+        self.start_message(events);
+        self.close_block(events);
+        let blocks = self.assistant["content"]
+            .as_array_mut()
+            .expect("assistant blocks");
+        let index = blocks.len();
+        blocks.push(json!({"type":"text","text":""}));
+        self.text_items.insert(output_index, (index, false));
+        self.update(json!({"type":"text_start","contentIndex":index}), events);
+        index
+    }
+
+    fn text_item_delta(&mut self, output_index: u64, delta: &str, events: &mut Vec<Value>) {
+        let index = self.text_item_index(output_index, events);
+        if self.text_items[&output_index].1 {
+            return;
+        }
+        if let Value::String(content) = &mut self.assistant["content"][index]["text"] {
+            content.push_str(delta);
+        }
+        self.update(
+            json!({"type":"text_delta","contentIndex":index,"delta":delta}),
+            events,
+        );
+    }
+
+    fn text_item_end(&mut self, output_index: u64, content: &str, events: &mut Vec<Value>) {
+        let index = self.text_item_index(output_index, events);
+        let ended = &mut self.text_items.get_mut(&output_index).expect("text item").1;
+        if *ended {
+            return;
+        }
+        *ended = true;
+        self.assistant["content"][index]["text"] = json!(content);
+        self.update(
+            json!({"type":"text_end","contentIndex":index,"content":content}),
+            events,
+        );
+    }
+
+    fn finish_text_items(&mut self, events: &mut Vec<Value>) {
+        let mut pending: Vec<_> = self
+            .text_items
+            .iter()
+            .filter_map(|(&output, &(index, ended))| (!ended).then_some((index, output)))
+            .collect();
+        pending.sort_unstable();
+        for (index, output) in pending {
+            let content = self.assistant["content"][index]["text"]
+                .as_str()
+                .expect("text block")
+                .to_owned();
+            self.text_item_end(output, &content, events);
+        }
+    }
+
     fn tool_delta(&mut self, delta: ToolCallDelta, events: &mut Vec<Value>) {
         self.start_message(events);
         self.close_block(events);
@@ -452,7 +673,7 @@ impl Stream {
             blocks.push(json!({"type":"toolCall","id":"","name":"","arguments":{}}));
             PendingTool {
                 content_index: next,
-                arguments: super::streaming_json::StreamingJson::default(),
+                arguments: super::StreamingJson::default(),
             }
         });
         let index = pending.content_index;
@@ -662,6 +883,318 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn summary_model_finished_record_is_not_forwarded() {
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        let record = json!({"type":"record","record":Record {
+            timestamp: None, run_id: None, version: 1, id: 1, parent: None,
+            event: Event::ModelFinished { request_id: Uuid::new_v4(), metadata: ModelMetadata::default(), usage: UsageReport::Unconfirmed, failure: None, partial: "private summary".into(), reply: None },
+        }});
+        assert!(!stream.suppress_summary_record(&record));
+        stream.observe(&json!({"type":"summary_request_start"}), &args);
+        assert!(stream.suppress_summary_record(&record));
+        assert!(!stream.suppress_summary_record(
+            &json!({"type":"record","record":{"event":{"type":"model_requested"}}})
+        ));
+        assert!(stream.observe(&record, &args).is_empty());
+        assert!(!stream.suppress_summary_record(&record));
+    }
+
+    #[test]
+    fn indexed_text_and_reasoning_preserve_interleaved_items() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut updates = Vec::new();
+        for event in [
+            json!({"type":"text_item_start","index":0}),
+            json!({"type":"text_item_delta","index":0,"delta":"a"}),
+            json!({"type":"reasoning_item_start","index":1}),
+            json!({"type":"reasoning_item_delta","index":1,"delta":"think"}),
+            json!({"type":"text_item_start","index":2}),
+            json!({"type":"text_item_delta","index":2,"delta":"b"}),
+            json!({"type":"text_item_delta","index":0,"delta":"c"}),
+            json!({"type":"text_item_end","index":2,"content":"B"}),
+            json!({"type":"reasoning_item_end","index":1,"content":"thought"}),
+            json!({"type":"text_item_end","index":0,"content":"AC"}),
+            json!({"type":"text_item_end","index":0,"content":"ignored"}),
+        ] {
+            updates.extend(stream.observe(&event, &args));
+        }
+        assert_eq!(
+            stream.assistant["content"],
+            json!([
+                {"type":"text","text":"AC"}, {"type":"thinking","thinking":"thought"}, {"type":"text","text":"B"}
+            ])
+        );
+        let events: Vec<_> = updates
+            .iter()
+            .filter_map(|v| v.get("assistantMessageEvent"))
+            .map(|v| {
+                (
+                    v["type"].as_str().unwrap(),
+                    v["contentIndex"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                ("text_start", 0),
+                ("text_delta", 0),
+                ("thinking_start", 1),
+                ("thinking_delta", 1),
+                ("text_start", 2),
+                ("text_delta", 2),
+                ("text_delta", 0),
+                ("text_end", 2),
+                ("thinking_end", 1),
+                ("text_end", 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_reasoning_start_precedes_interleaved_tool_and_delta() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"reasoning_item_start","index":4}),
+            json!({"type":"reasoning_item_start","index":4}),
+            json!({"type":"tool_call_delta","toolCallDelta":{"index":8,"id":"call","name":"read"}}),
+            json!({"type":"reasoning_delta","reasoningIndex":4,"delta":"thought"}),
+            json!({"type":"reasoning_item_end","index":4,"content":"final thought"}),
+        ] {
+            events.extend(stream.observe(&event, &args));
+        }
+        assert_eq!(
+            stream.assistant["content"][0],
+            json!({"type":"thinking","thinking":"final thought"})
+        );
+        assert_eq!(stream.assistant["content"][1]["type"], "toolCall");
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        let types: Vec<_> = updates
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["contentIndex"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("thinking_start", 0),
+                ("toolcall_start", 1),
+                ("thinking_delta", 0),
+                ("thinking_end", 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn unindexed_reasoning_delta_keeps_legacy_behavior() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        stream.observe(&json!({"type":"reasoning_delta","delta":"legacy"}), &args);
+        stream.finish_message(None, &mut Vec::new());
+        assert_eq!(
+            stream.assistant["content"],
+            json!([{"type":"thinking","thinking":"legacy"}])
+        );
+    }
+
+    #[test]
+    fn indexed_reasoning_observe_interleaves_and_uses_final_content() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"reasoning_item_delta","index":4,"delta":"a"}),
+            json!({"type":"reasoning_item_delta","index":9,"delta":"b"}),
+            json!({"type":"reasoning_item_delta","index":4,"delta":"c"}),
+            json!({"type":"reasoning_item_end","index":9,"content":"final b"}),
+            json!({"type":"reasoning_item_end","index":4,"content":"final a"}),
+            json!({"type":"reasoning_item_end","index":4,"content":"duplicate"}),
+        ] {
+            events.extend(stream.observe(&event, &args));
+        }
+        assert_eq!(
+            stream.assistant["content"],
+            json!([
+                {"type":"thinking","thinking":"final a"},
+                {"type":"thinking","thinking":"final b"}
+            ])
+        );
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        let types: Vec<_> = updates
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["contentIndex"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("thinking_start", 0),
+                ("thinking_delta", 0),
+                ("thinking_start", 1),
+                ("thinking_delta", 1),
+                ("thinking_delta", 0),
+                ("thinking_end", 1),
+                ("thinking_end", 0)
+            ]
+        );
+        assert_eq!(updates[5]["content"], "final b");
+    }
+
+    #[test]
+    fn indexed_reasoning_without_delta_and_unfinished_items_close_once() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = stream.observe(
+            &json!({"type":"reasoning_item_end","index":2,"content":"only final"}),
+            &args,
+        );
+        events.extend(stream.observe(
+            &json!({"type":"reasoning_item_delta","index":5,"delta":"partial"}),
+            &args,
+        ));
+        stream.finish_message(None, &mut events);
+        assert_eq!(stream.assistant["content"][0]["thinking"], "only final");
+        assert_eq!(stream.assistant["content"][1]["thinking"], "partial");
+        let ends: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .filter(|e| e["type"] == "thinking_end")
+            .collect();
+        assert_eq!(ends.len(), 2);
+        assert_eq!(ends[1]["content"], "partial");
+    }
+
+    #[test]
+    fn structured_read_metadata_is_correlated_and_not_added_to_messages() {
+        let operation_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "read-call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let metadata = json!("page\n\n[1 more line]");
+        stream.result_metadata.insert(other_id, json!("other"));
+        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata}), &args).is_empty());
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded(metadata.as_str().unwrap().into()),
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["structuredContent"], metadata);
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert!(message["message"].get("structuredContent").is_none());
+        assert_eq!(stream.result_metadata.get(&other_id), Some(&json!("other")));
+        assert!(!stream.result_metadata.contains_key(&operation_id));
+    }
+
+    #[test]
+    fn image_read_sidecar_appears_only_in_execution_event() {
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "image-read".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let blocks = json!([{ "type":"text", "text":"image note" }, { "type":"image", "mimeType":"image/png", "data":"aW1hZ2U=" }]);
+        let structured =
+            json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"image note"});
+        stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured}), &args);
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Structured {
+                    data: json!({"content":blocks}),
+                    attachments: vec![],
+                },
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["content"], blocks);
+        assert_eq!(end["result"]["structuredContent"], structured);
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(message["message"]["content"], blocks);
+        assert!(message["message"].get("structuredContent").is_none());
+    }
 
     #[test]
     fn multimodal_tool_events_preserve_order_and_native_metadata() {

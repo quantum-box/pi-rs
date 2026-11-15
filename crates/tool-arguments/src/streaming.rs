@@ -37,8 +37,10 @@ struct ScalarToken {
     text: String,
 }
 
+/// Incremental, best-effort JSON previews. Parse completed tool calls with
+/// [`crate::parse_tool_arguments`] before validating or executing them.
 #[derive(Default)]
-pub(super) struct StreamingJson {
+pub struct StreamingJson {
     root: Option<Value>,
     stack: Vec<Frame>,
     string: Option<StringToken>,
@@ -47,6 +49,8 @@ pub(super) struct StreamingJson {
 }
 
 impl StreamingJson {
+    /// Consume a UTF-8 fragment and return an owned best-effort snapshot.
+    /// Earlier snapshots are not changed by subsequent fragments.
     pub fn append(&mut self, fragment: &str) -> Value {
         for c in fragment.chars() {
             if self.done {

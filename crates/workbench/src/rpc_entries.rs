@@ -10,7 +10,7 @@ const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
 pub(super) fn session_header(session: &Session, cwd: &std::path::Path) -> Value {
     json!({
-        "type":"session", "version":3, "id":session.session_id(),
+        "type":"session", "version":3, "id":session.external_session_id(),
         "timestamp":session.records().first().and_then(|record| record.timestamp.as_deref()).unwrap_or(UNKNOWN_TIMESTAMP),
         "cwd":session.working_directory().map_or_else(|| cwd.to_string_lossy().into_owned(), str::to_owned)
     })
@@ -140,7 +140,7 @@ impl Entries {
         let values = session
             .records()
             .iter()
-            .flat_map(|record| cursor.append(session.records(), record, Some(session)))
+            .flat_map(|record| cursor.append(session.records(), record, Some(session), None))
             .collect();
         Self {
             values,
@@ -273,12 +273,7 @@ impl Entries {
                 .map(str::to_owned);
             let mut descendants = children.remove(id).unwrap_or_default();
             descendants.reverse();
-            descendants.sort_by_cached_key(|node| {
-                node["entry"]["timestamp"]
-                    .as_str()
-                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-                    .map(|timestamp| timestamp.timestamp_millis())
-            });
+            sort_tree_children(&mut descendants);
             let mut node = json!({"entry":entry});
             node["children"] = Value::Array(descendants);
             if let Some((label, timestamp)) = labels.remove(id) {
@@ -323,6 +318,72 @@ impl Entries {
     }
 }
 
+// V8's Date comparator treats a comparison involving an invalid date as
+// equal. That relation is not transitive, so passing it to Rust's general
+// stable sort is invalid. Reproduce V8's natural-run and binary-insertion
+// sequence, run-stack and galloping merges used by Node 22 and 24.
+fn sort_tree_children(children: &mut [Value]) {
+    let mut entries: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            (
+                node["entry"]["timestamp"].as_str().and_then(tree_timestamp),
+                index,
+            )
+        })
+        .collect();
+    if entries.iter().all(|(timestamp, _)| timestamp.is_some()) {
+        entries.sort_by_key(|(timestamp, _)| *timestamp);
+    } else {
+        sort_tree_mixed(&mut entries);
+    }
+    let mut original: Vec<_> = children.iter_mut().map(std::mem::take).collect();
+    for (destination, (_, index)) in children.iter_mut().zip(entries) {
+        *destination = std::mem::take(&mut original[index]);
+    }
+}
+
+#[path = "rpc_tree_sort.rs"]
+mod rpc_tree_sort;
+use rpc_tree_sort::sort_tree_mixed;
+
+// JavaScript Date treats valid ISO date-only forms as UTC midnight, whereas
+// chrono's RFC 3339 parser requires a time and offset.
+fn tree_timestamp(value: &str) -> Option<i64> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.timestamp_millis());
+    }
+    let bytes = value.as_bytes();
+    if !matches!(bytes.len(), 4 | 7 | 10)
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || (bytes.len() >= 7 && (bytes[4] != b'-' || !bytes[5..7].iter().all(u8::is_ascii_digit)))
+        || (bytes.len() == 10 && (bytes[7] != b'-' || !bytes[8..10].iter().all(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    let year = value[..4].parse().ok()?;
+    let month = if bytes.len() >= 7 {
+        value[5..7].parse().ok()?
+    } else {
+        1
+    };
+    let day: u32 = if bytes.len() == 10 {
+        value[8..10].parse().ok()?
+    } else {
+        1
+    };
+    // V8 accepts days 1 through 31 and rolls a day past the end of a
+    // month into the next month. Zero and values above 31 are invalid.
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    chrono::NaiveDate::from_ymd_opt(year, month, 1)?
+        .checked_add_signed(chrono::Duration::days(i64::from(day - 1)))?
+        .and_hms_opt(0, 0, 0)
+        .map(|timestamp| timestamp.and_utc().timestamp_millis())
+}
+
 pub(super) struct Cursor {
     positions: Vec<Position>,
     source_ids: HashMap<String, u64>,
@@ -342,11 +403,11 @@ impl Default for Cursor {
 impl Cursor {
     pub(super) fn advance(&mut self, records: &[Record]) {
         for record in records.iter().skip(self.positions.len() - 1) {
-            self.append(records, record, None);
+            self.append(records, record, None, None);
         }
     }
 
-    pub(super) fn appended(&mut self, records: &[Record]) -> Vec<Value> {
+    pub(super) fn appended(&mut self, records: &[Record], metadata: Option<&Value>) -> Vec<Value> {
         let Some((record, prefix)) = records.split_last() else {
             return Vec::new();
         };
@@ -354,7 +415,7 @@ impl Cursor {
         if record.id as usize != self.positions.len() {
             return Vec::new();
         }
-        self.append(records, record, None)
+        self.append(records, record, None, metadata)
     }
 
     fn append(
@@ -362,6 +423,7 @@ impl Cursor {
         records: &[Record],
         record: &Record,
         session: Option<&Session>,
+        live_metadata: Option<&Value>,
     ) -> Vec<Value> {
         let mut entries = Vec::new();
         self.messages.record(record);
@@ -446,6 +508,30 @@ impl Cursor {
                 }
                 None
             }
+            Event::BranchModelSelected {
+                provider, model, ..
+            } => {
+                let model_id = format!("{}-model", record.id);
+                entries.push(with_identity(
+                    json!({"type":"model_change","provider":provider,"modelId":model}),
+                    &model_id,
+                    wire_id(parent.visible),
+                    record,
+                ));
+                entries.push(with_identity(
+                    json!({"type":"thinking_level_change","thinkingLevel":"off"}),
+                    &record.id.to_string(),
+                    Some(model_id),
+                    record,
+                ));
+                position.visible = Some(record.id);
+                position.model = Some(record.id);
+                position.response_model = None;
+                position.explicit_model_seen = true;
+                position.imported = None;
+                self.positions.push(position);
+                return entries;
+            }
             Event::ModelSelected {
                 model,
                 provider,
@@ -468,17 +554,23 @@ impl Cursor {
                 }
                 position.response_model = None;
                 position.explicit_model_seen = true;
-                let previous = parent.model.and_then(|id| {
-                    let Event::ModelSelected {
-                        model,
-                        provider,
-                        thinking,
-                    } = &records[id as usize - 1].event
-                    else {
-                        return None;
-                    };
-                    Some(selection(model, provider.as_deref(), thinking.as_deref()))
-                });
+                let previous = parent
+                    .model
+                    .and_then(|id| match &records[id as usize - 1].event {
+                        Event::ModelSelected {
+                            model,
+                            provider,
+                            thinking,
+                        } => Some(selection(model, provider.as_deref(), thinking.as_deref())),
+                        Event::BranchModelSelected {
+                            model, provider, ..
+                        } => Some(selection(model, Some(provider), None)),
+                        Event::BranchSummary {
+                            fallback_model: Some(model),
+                            ..
+                        } => Some(selection(&model.model, Some(&model.provider), None)),
+                        _ => None,
+                    });
                 // A response may have been routed by a virtual selection. An
                 // explicit native selection must override that selection even
                 // when it names the same physical model as the response.
@@ -517,12 +609,24 @@ impl Cursor {
                 }
             }
             Event::Label { target, label } => {
-                let target = self
-                    .positions
-                    .get(*target as usize)
-                    .and_then(|target| target.visible);
+                let target = if matches!(
+                    records
+                        .get(target.saturating_sub(1) as usize)
+                        .map(|record| &record.event),
+                    Some(Event::BranchSummary {
+                        fallback_model: Some(_),
+                        ..
+                    })
+                ) {
+                    Some(format!("{target}-summary"))
+                } else {
+                    self.positions
+                        .get(*target as usize)
+                        .and_then(|target| target.visible)
+                        .map(|id| id.to_string())
+                };
                 target.map(|target| {
-                    let mut entry = json!({"type":"label","targetId":target.to_string()});
+                    let mut entry = json!({"type":"label","targetId":target});
                     if let Some(label) = label {
                         entry["label"] = json!(label);
                     }
@@ -551,6 +655,16 @@ impl Cursor {
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
                     "tokensBefore":compaction_tokens(records, record, session)
                 });
+                if let Some(metadata) = live_metadata
+                    .or_else(|| session.and_then(|session| session.record_metadata(record.id)))
+                {
+                    if let Some(details) = metadata.get("details") {
+                        entry["details"] = details.clone();
+                    }
+                    if metadata["fromExtension"] == true {
+                        entry["fromHook"] = json!(true);
+                    }
+                }
                 add_summary_usage(&mut entry, records, record);
                 Some(entry)
             }
@@ -560,6 +674,7 @@ impl Cursor {
                 extension_summary,
                 read_files,
                 modified_files,
+                fallback_model,
                 ..
             } => {
                 let from = from.and_then(|id| self.positions.get(id as usize)?.visible);
@@ -579,6 +694,30 @@ impl Cursor {
                     }
                 }
                 add_summary_usage(&mut entry, records, record);
+                if let Some(model) = fallback_model {
+                    let summary_id = format!("{}-summary", record.id);
+                    let model_id = format!("{}-model", record.id);
+                    entries.push(with_identity(
+                        entry,
+                        &summary_id,
+                        wire_id(parent.visible),
+                        record,
+                    ));
+                    entries.push(with_identity(json!({"type":"model_change","provider":model.provider,"modelId":model.model}), &model_id, Some(summary_id), record));
+                    entries.push(with_identity(
+                        json!({"type":"thinking_level_change","thinkingLevel":"off"}),
+                        &record.id.to_string(),
+                        Some(model_id),
+                        record,
+                    ));
+                    position.visible = Some(record.id);
+                    position.model = Some(record.id);
+                    position.response_model = None;
+                    position.explicit_model_seen = true;
+                    position.imported = None;
+                    self.positions.push(position);
+                    return entries;
+                }
                 Some(entry)
             }
             Event::ExtensionStates { states } => Some(json!({
@@ -716,7 +855,7 @@ pub(super) fn changes(session: &Session, previous: usize) -> Vec<Value> {
     cursor.advance(prefix);
     appended
         .iter()
-        .flat_map(|record| cursor.append(records, record, Some(session)))
+        .flat_map(|record| cursor.append(records, record, Some(session), None))
         .collect()
 }
 
@@ -752,6 +891,152 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_compaction_entry_projects_supplied_metadata() {
+        use super::*;
+        let session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = session.records().to_vec();
+        let id = records.len() as u64 + 1;
+        records.push(Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id,
+            parent: Some(id - 1),
+            event: Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: Some(42),
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        });
+        let mut cursor = Cursor::default();
+        let entries = cursor.appended(
+            &records,
+            Some(&json!({"fromExtension":true,"details":{"origin":"hook"}})),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["fromHook"], true);
+        assert_eq!(entries[0]["details"]["origin"], "hook");
+        for metadata in [
+            json!({"fromExtension":true}),
+            json!({"fromExtension":true,"details":null}),
+        ] {
+            let entries = Cursor::default().appended(&records, Some(&metadata));
+            assert_eq!(entries[0].get("details"), metadata.get("details"));
+        }
+    }
+
+    #[test]
+    fn share_header_preserves_imported_external_id_and_fork_identity() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let identity = "ID / 日本語\r\nlegacy";
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"session", "version":3, "id":identity})
+            ),
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let body = Entries::new(&session)
+            .write_share_branch(&session, dir.path())
+            .unwrap();
+        let first = body.split(|byte| *byte == b'\n').next().unwrap();
+        let header: Value = serde_json::from_slice(first).unwrap();
+        assert_eq!(header["id"], identity);
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        let body = Entries::new(&fork)
+            .write_share_branch(&fork, dir.path())
+            .unwrap();
+        let header: Value =
+            serde_json::from_slice(body.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(header["id"], fork.session_id().to_string());
+    }
+
+    #[test]
+    fn branch_fallback_projects_selection_and_summary() {
+        use super::*;
+        for summary in [false, true] {
+            let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            session
+                .select_provider_model(Some("old"), "shared", Some("high"))
+                .unwrap();
+            let mut records = session.records().to_vec();
+            let event = if summary {
+                Event::BranchSummary {
+                    summary: "summary".into(),
+                    fallback_model: Some(pi_rs::BranchFallbackModel {
+                        provider: "new".into(),
+                        model: "shared".into(),
+                    }),
+                    extension_summary: None,
+                    from: Some(2),
+                    target: Some(2),
+                    usage: None,
+                    usage_metadata: None,
+                    read_files: vec![],
+                    modified_files: vec![],
+                }
+            } else {
+                Event::BranchModelSelected {
+                    target: 2,
+                    provider: "new".into(),
+                    model: "shared".into(),
+                }
+            };
+            records.push(Record {
+                version: 4,
+                id: 3,
+                parent: Some(2),
+                run_id: None,
+                timestamp: None,
+                event,
+            });
+            let restored = Session::from_records(records).unwrap();
+            assert_eq!(
+                super::super::session_import::branch_selection(&restored, |_, _| None),
+                super::super::session_import::BranchSelection::Selected {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                    thinking: None
+                }
+            );
+            let entries = Entries::new(&restored);
+            let last = &entries.values[entries.values.len() - 1];
+            let model = &entries.values[entries.values.len() - 2];
+            assert_eq!(model["type"], "model_change");
+            assert_eq!(model["provider"], "new");
+            assert_eq!(last["type"], "thinking_level_change");
+            assert_eq!(last["thinkingLevel"], "off");
+            assert_eq!(last["parentId"], model["id"]);
+            if summary {
+                let branch = &entries.values[entries.values.len() - 3];
+                assert_eq!(branch["type"], "branch_summary");
+                assert_eq!(model["parentId"], branch["id"]);
+                let mut labeled = restored.records().to_vec();
+                labeled.push(Record {
+                    version: 4,
+                    id: 4,
+                    parent: Some(3),
+                    run_id: None,
+                    timestamp: None,
+                    event: Event::Label {
+                        target: 3,
+                        label: Some("saved".into()),
+                    },
+                });
+                let labeled = Entries::new(&Session::from_records(labeled).unwrap());
+                assert_eq!(labeled.values.last().unwrap()["targetId"], "3-summary");
+            }
+        }
+    }
     #[test]
     fn share_context_is_trailing_bounded_and_not_journaled() {
         let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
@@ -948,6 +1233,148 @@ mod tests {
             .collect();
         assert_eq!(names, ["earlier", "equal", "later"]);
         assert_eq!(tree["leafId"], children[1]["entry"]["id"]);
+    }
+
+    #[test]
+    fn imported_tree_orders_iso_date_only_timestamps_at_utc_midnight() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2024-01-01T00:00:00Z"),
+            ("february", Some("root"), "2025-02"),
+            ("january2", Some("root"), "2025-01-02"),
+            ("offset-equal", Some("root"), "2025-01-01T20:00:00-04:00"),
+            ("year", Some("root"), "2025"),
+        ] {
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,"message":{"role":"user","content":id}})).unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["year", "january2", "offset-equal", "february"]);
+        assert_eq!(children[0]["entry"]["timestamp"], "2025");
+        assert_eq!(children[1]["entry"]["timestamp"], "2025-01-02");
+    }
+
+    #[test]
+    fn tree_normalizes_date_only_overflow_with_stable_equal_instants() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2024-01-01T00:00:00Z"),
+            ("later", Some("root"), "2024-03-02"),
+            ("overflow", Some("root"), "2024-02-30"),
+            ("equal", Some("root"), "2024-03-01T00:00:00Z"),
+            ("earlier", Some("root"), "2024-02-29"),
+        ] {
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,"message":{"role":"user","content":id}})).unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["earlier", "overflow", "equal", "later"]);
+        assert_eq!(children[1]["entry"]["timestamp"], "2024-02-30");
+        for (overflow, normalized) in [("2023-02-29", "2023-03-01"), ("2024-04-31", "2024-05-01")] {
+            assert_eq!(tree_timestamp(overflow), tree_timestamp(normalized));
+        }
+        for invalid in ["2024-02-00", "2024-02-32", "2024-00-01", "2024-13-01"] {
+            assert_eq!(tree_timestamp(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn tree_invalid_timestamp_matches_v8_stable_sort() {
+        for (timestamps, expected) in [
+            (
+                vec!["2025-03-01", "bad", "2025-01-01"],
+                vec!["2025-03-01", "bad", "2025-01-01"],
+            ),
+            (
+                vec!["2025-03-01", "2025-01-01", "bad", "2025-02-01"],
+                vec!["2025-01-01", "2025-02-01", "2025-03-01", "bad"],
+            ),
+        ] {
+            let mut values = vec![json!({"id":"root","parentId":null,"timestamp":"2020-01-01"})];
+            for (index, timestamp) in timestamps.iter().enumerate() {
+                values
+                    .push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
+            }
+            let tree = Entries { values, leaf: None }.tree();
+            let actual: Vec<_> = tree["tree"][0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["entry"]["timestamp"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn large_tree_with_invalid_timestamp_keeps_v8_natural_run() {
+        // Node 22.23 and 24.22 both keep this 80-entry run in append order.
+        let mut values = vec![json!({"id":"root","parentId":null,"timestamp":"2020-01-01"})];
+        for index in 0..80 {
+            let timestamp = if index == 30 {
+                "bad"
+            } else if index < 30 {
+                "2025-03-01"
+            } else {
+                "2025-01-01"
+            };
+            values.push(json!({"id":index.to_string(),"parentId":"root","timestamp":timestamp}));
+        }
+        let tree = Entries { values, leaf: None }.tree();
+        let ids: Vec<_> = tree["tree"][0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                node["entry"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, (0..80).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn large_mixed_tree_sort_is_deterministic_and_keeps_every_entry() {
+        let original: Vec<_> = (0..128)
+            .map(|index| {
+                (
+                    if index % 11 == 0 {
+                        None
+                    } else {
+                        Some(((index * 7) % 28 + 1) as i64)
+                    },
+                    index,
+                )
+            })
+            .collect();
+        let mut first = original.clone();
+        let mut second = original;
+        sort_tree_mixed(&mut first);
+        sort_tree_mixed(&mut second);
+        assert_eq!(first, second);
+        let mut indices: Vec<_> = first.iter().map(|(_, index)| *index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..128).collect::<Vec<_>>());
+        assert!(
+            first
+                .windows(2)
+                .any(|pair| pair[0].0.is_some() && pair[1].0.is_none())
+        );
     }
 
     #[test]

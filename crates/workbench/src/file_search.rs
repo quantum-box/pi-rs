@@ -29,8 +29,20 @@ impl Grep {
         };
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(args["ignoreCase"] == true)
+            // Pi invokes ripgrep without multiline mode. The matcher must
+            // reject a required newline rather than silently finding nothing.
+            .line_terminator(Some(b'\n'))
             .build(&pattern)
-            .map_err(|error| Error::Config(error.to_string()))?;
+            .map_err(|error| {
+                let message = error.to_string();
+                if message == "the literal \"\\n\" is not allowed in a regex" {
+                    Error::Config(format!(
+                        "rg: {message}\n\nConsider enabling multiline mode with the --multiline flag (or -U for short).\nWhen multiline mode is enabled, new line characters can be matched."
+                    ))
+                } else {
+                    Error::Config(message)
+                }
+            })?;
         let context = args["context"]
             .as_u64()
             .unwrap_or_else(|| args["context"].as_f64().unwrap_or(0.0).max(0.0) as u64);
@@ -48,6 +60,13 @@ impl Grep {
             context,
         })
     }
+    /// Ripgrep converts NUL bytes to line breaks for explicit file arguments.
+    pub fn with_explicit_file(mut self) -> Self {
+        self.searcher
+            .set_binary_detection(BinaryDetection::convert(0));
+        self
+    }
+
     pub fn search(
         &mut self,
         path: &Path,
@@ -488,6 +507,65 @@ fn render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_line_patterns_follow_ripgrep_newline_rules() {
+        let expected = "rg: the literal \"\\n\" is not allowed in a regex\n\nConsider enabling multiline mode with the --multiline flag (or -U for short).\nWhen multiline mode is enabled, new line characters can be matched.";
+        for args in [
+            json!({"pattern":"foo\nbar"}),
+            json!({"pattern":"foo\nbar", "literal":true}),
+            json!({"pattern":r"foo\nbar"}),
+            json!({"pattern":r"[\n]"}),
+            json!({"pattern":r"\x0a"}),
+        ] {
+            match Grep::new(&args, 100) {
+                Err(Error::Config(message)) => assert_eq!(message, expected, "{args}"),
+                _ => panic!("expected newline rejection for {args}"),
+            }
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "alpha\nBETA\n").unwrap();
+        for pattern in [r"[a-z\n]", r"(?s:.)", r"[^x]"] {
+            let mut grep = Grep::new(&json!({"pattern":pattern}), 100).unwrap();
+            grep.search(file.path(), "fixture", &CancellationToken::new())
+                .unwrap();
+            assert!(
+                grep.finish().tool_content().contains("fixture:1: alpha"),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_binary_file_uses_ripgrep_nul_line_boundaries() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"match first\nnext line\n\0remaining match\n").unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match"}), 100)
+            .unwrap()
+            .with_explicit_file();
+        grep.search(file.path(), "binary.dat", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            grep.finish().tool_content(),
+            "binary.dat:1: match first\nbinary.dat:4: remaining match"
+        );
+
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100)
+            .unwrap()
+            .with_explicit_file();
+        grep.search(file.path(), "binary.dat", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            grep.finish().tool_content(),
+            "binary.dat:1: match first\nbinary.dat-2- next line\nbinary.dat-3- \0remaining match\nbinary.dat:4: "
+        );
+
+        let mut directory_grep = Grep::new(&json!({"pattern":"match"}), 100).unwrap();
+        directory_grep
+            .search(file.path(), "binary.dat", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(directory_grep.finish().tool_content(), "No matches found");
+    }
 
     #[test]
     fn reading_search_input_stops_after_cancellation() {

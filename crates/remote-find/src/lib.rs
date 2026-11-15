@@ -122,10 +122,7 @@ fn normalize(value: &str, remote_home: Option<&Path>) -> Result<PathBuf> {
         };
     }
     if value.starts_with("file://") {
-        return url::Url::parse(value)
-            .map_err(|error| Error::Config(error.to_string()))?
-            .to_file_path()
-            .map_err(|_| Error::Config("invalid file URL".into()));
+        return pi_rs_file_url::to_file_path(value).map_err(Error::Config);
     }
     Ok(PathBuf::from(value))
 }
@@ -451,6 +448,15 @@ impl Tool for RemoteFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_url_windows_separator_rules_follow_node() {
+        assert!(pi_rs_file_url::validate_path("/C:/dir%5cfile", true).is_err());
+        assert!(pi_rs_file_url::validate_path("/C:/dir%2ffile", true).is_err());
+        assert!(pi_rs_file_url::validate_path("/dir%5cfile", false).is_ok());
+        assert!(pi_rs_file_url::validate_path("/dir%f0%9f%98%80", false).is_ok());
+        assert!(pi_rs_file_url::validate_path("/dir%ed%a0%80", false).is_err());
+    }
+
     #[test]
     fn bounded_listing_counts_full_output_and_observes_cancellation() {
         let token = pi_rs::CancellationToken::new();

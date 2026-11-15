@@ -23,6 +23,9 @@ use super::theme::Theme;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub text: String,
+    // Search-only text may retain U+0085; `text` is always terminal-safe.
+    search_text: Option<String>,
+    base_text: bool,
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
@@ -35,8 +38,12 @@ pub struct Span {
 }
 impl Span {
     pub(super) fn new(text: impl Into<String>, color: Color) -> Self {
+        let text = text.into();
+        let search_text = text.contains('\u{85}').then(|| clean_for_search(&text));
         Self {
-            text: clean(&text.into()),
+            text: clean(&text),
+            search_text,
+            base_text: false,
             color,
             background: None,
             bold: false,
@@ -48,8 +55,36 @@ impl Span {
             hyperlink: None,
         }
     }
+    pub(super) fn searchable(&self) -> &str {
+        self.search_text.as_deref().unwrap_or(&self.text)
+    }
+    fn set_source(&mut self, text: &str) {
+        self.text = clean(text);
+        self.search_text = text.contains('\u{85}').then(|| clean_for_search(text));
+    }
+    fn search_slice(&self, range: Range<usize>) -> Option<String> {
+        let raw = self.search_text.as_ref()?;
+        let boundary = |target: usize| {
+            if target == self.text.len() {
+                return raw.len();
+            }
+            let mut visible = 0;
+            for (offset, character) in raw.char_indices() {
+                if visible == target {
+                    return offset;
+                }
+                if character != '\u{85}' {
+                    visible += character.len_utf8();
+                }
+            }
+            raw.len()
+        };
+        let result = &raw[boundary(range.start)..boundary(range.end)];
+        result.contains('\u{85}').then(|| result.to_owned())
+    }
     pub(super) fn themed(text: impl Into<String>, theme: &Theme, role: &str) -> Self {
         let mut span = Self::new(text, theme.color(role));
+        span.base_text = role == "text";
         span.dim = theme.is_dim(role);
         span
     }
@@ -94,7 +129,8 @@ impl Line {
                 ] {
                     if !range.is_empty() {
                         let mut piece = Span {
-                            text: span.text[range].into(),
+                            text: span.text[range.clone()].into(),
+                            search_text: span.search_slice(range),
                             ..span.clone()
                         };
                         if matched {
@@ -231,6 +267,10 @@ pub enum Entry {
     },
     Assistant(String),
     Thinking(String),
+    CustomMessage {
+        custom_type: String,
+        text: String,
+    },
     Summary {
         id: u64,
         kind: SummaryKind,
@@ -339,6 +379,24 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
+            Self::CustomMessage { custom_type, text } => {
+                let mut label =
+                    Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
+                label.bold = true;
+                let mut lines = vec![Line::default()];
+                lines.extend(wrap(&[label], inner));
+                lines.push(Line::default());
+                let mut body =
+                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
+                custom_message_base_style(&mut body, theme);
+                lines.extend(body);
+                lines.push(Line::default());
+                for line in &mut lines {
+                    line.background = Some(theme.color("customMessageBg"));
+                }
+                lines.push(Line::default());
+                lines
+            }
             Self::Summary {
                 kind,
                 text,
@@ -428,6 +486,12 @@ impl Entry {
                 numbered_diff,
                 ..
             } => {
+                // Shell output may contain terminal escape sequences, including
+                // partial sequences while a command is still streaming. Treat
+                // them as data, never as transcript styling.
+                let shell_output = matches!(name.as_str(), "bash" | "bash (excluded)")
+                    .then(|| strip_shell_ansi(output));
+                let output = shell_output.as_deref().unwrap_or(output);
                 let role = if *failed {
                     "toolErrorBg"
                 } else if *finished {
@@ -512,12 +576,112 @@ impl Entry {
         lines
     }
 }
+fn custom_message_base_style(lines: &mut [Line], theme: &Theme) {
+    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+        if span.base_text {
+            span.color = theme.color("customMessageText");
+            span.dim = theme.is_dim("customMessageText");
+        }
+    }
+}
 
 pub fn clean(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect::<String>()
         .replace('\t', "    ")
+}
+
+fn clean_for_search(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t' | '\u{85}'))
+        .collect::<String>()
+        .replace('\t', "    ")
+}
+
+// Segment after sanitizing: removing a control can join a ZWJ emoji into one
+// displayed grapheme. Return the corresponding byte range in the raw source.
+pub(super) fn search_graphemes(text: &str, mut visit: impl FnMut(Range<usize>, &str)) {
+    if !text.contains('\u{85}') {
+        for (start, grapheme) in text.grapheme_indices(true) {
+            visit(start..start + grapheme.len(), grapheme);
+        }
+        return;
+    }
+    let display = clean(text);
+    let mut raw = text.char_indices();
+    let mut raw_start = 0;
+    for (start, grapheme) in display.grapheme_indices(true) {
+        let mut visible = 0;
+        let mut raw_end = raw_start;
+        while visible < grapheme.len() {
+            let (offset, character) = raw.next().expect("sanitized grapheme has source");
+            raw_end = offset + character.len_utf8();
+            if character != '\u{85}' {
+                visible += character.len_utf8();
+            }
+        }
+        if start + grapheme.len() == display.len() {
+            raw_end = text.len();
+        }
+        visit(raw_start..raw_end, grapheme);
+        raw_start = raw_end;
+    }
+    if display.is_empty() {
+        visit(0..text.len(), "");
+    }
+}
+
+pub(crate) fn strip_shell_ansi(text: &str) -> String {
+    let mut chars = text.chars().peekable();
+    let mut result = String::with_capacity(text.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' | '\u{9b}' => {
+                let introducer = if ch == '\u{9b}' {
+                    Some('[')
+                } else {
+                    chars.next()
+                };
+                match introducer {
+                    Some('[') => {
+                        for next in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']' | 'P' | 'X' | '^' | '_') => {
+                        while let Some(next) = chars.next() {
+                            if next == '\u{7}' || next == '\u{9c}' {
+                                break;
+                            }
+                            if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(next) if ('\u{20}'..='\u{2f}').contains(&next) => {
+                        for next in chars.by_ref() {
+                            if ('\u{30}'..='\u{7e}').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                result.push('\n');
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     let width = width.max(1);
@@ -526,22 +690,41 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     for span in spans {
         let mut fragment = span.clone();
         fragment.text.clear();
-        for grapheme in span.text.graphemes(true) {
+        fragment.search_text = span.search_text.as_ref().map(|_| String::new());
+        search_graphemes(span.searchable(), |range, grapheme| {
             let size = UnicodeWidthStr::width(grapheme);
+            let source = &span.searchable()[range];
+            let (before_newline, after_newline) = if grapheme == "\n" {
+                source.split_once('\n').unwrap_or(("", ""))
+            } else {
+                ("", "")
+            };
+            if let Some(raw) = &mut fragment.search_text {
+                raw.push_str(before_newline);
+            }
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
                 fragment.text.clear();
+                if let Some(raw) = &mut fragment.search_text {
+                    raw.clear();
+                }
                 lines.push(Line::default());
                 used = 0;
                 if grapheme == "\n" {
-                    continue;
+                    if let Some(raw) = &mut fragment.search_text {
+                        raw.push_str(after_newline);
+                    }
+                    return;
                 }
             }
             if size <= width {
                 fragment.text.push_str(grapheme);
+                if let Some(raw) = &mut fragment.search_text {
+                    raw.push_str(source);
+                }
                 used += size;
             }
-        }
+        });
         lines.last_mut().unwrap().spans.push(fragment);
     }
     lines
@@ -1228,23 +1411,43 @@ fn original_list_marker(source: &str, ordered: bool) -> Option<String> {
     Some(format!("{} ", &line[..end]))
 }
 
-// Pulldown-cmark emits paragraph events inside loose list items, but does not
-// expose the list's looseness directly. Record it before rendering so every
-// pair of items receives the same spacing, including the first pair.
+// Pulldown-cmark does not expose list looseness directly. Paragraph events
+// identify ordinary loose lists; trailing blank lines identify block-only
+// sibling items. Record it before rendering so every pair is spaced alike.
 fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet<usize> {
     let mut loose = std::collections::HashSet::new();
-    let mut lists = Vec::new();
+    let mut lists: Vec<(usize, usize, bool)> = Vec::new();
     let mut quote_depth = 0usize;
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         match event {
-            Event::Start(Tag::List(_)) => lists.push((range.start, quote_depth)),
+            Event::Start(Tag::List(_)) => lists.push((range.start, quote_depth, false)),
             Event::End(TagEnd::List(_)) => {
                 lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                if let Some((offset, _, previous_blank)) = lists.last_mut() {
+                    if *previous_blank {
+                        loose.insert(*offset);
+                    }
+                    *previous_blank = false;
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                if let Some((_, list_quote_depth, previous_blank)) = lists.last_mut() {
+                    // Item ranges include blank lines between sibling items.
+                    // Inspect only the trailing line, not blank lines inside
+                    // fenced code or a nested blockquote.
+                    let mut lines = text[range].split('\n').rev();
+                    *previous_blank = lines.next() == Some("")
+                        && lines
+                            .next()
+                            .is_some_and(|line| blank_list_separator(line, *list_quote_depth));
+                }
             }
             Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
             Event::End(TagEnd::BlockQuote(_)) => quote_depth -= 1,
             Event::Start(Tag::Paragraph) => {
-                if let Some(&(offset, list_quote_depth)) = lists.last()
+                if let Some(&(offset, list_quote_depth, _)) = lists.last()
                     && quote_depth == list_quote_depth
                 {
                     loose.insert(offset);
@@ -1254,6 +1457,20 @@ fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet
         }
     }
     loose
+}
+
+fn blank_list_separator(line: &str, quote_depth: usize) -> bool {
+    let mut rest = line.trim_matches([' ', '\t', '\r']);
+    if rest.is_empty() {
+        return true;
+    }
+    for _ in 0..quote_depth {
+        let Some(after) = rest.strip_prefix('>') else {
+            return false;
+        };
+        rest = after.trim_start_matches([' ', '\t']);
+    }
+    rest.is_empty()
 }
 
 fn markdown_at_depth(
@@ -1557,9 +1774,10 @@ fn markdown_at_depth(
                 for mut line in quoted {
                     for span in &mut line.spans {
                         span.italic = true;
-                        if span.color == theme.color("text") && !span.dim {
+                        if span.base_text {
                             span.color = theme.color("mdQuote");
                             span.dim = theme.is_dim("mdQuote");
+                            span.base_text = false;
                         }
                     }
                     if bordered {
@@ -1635,7 +1853,7 @@ fn markdown_at_depth(
                         for (link_range, url) in bare_links(displayed) {
                             let Some(mut url) = url else {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..link_range.end]);
+                                plain.set_source(&displayed[cursor..link_range.end]);
                                 spans.push(plain);
                                 cursor = link_range.end;
                                 continue;
@@ -1651,7 +1869,7 @@ fn markdown_at_depth(
                             }
                             if cursor < link_range.start {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..link_range.start]);
+                                plain.set_source(&displayed[cursor..link_range.start]);
                                 spans.push(plain);
                             }
                             let raw_label = &displayed[link_range.clone()];
@@ -1662,8 +1880,9 @@ fn markdown_at_depth(
                                 raw_label.to_owned()
                             };
                             let mut link = span.clone();
-                            link.text = clean(&label);
+                            link.set_source(&label);
                             link.color = theme.color("mdLink");
+                            link.base_text = false;
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
                             link.hyperlink =
@@ -1678,7 +1897,7 @@ fn markdown_at_depth(
                             cursor = link_range.end;
                         }
                         if cursor < displayed.len() {
-                            span.text = clean(&displayed[cursor..]);
+                            span.set_source(&displayed[cursor..]);
                             spans.push(span);
                         }
                     } else {
@@ -2566,6 +2785,30 @@ mod tests {
                 vec!["- outer", "    - one", "", "    - two", "- next"],
             ),
             ("- > quote\n- next", vec!["- ", "│ quote", "- next"]),
+            (
+                "- > first\n\n- > second\n- > third",
+                vec!["- ", "│ first", "", "- ", "│ second", "", "- ", "│ third"],
+            ),
+            (
+                "- > first\r\n \r\n- > second",
+                vec!["- ", "│ first", "", "- ", "│ second"],
+            ),
+            (
+                "- > first\n- > second",
+                vec!["- ", "│ first", "- ", "│ second"],
+            ),
+            (
+                "- outer\n  - > first\n\n  - > second\n- next",
+                vec![
+                    "- outer",
+                    "    - ",
+                    "│ first",
+                    "",
+                    "    - ",
+                    "│ second",
+                    "- next",
+                ],
+            ),
         ] {
             let actual: Vec<String> = markdown(source, &theme, 80)
                 .iter()
@@ -2573,6 +2816,49 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected, "{source}");
         }
+    }
+
+    #[test]
+    fn blank_lines_inside_fenced_code_do_not_make_the_list_loose() {
+        let source = "- ```\n  a\n\n  b\n  ```\n- ```\n  c\n  ```";
+        assert!(
+            loose_list_offsets(source, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quoted_block_only_loose_list_keeps_item_spacing() {
+        let source = "> - > first\n>\n> - > second";
+        let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+        assert!(!loose_list_offsets(source, options).is_empty());
+        assert!(blank_list_separator(" > >  ", 2));
+        assert!(!blank_list_separator("> > content", 2));
+        assert!(!blank_list_separator("> >", 1));
+        let lines = markdown(source, &Theme::system(), 80);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert!(text.iter().any(|line| line == "│ "), "{text:?}");
+    }
+
+    #[test]
+    fn loose_block_lists_keep_configured_bullet_style() {
+        let theme = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
+        let lines = markdown("- > first\n\n- > second", &theme, 80);
+        let bullets: Vec<_> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.text == "- ")
+            .collect();
+        assert_eq!(bullets.len(), 2);
+        assert!(
+            bullets
+                .iter()
+                .all(|span| span.color == theme.color("mdListBullet"))
+        );
+        assert!(lines.iter().any(|line| line.spans.is_empty()));
     }
 
     #[test]
@@ -2600,6 +2886,85 @@ mod tests {
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
+    }
+
+    #[test]
+    fn custom_message_uses_markdown_theme_and_safe_terminal_output() {
+        let theme = Theme::system();
+        let entry = Entry::CustomMessage {
+            custom_type: "fixture\x1b]bad".into(),
+            text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
+        };
+        for width in [12, 80] {
+            let lines = entry.render(
+                &theme,
+                width,
+                false,
+                true,
+                TranscriptOptions {
+                    padding: 1,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.background == Some(theme.color("customMessageBg")))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.bold
+                        && span.color == theme.color("customMessageLabel")
+                        && span.text.contains("fixture"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.bold && span.text == "bold")
+            );
+            let mut output = Vec::new();
+            for line in lines {
+                line.draw(&mut output, width).unwrap();
+            }
+            assert!(
+                !output
+                    .windows(b"\x1b]0;bad".len())
+                    .any(|part| part == b"\x1b]0;bad")
+            );
+            assert!(!output.contains(&7));
+        }
+    }
+
+    #[test]
+    fn custom_message_base_style_does_not_replace_colliding_markdown_roles() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
+        json["colors"]["mdCode"] = json["colors"]["text"].clone();
+        json["colors"]["customMessageText"] = serde_json::json!("#ff0000");
+        let theme = Theme::parse(&json.to_string(), None).unwrap();
+        let entry = Entry::CustomMessage {
+            custom_type: "x".into(),
+            text: "plain `code`".into(),
+        };
+        let lines = entry.render(&theme, 80, false, false, TranscriptOptions::default());
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans.iter().any(|span| span.text.contains("plain")
+                && span.color == theme.color("customMessageText"))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "code" && span.color == theme.color("mdCode"))
+        );
+        let mut dim = Line::themed("text", &theme, "text");
+        dim.spans[0].dim = true;
+        custom_message_base_style(std::slice::from_mut(&mut dim), &theme);
+        assert_eq!(dim.spans[0].color, theme.color("customMessageText"));
+        assert_eq!(dim.spans[0].dim, theme.is_dim("customMessageText"));
     }
 
     #[test]

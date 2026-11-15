@@ -40,10 +40,10 @@ struct ResourceOrigins {
 
 impl ResourceOrigin {
     fn source_info(path: &std::path::Path, origins: &[Self]) -> Option<serde_json::Value> {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
         let origin = origins
             .iter()
-            .find(|origin| path.starts_with(&origin.root))?;
+            .find(|origin| canonical.starts_with(&origin.root))?;
         let mut result =
             json!({"path":path,"source":origin.source,"scope":"temporary","origin":"top-level"});
         if let Some(base) = &origin.base_dir {
@@ -67,6 +67,21 @@ fn synthetic_command_source(command: &pi_rs::RegisteredCommand) -> serde_json::V
             "scope": "temporary",
             "origin": "top-level",
         }),
+    }
+}
+
+fn discovered_resource_source(item: &pi_rs::ExtensionResources, registry: &Registry) -> String {
+    if let Some(name) = item.source.as_ref().and_then(|path| path.file_name()) {
+        let name = name.to_string_lossy();
+        let name = name
+            .strip_suffix(".ts")
+            .or_else(|| name.strip_suffix(".js"))
+            .unwrap_or(&name);
+        format!("extension:{name}")
+    } else if registry.extension_source_is_builtin(&item.extension_id) {
+        format!("extension:builtin:{}", item.extension_id)
+    } else {
+        format!("extension:inline:{}", item.extension_id)
     }
 }
 
@@ -135,13 +150,7 @@ impl Runtime {
         let mut discovered = pi_rs::DiscoveredResources::default();
         let mut origins = ResourceOrigins::default();
         for item in results {
-            let source = item
-                .source
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| item.extension_id.clone());
-            let source = format!("extension:{source}");
+            let source = discovered_resource_source(&item, &self.registry);
             let base_dir = item
                 .source
                 .as_deref()
@@ -257,7 +266,11 @@ impl Runtime {
             }
             commands.push(entry);
         }
+        let mut prompt_surrogates = Vec::new();
         for (name, prompt) in &self.resources.prompts {
+            if let Some(unit) = prompt.fallback_surrogate {
+                prompt_surrogates.push(json!([commands.len(), unit]));
+            }
             commands.push(json!({
                 "name": name,
                 "description": prompt.description,
@@ -273,7 +286,11 @@ impl Runtime {
                 "sourceInfo": ResourceOrigin::source_info(&skill.path, &self.resource_origins.skills).unwrap_or_else(|| source_info(&skill.path, &self.resources.packages.skills)),
             }));
         }
-        json!({"commands":commands})
+        let mut catalog = json!({"commands":commands});
+        if !prompt_surrogates.is_empty() {
+            catalog["_pi_rs_prompt_surrogates"] = json!(prompt_surrogates);
+        }
+        catalog
     }
 
     pub fn agent<'a>(&'a self, args: &'a Cli, session: &Session) -> Agent<'a> {
@@ -282,13 +299,20 @@ impl Runtime {
         // Resolve every recorded identity through its own configured provider.
         // The journal id scopes the cache so credentials cannot cross sessions.
         for record in session.records() {
-            let pi_rs::Event::ModelSelected {
-                provider: Some(provider),
-                model,
-                ..
-            } = &record.event
-            else {
-                continue;
+            let (provider, model) = match &record.event {
+                pi_rs::Event::ModelSelected {
+                    provider: Some(provider),
+                    model,
+                    ..
+                }
+                | pi_rs::Event::BranchModelSelected {
+                    provider, model, ..
+                } => (provider, model),
+                pi_rs::Event::BranchSummary {
+                    fallback_model: Some(selection),
+                    ..
+                } => (&selection.provider, &selection.model),
+                _ => continue,
             };
             let Some(selected) = args.model_profiles.provider(provider) else {
                 continue;
@@ -318,14 +342,17 @@ impl Runtime {
                 );
             }
         }
-        self.shell.set_context(ShellContext {
-            id: session_id,
-            path: (!args.no_session && !args.ephemeral_worker_session)
-                .then(|| args.session.clone()),
-            provider: args.provider.id().into(),
-            model: args.model.clone(),
-            reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
-        });
+        self.shell.set_context_with_external_id(
+            ShellContext {
+                id: session_id,
+                path: (!args.no_session && !args.ephemeral_worker_session)
+                    .then(|| args.session.clone()),
+                provider: args.provider.id().into(),
+                model: args.model.clone(),
+                reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+            },
+            session.external_session_id(),
+        );
         self.auto_compaction.set_token_settings(
             args.settings
                 .compaction_tokens(args.provider.id(), &args.model),
@@ -1241,6 +1268,44 @@ mod resource_origin_tests {
     }
 
     #[test]
+    fn discovered_resource_sources_distinguish_inline_builtin_and_files() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(pi_rs_extensions::Notes))
+            .unwrap();
+        registry.register(Arc::new(InlineCommand)).unwrap();
+        let mut item = pi_rs::ExtensionResources {
+            extension_id: "custom".into(),
+            source: None,
+            resources: Default::default(),
+        };
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:inline:custom"
+        );
+        item.extension_id = "notes".into();
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:builtin:notes"
+        );
+        item.source = Some("/extensions/example.ts".into());
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:example"
+        );
+        item.source = Some("/extensions/example.js".into());
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:example"
+        );
+        item.source = Some("/extensions/native.exe".into());
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:native.exe"
+        );
+    }
+
+    #[test]
     fn extension_paths_resolve_against_workspace_with_home_and_file_urls() {
         let directory = tempfile::tempdir().unwrap();
         let cwd = directory.path();
@@ -1284,5 +1349,27 @@ mod resource_origin_tests {
         assert_eq!(source["origin"], "top-level");
         assert_eq!(source["baseDir"], json!(base));
         assert!(ResourceOrigin::source_info(&base.join("skills-other/file"), &origins).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_resource_origin_matches_target_but_reports_selected_path() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let target = base.join("target/SKILL.md");
+        let alias = base.join("alias/SKILL.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(&target, "content").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let origins = vec![ResourceOrigin {
+            root: target,
+            source: "extension:fixture".into(),
+            base_dir: None,
+        }];
+        assert_eq!(
+            ResourceOrigin::source_info(&alias, &origins).unwrap()["path"],
+            json!(alias)
+        );
     }
 }

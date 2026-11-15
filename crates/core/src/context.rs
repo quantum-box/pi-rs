@@ -5,17 +5,10 @@ use std::path::{Path, PathBuf};
 use cap_std::fs::Dir;
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Result};
+use crate::{Error, Resource, Result};
 
 const MAX_RESOURCE_BYTES: u64 = 64 * 1024;
 const MAX_CONTEXT_BYTES: usize = 256 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Resource {
-    pub id: String,
-    pub version: String,
-    pub text: String,
-}
 
 /// Local resource adapter bound to one project. A host that changes access must
 /// check its authorization before loading resources for each request.

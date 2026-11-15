@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bedrock", "crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/remote-find", "crates/remote-grep", "crates/remote-ls", "crates/extensions", "crates/workbench"]
+members = ["crates/bedrock", "crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/file-url", "crates/remote-find", "crates/remote-grep", "crates/remote-ls", "crates/extensions", "crates/tool-arguments", "crates/workbench"]
 resolver = "3"
 
 [package]
@@ -34,3 +34,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 uuid = "1"
 pi-rs-review = { path = "crates/review" }
+
+[patch.crates-io]
+reqwest-012 = { package = "reqwest", path = "vendor/reqwest-0.12.28" }
+reqwest-013 = { package = "reqwest", path = "vendor/reqwest-0.13.5" }

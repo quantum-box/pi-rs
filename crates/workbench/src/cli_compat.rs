@@ -11,9 +11,59 @@ pub(super) fn parse(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<(ArgMatches, ExtensionFlags), clap::Error> {
     let mut command = super::Cli::command();
+    // Pi assigns these options as it scans argv, so later values replace
+    // earlier ones. Keep repeatable resource arguments and native-only flags
+    // on their existing Clap actions.
+    for name in [
+        "provider",
+        "model",
+        "models",
+        "api-key",
+        "session-dir",
+        "name",
+        "use-theme",
+        "system-prompt",
+        "tools",
+        "exclude-tools",
+        "mode",
+        "tui-mode",
+        "session",
+        "session-id",
+        "fork",
+    ] {
+        let id = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(name))
+            .map(|arg| arg.get_id().clone());
+        if let Some(id) = id {
+            command = command.mut_arg(id.clone(), |arg| arg.overrides_with(id));
+        }
+    }
+    command = command.mut_arg("tools", |arg| arg.value_parser(validate_tool_list));
     command.build();
     let (args, flags) = normalize(&command, args);
     Ok((command.try_get_matches_from(args)?, flags))
+}
+
+fn validate_tool_list(value: &str) -> Result<String, String> {
+    let entries: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let modifiers: Vec<_> = entries
+        .iter()
+        .filter(|s| s.starts_with(['+', '-']))
+        .collect();
+    if !modifiers.is_empty() && modifiers.len() != entries.len() {
+        return Err("tool names cannot be mixed with +name or -name entries".into());
+    }
+    if let Some(pattern) = modifiers.iter().find(|s| s.contains('*')) {
+        return Err(format!(
+            "+name and -name entries take exact tool names, not patterns: {pattern}"
+        ));
+    }
+    Ok(value.into())
 }
 
 fn normalize(
@@ -314,6 +364,140 @@ mod tests {
         let args = cli(&["pi", "--approve", "--", "--no-approve"]);
         assert!(args.trust && !args.no_trust);
         assert_eq!(args.prompt, ["--no-approve"]);
+    }
+
+    #[test]
+    fn repeated_pi_scalar_options_keep_the_last_value() {
+        let args = cli(&[
+            "pi",
+            "--provider",
+            "first",
+            "--provider",
+            "last",
+            "--model",
+            "first-model",
+            "--model",
+            "last-model",
+            "--api-key",
+            "first-key",
+            "--api-key",
+            "last-key",
+            "--models",
+            "first",
+            "--models",
+            "second",
+            "--session-dir",
+            "first-dir",
+            "--session-dir",
+            "last-dir",
+            "--use-theme",
+            "first-theme",
+            "--use-theme",
+            "last-theme",
+            "--system-prompt",
+            "first-prompt",
+            "--system-prompt",
+            "last-prompt",
+            "-n",
+            "first",
+            "--name",
+            "last",
+            "-xt",
+            "read",
+            "--exclude-tools",
+            "bash",
+            "--skill",
+            "one",
+            "--skill",
+            "two",
+            "--",
+            "--model",
+            "literal",
+        ]);
+        assert_eq!(args.provider_argument.as_deref(), Some("last"));
+        assert_eq!(args.model, "last-model");
+        assert_eq!(args.api_key.as_deref(), Some("last-key"));
+        assert_eq!(args.models.as_deref(), Some("second"));
+        assert_eq!(
+            args.session_dir.as_deref(),
+            Some(std::path::Path::new("last-dir"))
+        );
+        assert_eq!(args.use_theme.as_deref(), Some("last-theme"));
+        assert_eq!(
+            args.system_prompt.as_deref(),
+            Some(std::path::Path::new("last-prompt"))
+        );
+        assert_eq!(args.name.as_deref(), Some("last"));
+        assert_eq!(args.exclude_tools.as_deref(), Some("bash"));
+        assert_eq!(args.skill, ["one", "two"]);
+        assert_eq!(args.prompt, ["--model", "literal"]);
+    }
+
+    #[test]
+    fn repeated_modes_and_session_references_keep_the_last_value() {
+        let args = cli(&[
+            "pi",
+            "--mode",
+            "text",
+            "--mode",
+            "json",
+            "--tui-mode",
+            "regular",
+            "--tui-mode",
+            "fullscreen",
+            "--session",
+            "first",
+            "--session",
+            "last",
+            "--",
+            "--mode",
+            "rpc",
+        ]);
+        assert!(matches!(args.mode, Some(super::super::OutputMode::Json)));
+        assert!(matches!(
+            args.tui_mode,
+            Some(super::super::TuiMode::Fullscreen)
+        ));
+        assert_eq!(args.session, std::path::Path::new("last"));
+        assert_eq!(args.prompt, ["--mode", "rpc"]);
+        let args = cli(&["pi", "--session-id", "first", "--session-id", "last"]);
+        assert_eq!(args.session_id.as_deref(), Some("last"));
+        let args = cli(&["pi", "--fork", "first", "--fork", "last"]);
+        assert_eq!(
+            args.fork_session.as_deref(),
+            Some(std::path::Path::new("last"))
+        );
+        for args in [
+            &["pi", "--mode", "bogus", "--mode", "json"][..],
+            &["pi", "--tui-mode", "bogus", "--tui-mode", "regular"][..],
+            &["pi", "--session-id", "invalid/id", "--session-id", "valid"][..],
+            &[
+                "pi",
+                "--session",
+                "one",
+                "--session",
+                "two",
+                "--session-id",
+                "id",
+            ][..],
+        ] {
+            assert!(parse(args.iter().map(OsString::from)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_tool_selections_keep_the_last_value() {
+        for arguments in [
+            &["pi", "--tools", "read", "--tools", "bash"][..],
+            &["pi", "-t", "read", "--tools", "bash"][..],
+            &["pi", "--tools=read", "-t", "bash"][..],
+        ] {
+            let args = cli(arguments);
+            assert_eq!(args.tools.as_deref(), Some("bash"));
+        }
+        for invalid in ["read,+bash", "+b*"] {
+            assert!(parse(["pi", "--tools", invalid, "-t", "bash"].map(OsString::from)).is_err());
+        }
     }
 
     #[test]

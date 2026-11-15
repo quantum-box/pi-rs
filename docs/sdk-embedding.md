@@ -6,6 +6,38 @@ the webview does not need to compile pi-rs to WebAssembly. The SDK does not
 automatically install the workbench's tools, load its configuration, or manage
 credentials for an embedding host.
 
+## Host-owned model catalog
+
+`ModelCatalogBuilder` collects already constructed clients by exact provider
+and model name. Its immutable `ModelCatalog` creates a `SessionBuilder` and
+resolves provider-qualified historical selections when sessions reopen or
+navigate branches. This is useful when two providers use the same model name:
+the SDK never guesses a provider or silently replaces an existing binding.
+
+For older journals that recorded a model name without its provider, the host
+may explicitly authorize that name with `session_builder_with_legacy_model`.
+Use this only when the host knows which provider the old name represents; the
+ordinary `session_builder` deliberately leaves such histories unbound.
+
+```rust,no_run
+use std::sync::Arc;
+use pi_rs::{Model, ModelCatalogBuilder};
+
+fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilder> {
+    let mut models = ModelCatalogBuilder::new();
+    models.register("my-provider", "my-model", client)?;
+    models.build().session_builder("my-provider", "my-model")
+}
+```
+
+Clients, endpoints and credentials remain the host's responsibility. Journal
+identities are used only for exact lookups in this trusted snapshot; unknown
+identities do not cause a network request or automatic fallback. Build a new
+catalog and new sessions after changing credentials or endpoint policy. Existing
+sessions retain their original clients. Hosts needing automatic fallback can
+provide their own `HistoricalModelResolver` instead. This provider-neutral API
+does not depend on Tauri or a desktop runtime.
+
 ## Native quickstart
 
 The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
@@ -23,11 +55,40 @@ app, a native server can own the session and expose an application-specific API.
 
 The [native host example](../examples/native_sdk_host.rs) demonstrates shared
 session state using an offline fixture; its tests check session reuse and that
-the state is `Send + Sync`. The following is a Tauri 2 integration sketch using the same
-pattern. It needs a Tauri project and its normal generated configuration; the
-Tauri glue itself is not built by this repository's CI. Add `pi-rs` (with the
+the state is `Send + Sync`. The standalone [Tauri SDK fixture](../fixtures/tauri-sdk/)
+compiles real Tauri 2 command macros and managed state against `pi-rs-core`.
+Its mock-runtime IPC tests invoke two prompts, an idle abort, and close, check
+session reuse, and verify that close cancels active and queued prompts, including
+one still starting before run registration. A separate integration test composes
+the public fixture commands with an application command. Run
+it on a native host with Tauri's platform
+prerequisites installed:
+
+```sh
+cargo test --locked --manifest-path fixtures/tauri-sdk/Cargo.toml
+```
+
+The fixture disables Tauri's default features and does not build the Wry
+webview runtime. It uses a fake model and Tauri's mock runtime: it does not test
+a real webview, frontend, application lifecycle, network provider, or package.
+The repository workflow runs the fixture on macOS. Linux builds may require
+GTK development libraries even without Wry. The [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
+describe the platform dependencies.
+
+The following is a Tauri 2 integration sketch using the same pattern. It
+needs a Tauri project and its normal generated configuration. Add `pi-rs` (with the
 default `ollama` feature) and `tokio` with the `sync` feature to `src-tauri`.
 Use a local path to your checkout or a pinned Git revision of this repository.
+The fixture's `configure` installs one invoke handler and replaces any handler
+already set on the builder. To integrate with other application commands, use
+the fixture's public `session_state` and `commands` in one handler, as exercised
+by [the composition test](../fixtures/tauri-sdk/tests/composition.rs).
+Closing requests SDK shutdown before waiting for the session lock. The SDK
+cancels the active run and makes later run tokens inherit cancellation; ordinary
+`abort` still affects only the current run. The fixture rejects queued prompts
+and waits for an admitted prompt to settle so SDK cleanup can finish. Close can
+wait if startup itself never settles. This example uses an in-memory session
+without extension hooks or tools; cancellation cannot undo work already begun.
 
 ```rust
 use std::sync::Arc;
@@ -80,34 +141,24 @@ See [Tauri's state guide](https://v2.tauri.app/develop/state-management/) and
 
 ## Browser WASM status
 
-**Browser WASM is not currently supported or tested.** The target name
-`wasm32-unknown-unknown` alone does not imply a browser host. The native core
-has unconditional dependencies on `cap-std` and `tempfile`, uses filesystem
-journals and workspace access, and uses OS-backed context fingerprinting.
-`SessionBuilder::in_memory()` changes journal storage but does not remove these
-dependencies from the crate. The default root feature also includes the Ollama
-HTTP adapter, whose native HTTP configuration needs separate browser review.
-The [initial public CI diagnostic](https://github.com/quantum-box/pi-rs/actions/runs/43569708117/job/132371210751)
-failed with exit code 101: `errno` 0.3.14 rejects the unknown target OS. The
-locked target tree reaches it through `cap-std` / `cap-primitives` → `rustix`
-→ `errno`. This is the first reported failure, not an exhaustive blocker list.
+The standalone `pi-rs-tool-arguments` crate isolates complete tool-argument
+parsing and incremental JSON previews from the native agent and its filesystem,
+process, network, and randomness dependencies. Rust embeddings can depend on
+this crate directly to build those values without depending on `pi-rs-core`.
+The existing `pi_rs::parse_tool_arguments` export remains available, and
+`pi_rs::StreamingJson` exposes the same preview parser used by the terminal
+and RPC frontends. Preview values are not final tool validation: call
+`parse_tool_arguments` on the complete input before executing a tool.
 
-For the locked dependency graph, `cargo tree -p pi-rs-core --target
-wasm32-unknown-unknown -i getrandom@0.3.4` shows the `jsonschema`/`ahash`
-path to `getrandom`. Its browser backend requires explicit feature and target
-configuration; see [getrandom 0.3's WebAssembly documentation](https://docs.rs/crate/getrandom/0.3.4/source/README.md).
-The locked `uuid` 1.29.2 enables `v4` but none of its browser randomness
-backends; its [target-specific implementation](https://docs.rs/crate/uuid/1.29.2/source/src/rng.rs)
-requires an explicit `js`, `rng-getrandom`, or `rng-rand` feature on this
-target. These are separate dependency paths. Other resolved randomness
-dependencies need their own target-specific audit. Enabling randomness alone
-does not provide browser implementations of the filesystem, process,
-networking, or storage contracts.
+CI checks this isolated crate with `cargo check --locked -p
+pi-rs-tool-arguments --target wasm32-unknown-unknown`, and its parser tests run
+on native targets. This is a compile check for a library component; it does not
+run the component in a browser or establish browser support for the SDK.
 
-The public CI workflow includes a **non-gating diagnostic** running
-`cargo check --locked -p pi-rs-core --target wasm32-unknown-unknown`. Its log
-and job summary report the result; a successful compile would still not prove
-that a browser can run an agent, persist a session, or call a provider. The
-native example does not test WASM, Tauri, or a browser. Browser support needs
-an explicit platform boundary, browser-safe randomness and transport, suitable
-storage, and browser execution tests before it can be claimed.
+An experimental text-only browser host uses the same Rust `AgentSession`, a
+Fetch gateway, and localStorage guarded by Web Locks. Its Chrome integration
+checks execution, communication, cancellation, timeout, lock exclusion and
+journal restoration and resumption of an interrupted run after page reload.
+See [Browser SDK](browser-sdk.md) for build instructions, the gateway contract, storage semantics and limitations.
+It does not yet provide native tools, extensions, provider adapters or the
+complete SDK surface. The native Tauri fixture does not test this browser host.

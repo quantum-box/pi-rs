@@ -31,6 +31,8 @@ pub enum McpCommand {
     },
     Logout {
         name: String,
+        #[arg(short = 'l', long)]
+        local: bool,
     },
     Add {
         name: String,
@@ -38,6 +40,12 @@ pub enum McpCommand {
         local: bool,
         #[arg(long)]
         url: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
         #[arg(long)]
         bearer_token_env_var: Option<String>,
         /// Authenticate with credentials saved by mcp login.
@@ -58,8 +66,14 @@ pub enum McpCommand {
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    Ok(configurations_with_project_scope(args)?.0)
+}
+
+fn configurations_with_project_scope(
+    args: &Cli,
+) -> Result<(BTreeMap<String, Value>, BTreeSet<String>)> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeSet::new()));
     }
     let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
     let mut servers = user
@@ -67,35 +81,155 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let mut project_definitions = BTreeSet::new();
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
-            for (name, entry) in entries {
-                if entry.get("auth").is_some() {
-                    return Err(Error::Config(format!(
-                        "project MCP server {name} cannot use auth.provider"
-                    )));
-                }
-                if !["command", "url", "type"]
-                    .iter()
-                    .any(|key| entry.get(*key).is_some())
-                    && let (Some(base), Some(overlay)) = (
-                        servers.get_mut(name).and_then(Value::as_object_mut),
-                        entry.as_object(),
-                    )
-                {
-                    for key in ["enabled", "exposure", "toolExposure", "oauth"] {
-                        if let Some(value) = overlay.get(key) {
-                            base.insert(key.into(), value.clone());
-                        }
-                    }
-                    continue;
-                }
-                servers.insert(name.clone(), entry.clone());
-            }
+            project_definitions.extend(entries.iter().filter_map(|(name, entry)| {
+                entry
+                    .as_object()
+                    .filter(|entry| {
+                        ["command", "url", "type"]
+                            .iter()
+                            .any(|key| entry.contains_key(*key))
+                    })
+                    .map(|_| name.clone())
+            }));
+            merge_project_servers(&mut servers, entries)?;
         }
     }
-    Ok(servers.into_iter().collect())
+    Ok((servers.into_iter().collect(), project_definitions))
+}
+
+fn merge_project_servers(
+    servers: &mut serde_json::Map<String, Value>,
+    entries: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    const OVERRIDE_KEYS: &[&str] = &["enabled", "exposure", "toolExposure", "oauth"];
+    for (name, entry) in entries {
+        if entry.get("auth").is_some() {
+            return Err(Error::Config(format!(
+                "project MCP server {name} cannot use auth.provider"
+            )));
+        }
+        if !["command", "url", "type"]
+            .iter()
+            .any(|key| entry.get(*key).is_some())
+            && let (Some(base), Some(overlay)) = (
+                servers.get_mut(name).and_then(Value::as_object_mut),
+                entry.as_object(),
+            )
+        {
+            if let Some(key) = overlay
+                .keys()
+                .find(|key| !OVERRIDE_KEYS.contains(&key.as_str()))
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} override has unsupported field {key}"
+                )));
+            }
+            for (key, value) in overlay {
+                if !valid_override_value(key, value) {
+                    return Err(Error::Config(format!(
+                        "project MCP server {name} override has invalid field {key}"
+                    )));
+                }
+            }
+            let mut candidate = base.clone();
+            candidate.extend(overlay.clone());
+            for key in OVERRIDE_KEYS {
+                if !overlay.contains_key(*key) {
+                    // Preserve serde's existing global Option semantics while
+                    // validating non-null inherited values before enabling.
+                    if *key == "oauth"
+                        || (matches!(*key, "enabled" | "exposure")
+                            && candidate.get(*key).is_some_and(Value::is_null))
+                    {
+                        continue;
+                    }
+                }
+                if candidate
+                    .get(*key)
+                    .is_some_and(|value| !valid_override_value(key, value))
+                {
+                    return Err(Error::Config(format!(
+                        "project MCP server {name} merged configuration has invalid field {key}"
+                    )));
+                }
+            }
+            let config: ServerConfig =
+                serde_json::from_value(Value::Object(candidate)).map_err(|_| {
+                    Error::Config(format!("project MCP server {name} override is invalid"))
+                })?;
+            if let Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(client)) = &config.oauth {
+                pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).map_err(
+                    |_| {
+                        Error::Config(format!(
+                            "project MCP server {name} override has invalid OAuth settings"
+                        ))
+                    },
+                )?;
+            }
+            if matches!(
+                config.oauth,
+                Some(pi_rs_workbench::mcp_auth::OAuthSetting::Client(_))
+                    | Some(pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(true))
+            ) && config.command.is_some()
+            {
+                return Err(Error::Config(format!(
+                    "project MCP server {name} OAuth requires an HTTP server"
+                )));
+            }
+            for (key, value) in overlay {
+                base.insert(key.clone(), value.clone());
+            }
+            continue;
+        }
+        servers.insert(name.clone(), entry.clone());
+    }
+    Ok(())
+}
+
+fn valid_override_value(key: &str, value: &Value) -> bool {
+    match key {
+        "enabled" => value.is_boolean(),
+        "exposure" => valid_exposure(value),
+        "toolExposure" => value
+            .as_object()
+            .is_some_and(|tools| tools.values().all(valid_exposure)),
+        "oauth" => valid_oauth(value),
+        _ => false,
+    }
+}
+
+fn valid_exposure(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| {
+        matches!(
+            value,
+            "direct" | "deferred" | "codemode" | "codemode-deferred" | "hidden" | "off"
+        )
+    })
+}
+
+fn valid_oauth(value: &Value) -> bool {
+    // Serde treats null in an optional member as absent, but Pi validates
+    // explicitly supplied OAuth fields and rejects null values.
+    if value
+        .as_object()
+        .is_some_and(|fields| fields.values().any(Value::is_null))
+    {
+        return false;
+    }
+    valid_inherited_oauth(value)
+}
+
+fn valid_inherited_oauth(value: &Value) -> bool {
+    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
+    match serde_json::from_value::<OAuthSetting>(value.clone()) {
+        Ok(OAuthSetting::Enabled(_)) => true,
+        Ok(OAuthSetting::Client(client)) => validate_oauth_client_settings(&client).is_ok(),
+        Err(_) => false,
+    }
 }
 
 pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
@@ -269,6 +403,9 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             name,
             local,
             url,
+            cwd,
+            headers,
+            description,
             bearer_token_env_var,
             oauth,
             exposure,
@@ -292,8 +429,42 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             } else {
                 json!({"command":command[0],"args":command[1..]})
             };
+            if let Some(cwd) = cwd {
+                if value.get("command").is_none() {
+                    return Err(Error::Config("--cwd requires a stdio server".into()));
+                }
+                value["cwd"] = json!(cwd);
+            }
+            if let Some(description) = description {
+                value["description"] = json!(description);
+            }
+            if !headers.is_empty() {
+                if value.get("url").is_none() {
+                    return Err(Error::Config("--header requires an HTTP server".into()));
+                }
+                let mut map = serde_json::Map::new();
+                for item in headers {
+                    let (name, header_value) = item
+                        .split_once('=')
+                        .filter(|(name, _)| !name.is_empty())
+                        .ok_or_else(|| Error::Config("--header expects NAME=VALUE".into()))?;
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| Error::Config("invalid MCP header name".into()))?;
+                    http::header::HeaderValue::from_str(header_value)
+                        .map_err(|_| Error::Config("invalid MCP header value".into()))?;
+                    map.insert(name.as_str().into(), json!(header_value));
+                }
+                value["headers"] = Value::Object(map);
+            }
             if oauth {
-                if value.get("url").is_none() || bearer_token_env_var.is_some() {
+                if value.get("url").is_none()
+                    || bearer_token_env_var.is_some()
+                    || value["headers"].as_object().is_some_and(|headers| {
+                        headers
+                            .keys()
+                            .any(|name| name.eq_ignore_ascii_case("authorization"))
+                    })
+                {
                     return Err(Error::Config(
                         "--oauth requires --url and cannot use --bearer-token-env-var".into(),
                     ));
@@ -304,6 +475,11 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 value["exposure"] = json!(exposure);
             }
             if let Some(variable) = bearer_token_env_var {
+                if value.get("url").is_none() {
+                    return Err(Error::Config(
+                        "--bearer-token-env-var requires an HTTP server".into(),
+                    ));
+                }
                 if !variable
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -311,14 +487,36 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 {
                     return Err(Error::Config("invalid token environment variable".into()));
                 }
-                value["headers"] = json!({"Authorization":format!("Bearer ${{{variable}}}")});
+                let headers = value
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("headers")
+                    .or_insert_with(|| json!({}));
+                let headers = headers.as_object_mut().unwrap();
+                if headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(Error::Config(
+                        "--bearer-token-env-var cannot be combined with an Authorization header"
+                            .into(),
+                    ));
+                }
+                headers.insert(
+                    "Authorization".into(),
+                    json!(format!("Bearer ${{{variable}}}")),
+                );
             }
             if !environment.is_empty() {
+                if value.get("command").is_none() {
+                    return Err(Error::Config("--env requires a stdio server".into()));
+                }
                 let mut env = serde_json::Map::new();
                 for item in environment {
-                    let (name, value) = item
-                        .split_once('=')
-                        .ok_or_else(|| Error::Config("--env expects NAME=VALUE".into()))?;
+                    let (name, value) =
+                        item.split_once('=')
+                            .filter(|(name, _)| !name.is_empty())
+                            .ok_or_else(|| Error::Config("--env expects NAME=VALUE".into()))?;
                     env.insert(name.into(), json!(value));
                 }
                 value["env"] = Value::Object(env);
@@ -440,24 +638,79 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             })?;
             output(json!({"type":"mcp_logged_in","name":name}));
         }
-        McpCommand::Logout { name } => {
-            let servers = configurations(args)?;
-            let server: ServerConfig = serde_json::from_value(
-                servers
-                    .get(&name)
-                    .ok_or_else(|| Error::Config("MCP server is not configured".into()))?
-                    .clone(),
-            )?;
+        McpCommand::Logout { name, local } => {
+            let (servers, project_definitions) = configurations_with_project_scope(args)?;
+            if local && !project_definitions.contains(&name) {
+                return Err(Error::Config(format!(
+                    "MCP server {name} is not configured in the trusted project"
+                )));
+            }
+            let value = servers
+                .get(&name)
+                .ok_or_else(|| Error::Config("MCP server is not configured".into()))?;
+            for key in ["enabled", "exposure", "toolExposure", "oauth"] {
+                if !project_definitions.contains(&name)
+                    && matches!(key, "enabled" | "exposure" | "oauth")
+                    && value.get(key).is_some_and(Value::is_null)
+                {
+                    continue;
+                }
+                if key == "oauth"
+                    && !project_definitions.contains(&name)
+                    && value.get(key).is_some_and(valid_inherited_oauth)
+                {
+                    continue;
+                }
+                if value
+                    .get(key)
+                    .is_some_and(|field| !valid_override_value(key, field))
+                {
+                    return Err(Error::Config(format!("invalid MCP server field {key}")));
+                }
+            }
+            let inherited_global = !project_definitions.contains(&name);
+            if value
+                .get("description")
+                .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
+                || value.get("timeout").is_some_and(|field| {
+                    !(inherited_global && field.is_null()) && field.as_u64().is_none()
+                })
+            {
+                return Err(Error::Config("invalid MCP server configuration".into()));
+            }
+            let server: ServerConfig = serde_json::from_value(value.clone())?;
             if let Some(auth) = &server.auth {
                 return Err(Error::Config(format!(
                     "MCP {name} uses credentials from provider {}; sign out of that provider",
                     auth.provider
                 )));
             }
+            if server
+                .headers
+                .keys()
+                .any(|header| header.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(Error::Config(
+                    "MCP OAuth cannot be combined with an Authorization header".into(),
+                ));
+            }
+            if server.command.is_some()
+                || server
+                    .transport
+                    .as_deref()
+                    .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
+            {
+                return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
+            }
             let url = server
                 .url
                 .as_deref()
                 .ok_or_else(|| Error::Config("MCP OAuth requires an HTTP server".into()))?;
+            let parsed = reqwest_mcp::Url::parse(url)
+                .map_err(|_| Error::Config("invalid MCP URL".into()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
+            }
             pi_rs_workbench::mcp_auth::logout(&name, url).await?;
             output(json!({"type":"mcp_logged_out","name":name}));
         }
@@ -483,5 +736,149 @@ fn path(args: &Cli, local: bool) -> PathBuf {
         args.workspace.join(".pi/mcp.json")
     } else {
         config::agent_dir().join("mcp.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_override_rejects_unknown_fields_before_changing_global_server() {
+        for extra in ["headers", "args", "url_typo", "description"] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"headers":{"Authorization":"Bearer ${TOKEN}"}}});
+            let mut servers = original.as_object().unwrap().clone();
+            let mut overlay = json!({"service":{"enabled":true}});
+            overlay["service"][extra] = json!("unexpected");
+            let error =
+                merge_project_servers(&mut servers, overlay.as_object().unwrap()).unwrap_err();
+            assert!(error.to_string().contains(extra));
+            assert_eq!(Value::Object(servers), original);
+        }
+    }
+
+    #[test]
+    fn project_override_retains_native_oauth_and_global_credentials() {
+        let mut servers = json!({"service":{"url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer ${TOKEN}"},"enabled":false}}).as_object().unwrap().clone();
+        let project = json!({"service":{"enabled":true,"exposure":"deferred","toolExposure":{"read":"hidden"},"oauth":false}});
+        merge_project_servers(&mut servers, project.as_object().unwrap()).unwrap();
+        assert_eq!(servers["service"]["enabled"], true);
+        assert_eq!(servers["service"]["oauth"], false);
+        assert_eq!(
+            servers["service"]["headers"]["Authorization"],
+            "Bearer ${TOKEN}"
+        );
+        let before = servers.clone();
+        let forbidden = json!({"service":{"enabled":true,"auth":{"provider":"openai"}}});
+        assert!(merge_project_servers(&mut servers, forbidden.as_object().unwrap()).is_err());
+        assert_eq!(servers, before);
+    }
+
+    #[test]
+    fn project_override_rejects_invalid_values_before_enabling_server() {
+        for invalid in [
+            json!({"enabled": null}),
+            json!({"enabled": "true"}),
+            json!({"enabled": true, "exposure": null}),
+            json!({"enabled": true, "exposure": "unknown"}),
+            json!({"enabled": true, "toolExposure": {"read": "unknown"}}),
+            json!({"enabled": true, "oauth": null}),
+            json!({"enabled": true, "oauth": {"callbackPort": null}}),
+            json!({"enabled": true, "oauth": {"clientId": null}}),
+            json!({"enabled": true, "oauth": {"clientRegistration": "unknown"}}),
+            json!({"enabled": true, "oauth": {"clientSecret": "secret"}}),
+            json!({"enabled": true, "oauth": {"clientId": " "}}),
+            json!({"enabled": true, "oauth": {"clientName": ""}}),
+            json!({"enabled": true, "oauth": {"clientRegistration": "cimd", "clientId": "id"}}),
+            json!({"enabled": true, "oauth": {"callbackPort": 0}}),
+            json!({"enabled": true, "oauth": {"callbackUrl": "http://example.com/callback"}}),
+            json!({"enabled": true, "oauth": {"callbackUrl": "http://127.0.0.1:9000/callback", "callbackPort": 9001}}),
+            json!({"enabled": true, "oauth": {"clientMetadataUrl": "http://example.com/client.json"}}),
+        ] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
+            let mut servers = original.as_object().unwrap().clone();
+            let overlay = json!({"service": invalid});
+            assert!(merge_project_servers(&mut servers, overlay.as_object().unwrap()).is_err());
+            assert_eq!(Value::Object(servers), original);
+        }
+        let mut servers = json!({"service":{"url":"https://example.invalid/mcp","enabled":false}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let valid = json!({"service":{"enabled":true,"oauth":{"callbackUrl":"http://127.0.0.1:9000/callback","callbackPort":9000,"clientMetadataUrl":"https://example.com/client.json"}}});
+        merge_project_servers(&mut servers, valid.as_object().unwrap()).unwrap();
+        assert_eq!(servers["service"]["enabled"], true);
+        let original = json!({"service":{"command":"fixture","enabled":false}});
+        let mut servers = original.as_object().unwrap().clone();
+        let invalid = json!({"service":{"enabled":true,"oauth":true}});
+        assert!(merge_project_servers(&mut servers, invalid.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
+        let enabled = json!({"service":{"enabled":true}});
+        for inherited in [
+            json!(null),
+            json!({"callbackUrl": null, "callbackPort": null}),
+        ] {
+            let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":inherited}});
+            let mut servers = original.as_object().unwrap().clone();
+            merge_project_servers(&mut servers, enabled.as_object().unwrap()).unwrap();
+            assert_eq!(servers["service"]["enabled"], true);
+            assert_eq!(servers["service"]["oauth"], original["service"]["oauth"]);
+        }
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackPort":0}}});
+        let mut servers = original.as_object().unwrap().clone();
+        assert!(merge_project_servers(&mut servers, enabled.as_object().unwrap()).is_err());
+        assert_eq!(Value::Object(servers), original);
+        for (key, value) in [
+            ("exposure", json!("bad")),
+            ("toolExposure", json!(null)),
+            ("toolExposure", json!({"read": null})),
+        ] {
+            let mut original =
+                json!({"service":{"url":"https://example.invalid/mcp","enabled":false}});
+            original["service"][key] = value;
+            let mut servers = original.as_object().unwrap().clone();
+            let error =
+                merge_project_servers(&mut servers, enabled.as_object().unwrap()).unwrap_err();
+            assert!(error.to_string().contains(key));
+            assert_eq!(Value::Object(servers), original);
+        }
+        let original = json!({"service":{"url":"https://example.invalid/mcp","enabled":false,"oauth":{"callbackUrl":"http://127.0.0.1:80/callback","callbackPort":9001,"clientId":"sensitive-id"}}});
+        let mut servers = original.as_object().unwrap().clone();
+        let error = merge_project_servers(&mut servers, enabled.as_object().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("sensitive-id"));
+        assert_eq!(Value::Object(servers), original);
+    }
+
+    #[test]
+    fn inherited_optional_nulls_preserve_native_defaults() {
+        for (global, project) in [
+            (json!({"enabled":null}), json!({"exposure":"hidden"})),
+            (
+                json!({"enabled":false,"exposure":null}),
+                json!({"enabled":true}),
+            ),
+            (
+                json!({"enabled":false,"exposure":null,"oauth":null}),
+                json!({"enabled":true}),
+            ),
+        ] {
+            let mut base = json!({"url":"https://example.invalid/mcp"});
+            base.as_object_mut()
+                .unwrap()
+                .extend(global.as_object().unwrap().clone());
+            let mut servers = json!({"service":base}).as_object().unwrap().clone();
+            let overlay = json!({"service":project});
+            merge_project_servers(&mut servers, overlay.as_object().unwrap()).unwrap();
+            let config: ServerConfig = serde_json::from_value(servers["service"].clone()).unwrap();
+            if global["enabled"].is_null() {
+                assert_eq!(config.enabled, None);
+            }
+            if global.get("exposure").is_some_and(Value::is_null) {
+                assert_eq!(config.exposure, None);
+                assert_eq!(config.exposure.as_deref().unwrap_or("codemode"), "codemode");
+            }
+        }
     }
 }

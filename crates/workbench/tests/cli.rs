@@ -10,6 +10,344 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn mcp_logout_local_targets_trusted_project_credentials() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    let auth = home.join("mcp-auth");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&auth).unwrap();
+    let global_url = "https://global.example/mcp";
+    let local_url = "https://local.example/mcp";
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url},"global-only":{"url":global_url}}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":local_url}}}).to_string(),
+    )
+    .unwrap();
+    let credential = |url| {
+        let digest = Sha256::digest(serde_json::to_vec(&("service", url)).unwrap());
+        auth.join(format!("{digest:x}.json"))
+    };
+    let global = credential(global_url);
+    let local = credential(local_url);
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(&local, "local").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        !run(&["--trust", "mcp", "logout", "global-only", "--local"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists() && local.exists());
+    let output = run(&["--trust", "mcp", "logout", "service", "-l"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(&local, "local").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(!output.status.success());
+    assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"type":"sse","url":global_url}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"exposure":"typo"}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"enabled":null,"exposure":null,"oauth":null,"description":null,"timeout":null}}}).to_string()).unwrap();
+    for project_config in [
+        json!({"mcpServers":{}}),
+        json!({"mcpServers":{"service":{"enabled":true}}}),
+    ] {
+        std::fs::write(project.join("mcp.json"), project_config.to_string()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        let output = run(&["--trust", "mcp", "logout", "service"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!global.exists());
+    }
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"oauth":{"callbackUrl":null,"callbackPort":null}}}}).to_string()).unwrap();
+    for project_config in [
+        json!({"mcpServers":{}}),
+        json!({"mcpServers":{"service":{"enabled":true}}}),
+    ] {
+        std::fs::write(project.join("mcp.json"), project_config.to_string()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        let output = run(&["--trust", "mcp", "logout", "service"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!global.exists());
+    }
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":true}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&global, "global").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&global, "global").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"headers":{"authorization":"Bearer static"}}}}).to_string()).unwrap();
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+}
+
+#[test]
+fn mcp_add_saves_stdio_and_http_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--cwd",
+            "subdir",
+            "--description",
+            "Local tools",
+            "--env",
+            "FIRST=one=two",
+            "--env",
+            "EMPTY=",
+            "--",
+            "server",
+            "--flag",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-First=one",
+            "--header",
+            "X-Second=two=three",
+            "--header",
+            "x-first=latest",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--description",
+            "Remote tools",
+        ],
+    ] {
+        let output = run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["local"],
+        json!({"command":"server", "args":["--flag"], "cwd":"subdir", "description":"Local tools", "env":{"FIRST":"one=two", "EMPTY":""}})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["headers"],
+        json!({"x-first":"latest", "x-second":"two=three", "Authorization":"Bearer ${TOKEN}"})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["description"],
+        "Remote tools"
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--cwd",
+            "dir",
+        ],
+        vec!["mcp", "add", "bad", "--header", "X=1", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--env",
+            "VAR=value",
+        ],
+        vec!["mcp", "add", "local", "--env", "=value", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "bad",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "Bad Name=value",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-Test=bad\nvalue",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "authorization=secret",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
+fn repeated_session_id_selects_the_last_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .args([
+            "--session-id",
+            "first",
+            "--session-id",
+            "last",
+            "name",
+            "selected",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sessions.join("first.jsonl").exists());
+    assert!(sessions.join("last.jsonl").is_file());
+}
+
+#[test]
 fn jsonl_session_id_can_be_opened_by_session_and_resume() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -156,6 +494,36 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     std::fs::create_dir_all(prompts.join("nested")).unwrap();
     std::fs::write(prompts.join("nested/deep.md"), "Nested").unwrap();
     std::fs::write(prompts.join("top.md"), "Top level").unwrap();
+    std::fs::write(
+        prompts.join("unicode-space.md"),
+        "---\nother: value\n---\n\u{0085}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-bom.md"),
+        "---\nother: value\n---\n\u{feff}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-cut.md"),
+        format!("{}😀tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-cut.md"),
+        format!("{}�tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-before-cut.md"),
+        format!("{}�😀tail", "x".repeat(58)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("two-boms.md"),
+        "\u{feff}\u{feff}---\ndescription: not frontmatter\n---\nbody",
+    )
+    .unwrap();
     std::fs::write(prompts.join(".hidden.md"), "Hidden").unwrap();
     std::fs::write(prompts.join("ignored.md"), "Ignored").unwrap();
     std::fs::write(prompts.join(".gitignore"), "ignored.md\n").unwrap();
@@ -183,8 +551,11 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
+            // serde_json rejects unpaired surrogate escapes; preserve the raw
+            // wire line for exact assertions and normalize only for inspection.
+            let normalized = line.replace("\\ud83d", "\\ufffd");
             if sender
-                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .send((line, serde_json::from_str::<Value>(&normalized).unwrap()))
                 .is_err()
             {
                 break;
@@ -193,15 +564,31 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     });
     writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
     input.flush().unwrap();
-    let response = loop {
-        let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    let (wire, response) = loop {
+        let (wire, event) = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
         if event["id"] == "commands" {
-            break event;
+            break (wire, event);
         }
     };
+    assert!(wire.contains(&format!("{}\\ud83d...", "x".repeat(59))));
+    assert!(wire.contains(&format!("{}�\\ud83d...", "x".repeat(58))));
+    assert!(wire.contains(&format!("{}�...", "x".repeat(59))));
+    assert!(!wire.contains("_pi_rs_prompt_surrogates"));
     let commands = response["data"]["commands"]
         .as_array()
         .expect("command list");
+    for (name, expected) in [
+        ("unicode-space", "\u{0085}".to_owned()),
+        ("unicode-bom", "visible".to_owned()),
+        ("unicode-cut", format!("{}�...", "x".repeat(59))),
+        ("two-boms", "\u{feff}---".to_owned()),
+    ] {
+        let command = commands
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap();
+        assert_eq!(command["description"], expected, "{name}");
+    }
     let builtin = commands
         .iter()
         .find(|command| command["sourceInfo"]["path"] == "builtin:plan-mode")
@@ -301,6 +688,101 @@ fn xai_provider_streams_through_the_cli() {
 }
 
 #[test]
+fn chat_completion_vllm_priority_respects_config_and_sampling_precedence() {
+    for (provider_compat, model_compat, override_compat, sampling, expected) in [
+        (
+            json!({"vllmPriority":7}),
+            json!({}),
+            json!({}),
+            json!({}),
+            json!(7),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({"vllmPriority":0}),
+            json!({}),
+            json!({}),
+            json!(0),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({"vllmPriority":2}),
+            json!({"vllmPriority":-3}),
+            json!({}),
+            json!(-3),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({}),
+            json!({}),
+            json!({"priority":4}),
+            json!(4),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"relay":{
+                "baseUrl":base, "api":"openai-completions", "apiKey":"fixture",
+                "compat":provider_compat,
+                "models":[{"id":"fixture-model", "compat":model_compat, "samplingParams":sampling}],
+                "modelOverrides":{"fixture-model":{"compat":override_compat}}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["priority"], expected);
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "relay",
+                "--model",
+                "fixture-model",
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
     for (level, temperature, top_k) in [("high", 0.2, 40), ("off", 0.7, 10)] {
         let root = tempfile::tempdir().unwrap();
@@ -371,6 +853,48 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
             String::from_utf8_lossy(&output.stderr)
         );
         server.join().unwrap();
+    }
+}
+
+#[test]
+fn model_listing_searches_ids_with_pi_token_swaps() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"models":[
+            {"id":"nova-2p", "name":"DistinctSparkName"},
+            {"id":"nova-4x", "name":"Other"}
+        ]}}})
+        .to_string(),
+    )
+    .unwrap();
+    for (search, expected, absent) in [
+        ("p2", "nova-2p", "nova-4x"),
+        ("DistinctSparkName", "No models matching", "nova-2p"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                "ollama",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--list-models",
+                search,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains(absent), "{text}");
     }
 }
 
@@ -875,7 +1399,15 @@ fn configured_messages_thinking_budget_respects_native_output_limits() {
             listener.local_addr().unwrap()
         );
         let server = std::thread::spawn(move || {
-            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            let (mut socket, mut reader, first) = loop {
+                let (mut socket, reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                if first.starts_with("GET /anthropic/v1/models/") {
+                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                break (socket, reader, first);
+            };
             assert!(first.starts_with("POST /anthropic/v1/messages "), "{first}");
             let mut length = 0;
             let mut headers = String::new();
@@ -1250,19 +1782,28 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         writeln!(
             input,
             "{}",
-            json!({"id": id, "type": "prompt", "message": "/trigger"})
+            json!({"id": id, "type": "prompt", "message": "/trigger", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
         )
         .unwrap();
         input.flush().unwrap();
         let mut started = false;
         loop {
             let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_ne!(event["message"]["role"], "user", "{event}");
             if event["type"] == "response" && event["id"] == id {
                 assert_eq!(event["data"]["disposition"], "started", "{event}");
                 started = true;
             }
             if event["type"] == "agent_end" {
                 assert!(started, "turn ended before prompt was acknowledged");
+                assert!(
+                    event["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|message| message["role"] != "user"),
+                    "{event}"
+                );
                 break;
             }
         }
@@ -1344,7 +1885,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     writeln!(
         input,
         "{}",
-        json!({"id":"context", "type":"prompt", "message":"/context"})
+        json!({"id":"context", "type":"prompt", "message":"/context", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
     )
     .unwrap();
     input.flush().unwrap();
@@ -2455,6 +2996,217 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
     assert!(replies[4]["data"]["sessionFile"].is_string());
 }
 
+// A nonblocking listener may produce nonblocking accepted sockets. Each
+// fixture connection is read with a bounded blocking timeout, independently
+// of the listener and of any idle peers on the same port.
+fn read_rpc_model_fixture_request(
+    socket: &TcpStream,
+    after_setup: impl FnOnce(&TcpStream) -> std::io::Result<()>,
+) -> std::io::Result<(String, Vec<u8>)> {
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    after_setup(socket)?;
+    let mut reader = BufReader::new(socket.try_clone()?);
+    let mut request = String::new();
+    if reader.read_line(&mut request)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "missing request",
+        ));
+    }
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value
+                .trim()
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok((request, body))
+}
+
+#[test]
+fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    let mut line = String::new();
+    let nonblocking_error = reader.read_line(&mut line).unwrap_err();
+    assert_eq!(nonblocking_error.kind(), std::io::ErrorKind::WouldBlock);
+    drop(reader);
+    let (request, body) = read_rpc_model_fixture_request(&socket, |socket| {
+        // Inspect the actual socket after the production fixture's setup,
+        // before the peer sends any bytes. No reader scheduling is involved.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        #[cfg(windows)]
+        {
+            socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+            let mut probe = BufReader::new(socket.try_clone()?);
+            let mut line = String::new();
+            let timed_out = probe.read_line(&mut line).unwrap_err();
+            assert_eq!(timed_out.kind(), std::io::ErrorKind::TimedOut);
+            assert_ne!(timed_out.raw_os_error(), nonblocking_error.raw_os_error());
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        }
+        client.write_all(b"POST /api/show HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+    })
+    .unwrap();
+    assert_eq!(request, "POST /api/show HTTP/1.1\r\n");
+    assert_eq!(body, b"{}");
+}
+
+#[test]
+fn rpc_discovered_ollama_thinking_budget_reaches_worker_wire() {
+    use std::sync::mpsc;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"compat":{"supportsThinkingTokenBudget":true}}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"thinkingBudgets":{"low":1500}}).to_string(),
+    )
+    .unwrap();
+    let (send, receive) = mpsc::channel();
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_stopping = stopping.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut workers = Vec::new();
+        while Instant::now() < deadline
+            && !server_stopping.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let send = send.clone();
+                    workers.push(std::thread::spawn(move || {
+                        let Ok((request, bytes)) = read_rpc_model_fixture_request(&socket, |_| Ok(())) else { return; };
+                        let (body, content_type) = if request.starts_with("POST /api/show ") {
+                            (r#"{"thinking":{"values":["off","low","high"]},"capabilities":["thinking"]}"#.to_owned(), "application/json")
+                        } else if request.starts_with("GET /api/ps ") {
+                            (r#"{"models":[]}"#.to_owned(), "application/json")
+                        } else if request.starts_with("GET /v1/models ") {
+                            (r#"{"data":[{"id":"dynamic"}]}"#.to_owned(), "application/json")
+                        } else if request.starts_with("POST /v1/chat/completions ") {
+                            let body: Value = serde_json::from_slice(&bytes).unwrap();
+                            let _ = send.send(body);
+                            ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(), "text/event-stream")
+                        } else { panic!("unexpected request {request}") };
+                        let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--offline",
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--max-output-tokens",
+                "4096",
+                "--model",
+                "dynamic",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (events, replies) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && events.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"thinking","type":"set_thinking_level","level":"low"})
+    )
+    .unwrap();
+    loop {
+        let event = replies
+            .recv_timeout(Duration::from_secs(10))
+            .expect("thinking response");
+        if event["id"] == "thinking" {
+            assert_eq!(event["success"], true, "{event}");
+            break;
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt","type":"prompt","message":"hello"})
+    )
+    .unwrap();
+    let body = receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("model request");
+    assert_eq!(body["thinking_token_budget"], 1500);
+    stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(input);
+    drop(child);
+    drop(replies);
+    reader.join().unwrap();
+    server.join().unwrap();
+}
+
 #[test]
 fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     use std::sync::{
@@ -2462,6 +3214,19 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
         root.path().join("models.json"),
@@ -2470,13 +3235,19 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let endpoint = format!(
-        "http://{}/v1/chat/completions",
-        listener.local_addr().unwrap()
-    );
+    let fixture_address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{}/v1/chat/completions", fixture_address);
     let stop = Arc::new(AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(stop.clone());
     let stopped = stop.clone();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let (idle_started, idle_ready) = mpsc::channel();
+    let (release_idle, idle_release) = mpsc::channel();
+    let (idle_finished, idle_done) = mpsc::channel();
     let server = std::thread::spawn(move || {
+        let mut connections = Vec::new();
+        let mut idle_signals = Some((idle_started, idle_release, idle_finished));
         while !stopped.load(Ordering::Relaxed) {
             let (mut socket, _) = match listener.accept() {
                 Ok(pair) => pair,
@@ -2486,70 +3257,93 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
                 }
                 Err(e) => panic!("{e}"),
             };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
+            let idle_gate = idle_signals.take();
+            let observed = observed.clone();
+            connections.push(std::thread::spawn(move || {
+                let (gate, idle_finished) = match idle_gate {
+                    Some((started, release, finished)) => {
+                        (Some((started, release)), Some(finished))
+                    }
+                    None => (None, None),
+                };
+                let result = read_rpc_model_fixture_request(&socket, |_| {
+                    if let Some((started, release)) = gate {
+                        let _ = started.send(());
+                        // Dropping the sender on panic releases the handler.
+                        let _ = release.recv();
+                    }
+                    Ok(())
+                });
+                if let Some(finished) = idle_finished {
+                    let _ = finished.send(());
+                }
+                let (request, request_body) = match result {
+                    Ok(request) => request,
+                    Err(error) => {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(format!("fixture read failed: {error}"));
+                        return;
+                    }
+                };
+                observed.lock().unwrap().push(request.clone());
+                let body = if request.starts_with("GET /v1/models ") {
+                    r#"{"data":[{"id":"dynamic"}]}"#
+                } else if request.starts_with("GET /api/ps ") {
+                    r#"{"models":[]}"#
+                } else if request.starts_with("POST /api/show ") {
+                    let body: Value = serde_json::from_slice(&request_body).unwrap();
+                    match body["model"].as_str() {
+                        Some("dynamic") => r#"{"capabilities":["vision"]}"#,
+                        Some("configured") => r#"{"capabilities":[]}"#,
+                        _ => panic!("unexpected model request: {body}"),
+                    }
+                } else {
+                    panic!("unexpected request {request}")
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
                 .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() || line.is_empty() {
-                continue;
-            }
-            let request = line.clone();
-            let mut length = 0;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut request_body = vec![0; length];
-            reader.read_exact(&mut request_body).unwrap();
-            let body = if request.starts_with("GET /v1/models ") {
-                r#"{"data":[{"id":"dynamic"}]}"#
-            } else if request.starts_with("GET /api/ps ") {
-                r#"{"models":[]}"#
-            } else if request.starts_with("POST /api/show ") {
-                r#"{"capabilities":["vision"]}"#
-            } else {
-                panic!("unexpected request {request}")
-            };
-            write!(
-                socket,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+            }));
+        }
+        for connection in connections {
+            connection.join().unwrap();
         }
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .env("PI_RS_HOME", root.path())
-        .args([
-            "--workspace",
-            root.path().to_str().unwrap(),
-            "--offline",
-            "--no-session",
-            "--no-mcp",
-            "--no-trust",
-            "--model",
-            "dynamic",
-            "--endpoint",
-            &endpoint,
-            "--mode",
-            "rpc",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let output = child.stdout.take().unwrap();
+    // Keep one accepted connection idle while the real discovery proceeds.
+    // A serial fixture would wait for this peer and miss the probe deadline.
+    let idle = TcpStream::connect(fixture_address).unwrap();
+    idle_ready.recv_timeout(Duration::from_secs(3)).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--offline",
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--model",
+                "dynamic",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
     let (sender, receiver) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
@@ -2574,12 +3368,21 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
         }
     };
     let models = request(json!({"type":"get_available_models", "id":"models"}));
+    assert!(matches!(
+        idle_done.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release_idle.send(()).unwrap();
+    drop(idle);
+    idle_done.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(
         models["models"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"]))
+            .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"])),
+        "models: {models}; fixture requests: {:?}",
+        requests.lock().unwrap()
     );
     assert!(
         models["models"]
@@ -2601,7 +3404,18 @@ fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
     let state = request(json!({"type":"get_state", "id":"state2"}));
     assert_eq!(state["model"]["input"], json!(["text"]));
     drop(input);
-    let status = child.wait().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            panic!("RPC process did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     reader.join().unwrap();
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
@@ -4535,6 +5349,22 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     }
                     headers.push_str(&line.to_ascii_lowercase());
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut origin_headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    origin_headers.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(!origin_headers.contains("proxy-authorization:"));
                 if first.starts_with("GET ") {
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
@@ -4602,10 +5432,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     String::from_utf8_lossy(&stderr)
                 )
             });
-        assert!(
-            request.starts_with("POST http://127.0.0.1:1/"),
-            "{provider}: {request}"
-        );
+        assert!(request.starts_with("POST /"), "{provider}: {request}");
         assert!(
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"
@@ -4718,6 +5545,19 @@ fn model_listing_uses_proxy_before_a_model_request() {
     .unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -4754,12 +5594,7 @@ fn model_listing_uses_proxy_before_a_model_request() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        server
-            .join()
-            .unwrap()
-            .starts_with("GET http://127.0.0.1:1/v1/models ")
-    );
+    assert!(server.join().unwrap().starts_with("GET /v1/models "));
 }
 
 #[test]
@@ -4775,6 +5610,19 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -4813,7 +5661,7 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new-token");
     let (request, body) = server.join().unwrap();
-    assert!(request.starts_with("POST http://127.0.0.1:1/v1/oauth/token "));
+    assert!(request.starts_with("POST /v1/oauth/token "));
     assert!(
         String::from_utf8(body)
             .unwrap()
@@ -4834,6 +5682,19 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut headers = String::new();
         loop {
             let mut line = String::new();
@@ -4870,10 +5731,7 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
             String::from_utf8_lossy(&output.stderr)
         )
     });
-    assert!(
-        request.starts_with("POST http://127.0.0.1:1/mcp "),
-        "{request}"
-    );
+    assert!(request.starts_with("POST /mcp "), "{request}");
     assert!(
         headers.contains("authorization: bearer fixture-token"),
         "{headers}"
@@ -5032,6 +5890,99 @@ else:
     assert!(session.pending_custom_trigger().is_none());
     assert_eq!(session.records().iter().filter(|record| matches!(&record.event,
         pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_discovered_prompt_reports_extension_source() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("fixture.js");
+    let prompt = root.path().join("discovered.md");
+    std::fs::write(&prompt, "---\ndescription: discovered prompt\n---\nHello").unwrap();
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request=json.load(sys.stdin)
+if request['type']=='describe': result={'id':'fixture','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True}
+elif request['type']=='discover_resources': result={'skillPaths':[],'promptPaths':['discovered.md'],'themePaths':[]}
+else: result=None
+print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--mode",
+                "rpc",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver.recv_timeout(remaining).unwrap();
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    let command = response["data"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "discovered")
+        .unwrap();
+    assert_eq!(
+        command["sourceInfo"],
+        json!({
+            "path":prompt.canonicalize().unwrap(), "source":"extension:fixture",
+            "scope":"temporary", "origin":"top-level", "baseDir":root.path().canonicalize().unwrap()
+        })
+    );
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "RPC process did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    assert!(status.success(), "RPC process exited with {status}");
 }
 
 #[cfg(unix)]
@@ -6092,6 +7043,36 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 }
 
 #[test]
+fn chatgpt_auth_check_no_refresh_uses_saved_credential() {
+    let root = tempfile::tempdir().unwrap();
+    let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":1,"scopes":["chatgpt.tokens.use.direct"]});
+    let auth = root.path().join("auth.json");
+    let original = json!({"openai-chatgpt":{"type":"oauth","credential":credential}}).to_string();
+    std::fs::write(&auth, &original).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--provider",
+            "openai-chatgpt",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "ready");
+    assert_eq!(std::fs::read_to_string(auth).unwrap(), original);
+}
+
+#[test]
 fn chatgpt_access_and_account_login_wait_for_shared_auth_lock() {
     for login in [false, true] {
         let root = tempfile::tempdir().unwrap();
@@ -6856,4 +7837,182 @@ fn bedrock_uses_configured_provider_and_model_headers() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("route-secret"));
+}
+
+#[tokio::test]
+async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as AsyncListener;
+    use tokio::process::Command as AsyncCommand;
+
+    async fn headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: tokio::time::Instant,
+    ) -> (String, usize) {
+        tokio::time::timeout_at(deadline, async {
+            let mut first = String::new();
+            assert_ne!(
+                reader.read_line(&mut first).await.unwrap(),
+                0,
+                "missing request line"
+            );
+            let mut total = first.len();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader.read_line(&mut line).await.unwrap(),
+                    0,
+                    "incomplete request headers"
+                );
+                total += line.len();
+                assert!(total <= 64 * 1024, "headers too large");
+                if line == "\r\n" {
+                    break;
+                }
+                assert!(
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                );
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(length <= 64 * 1024, "body too large");
+            (first, length)
+        })
+        .await
+        .expect("fixture header deadline")
+    }
+
+    for (bypass, explicit_metadata) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let base = format!("http://{origin_addr}");
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpProxy":format!("http://localhost:{proxy_port}")}).to_string(),
+        )
+        .unwrap();
+        let mut oauth = json!({"clientRegistration":"dcr"});
+        if explicit_metadata {
+            oauth["authServerMetadataUrl"] = json!(format!("{base}/metadata"));
+        }
+        std::fs::write(
+            root.path().join("mcp.json"),
+            json!({"mcpServers":{"fixture":{"url":format!("{base}/mcp"),"oauth":oauth}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (selected, unused) = if bypass {
+            (origin, proxy)
+        } else {
+            (proxy, origin)
+        };
+        let server_base = base.clone();
+        // Share one deadline with the subprocess, including startup and discovery.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let Ok(Ok((socket, _))) =
+                    tokio::time::timeout_at(deadline, selected.accept()).await
+                else {
+                    break;
+                };
+                let mut socket = tokio::io::BufReader::new(socket);
+                let (mut first, mut length) = headers(&mut socket, deadline).await;
+                if !bypass {
+                    assert_eq!(first, format!("CONNECT {origin_addr} HTTP/1.1\r\n"));
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    (first, length) = headers(&mut socket, deadline).await;
+                }
+                let mut body = vec![0; length];
+                tokio::time::timeout_at(
+                    deadline,
+                    tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body),
+                )
+                .await
+                .expect("fixture body deadline")
+                .unwrap();
+                let registration = first.starts_with("POST /register ");
+                let metadata = first.starts_with("GET /metadata ")
+                    || first.contains("/.well-known/oauth-authorization-server")
+                    || first.contains("/.well-known/openid-configuration");
+                let issuer = if first.contains("oauth-authorization-server/mcp") {
+                    format!("{server_base}/mcp")
+                } else {
+                    server_base.clone()
+                };
+                requests.push(first);
+                let (status, body) = if metadata {
+                    ("200 OK", json!({"issuer":issuer,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if registration {
+                    ("400 Bad Request", "{}".to_owned())
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                if registration {
+                    break;
+                }
+            }
+            requests
+        });
+        let mut command = AsyncCommand::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("NO_PROXY")
+            .env("no_proxy", if bypass { "127.0.0.1" } else { "" })
+            .args(["mcp", "login", "fixture"])
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout_at(deadline, command.output())
+            .await
+            .expect("login exceeded fixture deadline")
+            .unwrap();
+        assert!(!output.status.success(), "fixture rejects registration");
+        let requests = tokio::time::timeout_at(deadline + Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests.iter().any(|line| if explicit_metadata {
+                line.starts_with("GET /metadata ")
+            } else {
+                line.starts_with("GET /.well-known/")
+            }),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            requests
+                .last()
+                .is_some_and(|line| line.starts_with("POST /register ")),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unused.accept())
+                .await
+                .is_err(),
+            "unexpected route"
+        );
+    }
 }

@@ -32,6 +32,8 @@ pub struct Ollama {
     headers: HeaderMap,
     cache_retention: CacheRetention,
     reasoning_effort: Option<String>,
+    thinking_budget_level: Option<String>,
+    thinking_budgets: Option<Value>,
     compatibility: ChatCompatibility,
     supports_reasoning: Option<bool>,
     reasoning_enabled: bool,
@@ -115,6 +117,8 @@ impl Ollama {
             headers: HeaderMap::new(),
             cache_retention: CacheRetention::None,
             reasoning_effort: None,
+            thinking_budget_level: None,
+            thinking_budgets: None,
             compatibility: ChatCompatibility::default(),
             supports_reasoning: None,
             reasoning_enabled: false,
@@ -215,6 +219,13 @@ impl Ollama {
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         self.reasoning_effort = effort.map(str::to_owned);
+        self
+    }
+
+    /// Set the selected Pi thinking level and optional budget overrides.
+    pub fn with_thinking_budgets(mut self, level: Option<&str>, budgets: Option<Value>) -> Self {
+        self.thinking_budget_level = level.map(str::to_owned);
+        self.thinking_budgets = budgets;
         self
     }
 
@@ -659,6 +670,8 @@ impl Model for Ollama {
             self.reasoning_enabled,
             self.allow_reasoning_off,
             &self.reasoning_effort,
+            &self.thinking_budget_level,
+            &self.thinking_budgets,
             &self.sampling,
             self.cache_retention.anthropic_control(),
         ))
@@ -765,6 +778,13 @@ impl Model for Ollama {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        self.compatibility.thinking_budget_options(
+            &mut body,
+            self.thinking_budget_level.as_deref(),
+            self.thinking_budgets.as_ref(),
+            request.max_output_tokens,
+            self.supports_reasoning,
+        )?;
         self.compatibility.reasoning_options(
             &mut body,
             self.supports_reasoning,
@@ -780,6 +800,12 @@ impl Model for Ollama {
         if let Some(control) = self.cache_retention.anthropic_control() {
             apply_anthropic_cache(&mut body, &control);
         }
+        let error_secrets = pi_rs_core::provider_error_secrets(
+            self.token.as_deref(),
+            self.headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+        );
         let builder = self
             .authenticate(self.client.post(self.endpoint.clone()))
             .json(&body);
@@ -810,13 +836,33 @@ impl Model for Ollama {
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");
-            return Err(
-                if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
-                    Error::RetryableModel(description)
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
+            if matches!(status.as_u16(), 400 | 422) {
+                let overflow = pi_rs_core::provider_context_overflow_stream_or_empty(
+                    response.bytes_stream(),
+                    &error_secrets,
+                    self.provider == "cerebras" && status.as_u16() == 400,
+                )
+                .await;
+                return Err(Error::Model(if overflow {
+                    "context window exceeded".into()
                 } else {
-                    Error::Model(description)
-                },
-            );
+                    description
+                }));
+            }
+            let permanent_quota = (matches!(status.as_u16(), 408 | 429)
+                || status.is_server_error())
+                && pi_rs_core::permanent_provider_limit(response.bytes_stream(), &error_secrets)
+                    .await;
+            return Err(if permanent_quota {
+                Error::Model("Chat Completions account quota or billing limit reached".into())
+            } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+                Error::RetryableModel(description)
+            } else {
+                Error::Model(description)
+            });
         }
         if !response
             .headers()
@@ -898,8 +944,16 @@ impl Model for Ollama {
                 }
                 let chunk: Chunk = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
-                if chunk.error.is_some() {
-                    Err(Error::Model("provider returned a stream error".into()))?;
+                if let Some(error) = &chunk.error {
+                    Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {
+                        Error::Model("Chat Completions account quota or billing limit reached".into())
+                    } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
+                        Error::RetryableModel("provider returned a transient stream error".into())
+                    } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
+                        Error::Model("context window exceeded".into())
+                    } else {
+                        Error::Model("provider returned a stream error".into())
+                    })?;
                 }
                 let previous = metadata.clone();
                 if let Some(id) = chunk.id
@@ -1151,7 +1205,497 @@ struct CallDelta {
 
 #[cfg(test)]
 mod content_tests {
+    #[tokio::test]
+    async fn configured_thinking_budget_is_sent_on_wire() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            let (offset, length) = loop {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0 && bytes.len() + count < 65536);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..pos]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    break (pos + 4, length);
+                }
+            };
+            while bytes.len() - offset < length {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0 && bytes.len() + count < 65536);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
+            assert_eq!(body["thinking_budget_tokens"], 2500);
+            assert_eq!(body["reasoning_effort"], "high");
+            let reply = "data: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+        });
+        let compat =
+            serde_json::from_value(json!({"thinkingTokenBudgetField":"thinking_budget_tokens"}))
+                .unwrap();
+        let model = Ollama::new(&format!("http://{address}"), None)
+            .unwrap()
+            .with_chat_compatibility(compat, Some(true), true, true)
+            .with_mapped_reasoning_effort(Some("high"))
+            .with_thinking_budgets(Some("low"), Some(json!({"low":2500, "high":7000})));
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 4096,
+        };
+        let _stream = model.stream(request).await.unwrap();
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_header_error_literals_are_not_classified() {
+        use std::io::{Read, Write};
+        for (name, value) in [("x-api-key", "quota exceeded"), ("x-auth-token", "timeout")] {
+            for streaming in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let event = json!({"error":{"code":"error","message":value}});
+                let worker = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 2048];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(
+                            count != 0 && request.len() + count <= 32 * 1024,
+                            "incomplete request headers"
+                        );
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("{name}: {value}")),
+                        "header missing from fixture request"
+                    );
+                    let body = if streaming {
+                        format!("data: {event}\n\n")
+                    } else {
+                        json!({"error":{"message":value}}).to_string()
+                    };
+                    let status = if streaming { "200 OK" } else { "503 Fixture" };
+                    let content_type = if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                });
+                let model = Ollama::new(&format!("http://{address}"), Some("ordinary-key".into()))
+                    .unwrap()
+                    .with_headers({
+                        let mut headers = reqwest::header::HeaderMap::new();
+                        headers.insert(name, value.parse().unwrap());
+                        headers
+                    });
+                let request = ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let error = match model.stream(request).await {
+                    Err(error) => error,
+                    Ok(mut stream) => loop {
+                        match stream.next().await {
+                            Some(Err(error)) => break error,
+                            Some(Ok(_)) => {}
+                            None => panic!("missing stream error"),
+                        }
+                    },
+                };
+                assert_eq!(
+                    matches!(error, Error::RetryableModel(_)),
+                    !streaming,
+                    "{name} {streaming}"
+                );
+                assert!(!error.to_string().contains(value));
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-billing-timeout-secret", true, false),
+            ("timeout sk-billing-timeout-secret", false, true),
+            ("sk-billing-timeout-secret", false, false),
+            ("sk-timeout-secret", false, false),
+            ("service-is-unavailable", false, true),
+            ("sk-header-billing-timeout-secret", false, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"error":{"code":"error","message":message,"request_id":"billing-sentinel-secret"}});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Ollama::new(
+                &format!("http://{address}"),
+                Some("sk-billing-timeout-secret".into()),
+            )
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-routing", "timeout".parse().unwrap());
+                headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_429_is_permanent_and_transient_is_retryable() {
+        use std::io::{Read, Write};
+        for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"sk-header-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (408, r#"{"error":{"message":"quota exceeded"}}"#, true),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
+            let model = Ollama::new(&format!("http://{address}"), Some(credential.into())).unwrap();
+            let model = model.with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
+            let result = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            assert!(!error.to_string().contains(credential));
+            worker.join().unwrap();
+        }
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn cerebras_bodyless_400_is_overflow_without_reclassifying_other_errors() {
+        use std::io::{Read, Write};
+        for (provider, status, body, overflow) in [
+            ("cerebras", 400, "", true),
+            ("other", 400, "", false),
+            ("cerebras", 422, "", false),
+            ("cerebras", 400, "{}", false),
+            ("cerebras", 400, "private-error-body", false),
+            (
+                "cerebras",
+                400,
+                r#"{"error":{"message":"prompt is too long"}}"#,
+                true,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 1024];
+                let header_end = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 32 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .unwrap();
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 64 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let model = Ollama::new(&format!("http://{address}/v1/chat/completions"), None)
+                .unwrap()
+                .with_provider(provider);
+            let error = match model
+                .stream(ModelRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("expected HTTP error"),
+            };
+            assert_eq!(
+                error.to_string().contains("context window exceeded"),
+                overflow,
+                "{provider} {status} {body:?}"
+            );
+            assert!(!error.to_string().contains("private-error-body"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cerebras_bodyless_overflow_compacts_and_retries_the_turn() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 2048];
+                let header_end = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 64 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let length = String::from_utf8_lossy(&bytes[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .unwrap();
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 128 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                if index == 1 {
+                    write!(
+                        socket,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let text = if index == 2 {
+                    "saved summary"
+                } else {
+                    "answer"
+                };
+                let chunk = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}});
+                let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let model = Ollama::new(&format!("http://{address}/v1/chat/completions"), None)
+            .unwrap()
+            .with_provider("cerebras");
+        let registry = pi_rs_core::Registry::default();
+        let agent = pi_rs_core::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs_core::Limits {
+                context_window: Some(10000),
+                output_tokens_per_request: 16,
+                model_requests: 3,
+                compaction_tokens: Some(pi_rs_core::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Default::default()
+            },
+        };
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let cancel = pi_rs_core::CancellationToken::new();
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    Some("old".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert!(session.records().iter().any(|record| matches!(&record.event, pi_rs_core::Event::Compacted { summary, .. } if summary == "saved summary")));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn capacity_estimate_matches_image_and_replay_serialization() {

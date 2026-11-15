@@ -135,6 +135,13 @@ impl Tracker {
                 );
             }
             Event::ModelSelected { provider, .. } => self.selected_provider = provider.clone(),
+            Event::BranchModelSelected { provider, .. } => {
+                self.selected_provider = Some(provider.clone())
+            }
+            Event::BranchSummary {
+                fallback_model: Some(selection),
+                ..
+            } => self.selected_provider = Some(selection.provider.clone()),
             Event::ModelRequested { model, .. } => {
                 self.requested_model = Some(model.clone());
                 self.requested_at = record.timestamp_millis();

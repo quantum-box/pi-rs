@@ -1,4 +1,5 @@
 //! Owned session API for embedding the agent in long-lived native applications.
+use crate::runtime::time as platform_time;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -401,6 +402,7 @@ pub struct SessionControl {
     owner: Arc<SessionOwner>,
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
+    shutdown: CancellationToken,
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
@@ -717,7 +719,7 @@ impl SessionControl {
         if closed.is_cancelled() {
             return Err(Error::Config("session is closed".into()));
         }
-        let token = CancellationToken::new();
+        let token = self.shutdown.child_token();
         *self.active.lock().expect("session control") = Some(token.clone());
         let active = ActiveRun {
             token,
@@ -747,6 +749,24 @@ impl SessionControl {
                 })?;
             config.model = Arc::downgrade(&model);
             config.model_name = name;
+        } else {
+            let config = self.owner.config.lock().expect("run config");
+            let registry = config
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            let cached = config
+                .model
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            if !branch_client(&registry, journal.session_id(), None, &config.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &cached))
+            {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {}",
+                    config.model_name
+                )));
+            }
         }
         let startup = self
             .owner
@@ -1055,6 +1075,18 @@ impl SessionControl {
         }
     }
 
+    /// Permanently cancel active and subsequently registered runs while the
+    /// owner waits to close the session. This does not itself close the session.
+    pub fn request_shutdown(&self) {
+        let Ok(_guard) = self.scoped_guard() else {
+            return;
+        };
+        self.shutdown.cancel();
+        if let Some(active) = self.active.lock().expect("session control").as_ref() {
+            active.cancel();
+        }
+    }
+
     fn observe(&self, event: &Notification<'_>) {
         if let Notification::BranchState(states) = event {
             self.input_hooks.lock().expect("SDK input hooks").states = (*states).clone();
@@ -1099,6 +1131,8 @@ pub enum HistoricalModelResolution {
     /// Use a client for the exact requested provider and model.
     Historical(Arc<dyn Model>),
     /// Use a different host-selected provider and model.
+    /// If that identity is already registered, return the same `Arc` to avoid
+    /// replacing a potentially different endpoint or credential binding.
     Fallback {
         provider: String,
         model: String,
@@ -1118,7 +1152,7 @@ pub struct HistoricalModelFallback {
 }
 
 /// Resolves from host-owned catalog, endpoint and credential policy. The
-/// callback runs synchronously during session construction and must not block.
+/// callback runs synchronously during construction and branch transitions and must not block.
 pub trait HistoricalModelResolver: Send + Sync {
     fn resolve(&self, provider: &str, model: &str) -> Result<HistoricalModelResolution>;
 }
@@ -1229,7 +1263,7 @@ impl SessionBuilder {
     }
 
     /// Opt in to host-controlled restoration or fallback for unavailable,
-    /// provider-qualified historical models during session construction.
+    /// provider-qualified historical models during construction and branch transitions.
     pub fn historical_model_resolver(mut self, resolver: Arc<dyn HistoricalModelResolver>) -> Self {
         self.historical_model_resolver = Some(resolver);
         self
@@ -1289,7 +1323,6 @@ impl SessionBuilder {
                             "fallback provider or model name is empty".into(),
                         ));
                     }
-                    session.select_provider_model_atomic(&replacement_provider, &model)?;
                     model_fallback = Some(HistoricalModelFallback {
                         requested_provider: provider,
                         requested_model: name,
@@ -1301,42 +1334,81 @@ impl SessionBuilder {
                 HistoricalModelResolution::Unavailable => {}
             }
         }
+        // Stage every builder binding and reserve the session before any write.
+        // The fallback identity must not replace a different opaque client.
+        if let Some((provider, name, client)) = &resolved {
+            let same_default = self.model_provider.as_deref() == Some(provider.as_str())
+                && self.model_name == *name;
+            if (same_default && !Arc::ptr_eq(&self.model, client))
+                || self
+                    .provider_models
+                    .get(&(provider.clone(), name.clone()))
+                    .is_some_and(|existing| !Arc::ptr_eq(existing, client))
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {provider}/{name}"
+                )));
+            }
+        }
+        let mut bindings = Vec::new();
         for (name, model) in self.branch_models {
-            self.registry
-                .register_session_branch_model(session.session_id(), name, model)?;
+            bindings.push((None, name, model));
         }
         for ((provider, name), model) in self.provider_models {
-            self.registry.register_session_provider_model(
-                session.session_id(),
-                &provider,
-                &name,
-                model,
-            )?;
+            bindings.push((Some(provider), name, model));
         }
-        if let Some(provider) = &self.model_provider {
-            self.registry.register_session_provider_model(
-                session.session_id(),
-                provider,
-                &self.model_name,
-                self.model.clone(),
-            )?;
-        } else {
-            self.registry.register_session_branch_model(
-                session.session_id(),
-                self.model_name.clone(),
-                self.model.clone(),
-            )?;
+        bindings.push((
+            self.model_provider.clone(),
+            self.model_name.clone(),
+            self.model.clone(),
+        ));
+        if let Some((provider, name, client)) = &resolved {
+            bindings.push((Some(provider.clone()), name.clone(), client.clone()));
         }
+        let guarded = resolved
+            .as_ref()
+            .map(|(provider, name, client)| (provider.as_str(), name.as_str(), client));
+        // A request-only journal does not carry a provider. Record the initial
+        // qualified choice before its first request, while leaving existing
+        // historical selections (including unqualified ones) untouched.
+        let initial_selection = session.model_identity_at(session.head()).is_none();
+        let (_, _revoked) = self.registry.commit_session_model_bindings(
+            session.session_id(),
+            bindings,
+            guarded,
+            || {
+                if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
+                    session.select_provider_model_atomic(provider, name)?;
+                } else if initial_selection && let Some(provider) = &self.model_provider {
+                    session.select_provider_model_atomic(provider, &self.model_name)?;
+                }
+                Ok(())
+            },
+        )?;
         if let Some((provider, name, client)) = resolved {
-            self.registry.register_session_provider_model(
-                session.session_id(),
-                &provider,
-                &name,
-                client.clone(),
-            )?;
             self.model = client;
             self.model_name = name;
+            self.model_provider = Some(provider);
         }
+        // Registered historical models must be active even before startup
+        // hooks run: synchronous checkout and fork can be called immediately.
+        let model_identity_resolved = match session.model_identity_at(session.head()) {
+            Some((provider, name, _)) => match branch_client(
+                &self.registry,
+                session.session_id(),
+                provider.as_deref(),
+                &name,
+            ) {
+                Some(client) => {
+                    self.model = client;
+                    self.model_name = name;
+                    self.model_provider = provider;
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        };
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
@@ -1366,6 +1438,8 @@ impl SessionBuilder {
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
+            model_provider: self.model_provider,
+            model_identity_resolved,
             system_prompt: self.system_prompt,
             registry,
             limits: self.limits,
@@ -1378,6 +1452,7 @@ impl SessionBuilder {
                 owner,
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
+                shutdown: CancellationToken::new(),
                 auto_compaction,
                 retry,
                 input_hooks,
@@ -1389,6 +1464,7 @@ impl SessionBuilder {
             pending_start,
             session_file: None,
             model_fallback,
+            historical_model_resolver: self.historical_model_resolver,
         })
     }
 }
@@ -1398,6 +1474,8 @@ impl SessionBuilder {
 pub struct AgentSession {
     model: Arc<dyn Model>,
     model_name: String,
+    model_provider: Option<String>,
+    model_identity_resolved: bool,
     system_prompt: String,
     registry: Arc<Registry>,
     limits: Limits,
@@ -1410,23 +1488,165 @@ pub struct AgentSession {
     pending_start: PendingStart,
     session_file: Option<PathBuf>,
     model_fallback: Option<HistoricalModelFallback>,
+    historical_model_resolver: Option<Arc<dyn HistoricalModelResolver>>,
+}
+
+#[derive(Clone)]
+enum BranchResolution {
+    Registered,
+    Legacy {
+        model: String,
+        client: Arc<dyn Model>,
+        inherited: bool,
+    },
+    Existing {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
+    Inherited {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
+    Historical {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
+    Fallback {
+        requested_provider: String,
+        requested_model: String,
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
 }
 impl AgentSession {
-    /// The fallback chosen while opening this session, if any.
+    /// The fallback chosen for the most recent construction or branch transition, if any.
     pub fn model_fallback(&self) -> Option<&HistoricalModelFallback> {
         self.model_fallback.as_ref()
     }
-    fn validate_tree_model(&self, journal: &Session, selected: u64) -> Result<()> {
-        if let Some(target) = journal.tree_navigation_target(selected)?
-            && let Some((provider, name, _)) = journal.model_identity_at(target)
-            && branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_none()
+    fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
+        let Some((provider, name, _)) = journal.model_identity_at(target) else {
+            let current = if journal.session_id() == self.session_id {
+                journal.model_identity_at(journal.head())
+            } else {
+                let source = self.journal()?;
+                source.model_identity_at(source.head())
+            };
+            if let Some((Some(provider), name, _)) = &current {
+                let client = branch_client(&self.registry, self.session_id, Some(provider), name)
+                    .ok_or_else(|| {
+                    Error::Config(format!("session branch requires registered model {name}"))
+                })?;
+                return Ok(BranchResolution::Inherited {
+                    provider: provider.clone(),
+                    model: name.clone(),
+                    client,
+                });
+            }
+            if let Some((None, name, _)) = &current {
+                let client = branch_client(&self.registry, self.session_id, None, name)
+                    .ok_or_else(|| {
+                        Error::Config(format!("session branch requires registered model {name}"))
+                    })?;
+                return Ok(BranchResolution::Legacy {
+                    model: name.clone(),
+                    client,
+                    inherited: true,
+                });
+            }
+            if !self.model_identity_resolved {
+                return Err(Error::Config(
+                    "current session model is not registered".into(),
+                ));
+            }
+            if let Some(provider) = &self.model_provider {
+                let client = branch_client(
+                    &self.registry,
+                    self.session_id,
+                    Some(provider),
+                    &self.model_name,
+                )
+                .filter(|client| Arc::ptr_eq(client, &self.model))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "session branch requires registered model {}",
+                        self.model_name
+                    ))
+                })?;
+                return Ok(BranchResolution::Inherited {
+                    provider: provider.clone(),
+                    model: self.model_name.clone(),
+                    client,
+                });
+            }
+            let client = branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .filter(|client| Arc::ptr_eq(client, &self.model))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "session branch requires registered model {}",
+                        self.model_name
+                    ))
+                })?;
+            return Ok(BranchResolution::Legacy {
+                model: self.model_name.clone(),
+                client,
+                inherited: true,
+            });
+        };
+        if let Some(client) =
+            branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
         {
-            return Err(Error::Config(format!(
-                "session branch requires registered model {name}"
-            )));
+            return Ok(match provider {
+                Some(provider) => BranchResolution::Existing {
+                    provider,
+                    model: name,
+                    client,
+                },
+                None => BranchResolution::Legacy {
+                    model: name,
+                    client,
+                    inherited: false,
+                },
+            });
         }
-        Ok(())
+        if let (Some(provider), Some(resolver)) = (provider, &self.historical_model_resolver) {
+            return match resolver.resolve(&provider, &name)? {
+                HistoricalModelResolution::Historical(client) => Ok(BranchResolution::Historical {
+                    provider,
+                    model: name,
+                    client,
+                }),
+                HistoricalModelResolution::Fallback {
+                    provider: replacement,
+                    model,
+                    client,
+                } => {
+                    if replacement.trim().is_empty() || model.trim().is_empty() {
+                        return Err(Error::Config(
+                            "fallback provider or model name is empty".into(),
+                        ));
+                    }
+                    Ok(BranchResolution::Fallback {
+                        requested_provider: provider,
+                        requested_model: name,
+                        provider: replacement,
+                        model,
+                        client,
+                    })
+                }
+                HistoricalModelResolution::Unavailable => Err(Error::Config(format!(
+                    "session branch requires registered model {name}"
+                ))),
+            };
+        }
+        Err(Error::Config(format!(
+            "session branch requires registered model {name}"
+        )))
     }
+
     fn restore_branch_model(&mut self, provider: Option<&str>, name: String) -> Result<()> {
         let model =
             branch_client(&self.registry, self.session_id, provider, &name).ok_or_else(|| {
@@ -1434,6 +1654,8 @@ impl AgentSession {
             })?;
         self.model = model;
         self.model_name = name;
+        self.model_provider = provider.map(str::to_owned);
+        self.model_identity_resolved = true;
         self.refresh_run_config();
         Ok(())
     }
@@ -1494,7 +1716,7 @@ impl AgentSession {
         };
         let window = match self.limits.context_window {
             Some(window) => Some(window),
-            None => tokio::time::timeout(self.limits.model_timeout, model.context_window(&name))
+            None => platform_time::timeout(self.limits.model_timeout, model.context_window(&name))
                 .await
                 .ok()
                 .flatten(),
@@ -1647,7 +1869,18 @@ impl AgentSession {
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
         let count = journal.records().len();
-        journal.select_provider_model(provider, &name, None)?;
+        let replaces_selected_client =
+            journal.model_identity_at(journal.head()).is_some_and(
+                |(selected_provider, selected_name, _)| {
+                    selected_provider.as_deref() == provider && selected_name == name
+                },
+            ) && branch_client(&self.registry, self.session_id, provider, &name)
+                .is_some_and(|existing| !Arc::ptr_eq(&existing, &model));
+        if replaces_selected_client && let Some(provider) = provider {
+            journal.select_provider_model_atomic(provider, &name)?;
+        } else {
+            journal.select_provider_model(provider, &name, None)?;
+        }
         if let Some(provider) = provider {
             self.registry.register_session_provider_model(
                 self.session_id,
@@ -1669,6 +1902,8 @@ impl AgentSession {
         }
         self.model = model;
         self.model_name = name;
+        self.model_provider = provider.map(str::to_owned);
+        self.model_identity_resolved = true;
         self.refresh_run_config();
         Ok(())
     }
@@ -1695,7 +1930,11 @@ impl AgentSession {
             None => None,
         };
         let (fallback_previous, startup_error) = self
-            .start_with_fallback(Some((model.clone(), provider.clone(), name.clone())))
+            .start_with_fallback(
+                Some((model.clone(), provider.clone(), name.clone())),
+                true,
+                false,
+            )
             .await?;
         let (previous_provider, previous_name, previous_level) = match fallback_previous {
             Some(previous) => previous,
@@ -1765,6 +2004,14 @@ impl AgentSession {
         }
         Ok(())
     }
+    /// The host-configured base prompt used when preparing future requests.
+    /// Extension context hooks can change the actual prompt for each request;
+    /// this accessor does not execute hooks or report their effective output.
+    /// Forks copy the configured value and can subsequently change it independently.
+    pub fn configured_system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         self.system_prompt = prompt.into();
@@ -1788,31 +2035,152 @@ impl AgentSession {
     /// Check out a branch after validating that its selected model is registered.
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
-        {
+        let resolution = {
             let journal = self.journal()?;
             journal.validate_checkout(record)?;
-            if let Some((provider, name, _)) = journal.model_identity_at(record)
-                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
-                    .is_none()
-            {
-                return Err(Error::Config(format!(
-                    "session branch requires registered model {name}"
-                )));
-            }
-        }
-        self.session
-            .try_lock()
-            .map_err(|_| Error::Session("session journal is in use".into()))?
-            .checkout(record)?;
-        self.refresh_input_hooks()?;
-        self.emit_last()?;
-        let selection = {
-            let journal = self.journal()?;
-            journal.model_identity_at(journal.head())
+            self.resolve_branch_model(&journal, record)?
         };
-        if let Some((provider, model, _)) = selection {
-            self.restore_branch_model(provider.as_deref(), model)?;
+        let (revoked, selection, record, hooks) = {
+            let mut journal = self
+                .session
+                .try_lock()
+                .map_err(|_| Error::Session("session journal is in use".into()))?;
+            let revoked = match &resolution {
+                BranchResolution::Legacy { model, client, .. } => {
+                    self.registry
+                        .commit_existing_legacy_model(
+                            self.session_id,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
+                BranchResolution::Existing {
+                    provider,
+                    model,
+                    client,
+                } => {
+                    self.registry
+                        .commit_existing_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
+                BranchResolution::Inherited {
+                    provider,
+                    model,
+                    client,
+                } => {
+                    self.registry
+                        .commit_existing_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout_provider_model_atomic(record, provider, model),
+                        )?
+                        .1
+                }
+                BranchResolution::Fallback {
+                    provider,
+                    model,
+                    client,
+                    ..
+                } => {
+                    self.registry
+                        .commit_resolved_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout_provider_model_atomic(record, provider, model),
+                        )?
+                        .1
+                }
+                BranchResolution::Historical {
+                    provider,
+                    model,
+                    client,
+                } => {
+                    self.registry
+                        .commit_resolved_session_model(
+                            self.session_id,
+                            provider,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
+                BranchResolution::Registered => {
+                    journal.checkout(record)?;
+                    false
+                }
+            };
+            (
+                revoked,
+                journal.model_identity_at(journal.head()),
+                journal.records().last().cloned().expect("checkout record"),
+                InputHooks::new(&self.registry, &journal),
+            )
+        };
+        if !revoked
+            && let BranchResolution::Legacy {
+                model,
+                client,
+                inherited: true,
+            } = &resolution
+        {
+            self.model = client.clone();
+            self.model_name = model.clone();
+            self.model_provider = None;
+            self.model_identity_resolved = true;
+            self.refresh_run_config();
         }
+        match resolution {
+            BranchResolution::Legacy { .. }
+            | BranchResolution::Historical { .. }
+            | BranchResolution::Inherited { .. }
+            | BranchResolution::Existing { .. } => {
+                self.model_fallback = None;
+            }
+            BranchResolution::Fallback {
+                requested_provider,
+                requested_model,
+                provider,
+                model,
+                client: _,
+            } => {
+                self.model_fallback = Some(HistoricalModelFallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                });
+            }
+            BranchResolution::Registered => self.model_fallback = None,
+        }
+        *self.control.input_hooks.lock().expect("SDK input hooks") = hooks;
+        if !revoked
+            && let Some((provider, model, _)) = selection
+            && let Some(client) =
+                branch_client(&self.registry, self.session_id, provider.as_deref(), &model)
+        {
+            self.model = client;
+            self.model_name = model;
+            self.model_provider = provider;
+            self.model_identity_resolved = true;
+            self.refresh_run_config();
+        }
+        emit(
+            self.events.as_ref().expect("open session"),
+            &Notification::Committed(&record),
+        );
         Ok(())
     }
 
@@ -1824,14 +2192,28 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.ensure_open()?;
-        {
+        let (initial_target, initial_resolution) = {
             let journal = self.session.lock().await;
-            self.validate_tree_model(&journal, selected)?;
-        }
+            let target = journal.tree_navigation_target(selected)?;
+            let resolution = match target {
+                Some(target) if journal.model_identity_at(target).is_some() => {
+                    Some(self.resolve_branch_model(&journal, target)?)
+                }
+                _ => None,
+            };
+            (target, resolution)
+        };
         self.start().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
-        self.validate_tree_model(&journal, selected)?;
+        let target = journal.tree_navigation_target(selected)?;
+        let resolution = match (target == initial_target, initial_resolution) {
+            (true, Some(resolution)) => resolution,
+            _ => match target {
+                Some(target) => self.resolve_branch_model(&journal, target)?,
+                None => BranchResolution::Registered,
+            },
+        };
         let first_record = journal.records().len();
         let editor_text = {
             journal
@@ -1860,23 +2242,138 @@ impl AgentSession {
             control.observe(&event);
             emit(&events, &event);
         };
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tree_resolution = match &resolution {
+            BranchResolution::Registered => None,
+            BranchResolution::Legacy { model, client, .. } => {
+                Some(crate::agent::TreeModelResolution {
+                    provider: String::new(),
+                    model: model.clone(),
+                    client: client.clone(),
+                    fallback: false,
+                    require_existing: true,
+                    legacy: true,
+                    revoked: revoked.clone(),
+                })
+            }
+            BranchResolution::Existing {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: false,
+                require_existing: true,
+                legacy: false,
+                revoked: revoked.clone(),
+            }),
+            BranchResolution::Inherited {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: true,
+                require_existing: true,
+                legacy: false,
+                revoked: revoked.clone(),
+            }),
+            BranchResolution::Historical {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: false,
+                require_existing: false,
+                legacy: false,
+                revoked: revoked.clone(),
+            }),
+            BranchResolution::Fallback {
+                provider,
+                model,
+                client,
+                ..
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: true,
+                require_existing: false,
+                legacy: false,
+                revoked: revoked.clone(),
+            }),
+        };
         let mut result = agent
-            .navigate_tree_with_options(
+            .navigate_tree_with_resolution(
                 &mut journal,
                 selected,
                 options,
                 &active.token,
                 &mut observer,
+                tree_resolution,
             )
             .await;
-        if result.is_ok() {
+        if result.is_ok()
+            || journal.records()[first_record..].iter().any(|record| {
+                matches!(
+                    &record.event,
+                    crate::Event::BranchModelSelected { .. }
+                        | crate::Event::BranchSummary {
+                            target: Some(_),
+                            ..
+                        }
+                        | crate::Event::Checkout { .. }
+                )
+            })
+        {
             *self.control.input_hooks.lock().expect("SDK input hooks") =
                 InputHooks::new(&self.registry, &journal);
-            if let Some((provider, model, _)) = journal.model_identity_at(journal.head()) {
-                result = self
-                    .restore_branch_model(provider.as_deref(), model)
-                    .map(|_| ());
+            if !revoked.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some((provider, model, _)) = journal.model_identity_at(journal.head())
+            {
+                let restored = self.restore_branch_model(provider.as_deref(), model);
+                if result.is_ok() && restored.is_ok() {
+                    result = restored;
+                } else if restored.is_err() {
+                    revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
+            if !revoked.load(std::sync::atomic::Ordering::SeqCst)
+                && journal.model_identity_at(journal.head()).is_none()
+                && let BranchResolution::Legacy {
+                    model,
+                    client,
+                    inherited: true,
+                } = &resolution
+            {
+                self.model = client.clone();
+                self.model_name = model.clone();
+                self.model_provider = None;
+                self.model_identity_resolved = true;
+                self.refresh_run_config();
+            }
+            self.model_fallback = match resolution {
+                BranchResolution::Fallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                    ..
+                } => Some(HistoricalModelFallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                }),
+                _ => None,
+            };
         }
         let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
         let result = result.and(final_inputs);
@@ -1893,7 +2390,9 @@ impl AgentSession {
             .map(Box::new);
         drop(input_queue);
         drop(journal);
-        let _ = self.drain_idle_triggers().await?;
+        if !revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.drain_idle_triggers().await?;
+        }
         Ok(TreeNavigationResult {
             editor_text,
             summary_entry,
@@ -1922,7 +2421,7 @@ impl AgentSession {
 
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
-        let (_, error) = self.start_with_fallback(None).await?;
+        let (_, error) = self.start_with_fallback(None, true, false).await?;
         error.map_or(Ok(()), Err)
     }
 
@@ -1932,11 +2431,18 @@ impl AgentSession {
     async fn start_with_fallback(
         &mut self,
         fallback: Option<(Arc<dyn Model>, Option<String>, String)>,
+        drain_triggers: bool,
+        defer_startup: bool,
     ) -> Result<(Option<(Option<String>, String, String)>, Option<Error>)> {
         self.ensure_open()?;
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before startup".into(),
+            ));
+        }
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
@@ -1946,8 +2452,17 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal);
         }
         let mut replaced = None;
-        if let Some((provider, name, level)) = journal.model_identity_at(journal.head()) {
-            if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some()
+        let selected = journal.model_identity_at(journal.head());
+        let missing_legacy = selected.is_none()
+            && self.model_provider.is_none()
+            && !branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
+        let current =
+            selected.or_else(|| missing_legacy.then(|| (None, self.model_name.clone(), None)));
+        if let Some((provider, name, level)) = current {
+            if !missing_legacy
+                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                    .is_some()
             {
                 self.restore_branch_model(provider.as_deref(), name)?;
             } else if let Some((model, replacement_provider, replacement)) = fallback {
@@ -1981,13 +2496,23 @@ impl AgentSession {
                 }
                 self.model = model;
                 self.model_name = replacement;
+                self.model_provider = replacement_provider;
+                self.model_identity_resolved = true;
                 self.refresh_run_config();
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
-            } else {
+            } else if !missing_legacy {
                 self.restore_branch_model(provider.as_deref(), name)?;
+            } else {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {name}"
+                )));
             }
         }
-        let startup = self.pending_start.lock().expect("session startup").take();
+        let startup = if defer_startup {
+            None
+        } else {
+            self.pending_start.lock().expect("session startup").take()
+        };
         let startup_result = if let Some((reason, previous_session_file)) = startup {
             let active = self.begin_run();
             let events = self.events.as_ref().expect("open session").clone();
@@ -2010,7 +2535,8 @@ impl AgentSession {
         drop(journal);
         drop(order);
         let startup_result = match startup_result {
-            Ok(()) => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) if drain_triggers => self.drain_idle_triggers().await.map(|_| ()),
+            Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
         match startup_result {
@@ -2178,26 +2704,83 @@ impl AgentSession {
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(self.journal()?.fork_records(record)?)?;
-        self.fork_session(session)
+        let session = self.journal()?.fork_session_after_handoff(record)?;
+        let resolution = self.resolve_branch_model(&session, session.head())?;
+        self.fork_snapshot(session, resolution)
+    }
+
+    fn fork_snapshot(&self, mut session: Session, resolution: BranchResolution) -> Result<Self> {
+        if let BranchResolution::Fallback {
+            provider, model, ..
+        } = &resolution
+        {
+            session.select_provider_model_atomic(provider, model)?;
+        }
+        if let BranchResolution::Legacy { model, client, .. } = &resolution {
+            let (fork, revoked) = self.registry.commit_existing_legacy_model(
+                self.session_id,
+                model,
+                client.clone(),
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
+        if let BranchResolution::Inherited {
+            provider,
+            model,
+            client,
+        }
+        | BranchResolution::Existing {
+            provider,
+            model,
+            client,
+        } = &resolution
+        {
+            let (fork, revoked) = self.registry.commit_existing_session_model(
+                self.session_id,
+                provider,
+                model,
+                client.clone(),
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
+        self.fork_session(session, resolution)
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
         let journal = self.journal()?;
-        let records = journal.fork_records(record)?;
-        let snapshot = Session::from_records(records)?;
-        if let Some((provider, name, _)) = snapshot.model_identity_at(snapshot.head())
-            && branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_none()
-        {
-            return Err(Error::Config(format!(
-                "session branch requires registered model {name}"
-            )));
-        }
-        let forked = journal.fork_to(record, &destination)?;
+        let snapshot = journal.fork_session_after_handoff(record)?;
         drop(journal);
-        let mut fork = self.fork_session(forked)?;
-        fork.session_file = Some(destination);
+        let resolution = self.resolve_branch_model(&snapshot, snapshot.head())?;
+        self.fork_snapshot_to(snapshot, resolution, &destination)
+    }
+
+    fn fork_snapshot_to(
+        &self,
+        snapshot: Session,
+        resolution: BranchResolution,
+        destination: &Path,
+    ) -> Result<Self> {
+        // Resolve, register and initialize the complete fork before publishing
+        // its journal. A failed resolver or client conflict leaves no file.
+        let mut fork = self.fork_snapshot(snapshot, resolution)?;
+        {
+            let mut journal = fork.journal()?;
+            journal.publish_and_bind_snapshot(destination)?;
+        }
+        fork.session_file = Some(destination.to_owned());
         Ok(fork)
     }
     /// Fork before or at an entry after consulting the source session's extensions.
@@ -2214,11 +2797,23 @@ impl AgentSession {
             .iter()
             .find(|record| record.id == entry_id)
             .ok_or_else(|| Error::Session("invalid fork entry".into()))?;
-        let target = match position {
-            crate::ForkPosition::Before => record.parent.unwrap_or(1),
-            crate::ForkPosition::At => record.id,
+        let resolved_entry = journal.fork_target_after_handoff(record.id)?;
+        let target = if resolved_entry != record.id {
+            resolved_entry
+        } else {
+            match position {
+                crate::ForkPosition::Before => record.parent.unwrap_or(1),
+                crate::ForkPosition::At => record.id,
+            }
         };
+        let target = journal.fork_target_after_handoff(target)?;
+        let snapshot = journal.fork_session_after_handoff(target)?;
         drop(journal);
+        let initial_resolution = if snapshot.model_identity_at(snapshot.head()).is_some() {
+            Some(self.resolve_branch_model(&snapshot, snapshot.head())?)
+        } else {
+            None
+        };
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
             let events = self.events.as_ref().expect("open session");
@@ -2240,9 +2835,14 @@ impl AgentSession {
                 return Err(Error::Cancelled);
             }
         }
+        let snapshot = self.journal()?.fork_session_after_handoff(target)?;
+        let resolution = match initial_resolution {
+            Some(resolution) => resolution,
+            None => self.resolve_branch_model(&snapshot, snapshot.head())?,
+        };
         match destination {
-            Some(path) => self.fork_to(target, path),
-            None => self.fork_at(target),
+            Some(path) => self.fork_snapshot_to(snapshot, resolution, &std::path::absolute(path)?),
+            None => self.fork_snapshot(snapshot, resolution),
         }
     }
     pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
@@ -2252,7 +2852,7 @@ impl AgentSession {
             .map_err(|_| Error::Session("session journal is in use".into()))?
             .export_jsonl(destination)
     }
-    fn fork_session(&self, session: Session) -> Result<Self> {
+    fn fork_session(&self, session: Session, resolution: BranchResolution) -> Result<Self> {
         session.retry_control().configure(
             self.session
                 .try_lock()
@@ -2262,13 +2862,38 @@ impl AgentSession {
         );
         let selection = session.model_identity_at(session.head());
         let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
-            let model = branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
-                .ok_or_else(|| {
-                    Error::Config(format!("session branch requires registered model {name}"))
-                })?;
+            let model = match &resolution {
+                BranchResolution::Legacy { client, .. }
+                | BranchResolution::Existing { client, .. }
+                | BranchResolution::Inherited { client, .. }
+                | BranchResolution::Historical { client, .. }
+                | BranchResolution::Fallback { client, .. } => Some(client.clone()),
+                BranchResolution::Registered => {
+                    branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                }
+            }
+            .ok_or_else(|| {
+                Error::Config(format!("session branch requires registered model {name}"))
+            })?;
             (provider, name, model)
         } else {
-            (None, self.model_name.clone(), self.model.clone())
+            // A fork before the first model selection still uses the source's
+            // active client. Preserve its qualified identity when it is known.
+            match &resolution {
+                BranchResolution::Legacy { model, client, .. } => {
+                    (None, model.clone(), client.clone())
+                }
+                BranchResolution::Inherited {
+                    provider,
+                    model,
+                    client,
+                } => (Some(provider.clone()), model.clone(), client.clone()),
+                _ => (
+                    self.model_provider.clone(),
+                    self.model_name.clone(),
+                    self.model.clone(),
+                ),
+            }
         };
         session
             .auto_compaction_control()
@@ -2299,6 +2924,64 @@ impl AgentSession {
                 .session_id(),
         );
         fork.registry = self.registry.clone();
+        match resolution {
+            BranchResolution::Existing {
+                provider,
+                model,
+                client,
+            }
+            | BranchResolution::Inherited {
+                provider,
+                model,
+                client,
+            }
+            | BranchResolution::Historical {
+                provider,
+                model,
+                client,
+            } => {
+                let (_, revoked) = fork.registry.commit_resolved_session_model(
+                    fork.session_id,
+                    &provider,
+                    &model,
+                    client,
+                    || Ok(()),
+                )?;
+                if revoked {
+                    return Err(Error::Config(
+                        "model client was revoked while preparing fork".into(),
+                    ));
+                }
+            }
+            BranchResolution::Fallback {
+                requested_provider,
+                requested_model,
+                provider,
+                model,
+                client,
+            } => {
+                let (_, revoked) = fork.registry.commit_resolved_session_model(
+                    fork.session_id,
+                    &provider,
+                    &model,
+                    client,
+                    || Ok(()),
+                )?;
+                if revoked {
+                    return Err(Error::Config(
+                        "model client was revoked while preparing fork".into(),
+                    ));
+                }
+                fork.model_fallback = Some(HistoricalModelFallback {
+                    requested_provider,
+                    requested_model,
+                    provider,
+                    model,
+                });
+            }
+            BranchResolution::Legacy { .. } | BranchResolution::Registered => {}
+        }
+        fork.historical_model_resolver = self.historical_model_resolver.clone();
         fork.refresh_run_config();
         *fork.pending_start.lock().expect("session startup") =
             Some((crate::SessionStartReason::Fork, self.session_file.clone()));
@@ -2307,8 +2990,15 @@ impl AgentSession {
     }
 
     pub async fn prompt(&mut self, input: impl Into<String>) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, &mut |_| {})
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
     }
     /// Submit text and images as one durable user message.
     pub async fn prompt_with_images(
@@ -2321,6 +3011,7 @@ impl AgentSession {
             Some(images),
             Uuid::new_v4(),
             true,
+            false,
             &mut |_| {},
         )
         .await
@@ -2330,11 +3021,79 @@ impl AgentSession {
         input: impl Into<String>,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, observer)
-            .await
+        self.run_input(
+            Some(input.into()),
+            None,
+            Uuid::new_v4(),
+            true,
+            false,
+            observer,
+        )
+        .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        self.run(None, Uuid::new_v4(), &mut |_| {}).await
+        let recovery = {
+            let journal = self.journal_async().await;
+            crate::agent::resumable_compaction_run(&journal)
+        };
+        let (_, startup_error) = self
+            .start_with_fallback(None, false, recovery.is_some())
+            .await?;
+        if let Some(error) = startup_error {
+            return Err(error);
+        }
+        if recovery.as_ref().is_some_and(|(_, model, _)| {
+            model
+                .as_ref()
+                .is_some_and(|model| model != &self.model_name)
+        }) {
+            return Err(Error::Session(
+                "pending compaction recovery requires its original model".into(),
+            ));
+        }
+        if let Some((run_id, _, _)) = recovery.as_ref()
+            && !self.registry.extensions.is_empty()
+        {
+            let journal = self.journal_async().await;
+            let agent = Agent {
+                model: self.model.as_ref(),
+                model_name: &self.model_name,
+                registry: &self.registry,
+                system_prompt: &self.system_prompt,
+                limits: self.limits.clone(),
+            };
+            agent
+                .settle_recovery_before_hooks(&journal, *run_id)
+                .await?;
+            return Err(Error::Session(
+                "pending compaction recovery requires reconciliation after extensions changed"
+                    .into(),
+            ));
+        }
+        let run_id = recovery.map(|(run_id, _, _)| run_id);
+        if run_id.is_none() {
+            self.drain_idle_triggers().await?;
+        }
+        let result = self
+            .run_input(
+                None,
+                None,
+                run_id.unwrap_or_else(Uuid::new_v4),
+                false,
+                true,
+                &mut |_| {},
+            )
+            .await;
+        if result.is_ok() && run_id.is_some() {
+            let unresolved = {
+                let journal = self.journal_async().await;
+                crate::agent::resumable_compaction_run(&journal).is_some()
+            };
+            if !unresolved {
+                self.start().await?;
+            }
+        }
+        result
     }
     /// A duplicate run ID follows the core's durable idempotency rules.
     pub async fn run(
@@ -2343,17 +3102,59 @@ impl AgentSession {
         run_id: Uuid,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(input, None, run_id, false, observer).await
+        self.run_input(input, None, run_id, false, false, observer)
+            .await
     }
+    /// Run with ordered provider text and reasoning item events.
+    pub async fn run_with_events(
+        &mut self,
+        input: Option<String>,
+        run_id: Uuid,
+        observer: &mut crate::AgentObserver<'_>,
+    ) -> Result<String> {
+        self.run_input_with_events(input, None, run_id, false, false, observer)
+            .await
+    }
+
     async fn run_input(
+        &mut self,
+        input: Option<String>,
+        images: Option<Vec<crate::ImageContent>>,
+        run_id: Uuid,
+        prepare: bool,
+        already_started: bool,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: crate::AgentEvent<'_>| match event {
+            crate::AgentEvent::Notification(event) => observer(event),
+            crate::AgentEvent::TextDelta { delta, .. } => observer(Notification::Text(delta)),
+            crate::AgentEvent::ReasoningDelta { delta, .. } => {
+                observer(Notification::Reasoning(delta))
+            }
+            _ => {}
+        };
+        self.run_input_with_events(
+            input,
+            images,
+            run_id,
+            prepare,
+            already_started,
+            &mut adapter,
+        )
+        .await
+    }
+    async fn run_input_with_events(
         &mut self,
         mut input: Option<String>,
         mut images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
         prepare: bool,
-        observer: &mut Observer<'_>,
+        already_started: bool,
+        observer: &mut crate::AgentObserver<'_>,
     ) -> Result<String> {
-        self.start().await?;
+        if !already_started {
+            self.start().await?;
+        }
         let journal_owner = self
             .control
             .owner
@@ -2370,10 +3171,26 @@ impl AgentSession {
         let mut input_queue = input_owner.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
-        let mut observe = |event: Notification<'_>| {
-            self.control.observe(&event);
-            emit(&events, &event);
+        let observe_event = std::sync::Mutex::new(|event: crate::AgentEvent<'_>| {
+            match &event {
+                crate::AgentEvent::Notification(notification) => {
+                    self.control.observe(notification);
+                    emit(&events, notification);
+                }
+                crate::AgentEvent::TextDelta { delta, .. } => {
+                    emit(&events, &Notification::Text(delta))
+                }
+                crate::AgentEvent::ReasoningDelta { delta, .. } => {
+                    emit(&events, &Notification::Reasoning(delta))
+                }
+                _ => {}
+            }
             observer(event);
+        });
+        let mut observe = |event: Notification<'_>| {
+            (observe_event.lock().expect("agent event observer"))(crate::AgentEvent::Notification(
+                event,
+            ))
         };
         let config = self
             .control
@@ -2417,13 +3234,15 @@ impl AgentSession {
                 let pending_trigger = journal.pending_custom_trigger();
                 if let Some(trigger_id) = pending_trigger {
                     agent
-                        .run_correlated(
+                        .run_correlated_with_events(
                             &mut journal,
                             trigger_id,
                             None,
                             &mut input_queue,
                             &active.token,
-                            &mut observe,
+                            &mut |event: crate::AgentEvent<'_>| {
+                                (observe_event.lock().expect("agent event observer"))(event)
+                            },
                         )
                         .await?;
                 }
@@ -2447,13 +3266,15 @@ impl AgentSession {
                 ));
             }
             agent
-                .run_correlated(
+                .run_correlated_with_events(
                     &mut journal,
                     run_id,
                     input,
                     &mut input_queue,
                     &active.token,
-                    &mut observe,
+                    &mut |event: crate::AgentEvent<'_>| {
+                        (observe_event.lock().expect("agent event observer"))(event)
+                    },
                 )
                 .await
         }
@@ -2723,7 +3544,7 @@ impl AgentSession {
         }
     }
     fn begin_run(&self) -> ActiveRun {
-        let token = CancellationToken::new();
+        let token = self.control.shutdown.child_token();
         *self.control.active.lock().expect("session control") = Some(token.clone());
         ActiveRun {
             token,
@@ -2947,7 +3768,18 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         },
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
-        Notification::Reasoning(text) => SessionEvent::Reasoning((*text).into()),
+        Notification::Reasoning(text) => {
+            if matches!(
+                crate::reasoning_event_metadata(),
+                Some(
+                    crate::ReasoningEventMetadata::Start { .. }
+                        | crate::ReasoningEventMetadata::End { .. }
+                )
+            ) {
+                return;
+            }
+            SessionEvent::Reasoning((*text).into())
+        }
         Notification::ToolCallDelta(delta) => SessionEvent::ToolCallDelta((*delta).clone()),
         Notification::ExtensionLifecycleError {
             extension,
@@ -3145,6 +3977,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancellation_is_inherited_by_new_runs() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let active = session.begin_run();
+        control.abort();
+        assert!(active.token.is_cancelled());
+        drop(active);
+        let next = session.begin_run();
+        assert!(!next.token.is_cancelled(), "ordinary abort is not sticky");
+        control.request_shutdown();
+        assert!(next.token.is_cancelled());
+        drop(next);
+        let after_shutdown = session.begin_run();
+        assert!(after_shutdown.token.is_cancelled());
+        drop(after_shutdown);
+        assert!(session.prompt("after shutdown").await.is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_prompt_tracks_changes_and_forks_independently() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .system_prompt("initial")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.configured_system_prompt(), "initial");
+        session.set_system_prompt("updated").unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.configured_system_prompt(), "updated");
+        fork.set_system_prompt("fork prompt").unwrap();
+        assert_eq!(session.configured_system_prompt(), "updated");
+        assert_eq!(fork.configured_system_prompt(), "fork prompt");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shared_owner_tracks_configuration_and_releases_session_resources() {
         let first: Arc<dyn Model> = Arc::new(WaitingModel);
         let mut session = SessionBuilder::new(first, "first").in_memory().unwrap();
@@ -3235,13 +4107,13 @@ mod tests {
         let waiting = session.journal_async();
         tokio::pin!(waiting);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+            platform_time::timeout(std::time::Duration::from_millis(10), &mut waiting)
                 .await
                 .is_err()
         );
         drop(guard);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            platform_time::timeout(std::time::Duration::from_secs(1), waiting)
                 .await
                 .is_ok()
         );
@@ -3534,6 +4406,38 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_model_replaces_revoked_selection_free_legacy_client() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("old")), "old")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        session
+            .set_model_with_hooks(
+                Arc::new(NamedBranchModel("new")),
+                "new",
+                serde_json::json!({"id":"new", "provider":"fixture"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("fixture"));
+        assert_eq!(session.prompt("next").await.unwrap(), "new");
+        assert!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, crate::LifecycleEvent::SessionStart { .. }))
+        );
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -4209,6 +5113,361 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inherited_model_cannot_restore_a_revoked_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            branch_client(&session.registry, session.session_id, Some("a"), "shared").is_none()
+        );
+    }
+
+    #[test]
+    fn inherited_model_reservation_does_not_restore_concurrently_revoked_binding() {
+        let registry = Arc::new(Registry::default());
+        let id = Uuid::new_v4();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("a"));
+        registry
+            .register_session_provider_model(id, "a", "shared", client.clone())
+            .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let worker_registry = registry.clone();
+        let worker_client = client.clone();
+        let worker = std::thread::spawn(move || {
+            worker_registry.commit_existing_session_model(id, "a", "shared", worker_client, || {
+                ready_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        ready_rx.recv().unwrap();
+        registry.remove_session_branch_models(id);
+        continue_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap().1);
+        assert!(branch_client(&registry, id, Some("a"), "shared").is_none());
+        assert!(
+            registry
+                .commit_existing_session_model(id, "a", "shared", client, || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_inherits_the_model_restored_during_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(old, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(session.prompt("one").await.unwrap(), "b");
+        assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkout_before_startup_inherits_registered_historical_model() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(session.prompt("one").await.unwrap(), "b");
+        assert_eq!(session.prompt("two").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_historical_model_cannot_silently_inherit_default() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("missing"), "shared", None)
+            .unwrap();
+        let original_head = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("default")), "shared")
+            .provider("default")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(session.journal().unwrap().head(), original_head);
+        assert_eq!(session.journal().unwrap().model_provider(), Some("missing"));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_current_client_is_inherited_across_transitions() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .build(journal)
+            .unwrap();
+        session
+            .journal()
+            .unwrap()
+            .select_model("model-B", None)
+            .unwrap();
+        session
+            .register_branch_model("model-B", Arc::new(NamedBranchModel("model-B")))
+            .unwrap();
+        let mut fork = session.fork_at(old).unwrap();
+        assert_eq!(fork.prompt("one").await.unwrap(), "model-B");
+        assert_eq!(fork.prompt("two").await.unwrap(), "model-B");
+        fork.close().await.unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "model-B");
+        session
+            .navigate_tree(old, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree").await.unwrap(), "model-B");
+        let mut hooked = session
+            .fork_with_hooks(old, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert_eq!(hooked.prompt("hook").await.unwrap(), "model-B");
+        hooked.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_blocks_selection_free_transitions_and_prompt() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "a")
+            .build(journal)
+            .unwrap();
+        session.checkout(old).unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        assert!(session.prompt("must not run").await.is_err());
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .fork_with_hooks(old, crate::ForkPosition::At, None)
+                .await
+                .is_err()
+        );
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn legacy_reservation_detects_revocation_and_blocks_replacement() {
+        let registry = Registry::default();
+        let id = Uuid::new_v4();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("a"));
+        registry
+            .register_session_branch_model(id, "a".into(), client.clone())
+            .unwrap();
+        let (_, revoked) = registry
+            .commit_existing_legacy_model(id, "a", client.clone(), || {
+                assert!(
+                    registry
+                        .register_session_branch_model(id, "a".into(), client.clone())
+                        .is_err()
+                );
+                registry.remove_session_branch_models(id);
+                Ok(())
+            })
+            .unwrap();
+        assert!(revoked);
+        assert!(branch_client(&registry, id, None, "a").is_none());
+        assert!(
+            registry
+                .commit_existing_legacy_model(id, "a", client, || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_journal_selection_requires_current_registered_identity() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .journal()
+            .unwrap()
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        session
+            .register_provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap();
+        let mut fork = session.fork_at(old).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "b");
+        fork.close().await.unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "b");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooked_fork_reserves_the_model_restored_during_startup() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        journal
+            .select_provider_model(Some("b"), "shared", None)
+            .unwrap();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "shared")
+            .provider("a")
+            .unwrap()
+            .provider_branch_model("b", "shared", Arc::new(ProviderBranchModel("b")))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut fork = session
+            .fork_with_hooks(old, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert_eq!(fork.journal().unwrap().model_provider(), Some("b"));
+        assert_eq!(fork.prompt("one").await.unwrap(), "b");
+        assert_eq!(fork.prompt("two").await.unwrap(), "b");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn initial_provider_selection_on_imported_head_is_atomic() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .append(crate::Event::SourceEntry {
+                format: "pi".into(),
+                entry: serde_json::json!({"type":"message"}),
+            })
+            .unwrap();
+        let head = original.head();
+        for fail_on in [1, 2] {
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
+            })
+            .unwrap();
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("provider")), "shared")
+                .provider("provider")
+                .unwrap()
+                .build(journal);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert_eq!(restored.head(), head);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(restored.head(), head + 1);
+                assert_eq!(restored.model_provider(), Some("provider"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn resolver_recovers_custom_store_handoff_before_selecting_model() {
         for registered in [false, true] {
             let mut original = Session::with_store(MemoryStore::default()).unwrap();
@@ -4365,6 +5624,1200 @@ mod tests {
         assert_eq!(session.journal().unwrap().head(), head);
         assert!(session.model_fallback().is_none());
         assert_eq!(session.prompt("test").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_resolver_restores_checkout_navigation_and_forks() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let current = journal.head();
+        let resolver = Arc::new(
+            |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                Ok(HistoricalModelResolution::Historical(Arc::new(
+                    ProviderBranchModel("historical"),
+                )))
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        let mut fork = session.fork_at(historical).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "historical");
+        fork.close().await.unwrap();
+        session.checkout(historical).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "historical");
+        session
+            .navigate_tree(current, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("current").await.unwrap(), "current");
+        session
+            .navigate_tree(historical, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_checkout_can_be_forked_again() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        session.checkout(target).unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.prompt("re-fork").await.unwrap(), "replacement");
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_resolver_direct_tree_navigation_uses_exact_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let resolver = Arc::new(
+            move |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                called.fetch_add(1, Ordering::SeqCst);
+                Ok(HistoricalModelResolution::Historical(Arc::new(
+                    ProviderBranchModel("historical"),
+                )))
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(historical, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            session
+                .journal()
+                .unwrap()
+                .model_selection()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(session.prompt("tree").await.unwrap(), "historical");
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn historical_fallback_checkout_is_one_atomic_write() {
+        for fail_on in [1, 2] {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("historical"), "shared", Some("high"))
+                .unwrap();
+            let historical = original.head();
+            original
+                .select_provider_model(Some("current"), "shared", None)
+                .unwrap();
+            let current = original.head();
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
+            })
+            .unwrap();
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("replacement")),
+                })
+            });
+            let mut session =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                    .provider("current")
+                    .unwrap()
+                    .historical_model_resolver(resolver)
+                    .build(journal)
+                    .unwrap();
+            let mut events = session.subscribe();
+            let result = session.checkout(historical);
+            let observed = std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. })));
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert!(!observed);
+                assert_eq!(restored.head(), current);
+                assert_eq!(restored.model_provider(), Some("current"));
+            } else {
+                result.unwrap();
+                assert!(observed);
+                assert_eq!(restored.model_provider(), Some("replacement"));
+                assert_eq!(restored.model_selection().unwrap().1, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_tree_summary_and_persistent_fork_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", Some("high"))
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(
+            |provider: &str, model: &str| -> Result<HistoricalModelResolution> {
+                assert_eq!((provider, model), ("historical", "shared"));
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("replacement")),
+                })
+            },
+        );
+        let hooks = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver.clone())
+            .extension(Arc::new(TreePreflightHook(hooks.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut fork = session.fork_to(historical, &fork_path).unwrap();
+        assert_eq!(fork.prompt("fork").await.unwrap(), "replacement");
+        fork.close().await.unwrap();
+        drop(fork);
+        let result = session
+            .navigate_tree(
+                historical,
+                crate::TreeNavigationOptions {
+                    summary: Some(crate::BranchSummaryOptions {
+                        instructions: None,
+                        reserve_tokens: 1024,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.summary_entry.unwrap().event,
+            crate::Event::BranchSummary {
+                fallback_model: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(session.prompt("tree").await.unwrap(), "replacement");
+        assert_eq!(&*hooks.lock().unwrap(), &["before", "after"]);
+        session.close().await.unwrap();
+        drop(session);
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .provider_branch_model(
+                "replacement",
+                "shared",
+                Arc::new(ProviderBranchModel("replacement")),
+            )
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("reopened").await.unwrap(), "replacement");
+        reopened.close().await.unwrap();
+        let mut reopened_fork =
+            SessionBuilder::new(Arc::new(ProviderBranchModel("replacement")), "shared")
+                .provider("replacement")
+                .unwrap()
+                .open(&fork_path)
+                .unwrap();
+        assert_eq!(
+            reopened_fork.prompt("reopened fork").await.unwrap(),
+            "replacement"
+        );
+        reopened_fork.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_tree_failed_transition_never_publishes_client() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let historical = original.head();
+        original
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = original.head();
+        let records = Arc::new(Mutex::new(original.records().to_vec()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let journal = Session::with_store(SeededStore {
+            records: records.clone(),
+            writes,
+            fail_on: 1,
+        })
+        .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        let mut events = session.subscribe();
+        assert!(
+            session
+                .navigate_tree(historical, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
+        assert!(
+            branch_client(
+                &session.registry,
+                session.session_id,
+                Some("replacement"),
+                "shared"
+            )
+            .is_none()
+        );
+        assert!(session.model_fallback().is_none());
+        let reopened = Session::from_records(records.lock().unwrap().clone()).unwrap();
+        assert_eq!(reopened.head(), head);
+        assert_eq!(reopened.model_provider(), Some("current"));
+    }
+
+    #[test]
+    fn historical_fallback_does_not_replace_concurrent_registration() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let session_id = journal.session_id();
+        let registry = Registry::default();
+        let concurrent = Arc::new(ProviderBranchModel("concurrent"));
+        let captured_registry = registry.clone();
+        let captured = concurrent.clone();
+        let resolver = Arc::new(
+            move |_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                captured_registry.register_session_provider_model(
+                    session_id,
+                    "replacement",
+                    "shared",
+                    captured.clone(),
+                )?;
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("resolver")),
+                })
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.checkout(target).is_err());
+        assert_eq!(session.journal().unwrap().head(), head);
+        let stored = branch_client(&registry, session_id, Some("replacement"), "shared").unwrap();
+        let concurrent: Arc<dyn Model> = concurrent;
+        assert!(Arc::ptr_eq(&stored, &concurrent));
+    }
+
+    #[test]
+    fn historical_fallback_store_can_reenter_registry_without_deadlock() {
+        struct ReentrantStore {
+            records: Vec<crate::Record>,
+            registry: Registry,
+            session_id: Uuid,
+        }
+        impl crate::SessionStore for ReentrantStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                Ok(self.records.clone())
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                assert!(
+                    self.registry
+                        .register_session_provider_model(
+                            self.session_id,
+                            "replacement",
+                            "shared",
+                            Arc::new(ProviderBranchModel("wrong"))
+                        )
+                        .is_err()
+                );
+                self.registry.register_session_provider_model(
+                    self.session_id,
+                    "other",
+                    "shared",
+                    Arc::new(ProviderBranchModel("other")),
+                )?;
+                self.records.push(record.clone());
+                Ok(())
+            }
+        }
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = original.head();
+        original
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let registry = Registry::default();
+        let journal = Session::with_store(ReentrantStore {
+            records: original.records().to_vec(),
+            registry: registry.clone(),
+            session_id: original.session_id(),
+        })
+        .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry)
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        session.checkout(target).unwrap();
+        assert_eq!(
+            session.journal().unwrap().model_provider(),
+            Some("replacement")
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_revocation_during_write_fails_closed() {
+        struct RevokingStore {
+            records: Vec<crate::Record>,
+            registry: Registry,
+            session_id: Uuid,
+        }
+        impl crate::SessionStore for RevokingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                Ok(self.records.clone())
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                self.registry.remove_session_branch_models(self.session_id);
+                self.records.push(record.clone());
+                Ok(())
+            }
+        }
+        for mode in 0..3 {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("historical"), "shared", None)
+                .unwrap();
+            let target = original.head();
+            original
+                .select_provider_model(Some("current"), "shared", None)
+                .unwrap();
+            let registry = Registry::default();
+            let journal = Session::with_store(RevokingStore {
+                records: original.records().to_vec(),
+                registry: registry.clone(),
+                session_id: original.session_id(),
+            })
+            .unwrap();
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "replacement".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("replacement")),
+                })
+            });
+            let mut builder =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                    .provider("current")
+                    .unwrap()
+                    .registry(registry)
+                    .historical_model_resolver(resolver);
+            if mode == 2 {
+                builder = builder
+                    .extension(Arc::new(TreePreflightHook(Arc::new(
+                        Mutex::new(Vec::new()),
+                    ))))
+                    .unwrap();
+            }
+            let mut session = builder.build(journal).unwrap();
+            let mut events = session.subscribe();
+            if mode != 0 {
+                session
+                    .navigate_tree(
+                        target,
+                        crate::TreeNavigationOptions {
+                            summary: (mode == 2).then_some(crate::BranchSummaryOptions {
+                                instructions: None,
+                                reserve_tokens: 1024,
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                session.checkout(target).unwrap();
+            }
+            assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. } | crate::Event::BranchSummary { fallback_model: Some(_), .. }))));
+            assert_eq!(
+                session.journal().unwrap().model_provider(),
+                Some("replacement")
+            );
+            assert!(
+                branch_client(
+                    &session.registry,
+                    session.session_id,
+                    Some("replacement"),
+                    "shared"
+                )
+                .is_none()
+            );
+            assert!(session.prompt("must not dispatch").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_tree_revocation_after_commit_keeps_success_observable() {
+        struct RevokeAfterTree(Registry, Uuid);
+        #[async_trait::async_trait]
+        impl Extension for RevokeAfterTree {
+            fn id(&self) -> &str {
+                "revoke-after-tree"
+            }
+            fn handles_tree_navigation(&self) -> bool {
+                true
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<()> {
+                if matches!(event, crate::LifecycleEvent::SessionTree { .. }) {
+                    self.0.remove_session_branch_models(self.1);
+                }
+                Ok(())
+            }
+        }
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(RevokeAfterTree(registry, id)))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut events = session.subscribe();
+        session
+            .navigate_tree(target, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, SessionEvent::Record(record) if matches!(record.event, crate::Event::BranchModelSelected { .. }))));
+        assert!(session.prompt("must not dispatch").await.is_err());
+    }
+
+    #[test]
+    fn historical_fallback_fork_conflict_does_not_publish_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("resolver")),
+            })
+        });
+        let session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .provider_branch_model(
+                "replacement",
+                "shared",
+                Arc::new(ProviderBranchModel("registered")),
+            )
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert!(session.fork_to(target, &path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn historical_fallback_partial_record_recovers_previous_branch() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let record = crate::Record {
+            version: 4,
+            id: journal.records().len() as u64 + 1,
+            parent: Some(target),
+            run_id: None,
+            timestamp: None,
+            event: crate::Event::BranchModelSelected {
+                target,
+                provider: "replacement".into(),
+                model: "shared".into(),
+            },
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        drop(journal);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes[..bytes.len() / 2]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.head(), head);
+        assert_eq!(reopened.model_provider(), Some("current"));
+        drop(reopened);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.model_provider(), Some("replacement"));
+        assert_eq!(reopened.records().last().unwrap().parent, Some(target));
+    }
+
+    #[test]
+    fn historical_fallback_summary_is_rejected_by_v3_reader() {
+        // This fixture reproduces the v3 reader's serde shape and version
+        // check: unknown BranchSummary fields are ignored before validation.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct V3Record {
+            version: u32,
+            id: u64,
+            parent: Option<u64>,
+            event: V3Event,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum V3Event {
+            Created {
+                session_id: Uuid,
+            },
+            ModelSelected {
+                model: String,
+                thinking: Option<String>,
+                provider: Option<String>,
+            },
+            BranchSummary {
+                summary: String,
+                #[serde(default)]
+                extension_summary: Option<crate::ExtensionTreeSummary>,
+                from: Option<u64>,
+                target: Option<u64>,
+                #[serde(default)]
+                usage: Option<crate::Usage>,
+                #[serde(default)]
+                usage_metadata: Option<Box<crate::SummaryUsageMetadata>>,
+                #[serde(default)]
+                read_files: Vec<String>,
+                #[serde(default)]
+                modified_files: Vec<String>,
+            },
+            SessionInfo {
+                name: Option<String>,
+                cwd: Option<String>,
+            },
+        }
+        fn read_v3(records: &[crate::Record]) -> bool {
+            let mut version = 1;
+            let mut head = 0;
+            for (index, record) in records.iter().enumerate() {
+                let Ok(old) =
+                    serde_json::from_value::<V3Record>(serde_json::to_value(record).unwrap())
+                else {
+                    return false;
+                };
+                let expected_parent = match &old.event {
+                    V3Event::BranchSummary { target, .. } => target.or((head != 0).then_some(head)),
+                    _ => (head != 0).then_some(head),
+                };
+                if !(version..=3).contains(&old.version)
+                    || old.id != index as u64 + 1
+                    || old.parent != expected_parent
+                {
+                    return false;
+                }
+                version = old.version;
+                head = old.id;
+            }
+            true
+        }
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        assert!(read_v3(session.records()));
+        let target = session.head();
+        session
+            .append(crate::Event::BranchSummary {
+                summary: "summary".into(),
+                fallback_model: Some(crate::BranchFallbackModel {
+                    provider: "new".into(),
+                    model: "shared".into(),
+                }),
+                extension_summary: None,
+                from: Some(target),
+                target: Some(target),
+                usage: None,
+                usage_metadata: None,
+                read_files: vec![],
+                modified_files: vec![],
+            })
+            .unwrap();
+        let encoded = serde_json::to_value(session.records().last().unwrap()).unwrap();
+        let parsed: V3Record = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(parsed.event, V3Event::BranchSummary { .. }));
+        assert_eq!(parsed.version, 4);
+        assert!(!read_v3(session.records()));
+        let mut downgraded = session.records().to_vec();
+        downgraded.last_mut().unwrap().version = 3;
+        assert!(Session::from_records(downgraded).is_err());
+        session
+            .append(crate::Event::SessionInfo {
+                name: None,
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(session.records().last().unwrap().version, 4);
+        assert!(Session::from_records(session.records().to_vec()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn historical_fork_recovers_handoff_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let marker = {
+            let mut journal = session.journal().unwrap();
+            journal
+                .select_provider_model(Some("current"), "shared", None)
+                .unwrap();
+            let return_to = journal.head();
+            journal
+                .append(crate::Event::TreeTriggerHandoff {
+                    run_id: Uuid::new_v4(),
+                    return_to,
+                })
+                .unwrap();
+            journal.head()
+        };
+        let mut fork = session.fork_to(marker, &path).unwrap();
+        assert!(path.exists());
+        assert_eq!(fork.prompt("fork").await.unwrap(), "current");
+        fork.close().await.unwrap();
+        drop(fork);
+        let mut reopened = Session::open(&path).unwrap();
+        assert!(reopened.recover_tree_trigger_handoff().unwrap().is_none());
+        drop(reopened);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fork_resolves_handoff_before_selecting_temporary_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let hook_path = dir.path().join("hook-fork.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("return")), "shared")
+            .provider("return")
+            .unwrap()
+            .provider_branch_model(
+                "temporary",
+                "shared",
+                Arc::new(ProviderBranchModel("temporary")),
+            )
+            .unwrap()
+            .provider_branch_model("other", "shared", Arc::new(ProviderBranchModel("other")))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let (temporary_record, unrelated) = {
+            let mut journal = session.journal().unwrap();
+            journal
+                .select_provider_model(Some("other"), "shared", None)
+                .unwrap();
+            journal
+                .append_user_with_images("unrelated".into(), vec![], None)
+                .unwrap();
+            let unrelated = journal.head();
+            journal.checkout(1).unwrap();
+            journal
+                .select_provider_model(Some("temporary"), "shared", None)
+                .unwrap();
+            journal
+                .append_user_with_images("temporary before".into(), vec![], None)
+                .unwrap();
+            let temporary = journal.head();
+            journal.checkout(1).unwrap();
+            journal
+                .select_provider_model(Some("return"), "shared", None)
+                .unwrap();
+            journal
+                .append_user_with_images("selected context".into(), vec![], None)
+                .unwrap();
+            let return_to = journal.head();
+            journal
+                .append(crate::Event::TreeTriggerHandoff {
+                    run_id: Uuid::new_v4(),
+                    return_to,
+                })
+                .unwrap();
+            journal.checkout(temporary).unwrap();
+            journal
+                .append_user_with_images("temporary after marker".into(), vec![], None)
+                .unwrap();
+            (journal.head(), unrelated)
+        };
+        let mut fork = session.fork_at(temporary_record).unwrap();
+        let context = {
+            let journal = fork.journal().unwrap();
+            format!("{:?}", journal.conversation_at(journal.head()).unwrap())
+        };
+        assert!(context.contains("selected context"));
+        assert!(!context.contains("temporary after marker"));
+        assert_eq!(fork.prompt("fork").await.unwrap(), "return");
+        fork.close().await.unwrap();
+        let mut other = session.fork_at(unrelated).unwrap();
+        assert_eq!(other.prompt("other").await.unwrap(), "other");
+        other.close().await.unwrap();
+        let mut persistent = session.fork_to(temporary_record, &path).unwrap();
+        assert_eq!(persistent.prompt("persistent").await.unwrap(), "return");
+        persistent.close().await.unwrap();
+        drop(persistent);
+        let mut reopened = SessionBuilder::new(Arc::new(ProviderBranchModel("return")), "shared")
+            .provider("return")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("reopened").await.unwrap(), "return");
+        reopened.close().await.unwrap();
+        assert_eq!(session.journal().unwrap().head(), temporary_record);
+        let mut hooked = session
+            .fork_with_hooks(temporary_record, crate::ForkPosition::At, Some(&hook_path))
+            .await
+            .unwrap();
+        assert_eq!(hooked.prompt("hooked").await.unwrap(), "return");
+        hooked.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fork_hook_positions_resolve_selected_handoff_entry() {
+        for (position, checkout_entry) in [
+            (crate::ForkPosition::Before, false),
+            (crate::ForkPosition::At, false),
+            (crate::ForkPosition::Before, true),
+            (crate::ForkPosition::At, true),
+        ] {
+            let mut session =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("return")), "shared")
+                    .provider("return")
+                    .unwrap()
+                    .provider_branch_model(
+                        "temporary",
+                        "shared",
+                        Arc::new(ProviderBranchModel("temporary")),
+                    )
+                    .unwrap()
+                    .in_memory()
+                    .unwrap();
+            let selected = {
+                let mut journal = session.journal().unwrap();
+                journal
+                    .select_provider_model(Some("temporary"), "shared", None)
+                    .unwrap();
+                let temporary = journal.head();
+                journal.checkout(1).unwrap();
+                journal
+                    .select_provider_model(Some("return"), "shared", None)
+                    .unwrap();
+                let return_to = journal.head();
+                journal
+                    .append(crate::Event::TreeTriggerHandoff {
+                        run_id: Uuid::new_v4(),
+                        return_to,
+                    })
+                    .unwrap();
+                journal.checkout(temporary).unwrap();
+                let checkout = journal.records().last().unwrap().id;
+                journal
+                    .append_user_with_images("temporary".into(), vec![], None)
+                    .unwrap();
+                if checkout_entry {
+                    checkout
+                } else {
+                    journal.head()
+                }
+            };
+            let mut fork = session
+                .fork_with_hooks(selected, position, None)
+                .await
+                .unwrap();
+            assert_eq!(fork.prompt("test").await.unwrap(), "return");
+            fork.close().await.unwrap();
+            session.close().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn historical_fork_accepts_settled_target_when_source_is_unsettled() {
+        for handoff in [false, true] {
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .select_provider_model(Some("temporary"), "shared", None)
+                .unwrap();
+            let temporary = journal.head();
+            journal.checkout(1).unwrap();
+            journal
+                .select_provider_model(Some("return"), "shared", None)
+                .unwrap();
+            let return_to = journal.head();
+            if handoff {
+                journal
+                    .append(crate::Event::TreeTriggerHandoff {
+                        run_id: Uuid::new_v4(),
+                        return_to,
+                    })
+                    .unwrap();
+            }
+            journal.checkout(temporary).unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![crate::Invocation {
+                        operation_id: Uuid::new_v4(),
+                        call: crate::ToolCall {
+                            id: "pending".into(),
+                            name: "tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let requested = if handoff { journal.head() } else { return_to };
+            let fork =
+                Session::from_records(journal.fork_records_after_handoff(requested).unwrap())
+                    .unwrap();
+            assert_eq!(fork.model_provider(), Some("return"));
+            assert!(journal.conversation_at(journal.head()).is_err());
+            assert!(journal.fork_records_after_handoff(0).is_err());
+            if !handoff {
+                assert!(journal.fork_records_after_handoff(journal.head()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn historical_fork_publish_failure_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        std::fs::write(&path, b"existing user data").unwrap();
+        let session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let target = session.journal().unwrap().head();
+        assert!(session.fork_to(target, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing user data");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            name == "fork.jsonl" || name == "fork.jsonl.lock"
+        }));
+    }
+
+    #[test]
+    fn historical_fork_publish_rejects_oversized_record_without_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut snapshot = Session::with_store(MemoryStore::default()).unwrap();
+        snapshot
+            .append(crate::Event::SourceEntry {
+                format: "fixture".into(),
+                entry: serde_json::json!({"data":"x".repeat(16 * 1024 * 1024)}),
+            })
+            .unwrap();
+        assert!(snapshot.publish_and_bind_snapshot(&path).is_err());
+        assert!(!path.exists());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "fork.jsonl.lock")
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_fork_preflights_before_hooks_and_publication() {
+        struct CountingForkHook(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Extension for CountingForkHook {
+            fn id(&self) -> &str {
+                "count-fork"
+            }
+            fn handles_session_transitions(&self) -> bool {
+                true
+            }
+            async fn before_session_transition(
+                &self,
+                _: &crate::BeforeSessionTransition,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<bool> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.jsonl");
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Unavailable)
+        });
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(CountingForkHook(hooks.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(
+            session
+                .fork_with_hooks(target, crate::ForkPosition::At, Some(&path))
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        assert_eq!(hooks.load(Ordering::SeqCst), 0);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_cancelled_tree_does_not_publish_client() {
+        struct CancelTree;
+        #[async_trait::async_trait]
+        impl Extension for CancelTree {
+            fn id(&self) -> &str {
+                "cancel-tree"
+            }
+            fn handles_tree_navigation(&self) -> bool {
+                true
+            }
+            async fn before_tree(
+                &self,
+                _: &crate::TreePreparation,
+                _: Option<&crate::ExtensionState>,
+                _: &CancellationToken,
+            ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+                Ok(Some(crate::TreeDecision {
+                    cancel: true,
+                    ..Default::default()
+                }))
+            }
+        }
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let historical = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let head = journal.head();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(CancelTree))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        assert!(matches!(
+            session
+                .navigate_tree(historical, crate::TreeNavigationOptions::default())
+                .await,
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(session.journal().unwrap().head(), head);
+        assert!(
+            branch_client(
+                &session.registry,
+                session.session_id,
+                Some("replacement"),
+                "shared"
+            )
+            .is_none()
+        );
+        assert!(session.model_fallback().is_none());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_fallback_tree_hook_trigger_uses_replacement_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("historical"), "shared", None)
+            .unwrap();
+        let target = journal.head();
+        journal
+            .select_provider_model(Some("current"), "shared", None)
+            .unwrap();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "replacement".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("replacement")),
+            })
+        });
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .extension(Arc::new(TreeLifecycleMessage))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        session
+            .navigate_tree(target, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::Assistant { content, .. } if content == "replacement")));
         session.close().await.unwrap();
     }
 
@@ -4535,6 +6988,324 @@ mod tests {
                 .provider_branch_config(session_id, "new", "shared")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn startup_fallback_rejects_conflicting_clients_before_journal_write() {
+        for source in ["default", "builder", "registry"] {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("old"), "shared", None)
+                .unwrap();
+            let head = original.head();
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on: usize::MAX,
+            })
+            .unwrap();
+            let session_id = journal.session_id();
+            let existing: Arc<dyn Model> = Arc::new(ProviderBranchModel("existing"));
+            let registry = Registry::default();
+            if source == "registry" {
+                registry
+                    .register_session_provider_model(
+                        session_id,
+                        "fallback",
+                        "shared",
+                        existing.clone(),
+                    )
+                    .unwrap();
+            }
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("resolver")),
+                })
+            });
+            let mut builder = SessionBuilder::new(existing.clone(), "shared")
+                .provider(if source == "default" {
+                    "fallback"
+                } else {
+                    "current"
+                })
+                .unwrap()
+                .registry(registry.clone())
+                .historical_model_resolver(resolver);
+            if source == "builder" {
+                builder = builder
+                    .provider_branch_model("fallback", "shared", existing.clone())
+                    .unwrap();
+            }
+            assert!(builder.build(journal).is_err(), "{source}");
+            assert_eq!(writes.load(Ordering::SeqCst), 0, "{source}");
+            assert_eq!(
+                Session::from_records(records.lock().unwrap().clone())
+                    .unwrap()
+                    .head(),
+                head
+            );
+            if source == "registry" {
+                let retained = registry
+                    .provider_branch_config(session_id, "fallback", "shared")
+                    .unwrap()
+                    .0;
+                assert!(Arc::ptr_eq(&retained, &existing));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_fallback_accepts_the_same_registered_client() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let same: Arc<dyn Model> = Arc::new(ProviderBranchModel("fallback"));
+        let returned = same.clone();
+        let resolver = Arc::new(
+            move |_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: returned.clone(),
+                })
+            },
+        );
+        let mut session = SessionBuilder::new(same, "shared")
+            .provider("fallback")
+            .unwrap()
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_fallback_preserves_registered_client_limits() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let same: Arc<dyn Model> = Arc::new(ProviderBranchModel("fallback"));
+        let limits = Limits {
+            output_tokens_per_request: 1234,
+            output_tokens_per_run: 2345,
+            ..Default::default()
+        };
+        registry
+            .register_session_provider_model_with_limits(
+                id,
+                "fallback",
+                "shared",
+                same.clone(),
+                Some(limits),
+            )
+            .unwrap();
+        let returned = same.clone();
+        let resolver = Arc::new(
+            move |_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: returned.clone(),
+                })
+            },
+        );
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver)
+            .build(journal)
+            .unwrap();
+        let (client, effective) = registry
+            .provider_branch_config(id, "fallback", "shared")
+            .unwrap();
+        assert!(Arc::ptr_eq(&client, &same));
+        let effective = effective.unwrap();
+        assert_eq!(effective.output_tokens_per_request, 1234);
+        assert_eq!(effective.output_tokens_per_run, 2345);
+        assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_fallback_reserves_binding_and_honors_reentrant_revocation() {
+        struct ReentrantStore {
+            records: Vec<crate::Record>,
+            registry: Registry,
+            session_id: Uuid,
+            revoke: bool,
+        }
+        impl crate::SessionStore for ReentrantStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                Ok(self.records.clone())
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(&record.event, crate::Event::ModelSelected { provider: Some(provider), .. } if provider == "fallback")
+                {
+                    assert!(
+                        self.registry
+                            .register_session_provider_model(
+                                self.session_id,
+                                "fallback",
+                                "shared",
+                                Arc::new(ProviderBranchModel("wrong"))
+                            )
+                            .is_err()
+                    );
+                    if self.revoke {
+                        self.registry.remove_session_branch_models(self.session_id);
+                    }
+                }
+                self.records.push(record.clone());
+                Ok(())
+            }
+        }
+        for revoke in [false, true] {
+            let mut original = Session::with_store(MemoryStore::default()).unwrap();
+            original
+                .select_provider_model(Some("old"), "shared", None)
+                .unwrap();
+            let registry = Registry::default();
+            let journal = Session::with_store(ReentrantStore {
+                records: original.records().to_vec(),
+                registry: registry.clone(),
+                session_id: original.session_id(),
+                revoke,
+            })
+            .unwrap();
+            let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+                Ok(HistoricalModelResolution::Fallback {
+                    provider: "fallback".into(),
+                    model: "shared".into(),
+                    client: Arc::new(ProviderBranchModel("fallback")),
+                })
+            });
+            let mut session =
+                SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+                    .provider("current")
+                    .unwrap()
+                    .registry(registry)
+                    .historical_model_resolver(resolver)
+                    .build(journal)
+                    .unwrap();
+            assert_eq!(
+                session.journal().unwrap().model_provider(),
+                Some("fallback")
+            );
+            if revoke {
+                assert!(
+                    branch_client(
+                        &session.registry,
+                        session.session_id,
+                        Some("current"),
+                        "shared"
+                    )
+                    .is_none()
+                );
+                assert!(
+                    branch_client(
+                        &session.registry,
+                        session.session_id,
+                        Some("fallback"),
+                        "shared"
+                    )
+                    .is_none()
+                );
+                assert!(session.prompt("no dispatch").await.is_err());
+            } else {
+                assert_eq!(session.prompt("test").await.unwrap(), "fallback");
+            }
+            session.close().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_fallback_rejects_other_session_reservation_before_write() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let records = Arc::new(Mutex::new(original.records().to_vec()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let journal = Session::with_store(SeededStore {
+            records,
+            writes: writes.clone(),
+            fail_on: usize::MAX,
+        })
+        .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "fallback".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("fallback")),
+            })
+        });
+        let builder = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver);
+        registry
+            .commit_session_model_bindings(id, vec![], None, || {
+                assert!(builder.build(journal).is_err());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn startup_fallback_rejects_other_identity_reservation_before_write() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .select_provider_model(Some("old"), "shared", None)
+            .unwrap();
+        let records = Arc::new(Mutex::new(original.records().to_vec()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let journal = Session::with_store(SeededStore {
+            records,
+            writes: writes.clone(),
+            fail_on: usize::MAX,
+        })
+        .unwrap();
+        let id = journal.session_id();
+        let registry = Registry::default();
+        let resolver = Arc::new(|_: &str, _: &str| -> Result<HistoricalModelResolution> {
+            Ok(HistoricalModelResolution::Fallback {
+                provider: "fallback".into(),
+                model: "shared".into(),
+                client: Arc::new(ProviderBranchModel("fallback")),
+            })
+        });
+        let builder = SessionBuilder::new(Arc::new(ProviderBranchModel("current")), "shared")
+            .provider("current")
+            .unwrap()
+            .registry(registry.clone())
+            .historical_model_resolver(resolver);
+        registry
+            .commit_resolved_session_model(
+                id,
+                "unrelated",
+                "shared",
+                Arc::new(ProviderBranchModel("unrelated")),
+                || {
+                    assert!(builder.build(journal).is_err());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -5265,7 +8036,7 @@ mod tests {
         };
         let mut journal = session.session.lock().await;
         let mut input_queue = session.input.lock().await;
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut journal,
@@ -5418,7 +8189,7 @@ mod tests {
         };
         let mut journal = session.session.lock().await;
         let mut input_queue = session.input.lock().await;
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut journal,
@@ -5810,7 +8581,7 @@ mod tests {
                 .build(journal)
                 .unwrap();
             let control = session.controls();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(session.start(), async {
                     if cancel_run {
                         model.entered.notified().await;
@@ -6353,7 +9124,7 @@ mod tests {
             .find(|record| matches!(record.event, crate::Event::User { .. }))
             .unwrap()
             .id;
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.navigate_tree(selected, crate::TreeNavigationOptions::default()),
         )
@@ -6753,7 +9524,7 @@ mod tests {
                 .open(&path)
                 .unwrap();
         session.prompt("first").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
             .await
             .unwrap()
             .unwrap();
@@ -6795,7 +9566,7 @@ mod tests {
                 .in_memory()
                 .unwrap();
         session.prompt("first").await.unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.compact_with_hooks(Compaction {
                 summary: "supplied".into(),
@@ -7025,7 +9796,7 @@ mod tests {
             .open(&path)
             .unwrap();
         session.prompt("first").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
             .await
             .unwrap()
             .unwrap();
@@ -7052,9 +9823,10 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
-            .await
-            .unwrap();
+        let result =
+            platform_time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+                .await
+                .unwrap();
         assert!(
             result
                 .unwrap_err()
@@ -7194,6 +9966,840 @@ mod tests {
                     usage: None,
                 }),
             ])))
+        }
+    }
+
+    struct ResumeSettlementModel {
+        summary_id: Uuid,
+        attempts: std::sync::Mutex<Vec<(Uuid, crate::UsageReport, crate::ModelMetadata)>>,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for ResumeSettlementModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            id: Uuid,
+            usage: &crate::UsageReport,
+            metadata: &crate::ModelMetadata,
+        ) -> Result<()> {
+            if id == self.summary_id {
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push((id, usage.clone(), metadata.clone()));
+                if attempts.len() == 1 {
+                    return Err(Error::RetryableModel("settlement unavailable".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_reopens_and_settles_saved_overflow_summaries() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resume.jsonl");
+            let run_id = Uuid::new_v4();
+            let turn_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            let steering_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal.select_model("fixture", None).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            let boundary = journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap()
+                .id;
+            if silent {
+                journal
+                    .append(Event::ModelRequested {
+                        model: "fixture".into(),
+                        messages: 1,
+                        tools: 0,
+                        max_output_tokens: 16,
+                        request_id: Some(turn_id),
+                        context_head: None,
+                        context_sha256: None,
+                        context_transformed: None,
+                        context_configuration_sha256: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::ModelFinished {
+                        request_id: turn_id,
+                        metadata: Default::default(),
+                        usage: crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            },
+                        },
+                        failure: None,
+                        partial: String::new(),
+                        reply: Some(RecordedReply {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            advertised_tools: vec![],
+                            max_output_tokens: 16,
+                        }),
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        usage: Some(crate::Usage {
+                            input_tokens: 1001,
+                            output_tokens: 2,
+                        }),
+                        request_id: Some(turn_id),
+                    })
+                    .unwrap();
+            }
+            journal
+                .append(Event::SourceEntry {
+                    format: if silent {
+                        "pi-rs:silent-overflow"
+                    } else {
+                        "pi-rs:overflow-recovery"
+                    }
+                    .into(),
+                    entry: serde_json::json!({"requestId":turn_id}),
+                })
+                .unwrap();
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(summary_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id: summary_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Measured {
+                        usage: crate::Usage {
+                            input_tokens: 9,
+                            output_tokens: 3,
+                        },
+                    },
+                    failure: None,
+                    partial: "saved summary".into(),
+                    reply: None,
+                })
+                .unwrap();
+            if !silent {
+                journal
+                    .append(Event::InputQueued {
+                        input: crate::QueuedInput {
+                            id: steering_id,
+                            kind: crate::InputKind::Steer,
+                            content: "after recovery".into(),
+                        },
+                    })
+                    .unwrap();
+            }
+            drop(journal);
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let limits = Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                model_requests: 2,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            };
+            // Startup would append immediate context; recovery must be
+            // classified before this callback can invalidate the summary.
+            let guarded_model = Arc::new(ResumeSettlementModel {
+                summary_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .start()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .prompt("new prompt")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending compaction recovery")
+            );
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut guarded = SessionBuilder::new(guarded_model.clone(), "default")
+                .branch_model("fixture", guarded_model.clone())
+                .unwrap()
+                .extension(Arc::new(IdleLifecycleMessages))
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                guarded
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reconciliation")
+            );
+            assert!(
+                !guarded
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(&record.event,
+                Event::CustomMessage { message, .. } if message.custom_type == "lifecycle"))
+            );
+            assert_eq!(guarded_model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(guarded_model.attempts.lock().unwrap().len(), 2);
+            guarded.close().await.unwrap();
+            drop(guarded);
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .limits(limits.clone())
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert!(
+                !session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+            drop(session);
+            let mut session = SessionBuilder::new(model.clone(), "default")
+                .branch_model("fixture", model.clone())
+                .unwrap()
+                .limits(limits)
+                .open(&path)
+                .unwrap();
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            {
+                let attempts = model.attempts.lock().unwrap();
+                assert_eq!(attempts.len(), 2);
+                assert!(attempts.iter().all(|(id, usage, metadata)| *id == summary_id && matches!(usage, crate::UsageReport::Measured { usage } if usage.input_tokens == 9 && usage.output_tokens == 3) && metadata.finish_reason.as_deref() == Some("stop")));
+            }
+            assert!(session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "saved summary")));
+            if !silent {
+                let journal = session.journal().unwrap();
+                let compacted = journal.records().iter().position(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "saved summary")).unwrap();
+                let delivered = journal.records().iter().position(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)).unwrap();
+                assert!(compacted < delivered);
+            }
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.calls.load(Ordering::SeqCst), usize::from(!silent));
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_handles_interrupted_compaction_markers_without_duplicate_requests() {
+        use crate::journal::{Event, RecordedReply, RunState};
+        for silent in [false, true] {
+            for started in [false, true] {
+                let summary_id = Uuid::new_v4();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("interrupted.jsonl");
+                let run_id = Uuid::new_v4();
+                let turn_id = Uuid::new_v4();
+                let mut journal = Session::open(&path).unwrap();
+                journal
+                    .append(Event::User {
+                        content: "old".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(Event::Assistant {
+                        content: "old reply".into(),
+                        invocations: vec![],
+                        usage: None,
+                        request_id: None,
+                    })
+                    .unwrap();
+                journal.set_run_id(Some(run_id));
+                journal
+                    .append(Event::Run {
+                        state: RunState::Running,
+                        initial: Some("new".into()),
+                    })
+                    .unwrap();
+                let boundary = journal
+                    .append(Event::User {
+                        content: "new".into(),
+                        input_id: Some(run_id),
+                    })
+                    .unwrap()
+                    .id;
+                if silent {
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(turn_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::ModelFinished {
+                            request_id: turn_id,
+                            metadata: Default::default(),
+                            usage: crate::UsageReport::Measured {
+                                usage: crate::Usage {
+                                    input_tokens: 1001,
+                                    output_tokens: 2,
+                                },
+                            },
+                            failure: None,
+                            partial: String::new(),
+                            reply: Some(RecordedReply {
+                                content: "answer".into(),
+                                invocations: vec![],
+                                advertised_tools: vec![],
+                                max_output_tokens: 16,
+                            }),
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::Assistant {
+                            content: "answer".into(),
+                            invocations: vec![],
+                            usage: Some(crate::Usage {
+                                input_tokens: 1001,
+                                output_tokens: 2,
+                            }),
+                            request_id: Some(turn_id),
+                        })
+                        .unwrap();
+                }
+                journal
+                    .append(Event::SourceEntry {
+                        format: if silent {
+                            "pi-rs:silent-overflow"
+                        } else {
+                            "pi-rs:overflow-recovery"
+                        }
+                        .into(),
+                        entry: serde_json::json!({"requestId":turn_id}),
+                    })
+                    .unwrap();
+                if started {
+                    journal.append(Event::SourceEntry { format: "pi-rs:overflow-retention-v1".into(), entry: serde_json::json!({"boundary":boundary,"keepTurns":1,"splitTurn":false}) }).unwrap();
+                    journal
+                        .append(Event::ModelRequested {
+                            model: "fixture".into(),
+                            messages: 1,
+                            tools: 0,
+                            max_output_tokens: 16,
+                            request_id: Some(summary_id),
+                            context_head: None,
+                            context_sha256: None,
+                            context_transformed: None,
+                            context_configuration_sha256: None,
+                        })
+                        .unwrap();
+                }
+                let trigger = Uuid::new_v4();
+                let steering_id = Uuid::new_v4();
+                if started && !silent {
+                    journal
+                        .append(Event::InputQueued {
+                            input: crate::QueuedInput {
+                                id: steering_id,
+                                kind: crate::InputKind::Steer,
+                                content: "queued steering".into(),
+                            },
+                        })
+                        .unwrap();
+                    journal
+                        .append(Event::CustomMessageQueued {
+                            input: crate::QueuedCustomMessage {
+                                id: trigger,
+                                delivery: crate::CustomMessageDelivery::TriggerTurn,
+                                message: crate::CustomMessage {
+                                    custom_type: "queued".into(),
+                                    content: crate::ContextContent::Text("later".into()),
+                                    display: false,
+                                    details: None,
+                                },
+                            },
+                        })
+                        .unwrap();
+                }
+                drop(journal);
+                let model = Arc::new(ResumeSettlementModel {
+                    summary_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let mut session = SessionBuilder::new(model.clone(), "fixture")
+                    .limits(Limits {
+                        context_window: if silent && !started { None } else { Some(1000) },
+                        output_tokens_per_request: 16,
+                        model_requests: 3,
+                        compaction_tokens: Some(crate::CompactionTokens {
+                            reserve_tokens: Some(0),
+                            keep_recent_tokens: None,
+                        }),
+                        ..Limits::default()
+                    })
+                    .open(&path)
+                    .unwrap();
+                if silent && started {
+                    session
+                        .controls()
+                        .set_auto_compaction_enabled(false)
+                        .unwrap();
+                }
+                if started {
+                    assert!(
+                        session
+                            .resume()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settlement unavailable")
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|r| matches!(&r.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+                }
+                let result = session.resume().await;
+                if silent {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                } else if started {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("requires reconciliation")
+                    );
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        model
+                            .attempts
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed))
+                    );
+                    assert_eq!(model.attempts.lock().unwrap().len(), 2);
+                    assert!(
+                        session
+                            .journal()
+                            .unwrap()
+                            .queued_inputs()
+                            .iter()
+                            .any(|input| input.input.id == steering_id)
+                    );
+                    assert!(!session.journal().unwrap().records().iter().any(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)));
+                    assert_eq!(
+                        session.journal().unwrap().pending_custom_trigger(),
+                        Some(trigger)
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+                }
+                session.close().await.unwrap();
+                drop(session);
+                if silent {
+                    let mut reopened = SessionBuilder::new(model.clone(), "fixture")
+                        .limits(Limits {
+                            context_window: Some(1000),
+                            output_tokens_per_request: 16,
+                            model_requests: 3,
+                            compaction_tokens: Some(crate::CompactionTokens {
+                                reserve_tokens: Some(0),
+                                keep_recent_tokens: None,
+                            }),
+                            ..Limits::default()
+                        })
+                        .open(&path)
+                        .unwrap();
+                    assert_eq!(reopened.prompt("next").await.unwrap(), "answer");
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                    {
+                        let attempts = model.attempts.lock().unwrap();
+                        if started {
+                            assert_eq!(attempts.len(), 2);
+                            assert!(attempts.iter().all(|(id, usage, _)| *id == summary_id
+                                && matches!(usage, crate::UsageReport::Unconfirmed)));
+                        } else {
+                            assert!(attempts.is_empty());
+                        }
+                    }
+                    reopened.close().await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_resume_recovers_overflow_before_marker_without_resending_turn() {
+        use crate::journal::{Event, ModelFailure, RecordedReply, RunState};
+        for length in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("before-marker.jsonl");
+            let run_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(Event::Run {
+                    state: RunState::Running,
+                    initial: Some("new".into()),
+                })
+                .unwrap();
+            // A completed compaction from an earlier turn of the same run
+            // must not hide a later pre-marker overflow.
+            journal
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-recovery".into(),
+                    entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            journal
+                .append(Event::Compacted {
+                    summary: "earlier summary".into(),
+                    system_prompt: None,
+                    retain_from: None,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "intervening turn".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::Assistant {
+                    content: "intervening answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::User {
+                    content: "new".into(),
+                    input_id: Some(run_id),
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(request_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                })
+                .unwrap();
+            journal
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: crate::ModelMetadata {
+                        finish_reason: Some(
+                            if length {
+                                "length"
+                            } else {
+                                "pi-rs:context-overflow"
+                            }
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                    usage: if length {
+                        crate::UsageReport::Measured {
+                            usage: crate::Usage {
+                                input_tokens: 20,
+                                output_tokens: 2,
+                            },
+                        }
+                    } else {
+                        crate::UsageReport::Unconfirmed
+                    },
+                    failure: (!length).then_some(ModelFailure::Failed),
+                    partial: String::new(),
+                    reply: length.then(|| RecordedReply {
+                        content: "partial".into(),
+                        invocations: vec![],
+                        advertised_tools: vec![],
+                        max_output_tokens: 16,
+                    }),
+                })
+                .unwrap();
+            drop(journal);
+            for disabled in [false, true] {
+                let gate_path = dir.path().join(format!("gate-{disabled}.jsonl"));
+                std::fs::copy(&path, &gate_path).unwrap();
+                let gate_model = Arc::new(ResumeSettlementModel {
+                    summary_id: request_id,
+                    attempts: std::sync::Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                });
+                let limits = Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: if disabled { 3 } else { 0 },
+                    ..Limits::default()
+                };
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits.clone())
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                assert!(
+                    gated
+                        .resume()
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("settlement unavailable")
+                );
+                gated.close().await.unwrap();
+                drop(gated);
+                let mut gated = SessionBuilder::new(gate_model.clone(), "fixture")
+                    .limits(limits)
+                    .open(&gate_path)
+                    .unwrap();
+                if disabled {
+                    gated.controls().set_auto_compaction_enabled(false).unwrap();
+                }
+                let _ = gated.resume().await;
+                assert_eq!(gate_model.attempts.lock().unwrap().len(), 2);
+                assert_eq!(gate_model.calls.load(Ordering::SeqCst), 0);
+                gated.close().await.unwrap();
+            }
+            let model = Arc::new(ResumeSettlementModel {
+                summary_id: request_id,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests: 3,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .open(&path)
+                .unwrap();
+            assert!(
+                session
+                    .resume()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(session.resume().await.unwrap(), "answer");
+            assert_eq!(model.attempts.lock().unwrap().len(), 2);
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                2,
+                "only summary and retry may call the model"
+            );
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+            session.close().await.unwrap();
+        }
+    }
+
+    struct SilentFailureModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for SilentFailureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            if request.messages.iter().any(|message| matches!(message, crate::Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
+                return Err(Error::Model("summary failed".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(crate::Usage {
+                        input_tokens: if call == 0 { 1001 } else { 1 },
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_compaction_failure_does_not_block_the_next_prompt() {
+        for model_requests in [1, 3] {
+            let model = Arc::new(SilentFailureModel(AtomicUsize::new(0)));
+            let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+            journal
+                .append(crate::Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .limits(Limits {
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    model_requests,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                })
+                .build(journal)
+                .unwrap();
+            assert_eq!(session.prompt("new").await.unwrap(), "answer");
+            assert!(session.journal().unwrap().records().iter().any(|record| matches!(&record.event, crate::Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+            assert_eq!(session.prompt("next").await.unwrap(), "answer");
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                if model_requests == 1 { 2 } else { 3 }
+            );
+            session.close().await.unwrap();
         }
     }
 
@@ -7339,6 +10945,94 @@ mod tests {
         }
     }
     struct InputExtension;
+
+    struct ShutdownIdleHook {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Extension for ShutdownIdleHook {
+        fn id(&self) -> &str {
+            "shutdown-idle-hook"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "shutdown-test".into(),
+                    content: crate::ContextContent::Text("trigger".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(crate::InputAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_hook_inherits_shutdown_before_and_after_registration() {
+        for shutdown_before_registration in [true, false] {
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let hook = Arc::new(ShutdownIdleHook {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                calls: AtomicUsize::new(0),
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .extension(hook.clone())
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            session.start().await.unwrap();
+            let control = session.controls();
+            let journal = if shutdown_before_registration {
+                Some(session.session.lock().await)
+            } else {
+                None
+            };
+            let submit_control = control.clone();
+            let submit = tokio::spawn(async move { submit_control.follow_up("queued").await });
+            platform_time::timeout(std::time::Duration::from_secs(3), async {
+                if shutdown_before_registration {
+                    while !control.input_order.state.lock().unwrap().busy {
+                        tokio::task::yield_now().await;
+                    }
+                } else {
+                    hook.entered.notified().await;
+                }
+            })
+            .await
+            .expect("idle submission did not reach its gate");
+            control.request_shutdown();
+            drop(journal);
+            hook.release.notify_one();
+            let result = platform_time::timeout(std::time::Duration::from_secs(3), submit)
+                .await
+                .expect("idle submission did not settle")
+                .unwrap();
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(
+                hook.calls.load(Ordering::SeqCst),
+                usize::from(!shutdown_before_registration)
+            );
+            assert_eq!(model.0.load(Ordering::SeqCst), 0);
+            session.close().await.unwrap();
+        }
+    }
 
     #[async_trait::async_trait]
     impl Extension for InputExtension {
@@ -7899,7 +11593,7 @@ mod tests {
             .open(path)
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(3), session.resume())
+            platform_time::timeout(std::time::Duration::from_secs(3), session.resume())
                 .await
                 .unwrap()
                 .unwrap(),
@@ -8213,7 +11907,7 @@ mod tests {
                 .unwrap()
                 .in_memory()
                 .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .expect("lifecycle host call deadlocked")
             .unwrap();
@@ -8296,7 +11990,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .unwrap()
             .unwrap();
@@ -8355,7 +12049,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .unwrap()
             .unwrap();
@@ -8424,7 +12118,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
             .await
             .unwrap()
             .unwrap();
@@ -8456,7 +12150,7 @@ mod tests {
             control.steer("queued user").await.unwrap();
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("prompt"), driver)
         })
         .await
@@ -8518,7 +12212,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
             .await
             .unwrap()
             .unwrap();
@@ -8594,7 +12288,7 @@ mod tests {
                 .unwrap()
                 .in_memory()
                 .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
+            platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
                 .await
                 .unwrap()
                 .unwrap();
@@ -9105,7 +12799,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
             let mut observer = |_: Notification<'_>| {};
-            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(
                     agent.run_correlated(
                         &mut session,
@@ -9240,7 +12934,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
             let mut observer = |_: Notification<'_>| {};
-            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(
                     agent.run_correlated(
                         &mut session,
@@ -9353,7 +13047,7 @@ mod tests {
         let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
         let cancel = CancellationToken::new();
         let mut observer = |_: Notification<'_>| {};
-        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut session,
@@ -9619,6 +13313,92 @@ mod tests {
                 crate::Event::TurnEndCallbacksCompleted { .. }
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn upgraded_v2_journal_recovers_new_interrupted_turn_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let mut legacy = Session::with_store(MemoryStore::default()).unwrap();
+        legacy.set_run_id(Some(Uuid::new_v4()));
+        legacy
+            .append(crate::Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let mut records = legacy.records().to_vec();
+        for record in &mut records {
+            record.version = 2;
+        }
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap() + "\n")
+            .collect::<String>();
+        std::fs::write(&path, contents).unwrap();
+
+        let new_run = Uuid::new_v4();
+        let assistant_id = {
+            let mut session = Session::open(&path).unwrap();
+            session.set_run_id(Some(new_run));
+            session
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: Some("new prompt".into()),
+                })
+                .unwrap();
+            session
+                .append(crate::Event::User {
+                    content: "new prompt".into(),
+                    input_id: Some(new_run),
+                })
+                .unwrap();
+            let assistant = session
+                .append(crate::Event::Assistant {
+                    content: "new answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            assert_eq!(assistant.version, crate::journal::TURN_END_JOURNAL_VERSION);
+            assistant.id
+        }; // Simulate interruption after the assistant record, before turn-end callbacks.
+
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(1),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = EchoModel(AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.records()[0].version, 2);
+        agent
+            .resolve_prior_turn_end(
+                &mut reopened,
+                Uuid::new_v4(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            2,
+            "only the new turn must invoke the callback"
+        );
+        assert!(reopened.records().iter().any(|record| matches!(record.event, crate::Event::TurnEndBoundaryApplied { assistant_record } if assistant_record == assistant_id)));
     }
 
     struct LegacyDeferredModel;
@@ -10074,7 +13854,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(32);
         let mut observer = |_: Notification<'_>| {};
-        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut session,
@@ -10314,7 +14094,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
             let mut observer = |_: Notification<'_>| {};
-            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(
                     agent.run_correlated(
                         &mut session,
@@ -10443,7 +14223,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
         let mut observer = |_: Notification<'_>| {};
-        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut session,
@@ -10757,7 +14537,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
             .await
             .unwrap()
             .unwrap();
@@ -10788,7 +14568,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.controls().follow_up("queued"),
         )
@@ -10876,7 +14656,7 @@ mod tests {
             .in_memory()
             .unwrap();
         let control = session.controls();
-        let (queued, prompted) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (queued, prompted) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(control.follow_up("control"), async {
                 entered.notified().await;
                 release.notify_one();
@@ -10930,7 +14710,7 @@ mod tests {
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
         session.start().await.unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             control.follow_up("queued"),
         )
@@ -10994,7 +14774,7 @@ mod tests {
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
         session.start().await.unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             control.follow_up("queued"),
         )
@@ -11024,7 +14804,7 @@ mod tests {
             .unwrap();
         let control = session.controls();
         let sender = control.clone();
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(sender.steer("input"), async {
                 notified.notified().await;
                 control.abort();
@@ -11062,7 +14842,7 @@ mod tests {
             .in_memory()
             .unwrap();
         let control = session.controls();
-        let (result, closed) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, closed) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(control.steer("input"), async {
                 notified.notified().await;
                 session.close().await
@@ -11132,7 +14912,7 @@ mod tests {
         *slot.lock().unwrap() = Some(control.clone());
         let parent = control.clone();
         let external = control.clone();
-        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (first, second) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(parent.steer("parent"), async {
                 entered.notified().await;
                 let task = tokio::spawn(async move { external.follow_up("external").await });
@@ -11215,7 +14995,7 @@ mod tests {
             let control = session.controls();
             *slot.lock().unwrap() = Some(control.clone());
             let parent = control.clone();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(parent.steer("parent"), async {
                     ready.notified().await;
                     control.abort();
@@ -11325,7 +15105,7 @@ mod tests {
             .unwrap();
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
-        tokio::time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
+        platform_time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
             .await
             .expect("spawned child deadlocked")
             .unwrap();
@@ -11356,7 +15136,7 @@ mod tests {
             .unwrap();
         let control = session.controls();
         *slot.lock().unwrap() = Some(control.clone());
-        tokio::time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
+        platform_time::timeout(std::time::Duration::from_secs(3), control.steer("parent"))
             .await
             .expect("startup child deadlocked")
             .unwrap();
@@ -11386,7 +15166,7 @@ mod tests {
             .in_memory()
             .unwrap();
         *slot.lock().unwrap() = Some(session.controls());
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.start())
+        platform_time::timeout(std::time::Duration::from_secs(3), session.start())
             .await
             .expect("explicit startup deadlocked")
             .unwrap();
@@ -11503,7 +15283,7 @@ mod tests {
             let driver = control.clone();
             let baseline_retry = control.retry.settings();
             let baseline_tokens = control.auto_compaction.token_settings();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(driver.steer("parent"), async {
                     entered.notified().await;
                     assert!(control.auto_compaction.enabled());
@@ -11629,7 +15409,7 @@ mod tests {
                 .in_memory()
                 .unwrap();
             let control = session.controls();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
                 tokio::join!(control.steer("parent"), async {
                     entered.notified().await;
                     let stale = saved.lock().unwrap().clone().unwrap();
@@ -11707,7 +15487,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        tokio::time::timeout(
+        platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.controls().steer("outer"),
         )
@@ -11749,7 +15529,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("parent"), async {
                 entered.notified().await;
                 let stale = saved.lock().unwrap().clone().unwrap();
@@ -11836,7 +15616,7 @@ mod tests {
             source: crate::InputSource::Extension,
             streaming_behavior: None,
         };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let result = platform_time::timeout(std::time::Duration::from_secs(3), async {
             let mut observer = |_: Notification<'_>| {};
             tokio::join!(
                 prepare_idle_input_with_host(
@@ -11907,7 +15687,7 @@ mod tests {
             .unwrap();
         session.prompt("first").await.unwrap();
         let target = session.journal().unwrap().head();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.fork_with_hooks(target, crate::ForkPosition::At, None),
         )
@@ -11935,7 +15715,7 @@ mod tests {
             .unwrap();
         session.prompt("first").await.unwrap();
         let target = session.journal().unwrap().head();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(3),
             session.fork_with_hooks(target, crate::ForkPosition::At, None),
         )
@@ -12262,7 +16042,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let result = tokio::time::timeout(
+        let result = platform_time::timeout(
             std::time::Duration::from_secs(2),
             session.prompt("parallel"),
         )
@@ -12440,7 +16220,7 @@ mod tests {
         let mut events = session.subscribe();
         let driver = async {
             while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
-            let removed = tokio::time::timeout(
+            let removed = platform_time::timeout(
                 std::time::Duration::from_secs(1),
                 control.clear_queued_inputs(),
             )
@@ -12481,7 +16261,7 @@ mod tests {
         control.follow_up("after compaction").await.unwrap();
         let driver = async {
             while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
-            let removed = tokio::time::timeout(
+            let removed = platform_time::timeout(
                 std::time::Duration::from_secs(1),
                 control.clear_queued_inputs(),
             )
@@ -12552,7 +16332,7 @@ mod tests {
             started.notified().await;
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(2), async {
             tokio::join!(session.prompt("cancel metadata lookup"), driver)
         })
         .await
@@ -12615,7 +16395,7 @@ mod tests {
             control.set_session_name("new name").await.unwrap();
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait"), queue)
         })
         .await
@@ -12647,7 +16427,7 @@ mod tests {
                 .unwrap();
             control.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait"), queue)
         })
         .await
@@ -12680,7 +16460,7 @@ mod tests {
             assert_eq!(queued[0].input.content, "follow-up:ACTIVE");
             controls.abort();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait"), queue)
         })
         .await
@@ -12718,7 +16498,7 @@ mod tests {
                 }
             }
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(session.prompt("wait for abort"), abort)
         })
         .await

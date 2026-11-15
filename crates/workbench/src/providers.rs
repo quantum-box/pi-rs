@@ -1,4 +1,5 @@
 //! Provider selection and shared workbench catalog and progress controls.
+use futures_util::StreamExt;
 use std::collections::BTreeMap;
 
 use pi_rs::anthropic::Anthropic;
@@ -442,6 +443,20 @@ impl Deferred {
 }
 
 impl Client {
+    /// Resolve dynamic credentials and request headers once before deciding
+    /// which affinity defaults are actually needed.
+    pub(super) async fn resolve_affinity_headers(&self) -> Result<(Self, HeaderMap)> {
+        match self {
+            Self::Deferred(deferred) => deferred.resolve_with_headers().await,
+            Self::Ollama(client) => Ok((self.clone(), client.context_headers())),
+            Self::Anthropic(client) => Ok((self.clone(), client.context_headers())),
+            Self::Google(client) => Ok((self.clone(), client.context_headers())),
+            Self::OpenAi(client) => Ok((self.clone(), client.context_headers())),
+            Self::PiMessages(client) => Ok((self.clone(), client.context_headers())),
+            _ => Ok((self.clone(), HeaderMap::new())),
+        }
+    }
+
     pub fn deferred(
         provider: Provider,
         adapter: Adapter,
@@ -549,6 +564,7 @@ impl Client {
         request: ModelRequest,
         defaults: &HeaderMap,
         cache_disabled: bool,
+        session_cache_key: Option<&str>,
     ) -> Result<ModelStream> {
         match self {
             Self::Ollama(client) if cache_disabled => {
@@ -564,6 +580,16 @@ impl Client {
                     .with_default_headers(defaults)
                     .stream(request)
                     .await
+            }
+            Self::OpenAi(client) => {
+                let client = if cache_disabled {
+                    client.clone().without_cache()
+                } else if let Some(key) = session_cache_key {
+                    client.clone().with_session_cache_key(key)
+                } else {
+                    client.clone()
+                };
+                client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
@@ -594,10 +620,63 @@ impl Client {
                     request,
                     defaults,
                     cache_disabled,
+                    session_cache_key,
                 ))
                 .await
             }
             _ => self.stream(request).await,
+        }
+    }
+
+    pub async fn stream_enriched_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+        cache_disabled: bool,
+        session_cache_key: Option<&str>,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        match self {
+            Self::OpenAi(client) => {
+                if cache_disabled {
+                    client
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else if let Some(key) = session_cache_key {
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            key,
+                            request,
+                        )
+                        .await
+                } else {
+                    let stream = client.stream(request).await?;
+                    Ok(Box::pin(
+                        stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                    ))
+                }
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(client.resolve().await?.stream_enriched_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                    session_cache_key,
+                ))
+                .await
+            }
+            _ => {
+                let stream = self
+                    .stream_with_headers(request, defaults, cache_disabled, session_cache_key)
+                    .await?;
+                Ok(Box::pin(
+                    stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
+                ))
+            }
         }
     }
 
@@ -747,7 +826,7 @@ impl Client {
                     .chat_compatibility(&args.provider, configured.as_ref());
                 let client = client.with_chat_compatibility(
                     compatibility,
-                    configured.as_ref().and_then(|model| model.reasoning),
+                    super::thinking::adopted_reasoning(args),
                     thinking.is_some_and(|level| level != "off"),
                     configured
                         .as_ref()
@@ -756,7 +835,14 @@ impl Client {
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();
-                Self::Ollama(client.with_sampling(sampling)?)
+                Self::Ollama(
+                    client
+                        .with_thinking_budgets(
+                            thinking,
+                            args.settings.value().get("thinkingBudgets").cloned(),
+                        )
+                        .with_sampling(sampling)?,
+                )
             }
             Self::Anthropic(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
@@ -764,10 +850,6 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
-                let gateway = matches!(
-                    args.provider.id(),
-                    "fireworks" | "openrouter" | "vercel-ai-gateway"
-                );
                 let mut client = client
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
@@ -778,21 +860,35 @@ impl Client {
                     client =
                         client.with_empty_thinking_signature(metadata.allows_empty_signature());
                     let adaptive = metadata.adaptive_thinking();
-                    if metadata.reasoning == Some(true) && (gateway || adaptive.is_some()) {
+                    if metadata.reasoning == Some(true) {
+                        // Messages-compatible gateways need not implement Anthropic's
+                        // Models API. Keep their configured capabilities local.
+                        if args.provider.id() != "anthropic" {
+                            client = client.with_context_probe(false);
+                        }
                         let selected = thinking.unwrap_or("off");
                         let mapped = metadata.mapped_effort(selected);
                         if selected == "off" && mapped == Some(None) {
                             client = client.with_thinking(None);
                         } else {
-                            let effort = mapped
-                                .flatten()
-                                .filter(|_| selected != "off")
-                                .unwrap_or(selected);
-                            client = client.with_configured_thinking(
-                                effort,
-                                adaptive.unwrap_or(false),
-                                true,
-                            );
+                            let effort = if adaptive == Some(true) && selected != "off" {
+                                mapped.flatten().unwrap_or(if selected == "minimal" {
+                                    "low"
+                                } else {
+                                    selected
+                                })
+                            } else {
+                                selected
+                            };
+                            client = if adaptive.is_some() || metadata.has_thinking_level_map() {
+                                client.with_configured_thinking(
+                                    effort,
+                                    adaptive.unwrap_or(false),
+                                    true,
+                                )
+                            } else {
+                                client.with_fallback_thinking(effort, false, true)
+                            };
                             if matches!(args.provider.id(), "minimax" | "minimax-cn")
                                 && args.model == "MiniMax-M3"
                             {
@@ -878,7 +974,11 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
+                let (supports_long, explicit_cache) = args
+                    .model_profiles
+                    .responses_cache_support(&args.provider, metadata.as_ref());
                 let client = client
+                    .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_thinking(thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
@@ -934,25 +1034,31 @@ impl Client {
         })
     }
 
-    pub async fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {
+    pub async fn thinking_levels(
+        &self,
+        model: &str,
+    ) -> Option<(Option<Vec<String>>, Option<bool>)> {
         match self {
             Self::Ollama(client) => {
-                client
-                    .model_details(&[model.into()])
-                    .await
-                    .remove(model)?
-                    .thinking_levels
+                let details = client.model_details(&[model.into()]).await.remove(model)?;
+                (details.thinking_levels.is_some() || details.reasoning.is_some())
+                    .then_some((details.thinking_levels, details.reasoning))
             }
-            Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
-            Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
+            Self::Anthropic(client) => client
+                .model(model)
+                .await
+                .filter(|entry| entry.has_known_thinking())
+                .map(|entry| (Some(entry.thinking_levels), entry.reasoning)),
+            Self::Google(client) => client
+                .model(model)
+                .await
+                .map(|entry| (Some(entry.thinking_levels), Some(entry.reasoning))),
             Self::PiMessages(client) => {
-                client
-                    .model_details(&[model.into()])
-                    .await
-                    .remove(model)?
-                    .thinking_levels
+                let details = client.model_details(&[model.into()]).await.remove(model)?;
+                (details.thinking_levels.is_some() || details.reasoning.is_some())
+                    .then_some((details.thinking_levels, details.reasoning))
             }
-            Self::OpenAi(_) => Some(pi_rs::openai::thinking_levels(model)),
+            Self::OpenAi(_) => Some((Some(pi_rs::openai::thinking_levels(model)), None)),
             Self::Bedrock(_) => None,
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await
@@ -1029,7 +1135,7 @@ impl Model for Client {
             Self::OpenAi(client) => client.stream(request).await,
             Self::Bedrock(client) => client.stream(request).await,
             Self::Deferred(_) => {
-                self.stream_with_headers(request, &HeaderMap::new(), false)
+                self.stream_with_headers(request, &HeaderMap::new(), false, None)
                     .await
             }
         }
@@ -2019,7 +2125,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), true)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), true, None)
                 .await
                 .unwrap();
             args.model = "anthropic.claude-opus-4-8".into();
@@ -2028,7 +2134,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             for (model, level) in [
@@ -2042,7 +2148,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2058,7 +2164,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2069,7 +2175,7 @@ mod bedrock_tests {
                 .with_model_options(&args, false)
                 .unwrap();
             let _stream = client
-                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.model_profiles = super::super::model_profiles::Profiles::parse(
@@ -2092,7 +2198,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false, None)
                     .await
                     .unwrap();
             }
@@ -2103,7 +2209,7 @@ mod bedrock_tests {
                     .with_model_options(&args, false)
                     .unwrap();
                 let _stream = client
-                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                     .await
                     .unwrap();
             }
@@ -2115,7 +2221,7 @@ mod bedrock_tests {
                         .with_model_options(&args, false)
                         .unwrap();
                     let _stream = client
-                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary, None)
                         .await
                         .unwrap();
                 }
@@ -2136,7 +2242,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let _stream = client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
                 .unwrap();
             args.thinking = Some("low".into());
@@ -2146,7 +2252,7 @@ mod bedrock_tests {
             let mut req = request(&args.model);
             req.max_output_tokens = 8192;
             let error = match client
-                .stream_with_headers(req, &HeaderMap::new(), false)
+                .stream_with_headers(req, &HeaderMap::new(), false, None)
                 .await
             {
                 Ok(_) => panic!("invalid selected budget accepted"),
