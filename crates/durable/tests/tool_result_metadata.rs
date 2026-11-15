@@ -114,10 +114,10 @@ impl Hook for Observe {
             .lock()
             .unwrap()
             .push(ctx.snapshot["tool_results"].clone());
-        if call.name == "detailed" {
-            if let Some(cancel) = &self.cancel {
-                cancel.cancel();
-            }
+        if call.name == "detailed"
+            && let Some(cancel) = &self.cancel
+        {
+            cancel.cancel();
         }
         Ok(None)
     }
