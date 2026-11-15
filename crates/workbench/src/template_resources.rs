@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use pi_rs::{Error, Result};
 
 const MAX_FILES: usize = 128;
+const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Explicitly granted template files. No directory scanning or implicit reads
@@ -25,6 +26,54 @@ pub struct PromptTemplate {
 }
 
 impl TemplateReadGrants {
+    /// Load explicitly granted files and then the direct `.md` files in each
+    /// explicitly granted directory. Directory order follows the caller's
+    /// list; entries within a directory are sorted by path. Hidden files and
+    /// symlinks to files are included. Nested directories are never traversed.
+    /// The grant follows symlinks and is not a filesystem sandbox. A read or
+    /// scan failure rejects the whole snapshot, as do duplicate names and limits.
+    pub fn load_with_directories(&self, directories: &[PathBuf]) -> Result<Vec<PromptTemplate>> {
+        if directories.len() > MAX_FILES || self.files.len() > MAX_FILES {
+            return Err(Error::Config("too many prompt template paths".into()));
+        }
+        let mut files = self.files.clone();
+        let mut examined = 0usize;
+        for directory in directories {
+            let mut entries = Vec::new();
+            for item in std::fs::read_dir(directory)? {
+                examined += 1;
+                if examined > MAX_DIRECTORY_ENTRIES {
+                    return Err(Error::Config("too many prompt directory entries".into()));
+                }
+                let entry = item?;
+                let path = entry.path();
+                let dot_md = path.file_name().is_some_and(|name| name == ".md");
+                if !dot_md && path.extension().is_none_or(|ext| ext != "md") {
+                    continue;
+                }
+                let kind = entry.file_type()?;
+                let is_file = if kind.is_symlink() {
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) => metadata.is_file(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    kind.is_file()
+                };
+                if is_file {
+                    if files.len() + entries.len() >= MAX_FILES {
+                        return Err(Error::Config("too many prompt templates".into()));
+                    }
+                    entries.push(path);
+                }
+            }
+            entries.sort();
+            files.extend(entries);
+        }
+        TemplateReadGrants { files }.load()
+    }
+
     /// Read each granted file in order. Any error rejects the whole snapshot.
     /// Reads are synchronous and must be kept off a UI thread.
     pub fn load(&self) -> Result<Vec<PromptTemplate>> {
@@ -39,7 +88,6 @@ impl TemplateReadGrants {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".md"))
-                .filter(|name| !name.is_empty())
                 .ok_or_else(|| {
                     Error::Config("prompt template must have a UTF-8 .md filename".into())
                 })?;

@@ -6,6 +6,8 @@ mod context;
 mod context_fingerprint;
 mod context_replay;
 mod extension;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod host_auth;
 mod journal;
 mod lifecycle;
 mod model_catalog;
@@ -24,6 +26,8 @@ pub use context::*;
 pub use context_fingerprint::protected_model_fingerprint;
 pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use host_auth::*;
 pub use journal::*;
 pub use lifecycle::{
     BeforeSessionTransition, CompactionReason, ExtensionTreeSummary, ForkPosition, LifecycleEvent,

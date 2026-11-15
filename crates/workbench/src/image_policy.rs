@@ -464,8 +464,22 @@ mod tests {
             for enriched in [false, true] {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let address = listener.local_addr().unwrap();
+                listener.set_nonblocking(true).unwrap();
                 let server = std::thread::spawn(move || {
-                    let (mut socket, _) = listener.accept().unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                         .unwrap();
@@ -554,6 +568,107 @@ mod tests {
                     expected.as_deref()
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_session_headers_respect_explicit_values_and_summary_boundary() {
+        use std::io::{Read, Write};
+        for (summary, explicit, enriched) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut block = [0; 2048];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                String::from_utf8(bytes).unwrap().to_ascii_lowercase()
+            });
+            let mut headers = HeaderMap::new();
+            if explicit {
+                headers.insert("session-id", "explicit".parse().unwrap());
+            }
+            let model = WorkbenchModel {
+                client: Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(
+                        &format!("http://{address}/responses"),
+                        "fixture".into(),
+                    )
+                    .unwrap()
+                    .with_headers(headers),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: &["session-id", "x-client-request-id"],
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            match (summary, enriched) {
+                (true, true) => {
+                    let _ = model
+                        .stream_enriched_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                }
+                (true, false) => {
+                    let _ = model
+                        .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                        .await;
+                }
+                (false, true) => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            "session-one",
+                            request,
+                        )
+                        .await;
+                }
+                (false, false) => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            "session-one",
+                            request,
+                        )
+                        .await;
+                }
+            }
+            let headers = server.join().unwrap();
+            assert_eq!(
+                headers.contains("x-client-request-id: session-one\r\n"),
+                !summary
+            );
+            assert_eq!(
+                headers.contains("session-id: session-one\r\n"),
+                !summary && !explicit
+            );
+            assert_eq!(headers.contains("session-id: explicit\r\n"), explicit);
         }
     }
 

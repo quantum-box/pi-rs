@@ -94,12 +94,55 @@ struct Branch {
     entry_start: u64,
     context_target: Option<u64>,
     calls: BTreeMap<String, Uuid>,
+    ambiguous_calls: std::collections::BTreeSet<String>,
     missing_ancestors: bool,
+    ancestry_index: usize,
     model: String,
     provider: Option<String>,
     thinking: Option<String>,
     store: BTreeMap<String, Value>,
 }
+// Source entries form an append-only forest. Binary lifting lets repeated
+// compactions validate their retained boundary without scanning the branch.
+struct SourceAncestry {
+    nodes: Vec<(usize, Vec<usize>)>,
+}
+impl Default for SourceAncestry {
+    fn default() -> Self {
+        Self {
+            nodes: vec![(0, Vec::new())],
+        }
+    }
+}
+impl SourceAncestry {
+    fn add(&mut self, parent: usize) -> usize {
+        let mut jumps = vec![parent];
+        while let Some(next) = self.nodes[*jumps.last().unwrap()].1.get(jumps.len() - 1) {
+            jumps.push(*next);
+        }
+        let index = self.nodes.len();
+        self.nodes.push((self.nodes[parent].0 + 1, jumps));
+        index
+    }
+
+    fn is_ancestor(&self, ancestor: usize, mut node: usize) -> bool {
+        let (ancestor_depth, node_depth) = (self.nodes[ancestor].0, self.nodes[node].0);
+        if ancestor_depth > node_depth {
+            return false;
+        }
+        let mut difference = node_depth - ancestor_depth;
+        let mut bit = 0;
+        while difference != 0 {
+            if difference & 1 != 0 {
+                node = self.nodes[node].1[bit];
+            }
+            difference >>= 1;
+            bit += 1;
+        }
+        node == ancestor
+    }
+}
+
 struct Importer {
     records: Vec<Record>,
     timestamp: Option<String>,
@@ -387,6 +430,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         importer.append(&mut root, Event::ParentSession { path: path.into() });
     }
     let mut branches = BTreeMap::<String, Branch>::new();
+    let mut ancestry = SourceAncestry::default();
     let mut previous = None;
     let mut legacy_ids: Vec<String> = Vec::new();
     let entry_count = entries.len();
@@ -458,9 +502,10 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 converted_entry = Some(migrated);
             }
         }
-        if entry["type"] == "compaction"
+        let converted = converted_entry.as_ref().unwrap_or(&entry);
+        if converted["type"] == "compaction"
             && (branch.missing_ancestors
-                || entry["firstKeptEntryId"]
+                || converted["firstKeptEntryId"]
                     .as_str()
                     .and_then(|target| branches.get(target))
                     .is_some_and(|target| target.missing_ancestors))
@@ -469,11 +514,17 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 "cannot import compaction involving an orphaned branch".into(),
             ));
         }
-        let events = convert(
-            converted_entry.as_ref().unwrap_or(&entry),
-            &mut branch,
-            &branches,
-        )?;
+        if converted["type"] == "compaction"
+            && let Some(target) = converted["firstKeptEntryId"].as_str()
+            && let Some(target_branch) = branches.get(target)
+            && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
+        {
+            return Err(Error::Session(format!(
+                "imported compaction target {target} is outside its branch"
+            )));
+        }
+        let parent_ancestry = branch.ancestry_index;
+        let events = convert(converted, &mut branch, &branches)?;
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
             .then(|| {
@@ -502,6 +553,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                     | Event::Assistant { .. }
                     | Event::ToolFinished { .. }
                     | Event::ToolReconciled { .. }
+                    | Event::ImportedUnattributedToolResult { .. }
             );
             let id = importer.append(&mut branch, event);
             if is_compaction && let Some(metadata) = &extra_compaction_metadata {
@@ -511,6 +563,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 branch.context_target = Some(id);
             }
         }
+        branch.ancestry_index = ancestry.add(parent_ancestry);
         branches.insert(id.clone(), branch);
         legacy_ids.push(id.clone());
         previous = Some(id);
@@ -749,16 +802,22 @@ fn convert(
                         _ => None,
                     };
                     let mut invocations = Vec::new();
+                    let mut current_ids = std::collections::BTreeSet::new();
                     if failure.is_none()
                         && let Some(blocks) = message["content"].as_array()
                     {
                         for block in blocks.iter().filter(|block| block["type"] == "toolCall") {
                             let id = required(block, "id")?.to_owned();
                             let operation_id = Uuid::new_v4();
-                            if branch.calls.insert(id.clone(), operation_id).is_some() {
+                            if !current_ids.insert(id.clone()) {
                                 return Err(Error::Session(format!(
                                     "duplicate unfinished imported tool call {id}"
                                 )));
+                            }
+                            // A result with a reused unfinished ID cannot be attributed
+                            // safely. Preserve both operations for reconciliation.
+                            if branch.calls.insert(id.clone(), operation_id).is_some() {
+                                branch.ambiguous_calls.insert(id.clone());
                             }
                             invocations.push(Invocation {
                                 operation_id,
@@ -849,9 +908,6 @@ fn convert(
                 "toolResult" => {
                     append_imported_usage(&mut events, &message["usage"]);
                     let id = required(message, "toolCallId")?;
-                    let operation_id = branch.calls.remove(id).ok_or_else(|| {
-                        Error::Session(format!("imported tool result has no call {id}"))
-                    })?;
                     let (text, images) = user_content(&message["content"])?;
                     let outcome = if !images.is_empty() {
                         let data = serde_json::json!({"content":message["content"],"isError":message["isError"] == true});
@@ -871,7 +927,7 @@ fn convert(
                         }
                     } else if message["isError"] == true {
                         Outcome::TextResult {
-                            output: text,
+                            output: text.clone(),
                             details: message.get("details").cloned(),
                             is_error: true,
                         }
@@ -879,17 +935,55 @@ fn convert(
                         message.get("details").filter(|details| !details.is_null())
                     {
                         Outcome::SucceededWithDetails {
-                            output: text,
+                            output: text.clone(),
                             details: details.clone(),
                         }
                     } else {
-                        Outcome::Succeeded(text)
+                        Outcome::Succeeded(text.clone())
                     };
-                    events.push(Event::ToolFinished {
-                        operation_id,
-                        outcome,
-                        states: Default::default(),
-                    });
+                    if branch.ambiguous_calls.contains(id) {
+                        let content = if let Some(blocks) = message["content"].as_array() {
+                            pi_rs::ContextContent::Blocks(
+                                blocks
+                                    .iter()
+                                    .filter_map(|block| match block["type"].as_str() {
+                                        Some("text") => Some(pi_rs::ContentBlock::Text {
+                                            text: block["text"].as_str().unwrap_or_default().into(),
+                                            text_signature: block["textSignature"]
+                                                .as_str()
+                                                .map(str::to_owned),
+                                        }),
+                                        Some("image") => Some(pi_rs::ContentBlock::Image {
+                                            data: block["data"].as_str().unwrap_or_default().into(),
+                                            mime_type: block["mimeType"]
+                                                .as_str()
+                                                .unwrap_or_default()
+                                                .into(),
+                                        }),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            pi_rs::ContextContent::Text(text.clone())
+                        };
+                        events.push(Event::ImportedUnattributedToolResult {
+                            call_id: id.into(),
+                            tool_name: message["toolName"].as_str().unwrap_or_default().into(),
+                            content,
+                            is_error: message["isError"] == true,
+                            details: message.get("details").cloned(),
+                        });
+                    } else {
+                        let operation_id = branch.calls.remove(id).ok_or_else(|| {
+                            Error::Session(format!("imported tool result has no call {id}"))
+                        })?;
+                        events.push(Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            states: Default::default(),
+                        });
+                    }
                 }
                 "custom" | "hookMessage" => events.push(Event::CustomMessage {
                     message: imported_custom_message(message, true)?,
@@ -1729,6 +1823,188 @@ mod tests {
     }
 
     #[test]
+    fn imported_tool_call_ids_can_be_reused_after_a_new_turn() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"same","name":"read","arguments":{"path":"old"}}]}}),
+            json!({"type":"message","id":"u","parentId":"a","message":{"role":"user","content":"retry"}}),
+            json!({"type":"message","id":"b","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","id":"same","name":"read","arguments":{"path":"new"}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"same","content":[{"type":"text","text":"new result"}],"isError":false}}),
+        ]).unwrap();
+        let starts: Vec<_> = session
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolStarted { operation_id } => Some(*operation_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert!(!session.records().iter().any(|r| matches!(&r.event,
+            Event::ToolFinished { operation_id, .. } if *operation_id == starts[1])));
+        assert!(session.records().iter().any(|r| matches!(&r.event,
+            Event::SourceEntry { entry, .. } if entry["id"] == "r")));
+        assert!(!session.records().iter().any(|r| matches!(&r.event,
+            Event::ToolFinished { operation_id, .. } if *operation_id == starts[0])));
+    }
+
+    #[test]
+    fn imported_assistant_can_reuse_call_id_but_duplicate_in_one_message_fails() {
+        let assistant = |id: &str, parent: Value, calls: Value| json!({"type":"message","id":id,"parentId":parent,"message":{"role":"assistant","content":calls}});
+        let call = json!({"type":"toolCall","id":"same","name":"read","arguments":{}});
+        let header = json!({"type":"session","version":3});
+        assert!(
+            import_pi(vec![
+                header.clone(),
+                assistant("a", Value::Null, json!([call.clone()])),
+                assistant("b", json!("a"), json!([call.clone()])),
+            ])
+            .is_ok()
+        );
+        assert!(
+            import_pi(vec![
+                header,
+                assistant("a", Value::Null, json!([call.clone(), call])),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reused_unfinished_ids_leave_all_ambiguous_results_unresolved() {
+        for second_name in ["write", "read"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+                json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":second_name,"arguments":{}}]}}),
+                json!({"type":"message","id":"r1","parentId":"b","message":{"role":"toolResult","toolCallId":"x","toolName":"write","content":[{"type":"text","text":"first"}]}}),
+                json!({"type":"message","id":"r2","parentId":"r1","message":{"role":"toolResult","toolCallId":"x","toolName":second_name,"content":[{"type":"text","text":"second"}]}}),
+            ]).unwrap();
+            assert_eq!(
+                session
+                    .records()
+                    .iter()
+                    .filter(|r| matches!(r.event, Event::ToolStarted { .. }))
+                    .count(),
+                2
+            );
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+            );
+            for id in ["r1", "r2"] {
+                assert!(session.records().iter().any(
+                    |r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == id)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_tool_result_is_visible_and_editable_without_settling_calls() {
+        let base = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"x","toolName":"write","content":[{"type":"text","text":"original result"}],"isError":true}}),
+        ];
+        let session = import_pi(base.clone()).unwrap();
+        assert!(super::super::sessions::html(&session).contains("original result"));
+        assert!(super::super::sessions::html(&session).contains("Unattributed tool result"));
+        let (visible, _) = super::super::rpc_messages::snapshot(&session);
+        assert!(visible.iter().any(|v| v["role"] == "user"
+            && v["nativeUnattributed"] == true
+            && v["content"].to_string().contains("original result")
+            && v["content"].to_string().contains(", error)")));
+        assert!(!visible.iter().any(|v| v["role"] == "toolResult"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopened.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(super::super::sessions::html(&reopened).contains("original result"));
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+        );
+        let mut reconciled = import_pi(base.clone()).unwrap();
+        let operation_ids: Vec<_> = reconciled
+            .operations()
+            .into_iter()
+            .map(|(invocation, _)| invocation.operation_id)
+            .collect();
+        for operation_id in operation_ids {
+            reconciled
+                .reconcile(
+                    operation_id,
+                    pi_rs::Outcome::Succeeded("confirmed separately".into()),
+                )
+                .unwrap();
+        }
+        assert!(reconciled.conversation_at(reconciled.head()).unwrap().iter().any(
+            |m| matches!(m, pi_rs::Message::User { content } if content.contains("original result") && content.contains(", error)"))
+        ));
+        let mut success = base.clone();
+        success[3]["message"]["isError"] = json!(false);
+        let success = import_pi(success).unwrap();
+        assert!(success.current_messages().iter().any(
+            |m| matches!(m, pi_rs::Message::User { content } if content.contains(", success)"))
+        ));
+        let mut edited = base.clone();
+        edited.push(json!({"type":"context_edit","id":"e","parentId":"r","targetId":"r","replacement":{"content":[{"type":"text","text":"replacement"}]}}));
+        let edited = import_pi(edited).unwrap();
+        let (edited_visible, _) = super::super::rpc_messages::snapshot(&edited);
+        assert!(edited_visible.iter().any(|v| v["role"] == "user"
+            && v["nativeUnattributed"] == true
+            && v["content"].to_string().contains("replacement")
+            && v["content"].to_string().contains(", error)")));
+        assert!(!edited_visible.iter().any(|v| v["role"] == "toolResult"));
+        assert!(edited.current_messages().iter().any(|m| matches!(m, pi_rs::Message::User { content } if content.contains("Historical unattributed") && content.contains("replacement"))));
+        let mut omitted = base;
+        omitted.push(json!({"type":"context_edit","id":"e","parentId":"r","targetId":"r","replacement":null}));
+        let omitted = import_pi(omitted).unwrap();
+        assert!(!omitted.current_messages().iter().any(|m| matches!(m, pi_rs::Message::User { content } if content.contains("Historical unattributed"))));
+    }
+
+    #[test]
+    fn large_unattributed_result_survives_native_export_and_reopen() {
+        let large = "x".repeat(7 * 1024 * 1024);
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"x","content":[{"type":"text","text":large}]}}),
+        ]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(reopened.records().iter().any(|r| matches!(&r.event,
+            Event::ImportedUnattributedToolResult { content: pi_rs::ContextContent::Blocks(blocks), .. }
+                if matches!(&blocks[0], pi_rs::ContentBlock::Text { text, .. } if text.len() == 7 * 1024 * 1024))));
+    }
+
+    #[test]
+    fn imported_late_tool_result_still_matches_without_reuse() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"u","parentId":"a","message":{"role":"user","content":"interrupt"}}),
+            json!({"type":"message","id":"r","parentId":"u","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"late"}],"isError":false}}),
+        ]).unwrap();
+        assert!(
+            session
+                .records()
+                .iter()
+                .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+        );
+    }
+
+    #[test]
     fn missing_parent_import_preserves_orphan_branch_and_source() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
@@ -1776,6 +2052,103 @@ mod tests {
         let path = directory.path().join("reopened.jsonl");
         session.export_jsonl(&path).unwrap();
         check(&read(&path).unwrap());
+    }
+
+    #[test]
+    fn compaction_rejects_boundary_from_another_complete_branch() {
+        let header = json!({"type":"session","version":3});
+        let first = json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"first"}});
+        let second = json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other branch"}});
+        let compact = json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100});
+        let error = match import_pi(vec![header, first, second, compact]) {
+            Ok(_) => panic!("cross-branch compaction was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("outside its branch"));
+    }
+
+    #[test]
+    fn compaction_ancestor_and_self_boundaries_keep_rpc_identity_after_reopen() {
+        for target in ["a", "b", "c"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"before"}}),
+                json!({"type":"thinking_level_change","id":"b","parentId":"a","thinkingLevel":"off"}),
+                json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":target,"summary":"summary","tokensBefore":100}),
+            ]).unwrap();
+            let check = |session: &pi_rs::Session| {
+                let target_record = session
+                    .records()
+                    .iter()
+                    .find(|record| {
+                        matches!(&record.event,
+                    Event::SourceEntry { entry, .. } if entry["id"] == target)
+                    })
+                    .unwrap();
+                let projected = super::super::rpc_entries::Entries::new(session)
+                    .after(None)
+                    .unwrap();
+                let compaction = projected["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["type"] == "compaction")
+                    .unwrap();
+                assert_eq!(compaction["firstKeptEntryId"], target_record.id.to_string());
+                let messages = session.current_messages();
+                assert!(messages.iter().any(|message| matches!(message, pi_rs::Message::User { content } if content.contains("summary"))));
+                assert_eq!(messages.iter().any(|message| matches!(message, pi_rs::Message::User { content } if content == "before")), target == "a");
+            };
+            check(&session);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            session.export_jsonl(&path).unwrap();
+            check(&read(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn source_ancestry_matches_parent_walk_for_branched_forest() {
+        let mut index = SourceAncestry::default();
+        let mut parents = vec![0];
+        for child in 1..512 {
+            let parent = (child * 97 + 31) % child;
+            assert_eq!(index.add(parent), child);
+            parents.push(parent);
+        }
+        for node in 0..512 {
+            let mut expected = std::collections::BTreeSet::new();
+            let mut current = node;
+            loop {
+                expected.insert(current);
+                if current == 0 {
+                    break;
+                }
+                current = parents[current];
+            }
+            for ancestor in 0..512 {
+                assert_eq!(
+                    index.is_ancestor(ancestor, node),
+                    expected.contains(&ancestor)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_ancestry_handles_deep_and_divergent_branches() {
+        let mut ancestry = SourceAncestry::default();
+        let first = ancestry.add(0);
+        let mut leaf = first;
+        for _ in 0..8192 {
+            leaf = ancestry.add(leaf);
+        }
+        let sibling = ancestry.add(first);
+        assert!(ancestry.is_ancestor(first, leaf));
+        assert!(ancestry.is_ancestor(leaf, leaf));
+        assert!(!ancestry.is_ancestor(sibling, leaf));
+        assert!(!ancestry.is_ancestor(leaf, sibling));
+        assert!(ancestry.nodes[leaf].1.len() <= 15);
     }
 
     #[test]
