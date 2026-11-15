@@ -284,7 +284,11 @@ Chord path segments, excessive changes and non-beneficial patches fall back to
 `["r", value]`. Document deletions are retirement frames with no operations;
 creation and recreation use root replacements. The incremental frame supplies
 its verified predecessor where available so a consumer can apply the operations
-only to that state. Progress remains replacement-state data. These are derived
+only to that state. Progress operations apply to the serialized entire progress
+change, including its request or attempt identity. A running predecessor must
+be uniquely identified in the immediately preceding tracked progress record;
+otherwise the change is a replacement. Nested paths and operation counts are
+bounded, and old overwritten progress is never reconstructed. These are derived
 state transitions, not original upstream operation batches; observation and
 record sizes remain subject to the existing merged-watch limits. Conversion
 errors do not advance the watch cursor.

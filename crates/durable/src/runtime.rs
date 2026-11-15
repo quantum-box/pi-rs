@@ -1390,6 +1390,20 @@ pub enum ProgressHistoryChange {
         partial_is_null: bool,
     },
 }
+fn same_progress_identity(a: &ProgressHistoryChange, b: &ProgressHistoryChange) -> bool {
+    match (a, b) {
+        (
+            ProgressHistoryChange::Generation { request_id: a, .. },
+            ProgressHistoryChange::Generation { request_id: b, .. },
+        ) => a == b,
+        (
+            ProgressHistoryChange::Tool { attempt: a, .. },
+            ProgressHistoryChange::Tool { attempt: b, .. },
+        ) => a == b,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct ProgressHistoryRecord {
     version: u32,
@@ -1518,12 +1532,20 @@ pub struct MergedDocumentOperations {
     pub ops: Vec<serde_json::Value>,
     pub retired: bool,
 }
+/// A progress operation and its proven predecessor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergedProgressOperations {
+    pub previous: Option<ProgressHistoryChange>,
+    pub ops: Vec<serde_json::Value>,
+}
 /// One complete merged transaction with derived Chord operations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IncrementalMergedFrame {
     pub frame: MergedProgressFrame,
     /// Present only when a predecessor was verified; otherwise ops replace root.
     pub observation_previous: Option<serde_json::Value>,
+    /// Aligned with progress changes and applied to each serialized entire change.
+    pub progress: Vec<MergedProgressOperations>,
     pub documents: Vec<MergedDocumentOperations>,
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -6203,6 +6225,36 @@ impl Harness {
             next,
         )))
     }
+    fn prior_progress_for_operations(
+        &self,
+        current: &ProgressHistoryFrame,
+    ) -> Result<Option<ProgressHistoryFrame>, Error> {
+        if current.cursor.position <= 1 {
+            return Ok(None);
+        }
+        let cursor = ProgressHistoryCursor {
+            version: 1,
+            conversation: current.cursor.conversation,
+            position: current.cursor.position - 2,
+        };
+        let mut page = match self.progress_history(&cursor, std::num::NonZeroUsize::MIN) {
+            Ok(page) => page,
+            Err(error @ Error::Storage(_))
+            | Err(error @ Error::Observer(crate::observer::Error::Store(_))) => return Err(error),
+            Err(_) => return Ok(None),
+        };
+        let Some(previous) = page.records.pop() else {
+            return Ok(None);
+        };
+        if previous.cursor.position.checked_add(1) != Some(current.cursor.position)
+            || previous.commit_sequence >= current.commit_sequence
+        {
+            return Err(Error::Invalid(
+                "invalid progress predecessor ordering".into(),
+            ));
+        }
+        Ok(Some(previous))
+    }
     fn incremental_merged_page(
         &self,
         page: MergedProgressPage,
@@ -6225,6 +6277,51 @@ impl Harness {
                         }
                         Err(_) => {} // The proven current snapshot remains a safe root replacement.
                     }
+                }
+            }
+            let mut progress = Vec::new();
+            if let Some(current) = &frame.progress {
+                let previous = self.prior_progress_for_operations(current)?;
+                for change in &current.changes {
+                    let matching: Vec<_> = previous
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|record| &record.changes)
+                        .filter(|candidate| same_progress_identity(candidate, change))
+                        .collect();
+                    let unique_current = current
+                        .changes
+                        .iter()
+                        .filter(|candidate| same_progress_identity(candidate, change))
+                        .count()
+                        == 1;
+                    let prior = if matching.len() == 1 && unique_current {
+                        match matching[0] {
+                            ProgressHistoryChange::Generation { state, .. }
+                                if matches!(state.as_ref(), crate::progress::State::Running(_)) =>
+                            {
+                                Some(matching[0].clone())
+                            }
+                            ProgressHistoryChange::Tool {
+                                state: crate::tool_progress::State::Running(_),
+                                ..
+                            } => Some(matching[0].clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let value = serde_json::to_value(change)?;
+                    let ops = match &prior {
+                        Some(prior) => {
+                            crate::chord_ops::progress_diff(&serde_json::to_value(prior)?, &value)
+                        }
+                        None => crate::chord_ops::replacement(&value),
+                    };
+                    progress.push(MergedProgressOperations {
+                        previous: prior,
+                        ops,
+                    });
                 }
             }
             let mut documents = Vec::with_capacity(frame.documents.len());
@@ -6275,6 +6372,7 @@ impl Harness {
             frames.push(IncrementalMergedFrame {
                 frame,
                 observation_previous,
+                progress,
                 documents,
             });
         }

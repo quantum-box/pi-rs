@@ -387,3 +387,5 @@ storage prerequisite: retirement requires external proof that the old executor
 stopped, and future integration must atomically compose conversation, task and
 abort fences. It does not park a parent, release its worker, own or poll jobs,
 or provide upstream task wake semantics.
+
+Opt-in merged watch progress operations derive bounded Chord patches from the immediately preceding uniquely matching tracked running change. Other cases use replacements; overwritten pre-tracking history and original upstream operation batches are not reconstructed.

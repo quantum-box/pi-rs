@@ -1059,6 +1059,48 @@ impl Tool for ProgressTool {
     }
 }
 
+fn apply_progress_operations(
+    mut value: serde_json::Value,
+    ops: &[serde_json::Value],
+) -> serde_json::Value {
+    for op in ops {
+        let op = op.as_array().unwrap();
+        if op[0] == "r" {
+            value = op[1].clone();
+            continue;
+        }
+        let path = op[1].as_array().unwrap();
+        let mut parent = &mut value;
+        for key in &path[..path.len() - 1] {
+            parent = parent.get_mut(key.as_str().unwrap()).unwrap();
+        }
+        let key = path.last().unwrap().as_str().unwrap();
+        match op[0].as_str().unwrap() {
+            "s" => {
+                parent
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key.into(), op[2].clone());
+            }
+            "d" => {
+                parent.as_object_mut().unwrap().remove(key);
+            }
+            "a" => {
+                let text = parent[key].as_str().unwrap().to_owned() + op[2].as_str().unwrap();
+                parent[key] = text.into();
+            }
+            "p" => {
+                let array = parent[key].as_array_mut().unwrap();
+                let start = op[2].as_u64().unwrap() as usize;
+                let count = op[3].as_u64().unwrap() as usize;
+                array.splice(start..start + count, op[4].as_array().unwrap().clone());
+            }
+            other => panic!("unexpected op {other}"),
+        }
+    }
+    value
+}
+
 #[tokio::test]
 async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_reopen() {
     use pi_rs_durable::{runtime::Scheduler, tool_progress::State};
@@ -1174,14 +1216,34 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         if *seen == attempt && *value == json!({"text":"later"})
     ))));
     loop {
-        let page = tokio::time::timeout(std::time::Duration::from_secs(5), merged.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        if page.frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|progress| progress.changes.iter().any(|change| matches!(change,
-            pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"})
-        )))) { break; }
+        let page =
+            tokio::time::timeout(std::time::Duration::from_secs(5), merged.next_operations())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        let mut found = false;
+        for frame in &page.frames {
+            if let Some(progress) = &frame.frame.progress {
+                for (change, patch) in progress.changes.iter().zip(&frame.progress) {
+                    if matches!(change, pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"}))
+                    {
+                        let previous = patch.previous.as_ref().unwrap();
+                        assert!(
+                            matches!(previous, pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. } if *seen == attempt && *value == json!({"text":"working"}))
+                        );
+                        assert_eq!(
+                            apply_progress_operations(json!(previous), &patch.ops),
+                            json!(change)
+                        );
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found {
+            break;
+        }
     }
     let merged_cursor = merged.cursor().clone();
     let error = scheduler.abort_and_wait(id).await.unwrap_err();
@@ -1218,14 +1280,34 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         )
         .unwrap();
     loop {
-        let page = tokio::time::timeout(std::time::Duration::from_secs(5), merged.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        if page.frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|progress| progress.changes.iter().any(|change| matches!(change,
-            pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Aborted(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"})
-        )))) { break; }
+        let page =
+            tokio::time::timeout(std::time::Duration::from_secs(5), merged.next_operations())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        let mut found = false;
+        for frame in &page.frames {
+            if let Some(progress) = &frame.frame.progress {
+                for (change, patch) in progress.changes.iter().zip(&frame.progress) {
+                    if matches!(change, pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Aborted(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"}))
+                    {
+                        let previous = patch.previous.as_ref().unwrap();
+                        assert!(
+                            matches!(previous, pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"}))
+                        );
+                        assert_eq!(
+                            apply_progress_operations(json!(previous), &patch.ops),
+                            json!(change)
+                        );
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found {
+            break;
+        }
     }
     merged.close();
     let history_terminal = reopened
@@ -1835,4 +1917,97 @@ fn runtime_block_commit_survives_process_exit() {
         h.conversation(fork).unwrap().content_blocks,
         c.content_blocks
     );
+}
+
+struct IncrementalProgressModel;
+#[async_trait]
+impl Model for IncrementalProgressModel {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        Ok(stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((Ok(ModelEvent::Text("x".repeat(3000))), 1)),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    Some((Ok(ModelEvent::Text("🚀".into())), 2))
+                }
+                2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    Some((
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                        3,
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn incremental_generation_progress_applies_and_completes() {
+    use pi_rs_durable::{
+        progress::State,
+        runtime::{ProgressHistoryChange, Scheduler},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options {
+        model: Arc::new(IncrementalProgressModel),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    let mut watch = scheduler
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    let mut saw_append = false;
+    let mut saw_initial = false;
+    let mut saw_completed = false;
+    while !saw_completed {
+        let page = tokio::time::timeout(Duration::from_secs(10), watch.next_operations())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for frame in &page.frames {
+            if let Some(progress) = &frame.frame.progress {
+                assert_eq!(progress.changes.len(), frame.progress.len());
+                for (change, patch) in progress.changes.iter().zip(&frame.progress) {
+                    let ProgressHistoryChange::Generation { state, .. } = change else {
+                        continue;
+                    };
+                    let previous = patch
+                        .previous
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |p| json!(p));
+                    assert_eq!(
+                        apply_progress_operations(previous, &patch.ops),
+                        json!(change)
+                    );
+                    if patch.previous.is_none() {
+                        assert_eq!(patch.ops[0][0], "r");
+                        saw_initial = true;
+                    }
+                    saw_append |= patch.ops.iter().any(|op| op[0] == "a" && op[2] == "🚀");
+                    if matches!(state.as_ref(), State::Completed) {
+                        assert!(
+                            matches!(patch.previous, Some(ProgressHistoryChange::Generation { ref state, .. }) if matches!(state.as_ref(), State::Running(_)))
+                        );
+                        saw_completed = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(saw_initial && saw_append && saw_completed);
+    watch.close();
+    scheduler.shutdown().await.unwrap();
 }
