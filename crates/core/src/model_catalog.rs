@@ -66,6 +66,15 @@ impl ModelCatalog {
             .cloned()
     }
 
+    /// List the exact identities registered by the host, ordered by provider
+    /// and then model. This does not probe clients or guarantee that credentials
+    /// remain valid. The iterator cannot expose clients or their credentials.
+    pub fn identities(&self) -> impl ExactSizeIterator<Item = (&str, &str)> + '_ {
+        self.clients
+            .keys()
+            .map(|(provider, model)| (provider.as_str(), model.as_str()))
+    }
+
     /// Create a session builder and configure exact historical model recovery.
     /// Missing historical identities remain unavailable; no fallback or
     /// name-only lookup is inferred from untrusted journal contents.
@@ -141,6 +150,29 @@ mod tests {
         ));
         fn send_sync<T: Send + Sync>() {}
         send_sync::<ModelCatalog>();
+    }
+
+    #[test]
+    fn identities_are_exact_sorted_and_snapshot_owned() {
+        let mut builder = ModelCatalogBuilder::new();
+        assert_eq!(builder.build().identities().count(), 0);
+        builder = ModelCatalogBuilder::new();
+        builder
+            .register("z", "same", Arc::new(NamedModel("secret")))
+            .unwrap();
+        builder
+            .register("a", "z", Arc::new(NamedModel("secret")))
+            .unwrap();
+        builder
+            .register("a", "A", Arc::new(NamedModel("secret")))
+            .unwrap();
+        let catalog = builder.build();
+        let copy = catalog.clone();
+        drop(catalog);
+        assert_eq!(
+            copy.identities().collect::<Vec<_>>(),
+            vec![("a", "A"), ("a", "z"), ("z", "same")]
+        );
     }
 
     #[tokio::test]
