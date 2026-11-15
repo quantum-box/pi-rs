@@ -749,6 +749,24 @@ impl SessionControl {
                 })?;
             config.model = Arc::downgrade(&model);
             config.model_name = name;
+        } else {
+            let config = self.owner.config.lock().expect("run config");
+            let registry = config
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            let cached = config
+                .model
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            if !branch_client(&registry, journal.session_id(), None, &config.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &cached))
+            {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {}",
+                    config.model_name
+                )));
+            }
         }
         let startup = self
             .owner
@@ -1476,6 +1494,11 @@ pub struct AgentSession {
 #[derive(Clone)]
 enum BranchResolution {
     Registered,
+    Legacy {
+        model: String,
+        client: Arc<dyn Model>,
+        inherited: bool,
+    },
     Existing {
         provider: String,
         model: String,
@@ -1524,15 +1547,15 @@ impl AgentSession {
                 });
             }
             if let Some((None, name, _)) = &current {
-                if name == &self.model_name
-                    && branch_client(&self.registry, self.session_id, None, name)
-                        .is_some_and(|client| Arc::ptr_eq(&client, &self.model))
-                {
-                    return Ok(BranchResolution::Registered);
-                }
-                return Err(Error::Config(format!(
-                    "session branch requires registered model {name}"
-                )));
+                let client = branch_client(&self.registry, self.session_id, None, name)
+                    .ok_or_else(|| {
+                        Error::Config(format!("session branch requires registered model {name}"))
+                    })?;
+                return Ok(BranchResolution::Legacy {
+                    model: name.clone(),
+                    client,
+                    inherited: true,
+                });
             }
             if !self.model_identity_resolved {
                 return Err(Error::Config(
@@ -1559,7 +1582,19 @@ impl AgentSession {
                     client,
                 });
             }
-            return Ok(BranchResolution::Registered);
+            let client = branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .filter(|client| Arc::ptr_eq(client, &self.model))
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "session branch requires registered model {}",
+                        self.model_name
+                    ))
+                })?;
+            return Ok(BranchResolution::Legacy {
+                model: self.model_name.clone(),
+                client,
+                inherited: true,
+            });
         };
         if let Some(client) =
             branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
@@ -1570,7 +1605,11 @@ impl AgentSession {
                     model: name,
                     client,
                 },
-                None => BranchResolution::Registered,
+                None => BranchResolution::Legacy {
+                    model: name,
+                    client,
+                    inherited: false,
+                },
             });
         }
         if let (Some(provider), Some(resolver)) = (provider, &self.historical_model_resolver) {
@@ -1999,6 +2038,16 @@ impl AgentSession {
                 .try_lock()
                 .map_err(|_| Error::Session("session journal is in use".into()))?;
             let revoked = match &resolution {
+                BranchResolution::Legacy { model, client, .. } => {
+                    self.registry
+                        .commit_existing_legacy_model(
+                            self.session_id,
+                            model,
+                            client.clone(),
+                            || journal.checkout(record),
+                        )?
+                        .1
+                }
                 BranchResolution::Existing {
                     provider,
                     model,
@@ -2072,8 +2121,22 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal),
             )
         };
+        if !revoked
+            && let BranchResolution::Legacy {
+                model,
+                client,
+                inherited: true,
+            } = &resolution
+        {
+            self.model = client.clone();
+            self.model_name = model.clone();
+            self.model_provider = None;
+            self.model_identity_resolved = true;
+            self.refresh_run_config();
+        }
         match resolution {
-            BranchResolution::Historical { .. }
+            BranchResolution::Legacy { .. }
+            | BranchResolution::Historical { .. }
             | BranchResolution::Inherited { .. }
             | BranchResolution::Existing { .. } => {
                 self.model_fallback = None;
@@ -2174,6 +2237,17 @@ impl AgentSession {
         let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tree_resolution = match &resolution {
             BranchResolution::Registered => None,
+            BranchResolution::Legacy { model, client, .. } => {
+                Some(crate::agent::TreeModelResolution {
+                    provider: String::new(),
+                    model: model.clone(),
+                    client: client.clone(),
+                    fallback: false,
+                    require_existing: true,
+                    legacy: true,
+                    revoked: revoked.clone(),
+                })
+            }
             BranchResolution::Existing {
                 provider,
                 model,
@@ -2184,6 +2258,7 @@ impl AgentSession {
                 client: client.clone(),
                 fallback: false,
                 require_existing: true,
+                legacy: false,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Inherited {
@@ -2196,6 +2271,7 @@ impl AgentSession {
                 client: client.clone(),
                 fallback: true,
                 require_existing: true,
+                legacy: false,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Historical {
@@ -2208,6 +2284,7 @@ impl AgentSession {
                 client: client.clone(),
                 fallback: false,
                 require_existing: false,
+                legacy: false,
                 revoked: revoked.clone(),
             }),
             BranchResolution::Fallback {
@@ -2221,6 +2298,7 @@ impl AgentSession {
                 client: client.clone(),
                 fallback: true,
                 require_existing: false,
+                legacy: false,
                 revoked: revoked.clone(),
             }),
         };
@@ -2258,6 +2336,20 @@ impl AgentSession {
                 } else if restored.is_err() {
                     revoked.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+            }
+            if !revoked.load(std::sync::atomic::Ordering::SeqCst)
+                && journal.model_identity_at(journal.head()).is_none()
+                && let BranchResolution::Legacy {
+                    model,
+                    client,
+                    inherited: true,
+                } = &resolution
+            {
+                self.model = client.clone();
+                self.model_name = model.clone();
+                self.model_provider = None;
+                self.model_identity_resolved = true;
+                self.refresh_run_config();
             }
             self.model_fallback = match resolution {
                 BranchResolution::Fallback {
@@ -2393,6 +2485,16 @@ impl AgentSession {
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
             } else {
                 self.restore_branch_model(provider.as_deref(), name)?;
+            }
+        }
+        if journal.model_identity_at(journal.head()).is_none() && self.model_provider.is_none() {
+            let valid = branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
+            if !valid {
+                return Err(Error::Config(format!(
+                    "session branch requires registered model {}",
+                    self.model_name
+                )));
             }
         }
         let startup = if defer_startup {
@@ -2603,6 +2705,20 @@ impl AgentSession {
         {
             session.select_provider_model_atomic(provider, model)?;
         }
+        if let BranchResolution::Legacy { model, client, .. } = &resolution {
+            let (fork, revoked) = self.registry.commit_existing_legacy_model(
+                self.session_id,
+                model,
+                client.clone(),
+                || self.fork_session(session, resolution.clone()),
+            )?;
+            if revoked {
+                return Err(Error::Config(
+                    "model client was revoked while preparing fork".into(),
+                ));
+            }
+            return Ok(fork);
+        }
         if let BranchResolution::Inherited {
             provider,
             model,
@@ -2736,7 +2852,8 @@ impl AgentSession {
         let selection = session.model_identity_at(session.head());
         let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
             let model = match &resolution {
-                BranchResolution::Existing { client, .. }
+                BranchResolution::Legacy { client, .. }
+                | BranchResolution::Existing { client, .. }
                 | BranchResolution::Inherited { client, .. }
                 | BranchResolution::Historical { client, .. }
                 | BranchResolution::Fallback { client, .. } => Some(client.clone()),
@@ -2752,6 +2869,9 @@ impl AgentSession {
             // A fork before the first model selection still uses the source's
             // active client. Preserve its qualified identity when it is known.
             match &resolution {
+                BranchResolution::Legacy { model, client, .. } => {
+                    (None, model.clone(), client.clone())
+                }
                 BranchResolution::Inherited {
                     provider,
                     model,
@@ -2848,7 +2968,7 @@ impl AgentSession {
                     model,
                 });
             }
-            BranchResolution::Registered => {}
+            BranchResolution::Legacy { .. } | BranchResolution::Registered => {}
         }
         fork.historical_model_resolver = self.historical_model_resolver.clone();
         fork.refresh_run_config();
@@ -5011,6 +5131,110 @@ mod tests {
         assert_eq!(session.journal().unwrap().head(), original_head);
         assert_eq!(session.journal().unwrap().model_provider(), Some("missing"));
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_current_client_is_inherited_across_transitions() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("model-A")), "model-A")
+            .build(journal)
+            .unwrap();
+        session
+            .journal()
+            .unwrap()
+            .select_model("model-B", None)
+            .unwrap();
+        session
+            .register_branch_model("model-B", Arc::new(NamedBranchModel("model-B")))
+            .unwrap();
+        let mut fork = session.fork_at(old).unwrap();
+        assert_eq!(fork.prompt("one").await.unwrap(), "model-B");
+        assert_eq!(fork.prompt("two").await.unwrap(), "model-B");
+        fork.close().await.unwrap();
+        session.checkout(old).unwrap();
+        assert_eq!(session.prompt("checkout").await.unwrap(), "model-B");
+        session
+            .navigate_tree(old, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree").await.unwrap(), "model-B");
+        let mut hooked = session
+            .fork_with_hooks(old, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert_eq!(hooked.prompt("hook").await.unwrap(), "model-B");
+        hooked.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_blocks_selection_free_transitions_and_prompt() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("old".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let old = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(ProviderBranchModel("a")), "a")
+            .build(journal)
+            .unwrap();
+        session.checkout(old).unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        assert!(session.prompt("must not run").await.is_err());
+        assert!(session.checkout(old).is_err());
+        assert!(session.fork_at(old).is_err());
+        assert!(
+            session
+                .navigate_tree(old, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .fork_with_hooks(old, crate::ForkPosition::At, None)
+                .await
+                .is_err()
+        );
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn legacy_reservation_detects_revocation_and_blocks_replacement() {
+        let registry = Registry::default();
+        let id = Uuid::new_v4();
+        let client: Arc<dyn Model> = Arc::new(ProviderBranchModel("a"));
+        registry
+            .register_session_branch_model(id, "a".into(), client.clone())
+            .unwrap();
+        let (_, revoked) = registry
+            .commit_existing_legacy_model(id, "a", client.clone(), || {
+                assert!(
+                    registry
+                        .register_session_branch_model(id, "a".into(), client.clone())
+                        .is_err()
+                );
+                registry.remove_session_branch_models(id);
+                Ok(())
+            })
+            .unwrap();
+        assert!(revoked);
+        assert!(branch_client(&registry, id, None, "a").is_none());
+        assert!(
+            registry
+                .commit_existing_legacy_model(id, "a", client, || Ok(()))
+                .is_err()
+        );
     }
 
     #[tokio::test]
