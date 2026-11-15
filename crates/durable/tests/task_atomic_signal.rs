@@ -971,7 +971,9 @@ impl Handler for RepeatClosedOrMissing {
         } else {
             2
         });
-        let now = if self.mode == 0 || self.mode == 4 {
+        let now = if self.mode == 4 {
+            100_000
+        } else if self.mode == 0 {
             100
         } else {
             99
@@ -987,7 +989,7 @@ impl Handler for RepeatClosedOrMissing {
             let db = Store::open(&self.path).unwrap();
             assert_eq!(
                 TaskStore::new(&db)
-                    .deliver_signal_at(target, &token, "a", json!(7), 99)
+                    .deliver_signal_at(target, &token, "a", json!(7), 0)
                     .unwrap(),
                 SignalResult::Delivered
             );
@@ -1118,7 +1120,9 @@ fn repeated_missing_is_fenced_against_concurrent_creation() {
 fn repeated_expired_is_fenced_against_concurrent_delivery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    setup(&path, Some(100));
+    // The competing delivery uses an elapsed monotonic clock. Leave ample
+    // time before its deadline even when the test process is descheduled.
+    setup(&path, Some(100_000));
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let mut registry = Registry::default();
     registry.register(
