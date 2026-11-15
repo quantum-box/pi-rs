@@ -8,6 +8,7 @@ mod context_replay;
 mod extension;
 mod journal;
 mod lifecycle;
+mod model_catalog;
 mod resource;
 mod retry;
 mod runtime;
@@ -30,6 +31,7 @@ pub use lifecycle::{
     SessionSwitchReason, TreeDecision, TreePreparation, TreeSummary,
     notify as notify_extension_lifecycle,
 };
+pub use model_catalog::*;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
 pub use resource::Resource;
 pub use retry::*;

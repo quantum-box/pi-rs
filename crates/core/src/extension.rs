@@ -1667,6 +1667,15 @@ impl Registry {
         if name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        let reservations = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations");
+        if reservations.keys().any(|(_, provider, reserved)| {
+            provider.is_empty() && (reserved == &name || reserved.is_empty())
+        }) {
+            return Err(Error::Config("model client is being resolved".into()));
+        }
         self.branch_models
             .write()
             .expect("branch models")
@@ -1687,7 +1696,9 @@ impl Registry {
             .branch_reservations
             .read()
             .expect("branch reservations");
-        if reservations.contains_key(&(session_id, String::new(), String::new())) {
+        if reservations.contains_key(&(session_id, String::new(), String::new()))
+            || reservations.contains_key(&(session_id, String::new(), name.clone()))
+        {
             return Err(Error::Config("session models are being resolved".into()));
         }
         self.branch_models
@@ -1716,6 +1727,72 @@ impl Registry {
         model: Arc<dyn crate::Model>,
         commit: impl FnOnce() -> Result<T>,
     ) -> Result<(T, bool)> {
+        self.commit_session_model(session_id, provider, name, model, false, commit)
+    }
+
+    /// Reserve an already authorized binding; never recreate one after removal.
+    pub(crate) fn commit_existing_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        self.commit_session_model(session_id, provider, name, model, true, commit)
+    }
+
+    /// Reserve the effective provider-less binding without installing a new one.
+    pub(crate) fn commit_existing_legacy_model<T>(
+        &self,
+        session_id: Uuid,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        let key = (session_id, String::new(), name.to_owned());
+        {
+            let mut reservations = self
+                .branch_reservations
+                .write()
+                .expect("branch reservations");
+            let models = self.branch_models.read().expect("branch models");
+            let existing = models
+                .get(&(Some(session_id), None, name.to_owned()))
+                .or_else(|| models.get(&(None, None, name.to_owned())));
+            if reservations.contains_key(&key)
+                || reservations.contains_key(&(session_id, String::new(), String::new()))
+                || !existing.is_some_and(|(existing, _)| Arc::ptr_eq(existing, &model))
+            {
+                return Err(Error::Config(format!(
+                    "model client changed while resolving {name}"
+                )));
+            }
+            reservations.insert(key.clone(), false);
+        }
+        let reservation = BranchModelReservation {
+            reserved: self.branch_reservations.clone(),
+            key,
+        };
+        let result = commit()?;
+        let revoked = self
+            .branch_reservations
+            .read()
+            .expect("branch reservations")
+            .get(&reservation.key)
+            == Some(&true);
+        Ok((result, revoked))
+    }
+
+    fn commit_session_model<T>(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        name: &str,
+        model: Arc<dyn crate::Model>,
+        require_existing: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
         if provider.trim().is_empty() || name.trim().is_empty() {
             return Err(Error::Config("provider or model name is empty".into()));
         }
@@ -1726,14 +1803,12 @@ impl Registry {
                 .branch_reservations
                 .write()
                 .expect("branch reservations");
+            let models = self.branch_models.read().expect("branch models");
+            let existing = models.get(&key);
             if reservations.contains_key(&reservation_key)
                 || reservations.contains_key(&(session_id, String::new(), String::new()))
-                || self
-                    .branch_models
-                    .read()
-                    .expect("branch models")
-                    .get(&key)
-                    .is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
+                || existing.is_some_and(|(existing, _)| !Arc::ptr_eq(existing, &model))
+                || (require_existing && existing.is_none())
             {
                 return Err(Error::Config(format!(
                     "model client changed while resolving {provider}/{name}"
@@ -1890,9 +1965,11 @@ impl Registry {
             if reservations.contains_key(&(destination, String::new(), String::new())) {
                 continue;
             }
-            if provider.as_ref().is_some_and(|provider| {
-                reservations.contains_key(&(destination, provider.clone(), name.clone()))
-            }) {
+            if reservations.contains_key(&(
+                destination,
+                provider.clone().unwrap_or_default(),
+                name.clone(),
+            )) {
                 continue;
             }
             models.insert((Some(destination), provider, name), model);

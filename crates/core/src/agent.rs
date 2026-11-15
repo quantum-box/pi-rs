@@ -270,6 +270,8 @@ pub(crate) struct TreeModelResolution {
     pub model: String,
     pub client: Arc<dyn Model>,
     pub fallback: bool,
+    pub require_existing: bool,
+    pub legacy: bool,
     pub revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -3691,13 +3693,32 @@ impl Agent<'_> {
             }
         }
         if let Some(resolved) = resolution {
-            let (record, revoked) = self.registry.commit_resolved_session_model(
-                session.session_id(),
-                &resolved.provider,
-                &resolved.model,
-                resolved.client,
-                || session.append(transition).cloned(),
-            )?;
+            let session_id = session.session_id();
+            let commit = || session.append(transition).cloned();
+            let (record, revoked) = if resolved.legacy {
+                self.registry.commit_existing_legacy_model(
+                    session_id,
+                    &resolved.model,
+                    resolved.client,
+                    commit,
+                )?
+            } else if resolved.require_existing {
+                self.registry.commit_existing_session_model(
+                    session_id,
+                    &resolved.provider,
+                    &resolved.model,
+                    resolved.client,
+                    commit,
+                )?
+            } else {
+                self.registry.commit_resolved_session_model(
+                    session_id,
+                    &resolved.provider,
+                    &resolved.model,
+                    resolved.client,
+                    commit,
+                )?
+            };
             resolved
                 .revoked
                 .store(revoked, std::sync::atomic::Ordering::SeqCst);
