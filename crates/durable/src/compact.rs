@@ -274,7 +274,9 @@ fn serialize_summary_source(
     blocks: Option<&std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>>,
 ) -> Result<String> {
     if blocks.is_some_and(|map| map.iter().any(|(index, binding)| {
-        binding.message_id.is_nil() || !matches!(messages.get(*index), Some(Message::User { content }) if content.is_empty())
+        binding.message_id.is_nil()
+            || !matches!(messages.get(*index), Some(Message::User { content } | Message::Tool { content, .. }) if content.is_empty())
+            || crate::content::UserContent::from_yield(serde_json::Value::Array(binding.blocks.clone()), false).is_none()
     })) {
         return Err(invalid("invalid summary block binding"));
     }
@@ -340,13 +342,27 @@ fn serialize_summary_source(
                 }
             }
             Message::Tool { content, .. } => {
-                if !content.is_empty() {
+                let text = if let Some(binding) = blocks.and_then(|map| map.get(&index)) {
+                    binding
+                        .blocks
+                        .iter()
+                        .filter_map(|block| {
+                            (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                                .then(|| block.get("text").and_then(|v| v.as_str()))
+                                .flatten()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    content.clone()
+                };
+                if !text.is_empty() {
                     // JavaScript counts UTF-16 code units for its truncation limit.
-                    let units = content.encode_utf16().count();
+                    let units = text.encode_utf16().count();
                     let text = if units > 2000 {
                         let mut prefix = String::new();
                         let mut used = 0;
-                        for ch in content.chars() {
+                        for ch in text.chars() {
                             if used + ch.len_utf16() > 2000 {
                                 break;
                             }
@@ -358,7 +374,7 @@ fn serialize_summary_source(
                             units - used
                         )
                     } else {
-                        content.clone()
+                        text
                     };
                     parts.push(format!("[Tool result]: {text}"));
                 }
@@ -372,6 +388,13 @@ fn serialize_summary_source(
 impl Preparation {
     pub(crate) fn has_blocks(&self) -> bool {
         self.source_blocks.is_some()
+    }
+    pub(crate) fn has_tool_blocks(&self) -> bool {
+        self.source_blocks.as_ref().is_some_and(|blocks| {
+            blocks
+                .keys()
+                .any(|index| matches!(self.source.get(*index), Some(Message::Tool { .. })))
+        })
     }
     pub(crate) fn source_matches(&self, messages: &[Message]) -> bool {
         self.source == messages
@@ -825,6 +848,47 @@ mod tests {
             serialize_summary_source(&[opaque], None).unwrap(),
             "[Assistant tool calls]: legacy(not-json)"
         );
+    }
+
+    #[test]
+    fn tool_block_summary_keeps_text_and_omits_images() {
+        let messages = vec![Message::Tool {
+            call_id: "call".into(),
+            content: String::new(),
+        }];
+        let mut binding = crate::transcript::MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![
+                serde_json::json!({"type":"text", "text":"before"}),
+                serde_json::json!({"type":"image", "data":"secret-base64", "mimeType":"image/png"}),
+                serde_json::json!({"type":"text", "text":"after"}),
+            ],
+        };
+        let mut map = std::collections::BTreeMap::from([(0, binding.clone())]);
+        assert_eq!(
+            serialize_summary_source(&messages, Some(&map)).unwrap(),
+            "[Tool result]: before\nafter"
+        );
+        assert_eq!(
+            estimate_block_tokens(&binding),
+            ("before".len() as u64 + 4800 + "after".len() as u64).div_ceil(4)
+        );
+        binding.blocks = vec![serde_json::json!({"type":"text", "text":"x".repeat(2003)})];
+        map.insert(0, binding.clone());
+        assert!(
+            serialize_summary_source(&messages, Some(&map))
+                .unwrap()
+                .ends_with("\n\n[... 3 more characters truncated]")
+        );
+        binding.blocks =
+            vec![serde_json::json!({"type":"image", "data":"aGk=", "mimeType":"image/png"})];
+        map.insert(0, binding);
+        assert_eq!(serialize_summary_source(&messages, Some(&map)).unwrap(), "");
+        let conflicting = vec![Message::Tool {
+            call_id: "call".into(),
+            content: "hidden".into(),
+        }];
+        assert!(serialize_summary_source(&conflicting, Some(&map)).is_err());
     }
 
     #[test]

@@ -2552,7 +2552,9 @@ impl Harness {
         }
         let selected = self.selected_extensions(&state)?;
         if preparation.has_blocks() {
-            if !selected.supports_compaction_blocks() {
+            if !selected.supports_compaction_blocks()
+                || (preparation.has_tool_blocks() && !selected.supports_compaction_tool_blocks())
+            {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
             let cursor = state
@@ -3739,21 +3741,6 @@ impl Harness {
                     && state.messages == proof.messages
             })
         });
-        if let Some(previous) = old
-            && previous
-                .content_blocks
-                .keys()
-                .any(|index| matches!(previous.messages.get(*index), Some(Message::Tool { .. })))
-            && !reset_proven
-            && (!state.messages.starts_with(&previous.messages)
-                || previous.context_generation != state.context_generation
-                || previous
-                    .content_blocks
-                    .iter()
-                    .any(|(index, binding)| state.content_blocks.get(index) != Some(binding)))
-        {
-            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-        }
         if let Some(previous) = old {
             for (id, expected_blocks) in &previous.pending_reset_blocks {
                 if state.pending_reset_blocks.get(id) == Some(expected_blocks) {
@@ -7424,18 +7411,21 @@ impl Harness {
             .request_manual_compaction(id, keep_recent_tokens, instructions)?
             .is_some())
     }
+    fn compaction_hooks_support_context(&self, c: &Conversation) -> Result<bool, Error> {
+        let selected = self.selected_extensions(c)?;
+        Ok(selected.supports_compaction_blocks()
+            && (!c
+                .content_blocks
+                .keys()
+                .any(|index| matches!(c.messages.get(*index), Some(Message::Tool { .. })))
+                || selected.supports_compaction_tool_blocks()))
+    }
     fn prepare_runtime_compaction(
         &self,
         c: &Conversation,
         keep_recent_tokens: usize,
         instructions: Option<&str>,
     ) -> Result<Option<crate::compact::Preparation>, Error> {
-        if c.content_blocks
-            .keys()
-            .any(|index| matches!(c.messages.get(*index), Some(Message::Tool { .. })))
-        {
-            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
-        }
         if c.content_blocks.is_empty() {
             return Ok(crate::compact::prepare(
                 &c.messages,
@@ -7447,7 +7437,7 @@ impl Harness {
         }
         if !c.occurrence_epoch_proven
             || c.transcript.is_none()
-            || !self.selected_extensions(c)?.supports_compaction_blocks()
+            || !self.compaction_hooks_support_context(c)?
         {
             return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
         }
@@ -7493,7 +7483,7 @@ impl Harness {
         if !c.content_blocks.is_empty()
             && (!c.occurrence_epoch_proven
                 || c.transcript.is_none()
-                || !self.selected_extensions(&c)?.supports_compaction_blocks())
+                || !self.compaction_hooks_support_context(&c)?)
         {
             return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
         }
@@ -9110,7 +9100,11 @@ impl Harness {
                     reason,
                 } => {
                     let selected = self.selected_extensions(&c)?;
-                    if preparation.has_blocks() && !selected.supports_compaction_blocks() {
+                    if preparation.has_blocks()
+                        && (!selected.supports_compaction_blocks()
+                            || (preparation.has_tool_blocks()
+                                && !selected.supports_compaction_tool_blocks()))
+                    {
                         return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
                     }
                     let snapshot = serde_json::to_value(&c)?;
@@ -9377,7 +9371,7 @@ impl Harness {
                             && (c.content_blocks.is_empty()
                                 || (c.occurrence_epoch_proven
                                     && c.transcript.is_some()
-                                    && self.selected_extensions(&c)?.supports_compaction_blocks()))
+                                    && self.compaction_hooks_support_context(&c)?))
                         {
                             let window = tokio::select! {
                                 _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },

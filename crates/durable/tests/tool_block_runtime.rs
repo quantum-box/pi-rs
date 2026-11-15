@@ -46,6 +46,12 @@ impl Tool for ToolFixture {
 struct Blocks;
 #[async_trait]
 impl Hook for Blocks {
+    fn supports_compaction_blocks(&self) -> bool {
+        true
+    }
+    fn supports_compaction_tool_blocks(&self) -> bool {
+        true
+    }
     fn supports_runtime_tool_blocks(&self) -> bool {
         true
     }
@@ -318,7 +324,7 @@ async fn tool_blocks_reach_opt_in_adapter_and_survive_fork() {
         h.conversation(fork).unwrap().content_blocks,
         c.content_blocks
     );
-    assert!(h.request_compaction(id, 0).is_err());
+    assert!(!h.request_compaction(id, 0).unwrap());
     h.reset(id, Some("fresh".into())).unwrap();
     assert!(h.conversation(id).unwrap().content_blocks.is_empty());
     drop(h);
@@ -505,4 +511,693 @@ async fn invalid_structured_output_is_not_exposed_to_block_hook() {
     drop(h);
     let h = setup(&path);
     assert!(h.conversation(id).unwrap().content_blocks.is_empty());
+}
+
+#[derive(Default)]
+struct SummaryModel(std::sync::Mutex<Vec<ModelRequest>>);
+#[async_trait]
+impl Model for SummaryModel {
+    async fn context_window(&self, _: &str) -> Option<u32> {
+        Some(20_000)
+    }
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        panic!("ordinary calls use the adapter")
+    }
+    async fn stream_for_summary(
+        &self,
+        _: uuid::Uuid,
+        _: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream, Error> {
+        self.0.lock().unwrap().push(request);
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("checkpoint".into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+fn summary_options(model: Arc<SummaryModel>) -> Options {
+    let mut options = options();
+    options.model = model;
+    options
+}
+fn summary_setup(path: &std::path::Path, model: Arc<SummaryModel>) -> Harness {
+    let mut h = Harness::open_paused(path, summary_options(model)).unwrap();
+    h.install_extension(Extension {
+        name: "blocks".into(),
+        hooks: vec![Arc::new(Blocks)],
+        ..Default::default()
+    })
+    .unwrap();
+    h.install_provider_adapter(Arc::new(Adapter::default()))
+        .unwrap();
+    h
+}
+#[tokio::test]
+async fn manual_compaction_retains_and_then_summarizes_tool_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(SummaryModel::default());
+    let mut h = summary_setup(&path, model.clone());
+    let id = h
+        .create_conversation(Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.reset(id, Some("older".into())).unwrap();
+    h.submit_and_run(id, None, "tool turn".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let original = h
+        .conversation(id)
+        .unwrap()
+        .content_blocks
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(h.request_compaction(id, 0).unwrap());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let retained = h.conversation(id).unwrap();
+    assert!(retained.content_blocks.values().any(|b| b == &original));
+    let fork = h.fork(id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks,
+        retained.content_blocks
+    );
+    drop(h);
+    let mut h = summary_setup(&path, model.clone());
+    assert_eq!(
+        h.conversation(id).unwrap().content_blocks,
+        retained.content_blocks
+    );
+    h.submit_and_run(id, None, "later turn".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(h.request_compaction(id, 0).unwrap());
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(c.content_blocks.is_empty());
+    let requests = model.0.lock().unwrap();
+    let prompt = match &requests.last().unwrap().messages[1] {
+        Message::User { content } => content,
+        _ => panic!("summary request"),
+    };
+    assert!(prompt.contains("[Tool result]: before\nafter"));
+    assert!(!prompt.contains("aGk="));
+    drop(requests);
+    let history = h
+        .history(
+            id,
+            pi_rs_durable::observer::Cursor(0),
+            std::num::NonZeroUsize::new(1000).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        history
+            .records
+            .iter()
+            .any(|r| r.value.to_string().contains("aGk="))
+    );
+    h.reset(id, Some("new context".into())).unwrap();
+    drop(h);
+    let h = summary_setup(&path, model);
+    assert!(h.conversation(id).unwrap().content_blocks.is_empty());
+    assert!(
+        h.conversation(fork)
+            .unwrap()
+            .content_blocks
+            .values()
+            .any(|b| b == &original)
+    );
+}
+
+#[tokio::test]
+async fn automatic_compaction_summarizes_tool_text_without_image_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(SummaryModel::default());
+    let mut h = summary_setup(&path, model.clone());
+    let id = h
+        .create_conversation(Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.submit_and_run(id, None, "x".repeat(90_000), &CancellationToken::new())
+        .await
+        .unwrap();
+    let old = h
+        .conversation(id)
+        .unwrap()
+        .content_blocks
+        .values()
+        .next()
+        .unwrap()
+        .message_id;
+    h.submit_and_run(id, None, "later".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = model.0.lock().unwrap();
+    let prompt = match &requests.last().unwrap().messages[1] {
+        Message::User { content } => content,
+        _ => panic!("summary request"),
+    };
+    assert!(prompt.contains("[Tool result]: before\nafter"));
+    assert!(!prompt.contains("aGk="));
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .all(|b| b.message_id != old)
+    );
+}
+
+#[tokio::test]
+async fn independent_compaction_retains_and_summarizes_tool_blocks_after_reopen() {
+    use pi_rs_durable::{
+        extension::Registry,
+        runtime::{IndependentCompactionStatus, Scheduler, SummaryProviderIdentity},
+    };
+    for summarize_tool in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(SummaryModel::default());
+        let mut h = summary_setup(&path, model.clone());
+        let id = h
+            .create_conversation(Config {
+                model: "fake".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.select_extensions(id, vec!["blocks".into()]).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.reset(id, Some("older".into())).unwrap();
+        h.submit_and_run(id, None, "tool turn".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let original = h
+            .conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        if summarize_tool {
+            h.submit_and_run(id, None, "later".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        drop(h);
+        let mut registry = Registry::default();
+        registry
+            .install(Extension {
+                name: "blocks".into(),
+                hooks: vec![Arc::new(Blocks)],
+                ..Default::default()
+            })
+            .unwrap();
+        let identity = SummaryProviderIdentity {
+            model: "summary-fixture/v1".into(),
+            settlement: "ledger-fixture/v1".into(),
+        };
+        let mut scheduler = Scheduler::open_with_summary_recovery(
+            &path,
+            summary_options(model.clone()),
+            registry,
+            Some(Arc::new(Adapter::default())),
+            identity,
+        )
+        .unwrap();
+        let op = uuid::Uuid::new_v4();
+        assert!(
+            scheduler
+                .request_idle_independent_compaction(id, op, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            scheduler.wait_independent_compaction(op).await.unwrap(),
+            IndependentCompactionStatus::Applied
+        );
+        let c = scheduler.conversation(id).unwrap();
+        if summarize_tool {
+            assert!(c.content_blocks.is_empty());
+            let requests = model.0.lock().unwrap();
+            let prompt = match &requests.last().unwrap().messages[1] {
+                Message::User { content } => content,
+                _ => panic!("summary request"),
+            };
+            assert!(prompt.contains("[Tool result]: before\nafter"));
+            assert!(!prompt.contains("aGk="));
+        } else {
+            assert!(c.content_blocks.values().any(|b| b == &original));
+            let fork = scheduler.fork(id).unwrap();
+            assert_eq!(
+                scheduler.conversation(fork).unwrap().content_blocks,
+                c.content_blocks
+            );
+        }
+        scheduler.shutdown().await.unwrap();
+        let h = summary_setup(&path, model);
+        assert_eq!(h.conversation(id).unwrap().content_blocks, c.content_blocks);
+    }
+}
+
+struct GateSummary {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+#[async_trait]
+impl Model for GateSummary {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        panic!("ordinary calls use adapter")
+    }
+    async fn stream_for_summary(
+        &self,
+        _: uuid::Uuid,
+        _: uuid::Uuid,
+        _: ModelRequest,
+    ) -> Result<ModelStream, Error> {
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("checkpoint".into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn independent_tool_summary_recovery_and_reset_are_fenced() {
+    use pi_rs_durable::{
+        extension::Registry,
+        runtime::{IndependentCompactionStatus, Scheduler, SummaryProviderIdentity},
+    };
+    for reset in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let seed_model = Arc::new(SummaryModel::default());
+        let mut h = summary_setup(&path, seed_model);
+        let id = h
+            .create_conversation(Config {
+                model: "fake".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.select_extensions(id, vec!["blocks".into()]).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.reset(id, Some("older".into())).unwrap();
+        h.submit_and_run(id, None, "tool turn".into(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let original = h.conversation(id).unwrap().content_blocks;
+        drop(h);
+        let model = Arc::new(GateSummary {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let open = || {
+            let mut registry = Registry::default();
+            registry
+                .install(Extension {
+                    name: "blocks".into(),
+                    hooks: vec![Arc::new(Blocks)],
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut opts = options();
+            opts.model = model.clone();
+            Scheduler::open_with_summary_recovery(
+                &path,
+                opts,
+                registry,
+                Some(Arc::new(Adapter::default())),
+                SummaryProviderIdentity {
+                    model: "summary-fixture/v1".into(),
+                    settlement: "ledger-fixture/v1".into(),
+                },
+            )
+            .unwrap()
+        };
+        let mut scheduler = open();
+        let op = uuid::Uuid::new_v4();
+        assert!(
+            scheduler
+                .request_idle_independent_compaction(id, op, 0)
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), model.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        if reset {
+            scheduler.reset(id, Some("reset".into())).unwrap();
+        } else {
+            scheduler.shutdown().await.unwrap();
+            scheduler = open();
+            tokio::time::timeout(std::time::Duration::from_secs(5), model.started.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+        }
+        model.release.add_permits(1);
+        let expected = if reset {
+            IndependentCompactionStatus::Stale
+        } else {
+            IndependentCompactionStatus::Applied
+        };
+        assert_eq!(
+            scheduler.wait_independent_compaction(op).await.unwrap(),
+            expected
+        );
+        let c = scheduler.conversation(id).unwrap();
+        if reset {
+            assert!(c.content_blocks.is_empty());
+        } else {
+            assert_eq!(c.content_blocks.values().next(), original.values().next());
+        }
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+struct BusyAdapter {
+    started: tokio::sync::Semaphore,
+    release: Arc<tokio::sync::Semaphore>,
+}
+#[async_trait]
+impl pi_rs_durable::model::ProviderAdapter for BusyAdapter {
+    fn id(&self) -> &str {
+        "tool-block-fixture/v1"
+    }
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+    ) -> Result<Value, Error> {
+        Ok(json!({}))
+    }
+    fn validate(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        _: &Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        request: &pi_rs_durable::model::DurableToolRequest,
+    ) -> Result<Value, Error> {
+        request.validate_bindings()?;
+        Ok(json!({"tool_blocks":request.tool_blocks}))
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        request: &pi_rs_durable::model::DurableToolRequest,
+        body: &Value,
+    ) -> Result<(), Error> {
+        request.validate_bindings()?;
+        if body["tool_blocks"] != json!(request.tool_blocks) {
+            return Err(Error::Config("changed".into()));
+        }
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        _: Value,
+    ) -> Result<ModelStream, Error> {
+        self.started.add_permits(1);
+        let release = self.release.clone();
+        Ok(stream::once(async move {
+            release.acquire().await.unwrap().forget();
+            Ok(ModelEvent::Text("busy answer".into()))
+        })
+        .chain(stream::iter(vec![Ok(ModelEvent::Complete {
+            calls: vec![],
+            usage: None,
+        })]))
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn busy_independent_compaction_preserves_retained_tool_blocks() {
+    use pi_rs_durable::{
+        extension::Registry,
+        runtime::{IndependentCompactionStatus, Scheduler, SummaryProviderIdentity},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(SummaryModel::default());
+    let mut h = summary_setup(&path, model.clone());
+    let id = h
+        .create_conversation(Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.reset(id, Some("older".repeat(3000))).unwrap();
+    h.submit_and_run(id, None, "tool turn".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let original = h
+        .conversation(id)
+        .unwrap()
+        .content_blocks
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    drop(h);
+    let mut registry = Registry::default();
+    registry
+        .install(Extension {
+            name: "blocks".into(),
+            hooks: vec![Arc::new(Blocks)],
+            ..Default::default()
+        })
+        .unwrap();
+    let adapter = Arc::new(BusyAdapter {
+        started: tokio::sync::Semaphore::new(0),
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+    });
+    let mut scheduler = Scheduler::open_with_summary_recovery(
+        &path,
+        summary_options(model),
+        registry,
+        Some(adapter.clone()),
+        SummaryProviderIdentity {
+            model: "summary-fixture/v1".into(),
+            settlement: "ledger-fixture/v1".into(),
+        },
+    )
+    .unwrap();
+    scheduler.submit(id, None, "latest".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), adapter.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let op = uuid::Uuid::new_v4();
+    assert!(
+        scheduler
+            .request_busy_independent_compaction(id, op, 1500)
+            .unwrap()
+    );
+    assert_eq!(
+        scheduler.wait_independent_compaction(op).await.unwrap(),
+        IndependentCompactionStatus::Running
+    );
+    adapter.release.add_permits(1);
+    scheduler.wait(id).await.unwrap();
+    assert_eq!(
+        scheduler.independent_compaction_status(op).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .any(|b| b == &original)
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct OverflowAdapter(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl pi_rs_durable::model::ProviderAdapter for OverflowAdapter {
+    fn id(&self) -> &str {
+        "tool-block-fixture/v1"
+    }
+    fn supports_durable_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn prepare(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+    ) -> Result<Value, Error> {
+        Ok(json!({}))
+    }
+    fn validate(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        _: &Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn prepare_with_tool_blocks(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        request: &pi_rs_durable::model::DurableToolRequest,
+    ) -> Result<Value, Error> {
+        request.validate_bindings()?;
+        Ok(json!({"tool_blocks":request.tool_blocks}))
+    }
+    fn validate_with_tool_blocks(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        request: &pi_rs_durable::model::DurableToolRequest,
+        body: &Value,
+    ) -> Result<(), Error> {
+        request.validate_bindings()?;
+        if body["tool_blocks"] != json!(request.tool_blocks) {
+            return Err(Error::Config("changed".into()));
+        }
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: &pi_rs_durable::model::ProviderAttempt,
+        _: &ModelRequest,
+        _: Value,
+    ) -> Result<ModelStream, Error> {
+        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Model("context length exceeded".into()));
+        }
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("done".into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn provider_overflow_compacts_tool_block_text_before_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(SummaryModel::default());
+    let mut h = summary_setup(&path, model.clone());
+    let id = h
+        .create_conversation(Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.submit_and_run(id, None, "tool turn".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, summary_options(model.clone())).unwrap();
+    h.install_extension(Extension {
+        name: "blocks".into(),
+        hooks: vec![Arc::new(Blocks)],
+        ..Default::default()
+    })
+    .unwrap();
+    h.install_provider_adapter(Arc::new(OverflowAdapter(true.into())))
+        .unwrap();
+    h.submit_and_run(id, None, "later".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = model.0.lock().unwrap();
+    let prompt = match &requests.last().unwrap().messages[1] {
+        Message::User { content } => content,
+        _ => panic!("summary request"),
+    };
+    assert!(prompt.contains("[Tool result]: before\nafter"));
+    assert!(!prompt.contains("aGk="));
+    assert!(h.conversation(id).unwrap().content_blocks.is_empty());
+}
+
+#[tokio::test]
+async fn tool_block_compaction_rejects_hooks_without_block_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(SummaryModel::default());
+    let mut h = summary_setup(&path, model.clone());
+    let id = h
+        .create_conversation(Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.reset(id, Some("older".into())).unwrap();
+    h.submit_and_run(id, None, "tool turn".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let before = h.conversation(id).unwrap();
+    struct Unaware;
+    #[async_trait]
+    impl Hook for Unaware {
+        fn supports_compaction_blocks(&self) -> bool {
+            true
+        }
+    }
+    h.install_extension(Extension {
+        name: "blocks".into(),
+        hooks: vec![Arc::new(Unaware)],
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(h.request_compaction(id, 0).is_err());
+    let after = h.conversation(id).unwrap();
+    assert_eq!(after.messages, before.messages);
+    assert_eq!(after.content_blocks, before.content_blocks);
+    assert!(model.0.lock().unwrap().is_empty());
 }
