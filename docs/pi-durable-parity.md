@@ -583,14 +583,29 @@ checkpoint with the parent suspension. Once all captured pending jobs settle,
 `pending_wake()` supplies the checkpoint and ended operation IDs to the replayed
 root invocation. The same wake survives a process death during that replay,
 including after the replay commits another child's before-tool gate; recovery
-retains it only for the same operation. The parent must be replay-safe. Process-kill and abort tests cover the ordinary
-`KeyedTool` / nested `Tool` execution path without re-dispatching the child.
+retains it only for the same operation. A replay-unsafe `KeyedTool` may opt in
+with a positive host-declared `unsafe_park_version` and checkpointed park. The
+park commit binds the prior tool attempt, tool spec and version; wake verifies
+the current unsafe registration and claims a distinct attempt before running.
+Recovery can re-arm a wake only before the new claim and only when the prior
+attempt still matches. A crash after claim does not replay that invocation.
+The tool must branch on `pending_wake()` before pre-park effects and must not
+leave detached effects; host declarations and external effects cannot be
+verified by the runtime. Process-kill and abort tests cover both sides of that
+boundary and the ordinary nested `Tool` path without re-dispatching the child.
+A test-only stop after each actual conversation commit also exercises process
+kill immediately after wake persistence and after the new attempt claim. The
+former recovers the parked wake; the latter requires reconciliation even if
+the handler had not started. Abort and changed spec, version or replay policy
+remain fenced on both sides of the claim. These hooks are absent from production
+builds.
 
 This is a bounded extension of the existing external-pending path, not upstream
 `executeTool(..., {wait: false})` or `ToolPark`: initial child execution is
 awaited, operation IDs are not independently scheduled task handles, wake is
-all-pending rather than `any`, and checkpointed before-tool gates, unsafe
-parents, tool sleep and independent synchronous children are unsupported.
+all-pending rather than `any`, and checkpointed before-tool gates,
+non-opted-in unsafe parents, tool sleep and independent synchronous children
+are unsupported.
 Abort fences local replay but does not abort an accepted remote job. TaskTool
 handles cannot safely be reused here: their owner is a durable scheduler task,
 whereas a `NestedHost` call is an operation journal entry owned by a live tool

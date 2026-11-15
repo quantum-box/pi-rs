@@ -52,6 +52,10 @@ type ResolvedCompactionTarget = (Vec<Message>, (usize, usize));
 #[path = "summary_worker_tests.rs"]
 mod summary_worker_tests;
 
+#[cfg(test)]
+#[path = "unsafe_park_boundary_tests.rs"]
+mod unsafe_park_boundary_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("owner: {0}")]
@@ -1076,6 +1080,12 @@ struct BlockResetProof {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct UnsafeParkProof {
+    attempt: ToolAttempt,
+    identity: crate::keyed_tool::UnsafeParkIdentity,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NestedResume {
     operation_id: Uuid,
     restarts: u32,
@@ -1084,6 +1094,33 @@ struct NestedResume {
     explicit_suspend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_wake: Option<crate::nested::PendingWake>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unsafe_park: Option<UnsafeParkProof>,
+}
+
+// The process-kill tests stop only after the real checked commit has returned.
+// This hook is absent from non-test builds.
+#[cfg(test)]
+fn stop_at_unsafe_park_boundary(stage: &str, state: &Conversation) {
+    if std::env::var("PI_UNSAFE_BOUNDARY_STAGE").ok().as_deref() != Some(stage)
+        || !state
+            .nested_resume
+            .as_ref()
+            .is_some_and(|resume| resume.unsafe_park.is_some())
+    {
+        return;
+    }
+    let Some(root) = std::env::var_os("PI_UNSAFE_BOUNDARY_DIR") else {
+        return;
+    };
+    std::fs::write(
+        std::path::PathBuf::from(root).join("boundary"),
+        serde_json::to_vec(&state.tool_attempt()).unwrap(),
+    )
+    .unwrap();
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Identity of one execution of a durable tool operation.
@@ -1245,8 +1282,8 @@ pub fn conversation_wake(
 }
 
 impl Conversation {
-    /// Whether a replay-safe keyed tool explicitly suspended on pending
-    /// nested jobs. An abort keeps the suspension visible until reconciled.
+    /// Whether a keyed tool durably suspended on pending nested jobs.
+    /// An abort keeps the suspension visible until reconciled.
     pub fn nested_suspended(&self) -> bool {
         self.nested_resume
             .as_ref()
@@ -9039,6 +9076,44 @@ impl Harness {
                         "runtime/extension-report/{id}/{operation_id}/tool_execution_panic"
                     );
                     let panicked = self.owner.store().get(panic_key.as_bytes())?.is_some();
+                    // A committed park has no running invocation. After the
+                    // wake transition but before the next attempt is claimed,
+                    // a crash can safely return to that same parked state.
+                    if !c.abort_requested
+                        && !panicked
+                        && replay == ReplayPolicy::Unsafe
+                        && replay_ready
+                        && stored_identity == Some(DispatchIdentity::Other)
+                        && c.nested_resume.as_ref().is_some_and(|resume| {
+                            resume.operation_id == operation_id
+                                && resume.explicit_suspend
+                                && resume.pending_wake.is_some()
+                                && resume.unsafe_park.as_ref().is_some_and(|proof| {
+                                    proof.attempt.operation_id == operation_id
+                                        && !proof.attempt.attempt_id.is_nil()
+                                        && c.tool_attempt() == Some(proof.attempt)
+                                })
+                        })
+                    {
+                        c.phase = Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason: "recovering committed unsafe park before next attempt".into(),
+                            arguments: Some(arguments),
+                        };
+                        self.recovering = true;
+                        let result = self.save(&c, Expected::Version(version));
+                        self.recovering = false;
+                        return result;
+                    }
+                    // Once an unsafe invocation starts, its effects are uncertain
+                    // even if a previous park marker or nested gate still exists.
+                    if replay == ReplayPolicy::Unsafe {
+                        c.nested_resume = None;
+                    }
                     if !c.abort_requested
                         && !panicked
                         && replay == ReplayPolicy::Safe
@@ -9060,6 +9135,7 @@ impl Harness {
                             dispatch_identity: DispatchIdentity::Other,
                             explicit_suspend: true,
                             pending_wake,
+                            unsafe_park: None,
                         });
                         c.phase = Phase::Blocked {
                             tool_panicked: false,
@@ -9647,7 +9723,8 @@ impl Harness {
             return Ok(false);
         };
         if operation_id != resume.operation_id
-            || resume.restarts.saturating_add(1) >= self.options.restart_limit
+            || (resume.unsafe_park.is_none()
+                && resume.restarts.saturating_add(1) >= self.options.restart_limit)
         {
             return Ok(false);
         }
@@ -9661,7 +9738,18 @@ impl Harness {
         let Some(reg) = tools.get(&call.name) else {
             return Ok(false);
         };
-        if reg.replay != ReplayPolicy::Safe
+        let unsafe_park = resume.unsafe_park.as_ref().is_some_and(|proof| {
+            resume.explicit_suspend
+                && resume.pending_wake.is_some()
+                && proof.attempt.operation_id == operation_id
+                && !proof.attempt.attempt_id.is_nil()
+                && c.tool_attempt() == Some(proof.attempt)
+                && reg.replay == ReplayPolicy::Unsafe
+                && crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref()
+                    == Some(&proof.identity)
+        });
+        let safe_replay = resume.unsafe_park.is_none() && reg.replay == ReplayPolicy::Safe;
+        if !(unsafe_park || safe_replay)
             || dispatch_identity(&reg.tool).ok() != Some(resume.dispatch_identity.clone())
             || (resume.explicit_suspend
                 && crate::nested::has_staged_results(self.owner.store(), operation_id)?)
@@ -9669,8 +9757,15 @@ impl Harness {
         {
             return Ok(false);
         }
+        // An unsafe parked invocation ended normally. Merely waking or
+        // recovering before its next claim is not an interrupted execution.
+        let next_restarts = if unsafe_park {
+            resume.restarts
+        } else {
+            resume.restarts.saturating_add(1)
+        };
         if resume.explicit_suspend && (!c.extensions.is_empty() || resume.pending_wake.is_some()) {
-            c.nested_resume.as_mut().unwrap().restarts = resume.restarts.saturating_add(1);
+            c.nested_resume.as_mut().unwrap().restarts = next_restarts;
         } else {
             c.nested_resume = None;
         }
@@ -9680,8 +9775,12 @@ impl Harness {
             index,
             operation_id,
             arguments,
-            replay: ReplayPolicy::Safe,
-            restarts: resume.restarts.saturating_add(1),
+            replay: if unsafe_park {
+                ReplayPolicy::Unsafe
+            } else {
+                ReplayPolicy::Safe
+            },
+            restarts: next_restarts,
             replay_ready: true,
             dispatch_identity: Some(resume.dispatch_identity),
         };
@@ -9883,7 +9982,11 @@ impl Harness {
             if self.prepare_nested_resume(&mut c)? {
                 match self.save(&c, Expected::Version(version)) {
                     Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
-                    other => other?,
+                    Err(error) => return Err(error),
+                    Ok(()) => {
+                        #[cfg(test)]
+                        stop_at_unsafe_park_boundary("wake-saved", &c);
+                    }
                 }
                 continue;
             }
@@ -11577,6 +11680,27 @@ impl Harness {
                     dispatch_identity: stored_identity,
                 } => {
                     if replay_ready {
+                        if replay == ReplayPolicy::Unsafe
+                            && !c.nested_resume.as_ref().is_some_and(|resume| {
+                                resume.operation_id == operation_id
+                                    && resume.explicit_suspend
+                                    && resume.pending_wake.is_some()
+                                    && resume.unsafe_park.as_ref().is_some_and(|proof| {
+                                        proof.attempt.operation_id == operation_id
+                                            && !proof.attempt.attempt_id.is_nil()
+                                            && c.tool_attempt() == Some(proof.attempt)
+                                    })
+                            })
+                        {
+                            c.nested_resume = None;
+                            c.phase = Phase::Blocked {
+                                tool_panicked: false, turns, calls, index, operation_id,
+                                reason: "unsafe park attempt fence missing or changed; reconciliation required".into(),
+                                arguments: Some(arguments),
+                            };
+                            self.save(&c, Expected::Version(version))?;
+                            continue;
+                        }
                         c.tool_attempt = Some(ToolAttempt {
                             operation_id,
                             attempt_id: Uuid::new_v4(),
@@ -11585,6 +11709,10 @@ impl Harness {
                             *replay_ready = false;
                         }
                         self.save(&c, Expected::Version(version))?;
+                        #[cfg(test)]
+                        if replay == ReplayPolicy::Unsafe {
+                            stop_at_unsafe_park_boundary("attempt-claimed", &c);
+                        }
                         continue;
                     }
                     let call = calls
@@ -11626,6 +11754,7 @@ impl Harness {
                     let mut nested_resume_candidate = false;
                     let mut explicitly_suspended = false;
                     let mut parked_checkpoint = None;
+                    let mut empty_park_controls = false;
                     let task_adapter = tools
                         .get(&call.name)
                         .and_then(|reg| crate::task_tool::lookup(&reg.tool));
@@ -11645,6 +11774,33 @@ impl Harness {
                         };
                         self.save(&c, Expected::Version(version))?;
                         continue;
+                    }
+                    if replay == ReplayPolicy::Unsafe
+                        && let Some(proof) = c
+                            .nested_resume
+                            .as_ref()
+                            .filter(|resume| resume.operation_id == operation_id)
+                            .and_then(|resume| resume.unsafe_park.as_ref())
+                    {
+                        let valid = c.active_tool_attempt().is_some_and(|attempt| {
+                            attempt.operation_id == operation_id
+                                && attempt != proof.attempt
+                                && !attempt.attempt_id.is_nil()
+                        }) && tools.get(&call.name).is_some_and(|reg| {
+                            reg.replay == ReplayPolicy::Unsafe
+                                && crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref()
+                                    == Some(&proof.identity)
+                        });
+                        if !valid {
+                            c.nested_resume = None;
+                            c.phase = Phase::Blocked {
+                                tool_panicked: false, turns, calls, index, operation_id,
+                                reason: "unsafe park attempt or tool identity changed; reconciliation required".into(),
+                                arguments: Some(arguments),
+                            };
+                            self.save(&c, Expected::Version(version))?;
+                            continue;
+                        }
                     }
                     let reply = if let Some(reg) = tools
                         .get(&call.name)
@@ -11795,6 +11951,16 @@ impl Harness {
                                         explicitly_suspended = host.explicitly_suspended();
                                         parked_checkpoint =
                                             host.parked_checkpoint().map_err(Error::Invalid)?;
+                                        if replay == ReplayPolicy::Unsafe && explicitly_suspended {
+                                            empty_park_controls = control
+                                                .lock()
+                                                .map_err(|_| {
+                                                    Error::Invalid(
+                                                        "tool control lock poisoned".into(),
+                                                    )
+                                                })?
+                                                .eq(&crate::reset::ToolControl::default());
+                                        }
                                         nested_resume_candidate = inspection.is_err()
                                             && host.only_pending_failure()
                                             && !tool_panicked
@@ -11885,18 +12051,39 @@ impl Harness {
                     }
                     match reply.outcome {
                         Outcome::Unknown(reason) => {
+                            let unsafe_park = if replay == ReplayPolicy::Unsafe
+                                && explicitly_suspended
+                                && parked_checkpoint.is_some()
+                                && empty_park_controls
+                            {
+                                c.active_tool_attempt()
+                                    .filter(|attempt| !attempt.attempt_id.is_nil())
+                                    .and_then(|attempt| {
+                                        tools
+                                            .get(&call.name)
+                                            .filter(|reg| reg.replay == ReplayPolicy::Unsafe)
+                                            .and_then(|reg| {
+                                                crate::keyed_tool::unsafe_park_identity(&reg.tool)
+                                            })
+                                            .map(|identity| UnsafeParkProof { attempt, identity })
+                                    })
+                            } else {
+                                None
+                            };
                             c.nested_resume = if nested_resume_candidate
-                                && replay == ReplayPolicy::Safe
-                                && restarts.saturating_add(1) < self.options.restart_limit
+                                && (replay == ReplayPolicy::Safe || unsafe_park.is_some())
+                                && (unsafe_park.is_some()
+                                    || restarts.saturating_add(1) < self.options.restart_limit)
                                 && (c.extensions.is_empty() || explicitly_suspended)
                                 && stored_identity == Some(DispatchIdentity::Other)
                             {
                                 Some(NestedResume {
                                     operation_id,
-                                    restarts,
+                                    restarts: if unsafe_park.is_some() { 0 } else { restarts },
                                     dispatch_identity: DispatchIdentity::Other,
                                     explicit_suspend: explicitly_suspended,
                                     pending_wake: parked_checkpoint,
+                                    unsafe_park,
                                 })
                             } else {
                                 None
@@ -19620,6 +19807,174 @@ mod scheduler_tests {
         latest.phase = Phase::ModelReady { turns: 0 };
         assert!(!admission_only(&base, &latest).unwrap());
     }
+    #[test]
+    fn unsafe_park_recovery_only_rearms_matching_unclaimed_attempt() {
+        for scenario in [
+            "unclaimed",
+            "executing",
+            "wrong-attempt",
+            "wrong-operation",
+            "abort",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = Arc::new(GatedModel {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+            });
+            let mut opts = options(model.clone());
+            opts.uncertain_policy = UncertainPolicy::RequireReconciliation;
+            let mut h = Harness::open_paused(&path, opts.clone()).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let (mut state, version) = h.load(id).unwrap();
+            let operation_id = Uuid::new_v4();
+            let parked_attempt = ToolAttempt {
+                operation_id,
+                attempt_id: Uuid::new_v4(),
+            };
+            let current_attempt = if scenario == "wrong-attempt" || scenario == "executing" {
+                ToolAttempt {
+                    operation_id,
+                    attempt_id: Uuid::new_v4(),
+                }
+            } else {
+                parked_attempt
+            };
+            let identity: crate::keyed_tool::UnsafeParkIdentity = serde_json::from_value(serde_json::json!({
+                "spec": {"name":"parent", "description":"", "parameters":{"type":"object"}}, "version":1
+            })).unwrap();
+            state.tool_attempt = Some(current_attempt);
+            state.abort_requested = scenario == "abort";
+            state.nested_resume = Some(NestedResume {
+                operation_id: if scenario == "wrong-operation" {
+                    Uuid::new_v4()
+                } else {
+                    operation_id
+                },
+                restarts: 0,
+                dispatch_identity: DispatchIdentity::Other,
+                explicit_suspend: true,
+                pending_wake: Some(crate::nested::PendingWake {
+                    checkpoint: serde_json::json!({"value":42}),
+                    ended: vec![Uuid::new_v4()],
+                }),
+                unsafe_park: Some(UnsafeParkProof {
+                    attempt: parked_attempt,
+                    identity,
+                }),
+            });
+            state.phase = Phase::ToolRunning {
+                turns: 0,
+                calls: vec![],
+                index: 0,
+                operation_id,
+                replay: ReplayPolicy::Unsafe,
+                arguments: serde_json::json!({}),
+                restarts: 0,
+                replay_ready: scenario != "executing",
+                dispatch_identity: Some(DispatchIdentity::Other),
+            };
+            h.save(&state, Expected::Version(version)).unwrap();
+            drop(h);
+            let h = Harness::open_paused(&path, opts).unwrap();
+            let recovered = h.conversation(id).unwrap();
+            if scenario == "abort" {
+                assert!(recovered.abort_requested);
+                assert!(recovered.active_tool_attempt().is_none());
+                continue;
+            }
+            assert!(
+                matches!(recovered.phase, Phase::Blocked { .. }),
+                "{scenario}"
+            );
+            assert_eq!(
+                recovered.nested_resume.is_some(),
+                scenario == "unclaimed",
+                "{scenario}"
+            );
+            if scenario == "unclaimed" {
+                assert_eq!(recovered.nested_resume.unwrap().restarts, 0);
+                assert_eq!(recovered.tool_attempt, Some(parked_attempt));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_unclaimed_invocation_without_matching_park_fence_never_claims() {
+        for scenario in ["missing", "stale"] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(GatedModel {
+                started: Arc::new(Semaphore::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                active: AtomicUsize::new(0),
+                maximum: AtomicUsize::new(0),
+            });
+            let mut h = Harness::open_paused(dir.path().join("db"), options(model)).unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            let (mut state, version) = h.load(id).unwrap();
+            let operation_id = Uuid::new_v4();
+            let attempt = ToolAttempt {
+                operation_id,
+                attempt_id: Uuid::new_v4(),
+            };
+            state.tool_attempt = Some(attempt);
+            if scenario == "stale" {
+                let identity: crate::keyed_tool::UnsafeParkIdentity = serde_json::from_value(serde_json::json!({
+                    "spec": {"name":"parent", "description":"", "parameters":{"type":"object"}}, "version":1
+                })).unwrap();
+                state.nested_resume = Some(NestedResume {
+                    operation_id,
+                    restarts: 0,
+                    dispatch_identity: DispatchIdentity::Other,
+                    explicit_suspend: true,
+                    pending_wake: Some(crate::nested::PendingWake {
+                        checkpoint: serde_json::json!(null),
+                        ended: vec![Uuid::new_v4()],
+                    }),
+                    unsafe_park: Some(UnsafeParkProof {
+                        attempt: ToolAttempt {
+                            operation_id,
+                            attempt_id: Uuid::new_v4(),
+                        },
+                        identity,
+                    }),
+                });
+            }
+            state.phase = Phase::ToolRunning {
+                turns: 0,
+                calls: vec![],
+                index: 0,
+                operation_id,
+                replay: ReplayPolicy::Unsafe,
+                arguments: serde_json::json!({}),
+                restarts: 0,
+                replay_ready: true,
+                dispatch_identity: Some(DispatchIdentity::Other),
+            };
+            h.save(&state, Expected::Version(version)).unwrap();
+            h.resume(&CancellationToken::new()).await.unwrap();
+            let state = h.conversation(id).unwrap();
+            assert!(
+                matches!(state.phase, Phase::Blocked { ref reason, .. } if reason.contains("attempt fence")),
+                "{scenario}"
+            );
+            assert!(state.nested_resume.is_none());
+            assert_eq!(state.tool_attempt(), Some(attempt));
+            assert!(
+                h.tool_attempts(
+                    id,
+                    crate::observer::Cursor(0),
+                    std::num::NonZeroUsize::new(10).unwrap()
+                )
+                .unwrap()
+                .records
+                .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn legacy_tool_phases_have_no_invented_attempt() {
         let mut conversation = Harness::empty_conversation(Uuid::new_v4(), config());

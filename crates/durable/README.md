@@ -373,7 +373,7 @@ The runtime persists it with the outcome and ends the run without another model
 request only when every result in the nonempty tool round requests termination.
 The last defined handoff in model call order (including empty text) appends a reset after after-tools tasks and before queued boundary items. It starts a new model context while preserving history. Controls are persisted with tool outcomes and survive reopen; nested calls do not control their caller’s round.
 
-A replay-safe root `KeyedTool` can additionally use
+A root `KeyedTool` can use
 `call_keyed_unpolled_with_id` to retrieve a nested journal operation ID and
 `suspend_pending_with_checkpoint` to persist up to 64 KiB of JSON alongside
 an explicit suspension. On replay `pending_wake()` returns that checkpoint
@@ -384,8 +384,20 @@ the parent resumes only after **all** captured pending jobs settle. IDs are
 journal operation IDs, not task handles. Checkpointed suspension rejects
 before-tool gates; use the existing gate suspension API for those. A crash
 before the suspension commit cannot recover the proposed checkpoint. The
-parent must be replay-safe, return normally without state or controls, and
-make its own effects replay-safe. Conversation abort fences polling and replay
+parent must return normally without state or controls. A replay-safe parent must
+make its own effects replay-safe. A parent registered unsafe must explicitly opt
+in with a positive `unsafe_park_version`, branch on `pending_wake()` before
+repeating pre-park effects, and leave no detached effects running after return.
+The host must bump that version when the implementation or checkpoint meaning
+changes and restore the same spec, version, and unsafe policy after reopen.
+The committed checkpoint and original attempt identity fence the park; a new
+attempt is claimed before resumption. Process death after that claim is an
+interrupted unsafe invocation and requires reconciliation (or follows the
+configured interruption policy), even if an earlier wake exists. A crash
+before the claim does not start an invocation or consume the restart limit.
+The runtime cannot make arbitrary external effects idempotent; the declared
+wake branch and any destination-side idempotency remain the host's responsibility.
+Conversation abort fences polling and replay
 but does not cancel an accepted external job, which remains available for
 explicit reconciliation. This is not upstream's `wait: false`, `ToolPark`,
 `any` wake, or independently executing child task.

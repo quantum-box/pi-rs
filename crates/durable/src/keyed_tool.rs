@@ -74,6 +74,15 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
 #[async_trait::async_trait]
 pub trait KeyedTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Opt in to resuming a committed checkpointed park when registered unsafe.
+    /// The implementation must branch on `pending_wake()` before repeating any
+    /// pre-park effect and must not leave detached effects running after return.
+    /// Return a positive, stable version and change it when the implementation
+    /// or checkpoint interpretation changes. Interrupted invocations still do
+    /// not replay. The host must restore the same tool definition on reopen.
+    fn unsafe_park_version(&self) -> Option<u32> {
+        None
+    }
     async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
         Ok(arguments)
     }
@@ -184,8 +193,9 @@ impl KeyedHost {
     pub fn suspend_pending(&self) -> Result<(), String> {
         self.nested.suspend_pending()
     }
-    /// Park this replay-safe root until all accepted pending nested jobs settle,
-    /// recording a checkpoint in the same conversation transition. The
+    /// Park the root until all accepted pending nested jobs settle, recording a
+    /// checkpoint in the same conversation transition. Unsafe registrations
+    /// require `KeyedTool::unsafe_park_version` and its replay contract. The
     /// invocation must return normally without state or controls.
     pub fn suspend_pending_with_checkpoint(&self, checkpoint: Value) -> Result<(), String> {
         self.nested
@@ -382,16 +392,33 @@ impl<T: StreamedTool> KeyedTool for StreamedToolAdapter<T> {
 
 // Weak entries keep allocations from being reused while they are registered. The
 // token belongs to the adapter, not its address or concrete Rust type.
-type RegistryEntry = (Weak<dyn Tool>, Weak<()>);
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UnsafeParkIdentity {
+    spec: ToolSpec,
+    version: u32,
+}
+type RegistryEntry = (Weak<dyn Tool>, Weak<()>, Option<UnsafeParkIdentity>);
 static REGISTRY: OnceLock<Mutex<Vec<RegistryEntry>>> = OnceLock::new();
 
 fn registered_identity(tool: &Arc<dyn Tool>) -> Option<Arc<()>> {
     let mut entries = REGISTRY.get_or_init(Default::default).lock().ok()?;
-    entries.retain(|(tool, identity)| tool.strong_count() > 0 && identity.strong_count() > 0);
-    entries.iter().find_map(|(registered, identity)| {
+    entries.retain(|(tool, identity, _)| tool.strong_count() > 0 && identity.strong_count() > 0);
+    entries.iter().find_map(|(registered, identity, _)| {
         let registered = registered.upgrade()?;
         Arc::ptr_eq(&registered, tool)
             .then(|| identity.upgrade())
+            .flatten()
+    })
+}
+
+pub(crate) fn unsafe_park_identity(tool: &Arc<dyn Tool>) -> Option<UnsafeParkIdentity> {
+    let spec = tool.spec();
+    let mut entries = REGISTRY.get_or_init(Default::default).lock().ok()?;
+    entries.retain(|(tool, identity, _)| tool.strong_count() > 0 && identity.strong_count() > 0);
+    entries.iter().find_map(|(registered, _, identity)| {
+        let registered = registered.upgrade()?;
+        Arc::ptr_eq(&registered, tool)
+            .then(|| identity.clone().filter(|identity| identity.spec == spec))
             .flatten()
     })
 }
@@ -415,12 +442,25 @@ impl<T> KeyedToolAdapter<T> {
             .get_or_init(Default::default)
             .lock()
             .expect("keyed registry poisoned");
-        entries.retain(|(tool, identity)| tool.strong_count() > 0 && identity.strong_count() > 0);
+        entries
+            .retain(|(tool, identity, _)| tool.strong_count() > 0 && identity.strong_count() > 0);
         if !entries
             .iter()
-            .any(|(registered, _)| registered.ptr_eq(&Arc::downgrade(&tool)))
+            .any(|(registered, _, _)| registered.ptr_eq(&Arc::downgrade(&tool)))
         {
-            entries.push((Arc::downgrade(&tool), Arc::downgrade(&self.1)));
+            let park_identity = self
+                .0
+                .unsafe_park_version()
+                .filter(|version| *version > 0)
+                .map(|version| UnsafeParkIdentity {
+                    spec: self.0.spec(),
+                    version,
+                });
+            entries.push((
+                Arc::downgrade(&tool),
+                Arc::downgrade(&self.1),
+                park_identity,
+            ));
         }
         crate::runtime::RegisteredTool { tool, replay }
     }
