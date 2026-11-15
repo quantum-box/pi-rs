@@ -436,7 +436,12 @@ During manual compaction, an RPC `abort` response waits for the compaction
 command to finish, even if an internal agent-settled event arrives first.
 
 Unknown RPC commands return `Unknown command: <type>` and preserve the
-request ID when present. Malformed JSON produces a `parse` response with a
+request ID and original type when present. Object, array and numeric types use
+JavaScript string conversion in the diagnostic, including null array elements.
+The echoed JSON value retains Rust's parsed integer precision, which can differ
+from JavaScript for integers outside the safe range; out-of-range JSON numbers
+such as `1e400` are rejected by the native parser.
+Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
