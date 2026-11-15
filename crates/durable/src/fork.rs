@@ -314,6 +314,7 @@ mod tests {
             request_id: None,
             content: "q".into(),
             image_notes: Vec::new(),
+            input_blocks: None,
             status: Status::Queued,
         });
         assert!(matches!(extract(id, &record(&s)), Err(Error::Unsettled)));

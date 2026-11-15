@@ -470,6 +470,9 @@ Host `wake_at` does not schedule a timer: callers supply a scheduler-consistent 
 
 **User image admission:** `UserImageAdmission` is an opt-in pi-rs admission
 operation that fits user blocks against the selected model before the atomic
-submission commit. It returns and stores preparation notes, refuses busy
-conversations, and fences concurrent model changes. Upstream instead asks the
-host to call `fitImages` before submit; other pi-rs input paths remain unchanged.
+submission commit. It returns and stores preparation notes, supports queued
+steering and follow-ups, and fences concurrent model changes. Fitted resets
+support conversation-scoped request deduplication; host `onYield` hooks may
+explicitly prepare continuations against the lifecycle model profile. Upstream
+instead asks the host to call `fitImages` before submit; other pi-rs input
+paths remain unchanged.

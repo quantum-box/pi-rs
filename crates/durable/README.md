@@ -1578,8 +1578,10 @@ not runtime probing, and do not imply provider acceptance.
 `UserImageAdmission::new(Arc<dyn ImageProcessor>)` selects the processor for
 `Harness::submit_fitted_user_blocks` or the corresponding `Scheduler` method.
 The method fits an ordered nonempty text/image block array using the selected
-adapter's current model limits, then commits the fitted blocks and submission
-in one transition. The scheduler schedules only after that commit; a harness
+adapter's current model limits, then commits the fitted payload and submission
+in one transition. Immediately placed inputs also enter the transcript in that
+transition; queued inputs enter it when selected at a boundary. The scheduler
+schedules only after admission; a harness
 caller drives the run with `resume_conversation`. Unselected ordinary string
 submissions and `append_user_blocks` do not fit images. A selected block-aware
 adapter is required; an unknown image profile uses the default limits.
@@ -1598,10 +1600,26 @@ configuration is version-fenced
 across the asynchronous fit, and the adapter profile is rechecked before commit.
 Hosts must keep adapter profile configuration stable during admission.
 
-This API currently admits only settled conversations and returns `Busy` for
-queued, active, reset or independent-summary work; it does not implement busy
-steering, document-composed admission, or automatic fitting of continuations
-and resets. Fitted history is never refitted after a model change. These are
-pi-rs extensions: upstream exposes `fitImages` for the host to call before
-submit, not a general user-admission hook. Installing a tool-result fit extension
-alone does not select this user-input API.
+`submit_fitted_user_blocks_with_options` also admits steering or follow-up
+blocks while busy. The fitted payload and occurrence ID are durable while
+queued, use the existing queue ordering and rejection policies, and are not
+refitted at placement or after a model change. Abort withdraws queued inputs
+under the existing rules. Reusing a request ID returns the original result.
+`reset_with_fitted_blocks` fits each reset addition using the admission-time
+model and preserves the existing reset ordering. Its optional reset request ID
+has a separate conversation-scoped deduplication namespace; retries return the
+same reset ID, occurrence IDs and notes, including after reopen. Forks start a
+new reset-deduplication namespace. An admission or reset racing a conversation
+change can return a conflict; retry the operation with the same request ID.
+
+For an explicitly selected `onYield` hook, call
+`UserImageAdmission::prepare_for_context` and return its blocks in
+`GenerationDecision::Continue`. The lifecycle context supplies the current
+adapter model profile. Notes are appended to the continuation; the existing
+continuation precedence, recovery, and cancellation rules still apply. The
+host must opt in on each continuation; reset, string inputs, other hooks and
+document-composed admission are not fitted automatically. Fitted history is
+never refitted after a model change. These are pi-rs extensions: upstream
+exposes `fitImages` for the host to call before submit, not a general
+user-admission hook. Installing a tool-result fit extension alone does not
+select these APIs.

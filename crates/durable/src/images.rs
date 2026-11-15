@@ -224,6 +224,40 @@ impl UserImageAdmission {
     pub fn new(processor: std::sync::Arc<dyn ImageProcessor>) -> Self {
         Self { processor }
     }
+    /// Prepare host-supplied input (including on-yield continuations) with explicit limits.
+    /// Notes are appended as model-visible text and returned separately.
+    pub async fn prepare_blocks(
+        &self,
+        blocks: &[Value],
+        limits: ImageLimits,
+    ) -> Result<(Vec<Value>, Vec<String>), String> {
+        if blocks.is_empty() {
+            return Err("empty user content blocks".into());
+        }
+        let (mut output, notes) = match fit_images(blocks, limits, self.processor.as_ref()).await? {
+            FittedImages::Unchanged => (blocks.to_vec(), Vec::new()),
+            FittedImages::Fitted { content, notes } => (content, notes),
+        };
+        if !notes.is_empty() {
+            output.push(json!({"type":"text", "text":notes.join(" ")}));
+        }
+        Ok((output, notes))
+    }
+    /// Prepare continuation blocks against the lifecycle hook's current model profile.
+    pub async fn prepare_for_context(
+        &self,
+        blocks: &[Value],
+        context: &crate::extension::Context<'_>,
+    ) -> Result<(Vec<Value>, Vec<String>), String> {
+        let limits = context
+            .snapshot
+            .get("_model_image_profile")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<ModelImageProfile>(v).ok())
+            .map(|profile| profile.limits)
+            .unwrap_or_default();
+        self.prepare_blocks(blocks, limits).await
+    }
     pub(crate) async fn fit(
         &self,
         content: &[Value],

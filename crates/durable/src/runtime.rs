@@ -199,7 +199,16 @@ pub struct Submission {
     /// Model-visible preparation diagnostics for an image admission.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_notes: Vec<String>,
+    /// Ordered fitted input, including its durable occurrence identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_blocks: Option<crate::transcript::MessageContentBlocks>,
     pub status: Status,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct FittedResetReceipt {
+    reset: Uuid,
+    occurrences: Vec<Uuid>,
+    notes: Vec<String>,
 }
 /// A durable application entry. Queued entries wait for their preceding reset.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -698,6 +707,8 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pending_reset_blocks:
         std::collections::BTreeMap<Uuid, Vec<crate::transcript::MessageContentBlocks>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    fitted_reset_receipts: std::collections::BTreeMap<String, FittedResetReceipt>,
     #[serde(default)]
     pending_independent_summary: Option<PendingIndependentSummary>,
     #[serde(default)]
@@ -1113,6 +1124,7 @@ impl Conversation {
             request_id: None,
             content: content.clone(),
             image_notes: Vec::new(),
+            input_blocks: None,
             status: Status::Running,
         });
         self.input_modes.insert(id, InputMode::FollowUp);
@@ -3316,6 +3328,51 @@ impl Harness {
             state.content_blocks = blocks;
         }
         validate_pending_reset_blocks(state)?;
+        for (key, receipt) in &state.fitted_reset_receipts {
+            if key.is_empty()
+                || receipt.reset.is_nil()
+                || receipt.occurrences.is_empty()
+                || receipt.occurrences.iter().any(Uuid::is_nil)
+                || receipt
+                    .occurrences
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != receipt.occurrences.len()
+                || !state
+                    .resets
+                    .iter()
+                    .chain(&state.pending_resets)
+                    .any(|r| r.id == receipt.reset)
+                || state
+                    .pending_reset_blocks
+                    .get(&receipt.reset)
+                    .is_some_and(|b| {
+                        b.iter()
+                            .map(|b| b.message_id)
+                            .ne(receipt.occurrences.iter().copied())
+                    })
+            {
+                return Err(Error::Invalid("invalid fitted reset receipt".into()));
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        for submission in &state.submissions {
+            if let Some(binding) = &submission.input_blocks {
+                if submission.kind != SubmissionKind::Input
+                    || !submission.content.is_empty()
+                    || binding.message_id.is_nil()
+                    || !ids.insert(binding.message_id)
+                    || crate::content::UserContent::from_yield(
+                        serde_json::Value::Array(binding.blocks.clone()),
+                        false,
+                    )
+                    .is_none()
+                {
+                    return Err(Error::Invalid("invalid fitted input binding".into()));
+                }
+            }
+        }
         Ok(())
     }
     fn read_transcript_blocks(
@@ -3618,6 +3675,16 @@ impl Harness {
                     for marker in latest.pending_resets.iter().skip(base.pending_resets.len()) {
                         state.pending_resets.push(marker.clone());
                     }
+                    for (key, receipt) in &latest.fitted_reset_receipts {
+                        if !base.fitted_reset_receipts.contains_key(key)
+                            && state
+                                .fitted_reset_receipts
+                                .insert(key.clone(), receipt.clone())
+                                .is_some()
+                        {
+                            return Err(Error::Invalid("duplicate fitted reset receipt".into()));
+                        }
+                    }
                     for (id, blocks) in &latest.pending_reset_blocks {
                         if !base.pending_reset_blocks.contains_key(id)
                             && state
@@ -3872,7 +3939,11 @@ impl Harness {
                             .placed_resets
                             .last()
                             .is_some_and(|reset| reset.id == *id)
-                            && state.content_blocks.values().eq(expected_blocks.iter())
+                            && state
+                                .content_blocks
+                                .values()
+                                .take(expected_blocks.len())
+                                .eq(expected_blocks.iter())
                     });
                 if !placed {
                     return Err(Error::Invalid(
@@ -4677,6 +4748,7 @@ impl Harness {
             resets: vec![],
             pending_resets: vec![],
             pending_reset_blocks: Default::default(),
+            fitted_reset_receipts: Default::default(),
             pending_independent_summary: None,
             application_writes: vec![],
             tool_states: HashMap::new(),
@@ -4737,6 +4809,7 @@ impl Harness {
         state.resets.clear();
         state.pending_resets.clear();
         state.pending_reset_blocks.clear();
+        state.fitted_reset_receipts.clear();
         state.input_modes.clear();
         state.answer_ids.clear();
         state.auto_compaction_attempted = false;
@@ -4980,6 +5053,7 @@ impl Harness {
             )?,
             pending_resets: vec![],
             pending_reset_blocks: Default::default(),
+            fitted_reset_receipts: Default::default(),
             pending_independent_summary: None,
             application_writes: point
                 .documents
@@ -7332,6 +7406,16 @@ impl Harness {
         handoff: Option<String>,
         additions: Vec<Vec<serde_json::Value>>,
     ) -> Result<(Uuid, Vec<Uuid>), Error> {
+        self.reset_with_blocks_at_version(id, handoff, additions, None, None)
+    }
+    fn reset_with_blocks_at_version(
+        &mut self,
+        id: Uuid,
+        handoff: Option<String>,
+        additions: Vec<Vec<serde_json::Value>>,
+        expected_version: Option<u64>,
+        receipt: Option<(String, Vec<String>)>,
+    ) -> Result<(Uuid, Vec<Uuid>), Error> {
         if additions.is_empty()
             || additions.iter().any(|blocks| {
                 crate::content::UserContent::from_yield(
@@ -7354,6 +7438,11 @@ impl Harness {
         let ids: Vec<_> = bindings.iter().map(|binding| binding.message_id).collect();
         loop {
             let (mut state, version) = self.load(id)?;
+            if expected_version.is_some_and(|expected| expected != version) {
+                return Err(Error::Invalid(
+                    "conversation changed during image fitting".into(),
+                ));
+            }
             let source = state
                 .transcript
                 .clone()
@@ -7378,6 +7467,19 @@ impl Harness {
                     .any(|binding| unique.contains(&binding.message_id))
             {
                 return Err(Error::Invalid("reset identity collision".into()));
+            }
+            if let Some((key, notes)) = &receipt {
+                if state.fitted_reset_receipts.contains_key(key) {
+                    return Err(Error::Invalid("duplicate fitted reset request".into()));
+                }
+                state.fitted_reset_receipts.insert(
+                    key.clone(),
+                    FittedResetReceipt {
+                        reset: marker.id,
+                        occurrences: ids.clone(),
+                        notes: notes.clone(),
+                    },
+                );
             }
             state
                 .pending_reset_blocks
@@ -7407,10 +7509,85 @@ impl Harness {
             self.merge_admissions = merge;
             match saved {
                 Ok(()) => return Ok((marker.id, ids)),
-                Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+                    if expected_version.is_none() =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
+    }
+    /// Fit a reset's additions before committing the reset and occurrences together.
+    pub async fn reset_with_fitted_blocks(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        handoff: Option<String>,
+        additions: Vec<Vec<serde_json::Value>>,
+        admission: &crate::images::UserImageAdmission,
+        cancel: &CancellationToken,
+    ) -> Result<(Uuid, Vec<Uuid>, Vec<String>), Error> {
+        let (state, version) = self.load(id)?;
+        if let Some(key) = &request_id {
+            if key.is_empty() {
+                return Err(Error::Invalid("empty fitted reset request ID".into()));
+            }
+            if let Some(receipt) = state.fitted_reset_receipts.get(key) {
+                return Ok((
+                    receipt.reset,
+                    receipt.occurrences.clone(),
+                    receipt.notes.clone(),
+                ));
+            }
+        }
+        let adapter = self
+            .provider_adapter
+            .as_ref()
+            .filter(|a| {
+                state.provider_adapter.as_deref() == Some(a.id()) && a.supports_durable_blocks()
+            })
+            .ok_or_else(|| {
+                Error::Invalid("image admission requires a selected block-aware adapter".into())
+            })?;
+        if additions.is_empty() {
+            return Err(Error::Invalid("empty reset block additions".into()));
+        }
+        let profile = adapter.image_profile(&state.config.model);
+        let limits = profile.map(|p| p.limits).unwrap_or_default();
+        let mut output = Vec::with_capacity(additions.len());
+        let mut notes = Vec::new();
+        for blocks in additions {
+            let (blocks, mut image_notes) = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Interrupted),
+                result = admission.prepare_blocks(&blocks, limits) => result.map_err(Error::Invalid)?,
+            };
+            output.push(blocks);
+            notes.append(&mut image_notes);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted);
+        }
+        if self
+            .provider_adapter
+            .as_ref()
+            .filter(|a| state.provider_adapter.as_deref() == Some(a.id()))
+            .and_then(|a| a.image_profile(&state.config.model))
+            != profile
+        {
+            return Err(Error::Invalid(
+                "model image profile changed during admission".into(),
+            ));
+        }
+        let (reset, ids) = self.reset_with_blocks_at_version(
+            id,
+            handoff,
+            output,
+            Some(version),
+            request_id.map(|key| (key, notes.clone())),
+        )?;
+        Ok((reset, ids, notes))
     }
     /// Persist a display-only application entry and return its submission ID.
     /// It is immediately placed unless a reset is queued ahead of it.
@@ -7493,15 +7670,35 @@ impl Harness {
         }
         Ok(page)
     }
-    /// Admit fitted user blocks atomically. This opt-in API requires a settled
-    /// conversation and a selected block-aware adapter. A concurrent state or
-    /// model change makes the commit fail; the caller may retry from the start.
+    /// Admit fitted follow-up blocks atomically using a selected block-aware adapter.
+    /// Busy inputs queue; a concurrent state or model change makes the commit
+    /// fail and the caller may retry with the same request ID.
     pub async fn submit_fitted_user_blocks(
         &mut self,
         id: Uuid,
         request_id: Option<String>,
         blocks: Vec<serde_json::Value>,
         admission: &crate::images::UserImageAdmission,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        self.submit_fitted_user_blocks_with_options(
+            id,
+            request_id,
+            blocks,
+            admission,
+            AdmissionOptions::default(),
+            cancel,
+        )
+        .await
+    }
+    /// Fit and admit steering or follow-up blocks with ordinary admission policies.
+    pub async fn submit_fitted_user_blocks_with_options(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        options: AdmissionOptions,
         cancel: &CancellationToken,
     ) -> Result<crate::images::ImageAdmissionResult, Error> {
         if request_id
@@ -7539,22 +7736,29 @@ impl Harness {
                 });
             }
         }
-        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
-            || state.active.is_some()
-            || state.abort_requested
-            || !state.pending_resets.is_empty()
-            || state.pending_independent_summary.is_some()
-            || state
+        let busy = state.active.is_some()
+            || matches!(
+                state.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            );
+        if busy && options.reject_when_busy {
+            return Err(AdmissionError::Busy.into());
+        }
+        if !busy && options.reject_when_idle {
+            return Err(AdmissionError::Idle.into());
+        }
+        if state.abort_requested {
+            return Err(Error::Invalid("abort in progress".into()));
+        }
+        let place_now = matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            && state.active.is_none()
+            && state.pending_independent_summary.is_none()
+            && !state
                 .application_writes
                 .iter()
                 .any(|w| !w.placed && !w.withdrawn)
-            || state
-                .submissions
-                .iter()
-                .any(|s| matches!(s.status, Status::Queued | Status::Running))
-        {
-            return Err(AdmissionError::Busy.into());
-        }
+            && state.pending_resets.is_empty()
+            && !state.submissions.iter().any(|s| s.status == Status::Queued);
         let adapter = self
             .provider_adapter
             .as_ref()
@@ -7618,19 +7822,38 @@ impl Harness {
             request_id,
             content: String::new(),
             image_notes: notes.clone(),
-            status: Status::Running,
+            input_blocks: Some(crate::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: output.clone(),
+            }),
+            status: if place_now {
+                Status::Running
+            } else {
+                Status::Queued
+            },
         });
-        state.input_modes.insert(sid, InputMode::FollowUp);
-        state.active = Some(sid);
-        Self::append_yield(
-            &mut state,
-            crate::content::UserContent::Blocks(output),
-            true,
-        );
-        state.auto_compaction_attempted = false;
-        state.retry_state = RetryState::default();
-        state.overflow_compaction_attempted = false;
-        state.phase = Phase::ModelReady { turns: 0 };
+        state.input_modes.insert(sid, options.mode);
+        if place_now {
+            state.active = Some(sid);
+            let binding = state
+                .submissions
+                .last()
+                .unwrap()
+                .input_blocks
+                .clone()
+                .unwrap();
+            let index = state.messages.len();
+            state.messages.push(Message::User {
+                content: String::new(),
+            });
+            state.content_blocks.insert(index, binding);
+            state.auto_compaction_attempted = false;
+            state.retry_state = RetryState::default();
+            state.overflow_compaction_attempted = false;
+            state.phase = Phase::ModelReady { turns: 0 };
+        } else if matches!(state.phase, Phase::FailedIdle) {
+            state.phase = Phase::Idle;
+        }
         let merge = self.merge_admissions;
         self.merge_admissions = false;
         let saved = self.save(&state, Expected::Version(version));
@@ -8004,6 +8227,7 @@ impl Harness {
                 request_id: request_id.clone(),
                 content: content.clone(),
                 image_notes: Vec::new(),
+                input_blocks: None,
                 status: if place_now {
                     Status::Running
                 } else {
@@ -8148,6 +8372,7 @@ impl Harness {
                 request_id: request_id.clone(),
                 content: String::new(),
                 image_notes: Vec::new(),
+                input_blocks: None,
                 status: Status::Running,
             });
             c.active = Some(sid);
@@ -9129,7 +9354,15 @@ impl Harness {
             return Ok(Some((None, vec![], vec![])));
         }
         let selected = self.selected_extensions(c)?;
-        let snapshot = serde_json::to_value(c)?;
+        let mut snapshot = serde_json::to_value(c)?;
+        if let Some(profile) = self
+            .provider_adapter
+            .as_ref()
+            .filter(|a| c.provider_adapter.as_deref() == Some(a.id()))
+            .and_then(|a| a.image_profile(&c.config.model))
+        {
+            snapshot["_model_image_profile"] = serde_json::to_value(profile)?;
+        }
         let memo = self.extension_memo(operation_id)?;
         let context = crate::extension::Context {
             snapshot: &snapshot,
@@ -13325,6 +13558,42 @@ impl Scheduler {
         self.schedule(id);
         Ok(result)
     }
+    /// Fit and commit a reset, then schedule its placement.
+    pub async fn reset_with_fitted_blocks(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        handoff: Option<String>,
+        additions: Vec<Vec<serde_json::Value>>,
+        admission: &crate::images::UserImageAdmission,
+        cancel: &CancellationToken,
+    ) -> Result<(Uuid, Vec<Uuid>, Vec<String>), Error> {
+        let result = self
+            .harness
+            .reset_with_fitted_blocks(id, request_id, handoff, additions, admission, cancel)
+            .await?;
+        self.schedule(id);
+        Ok(result)
+    }
+    /// Fit and schedule a steering or follow-up block input.
+    pub async fn submit_fitted_user_blocks_with_options(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        options: AdmissionOptions,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        let result = self
+            .harness
+            .submit_fitted_user_blocks_with_options(
+                id, request_id, blocks, admission, options, cancel,
+            )
+            .await?;
+        self.schedule(id);
+        Ok(result)
+    }
     /// Commit a steering or follow-up input and schedule the conversation.
     pub fn submit_with_mode(
         &mut self,
@@ -14790,6 +15059,7 @@ fn summary_progress_only(base: &Conversation, latest: &Conversation) -> Result<b
     if base.id != latest.id
         || base.context_generation != latest.context_generation
         || base.resets != latest.resets
+        || base.fitted_reset_receipts != latest.fitted_reset_receipts
         || latest.submissions.len() < base.submissions.len()
         || latest.application_writes.len() < base.application_writes.len()
         || serde_json::to_value((
@@ -14816,6 +15086,7 @@ fn summary_progress_only(base: &Conversation, latest: &Conversation) -> Result<b
             || old.request_id != new.request_id
             || old.content != new.content
             || old.image_notes != new.image_notes
+            || old.input_blocks != new.input_blocks
             || base.input_modes.get(&old.id) != latest.input_modes.get(&old.id)
         {
             return Ok(false);
@@ -14862,6 +15133,22 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         .as_object_mut()
         .and_then(|v| v.remove("pending_independent_summary"));
     let pending_ok = old_pending == new_pending || old_pending == Some(serde_json::Value::Null);
+    old.as_object_mut()
+        .and_then(|v| v.remove("fitted_reset_receipts"));
+    new.as_object_mut()
+        .and_then(|v| v.remove("fitted_reset_receipts"));
+    let fitted_receipts_unchanged = base
+        .fitted_reset_receipts
+        .iter()
+        .all(|(k, v)| latest.fitted_reset_receipts.get(k) == Some(v))
+        && latest.fitted_reset_receipts.iter().all(|(k, v)| {
+            base.fitted_reset_receipts.contains_key(k)
+                || latest
+                    .pending_resets
+                    .iter()
+                    .skip(base.pending_resets.len())
+                    .any(|reset| reset.id == v.reset)
+        });
     old.as_object_mut()
         .and_then(|v| v.remove("pending_reset_blocks"));
     new.as_object_mut()
@@ -14929,6 +15216,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         && modes_unchanged
         && resets_unchanged
         && reset_blocks_unchanged
+        && fitted_receipts_unchanged
         && writes_unchanged
         && new_submissions.len() >= old_submissions.len()
         && old_submissions.iter().zip(new_submissions).all(|(a, b)| {
@@ -15151,9 +15439,16 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
         let message = Message::User {
             content: submission.content.clone(),
         };
+        let index = c.messages.len();
         c.messages.push(message.clone());
+        if let Some(binding) = &submission.input_blocks {
+            c.content_blocks.insert(index, binding.clone());
+        }
         if let Some(proof) = &mut c.block_reset_proof {
             proof.messages.push(message);
+            if let Some(binding) = &submission.input_blocks {
+                proof.blocks.insert(index, binding.clone());
+            }
         }
     }
     placed
@@ -18573,6 +18868,7 @@ mod scheduler_tests {
                 request_id: None,
                 content: content.into(),
                 image_notes: Vec::new(),
+                input_blocks: None,
                 status: Status::Queued,
             });
         }
@@ -18661,6 +18957,7 @@ mod scheduler_tests {
             resets: vec![],
             pending_resets: vec![],
             pending_reset_blocks: Default::default(),
+            fitted_reset_receipts: Default::default(),
             pending_independent_summary: None,
             application_writes: vec![],
             tool_states: HashMap::new(),
@@ -18686,6 +18983,7 @@ mod scheduler_tests {
             request_id: None,
             content: "queued".into(),
             image_notes: Vec::new(),
+            input_blocks: None,
             status: Status::Queued,
         });
         assert!(admission_only(&base, &latest).unwrap());

@@ -385,3 +385,439 @@ async fn scheduler_runs_only_after_fitted_admission() {
     assert!(adapter.0.lock().unwrap()[0].to_string().contains("bmV3"));
     scheduler.shutdown().await.unwrap();
 }
+
+struct GatedAdapter {
+    inner: Adapter,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    first: std::sync::atomic::AtomicBool,
+}
+impl GatedAdapter {
+    fn new() -> Self {
+        Self {
+            inner: Adapter::default(),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            first: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+#[async_trait]
+impl ProviderAdapter for GatedAdapter {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn supports_durable_blocks(&self) -> bool {
+        true
+    }
+    fn image_profile(&self, model: &str) -> Option<ModelImageProfile> {
+        self.inner.image_profile(model)
+    }
+    async fn prepare(&self, a: &ProviderAttempt, r: &ModelRequest) -> Result<Value, Error> {
+        self.inner.prepare(a, r).await
+    }
+    fn validate(&self, a: &ProviderAttempt, r: &ModelRequest, v: &Value) -> Result<(), Error> {
+        self.inner.validate(a, r, v)
+    }
+    async fn prepare_durable(
+        &self,
+        a: &ProviderAttempt,
+        r: &DurableRequest,
+    ) -> Result<Value, Error> {
+        self.inner.prepare_durable(a, r).await
+    }
+    fn validate_durable(
+        &self,
+        a: &ProviderAttempt,
+        r: &DurableRequest,
+        v: &Value,
+    ) -> Result<(), Error> {
+        self.inner.validate_durable(a, r, v)
+    }
+    async fn dispatch(
+        &self,
+        a: &ProviderAttempt,
+        r: &ModelRequest,
+        v: Value,
+    ) -> Result<ModelStream, Error> {
+        if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+        self.inner.dispatch(a, r, v).await
+    }
+}
+fn image_block() -> Value {
+    json!({"type":"image","data":"aGk=","mimeType":"image/png"})
+}
+
+#[tokio::test]
+async fn busy_fitted_inputs_queue_dedupe_and_survive_reopen() {
+    use pi_rs_durable::runtime::{AdmissionOptions, InputMode, Scheduler};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(GatedAdapter::new());
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let id = s.create_conversation(config("first")).unwrap();
+    s.select_provider_adapter(id, true).unwrap();
+    s.submit(id, None, "start".into()).unwrap();
+    adapter.started.acquire().await.unwrap().forget();
+    let proc = Arc::new(Processor::default());
+    let fit = UserImageAdmission::new(proc.clone());
+    let steer = s
+        .submit_fitted_user_blocks_with_options(
+            id,
+            Some("steer".into()),
+            vec![json!({"type":"text","text":"steer"}), image_block()],
+            &fit,
+            AdmissionOptions {
+                mode: InputMode::Steer,
+                ..Default::default()
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let duplicate = s
+        .submit_fitted_user_blocks_with_options(
+            id,
+            Some("steer".into()),
+            vec![image_block()],
+            &fit,
+            AdmissionOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steer, duplicate);
+    s.submit_fitted_user_blocks(
+        id,
+        Some("follow".into()),
+        vec![json!({"type":"text","text":"follow"}), image_block()],
+        &fit,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(proc.0.lock().unwrap().len(), 2);
+    assert_eq!(
+        s.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .filter(|x| matches!(x.status, pi_rs_durable::runtime::Status::Queued))
+            .count(),
+        2
+    );
+    adapter.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let state = s.conversation(id).unwrap();
+    let bindings: Vec<_> = state
+        .content_blocks
+        .values()
+        .map(|b| b.blocks[0]["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(bindings, ["steer", "follow"]);
+    let expected = state.content_blocks.clone();
+    s.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().content_blocks, expected);
+}
+
+struct ContinueFit {
+    admission: UserImageAdmission,
+    fired: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for ContinueFit {
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        _: &Value,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::OnYield
+            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let (blocks, _) = self
+                .admission
+                .prepare_for_context(&[image_block()], ctx)
+                .await?;
+            return Ok(GenerationDecision::Continue(json!(blocks)));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+#[tokio::test]
+async fn host_yield_continuation_fits_before_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(Adapter::default());
+    let proc = Arc::new(Processor::default());
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    h.install_extension(pi_rs_durable::extension::Extension {
+        name: "continue-fit".into(),
+        hooks: vec![Arc::new(ContinueFit {
+            admission: UserImageAdmission::new(proc.clone()),
+            fired: false.into(),
+        })],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config("second")).unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.select_extensions(id, vec!["continue-fit".into()])
+        .unwrap();
+    h.submit_and_run(id, None, "start".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(*proc.0.lock().unwrap(), vec![25]);
+    let state = h.conversation(id).unwrap();
+    assert!(
+        state
+            .content_blocks
+            .values()
+            .any(|b| b.blocks[0]["data"] == "bmV3")
+    );
+    let expected = state.content_blocks;
+    drop(h);
+    assert_eq!(
+        Harness::open_paused(&path, options())
+            .unwrap()
+            .conversation(id)
+            .unwrap()
+            .content_blocks,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn busy_fitted_reset_precedes_queued_fitted_followup_and_reopens() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(GatedAdapter::new());
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let id = s.create_conversation(config("first")).unwrap();
+    s.select_provider_adapter(id, true).unwrap();
+    s.submit(id, None, "start".into()).unwrap();
+    adapter.started.acquire().await.unwrap().forget();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    let reset = s
+        .reset_with_fitted_blocks(
+            id,
+            Some("reset-key".into()),
+            Some("handoff".into()),
+            vec![vec![json!({"type":"text","text":"reset"}), image_block()]],
+            &fit,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let reset_ids = reset.1.clone();
+    assert_eq!(
+        s.reset_with_fitted_blocks(
+            id,
+            Some("reset-key".into()),
+            None,
+            vec![vec![image_block()]],
+            &fit,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap(),
+        reset
+    );
+    s.submit_fitted_user_blocks(
+        id,
+        Some("after".into()),
+        vec![json!({"type":"text","text":"after"}), image_block()],
+        &fit,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    adapter.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    let c = s.conversation(id).unwrap();
+    let bindings: Vec<_> = c.content_blocks.values().collect();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].message_id, reset_ids[0]);
+    assert_eq!(bindings[0].blocks[0]["text"], "reset");
+    assert_eq!(bindings[1].blocks[0]["text"], "after");
+    let expected = c.content_blocks.clone();
+    s.shutdown().await.unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().content_blocks, expected);
+    assert_eq!(
+        h.reset_with_fitted_blocks(
+            id,
+            Some("reset-key".into()),
+            None,
+            vec![vec![image_block()]],
+            &fit,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap(),
+        reset
+    );
+}
+
+#[tokio::test]
+async fn abort_withdraws_queued_fitted_input_but_retains_fitted_reset() {
+    use pi_rs_durable::runtime::{Scheduler, Status};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(GatedAdapter::new());
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let id = s.create_conversation(config("first")).unwrap();
+    s.select_provider_adapter(id, true).unwrap();
+    s.submit(id, None, "start".into()).unwrap();
+    adapter.started.acquire().await.unwrap().forget();
+    let fit = UserImageAdmission::new(Arc::new(Processor::default()));
+    let queued = s
+        .submit_fitted_user_blocks(
+            id,
+            Some("queued".into()),
+            vec![image_block()],
+            &fit,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let (_, ids, _) = s
+        .reset_with_fitted_blocks(
+            id,
+            Some("reset-key".into()),
+            None,
+            vec![vec![image_block()]],
+            &fit,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    s.abort(id).unwrap();
+    s.wait(id).await.unwrap();
+    let c = s.conversation(id).unwrap();
+    let item = c
+        .submissions
+        .iter()
+        .find(|x| x.id == queued.submission_id)
+        .unwrap();
+    assert_eq!(
+        item.status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+    assert!(c.content_blocks.values().any(|b| b.message_id == ids[0]));
+    assert!(
+        !c.content_blocks
+            .values()
+            .any(|b| Some(b) == item.input_blocks.as_ref())
+    );
+    let blocks = c.content_blocks.clone();
+    s.shutdown().await.unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter).unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.content_blocks, blocks);
+    assert_eq!(
+        h.submit_fitted_user_blocks(
+            id,
+            Some("queued".into()),
+            vec![image_block()],
+            &fit,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap(),
+        queued
+    );
+}
+
+#[tokio::test]
+async fn queued_fitted_input_survives_scheduler_shutdown_and_recovery() {
+    use pi_rs_durable::runtime::{Scheduler, Status};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(GatedAdapter::new());
+    let mut s = Scheduler::open_with_provider_adapter(
+        &path,
+        options(),
+        Default::default(),
+        adapter.clone(),
+    )
+    .unwrap();
+    let id = s.create_conversation(config("first")).unwrap();
+    s.select_provider_adapter(id, true).unwrap();
+    s.submit(id, None, "start".into()).unwrap();
+    adapter.started.acquire().await.unwrap().forget();
+    let proc = Arc::new(Processor::default());
+    let fit = UserImageAdmission::new(proc.clone());
+    let queued = s
+        .submit_fitted_user_blocks(
+            id,
+            Some("recover".into()),
+            vec![image_block()],
+            &fit,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    s.shutdown().await.unwrap();
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    let state = h.conversation(id).unwrap();
+    let q = state
+        .submissions
+        .iter()
+        .find(|x| x.id == queued.submission_id)
+        .unwrap();
+    assert_eq!(q.status, Status::Queued);
+    assert_eq!(q.input_blocks.as_ref().unwrap().blocks[0]["data"], "bmV3");
+    assert_eq!(
+        h.submit_fitted_user_blocks(
+            id,
+            Some("recover".into()),
+            vec![image_block()],
+            &fit,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap(),
+        queued
+    );
+    assert_eq!(proc.0.lock().unwrap().len(), 1);
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .any(|b| b.blocks[0]["data"] == "bmV3")
+    );
+}
