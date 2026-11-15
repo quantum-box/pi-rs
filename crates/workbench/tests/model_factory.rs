@@ -107,6 +107,13 @@ async fn model_requests_use_authorized_routes_without_metadata_probes() {
 
     for (api, provider, endpoint_path, expected_path, auth_header) in [
         (
+            NativeModelApi::OpenAiChat,
+            "chat",
+            "/v1/chat/completions",
+            "/v1/chat/completions",
+            "authorization: Bearer fixture-key",
+        ),
+        (
             NativeModelApi::OpenAiResponses,
             "custom",
             "/v1/responses",
@@ -189,4 +196,28 @@ async fn model_requests_use_authorized_routes_without_metadata_probes() {
                 .contains(&auth_header.to_ascii_lowercase())
         );
     }
+}
+
+#[test]
+fn anonymous_chat_is_explicit_and_validates_provider() {
+    let factory = ModelClientFactory::default();
+    assert!(
+        factory
+            .anonymous_chat("ollama", "http://127.0.0.1:11434/v1/chat/completions")
+            .is_ok()
+    );
+    assert!(
+        factory
+            .anonymous_chat(" ", "http://127.0.0.1:11434/v1/chat/completions")
+            .is_err()
+    );
+    assert!(
+        factory
+            .client(
+                NativeModelApi::OpenAiChat,
+                "ollama",
+                "http://127.0.0.1:11434/v1/chat/completions"
+            )
+            .is_err()
+    );
 }

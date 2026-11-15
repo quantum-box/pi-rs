@@ -7,6 +7,7 @@ use pi_rs::{Error, HostAuthSnapshot, HostCredentialKind, Model, ModelCatalogBuil
 /// from session history.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeModelApi {
+    OpenAiChat,
     OpenAiResponses,
     ChatGptResponses,
     AnthropicMessages,
@@ -29,7 +30,7 @@ impl ModelClientFactory {
     /// Construct a client for an exact registered provider and endpoint.
     /// The host must authorize the endpoint and manage the lifetime of any
     /// returned client. Replacing a snapshot does not revoke existing clients.
-    /// Responses and Messages endpoints are complete request URLs; Gemini uses
+    /// Chat, Responses and Messages endpoints are complete request URLs; Gemini uses
     /// an API base URL and appends its model-specific streaming path. Granting a
     /// Gemini base authorizes those derived paths. Model discovery probes,
     /// redirects, and implicit proxy discovery are disabled.
@@ -44,6 +45,14 @@ impl ModelClientFactory {
             .get(provider, endpoint)
             .ok_or_else(|| Error::Config("model credential is not registered".into()))?;
         match (api, credential.kind()) {
+            (
+                NativeModelApi::OpenAiChat,
+                HostCredentialKind::ApiKey | HostCredentialKind::Bearer,
+            ) => Ok(Arc::new(
+                pi_rs::ollama::Ollama::new(endpoint, Some(credential.secret().to_owned()))?
+                    .with_provider(provider)
+                    .with_native_probes(false),
+            )),
             (NativeModelApi::OpenAiResponses, HostCredentialKind::ApiKey) => {
                 Ok(Arc::new(pi_rs::openai::OpenAiResponses::new_api_provider(
                     endpoint,
@@ -78,6 +87,19 @@ impl ModelClientFactory {
                 "credential kind is not supported for this model API".into(),
             )),
         }
+    }
+
+    /// Construct an unauthenticated chat client only when the host explicitly
+    /// chooses that mode. No credential lookup or environment fallback occurs.
+    pub fn anonymous_chat(&self, provider: &str, endpoint: &str) -> Result<Arc<dyn Model>> {
+        if provider.trim().is_empty() {
+            return Err(Error::Config("model provider is empty".into()));
+        }
+        Ok(Arc::new(
+            pi_rs::ollama::Ollama::new(endpoint, None)?
+                .with_provider(provider)
+                .with_native_probes(false),
+        ))
     }
 
     /// Register one host-authorized identity in a catalog builder. A duplicate
