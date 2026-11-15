@@ -205,7 +205,7 @@ impl OpenAiResponses {
             }
         });
         let names: &[&str] = match format {
-            SessionAffinityFormat::OpenAi => &["session_id", "x-client-request-id"],
+            SessionAffinityFormat::OpenAi => &["session-id", "x-client-request-id"],
             SessionAffinityFormat::OpenAiNoSession => &["x-client-request-id"],
             SessionAffinityFormat::OpenRouter => &["x-session-id"],
             SessionAffinityFormat::Disabled => &[],
@@ -1842,14 +1842,14 @@ mod tests {
             .with_session_affinity_format(SessionAffinityFormat::OpenAi)
             .with_session_routing("session-one")
             .unwrap();
-        assert_eq!(openai.headers["session_id"], "session-one");
+        assert_eq!(openai.headers["session-id"], "session-one");
         assert_eq!(openai.headers["x-client-request-id"], "session-one");
         let nosession = model
             .clone()
             .with_session_affinity_format(SessionAffinityFormat::OpenAiNoSession)
             .with_session_routing("session-one")
             .unwrap();
-        assert!(!nosession.headers.contains_key("session_id"));
+        assert!(!nosession.headers.contains_key("session-id"));
         assert_eq!(nosession.headers["x-client-request-id"], "session-one");
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-session-id", "explicit".parse().unwrap());
@@ -1883,7 +1883,7 @@ mod tests {
         .unwrap()
         .with_session_routing("id")
         .unwrap();
-        assert_eq!(uppercase.headers["session_id"], "id");
+        assert_eq!(uppercase.headers["session-id"], "id");
         let path = OpenAiResponses::new_api_provider(
             "https://example.com/openrouter.ai/../v1/responses",
             "fixture".into(),
@@ -1954,7 +1954,7 @@ mod tests {
                     .await;
             }
             let sent = server.join().unwrap();
-            assert_eq!(sent.contains("session_id: session-one\r\n"), !summary);
+            assert_eq!(sent.contains("session-id: session-one\r\n"), !summary);
             assert_eq!(
                 sent.contains("x-client-request-id: session-one\r\n"),
                 !summary
