@@ -5,6 +5,18 @@ use unicode_width::UnicodeWidthStr;
 pub(super) const MARKER_START: char = '\u{f0000}';
 pub(super) const MARKER_END: char = '\u{f0001}';
 pub(super) const PROTECTED_SPACE: char = '\u{f0002}';
+const MAX_LAYOUT_WORK: usize = 2 * 1024 * 1024;
+
+struct Budget(usize);
+impl Budget {
+    fn charge(&mut self, amount: usize) -> Option<()> {
+        self.0 = self.0.checked_sub(amount)?;
+        Some(())
+    }
+    fn area(&mut self, rows: usize, columns: usize) -> Option<()> {
+        self.charge(rows.checked_mul(columns.max(1))?)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LayoutNode {
@@ -53,9 +65,9 @@ fn text_layout(text: String) -> Layout {
         baseline: 0,
     }
 }
-fn join(layouts: &[Layout]) -> Layout {
+fn join(layouts: &[Layout], budget: &mut Budget) -> Option<Layout> {
     if layouts.is_empty() {
-        return text_layout(String::new());
+        return Some(text_layout(String::new()));
     }
     let baseline = layouts.iter().map(|item| item.baseline).max().unwrap_or(0);
     let below = layouts
@@ -63,7 +75,13 @@ fn join(layouts: &[Layout]) -> Layout {
         .map(|item| item.lines.len().saturating_sub(item.baseline + 1))
         .max()
         .unwrap_or(0);
-    let mut lines = Vec::with_capacity(baseline + below + 1);
+    let rows = baseline.checked_add(below)?.checked_add(1)?;
+    let columns = layouts.iter().try_fold(0usize, |sum, item| {
+        let bytes = item.lines.iter().map(String::len).max().unwrap_or(0);
+        sum.checked_add(item.width.max(bytes))
+    })?;
+    budget.area(rows, columns)?;
+    let mut lines = Vec::with_capacity(rows);
     for row in 0..=baseline + below {
         let mut line = String::new();
         for item in layouts {
@@ -77,24 +95,37 @@ fn join(layouts: &[Layout]) -> Layout {
         }
         lines.push(line.trim_end().to_owned());
     }
-    Layout {
+    Some(Layout {
         lines,
         width: layouts.iter().map(|item| item.width).sum(),
         baseline,
-    }
+    })
 }
 
-fn node_layout(node: &LayoutNode, nodes: &[LayoutNode], depth: usize) -> Option<Layout> {
+fn node_layout(
+    node: &LayoutNode,
+    nodes: &[LayoutNode],
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Layout> {
     match node {
         LayoutNode::Fraction {
             numerator,
             denominator,
         } => {
-            let numerator = render_at(numerator, nodes, depth + 1)?;
-            let denominator = render_at(denominator, nodes, depth + 1)?;
+            let numerator = render_at(numerator, nodes, depth + 1, budget)?;
+            let denominator = render_at(denominator, nodes, depth + 1, budget)?;
             let content_width = numerator.width.max(denominator.width).max(1);
             let total = content_width + 2;
             let baseline = numerator.lines.len();
+            budget.area(
+                numerator
+                    .lines
+                    .len()
+                    .checked_add(denominator.lines.len())?
+                    .checked_add(1)?,
+                total.checked_mul(4)?,
+            )?;
             let mut lines: Vec<_> = numerator
                 .lines
                 .iter()
@@ -121,6 +152,10 @@ fn node_layout(node: &LayoutNode, nodes: &[LayoutNode], depth: usize) -> Option<
             let content_width = width(operator)
                 .max(lower.as_deref().map_or(0, width))
                 .max(upper.as_deref().map_or(0, width));
+            budget.area(
+                1 + usize::from(lower.is_some()) + usize::from(upper.is_some()),
+                content_width.checked_mul(4)?.checked_add(1)?,
+            )?;
             let mut lines = Vec::new();
             if let Some(text) = upper {
                 lines.push(format!("{} ", padded(text, content_width, true)));
@@ -137,11 +172,11 @@ fn node_layout(node: &LayoutNode, nodes: &[LayoutNode], depth: usize) -> Option<
         }
         LayoutNode::Script { lower, upper } => {
             let upper = match upper {
-                Some(text) => Some(render_at(text, nodes, depth + 1)?),
+                Some(text) => Some(render_at(text, nodes, depth + 1, budget)?),
                 None => None,
             };
             let lower = match lower {
-                Some(text) => Some(render_at(text, nodes, depth + 1)?),
+                Some(text) => Some(render_at(text, nodes, depth + 1, budget)?),
                 None => None,
             };
             let cells = upper
@@ -149,6 +184,10 @@ fn node_layout(node: &LayoutNode, nodes: &[LayoutNode], depth: usize) -> Option<
                 .map_or(0, |layout| layout.width)
                 .max(lower.as_ref().map_or(0, |layout| layout.width));
             let baseline = upper.as_ref().map_or(0, |layout| layout.lines.len());
+            let rows = baseline
+                .checked_add(lower.as_ref().map_or(0, |layout| layout.lines.len()))?
+                .checked_add(1)?;
+            budget.area(rows, cells.checked_mul(4)?)?;
             let mut lines = Vec::new();
             if let Some(layout) = upper {
                 lines.extend(layout.lines.iter().map(|line| padded(line, cells, false)));
@@ -169,6 +208,8 @@ fn node_layout(node: &LayoutNode, nodes: &[LayoutNode], depth: usize) -> Option<
                 .map(|line| width(line.as_str()))
                 .max()
                 .unwrap_or(0);
+            let max_bytes = lines.iter().map(String::len).max().unwrap_or(0);
+            budget.area(lines.len(), cells.checked_add(max_bytes)?)?;
             Some(Layout {
                 lines: lines
                     .iter()
@@ -204,10 +245,16 @@ fn next_marker(line: &str, from: usize) -> Option<(usize, usize, usize)> {
     None
 }
 
-fn render_at(source: &str, nodes: &[LayoutNode], depth: usize) -> Option<Layout> {
+fn render_at(
+    source: &str,
+    nodes: &[LayoutNode],
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Layout> {
     if depth > 64 {
         return None;
     }
+    budget.charge(source.len().checked_add(1)?)?;
     let mut rendered = Vec::new();
     let mut first_baseline = 0;
     for source_line in source.split('\n') {
@@ -245,7 +292,7 @@ fn render_at(source: &str, nodes: &[LayoutNode], depth: usize) -> Option<Layout>
                 };
                 layouts.push(text_layout(text));
             }
-            layouts.push(node_layout(node, nodes, depth)?);
+            layouts.push(node_layout(node, nodes, depth, budget)?);
             position = end;
             previous = Some(node);
         }
@@ -263,7 +310,7 @@ fn render_at(source: &str, nodes: &[LayoutNode], depth: usize) -> Option<Layout>
                 if leading { " " } else { "" }
             )));
         }
-        let line = join(&layouts);
+        let line = join(&layouts, budget)?;
         if rendered.is_empty() {
             first_baseline = line.baseline;
         }
@@ -282,7 +329,7 @@ fn render_at(source: &str, nodes: &[LayoutNode], depth: usize) -> Option<Layout>
 }
 
 pub(super) fn render(source: &str, nodes: &[LayoutNode]) -> Option<Layout> {
-    render_at(source, nodes, 0)
+    render_at(source, nodes, 0, &mut Budget(MAX_LAYOUT_WORK))
 }
 
 #[cfg(test)]
@@ -320,6 +367,17 @@ mod tests {
             denominator: "1".into(),
         }];
         assert!(render(&marker(0), &nodes).is_none());
+        let mut nodes = vec![LayoutNode::Fraction {
+            numerator: "a".into(),
+            denominator: "b".into(),
+        }];
+        for index in 0..24 {
+            nodes.push(LayoutNode::Fraction {
+                numerator: marker(index),
+                denominator: marker(index),
+            });
+        }
+        assert!(render(&marker(24), &nodes).is_none());
     }
 
     #[test]
