@@ -3318,7 +3318,7 @@ fn slash(
                     .collect::<Vec<_>>();
                 if login
                     || radius_auth::Gateway::configured_with_settings(&args.settings)
-                        .and_then(|gateway| gateway.has_credential())
+                        .and_then(|gateway| gateway.has_stored_credential())
                         .unwrap_or(false)
                 {
                     items.push(Item {

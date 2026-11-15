@@ -3756,6 +3756,25 @@ rotated refresh token. Ordinary model, MCP and sharing requests accept a
 successfully refreshed token without imposing that export requirement.
 Normal Radius access refreshes credentials within five minutes of expiry,
 matching the upstream OAuth resolver's minimum refresh window.
+Before sending a refresh, native writes and syncs a keyless pending entry
+containing no token; on Unix it also syncs the parent directory. The outcome
+after power loss depends on the platform and filesystem, and equivalent
+directory durability has not been verified on Windows. If the exchange fails, returns no
+replacement refresh token, or its outcome is otherwise unknown, native fails
+closed and requires a new Radius login instead of retrying the old token. This
+is an intentional difference from upstream; it can require login even if no
+request reached the server. A pending entry also prevents `auto` sharing from
+silently falling back to Gist, while an explicit Radius API key still takes
+precedence. A saved replacement whose requested lifetime is too short remains
+saved as described above.
+
+The pending representation is readable by pinned Pi v1.5.0 as a keyless
+API-key entry, so that version's locked OAuth resolver does not reuse the old
+refresh token. It does not protect tokens already copied into another process,
+non-cooperating writers, storage rollback, or a compromised auth lock. After
+a process crash leaves `auth.json.lock`, stop all Pi and pi-rs processes before
+removing that stale lock directory from the agent directory; then sign in to
+Radius again or explicitly log out. Never remove a lock held by a live process.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
