@@ -717,32 +717,29 @@ fn convert(
         "message" => {
             let message = &entry["message"];
             match required(message, "role")? {
-                "user" => {
-                    branch.calls.clear();
-                    push_user(&mut events, &message["content"])?;
-                }
+                "user" => push_user(&mut events, &message["content"])?,
                 "assistant" => {
-                    // Pi closes the previous tool flow at each assistant or user message.
-                    // Keep unfinished operations in the journal for reconciliation, but
-                    // never match a later result to an earlier turn with a reused ID.
-                    branch.calls.clear();
                     let failure = match message["stopReason"].as_str() {
                         Some("error") => Some(pi_rs::ModelFailure::Failed),
                         Some("aborted") => Some(pi_rs::ModelFailure::Cancelled),
                         _ => None,
                     };
                     let mut invocations = Vec::new();
+                    let mut current_ids = std::collections::BTreeSet::new();
                     if failure.is_none()
                         && let Some(blocks) = message["content"].as_array()
                     {
                         for block in blocks.iter().filter(|block| block["type"] == "toolCall") {
                             let id = required(block, "id")?.to_owned();
                             let operation_id = Uuid::new_v4();
-                            if branch.calls.insert(id.clone(), operation_id).is_some() {
+                            if !current_ids.insert(id.clone()) {
                                 return Err(Error::Session(format!(
                                     "duplicate unfinished imported tool call {id}"
                                 )));
                             }
+                            // A reused ID belongs to this assistant response. The old
+                            // operation remains recorded and requires reconciliation.
+                            branch.calls.insert(id.clone(), operation_id);
                             invocations.push(Invocation {
                                 operation_id,
                                 call: ToolCall {
@@ -1737,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_assistant_boundaries_close_call_matching_but_duplicates_still_fail() {
+    fn imported_assistant_can_reuse_call_id_but_duplicate_in_one_message_fails() {
         let assistant = |id: &str, parent: Value, calls: Value| json!({"type":"message","id":id,"parentId":parent,"message":{"role":"assistant","content":calls}});
         let call = json!({"type":"toolCall","id":"same","name":"read","arguments":{}});
         let header = json!({"type":"session","version":3});
@@ -1755,6 +1752,22 @@ mod tests {
                 assistant("a", Value::Null, json!([call.clone(), call])),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn imported_late_tool_result_still_matches_without_reuse() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"u","parentId":"a","message":{"role":"user","content":"interrupt"}}),
+            json!({"type":"message","id":"r","parentId":"u","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"late"}],"isError":false}}),
+        ]).unwrap();
+        assert!(
+            session
+                .records()
+                .iter()
+                .any(|r| matches!(r.event, Event::ToolFinished { .. }))
         );
     }
 
