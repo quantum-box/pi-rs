@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>pi-rs ブラウザ SDK プレビュー</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; background: #f4f6f9; color: #182335; }
+    body { margin: 0; }
+    main { max-width: 800px; margin: 6vh auto; padding: 28px; }
+    h1 { font-size: 27px; margin: 8px 0; }
+    .hint { color: #536275; line-height: 1.6; }
+    .badge { display: inline-block; background: #dff5e9; color: #16613b; padding: 5px 10px; border-radius: 20px; font-size: 13px; }
+    .box { background: white; border: 1px solid #e1e6ee; border-radius: 14px; padding: 22px; margin-top: 20px; box-shadow: 0 5px 24px #1c2b3b0b; }
+    #log { min-height: 120px; max-height: 45vh; overflow: auto; white-space: pre-wrap; line-height: 1.8; }
+    .user { color: #075aa2; } .assistant { color: #26714b; } .status { color: #536275; font-size: 14px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input { flex: 1; min-width: 200px; padding: 12px; border: 1px solid #b9c4d2; border-radius: 8px; font: inherit; }
+    button { padding: 10px 14px; border: 1px solid #b9c4d2; border-radius: 8px; background: white; cursor: pointer; font: inherit; }
+    button.primary { background: #1d5dc9; color: white; border-color: #1d5dc9; }
+    button:disabled { opacity: .45; }
+  </style>
+</head>
+<body>
+<main>
+  <span class="badge">ブラウザで動作する Rust / WASM</span>
+  <h1>pi-rs セッションプレビュー</h1>
+  <p class="hint">pi-rs の AgentSession がブラウザ内で動きます。接続先を選んでください。</p>
+  <div class="box">
+    <label for="provider"><b>接続先</b></label>
+    <select id="provider" aria-label="接続先"><option value="browser">ブラウザ内 / Qwen3</option><option value="tachyon">Tachyon / GPT-6 Luna</option><option value="ollama">この PC の Ollama</option></select>
+    <div id="browser-settings"><p class="hint">モデルはこのブラウザ内で動きます。初回はモデルをダウンロードします。WebGPU が必要です。</p><label for="browser-model">モデル</label> <select id="browser-model" aria-label="ブラウザ内モデル"><option value="1.7b">Qwen3-1.7B（WebLLM）</option><option value="0.6b">Qwen3-0.6B（約570 MB）</option></select></div>
+    <div id="ollama-settings" hidden><p class="hint">この PC の Ollama（127.0.0.1:11434）に直接接続します。公開プレビューからは Ollama の接続許可が必要です。</p><label for="model">Ollama のモデル名</label><input id="model" value="qwen2.5:7b" aria-label="Ollama のモデル名"></div>
+    <div id="tachyon-settings" hidden><label for="token"><b>Tachyon アクセストークン</b></label>
+    <p class="hint">QuantumBox テナントにアクセスできるトークンを入力してください。トークンはこのページのメモリ内だけで使い、保存しません。API の利用料金はテナントに発生します。</p>
+    <div class="row"><input id="token" type="password" autocomplete="off" spellcheck="false" aria-label="Tachyon アクセストークン" placeholder="Tachyon アクセストークン"></div>
+    <p class="hint">macOS では <code>tachyon auth token --tenant-id quantumbox | pbcopy</code> でコピーできます。ページを再読み込みした場合は再入力してください。</p>
+    </div>
+    <div id="log" aria-live="polite"></div>
+    <p id="status" class="status">WASM を読み込み中…</p>
+    <div class="row">
+      <input id="input" value="こんにちは！" aria-label="メッセージ">
+      <button id="send" class="primary" disabled>送信</button>
+      <button id="cancel" disabled>キャンセル</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="reopen" disabled>保存した会話を再オープン</button>
+    </div>
+    <p class="hint">会話はこのブラウザに保存されます。回答中は「キャンセル」で中断できます。</p>
+  </div>
+</main>
+<script type="module">
+import init, { BrowserSession } from './pkg/pi_rs_browser_sdk.js';
+import { createGatewayFetch } from './tachyon-gateway.mjs';
+let gatewayError = '';
+const token = document.querySelector('#token'), provider = document.querySelector('#provider'), model = document.querySelector('#model'), browserModel = document.querySelector('#browser-model');
+token.value = '';
+window.addEventListener('pagehide', () => { token.value = ''; });
+window.addEventListener('pageshow', event => { if (event.persisted) token.value = ''; });
+window.fetch = createGatewayFetch({ fetchImpl: window.fetch.bind(window), getToken: () => token.value, getProvider: () => provider.value, getLocalModel: () => model.value, getBrowserModel: () => browserModel.value, onError: message => { gatewayError = message; }, onProgress: progress => { status.textContent = `モデルを読み込み中… ${Math.round(progress)}%`; }, onDelta: delta => { if (streamingMessage) { streamingMessage.textContent += delta; log.scrollTop = log.scrollHeight; } }, origin: location.origin });
+const log = document.querySelector('#log'), status = document.querySelector('#status');
+const send = document.querySelector('#send'), cancel = document.querySelector('#cancel');
+const reopen = document.querySelector('#reopen'), input = document.querySelector('#input');
+let session, streamingMessage;
+function show(text, cls = 'status') { const item = document.createElement('div'); item.className = cls; item.textContent = text; log.append(item); log.scrollTop = log.scrollHeight; }
+function render() {
+  log.replaceChildren();
+  const messages = JSON.parse(session.messages());
+  for (const message of messages) {
+    if (message.role === 'user') show('あなた: ' + message.content, 'user');
+    if (message.role === 'assistant' && message.content) show('pi-rs: ' + message.content, 'assistant');
+    if (message.role === 'assistant' && message.calls?.length) show('ツール呼び出し: ' + message.calls.map(call => call.name + ' ' + call.arguments).join(', '));
+    if (message.role === 'tool') show('ツール結果: ' + message.content);
+  }
+  if (!messages.length) show('まだ会話はありません。メッセージを送ってください。');
+}
+function ready() { provider.disabled = model.disabled = browserModel.disabled = false; send.disabled = false; reopen.disabled = false; cancel.disabled = true; }
+async function run(text) {
+  if (provider.value === 'ollama' && !model.value.trim()) { status.textContent = 'Ollama のモデル名を入力してください。'; model.focus(); return; }
+  if (provider.value === 'tachyon' && !token.value.trim()) { status.textContent = 'Tachyon アクセストークンを入力してください。'; token.focus(); return; }
+  log.replaceChildren();
+  for (const message of JSON.parse(session.messages())) {
+    if (message.role === 'user') show('あなた: ' + message.content, 'user');
+    if (message.role === 'assistant' && message.content) show('pi-rs: ' + message.content, 'assistant');
+    if (message.role === 'assistant' && message.calls?.length) show('ツール呼び出し: ' + message.calls.map(call => call.name + ' ' + call.arguments).join(', '));
+    if (message.role === 'tool') show('ツール結果: ' + message.content);
+  }
+  show('あなた: ' + text, 'user');
+  streamingMessage = document.createElement('div'); streamingMessage.className = 'assistant'; streamingMessage.textContent = 'pi-rs: '; log.append(streamingMessage);
+  gatewayError = ''; send.disabled = reopen.disabled = true; cancel.disabled = false; provider.disabled = model.disabled = browserModel.disabled = true; status.textContent = provider.value === 'browser' ? 'ブラウザ内モデルで生成中…' : provider.value === 'ollama' ? 'Ollama に問い合わせ中…' : 'GPT-6 Luna に問い合わせ中…';
+  try { await session.prompt(text); render(); status.textContent = '完了（会話をブラウザに保存しました）'; }
+  catch (error) { render(); status.textContent = gatewayError || ('中断またはエラー: ' + String(error)); }
+  finally { streamingMessage = null; ready(); }
+}
+send.onclick = () => run(input.value);
+input.onkeydown = event => { if (event.key === 'Enter' && !send.disabled) send.click(); };
+cancel.onclick = () => { session.cancel(); status.textContent = 'キャンセルを要求しました…'; };
+function sessionError(error) { provider.disabled = model.disabled = browserModel.disabled = reopen.disabled = false; send.disabled = true; status.textContent = 'セッションを開けません。別タブで開いている場合は閉じてから再試行するか、接続先を切り替えてください: ' + String(error); }
+async function openSelected() { return (provider.value === 'browser' ? BrowserSession.open_demo : BrowserSession.open)(provider.value === 'browser' ? 'browser-qwen-v2' : provider.value === 'ollama' ? 'ollama-preview-v1' : 'tachyon-luna-v1', location.origin + '/demo-gateway', provider.value === 'browser' ? 'browser-qwen' : provider.value === 'ollama' ? 'ollama' : 'openai/gpt-6-luna', '', 600000); }
+provider.onchange = () => { document.querySelector('#browser-settings').hidden = provider.value !== 'browser'; document.querySelector('#ollama-settings').hidden = provider.value !== 'ollama'; document.querySelector('#tachyon-settings').hidden = provider.value !== 'tachyon'; reopen.click(); };
+reopen.onclick = async () => {
+  provider.disabled = model.disabled = browserModel.disabled = send.disabled = reopen.disabled = true;
+  try { if (session) { await session.close(); session.free(); session = null; } session = await openSelected(); render(); status.textContent = '保存した会話を復元しました'; ready(); }
+  catch (error) { sessionError(error); }
+};
+try { await init(); session = await openSelected(); render(); status.textContent = '準備完了'; ready(); }
+catch (error) { sessionError(error); }
+</script>
+</body>
+</html>

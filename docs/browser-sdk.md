@@ -60,13 +60,13 @@ cookies and rejects redirects.
 The configured URL receives a JSON POST containing the serialized pi-rs
 `ModelRequest`: `model`, `messages`, `tools`, and `max_output_tokens`. When a
 nonempty token is provided the request includes `Authorization: Bearer …`.
-The gateway returns a successful JSON response `{ "text": "..." }`. The
+The gateway returns a successful JSON response `{ "text": "..." }`. It may also return `calls`, an array of `{ "id", "name", "arguments" }` objects, where `arguments` is a JSON string. The agent executes calls against the tools registered for the session. The
 transport reads its bounded response stream, but this adapter returns the text
 only after the whole JSON response arrives. The gateway is responsible for
 translating to a provider's API. Its errors are intentionally reported without
 response bodies or request URLs.
 
-The browser host currently provides no built-in tools, custom tool execution,
+Normal sessions have no built-in tools. For the browser demo only, `BrowserSession.open_demo` registers a side-effect-free `add_numbers` tool; it is not a general extension API. The browser host currently provides no custom tool execution,
 extensions, provider-specific adapters, streaming UI events, multimodal input,
 branch navigation, or native filesystem and process access. It does not expose
 the complete native SDK surface. The browser Fetch adapter enforces an 8 MiB
@@ -77,3 +77,8 @@ other browsers. The browser runtime supports single-threaded WASM only;
 threaded WASM has not been validated. Build flags select browser randomness
 explicitly; the same unknown WASM target name alone does not establish browser
 support.
+
+## Browser-local model demo
+
+See [the browser preview](../examples/browser-preview/README.md) for a runnable
+demo that executes a small model with WebGPU and exercises the demo tool.
