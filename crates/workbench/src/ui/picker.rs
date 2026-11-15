@@ -231,8 +231,20 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
-        self.query
-            .extend(text.chars().filter(|character| !character.is_control()));
+        if self.title == "Settings" {
+            // Pi's single-line input removes CR/LF, expands tabs, and keeps
+            // other characters for filtering. Rendering sanitizes controls.
+            for character in text.chars() {
+                match character {
+                    '\r' | '\n' => {}
+                    '\t' => self.query.push_str("    "),
+                    character => self.query.push(character),
+                }
+            }
+        } else {
+            self.query
+                .extend(text.chars().filter(|character| !character.is_control()));
+        }
         self.selected = 0;
         self.unfold_tree_for_search();
     }
@@ -616,10 +628,8 @@ impl Picker {
                     _ => item.label.to_lowercase(),
                 };
                 if self.title == "Settings" {
-                    crate::model_selection::fuzzy(
-                        &query,
-                        label.split(" · ").next().unwrap_or(&label),
-                    )
+                    settings_match_score(&query, label.split(" · ").next().unwrap_or(&label))
+                        .is_some()
                 } else if self.active_session.is_some()
                     || self.model_scope.is_some()
                     || self.title == "Thinking: select model"
@@ -645,6 +655,10 @@ impl Picker {
                     Selection::Completion { text, .. } => text.to_lowercase(),
                     _ => item.label.to_lowercase(),
                 };
+                if self.title == "Settings" {
+                    let name = label.split(" · ").next().unwrap_or(&label);
+                    return (settings_match_score(&query, name).unwrap_or(i64::MAX), 0);
+                }
                 (
                     label
                         .find(&query)
@@ -1830,6 +1844,15 @@ fn short_path(path: &std::path::Path) -> String {
     }
     path.display().to_string()
 }
+fn settings_match_score(query: &str, label: &str) -> Option<i64> {
+    query
+        .split(|ch| ch == '/' || super::session_search::is_whitespace(ch))
+        .filter(|token| !token.is_empty())
+        .try_fold(0_i64, |sum, token| {
+            super::session_search::fuzzy_score(token, label).map(|score| sum.saturating_add(score))
+        })
+}
+
 fn normalize_completion_description(text: &str) -> String {
     let mut result = String::new();
     let mut in_newline = false;
@@ -2114,6 +2137,72 @@ mod tests {
             matches!(&picker.matches()[picker.selected].selection, Selection::Setting(name, value) if name == "HTTP timeout" && *value == 30)
         );
         assert_eq!(picker.query, "ht to");
+    }
+
+    #[test]
+    fn settings_search_uses_pi_token_order_and_scores() {
+        let item = |name: &str| Item {
+            label: format!("{name} · value"),
+            selection: Selection::Setting(name.into(), serde_json::json!(true)),
+        };
+        let mut picker = Picker::new(
+            "Settings",
+            [
+                "HTTP timeout",
+                "Timeout HTTP",
+                "HTTP response timeout",
+                "Unrelated",
+            ]
+            .into_iter()
+            .map(item)
+            .collect(),
+        );
+        for query in ["timeout/http", "timeout http", "ht\u{feff}time"] {
+            picker.query = query.into();
+            let matches = picker.matches();
+            let names: Vec<_> = matches.iter().map(|item| item.label.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "Timeout HTTP · value",
+                    "HTTP timeout · value",
+                    "HTTP response timeout · value"
+                ],
+                "{query:?}"
+            );
+        }
+        picker.query = "http\u{85}timeout".into();
+        assert!(picker.matches().is_empty());
+        picker.query = "//".into();
+        assert_eq!(picker.matches().len(), 4);
+    }
+
+    #[test]
+    fn settings_paste_preserves_filter_semantics_and_sanitizes_display() {
+        let mut picker = Picker::new(
+            "Settings",
+            vec![Item {
+                label: "HTTP timeout · 30".into(),
+                selection: Selection::Setting("HTTP timeout".into(), serde_json::json!(30)),
+            }],
+        );
+        picker.paste("time\r\nout\thttp");
+        assert_eq!(picker.query, "timeout    http");
+        assert_eq!(picker.matches().len(), 1);
+
+        picker.query.clear();
+        picker.paste("http\u{85}timeout");
+        assert_eq!(picker.query, "http\u{85}timeout");
+        assert!(picker.matches().is_empty());
+
+        picker.paste("\u{1b}]8;;https://example.invalid\u{7}");
+        let lines = picker.render(&Theme::system(), 80, 8, &Keys::default());
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| { span.text.chars().all(|character| !character.is_control()) })
+        );
     }
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {
