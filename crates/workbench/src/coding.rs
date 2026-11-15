@@ -2292,6 +2292,16 @@ impl CodingTool {
     }
 
     fn read_image_inner(&self, path: &Path, infer_extension: bool) -> Result<Option<Value>> {
+        self.read_image_cancellable(path, infer_extension, None)
+    }
+
+    fn read_image_cancellable(
+        &self,
+        path: &Path,
+        infer_extension: bool,
+        cancellation: Option<&pi_rs::CancellationToken>,
+    ) -> Result<Option<Value>> {
+        crate::image_profile::check_cancelled(cancellation)?;
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
@@ -2301,13 +2311,15 @@ impl CodingTool {
             image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path)?))
         }
         .with_guessed_format()?;
+        crate::image_profile::check_cancelled(cancellation)?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
-        self.process_image(path, reader, format, None).map(Some)
+        self.process_image(path, reader, format, cancellation)
+            .map(Some)
     }
 
     fn process_image<R: std::io::BufRead + std::io::Seek>(
@@ -2505,7 +2517,7 @@ impl CodingTool {
         }
         let display_path = string(args, "path")?;
         let path = self.path(display_path)?;
-        if let Some(mut data) = self.read_image(&path)? {
+        if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
             if self.unrestricted
                 && matches!(
                     self.kind,
@@ -3523,6 +3535,91 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_image_read_honors_cancellation_before_processing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert!(
+            tool.read_image_cancellable(&path, true, Some(&token))
+                .unwrap()
+                .is_some()
+        );
+        token.cancel();
+        assert!(matches!(
+            tool.read_image_cancellable(&path, true, Some(&token)),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            tool.read(&json!({"path": "image.png"}), &token),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn image_processing_stops_when_cancelled_during_input_read() {
+        use std::io::{BufRead, Read, Seek, SeekFrom};
+
+        struct CancelOnRead {
+            data: std::io::Cursor<Vec<u8>>,
+            token: pi_rs::CancellationToken,
+        }
+        impl Read for CancelOnRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.token.cancel();
+                self.data.read(buf)
+            }
+        }
+        impl BufRead for CancelOnRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.data.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.data.consume(amount);
+            }
+        }
+        impl Seek for CancelOnRead {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let token = pi_rs::CancellationToken::new();
+        let reader = CancelOnRead {
+            data: std::io::Cursor::new(std::fs::read(&path).unwrap()),
+            token: token.clone(),
+        };
+        let reader = image::ImageReader::with_format(reader, image::ImageFormat::Png);
+        assert!(matches!(
+            tool.process_image(&path, reader, image::ImageFormat::Png, Some(&token)),
+            Err(Error::Cancelled)
+        ));
+    }
+
     #[test]
     fn image_read_structured_projection_uses_first_text_and_image() {
         use pi_rs::{AttachmentRef, Outcome};
