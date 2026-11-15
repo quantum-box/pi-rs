@@ -929,6 +929,21 @@ no reconstruction of old operations. Pages contain at most 256 document
 changes, but the page limit does not bound total bytes from legacy documents.
 On errors the cursor remains unchanged.
 
+`DocumentWatch::into_listener(interval)` adds serial, pull-driven async callback
+delivery using the same `MergedListenerSignals` and `MergedListenerEnd` types
+as the merged listener. Each successful callback acknowledges one complete
+frame; an error, panic, or dropped run leaves its frame unacknowledged for
+reattachment with `resume_watch`. Stop takes precedence over abort and then the
+host source-close signal. A callback already in progress is awaited before a
+signal ends the listener, and its successful result is acknowledged first. A
+host source-close ends without draining subsequent frames, which remain
+available after reattachment. The borrowed standalone store has no source lease,
+so the host must signal closure explicitly; dropping other store handles does
+not end the listener. The listener reads one frame at a time, with a 2 MiB
+limit on each current and previous document and a 1.1 MB evidence limit; an
+oversized document ends it with a failure and leaves the cursor unchanged.
+Callbacks must eventually return and should make external effects idempotent.
+
 `DocumentWatch::poll_operations` also returns one frame per committed state:
 a put produces a Chord root replacement `["r", value]`, and a delete produces
 an empty-operation retirement frame with no live document. It shares the same
@@ -937,8 +952,8 @@ methods unless they intend to consume the same stream. These replacements are
 synthesized from final states, not the original mutation operations. Unlike the
 upstream retired frame, deletion exposes no previous value. This is a subset of
 upstream `watchDoc`: the recorded-operation variant provides fine-grained
-operations for opted-in writes, but callbacks, abort/lifecycle handling and live
-notifications are not provided.
+operations for opted-in writes and an opt-in callback driver; automatic source
+lifetime notifications and push-based live notifications are not provided.
 Upstream attaches only to an existing address and delivers operation batches,
 folding pending operations and falling back to a root replacement above 10,000
 operations. Its retirement/incarnation and task-end semantics, listener

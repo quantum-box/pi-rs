@@ -391,3 +391,5 @@ or provide upstream task wake semantics.
 Opt-in merged watch progress operations derive bounded Chord patches from the immediately preceding uniquely matching tracked running change. Other cases use replacements; overwritten pre-tracking history and original upstream operation batches are not reconstructed.
 
 Opt-in document operation retention supports bounded decoded Chord operations over nested objects and arrays for existing versioned documents. UTF-16 truncation that would create an unpaired surrogate, sparse writes and unsafe or unrepresentable inputs are rejected; older batches and general Chord drafts remain unsupported.
+
+Standalone document watches offer a bounded, acknowledged callback listener with explicit stop, abort and host source-close signals; automatic source-lifetime detection remains limited to harness-owned merged watches.

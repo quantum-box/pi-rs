@@ -570,3 +570,211 @@ fn recorded_document_watch_replays_original_nested_batches_after_races_and_reope
     let deletion = resumed.poll_recorded_operations(1).unwrap();
     assert!(deletion[0].retired && !deletion[0].actual && deletion[0].ops.is_empty());
 }
+
+#[tokio::test]
+async fn document_listener_acknowledges_ordered_callbacks_and_reopens_after_error() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::{sync::Mutex, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("listener.db");
+    let store = Store::open(&path).unwrap();
+    put(&store, 0);
+    let docs = Documents::new(&store);
+    let (_, watch) = docs.watch(&address()).unwrap();
+    let mut listener = watch.into_listener(Duration::from_millis(1)).unwrap();
+    let version = docs.get(&address()).unwrap().unwrap().version;
+    let mut tx = Transaction::new();
+    tx.apply_operations(&store, &address(), version, &[json!(["s", ["n"], 1])])
+        .unwrap();
+    tx.commit(&store).unwrap();
+    put(&store, 2);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let end = listener
+        .run(&MergedListenerSignals::default(), move |frame| {
+            let n = frame.document.as_ref().unwrap().value["n"]
+                .as_i64()
+                .unwrap();
+            if n == 1 {
+                assert!(frame.actual);
+                assert_eq!(frame.ops, vec![json!(["s", ["n"], 1])]);
+            }
+            capture.lock().unwrap().push((n, frame.revision));
+            async move {
+                if n == 2 {
+                    Err("callback failed".into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+    assert_eq!(
+        end,
+        MergedListenerEnd::ListenerError("callback failed".into())
+    );
+    let entries = seen.lock().unwrap().clone();
+    assert_eq!(entries.iter().map(|v| v.0).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(listener.cursor(), entries[0].1);
+    let saved = listener.cursor();
+    drop(listener);
+    let watch = docs.resume_watch(&address(), saved).unwrap();
+    let mut panicking = watch.into_listener(Duration::from_millis(1)).unwrap();
+    assert_eq!(
+        panicking
+            .run(&MergedListenerSignals::default(), |_| async {
+                panic!("callback panic")
+            })
+            .await,
+        MergedListenerEnd::ListenerError("listener panicked".into())
+    );
+    assert_eq!(panicking.cursor(), saved);
+    drop(panicking);
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let watch = docs.resume_watch(&address(), saved).unwrap();
+    let mut resumed = watch.into_listener(Duration::from_millis(1)).unwrap();
+    let signals = MergedListenerSignals::default();
+    let stop = signals.stop.clone();
+    let end = resumed
+        .run(&signals, move |frame| {
+            assert_eq!(frame.document.unwrap().value["n"], 2);
+            stop.cancel();
+            async { Ok(()) }
+        })
+        .await;
+    assert_eq!(end, MergedListenerEnd::Stopped);
+    assert_eq!(resumed.cursor(), entries[1].1);
+}
+
+#[tokio::test]
+async fn document_listener_cancelled_callback_replays_and_host_close_preserves_later_commits() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("listener-close.db");
+    let store = Store::open(&path).unwrap();
+    put(&store, 0);
+    let docs = Documents::new(&store);
+    let (_, watch) = docs.watch(&address()).unwrap();
+    let mut listener = watch.into_listener(Duration::from_millis(1)).unwrap();
+    let start = listener.cursor();
+    put(&store, 1);
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let notify = reached.clone();
+    let signals = MergedListenerSignals::default();
+    {
+        let run = listener.run(&signals, move |_| {
+            let notify = notify.clone();
+            async move {
+                notify.notify_one();
+                std::future::pending::<Result<(), String>>().await
+            }
+        });
+        tokio::pin!(run);
+        tokio::select! { _ = reached.notified() => {}, end = &mut run => panic!("unexpected {end:?}") }
+    }
+    assert_eq!(listener.cursor(), start);
+    let close = signals.source_closed.clone();
+    let end = listener
+        .run(&signals, |frame| {
+            assert_eq!(frame.document.unwrap().value["n"], 1);
+            put(&store, 2);
+            close.cancel();
+            async { Ok(()) }
+        })
+        .await;
+    assert_eq!(end, MergedListenerEnd::Ended);
+    let saved = listener.cursor();
+    assert!(saved > start);
+    let mut replay = docs.resume_watch(&address(), saved).unwrap();
+    assert_eq!(
+        replay.poll_recorded_operations(1).unwrap()[0]
+            .document
+            .as_ref()
+            .unwrap()
+            .value["n"],
+        2
+    );
+    let watch = docs.resume_watch(&address(), start).unwrap();
+    let mut listener = watch.into_listener(Duration::from_millis(1)).unwrap();
+    let signals = MergedListenerSignals::default();
+    signals.stop.cancel();
+    signals.abort.cancel();
+    signals.source_closed.cancel();
+    assert_eq!(
+        listener
+            .run(&signals, |_| async { panic!("unexpected delivery") })
+            .await,
+        MergedListenerEnd::Stopped
+    );
+    assert_eq!(listener.cursor(), start);
+}
+
+#[tokio::test]
+async fn document_listener_fails_closed_on_oversized_frame() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("large.db")).unwrap();
+    let docs = Documents::new(&store);
+    let (_, watch) = docs.watch(&address()).unwrap();
+    let mut listener = watch.into_listener(Duration::from_millis(1)).unwrap();
+    let start = listener.cursor();
+    let mut tx = Transaction::new();
+    tx.put(
+        &address(),
+        Expected::Missing,
+        json!({"large":"x".repeat(2 * 1024 * 1024)})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    assert!(matches!(
+        listener
+            .run(&MergedListenerSignals::default(), |_| async {
+                panic!("oversized callback")
+            })
+            .await,
+        MergedListenerEnd::Failed(_)
+    ));
+    assert_eq!(listener.cursor(), start);
+}
+
+#[tokio::test]
+async fn document_listener_awaits_inflight_callback_before_abort() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("abort.db")).unwrap();
+    put(&store, 0);
+    let docs = Documents::new(&store);
+    let (_, watch) = docs.watch(&address()).unwrap();
+    let mut listener = watch.into_listener(Duration::from_millis(1)).unwrap();
+    let start = listener.cursor();
+    put(&store, 1);
+    let signals = MergedListenerSignals::default();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let callback_reached = reached.clone();
+    let callback_release = release.clone();
+    let run = listener.run(&signals, move |_| {
+        let reached = callback_reached.clone();
+        let release = callback_release.clone();
+        async move {
+            reached.notify_one();
+            release.notified().await;
+            Ok(())
+        }
+    });
+    let controller = async {
+        reached.notified().await;
+        signals.abort.cancel();
+        release.notify_one();
+    };
+    let (end, _) = tokio::join!(run, controller);
+    assert_eq!(end, MergedListenerEnd::Aborted);
+    assert!(listener.cursor() > start);
+}

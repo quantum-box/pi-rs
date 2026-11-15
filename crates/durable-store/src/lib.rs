@@ -9,7 +9,7 @@
 pub mod controls;
 pub mod owner;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     fmt,
     path::Path,
@@ -26,6 +26,8 @@ pub type KeyedEntry = (Vec<u8>, Entry);
 pub type MetadataPage = (Option<Entry>, Vec<KeyedEntry>);
 pub type DocumentChange = (Vec<u8>, Option<Entry>);
 pub type DocumentCommit = (u64, Vec<DocumentChange>);
+type BoundedHistoryRow = (Option<Vec<u8>>, Option<u64>, Option<u64>);
+type BoundedChangeRow = (u64, Option<Vec<u8>>, Option<u64>, Option<u64>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
     pub key: Vec<u8>,
@@ -386,6 +388,20 @@ impl Store {
             )
             .optional()?)
     }
+    /// Read an entry without materializing a value above `max_bytes`.
+    pub fn get_bounded(&self, key: &[u8], max_bytes: usize) -> Result<Option<Entry>, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let cap = i64::try_from(max_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let row: Option<(Option<Vec<u8>>, u64, u64)> = conn.query_row(
+            "SELECT CASE WHEN length(value)<=?2 THEN value ELSE NULL END,version,length(value) FROM durable_store_entries WHERE key=?1",
+            params![key, cap], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        match row {
+            None => Ok(None),
+            Some((Some(value), version, _)) => Ok(Some(Entry { value, version })),
+            Some(_) => Err(Error::DocumentFrameTooLarge),
+        }
+    }
     /// Returns a consistent snapshot in lexicographic byte order.
     pub fn list(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Entry)>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
@@ -503,6 +519,73 @@ impl Store {
             Some((Some(value), Some(version))) => Ok(Some(Entry { value, version })),
             Some((None, None)) | None => Ok(None),
             _ => Err(Error::Storage(rusqlite::Error::InvalidQuery)),
+        }
+    }
+
+    /// Read an immutable document snapshot without allocating an oversized blob.
+    pub fn document_at_bounded(
+        &self,
+        key: &[u8],
+        revision: u64,
+        max_bytes: usize,
+    ) -> Result<Option<Entry>, Error> {
+        if !key.starts_with(b"durable/document/") {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if revision > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let cap = i64::try_from(max_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let row: Option<BoundedHistoryRow> = conn.query_row(
+            "SELECT CASE WHEN length(value)<=?3 THEN value ELSE NULL END,version,length(value) FROM durable_document_history WHERE key=?1 AND revision<=?2 ORDER BY revision DESC LIMIT 1",
+            params![key,revision,cap], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        match row {
+            None | Some((None, None, None)) => Ok(None),
+            Some((Some(value), Some(version), Some(_))) => Ok(Some(Entry { value, version })),
+            Some((None, Some(_), Some(_))) => Err(Error::DocumentFrameTooLarge),
+            _ => Err(Error::InvalidSnapshot),
+        }
+    }
+
+    /// Fetch at most one document change, checking its size inside SQLite.
+    pub fn next_document_change_bounded(
+        &self,
+        key: &[u8],
+        after: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(u64, Option<Entry>)>, Error> {
+        if !key.starts_with(b"durable/document/") {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if after > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let cap = i64::try_from(max_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let row: Option<BoundedChangeRow> = conn.query_row(
+            "SELECT revision,CASE WHEN length(value)<=?3 THEN value ELSE NULL END,version,length(value) FROM durable_document_history WHERE key=?1 AND revision>?2 ORDER BY revision LIMIT 1",
+            params![key,after,cap], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        match row {
+            None => Ok(None),
+            Some((rev, None, None, None)) => Ok(Some((rev, None))),
+            Some((rev, Some(value), Some(version), Some(_))) => {
+                Ok(Some((rev, Some(Entry { value, version }))))
+            }
+            Some((_, None, Some(_), Some(_))) => Err(Error::DocumentFrameTooLarge),
+            _ => Err(Error::InvalidSnapshot),
         }
     }
 
@@ -1126,5 +1209,58 @@ mod document_history_tests {
             db.application_entries_at(key, 1).unwrap().unwrap().value,
             b"legacy"
         );
+    }
+    #[test]
+    fn bounded_document_and_entry_reads_enforce_exact_size_and_retirement() {
+        let db = Store::memory().unwrap();
+        let key = b"durable/document/test".to_vec();
+        let marker = b"marker".to_vec();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: key.clone(),
+                    value: b"12345".to_vec(),
+                },
+                Mutation::Put {
+                    key: marker.clone(),
+                    value: b"12345".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let rev = db.document_snapshot().unwrap();
+        assert!(matches!(
+            db.get_bounded(&marker, 4),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+        assert_eq!(db.get_bounded(&marker, 5).unwrap().unwrap().value, b"12345");
+        assert!(matches!(
+            db.document_at_bounded(&key, rev, 4),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+        assert_eq!(
+            db.document_at_bounded(&key, rev, 5).unwrap().unwrap().value,
+            b"12345"
+        );
+        assert!(matches!(
+            db.next_document_change_bounded(&key, 0, 4),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+        assert_eq!(
+            db.next_document_change_bounded(&key, 0, 5)
+                .unwrap()
+                .unwrap()
+                .0,
+            rev
+        );
+        db.commit(&[], &[Mutation::Delete { key: key.clone() }])
+            .unwrap();
+        let (deleted, value) = db
+            .next_document_change_bounded(&key, rev, 0)
+            .unwrap()
+            .unwrap();
+        assert!(value.is_none());
+        assert!(db.document_at_bounded(&key, deleted, 0).unwrap().is_none());
     }
 }

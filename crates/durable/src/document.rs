@@ -293,9 +293,12 @@ pub(crate) fn committed_operations(
     sequence: u64,
 ) -> Result<Option<Vec<Value>>, Error> {
     let key = ops_key(address, previous.version)?;
-    let Some(entry) = store.get(&key)? else {
-        return Ok(None);
+    let entry = match store.get_bounded(&key, 1_100_000) {
+        Ok(entry) => entry,
+        Err(durable_store::Error::DocumentFrameTooLarge) => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
+    let Some(entry) = entry else { return Ok(None) };
     if store.commit_for_version(&key, entry.version)? != Some(sequence) {
         return Ok(None);
     }
@@ -522,6 +525,192 @@ impl DocumentWatch<'_> {
             self.cursor = last.revision;
         }
         Ok(result)
+    }
+}
+
+/// Invalid configuration for a document listener.
+#[derive(Debug, thiserror::Error)]
+#[error("document listener interval must be nonzero")]
+pub struct DocumentListenerConfigError;
+
+/// Callback driver for a borrowed document watch. It reads at most one
+/// size-checked frame per callback and acknowledges only successful delivery.
+pub struct DocumentListener<'a> {
+    watch: Option<DocumentWatch<'a>>,
+    cursor: u64,
+    interval: std::time::Duration,
+    end: Option<crate::runtime::MergedListenerEnd>,
+}
+
+impl<'a> DocumentWatch<'a> {
+    /// Transfer this watch into an opt-in callback driver. Source closure is
+    /// host-signalled because a borrowed Store cannot know its writers' lifetime.
+    pub fn into_listener(
+        self,
+        interval: std::time::Duration,
+    ) -> Result<DocumentListener<'a>, DocumentListenerConfigError> {
+        if interval.is_zero() {
+            return Err(DocumentListenerConfigError);
+        }
+        Ok(DocumentListener {
+            cursor: self.cursor,
+            watch: Some(self),
+            interval,
+            end: None,
+        })
+    }
+
+    fn bounded_next(&self) -> Result<Option<DocumentOperationFrame>, Error> {
+        const MAX_DOCUMENT: usize = 2 * 1024 * 1024;
+        let Some((revision, entry)) =
+            self.store
+                .next_document_change_bounded(&self.key, self.cursor, MAX_DOCUMENT)?
+        else {
+            return Ok(None);
+        };
+        let previous = Documents::decode(self.store.document_at_bounded(
+            &self.key,
+            self.cursor,
+            MAX_DOCUMENT,
+        )?)?;
+        let document = Documents::decode(entry)?;
+        let address = Address::from_storage_key(&self.key)?;
+        let recorded = match (&previous, &document) {
+            (Some(old), Some(new)) => match self.store.document_commit_sequence(revision)? {
+                Some(seq)
+                    if self.store.commit_for_version(&self.key, new.version)? == Some(seq) =>
+                {
+                    committed_operations(self.store, &address, old, new, seq)?
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let actual = recorded.is_some();
+        let ops = if let Some(ops) = recorded {
+            ops
+        } else {
+            match (&previous, &document) {
+                (Some(old), Some(new)) => crate::chord_ops::diff(
+                    &Value::Object(old.value.clone()),
+                    &Value::Object(new.value.clone()),
+                ),
+                (None, Some(new)) => {
+                    crate::chord_ops::replacement(&Value::Object(new.value.clone()))
+                }
+                (_, None) => Vec::new(),
+            }
+        };
+        Ok(Some(DocumentOperationFrame {
+            revision,
+            retired: document.is_none(),
+            document,
+            ops,
+            actual,
+        }))
+    }
+}
+
+impl DocumentListener<'_> {
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+    pub fn end_reason(&self) -> Option<&crate::runtime::MergedListenerEnd> {
+        self.end.as_ref()
+    }
+    fn finish(
+        &mut self,
+        reason: crate::runtime::MergedListenerEnd,
+    ) -> crate::runtime::MergedListenerEnd {
+        if self.end.is_none() {
+            self.end = Some(reason);
+            self.watch = None;
+        }
+        self.end.as_ref().expect("terminal reason recorded").clone()
+    }
+
+    /// Deliver frames serially. Stop, abort and source-close are checked in
+    /// that order; an in-flight callback is awaited before acknowledging it.
+    /// Dropping this future leaves its in-flight frame unacknowledged.
+    pub async fn run<F, Fut>(
+        &mut self,
+        signals: &crate::runtime::MergedListenerSignals,
+        mut listener: F,
+    ) -> crate::runtime::MergedListenerEnd
+    where
+        F: FnMut(DocumentOperationFrame) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        use crate::runtime::MergedListenerEnd as End;
+        use futures_util::FutureExt;
+        if let Some(end) = &self.end {
+            return end.clone();
+        }
+        loop {
+            if signals.stop.is_cancelled() {
+                return self.finish(End::Stopped);
+            }
+            if signals.abort.is_cancelled() {
+                return self.finish(End::Aborted);
+            }
+            if signals.source_closed.is_cancelled() {
+                return self.finish(End::Ended);
+            }
+            let frame = match self.watch.as_ref().expect("listener open").bounded_next() {
+                Ok(frame) => frame,
+                Err(error) => return self.finish(End::Failed(error.to_string())),
+            };
+            let Some(frame) = frame else {
+                tokio::select! { biased;
+                    _ = signals.stop.cancelled() => return self.finish(End::Stopped),
+                    _ = signals.abort.cancelled() => return self.finish(End::Aborted),
+                    _ = signals.source_closed.cancelled() => return self.finish(End::Ended),
+                    _ = tokio::time::sleep(self.interval) => {},
+                }
+                continue;
+            };
+            if signals.stop.is_cancelled() {
+                return self.finish(End::Stopped);
+            }
+            if signals.abort.is_cancelled() {
+                return self.finish(End::Aborted);
+            }
+            if signals.source_closed.is_cancelled() {
+                return self.finish(End::Ended);
+            }
+            let revision = frame.revision;
+            let callback =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(frame))) {
+                    Ok(callback) => callback,
+                    Err(payload) => {
+                        crate::extension::discard_panic_payload(payload);
+                        return self.finish(End::ListenerError("listener panicked".into()));
+                    }
+                };
+            let callback = std::panic::AssertUnwindSafe(callback).catch_unwind();
+            tokio::pin!(callback);
+            let (result, signalled) = tokio::select! { biased;
+                result = &mut callback => (result, None),
+                _ = signals.stop.cancelled() => (callback.await, Some(End::Stopped)),
+                _ = signals.abort.cancelled() => (callback.await, Some(End::Aborted)),
+                _ = signals.source_closed.cancelled() => (callback.await, Some(End::Ended)),
+            };
+            let failure = match result {
+                Ok(Ok(())) => {
+                    self.cursor = revision;
+                    self.watch.as_mut().expect("listener open").cursor = revision;
+                    None
+                }
+                Ok(Err(error)) => Some(End::ListenerError(error)),
+                Err(payload) => {
+                    crate::extension::discard_panic_payload(payload);
+                    Some(End::ListenerError("listener panicked".into()))
+                }
+            };
+            if let Some(end) = signalled.or(failure) {
+                return self.finish(end);
+            }
+        }
     }
 }
 
