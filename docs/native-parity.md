@@ -4564,8 +4564,13 @@ Pi-compatible Anthropic subscription credentials already present in
 `auth.json` are bound to the official Messages endpoint and refreshed under
 the auth lock. OAuth requests use Pi's subscription headers, identity and
 tool-name mapping. To avoid ambiguous dispatch, native rejects tool names
-that differ only in case. Interactive Anthropic OAuth login and live
-subscription acceptance remain open.
+that differ only in case. `/login anthropic` supports browser and copy-code
+authorization; `pi login anthropic --copy-code` enables the headless flow.
+The browser callback binds and advertises IPv4 loopback and uses a state
+independent of the PKCE verifier, unlike upstream's `localhost` callback and
+shared state/verifier. Live subscription login and acceptance remain open.
+Native token exchanges have a 30-second HTTP timeout; upstream bounds stored
+OAuth refresh to 15 seconds.
 Opaque Anthropic replay is shared between API-key and OAuth authentication
 at the official endpoint, while custom endpoints use separate replay scopes;
 legacy custom-endpoint replay without a matching scope falls back to the

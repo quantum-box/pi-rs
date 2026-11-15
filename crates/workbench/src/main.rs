@@ -1145,10 +1145,13 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
+        /// Use Anthropic's headless copy-code authorization.
+        #[arg(long, conflicts_with = "device_code")]
+        copy_code: bool,
         /// Register a different ChatGPT account or workspace.
         #[arg(long, conflicts_with_all = ["account", "list_accounts"])]
         new_account: bool,
@@ -1161,7 +1164,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1719,6 +1722,7 @@ async fn execute(
         Some(Command::Login {
             provider,
             device_code,
+            copy_code,
             new_account,
             account,
             list_accounts,
@@ -1741,8 +1745,30 @@ async fn execute(
                     "--new-account and --account require openai-chatgpt".into(),
                 ));
             }
+            if *copy_code && provider != "anthropic" {
+                return Err(Error::Config("--copy-code requires anthropic".into()));
+            }
             let login = async {
-                if provider == "openai-chatgpt" {
+                if provider == "anthropic" {
+                    if *device_code {
+                        return Err(Error::Config(
+                            "Anthropic uses browser or copy-code authorization".into(),
+                        ));
+                    }
+                    let method = if *copy_code {
+                        anthropic_auth::LoginMethod::CopyCode
+                    } else {
+                        anthropic_auth::LoginMethod::Browser
+                    };
+                    anthropic_auth::login(&args.settings, method, meta_auth::LoginControl::default(), |url, sender| {
+                        eprintln!("Continue in your browser: {url}");
+                        eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                        std::thread::spawn(move || {
+                            let mut line = String::new();
+                            if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) { let _ = sender.send(line); }
+                        });
+                    }).await
+                } else if provider == "openai-chatgpt" {
                     if *device_code {
                         return Err(Error::Config("ChatGPT uses browser authorization".into()));
                     }
@@ -1801,7 +1827,7 @@ async fn execute(
                 xai_auth::logout().await?
             } else if provider == "kimi-coding" {
                 kimi_auth::logout().await?
-            } else if provider == "openrouter" {
+            } else if provider == "openrouter" || provider == "anthropic" {
                 model_auth::remove(
                     &Provider::named(provider).expect("built-in OpenRouter provider"),
                 )?

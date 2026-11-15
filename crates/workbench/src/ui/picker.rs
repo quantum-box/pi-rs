@@ -27,6 +27,8 @@ pub enum Selection {
     BedrockProfile,
     BedrockChain,
     LoginOpenRouter,
+    AnthropicMethods,
+    LoginAnthropic(crate::anthropic_auth::LoginMethod),
     LoginKimi,
     LoginMeta,
     LoginXai,
