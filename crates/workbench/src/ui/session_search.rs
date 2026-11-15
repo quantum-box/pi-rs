@@ -73,13 +73,19 @@ impl Query {
                 return Self::Invalid;
             }
             let pattern = pattern.trim_matches(is_whitespace);
-            let linear = format!("(?i){}", ascii_regex_classes(pattern));
+            let linear = format!(
+                "(?i){}",
+                js_regex_dots(&ascii_regex_classes(pattern), pattern)
+            );
             if let Ok(regex) = regex::Regex::new(&linear) {
                 return Self::Regex(SearchRegex::Linear(regex));
             }
             // The advanced engine cannot disable Unicode for boundaries.
             // Avoid mixing its Unicode boundaries with ASCII word classes.
-            let advanced = format!("(?i){}", translate_regex_classes(pattern, false));
+            let advanced = format!(
+                "(?i){}",
+                js_regex_dots(&translate_regex_classes(pattern, false), pattern)
+            );
             return fancy_regex::RegexBuilder::new(&advanced)
                 .backtrack_limit(100_000)
                 .build()
@@ -167,6 +173,55 @@ impl Query {
             }
         }
     }
+}
+// JavaScript's dot excludes all four line terminators. Preserve native inline
+// dotall behavior and avoid rewriting patterns with user bracket expressions.
+fn js_regex_dots(pattern: &str, original: &str) -> String {
+    let mut escaped = false;
+    for (offset, ch) in original.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '[' {
+            return pattern.to_owned();
+        } else if ch == '('
+            && let Some(flags) = original[offset..].strip_prefix("(?")
+            && flags
+                .chars()
+                .take_while(|c| "imsUx-".contains(*c))
+                .any(|c| c == 's')
+        {
+            return pattern.to_owned();
+        }
+    }
+    let mut result = String::with_capacity(pattern.len());
+    let mut escaped = false;
+    let mut in_class = false;
+    for ch in pattern.chars() {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            result.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        }
+        if ch == ']' {
+            in_class = false;
+        }
+        if ch == '.' && !in_class {
+            result.push_str(r"[^\n\r\x{2028}\x{2029}]");
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 // JavaScript's non-Unicode regular expressions use ASCII for these classes.
 // Translate single-shorthand bracket expressions too. More complex bracket
@@ -343,6 +398,56 @@ fn position_score(text: &[u16], positions: &[usize]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_dot_uses_javascript_line_terminators() {
+        let doc = |text: &str| {
+            Document::new(
+                text.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+            )
+        };
+        for pattern in [r"re:^.$", r"re:^(?=.).$"] {
+            for text in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+                assert!(
+                    Query::new(pattern).score(&doc(text)).is_none(),
+                    "{pattern} {text:?}"
+                );
+            }
+            for text in ["a", "\u{85}"] {
+                assert!(
+                    Query::new(pattern).score(&doc(text)).is_some(),
+                    "{pattern} {text:?}"
+                );
+            }
+        }
+        assert!(Query::new(r"re:^(?=\.)\.$").score(&doc(".")).is_some());
+        assert!(Query::new(r"re:^(.)\1$").score(&doc("\r\r")).is_none());
+        let combined = Query::new(r"re:^(?=\w)..$");
+        assert!(combined.score(&doc("aZ")).is_some());
+        assert!(combined.score(&doc("a\r")).is_none());
+        assert!(combined.score(&doc("éZ")).is_none());
+        let bracket = Query::new(r"re:^[\w].$");
+        assert!(bracket.score(&doc("aZ")).is_some());
+        assert!(bracket.score(&doc("éZ")).is_none());
+        // Dot rewriting is intentionally skipped for user bracket expressions.
+        assert!(bracket.score(&doc("a\r")).is_some());
+        assert_eq!(js_regex_dots("(?s:.)", "(?s:.)"), "(?s:.)");
+        assert_eq!(js_regex_dots("[.]", "[.]"), "[.]");
+        assert!(Query::new(r"re:(?s)^.$").score(&doc("\n")).is_some());
+        for text in ["s\r", "(s\r"] {
+            assert!(Query::new(r"re:\(?s.").score(&doc(text)).is_none());
+        }
+        for text in ["sX", "(sX"] {
+            assert!(Query::new(r"re:\(?s.").score(&doc(text)).is_some());
+        }
+        assert_eq!(js_regex_dots(r"\\(?s:.)", r"\\(?s:.)"), r"\\(?s:.)");
+        let long = format!("{}z", "a".repeat(50_000));
+        assert!(Query::new(r"re:^.*z(?=$)").score(&doc(&long)).is_some());
+    }
 
     #[test]
     fn regex_shorthand_classes_match_javascript_ascii_rules() {
