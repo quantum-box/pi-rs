@@ -101,7 +101,7 @@ without `defaultProvider` are still accepted.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt and explicit-directory context resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -4665,3 +4665,10 @@ allows the blocking worker to stop at the image processing cancellation checks,
 matching Pi's aborted read behavior. The restricted no-profile image path also checks cancellation after decoding,
 thumbnailing and each PNG encoding attempt. Individual image operations remain
 synchronous and are interrupted at their checkpoints.
+
+SDK hosts can load ordered context-file snapshots from explicitly granted directories.
+Each directory uses Pi’s context filename precedence; repeated selected paths are
+loaded once. Hosts choose directories and
+when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
+follow symlinks, fail atomically on errors, and use the prompt resource size limit.
+Unlike Pi, unreadable higher-priority files fail rather than falling through.
