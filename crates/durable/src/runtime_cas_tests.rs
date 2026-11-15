@@ -768,6 +768,154 @@ fn abort_fences_root_and_stale_lifecycle_admissions() {
 }
 
 #[test]
+fn cyclic_abort_retries_if_unchanged_task_changes_before_commit() {
+    use crate::ownership_edge::{self, Edge, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    use serde_json::json;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for terminal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let conversation = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "initial".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap();
+        let mut old_task = task.clone();
+        if terminal {
+            old_task.start().unwrap();
+            old_task.succeed(json!(null)).unwrap();
+        } else {
+            old_task.request_abort().unwrap();
+        }
+        let store = h.subagent_store().unwrap();
+        TaskStore::new(store)
+            .save(&[Save::Create(&old_task)])
+            .unwrap();
+        let edge = Edge {
+            task: task.id(),
+            task_owner: TaskOwner::Conversation(conversation),
+            child: conversation,
+            mode: Mode::Foreground,
+        };
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: ownership_edge::edge_key(conversation),
+                    value: serde_json::to_vec(&edge).unwrap(),
+                }],
+            )
+            .unwrap();
+        let parent = TaskStore::new(store).load(task.id()).unwrap().unwrap();
+        let child = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Task(task.id()),
+            Checkpoint {
+                phase: "child".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap();
+        let child_id = child.id();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = h.worker();
+        let thread = std::thread::spawn(move || {
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            // Model an old low-level writer that publishes an ownership change
+            // and advances its owner's version in the same checked commit.
+            writer
+                .subagent_store()
+                .unwrap()
+                .commit(
+                    &[Check {
+                        key: crate::task_store::key(parent.task.id()),
+                        expected: Expected::Version(parent.version),
+                    }],
+                    &[
+                        Mutation::Put {
+                            key: crate::task_store::key(parent.task.id()),
+                            value: serde_json::to_vec(&parent.task).unwrap(),
+                        },
+                        Mutation::Put {
+                            key: crate::task_store::key(child.id()),
+                            value: serde_json::to_vec(&child).unwrap(),
+                        },
+                    ],
+                )
+                .unwrap();
+            let version = TaskStore::new(writer.subagent_store().unwrap())
+                .load(parent.task.id())
+                .unwrap()
+                .unwrap()
+                .version;
+            done_tx.send(version).unwrap();
+        });
+        let mut attempts = 0;
+        let mut writer_version = 0;
+        h.abort_owned_graph_impl_with(Some(conversation), None, None, false, || {
+            attempts += 1;
+            if attempts == 1 {
+                ready_tx.send(()).unwrap();
+                writer_version = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        })
+        .unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            attempts, 2,
+            "changed visited task must trigger a full traversal retry"
+        );
+        assert_eq!(
+            TaskStore::new(h.subagent_store().unwrap())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .version,
+            writer_version,
+            "retry must not rewrite an unchanged marked or terminal task"
+        );
+        assert!(
+            TaskStore::new(h.subagent_store().unwrap())
+                .load(child_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        drop(h);
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        assert!(reopened.conversation(conversation).unwrap().abort_requested);
+        assert!(
+            TaskStore::new(reopened.subagent_store().unwrap())
+                .load(child_id)
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+}
+
+#[test]
 fn conversation_abort_fences_running_task_and_its_proposed_child() {
     use crate::task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor};
     use crate::task_scheduler::{Registry, Step};

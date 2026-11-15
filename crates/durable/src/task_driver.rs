@@ -456,33 +456,47 @@ fn cleanup_loop(shared: Arc<Shared>) {
             }
             let discovered = (|| -> Result<Vec<Uuid>, String> {
                 let store = shared.owner.store();
-                let tasks = TaskStore::new(store).list().map_err(|e| e.to_string())?;
-                let edges = crate::ownership_edge::EdgeStore::new(store);
+                // Snapshot all three namespaces together. Inspect an edge only
+                // for a marked child, so unrelated corrupt legacy edges cannot
+                // stop recovery of an otherwise independent conversation.
+                let entries: HashMap<_, _> = store
+                    .list_prefixes(&[
+                        crate::task_store::PREFIX,
+                        crate::ownership_edge::PREFIX,
+                        b"runtime/conversation/",
+                    ])
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .collect();
                 let mut found = Vec::new();
-                for task in tasks
-                    .iter()
-                    .filter(|t| t.task.abort_requested() || t.task.is_terminal())
-                {
-                    for edge in edges.children(task.task.id()).map_err(|e| e.to_string())? {
-                        if edge.edge.task_owner != *task.task.owner() {
-                            return Err("ownership edge owner mismatch".into());
-                        }
-                        // A background-inclusive conversation abort may mark a
-                        // child across either edge mode. Persisted marks, not
-                        // edge mode, decide which children need recovery.
-                        let h = shared
-                            .harness
-                            .as_ref()
-                            .unwrap()
-                            .lock()
-                            .map_err(|e| e.to_string())?;
-                        if h.conversation(edge.edge.child)
-                            .map_err(|e| e.to_string())?
-                            .abort_requested
-                        {
-                            found.push(edge.edge.child);
-                        }
+                for (key, entry) in &entries {
+                    if !key.starts_with(b"runtime/conversation/") {
+                        continue;
                     }
+                    let child: crate::runtime::Conversation =
+                        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+                    if !child.abort_requested {
+                        continue;
+                    }
+                    if *key != format!("runtime/conversation/{}", child.id).into_bytes() {
+                        return Err("conversation key mismatch".into());
+                    }
+                    let edge_key = crate::ownership_edge::edge_key(child.id);
+                    let Some(edge_entry) = entries.get(&edge_key) else {
+                        continue;
+                    };
+                    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
+                        .map_err(|e| e.to_string())?;
+                    let task_key = crate::task_store::key(edge.edge.task);
+                    let task_entry = entries.get(&task_key).ok_or("ownership task missing")?;
+                    let task = crate::task_store::decode(&task_key, task_entry.clone())
+                        .map_err(|e| e.to_string())?;
+                    if edge.edge.task_owner != *task.task.owner() {
+                        return Err("ownership edge owner mismatch".into());
+                    }
+                    // A child can be aborted independently of its live owner,
+                    // and explicit abort can cross background boundaries.
+                    found.push(child.id);
                 }
                 Ok(found)
             })();

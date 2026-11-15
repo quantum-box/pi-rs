@@ -868,6 +868,113 @@ mod tests {
     }
 
     #[test]
+    fn driver_recovers_child_abort_when_owner_is_still_live() {
+        for mode in [Mode::Foreground, Mode::Background] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            let (task, owner) = setup(&mut h);
+            let child = h
+                .ensure_task_owned_subagent(task, owner, "child", config(), mode)
+                .unwrap()
+                .child;
+            // A separate legacy edge has a mismatched owner. Its unmarked
+            // conversation must not prevent this child's recovery.
+            let unrelated = h.create_conversation(config()).unwrap();
+            let corrupt = Edge {
+                task,
+                task_owner: TaskOwner::Task(Uuid::new_v4()),
+                child: unrelated,
+                mode: Mode::Foreground,
+            };
+            h.subagent_store()
+                .unwrap()
+                .commit(
+                    &[],
+                    &[Mutation::Put {
+                        key: ownership_edge::edge_key(unrelated),
+                        value: serde_json::to_vec(&corrupt).unwrap(),
+                    }],
+                )
+                .unwrap();
+            h.request_abort(child).unwrap();
+            assert!(
+                !TaskStore::new(h.subagent_store().unwrap())
+                    .load(task)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested()
+            );
+            drop(h);
+            let h = Harness::open_paused(&path, options()).unwrap();
+            let driver = h.start_tasks(Default::default()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while h.conversation(child).unwrap().abort_requested {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "marked child was not recovered"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!driver.get(task).unwrap().unwrap().abort_requested());
+            driver.shutdown().unwrap();
+            drop(h);
+            let reopened = Harness::open_paused(&path, options()).unwrap();
+            assert!(!reopened.conversation(child).unwrap().abort_requested);
+        }
+    }
+
+    #[test]
+    fn driver_reports_mismatched_marked_edge_without_clearing_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, _) = setup(&mut h);
+        let child = h.create_conversation(config()).unwrap();
+        h.request_abort(child).unwrap();
+        let corrupt = Edge {
+            task,
+            task_owner: TaskOwner::Task(Uuid::new_v4()),
+            child,
+            mode: Mode::Foreground,
+        };
+        h.subagent_store()
+            .unwrap()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: ownership_edge::edge_key(child),
+                    value: serde_json::to_vec(&corrupt).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let driver = h.start_tasks(Default::default()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            if let Err(error) = driver.get(task) {
+                assert!(
+                    error.to_string().contains("ownership edge owner mismatch"),
+                    "{error}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "corrupt ownership was not reported"
+            );
+            std::thread::yield_now();
+        }
+        assert!(h.conversation(child).unwrap().abort_requested);
+        assert!(driver.shutdown().is_err());
+        drop(h);
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        assert!(reopened.conversation(child).unwrap().abort_requested);
+    }
+
+    #[test]
     fn driver_recovers_persisted_owned_cleanup_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");

@@ -7958,6 +7958,17 @@ impl Harness {
         receipt: Option<(Vec<u8>, Vec<u8>)>,
         background: bool,
     ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+        self.abort_owned_graph_impl_with(conversation, task, receipt, background, || {})
+    }
+
+    fn abort_owned_graph_impl_with(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+        receipt: Option<(Vec<u8>, Vec<u8>)>,
+        background: bool,
+        mut before_commit: impl FnMut(),
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -8108,6 +8119,18 @@ impl Harness {
                 )
                 .map_err(|e| Error::Invalid(format!("task batch: {e}")))?;
             batch.checks.extend(task_batch.checks);
+            // Check unchanged marked or terminal tasks too, so a child/edge
+            // change committed since traversal forces a retry. Do not rewrite
+            // them: that would invalidate an in-flight cleanup attempt.
+            for id in &tasks {
+                let record = by_id[id];
+                if record.task.is_terminal() || record.task.abort_requested() {
+                    batch.checks.push(Check {
+                        key: crate::task_store::key(*id),
+                        expected: Expected::Version(record.version),
+                    });
+                }
+            }
             if let Some((key, value)) = &receipt {
                 batch.checks.push(Check {
                     key: key.clone(),
@@ -8126,6 +8149,7 @@ impl Harness {
                 });
             }
             batch.mutations.extend(task_batch.mutations);
+            before_commit();
             match self.commit_conversation_save(batch) {
                 Ok(()) => {
                     return Ok((

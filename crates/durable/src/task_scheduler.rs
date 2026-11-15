@@ -1185,6 +1185,14 @@ impl Scheduler {
 /// Mark the entire existing subtree atomically. Checking every live record also
 /// fences a concurrent handler trying to publish a child under that record.
 pub(crate) fn request_abort_subtree(ts: &TaskStore<'_>, id: Uuid) -> Result<(), Error> {
+    request_abort_subtree_with(ts, id, || {})
+}
+
+fn request_abort_subtree_with(
+    ts: &TaskStore<'_>,
+    id: Uuid,
+    mut before_commit: impl FnMut(),
+) -> Result<(), Error> {
     loop {
         let records = ts.list()?;
         let root = records
@@ -1230,7 +1238,23 @@ pub(crate) fn request_abort_subtree(ts: &TaskStore<'_>, id: Uuid) -> Result<(), 
                 updates.push(next);
             }
         }
-        match ts.save(&updates.iter().map(Save::Update).collect::<Vec<_>>()) {
+        let mut batch = ts.prepare_save(&updates.iter().map(Save::Update).collect::<Vec<_>>())?;
+        for record in &records {
+            if ids.contains(&record.task.id())
+                && (record.task.is_terminal() || record.task.abort_requested())
+            {
+                batch.checks.push(durable_store::Check {
+                    key: task_store::key(record.task.id()),
+                    expected: durable_store::Expected::Version(record.version),
+                });
+            }
+        }
+        before_commit();
+        match ts
+            .store()
+            .commit(&batch.checks, &batch.mutations)
+            .map_err(task_store::Error::from)
+        {
             Ok(()) => return Ok(()),
             Err(task_store::Error::Store(durable_store::Error::Conflict { .. })) => continue,
             Err(e) => return Err(e.into()),
@@ -1253,6 +1277,82 @@ mod tests {
             .unwrap()
             .registered(kind.into(), safe)
     }
+    #[test]
+    fn repeated_abort_retries_when_marked_task_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        let ts = scheduler.ts();
+        let mut root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(100)),
+            "job",
+            true,
+            4,
+        );
+        root.request_abort().unwrap();
+        ts.save(&[Save::Create(&root)]).unwrap();
+        let parent = ts.load(root.id()).unwrap().unwrap();
+        let child = task(2, TaskOwner::Task(root.id()), "job", true, 4);
+        let owner = scheduler.owner();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            owner
+                .store()
+                .commit(
+                    &[durable_store::Check {
+                        key: task_store::key(parent.task.id()),
+                        expected: durable_store::Expected::Version(parent.version),
+                    }],
+                    &[
+                        durable_store::Mutation::Put {
+                            key: task_store::key(parent.task.id()),
+                            value: serde_json::to_vec(&parent.task).unwrap(),
+                        },
+                        durable_store::Mutation::Put {
+                            key: task_store::key(child.id()),
+                            value: serde_json::to_vec(&child).unwrap(),
+                        },
+                    ],
+                )
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let mut attempts = 0;
+        request_abort_subtree_with(&ts, root.id(), || {
+            attempts += 1;
+            if attempts == 1 {
+                ready_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        })
+        .unwrap();
+        writer.join().unwrap();
+        assert_eq!(attempts, 2);
+        assert!(
+            ts.load(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        drop(scheduler);
+        let reopened = Scheduler::open(&path, Registry::default()).unwrap();
+        assert!(
+            reopened
+                .ts()
+                .load(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+
     #[test]
     fn retired_attempt_survives_reopen_and_is_fenced_by_replay_and_abort() {
         use std::sync::Mutex;
