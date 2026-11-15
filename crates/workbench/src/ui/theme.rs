@@ -7,13 +7,42 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
 static TERMINAL_BACKGROUND: AtomicU32 = AtomicU32::new(0);
 static TERMINAL_FOREGROUND: AtomicU32 = AtomicU32::new(0);
+static TERMINAL_COLORS_PENDING: AtomicBool = AtomicBool::new(false);
 static TERMINAL_PALETTE: std::sync::Mutex<PaletteState> =
     std::sync::Mutex::new(PaletteState::new());
+
+#[cfg(any(unix, windows))]
+pub fn mark_terminal_colors_pending() {
+    TERMINAL_COLORS_PENDING.store(true, Ordering::Relaxed);
+}
+
+#[cfg(any(unix, windows))]
+pub fn finish_terminal_colors_pending() -> bool {
+    TERMINAL_COLORS_PENDING.swap(false, Ordering::Relaxed)
+}
+
+#[cfg(any(unix, windows))]
+pub struct PendingTerminalColors;
+
+#[cfg(any(unix, windows))]
+impl PendingTerminalColors {
+    pub fn new() -> Self {
+        mark_terminal_colors_pending();
+        Self
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for PendingTerminalColors {
+    fn drop(&mut self) {
+        finish_terminal_colors_pending();
+    }
+}
 
 struct PaletteState {
     current: Option<[[u8; 3]; 16]>,
@@ -343,6 +372,15 @@ impl Theme {
         self.dim.contains(role)
     }
     pub fn system() -> Self {
+        if TERMINAL_COLORS_PENDING.load(Ordering::Relaxed) {
+            let generated = super::system_theme::generate(None, None, None, 0.0, None);
+            return Self {
+                name: "system".into(),
+                path: None,
+                colors: generated.colors,
+                dim: generated.dim,
+            };
+        }
         let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
         let foreground = unpack_terminal_color(TERMINAL_FOREGROUND.load(Ordering::Relaxed));
         let palette = TERMINAL_PALETTE.lock().expect("terminal palette").current;
@@ -659,6 +697,32 @@ mod tests {
         for token in ["text", "toolTitle", "selectedBg", "toolErrorBg"] {
             assert_eq!(theme.color(token), Color::Reset, "{token}");
         }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn system_theme_stays_grayscale_until_color_query_settles() {
+        const CHILD: &str = "PI_RS_PENDING_SYSTEM_THEME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::theme::tests::system_theme_stays_grayscale_until_color_query_settles",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        assert_eq!(Theme::system().color("accent"), Color::Reset);
+        set_terminal_color(false, 0, 0, 0);
+        assert_eq!(Theme::system().color("accent"), Color::Reset);
+        assert!(finish_terminal_colors_pending());
+        assert!(!finish_terminal_colors_pending());
+        assert!(matches!(Theme::system().color("accent"), Color::Rgb { .. }));
     }
 
     #[test]

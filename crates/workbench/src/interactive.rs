@@ -134,11 +134,7 @@ struct Terminal {
     images: Cleanup,
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
-    color_queries: std::collections::VecDeque<ColorQuery>,
-    #[cfg(any(unix, windows))]
-    color_requery: bool,
-    #[cfg(any(unix, windows))]
-    completed_color_markers: usize,
+    colors: ColorQueries,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -159,19 +155,31 @@ struct ColorQuery {
     quarantined: bool,
 }
 
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct ColorQueries {
+    initial_started: Option<Instant>,
+    color_queries: std::collections::VecDeque<ColorQuery>,
+    color_requery: bool,
+    disabled: bool,
+    last_appearance_report: Option<bool>,
+}
+
 impl Terminal {
-    fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
+    fn enter(
+        mode: Option<TuiMode>,
+        images: Cleanup,
+        #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
+    ) -> Result<Self> {
         terminal::enable_raw_mode()?;
+        #[cfg(any(unix, windows))]
+        let initial_colors = previous_colors.is_none();
         let mut guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
             progress: None,
             #[cfg(any(unix, windows))]
-            color_queries: std::collections::VecDeque::new(),
-            #[cfg(any(unix, windows))]
-            color_requery: false,
-            #[cfg(any(unix, windows))]
-            completed_color_markers: 0,
+            colors: previous_colors.unwrap_or_default(),
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -188,9 +196,17 @@ impl Terminal {
         execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u"))?;
         #[cfg(any(unix, windows))]
         {
-            crate::ui::theme::reset_terminal_background();
+            if initial_colors {
+                crate::ui::theme::reset_terminal_background();
+            }
             execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
-            guard.query_terminal_colors()?;
+            guard.colors.query_terminal_colors(&mut std::io::stdout())?;
+        }
+        // Reentry disables color queries, so no DA1 will trigger the usual
+        // Xterm keyboard fallback. A later Kitty reply can still upgrade it.
+        #[cfg(unix)]
+        if guard.colors.disabled {
+            guard.keyboard_reply(false)?;
         }
         Ok(guard)
     }
@@ -224,82 +240,6 @@ impl Terminal {
         view.scrollbar_dragging = false;
         Ok(())
     }
-    #[cfg(any(unix, windows))]
-    fn query_terminal_colors(&mut self) -> Result<()> {
-        // Never overlap an incomplete query with a new request; OSC replies
-        // contain no query identifier. A complete query may precede its DA1.
-        if let Some(query) = self.color_queries.front() {
-            self.color_requery = true;
-            if query.replied == (1 << 18) - 1 {
-                self.completed_color_markers = self.completed_color_markers.saturating_add(1);
-                return self.finish_color_query();
-            }
-            return Ok(());
-        }
-        crate::ui::theme::begin_terminal_palette_query();
-        self.color_queries.push_back(ColorQuery {
-            started: Instant::now(),
-            replied: 0,
-            quarantined: false,
-        });
-        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
-        for index in 0..16 {
-            query.push_str(&format!("\x1b]4;{index};?\x07"));
-        }
-        query.push_str("\x1b[c");
-        execute!(std::io::stdout(), Print(query))?;
-        Ok(())
-    }
-
-    #[cfg(any(unix, windows))]
-    fn accepts_color_reply(&mut self, target: u8) -> Result<bool> {
-        let Some(query) = self.color_queries.front_mut() else {
-            return Ok(false);
-        };
-        let is_latest = !self.color_requery && !query.quarantined;
-        let flag = 1_u32 << target;
-        let fresh = query.replied & flag == 0;
-        query.replied |= flag;
-        if query.replied == (1 << 18) - 1 && self.color_requery {
-            self.completed_color_markers = self.completed_color_markers.saturating_add(1);
-            self.finish_color_query()?;
-        }
-        Ok(is_latest && fresh)
-    }
-
-    #[cfg(any(unix, windows))]
-    fn finish_color_query(&mut self) -> Result<()> {
-        self.color_queries.pop_front();
-        if std::mem::take(&mut self.color_requery) {
-            self.query_terminal_colors()?;
-        }
-        Ok(())
-    }
-
-    #[cfg(any(unix, windows))]
-    fn receive_color_marker(&mut self) -> Result<()> {
-        if self.completed_color_markers > 0 {
-            self.completed_color_markers -= 1;
-            Ok(())
-        } else {
-            self.finish_color_query()
-        }
-    }
-
-    #[cfg(any(unix, windows))]
-    fn poll_color_timeout(&mut self) -> Result<()> {
-        if self.color_requery
-            && let Some(query) = self.color_queries.front_mut()
-            && !query.quarantined
-            && query.started.elapsed() >= Duration::from_secs(2)
-        {
-            // An incomplete query remains isolated until DA1 or all targets
-            // have replied; a timeout alone cannot identify late OSC replies.
-            query.quarantined = true;
-        }
-        Ok(())
-    }
-
     fn update_progress(&mut self, active: bool) -> Result<()> {
         if active
             && self
@@ -340,6 +280,11 @@ impl Terminal {
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        let colors = guard.as_mut().map(|terminal| {
+            let mut colors = std::mem::take(&mut terminal.colors);
+            colors.disable_after_handoff();
+            colors
+        });
         drop(guard.take());
         // The foreground job owns this process group, including its frontend worker.
         let result = unsafe {
@@ -363,10 +308,105 @@ impl Terminal {
                 }
             }
         };
-        *guard = Some(Self::enter(mode, images)?);
+        *guard = Some(Self::enter(mode, images, colors)?);
         result.map_err(Error::Io)
     }
 }
+#[cfg(any(unix, windows))]
+impl ColorQueries {
+    fn query_terminal_colors(&mut self, output: &mut dyn Write) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        // Only DA1 separates consecutive queries. All color replies alone do not
+        // establish whether a late marker belongs to this request or the next.
+        if let Some(query) = self.color_queries.front() {
+            if !query.quarantined {
+                self.color_requery = true;
+            }
+            return Ok(());
+        }
+        crate::ui::theme::begin_terminal_palette_query();
+        let started = Instant::now();
+        self.initial_started.get_or_insert(started);
+        self.color_queries.push_back(ColorQuery {
+            started,
+            replied: 0,
+            quarantined: false,
+        });
+        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
+        for index in 0..16 {
+            query.push_str(&format!("\x1b]4;{index};?\x07"));
+        }
+        query.push_str("\x1b[c");
+        output.write_all(query.as_bytes())?;
+        output.flush()?;
+        Ok(())
+    }
+
+    fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
+        let previous = self.last_appearance_report.replace(dark);
+        // The first report may be the response to ?996n sent at startup.
+        // It cannot be distinguished from a simultaneous notification.
+        let initial_report = previous.is_none()
+            && self
+                .color_queries
+                .front()
+                .is_some_and(|query| Some(query.started) == self.initial_started);
+        if !initial_report {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(previous.is_some_and(|value| value != dark))
+    }
+
+    fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
+        let Some(query) = self.color_queries.front_mut() else {
+            return Ok(false);
+        };
+        let is_latest = !self.color_requery && !query.quarantined;
+        let flag = 1_u32 << target;
+        let fresh = query.replied & flag == 0;
+        query.replied |= flag;
+        Ok(is_latest && fresh)
+    }
+
+    fn finish_color_query(&mut self, output: &mut dyn Write) -> Result<()> {
+        self.color_queries.pop_front();
+        if std::mem::take(&mut self.color_requery) {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(())
+    }
+
+    fn receive_color_marker(&mut self, output: &mut dyn Write) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        self.finish_color_query(output)
+    }
+
+    fn disable_after_handoff(&mut self) {
+        // Another terminal owner may consume our marker or leave its own.
+        // Neither can be attributed reliably once ownership has changed.
+        self.color_queries.clear();
+        self.color_requery = false;
+        self.disabled = true;
+    }
+
+    fn poll_color_timeout(&mut self) -> Result<()> {
+        if self.color_requery
+            && let Some(query) = self.color_queries.front_mut()
+            && !query.quarantined
+            && query.started.elapsed() >= Duration::from_secs(2)
+        {
+            // A timeout is not a response boundary. Keep the refresh queued
+            // until DA1, and reject stale color replies in the meantime.
+            query.quarantined = true;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.update_progress(false);
@@ -376,7 +416,9 @@ impl Drop for Terminal {
         #[cfg(unix)]
         self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
-        let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        {
+            let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
             let _ = execute!(
@@ -3628,6 +3670,54 @@ fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     (changed, redraw_system)
 }
 
+#[cfg(any(unix, windows))]
+fn handle_terminal_appearance(
+    colors: &mut ColorQueries,
+    theme: &mut Theme,
+    dark: bool,
+    output: &mut dyn Write,
+) -> Result<(bool, bool)> {
+    let changed_report = colors.appearance_report(dark, output)?;
+    let invalidate = colors.disabled && changed_report;
+    if invalidate {
+        crate::ui::theme::invalidate_terminal_default_colors();
+        crate::ui::theme::clear_terminal_palette();
+    }
+    let (changed, redraw) = apply_terminal_appearance(theme, dark);
+    if invalidate && theme.name == "system" && !redraw {
+        *theme = Theme::system();
+    }
+    Ok((
+        changed || invalidate,
+        redraw || (invalidate && theme.name == "system"),
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+        *theme = Theme::system();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn expire_initial_terminal_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
+    colors
+        .initial_started
+        .is_some_and(|started| started.elapsed() >= Duration::from_millis(100))
+        && finish_initial_terminal_colors(theme)
+}
+
+#[cfg(any(unix, windows))]
+fn settle_complete_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
+    colors.color_queries.front().is_some_and(|query| {
+        !colors.color_requery && !query.quarantined && query.replied == (1 << 18) - 1
+    }) && finish_initial_terminal_colors(theme)
+}
+
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
@@ -3662,11 +3752,15 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         }
         Box::new(std::io::stderr())
     };
-    struct PickerTerminal(Box<dyn Write>);
+    struct PickerTerminal {
+        output: Box<dyn Write>,
+        input: Option<crate::ui::input::Reader>,
+    }
     impl Drop for PickerTerminal {
         fn drop(&mut self) {
+            // Preserve input queued for the next terminal owner.
             let _ = execute!(
-                self.0,
+                self.output,
                 ResetColor,
                 Show,
                 DisableBracketedPaste,
@@ -3676,9 +3770,17 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         }
     }
     terminal::enable_raw_mode()?;
-    let mut screen = PickerTerminal(output);
-    execute!(screen.0, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
-    let mut input = crate::ui::input::Reader::new()?;
+    let mut screen = PickerTerminal {
+        output,
+        input: None,
+    };
+    execute!(
+        screen.output,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    screen.input = Some(crate::ui::input::Reader::new_for_handoff()?);
     let keys = Keys::load()?;
     let mut theme = startup_picker_theme(args)?;
     let mut view = View::default();
@@ -3688,7 +3790,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     loop {
         if dirty {
             let (width, height) = terminal::size().unwrap_or((80, 24));
-            execute!(screen.0, MoveTo(0, 0), Clear(ClearType::All))?;
+            execute!(screen.output, MoveTo(0, 0), Clear(ClearType::All))?;
             if let Some(picker) = &view.picker {
                 for (row, line) in picker
                     .render(&theme, width as usize, height as usize, &keys)
@@ -3698,14 +3800,19 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
                     if row >= height as usize {
                         break;
                     }
-                    queue!(screen.0, MoveTo(0, row as u16))?;
-                    line.draw(&mut screen.0, width as usize)?;
+                    queue!(screen.output, MoveTo(0, row as u16))?;
+                    line.draw(&mut screen.output, width as usize)?;
                 }
             }
-            screen.0.flush()?;
+            screen.output.flush()?;
             dirty = false;
         }
-        match input.next(Duration::from_millis(100))? {
+        match screen
+            .input
+            .as_mut()
+            .expect("picker input")
+            .next(Duration::from_millis(40))?
+        {
             Some(crate::ui::input::InputEvent::Event(Event::Resize(..))) => dirty = true,
             Some(crate::ui::input::InputEvent::Event(Event::Paste(text))) => {
                 if let Some(picker) = &mut view.picker {
@@ -3766,6 +3873,8 @@ pub(super) async fn run(
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
+    #[cfg(any(unix, windows))]
+    let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
     let mut deferred_theme_error = None;
     let mut theme = match load_resolved_theme(
         args.use_theme.as_deref().unwrap_or("system"),
@@ -3800,7 +3909,12 @@ pub(super) async fn run(
         slash("/resume", &mut args, &mut view, None)?;
     }
     let mut keys = Keys::load()?;
-    let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+    let mut _terminal = Some(Terminal::enter(
+        args.tui_mode,
+        view.graphics.cleanup(),
+        #[cfg(any(unix, windows))]
+        None,
+    )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     install_terminal_signal(terminal_signal.clone())?;
@@ -4367,7 +4481,8 @@ pub(super) async fn run(
         }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
-            terminal.poll_color_timeout()?;
+            terminal.colors.poll_color_timeout()?;
+            dirty |= expire_initial_terminal_colors(&terminal.colors, &mut theme);
         }
         let input_wait = if dirty {
             frame_interval.saturating_sub(last_frame.elapsed())
@@ -4404,7 +4519,12 @@ pub(super) async fn run(
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.receive_color_marker()?;
+                    terminal
+                        .colors
+                        .receive_color_marker(&mut std::io::stdout())?;
+                    if !terminal.colors.color_requery && terminal.colors.color_queries.is_empty() {
+                        dirty |= finish_initial_terminal_colors(&mut theme);
+                    }
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
@@ -4420,7 +4540,10 @@ pub(super) async fn run(
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::TerminalColorInvalid { target }) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.accepts_color_reply(target)?;
+                    terminal
+                        .colors
+                        .accepts_color_reply(target, &mut std::io::stdout())?;
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
                 }
                 continue;
             }
@@ -4432,7 +4555,9 @@ pub(super) async fn run(
                 blue,
             }) => {
                 let accepted = match &mut _terminal {
-                    Some(terminal) => terminal.accepts_color_reply(index)?,
+                    Some(terminal) => terminal
+                        .colors
+                        .accepts_color_reply(index, &mut std::io::stdout())?,
                     None => false,
                 };
                 if accepted
@@ -4441,6 +4566,9 @@ pub(super) async fn run(
                 {
                     theme = Theme::system();
                     dirty = true;
+                }
+                if let Some(terminal) = &mut _terminal {
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
                 }
                 continue;
             }
@@ -4451,11 +4579,17 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        let (changed, redraw_system) = apply_terminal_appearance(&mut theme, dark);
+                        let (changed, redraw_system) = if let Some(terminal) = &mut _terminal {
+                            handle_terminal_appearance(
+                                &mut terminal.colors,
+                                &mut theme,
+                                dark,
+                                &mut std::io::stdout(),
+                            )?
+                        } else {
+                            apply_terminal_appearance(&mut theme, dark)
+                        };
                         dirty |= redraw_system;
-                        if let Some(terminal) = &mut _terminal {
-                            terminal.query_terminal_colors()?;
-                        }
                         changed
                     }
                     crate::ui::input::InputEvent::TerminalColor {
@@ -4465,9 +4599,10 @@ pub(super) async fn run(
                         blue,
                     } => {
                         let accepted = match &mut _terminal {
-                            Some(terminal) => {
-                                terminal.accepts_color_reply(if foreground { 16 } else { 17 })?
-                            }
+                            Some(terminal) => terminal.colors.accepts_color_reply(
+                                if foreground { 16 } else { 17 },
+                                &mut std::io::stdout(),
+                            )?,
                             None => false,
                         };
                         let changed = accepted
@@ -4480,6 +4615,9 @@ pub(super) async fn run(
                     }
                     _ => unreachable!(),
                 };
+                if let Some(terminal) = &mut _terminal {
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
+                }
                 if changed {
                     let selection = args.use_theme.as_deref().unwrap_or("system");
                     if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
@@ -5316,9 +5454,20 @@ pub(super) async fn run(
                         if args.tui_mode == Some(TuiMode::Regular) {
                             view.finish_regular()?;
                         }
+                        #[cfg(any(unix, windows))]
+                        let colors = _terminal.as_mut().map(|terminal| {
+                            let mut colors = std::mem::take(&mut terminal.colors);
+                            colors.disable_after_handoff();
+                            colors
+                        });
                         drop(_terminal.take());
                         let result = external_editor(&args, &mut view.editor);
-                        _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+                        _terminal = Some(Terminal::enter(
+                            args.tui_mode,
+                            view.graphics.cleanup(),
+                            #[cfg(any(unix, windows))]
+                            colors,
+                        )?);
                         if view.graphics.enabled() {
                             images::query_cell_size()?;
                         }
@@ -10396,6 +10545,108 @@ exit {exit}
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn initial_theme_query_settles_on_timeout_or_marker() {
+        const CHILD: &str = "PI_RS_INITIAL_THEME_QUERY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::initial_theme_query_settles_on_timeout_or_marker",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let mut terminal = super::ColorQueries {
+            initial_started: Some(std::time::Instant::now()),
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: 0,
+                quarantined: false,
+            }]),
+            color_requery: false,
+            disabled: false,
+            last_appearance_report: None,
+        };
+        assert!(!super::expire_initial_terminal_colors(
+            &terminal, &mut theme
+        ));
+        assert_eq!(theme.color("accent"), Color::Reset);
+        *terminal.initial_started.as_mut().unwrap() -= std::time::Duration::from_millis(101);
+        assert!(super::expire_initial_terminal_colors(&terminal, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        assert!(super::finish_initial_terminal_colors(&mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::finish_initial_terminal_colors(&mut theme));
+
+        // An early error drops the owner even before Terminal::enter succeeds.
+        let failed_start = || -> pi_rs::Result<()> {
+            let _pending = crate::ui::theme::PendingTerminalColors::new();
+            Err(pi_rs::Error::Config("startup failed".into()))
+        };
+        assert!(failed_start().is_err());
+        assert!(matches!(
+            super::Theme::system().color("accent"),
+            Color::Rgb { .. }
+        ));
+
+        // Suspending or launching an external editor drops the terminal, not the
+        // pending owner. The replacement query can still settle normally.
+        let _pending = crate::ui::theme::PendingTerminalColors::new();
+        let guard = super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            colors: super::ColorQueries::default(),
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Disabled,
+        };
+        drop(guard);
+        theme = super::Theme::system();
+        assert_eq!(theme.color("accent"), Color::Reset);
+        let resumed = super::ColorQueries {
+            initial_started: Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(101),
+            ),
+            ..Default::default()
+        };
+        assert!(super::expire_initial_terminal_colors(&resumed, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+
+        // The final target, including an invalid response, settles without DA1.
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        colors.query_terminal_colors(&mut std::io::sink()).unwrap();
+        for target in 0..18 {
+            assert!(
+                colors
+                    .accepts_color_reply(target, &mut std::io::sink())
+                    .unwrap()
+            );
+            if target < 17 {
+                assert!(!super::settle_complete_colors(&colors, &mut theme));
+            }
+        }
+        assert!(super::settle_complete_colors(&colors, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::settle_complete_colors(&colors, &mut theme));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn appearance_event_retains_colors_during_partial_requery() {
         const CHILD: &str = "PI_RS_SYSTEM_APPEARANCE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -10439,108 +10690,127 @@ exit {exit}
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn timed_out_color_query_quarantines_old_replies_until_marker() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now() - std::time::Duration::from_secs(3),
-                replied: 1 << 1,
-                quarantined: false,
-            }]),
-            color_requery: true,
-            completed_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.poll_color_timeout().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(terminal.color_queries[0].quarantined);
-        // Late replies from the old request are never accepted into a new palette.
-        let mut accepted = Vec::new();
-        for index in 0..16 {
-            if terminal.accepts_color_reply(index).unwrap() {
-                accepted.push((index, "old"));
-            }
-        }
-        assert!(accepted.is_empty());
-        assert!(!terminal.accepts_color_reply(16).unwrap());
-        assert!(terminal.color_requery);
-        // Seventeen replies are insufficient to start the queued query.
-        assert!(terminal.color_queries[0].quarantined);
-        assert!(!terminal.accepts_color_reply(17).unwrap());
-        assert!(!terminal.color_requery);
-        assert_eq!(terminal.completed_color_markers, 1);
-        // The old marker must not finish the newly issued query.
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(!terminal.color_requery);
-        for index in 0..18 {
-            assert!(terminal.accepts_color_reply(index).unwrap());
-            accepted.push((index, "new"));
-            assert!(!terminal.accepts_color_reply(index).unwrap());
-        }
-        assert_eq!(accepted.len(), 18);
-        assert!(accepted.iter().all(|(_, source)| *source == "new"));
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.color_queries.is_empty());
+    fn initial_appearance_report_does_not_discard_initial_colors() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        let initial_len = output.len();
+        // A late initial appearance response may follow an OSC reply.
+        assert!(colors.accepts_color_reply(16, &mut output).unwrap());
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(2);
+        colors.initial_started = Some(colors.color_queries.front().unwrap().started);
+        assert!(!colors.appearance_report(true, &mut output).unwrap());
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        assert_eq!(output.len(), initial_len);
+        // A subsequent appearance report must still schedule a refresh.
+        assert!(colors.appearance_report(false, &mut output).unwrap());
+        assert!(colors.color_requery);
+        assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn complete_color_query_allows_requery_without_da1() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: (1 << 18) - 1,
-                quarantined: false,
-            }]),
-            color_requery: false,
-            completed_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.query_terminal_colors().unwrap();
-        assert_eq!(terminal.completed_color_markers, 1);
-        assert_eq!(terminal.color_queries[0].replied, 0);
-        // A late marker for the completed request cannot end the new query.
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        for index in 0..18 {
-            assert!(terminal.accepts_color_reply(index).unwrap());
+    fn handoff_appearance_change_invalidates_only_on_new_report() {
+        const CHILD: &str = "PI_RS_HANDOFF_APPEARANCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::handoff_appearance_change_invalidates_only_on_new_report",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
         }
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.color_queries.is_empty());
+        use crate::ui::theme::{reset_terminal_background, set_terminal_color};
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let original = theme.color("accent");
+        assert!(matches!(original, Color::Rgb { .. }));
+        // The terminal's dark background can differ from its light OS appearance.
+        let mut colors = super::ColorQueries {
+            last_appearance_report: Some(false),
+            ..Default::default()
+        };
+        colors.disable_after_handoff();
+        let (_, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut std::io::sink())
+                .unwrap();
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), original);
+        // A changed report invalidates the stale background even when the new
+        // report happens to match the old background's inferred appearance.
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, true, &mut std::io::sink())
+                .unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn missing_old_color_marker_does_not_end_incomplete_new_query() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: (1 << 18) - 1,
-                quarantined: false,
-            }]),
-            color_requery: false,
-            completed_color_markers: 0,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.query_terminal_colors().unwrap();
-        assert!(terminal.accepts_color_reply(0).unwrap());
-        // The marker could belong to either request; keep the new query open.
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(!terminal.accepts_color_reply(0).unwrap());
-        assert!(terminal.accepts_color_reply(1).unwrap());
+    fn color_requery_waits_for_marker_even_after_all_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        for target in 0..18 {
+            assert!(colors.accepts_color_reply(target, &mut output).unwrap());
+        }
+        let first_len = output.len();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(colors.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn terminal_handoff_rejects_unattributable_markers_and_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.disable_after_handoff();
+        let before = output.len();
+        // The marker may be ours or the external owner's; neither may reopen
+        // queries. Old or external colors must not be applied on return.
+        colors.receive_color_marker(&mut output).unwrap();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), before);
+        assert!(!colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.disabled);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_marker_preserves_queued_retry_until_boundary_returns() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(3);
+        colors.poll_color_timeout().unwrap();
+        let first_len = output.len();
+        assert!(colors.color_queries[0].quarantined);
+        assert!(colors.color_requery);
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        // The late boundary releases the queued refresh exactly once.
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
     }
 
     #[test]

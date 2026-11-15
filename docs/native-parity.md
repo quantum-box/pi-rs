@@ -1193,23 +1193,37 @@ Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
 arrive. Requeries retain the last complete palette until a complete replacement
 arrives, including after an appearance notification or incomplete reply. Color
-requests are serialized and coalesced. An incomplete query holds the next
-request until its device-attributes (DA1) marker or all 18 targets reply;
-timeout alone cannot identify late OSC replies. A terminal that sends neither
-all replies nor DA1 can leave later queries pending, retaining the last complete
-palette. Completed queries allow a new request without DA1; late markers are
-counted separately. Because replies and markers have no request IDs, a missing
-old marker can be confused with a new one, and duplicate or reordered old color
-replies after completion cannot be attributed reliably. Pi also relies on ordered
-DA1 replies, but uses a shorter timeout and accepts late replies.
+requests are serialized and coalesced until the preceding device-attributes
+(DA1) marker arrives, including when all color targets have answered. If a
+refresh is waiting and DA1 does not arrive within two seconds, stale replies are
+quarantined and the refresh stays queued until the old marker arrives. This
+keeps stale responses out of a later query but means a terminal that never sends
+DA1 cannot refresh colors during that session. After an external editor or
+suspend hands terminal ownership away, further color queries are disabled for
+the session: another owner may consume the old DA1 or leave an unrelated one.
+If a later appearance report changes, stale colors are cleared and the reported
+light/dark mode is used with the ANSI fallback. A repeated report does not discard
+colors: a terminal's colors can intentionally differ from the OS appearance.
+The first appearance report received during the initial color query is treated as
+the startup status report, not a color change; the protocol
+does not distinguish this report from a simultaneous notification.
+These restrictions differ from Pi's behavior. The boundary assumes the terminal sends each query's color responses before its
+DA1; arbitrary reordering or unrelated DA1 replies cannot be disambiguated,
+because these protocols contain no request identifiers.
 On an appearance notification, the last reported foreground, background, and
 complete palette remain in effect until replacement replies arrive, as in Pi.
 The reported appearance is used when no background is known.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. With a known background,
 the system theme generates Pi's OKHSL color families and contrast-solved roles,
-using a complete terminal palette when available. Native applies terminal color
-replies incrementally; Pi initially renders in grayscale until its query finishes.
+using a complete terminal palette when available. At interactive startup the
+system theme stays grayscale until all color targets reply, the color query's
+device-attributes marker arrives, or its 100 ms initial timeout, then uses the
+available colors. The startup session selector does not issue color or appearance
+queries: it can hand off directly to RPC, print mode, or the shell, where delayed
+responses would otherwise leak as input. It uses the available fallback theme.
+In interactive mode, late replies are applied incrementally; query aggregation
+still differs from Pi.
 Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
