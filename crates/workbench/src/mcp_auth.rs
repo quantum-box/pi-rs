@@ -1298,7 +1298,7 @@ mod tests {
 
     // Drain the complete HTTP request before replying. Closing a socket with
     // unread request bytes can reset the connection and discard the response.
-    fn read_refresh_request(socket: &mut std::net::TcpStream) {
+    fn read_refresh_request(socket: &mut std::net::TcpStream, mut on_partial: impl FnMut(usize)) {
         use std::io::Read as _;
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -1328,11 +1328,17 @@ mod tests {
             })
             .expect("refresh request content length");
         assert!(length <= 64 * 1024 - header_end, "refresh body too large");
+        if data.len() > header_end && data.len() < header_end + length {
+            on_partial(data.len() - header_end);
+        }
         while data.len() < header_end + length {
             let count = socket.read(&mut chunk).expect("read refresh body");
             assert!(count > 0, "refresh request ended before its body");
             data.extend_from_slice(&chunk[..count]);
             assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if data.len() < header_end + length {
+                on_partial(data.len() - header_end);
+            }
         }
         let body = std::str::from_utf8(&data[header_end..header_end + length]).unwrap();
         assert!(body.contains("grant_type=refresh_token"));
@@ -1356,9 +1362,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            read_refresh_request(&mut socket);
+            read_refresh_request(&mut socket, |received| {
+                partial_tx.send(received).unwrap();
+            });
             done_tx.send(()).unwrap();
         });
         let mut client = std::net::TcpStream::connect(address).unwrap();
@@ -1370,6 +1379,8 @@ mod tests {
         )
         .unwrap();
         client.write_all(&body.as_bytes()[..10]).unwrap();
+        let received = partial_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(received > 0 && received <= 10);
         assert!(matches!(
             done_rx.recv_timeout(Duration::from_millis(30)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
@@ -1558,7 +1569,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let server = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                read_refresh_request(&mut socket);
+                read_refresh_request(&mut socket, |_| {});
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let body =
@@ -1677,7 +1688,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            read_refresh_request(&mut socket);
+            read_refresh_request(&mut socket, |_| {});
             started_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let body = r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
