@@ -606,19 +606,12 @@ impl Projection {
                 } => {
                     json!({"role":"compactionSummary","summary":summary,"tokensBefore":tokens_before,"timestamp":timestamp})
                 }
-                _ => json!({"role":"user","content":content,"timestamp":timestamp}),
+                _ => {
+                    json!({"role":"user","content":super::rpc_events::user_content(content, &[]),"timestamp":timestamp})
+                }
             },
             Message::UserWithImages { content, images } => {
-                let mut blocks = Vec::new();
-                if !content.is_empty() {
-                    blocks.push(json!({"type":"text","text":content}));
-                }
-                blocks.extend(images.iter().map(|image| {
-                    json!({
-                        "type":"image","mimeType":image.mime_type,"data":image.data
-                    })
-                }));
-                json!({"role":"user","content":blocks,"timestamp":timestamp})
+                json!({"role":"user","content":super::rpc_events::user_content(content, images),"timestamp":timestamp})
             }
             Message::Assistant {
                 content,
@@ -1028,6 +1021,47 @@ mod tests {
                 .edit_context(target, Some(pi_rs::ContextContent::Text("exposed".into())))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_user_history_uses_blocks_and_pi_imports_keep_original_content() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), vec![], None)
+            .unwrap();
+        session
+            .append_user_with_images(
+                "".into(),
+                vec![pi_rs::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                None,
+            )
+            .unwrap();
+        let (visible, native) = snapshot(&session);
+        assert_eq!(
+            visible[0]["content"],
+            json!([{ "type":"text", "text":"hello" }])
+        );
+        assert_eq!(
+            visible[1]["content"],
+            json!([{ "type":"text", "text":"" }, { "type":"image", "data":"aW1hZ2U=", "mimeType":"image/png" }])
+        );
+        assert!(matches!(&native[0], Message::User { content } if content == "hello"));
+
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        let imported = [
+            json!({"role":"user", "content":"original string", "timestamp":1}),
+            json!({"role":"user", "content":[{"type":"image", "data":"aW1hZ2U=", "mimeType":"image/png"}, {"type":"text", "text":"after"}], "timestamp":2}),
+        ];
+        writeln!(fixture, "{}", json!({"type":"session", "version":3})).unwrap();
+        for (index, message) in imported.iter().enumerate() {
+            writeln!(fixture, "{}", json!({"type":"message", "id":format!("u{index}"), "parentId": if index == 0 { None } else { Some("u0") }, "message":message})).unwrap();
+        }
+        let imported_session = super::super::session_import::read(fixture.path()).unwrap();
+        let (visible, _) = snapshot(&imported_session);
+        assert_eq!(visible, imported);
     }
 
     #[test]
