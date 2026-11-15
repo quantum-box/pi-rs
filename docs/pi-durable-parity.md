@@ -1,4 +1,4 @@
-**Nested pending identity gap:** Existing pending nested jobs persist a tool name, replay policy and opaque reference, but no implementation or tenant identity. A host must restore the original child configuration and tenant before polling; a same-named tool pointed at a different backend can otherwise associate the wrong remote result with the recorded operation. Reconciliation is required when that identity cannot be established.
+**Nested pending identity boundary:** Identity-bound nested jobs validate a host-declared implementation and tenant identity before polling and unsafe resume. Legacy unbound replay-safe jobs remain pollable for compatibility; their host must restore the original child configuration and tenant because those records cannot establish that identity. Unsafe legacy proofs without a parent identity require reconciliation. Identity declarations and updates are host responsibilities.
 
 **Task driver concurrency gap:** The attached generic task driver currently runs one synchronous handler at a time. A blocked handler can delay independent tasks and their cleanup. The upstream scheduler reserves work serially and executes handlers concurrently. A parallel-driver prototype remains isolated: safe integration must coordinate failure publication, running sibling cancellation, graph changes during execution, and cleanup across owned conversations. In particular, a TaskTool parent settling while a nested child is still running must not publish the child result ahead of the required abort cascade. The current driver requires handlers to return for shutdown and recovery to progress.
 
@@ -645,6 +645,7 @@ same-value rewrites, deadline and abort fences, staged effects, runtime updates
 and process death after the held outcome commits. A process death before that
 commit still follows the recorded replay policy and cannot recover an
 uncommitted non-replay-safe external effect.
+
 ### Identity-bound nested pending recovery
 
 Unsafe parks require the exact nested tool allocation to be registered with a
