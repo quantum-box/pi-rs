@@ -729,6 +729,16 @@ expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
 
+`pi mcp list --json` emits one JSON document with server state, source,
+transport, tool names, per-tool exposure overrides, and resource capability.
+Invalid entries are reported in `errors`; enabled connection failures cause a
+nonzero exit. An invalid trusted project override currently fails the merged
+configuration as a whole, preserving pi-rs's existing override validation.
+Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
+credentials, queries and fragments; failure messages are generic so these
+reports do not expose configured credentials through connection errors.
+Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
+
 `pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
 default is 300 seconds. Once credential persistence starts, it is allowed to
 finish even if the deadline passes, so its outcome can be reported reliably.
