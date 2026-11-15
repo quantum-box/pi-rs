@@ -637,6 +637,12 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 .get(&name)
                 .ok_or_else(|| Error::Config("MCP server is not configured".into()))?;
             for key in ["enabled", "exposure", "toolExposure", "oauth"] {
+                if !project_definitions.contains(&name)
+                    && matches!(key, "enabled" | "exposure" | "oauth")
+                    && value.get(key).is_some_and(Value::is_null)
+                {
+                    continue;
+                }
                 if value
                     .get(key)
                     .is_some_and(|field| !valid_override_value(key, field))
