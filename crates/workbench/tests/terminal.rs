@@ -55,6 +55,245 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+
+fn wait_for_cleanup(
+    timeout: Duration,
+    mut done: impl FnMut() -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "child cleanup timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// Like the original Process guard, this owns only the direct child. Descendants
+// are not managed; signalling a numeric process group after exit risks reuse.
+struct AppearanceProcess(Option<Child>, Option<File>);
+impl AppearanceProcess {
+    fn new(child: Child) -> Self {
+        Self(Some(child), None)
+    }
+
+    fn with_master(child: Child, master: File) -> Self {
+        Self(Some(child), Some(master))
+    }
+
+    fn close_master(&mut self) {
+        if self.1.take().is_some() {
+            appearance_stage("closed PTY master");
+        }
+    }
+
+    fn cleanup(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.close_master();
+        let Some(child) = self.0.as_mut() else {
+            return Ok(());
+        };
+        let pid = child.id();
+        appearance_stage("checking direct child");
+        if child.try_wait()?.is_none() {
+            appearance_stage("signalling direct child");
+            if let Err(error) = child.kill()
+                && child.try_wait()?.is_none()
+            {
+                return Err(error);
+            }
+        }
+        appearance_stage("waiting for direct child to exit");
+        wait_for_cleanup(timeout, || Ok(child.try_wait()?.is_some())).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("cleanup of child {pid}: {error}"))
+        })?;
+        self.0.take();
+        Ok(())
+    }
+}
+
+fn prepare_appearance_master(master: &File) -> std::io::Result<()> {
+    let fd = master.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+impl Drop for AppearanceProcess {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup(Duration::from_secs(5)) {
+            if std::thread::panicking() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "appearance child cleanup failed: {error}"
+                );
+            } else {
+                panic!("appearance child cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn appearance_cleanup_timeout_reports_stalled_child() {
+    let start = Instant::now();
+    let error = wait_for_cleanup(Duration::from_millis(30), || Ok(false)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn appearance_cleanup_accepts_already_reaped_child() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let mut process = AppearanceProcess::new(child);
+    process.cleanup(Duration::from_secs(1)).unwrap();
+    assert!(process.0.is_none());
+}
+
+#[test]
+fn appearance_cleanup_kills_and_reaps_direct_child() {
+    let mut process = AppearanceProcess::new(Command::new("/bin/sleep").arg("60").spawn().unwrap());
+    process.cleanup(Duration::from_secs(5)).unwrap();
+    assert!(process.0.is_none());
+}
+
+#[test]
+fn appearance_cleanup_runs_during_unwinding() {
+    let child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let caught = std::panic::catch_unwind(move || {
+        let _process = AppearanceProcess::new(child);
+        panic!("simulated assertion failure");
+    });
+    assert!(caught.is_err());
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+#[test]
+fn appearance_cleanup_closes_uninherited_master_before_waiting() {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    prepare_appearance_master(&master).unwrap();
+    assert_ne!(
+        unsafe { libc::fcntl(master_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    let child = Command::new("/bin/cat")
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = AppearanceProcess::with_master(child, master);
+    assert!(process.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    process.close_master();
+    wait_for_cleanup(Duration::from_secs(5), || {
+        Ok(process.0.as_mut().unwrap().try_wait()?.is_some())
+    })
+    .expect("PTY reader did not exit after closing master");
+    process.cleanup(Duration::from_secs(1)).unwrap();
+}
+
+// The PTY must be nonblocking: the deadline is checked between reads.
+fn drain_startup_frames(
+    reader: &mut impl Read,
+    timeout: Duration,
+    byte_limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "startup frame drain timed out",
+            ));
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(count) if count > byte_limit.saturating_sub(output.len()) => {
+                return Err(std::io::Error::other(
+                    "startup frame drain exceeded byte limit",
+                ));
+            }
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(output),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn appearance_stage(stage: &str) {
+    // Write directly so the stage remains visible if libtest captures output and hangs.
+    let _ = writeln!(std::io::stderr(), "appearance PTY test: {stage}");
+}
+
+#[test]
+fn startup_frame_drain_stops_at_would_block_and_eof() {
+    struct Finite(bool);
+    impl Read for Finite {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.0 {
+                return Err(ErrorKind::WouldBlock.into());
+            }
+            self.0 = true;
+            buffer[..3].copy_from_slice(b"abc");
+            Ok(3)
+        }
+    }
+    assert_eq!(
+        drain_startup_frames(&mut Finite(false), Duration::from_secs(1), 3).unwrap(),
+        b"abc"
+    );
+    assert_eq!(
+        drain_startup_frames(&mut std::io::Cursor::new(b"abc"), Duration::from_secs(1), 3).unwrap(),
+        b"abc"
+    );
+}
+
+#[test]
+fn startup_frame_drain_bounds_continuously_readable_output() {
+    let error =
+        drain_startup_frames(&mut std::io::repeat(b'x'), Duration::from_secs(1), 64).unwrap_err();
+    assert!(error.to_string().contains("byte limit"));
+    let error = drain_startup_frames(&mut std::io::repeat(b'x'), Duration::ZERO, 64).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+}
+
 fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
     output_until_with_timeout(master, Duration::from_secs(10), predicate);
 }
@@ -147,6 +386,7 @@ fn typing_redraws_in_a_synchronized_frame() {
 
 #[test]
 fn initial_appearance_report_keeps_late_color_replies() {
+    appearance_stage("setting up PTY");
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -168,13 +408,9 @@ fn initial_appearance_report_keeps_late_color_replies() {
         },
         0
     );
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
-    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-    assert_eq!(
-        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
-    );
+    prepare_appearance_master(&master).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
     unsafe {
         command.pre_exec(move || {
@@ -185,27 +421,29 @@ fn initial_appearance_report_keeps_late_color_replies() {
             Ok(())
         });
     }
-    let _process = Process(
-        command
-            .current_dir(root.path())
-            .env("PI_RS_HOME", root.path().join("home"))
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor")
-            .env_remove("NO_COLOR")
-            .args([
-                "--no-trust",
-                "--no-mcp",
-                "--offline",
-                "--use-theme",
-                "system",
-            ])
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave))
-            .spawn()
-            .unwrap(),
-    );
-    output_until_with_timeout(&mut master, Duration::from_secs(30), |text| {
+    appearance_stage("spawning child");
+    let child = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR")
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--offline",
+            "--use-theme",
+            "system",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let mut process = AppearanceProcess::with_master(child, master);
+    let master = process.1.as_mut().unwrap();
+    appearance_stage("waiting for initial query and prompt");
+    output_until_with_timeout(master, Duration::from_secs(30), |text| {
         assert!(!text.contains("\x1b[38;2;"));
         text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
     });
@@ -214,24 +452,24 @@ fn initial_appearance_report_keeps_late_color_replies() {
     master.write_all(b"\x1b]10;rgb:ffff/ffff/ffff\x07").unwrap();
     std::thread::sleep(Duration::from_millis(160));
     // Discard already-rendered startup frames before observing the response.
-    let mut pre_response = Vec::new();
-    let mut buffer = [0; 8192];
-    loop {
-        match master.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => pre_response.extend_from_slice(&buffer[..count]),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => panic!("terminal read failed: {error}"),
-        }
-    }
+    appearance_stage("draining startup frames");
+    let pre_response = drain_startup_frames(master, Duration::from_secs(5), 1024 * 1024)
+        .expect("draining startup frames");
     assert!(!String::from_utf8_lossy(&pre_response).contains("\x1b[38;2;"));
+    appearance_stage("sending late appearance and color replies");
     master
         .write_all(b"\x1b[?997;1n\x1b]11;rgb:0000/0000/0000\x07")
         .unwrap();
     // Pi applies the accumulated late result when its query reaches DA1.
     master.write_all(b"\x1b[?1;2c").unwrap();
-    output_until(&mut master, |text| text.contains("\x1b[38;2;"));
+    appearance_stage("waiting for color output");
+    output_until(master, |text| text.contains("\x1b[38;2;"));
+    appearance_stage("cleaning up child");
+    process
+        .cleanup(Duration::from_secs(5))
+        .expect("appearance child cleanup");
+    drop(process);
+    appearance_stage("complete");
 }
 
 #[test]
