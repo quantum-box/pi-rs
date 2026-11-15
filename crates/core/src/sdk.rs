@@ -169,10 +169,22 @@ struct SessionOwner {
 const MAX_IDLE_INPUT_DEPTH: usize = 16;
 
 struct IdleChildRequest {
-    input: crate::AgentInput,
+    action: IdleChildAction,
     reply: tokio::sync::oneshot::Sender<Result<()>>,
     lifetime: CancellationToken,
     gate: Arc<Mutex<()>>,
+}
+
+enum IdleChildAction {
+    Input(crate::AgentInput),
+    AppendEntry(
+        crate::CustomEntry,
+        tokio::sync::oneshot::Sender<crate::ExtensionResult<()>>,
+    ),
+    ReadEntries(
+        Option<String>,
+        tokio::sync::oneshot::Sender<crate::ExtensionResult<Vec<crate::CustomEntryRecord>>>,
+    ),
 }
 
 #[derive(Clone)]
@@ -193,10 +205,14 @@ tokio::task_local! {
 
 impl IdleInputScope {
     async fn submit(&self, input: crate::AgentInput) -> Result<()> {
+        self.submit_action(IdleChildAction::Input(input)).await
+    }
+
+    async fn submit_action(&self, action: IdleChildAction) -> Result<()> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         self.children
             .send(IdleChildRequest {
-                input,
+                action,
                 reply,
                 lifetime: self.lifetime.clone(),
                 gate: self.gate.clone(),
@@ -220,6 +236,41 @@ struct ScopedIdleHost {
 
 #[async_trait::async_trait]
 impl crate::ToolHost for ScopedIdleHost {
+    fn supports_custom_entries(&self) -> bool {
+        !self.scope.lifetime.is_cancelled()
+            && !self.scope.cancellation.is_cancelled()
+            && !self.scope.owner.closed.is_cancelled()
+    }
+    fn supports_custom_entry_read(&self) -> bool {
+        self.supports_custom_entries()
+    }
+    async fn append_entry(&self, entry: crate::CustomEntry) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_entry(&entry).map_err(|error| error.to_string())?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.scope
+            .submit_action(IdleChildAction::AppendEntry(entry, reply))
+            .await
+            .map_err(|error| error.to_string())?;
+        result
+            .await
+            .map_err(|_| "custom entry response lost".to_owned())?
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> crate::ExtensionResult<Vec<crate::CustomEntryRecord>> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.scope
+            .submit_action(IdleChildAction::ReadEntries(
+                custom_type.map(str::to_owned),
+                reply,
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        result
+            .await
+            .map_err(|_| "custom entry response lost".to_owned())?
+    }
     fn supports_prevalidated_call_accounting(&self) -> bool {
         !self.scope.lifetime.is_cancelled() && self.inner.supports_prevalidated_call_accounting()
     }
@@ -3642,10 +3693,28 @@ where
         gate: scope.gate.clone(),
     };
     tokio::pin!(future);
+    let mut entry_error = None;
+    enum Work {
+        Message(
+            crate::QueuedCustomMessage,
+            tokio::sync::oneshot::Sender<crate::ExtensionResult<()>>,
+        ),
+        Child(IdleChildRequest),
+    }
     loop {
         tokio::select! {
             biased;
-            Some((input, reply)) = incoming.recv() => {
+            _ = closed.cancelled() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
+            _ = scope.cancellation.cancelled() => return Err(entry_error.take().unwrap_or(Error::Cancelled)),
+            result = &mut future => return match entry_error { Some(error) => Err(error), None => result },
+            work = async {
+                tokio::select! {
+                    Some((message, reply)) = incoming.recv() => Work::Message(message, reply),
+                    Some(child) = children.recv() => Work::Child(child),
+                    else => std::future::pending().await,
+                }
+            } => match work {
+            Work::Message(input, reply) => {
                 let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
                     crate::agent::queue_custom_message(journal, input, observer)
                 } else {
@@ -3656,19 +3725,53 @@ where
                     Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
                 }
             }
-            Some(child) = children.recv() => {
+            Work::Child(child) => {
                 if child.reply.is_closed() { continue; }
-                let _guard = child.gate.lock().expect("idle scope gate");
+                let guard = child.gate.lock().expect("idle scope gate");
                 if child.lifetime.is_cancelled() || scope.cancellation.is_cancelled() || closed.is_cancelled() {
                     let _ = child.reply.send(Err(Error::Cancelled));
                     continue;
                 }
-                let result = child.input.apply(journal, observer);
-                let _ = child.reply.send(result);
-            }
-            _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
-            _ = scope.cancellation.cancelled() => return Err(Error::Cancelled),
-            result = &mut future => return result,
+                match child.action {
+                    IdleChildAction::Input(input) => {
+                        let result = input.apply(journal, observer);
+                        let _ = child.reply.send(result);
+                    }
+                    IdleChildAction::AppendEntry(entry, reply) => {
+                        if reply.is_closed() { let _ = child.reply.send(Ok(())); continue; }
+                        if let Err(error) = journal.ensure_settled() {
+                            let _ = reply.send(Err(error.to_string()));
+                            let _ = child.reply.send(Ok(()));
+                            continue;
+                        }
+                        let result = journal.append_custom_entry(entry).map(|()| observer(Notification::Committed(journal.records().last().expect("appended custom entry"))));
+                        match result {
+                            Ok(()) => { let _ = reply.send(Ok(())); let _ = child.reply.send(Ok(())); }
+                            Err(error) => {
+                                let _ = reply.send(Err(error.to_string()));
+                                let _ = child.reply.send(Ok(()));
+                                if entry_error.is_none() { entry_error = Some(error); }
+                            }
+                        }
+                    }
+                    IdleChildAction::ReadEntries(custom_type, mut reply) => {
+                        drop(guard);
+                        if reply.is_closed() { let _ = child.reply.send(Ok(())); continue; }
+                        tokio::select! {
+                            biased;
+                            _ = closed.cancelled() => return Err(entry_error.take().unwrap_or_else(|| Error::Config("session is closed".into()))),
+                            _ = scope.cancellation.cancelled() => return Err(entry_error.take().unwrap_or(Error::Cancelled)),
+                            result = &mut future => return match entry_error { Some(error) => Err(error), None => result },
+                            _ = child.lifetime.cancelled() => { let _ = child.reply.send(Err(Error::Cancelled)); },
+                            _ = reply.closed() => { let _ = child.reply.send(Ok(())); },
+                            records = crate::extension::branch_custom_entries(journal, custom_type.as_deref()) => {
+                                let _ = reply.send(records);
+                                let _ = child.reply.send(Ok(()));
+                            }
+                        }
+                    }
+                }
+            }}
         }
     }
 }
@@ -12193,6 +12296,541 @@ mod tests {
     }
 
     struct IdleLifecycleMessages;
+
+    struct ScopedStartupEntries;
+    #[async_trait::async_trait]
+    impl Extension for ScopedStartupEntries {
+        fn id(&self) -> &str {
+            "scoped-startup-entries"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                return Ok(());
+            }
+            assert!(host.supports_custom_entries());
+            assert!(host.supports_custom_entry_read());
+            let previous = host.custom_entries(Some("startup")).await?;
+            assert_eq!(previous.len(), 1);
+            assert_eq!(
+                previous[0].entry.data,
+                Some(serde_json::json!({"before":true}))
+            );
+            host.append_entry(crate::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::Value::Null),
+            })
+            .await?;
+            let current = host.custom_entries(Some("startup")).await?;
+            assert_eq!(current.len(), 2);
+            assert_eq!(current[1].entry.data, Some(serde_json::Value::Null));
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "context".into(),
+                    content: crate::ContextContent::Text("startup message".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_start_reads_and_appends_custom_entries() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedStartupEntries))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .append_custom_entry(crate::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::json!({"before":true})),
+            })
+            .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        let journal = session.journal().unwrap();
+        let entries: Vec<_> = journal
+            .branch()
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::Event::CustomEntry { entry } if entry.custom_type == "startup" => {
+                    Some(entry.data.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                Some(serde_json::json!({"before":true})),
+                Some(serde_json::Value::Null)
+            ]
+        );
+        drop(journal);
+        assert!(
+            matches!(session.messages().unwrap().as_slice(), [Message::User { content }] if content == "startup message")
+        );
+        session.close().await.unwrap();
+    }
+
+    struct ScopedEntryFailure(Arc<std::sync::atomic::AtomicBool>);
+    struct ScopedEntryFailureFollower(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFailureFollower {
+        fn id(&self) -> &str {
+            "scoped-entry-follower"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFailure {
+        fn id(&self) -> &str {
+            "scoped-entry-failure"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let error = host
+                    .append_entry(crate::CustomEntry {
+                        custom_type: "failed".into(),
+                        data: None,
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("fixture write failed"));
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_start_propagates_entry_store_failure() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        let journal = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let follower = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedEntryFailure(observed.clone())))
+            .unwrap()
+            .extension(Arc::new(ScopedEntryFailureFollower(follower.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let error = platform_time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("fixture write failed"));
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(follower.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    struct ScopedEntryFailurePending(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFailurePending {
+        fn id(&self) -> &str {
+            "scoped-entry-failure-pending"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let error = host
+                    .append_entry(crate::CustomEntry {
+                        custom_type: "failed".into(),
+                        data: None,
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("fixture write failed"));
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_entry_write_failure_takes_precedence_over_abort_and_close() {
+        struct FailingStore(crate::MemoryStore);
+        impl crate::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<crate::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &crate::Record) -> Result<()> {
+                if matches!(record.event, crate::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("fixture write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        for close in [false, true] {
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let journal = Session::with_store(FailingStore(crate::MemoryStore::default())).unwrap();
+            let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .extension(Arc::new(ScopedEntryFailurePending(ready.clone())))
+                .unwrap()
+                .build(journal)
+                .unwrap();
+            let control = session.controls();
+            let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(session.start(), async {
+                    ready.notified().await;
+                    if close {
+                        control.owner.closed.cancel();
+                    } else {
+                        control.abort();
+                    }
+                })
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fixture write failed")
+            );
+        }
+    }
+
+    struct ScopedEntryFlood(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Extension for ScopedEntryFlood {
+        fn id(&self) -> &str {
+            "scoped-entry-flood"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                let progressed = Arc::new(tokio::sync::Notify::new());
+                for _ in 0..48 {
+                    let host = host.clone();
+                    let progressed = progressed.clone();
+                    tokio::spawn(async move {
+                        while host
+                            .append_entry(crate::CustomEntry {
+                                custom_type: "flood".into(),
+                                data: None,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            progressed.notify_one();
+                        }
+                    });
+                }
+                progressed.notified().await;
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_entry_producers_do_not_starve_abort() {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedEntryFlood(ready.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let (result, ()) = platform_time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.start(), async {
+                ready.notified().await;
+                control.abort();
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn idle_entry_pump_prioritizes_completion_and_cancellation_over_queued_work() {
+        for cancelled in [false, true] {
+            let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .in_memory()
+                .unwrap();
+            let control = session.controls();
+            let (sender, mut incoming) = mpsc::channel(32);
+            let (children_sender, mut children) = mpsc::unbounded_channel();
+            let scope = IdleInputScope {
+                owner: control.owner.clone(),
+                children: children_sender.clone(),
+                host: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+                states: Default::default(),
+                cancellation: CancellationToken::new(),
+                lifetime: CancellationToken::new(),
+                gate: Arc::new(Mutex::new(())),
+                depth: 0,
+            };
+            let mut journal = session.session.lock().await;
+            let before = journal.records().len();
+            let (inner, inner_response) = tokio::sync::oneshot::channel();
+            let (outer, outer_response) = tokio::sync::oneshot::channel();
+            assert!(
+                children_sender
+                    .send(IdleChildRequest {
+                        action: IdleChildAction::AppendEntry(
+                            crate::CustomEntry {
+                                custom_type: "queued".into(),
+                                data: None
+                            },
+                            inner
+                        ),
+                        reply: outer,
+                        lifetime: scope.lifetime.clone(),
+                        gate: scope.gate.clone(),
+                    })
+                    .is_ok()
+            );
+            if cancelled {
+                scope.cancellation.cancel();
+            }
+            let future = async move {
+                if cancelled {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            };
+            let result = pump_idle_callback(
+                &mut journal,
+                &mut |_| {},
+                &mut incoming,
+                &mut children,
+                &control.owner.closed,
+                &scope,
+                future,
+            )
+            .await;
+            if cancelled {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(journal.records().len(), before);
+            drop(children);
+            assert!(outer_response.await.is_err());
+            assert!(inner_response.await.is_err());
+        }
+    }
+
+    struct ScopedLateEntryProducer {
+        release: Arc<tokio::sync::Notify>,
+        done: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedLateEntryProducer {
+        fn id(&self) -> &str {
+            "scoped-late-entry"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                return Ok(());
+            }
+            let release = self.release.clone();
+            let done = self.done.lock().unwrap().take().unwrap();
+            tokio::spawn(async move {
+                release.notified().await;
+                let result = host
+                    .append_entry(crate::CustomEntry {
+                        custom_type: "late".into(),
+                        data: None,
+                    })
+                    .await;
+                let _ = done.send(result.is_err());
+            });
+            Ok(())
+        }
+    }
+    struct ScopedLateEntryRelease {
+        release: Arc<tokio::sync::Notify>,
+        done: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ScopedLateEntryRelease {
+        fn id(&self) -> &str {
+            "scoped-late-release"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if !matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                return Ok(());
+            }
+            self.release.notify_one();
+            let done = self.done.lock().await.take().unwrap();
+            assert!(done.await.unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_start_rejects_previous_handler_late_entries() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (done, received) = tokio::sync::oneshot::channel();
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(ScopedLateEntryProducer {
+                release: release.clone(),
+                done: Mutex::new(Some(done)),
+            }))
+            .unwrap()
+            .extension(Arc::new(ScopedLateEntryRelease {
+                release,
+                done: tokio::sync::Mutex::new(Some(received)),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.custom_type == "late")));
+        session.close().await.unwrap();
+    }
+
+    struct ScopedInputEntries;
+    #[async_trait::async_trait]
+    impl Extension for ScopedInputEntries {
+        fn id(&self) -> &str {
+            "scoped-input-entries"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            assert!(host.custom_entries(Some("input")).await?.is_empty());
+            host.append_entry(crate::CustomEntry {
+                custom_type: "input".into(),
+                data: Some(serde_json::json!({"indexed":true})),
+            })
+            .await?;
+            assert_eq!(host.custom_entries(Some("input")).await?.len(), 1);
+            Ok(crate::InputAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_idle_input_reads_and_appends_custom_entries() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(ScopedInputEntries))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        platform_time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::CustomEntry { entry } if entry.custom_type == "input")));
+        assert!(
+            !serde_json::to_string(&session.messages().unwrap())
+                .unwrap()
+                .contains("indexed")
+        );
+        session.close().await.unwrap();
+    }
     #[async_trait::async_trait]
     impl Extension for IdleLifecycleMessages {
         fn id(&self) -> &str {
