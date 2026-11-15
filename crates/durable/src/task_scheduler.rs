@@ -398,11 +398,7 @@ impl WakeDefinitions {
             if parent.task.abort_requested()
                 || parent.task.is_terminal()
                 || parent.task.state() == &TaskState::Running
-                || parent
-                    .task
-                    .kind()
-                    .and_then(|kind| self.registry.entries.get(kind))
-                    .is_none()
+                || self.blocked_reason(&parent.task).is_some()
             {
                 return false;
             }
@@ -1130,7 +1126,7 @@ impl Scheduler {
         self.poisoned = false;
         Ok(true)
     }
-    /// A child must not execute while an interrupted or missing ancestor is
+    /// A child must not execute while an interrupted or incompatible ancestor is
     /// still awaiting recovery; such an ancestor can later cancel the subtree.
     fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
         let mut owner = task.owner();
@@ -1145,7 +1141,7 @@ impl Scheduler {
             if parent.task.abort_requested()
                 || parent.task.is_terminal()
                 || parent.task.state() == &TaskState::Running
-                || self.registered(&parent.task).is_err()
+                || self.blocked_reason(&parent.task).is_some()
             {
                 return false;
             }
@@ -2499,6 +2495,80 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn incompatible_parked_parent_blocks_child_across_reopen_until_definition_restored() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for stored_version in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let make_registry = |parent_version| {
+                let mut registry = Registry::default();
+                registry.register_versioned(
+                    "parent",
+                    parent_version,
+                    false,
+                    |_: &Task| Ok(Step::Succeed(json!("parent"))),
+                    None,
+                );
+                let calls = calls.clone();
+                registry.register("child", true, move |_: &Task| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step::Succeed(json!("child")))
+                });
+                registry
+            };
+            let parent_id = Uuid::from_u128(1);
+            let child_id = Uuid::from_u128(2);
+            {
+                let owner = Arc::new(OwnedStore::open(&path).unwrap());
+                let store = TaskStore::new(owner.store());
+                let mut parent = Task::new(
+                    parent_id,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    cp("start"),
+                    5,
+                )
+                .unwrap()
+                .registered_versioned("parent".into(), false, stored_version, json!(null))
+                .unwrap();
+                parent.start().unwrap();
+                parent.wait(WaitFor::TasksAny(vec![child_id])).unwrap();
+                let child = task(2, TaskOwner::Task(parent_id), "child", true, 5);
+                store
+                    .save(&[Save::Create(&parent), Save::Create(&child)])
+                    .unwrap();
+            }
+            // Cover both an older definition and a newer one without migration.
+            let incompatible = if stored_version == 1 { 2 } else { 1 };
+            {
+                let mut scheduler = Scheduler::open(&path, make_registry(incompatible)).unwrap();
+                assert!(!scheduler.wake_snapshot(0).unwrap().active);
+                assert!(!scheduler.tick(0).unwrap());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    scheduler.get(child_id).unwrap().unwrap().state(),
+                    &TaskState::Ready
+                );
+            }
+            let mut scheduler = Scheduler::open(&path, make_registry(incompatible)).unwrap();
+            assert!(!scheduler.wake_snapshot(0).unwrap().active);
+            assert!(!scheduler.tick(0).unwrap());
+            scheduler
+                .replace_registry(make_registry(stored_version))
+                .unwrap();
+            assert!(scheduler.wake_snapshot(0).unwrap().active);
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(
+                scheduler.get(parent_id).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("parent"))
+            );
+        }
     }
 
     #[test]
