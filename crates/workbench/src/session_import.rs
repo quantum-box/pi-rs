@@ -717,8 +717,15 @@ fn convert(
         "message" => {
             let message = &entry["message"];
             match required(message, "role")? {
-                "user" => push_user(&mut events, &message["content"])?,
+                "user" => {
+                    branch.calls.clear();
+                    push_user(&mut events, &message["content"])?;
+                }
                 "assistant" => {
+                    // Pi closes the previous tool flow at each assistant or user message.
+                    // Keep unfinished operations in the journal for reconciliation, but
+                    // never match a later result to an earlier turn with a reused ID.
+                    branch.calls.clear();
                     let failure = match message["stopReason"].as_str() {
                         Some("error") => Some(pi_rs::ModelFailure::Failed),
                         Some("aborted") => Some(pi_rs::ModelFailure::Cancelled),
@@ -1701,6 +1708,53 @@ mod tests {
         assert_eq!(
             branch_selection(&reopened, |_, _| Some(true)),
             virtual_selection
+        );
+    }
+
+    #[test]
+    fn imported_tool_call_ids_can_be_reused_after_a_new_turn() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"same","name":"read","arguments":{"path":"old"}}]}}),
+            json!({"type":"message","id":"u","parentId":"a","message":{"role":"user","content":"retry"}}),
+            json!({"type":"message","id":"b","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","id":"same","name":"read","arguments":{"path":"new"}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"same","content":[{"type":"text","text":"new result"}],"isError":false}}),
+        ]).unwrap();
+        let starts: Vec<_> = session
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolStarted { operation_id } => Some(*operation_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert!(session.records().iter().any(|r| matches!(&r.event,
+            Event::ToolFinished { operation_id, .. } if *operation_id == starts[1])));
+        assert!(!session.records().iter().any(|r| matches!(&r.event,
+            Event::ToolFinished { operation_id, .. } if *operation_id == starts[0])));
+    }
+
+    #[test]
+    fn imported_assistant_boundaries_close_call_matching_but_duplicates_still_fail() {
+        let assistant = |id: &str, parent: Value, calls: Value| json!({"type":"message","id":id,"parentId":parent,"message":{"role":"assistant","content":calls}});
+        let call = json!({"type":"toolCall","id":"same","name":"read","arguments":{}});
+        let header = json!({"type":"session","version":3});
+        assert!(
+            import_pi(vec![
+                header.clone(),
+                assistant("a", Value::Null, json!([call.clone()])),
+                assistant("b", json!("a"), json!([call.clone()])),
+            ])
+            .is_ok()
+        );
+        assert!(
+            import_pi(vec![
+                header,
+                assistant("a", Value::Null, json!([call.clone(), call])),
+            ])
+            .is_err()
         );
     }
 

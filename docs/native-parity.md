@@ -1243,7 +1243,9 @@ modifying the source. It retains original entries alongside native events,
 including branch topology, completed tool results, reasoning, usage, names,
 labels, compaction boundaries and branch-local codemode store values. User and tool-result images reach the model
 adapter as image content. Previously completed tools remain recorded results;
-unfinished imported calls remain uncertain and require reconciliation.
+unfinished imported calls remain uncertain and require reconciliation. A new user
+or assistant message ends the prior tool-result matching scope, so a reused call
+ID identifies the new operation without resolving the earlier one.
 
 Context edits are projected onto future model context while the imported raw
 entries remain available. Remaining specialized message variants and system
