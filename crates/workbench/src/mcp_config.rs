@@ -633,12 +633,27 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     "MCP server {name} is not configured in the trusted project"
                 )));
             }
-            let server: ServerConfig = serde_json::from_value(
-                servers
-                    .get(&name)
-                    .ok_or_else(|| Error::Config("MCP server is not configured".into()))?
-                    .clone(),
-            )?;
+            let value = servers
+                .get(&name)
+                .ok_or_else(|| Error::Config("MCP server is not configured".into()))?;
+            for key in ["enabled", "exposure", "toolExposure", "oauth"] {
+                if value
+                    .get(key)
+                    .is_some_and(|field| !valid_override_value(key, field))
+                {
+                    return Err(Error::Config(format!("invalid MCP server field {key}")));
+                }
+            }
+            if value
+                .get("description")
+                .is_some_and(|field| !field.is_string())
+                || value
+                    .get("timeout")
+                    .is_some_and(|field| field.as_f64().is_none_or(|timeout| timeout <= 0.0))
+            {
+                return Err(Error::Config("invalid MCP server configuration".into()));
+            }
+            let server: ServerConfig = serde_json::from_value(value.clone())?;
             if let Some(auth) = &server.auth {
                 return Err(Error::Config(format!(
                     "MCP {name} uses credentials from provider {}; sign out of that provider",
@@ -666,6 +681,11 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 .url
                 .as_deref()
                 .ok_or_else(|| Error::Config("MCP OAuth requires an HTTP server".into()))?;
+            let parsed = reqwest_mcp::Url::parse(url)
+                .map_err(|_| Error::Config("invalid MCP URL".into()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
+            }
             pi_rs_workbench::mcp_auth::logout(&name, url).await?;
             output(json!({"type":"mcp_logged_out","name":name}));
         }
