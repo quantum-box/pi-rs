@@ -102,6 +102,51 @@ async fn retry_survives_shutdown_and_recovers_in_background() {
 }
 
 #[tokio::test]
+async fn retry_delay_releases_conversation_worker() {
+    use pi_rs_durable::worker_activity::{WorkerKind, WorkerPhase};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let m = model(1, "503 overloaded");
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options(m)).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "hi".into()).unwrap();
+    let activity = scheduler.worker_activity();
+    let count_waiting = || {
+        activity
+            .snapshot()
+            .iter()
+            .filter(|worker| {
+                worker.kind == WorkerKind::Conversation
+                    && worker.id == id
+                    && worker.phase == WorkerPhase::Waiting
+            })
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while count_waiting() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    scheduler.schedule(id);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while count_waiting() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn permanent_failure_is_settled_and_not_retried() {
     let dir = tempfile::tempdir().unwrap();
     let m = model(10, "invalid api key");

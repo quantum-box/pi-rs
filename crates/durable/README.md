@@ -547,7 +547,8 @@ Current limits and differences from upstream Pi Durable:
   the task gate without waiting for the handler-held scheduler mutex. It does
   not include conversation deadlines or provide `onWake` notifications.
 - Polling uses an in-process interval rather than a durable timer; reopening
-  resumes it. Model retry deadlines use persisted bounded exponential backoff.
+  resumes it. Model retry deadlines use persisted bounded exponential backoff;
+  scheduled conversations release their worker lock until the deadline.
   There is no flow control.
 - The scheduler retains scheduled join handles until `wait` or `shutdown`;
   callers should bound submissions and drain them. Owner locking currently

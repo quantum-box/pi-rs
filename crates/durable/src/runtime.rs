@@ -10434,6 +10434,11 @@ impl Harness {
                 Phase::RetryWait { turns } => {
                     match c.retry_state.poll(unix_ms()) {
                         Decision::WaitUntil(deadline) => {
+                            // Scheduler-owned workers park outside the per-conversation
+                            // lock so other admissions and aborts can make progress.
+                            if self.execution_gate.is_some() {
+                                return Ok(());
+                            }
                             tokio::select! { biased;
                                 _ = cancel.cancelled() => { self.failed = true; return Err(Error::Interrupted); },
                                 _ = tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(unix_ms()))) => (),
@@ -14666,6 +14671,7 @@ pub(crate) async fn drive_scheduled<'a>(
                     .transpose()?
                     .unwrap_or(false),
                 Phase::TaskPending { .. }
+                | Phase::RetryWait { .. }
                 | Phase::ToolGateSleeping { .. }
                 | Phase::HookTasksWaiting { .. }
                 | Phase::YieldTasksWaiting { .. }
@@ -14682,8 +14688,21 @@ pub(crate) async fn drive_scheduled<'a>(
         // Every successful drive moves the shared periodic deadline. Explicit
         // scheduling still drives immediately, while existing parked drivers
         // share one poll per interval instead of each starting its own timer.
-        *next_poll.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        let now = tokio::time::Instant::now();
+        let interval = match state.phase {
+            Phase::RetryWait { .. } => Duration::from_millis(
+                state
+                    .retry_state
+                    .deadline_ms
+                    .ok_or_else(|| Error::Invalid("retry deadline missing".into()))?
+                    .saturating_sub(unix_ms()),
+            ),
+            _ => Duration::from_secs(1),
+        };
+        let deadline = now
+            .checked_add(interval)
+            .unwrap_or_else(|| now + Duration::from_secs(1));
+        *next_poll.lock().unwrap_or_else(|e| e.into_inner()) = Some(deadline);
         loop {
             let deadline = next_poll
                 .lock()
