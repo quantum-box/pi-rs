@@ -951,6 +951,14 @@ still applies the 50 KiB output limit with truncation metadata.
 
 ### Model-selection checkpoint
 
+Native SDK hosts can construct OpenAI Responses, ChatGPT Responses, Anthropic
+Messages and Gemini clients from an explicitly supplied credential snapshot,
+provider identity and endpoint, then register them in a host-owned model catalog.
+The factory does not perform implicit credential or model discovery, OAuth
+refresh, proxy discovery, or network I/O at construction. Hosts own endpoint
+policy and existing clients outlive replacement of the credential snapshot.
+
+
 `/thinking`, Shift+Tab and `--thinking` select a reasoning effort. Selection is
 persisted with the active session branch alongside the model. The local Ollama
 adapter maps off to `reasoning_effort: none`, and maps higher Pi-only levels to
