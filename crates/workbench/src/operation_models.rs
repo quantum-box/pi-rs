@@ -231,10 +231,10 @@ async fn send_model_request(
                 }
             }
         }
-        if attempt == retries
-            || (matches!(api, Api::OpenAiDecisions) && response.status().as_u16() == 504)
-            || !retryable_classifier_response(&response)
-        {
+        if matches!(api, Api::OpenAiDecisions) && response.status().as_u16() == 504 {
+            return Err(Error::Model("OpenAI Decisions error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.".into()));
+        }
+        if attempt == retries || !retryable_classifier_response(&response) {
             return Err(Error::Model(format!(
                 "model operation returned HTTP {}",
                 response.status().as_u16()
@@ -2587,7 +2587,7 @@ mod tests {
                 Api::OpenAiDecisions,
                 vec![(504, "x-should-retry: true\r\nretry-after-ms: 0\r\n")],
                 false,
-                "HTTP 504",
+                "OpenAI Decisions error (504)",
             ),
             (
                 Api::OpenAiDecisions,
