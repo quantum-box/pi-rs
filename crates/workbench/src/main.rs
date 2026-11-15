@@ -2284,7 +2284,9 @@ async fn execute(
                 event => {
                     let event = reasoning_event_json(event);
                     if let Some(stream) = &mut stream {
-                        for output_event in stream.observe(&event, &args) { output(output_event); }
+                        let mut rpc_event = event.clone();
+                        attach_redacted_reasoning(&mut rpc_event);
+                        for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
                     }
                     if args.trace { output(trace_agent_event_json(event)); }
                 }
@@ -2428,6 +2430,12 @@ fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
         pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+    }
+}
+
+fn attach_redacted_reasoning(event: &mut serde_json::Value) {
+    if event["type"] == "reasoning_item_start" && pi_rs::redacted_reasoning_start() {
+        event["redacted"] = json!(true);
     }
 }
 

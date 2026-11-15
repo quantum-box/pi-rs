@@ -27,8 +27,11 @@ fn anthropic_blocks_survive_get_messages() {
                 Err(e) => panic!("waiting for Anthropic request: {e}"),
             }
         };
+        // Accepted sockets can inherit the listener's nonblocking mode.
+        // Switch before cloning so request reads wait for the client.
+        socket.set_nonblocking(false).unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         socket
             .set_write_timeout(Some(Duration::from_secs(10)))
@@ -181,11 +184,12 @@ fn anthropic_blocks_survive_get_messages() {
         json!([
             {"type":"thinking","thinking":"first thought"},
             {"type":"thinking","thinking":"second thought"},
-            {"type":"thinking","thinking":"[Reasoning redacted]"},
+            {"type":"thinking","thinking":"[Reasoning redacted]","redacted":true},
             {"type":"text","text":"first answer"},
             {"type":"text","text":"second answer"}
         ])
     );
+    let snapshot_redacted = message["content"][2].clone();
     let visible = serde_json::to_string(&response).unwrap();
     assert!(!visible.contains("opaque-secret-fixture"));
     assert!(!visible.contains("sig0") && !visible.contains("sig1"));
@@ -205,12 +209,14 @@ fn anthropic_blocks_survive_get_messages() {
     };
     reader.join().unwrap();
     server.join().unwrap();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(status.success(), "{stderr}");
+    assert!(!stderr.contains("opaque-secret-fixture"));
     assert!(
-        status.success(),
-        "{}",
-        std::fs::read_to_string(stderr_path).unwrap()
+        events
+            .iter()
+            .all(|event| event.get("redactedSignature").is_none())
     );
-    assert_eq!(events.last().unwrap()["success"], true, "{events:?}");
     assert!(
         !serde_json::to_string(
             &events
@@ -219,8 +225,17 @@ fn anthropic_blocks_survive_get_messages() {
                 .collect::<Vec<_>>()
         )
         .unwrap()
-        .contains("opaque-secret-fixture"),
-        "redacted payload leaked into RPC events: {events:?}"
+        .contains("opaque-secret-fixture")
+    );
+    assert_eq!(events.last().unwrap()["success"], true, "{events:?}");
+    let redacted_start = events
+        .iter()
+        .filter_map(|event| event.get("assistantMessageEvent"))
+        .find(|event| event["type"] == "thinking_start" && event["contentIndex"] == 2)
+        .expect("redacted thinking start");
+    assert_eq!(
+        redacted_start["partial"]["content"][2],
+        json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
     );
     assert!(
         events.iter().any(|event| event["type"] == "response"
@@ -265,7 +280,6 @@ fn anthropic_blocks_survive_get_messages() {
             ("thinking_delta", 1, Some("second thought")),
             ("thinking_end", 1, Some("second thought")),
             ("thinking_start", 2, None),
-            ("thinking_delta", 2, Some("[Reasoning redacted]")),
             ("thinking_end", 2, Some("[Reasoning redacted]")),
             ("text_start", 3, None),
             ("text_delta", 3, Some("first answer")),
@@ -280,12 +294,13 @@ fn anthropic_blocks_survive_get_messages() {
         .iter()
         .find(|event| event["type"] == "message_end" && event["message"]["role"] == "assistant")
         .expect("assistant message_end");
+    assert_eq!(message["message"]["content"][2], snapshot_redacted);
     assert_eq!(
         message["message"]["content"],
         json!([
             {"type":"thinking","thinking":"first thought"},
             {"type":"thinking","thinking":"second thought"},
-            {"type":"thinking","thinking":"[Reasoning redacted]"},
+            {"type":"thinking","thinking":"[Reasoning redacted]","redacted":true},
             {"type":"text","text":"first answer"},
             {"type":"text","text":"second answer"}
         ])

@@ -999,9 +999,13 @@ async fn run_worker(
                         &cancel,
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
-                            event if args.trace => output(super::trace_agent_event_json(
-                                super::reasoning_event_json(event),
-                            )),
+                            event if args.trace => {
+                                let mut event = super::reasoning_event_json(event);
+                                if args.mode == Some(super::OutputMode::Rpc) {
+                                    super::attach_redacted_reasoning(&mut event);
+                                }
+                                output(super::trace_agent_event_json(event));
+                            }
                             _ => {}
                         },
                     ))
@@ -1099,9 +1103,13 @@ async fn run_worker(
                         &cancel,
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
-                            event if args.trace => output(super::trace_agent_event_json(
-                                super::reasoning_event_json(event),
-                            )),
+                            event if args.trace => {
+                                let mut event = super::reasoning_event_json(event);
+                                if args.mode == Some(super::OutputMode::Rpc) {
+                                    super::attach_redacted_reasoning(&mut event);
+                                }
+                                output(super::trace_agent_event_json(event));
+                            }
                             _ => {}
                         },
                     ))
@@ -1137,9 +1145,13 @@ async fn run_worker(
                             &cancel,
                             &mut |event| match event {
                                 pi_rs::AgentEvent::Notification(event) => observer(event),
-                                event if args.trace => output(super::trace_agent_event_json(
-                                    super::reasoning_event_json(event),
-                                )),
+                                event if args.trace => {
+                                    let mut event = super::reasoning_event_json(event);
+                                    if args.mode == Some(super::OutputMode::Rpc) {
+                                        super::attach_redacted_reasoning(&mut event);
+                                    }
+                                    output(super::trace_agent_event_json(event));
+                                }
                                 _ => {}
                             },
                         ))
