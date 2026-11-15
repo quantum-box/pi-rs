@@ -677,6 +677,19 @@ impl Scheduler {
             }
         }
         let tasks = self.ts().list()?;
+        // Use one snapshot of the active ownership graph. Admission is fenced
+        // by the task gate held above.
+        let cleanup_graph = if tasks
+            .iter()
+            .any(|task| task.task.abort_requested() && !task.task.is_terminal())
+        {
+            Some(
+                crate::ownership_edge::CleanupGraph::load(owner.store())
+                    .map_err(|e| Error::Handler(format!("ownership graph: {e}")))?,
+            )
+        } else {
+            None
+        };
         // Children settle before their owner, including when definitions are missing.
         let mut abortable = None;
         for snapshot in &tasks {
@@ -685,6 +698,11 @@ impl Scheduler {
                 || tasks.iter().any(|child| {
                     child.task.owner() == &TaskOwner::Task(snapshot.task.id())
                         && !child.task.is_terminal()
+                        && !child.task.is_background()
+                        && !cleanup_graph
+                            .as_ref()
+                            .unwrap()
+                            .cyclic_task_edge(snapshot.task.id(), child.task.id())
                 })
             {
                 continue;
@@ -711,7 +729,12 @@ impl Scheduler {
                 if child.id != edge.edge.child || edge.edge.task_owner != *snapshot.task.owner() {
                     return Err(Error::Ownership);
                 }
-                if child.abort_requested {
+                if child.abort_requested
+                    && !cleanup_graph
+                        .as_ref()
+                        .unwrap()
+                        .cyclic_conversation_edge(snapshot.task.id(), child.id)
+                {
                     pending = true;
                     break;
                 }

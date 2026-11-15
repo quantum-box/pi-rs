@@ -67,7 +67,9 @@ fn child_key(child: Uuid) -> Vec<u8> {
 }
 pub(crate) fn decode(key: &[u8], entry: Entry) -> Result<StoredEdge, Error> {
     let edge: Edge = serde_json::from_slice(&entry.value)?;
-    if edge_key(edge.child) != key || edge.task_owner == TaskOwner::Conversation(edge.child) {
+    // Existing stores may contain a self-cycle. Admission rejects creating one,
+    // but cleanup must be able to read and drain it.
+    if edge_key(edge.child) != key {
         return Err(Error::Invalid);
     }
     Ok(StoredEdge {
@@ -157,6 +159,123 @@ impl<'a> EdgeStore<'a> {
                 },
             ],
         })
+    }
+}
+
+// A legacy store can contain cycles even though current admission rejects them.
+// Capture the ownership graph and pending states in a single store snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum CleanupNode {
+    Task(Uuid),
+    Conversation(Uuid),
+}
+
+pub(crate) struct CleanupGraph {
+    children: std::collections::HashMap<CleanupNode, Vec<CleanupNode>>,
+    active: HashSet<CleanupNode>,
+}
+
+impl CleanupGraph {
+    pub(crate) fn load(store: &Store) -> Result<Self, Error> {
+        use std::collections::HashMap;
+        let entries =
+            store.list_prefixes(&[task_store::PREFIX, PREFIX, b"runtime/conversation/"])?;
+        let mut tasks = HashMap::new();
+        let mut edges = Vec::new();
+        let mut active = HashSet::new();
+        for (key, entry) in entries {
+            if key.starts_with(task_store::PREFIX) {
+                let task = task_store::decode(&key, entry)?;
+                if !task.task.is_terminal() {
+                    active.insert(CleanupNode::Task(task.task.id()));
+                }
+                tasks.insert(task.task.id(), task.task);
+            } else if key.starts_with(PREFIX) {
+                edges.push(decode(&key, entry)?.edge);
+            } else {
+                let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+                if conversation.abort_requested {
+                    active.insert(CleanupNode::Conversation(conversation.id));
+                }
+            }
+        }
+        let mut children: HashMap<CleanupNode, Vec<CleanupNode>> = HashMap::new();
+        for task in tasks.values().filter(|task| !task.is_background()) {
+            let parent = match task.owner() {
+                TaskOwner::Conversation(id) => CleanupNode::Conversation(*id),
+                TaskOwner::Task(id) => CleanupNode::Task(*id),
+            };
+            children
+                .entry(parent)
+                .or_default()
+                .push(CleanupNode::Task(task.id()));
+        }
+        for edge in edges {
+            let owner = tasks.get(&edge.task).ok_or(Error::Invalid)?;
+            if edge.task_owner != *owner.owner() {
+                return Err(Error::Invalid);
+            }
+            if edge.mode == Mode::Foreground {
+                children
+                    .entry(CleanupNode::Task(edge.task))
+                    .or_default()
+                    .push(CleanupNode::Conversation(edge.child));
+            }
+        }
+        Ok(Self { children, active })
+    }
+
+    fn reaches(&self, start: CleanupNode, target: CleanupNode) -> bool {
+        let mut pending = vec![start];
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !self.active.contains(&node) {
+                continue;
+            }
+            if node == target {
+                return true;
+            }
+            if seen.insert(node) {
+                if let Some(children) = self.children.get(&node) {
+                    pending.extend(children.iter().copied());
+                }
+            }
+        }
+        false
+    }
+
+    // Break a cycle only after every reachable dependency outside its strongly
+    // connected component has settled. Otherwise an owner could overtake an
+    // ordinary child just because another child participates in a cycle.
+    fn can_relax(&self, parent: CleanupNode, child: CleanupNode) -> bool {
+        if !self.reaches(child, parent) {
+            return false;
+        }
+        let mut pending = vec![child];
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !self.active.contains(&node) || !seen.insert(node) {
+                continue;
+            }
+            if !self.reaches(node, parent) {
+                return false;
+            }
+            if let Some(children) = self.children.get(&node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        true
+    }
+
+    // Keep conversation -> task waits, so abort_and_wait still joins all tasks.
+    pub(crate) fn cyclic_conversation_edge(&self, task: Uuid, child: Uuid) -> bool {
+        self.can_relax(CleanupNode::Task(task), CleanupNode::Conversation(child))
+    }
+
+    // A task-only cycle has no conversation edge to relax. UUID ordering breaks
+    // its back edges deterministically; background dependencies are never cut.
+    pub(crate) fn cyclic_task_edge(&self, parent: Uuid, child: Uuid) -> bool {
+        child <= parent && self.can_relax(CleanupNode::Task(parent), CleanupNode::Task(child))
     }
 }
 

@@ -1193,6 +1193,295 @@ mod tests {
         assert!(tasks.get(parent_task).unwrap().unwrap().is_terminal());
     }
 
+    #[tokio::test]
+    async fn direct_legacy_cycle_abort_and_wait_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        let edge = Edge {
+            task,
+            task_owner: TaskOwner::Conversation(parent),
+            child: parent,
+            mode: Mode::Foreground,
+        };
+        let store = h.subagent_store().unwrap();
+        assert!(EdgeStore::new(store).prepare_create(&edge).is_err());
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: ownership_edge::edge_key(parent),
+                    value: serde_json::to_vec(&edge).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        let mut scheduler = Scheduler::open(&path, options()).unwrap();
+        let driver = scheduler.start_tasks(Default::default()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            scheduler.abort_and_wait(parent),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(driver.get(task).unwrap().unwrap().is_terminal());
+        assert!(!scheduler.conversation(parent).unwrap().abort_requested);
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn cyclic_conversation_wait_does_not_overtake_acyclic_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let parent = h.create_conversation(config()).unwrap();
+        let checkpoint = || Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        };
+        let root_task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(parent),
+            checkpoint(),
+            1,
+        )
+        .unwrap();
+        TaskStore::new(h.subagent_store().unwrap())
+            .save(&[Save::Create(&root_task)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(
+                root_task.id(),
+                TaskOwner::Conversation(parent),
+                "child",
+                config(),
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let nested = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(child),
+            checkpoint(),
+            1,
+        )
+        .unwrap();
+        let leaf = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Task(nested.id()),
+            checkpoint(),
+            1,
+        )
+        .unwrap();
+        let store = h.subagent_store().unwrap();
+        TaskStore::new(store)
+            .save(&[Save::Create(&nested), Save::Create(&leaf)])
+            .unwrap();
+        let edge = Edge {
+            task: nested.id(),
+            task_owner: TaskOwner::Conversation(child),
+            child: parent,
+            mode: Mode::Foreground,
+        };
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: ownership_edge::edge_key(parent),
+                    value: serde_json::to_vec(&edge).unwrap(),
+                }],
+            )
+            .unwrap();
+        h.request_abort(parent).unwrap();
+        let mut scheduler = h.attach_tasks(Default::default()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.get(leaf.id()).unwrap().unwrap().is_terminal());
+        assert!(
+            !scheduler
+                .get(root_task.id())
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+        );
+        assert!(!scheduler.get(nested.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[test]
+    fn task_only_cycle_break_keeps_acyclic_children_first_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+        let task = |id, owner| {
+            Task::new(
+                id,
+                TaskOwner::Task(owner),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .unwrap()
+        };
+        let store = h.subagent_store().unwrap();
+        let tasks = [task(a, b), task(b, a), task(c, a)];
+        let mutations: Vec<_> = tasks
+            .iter()
+            .map(|t| Mutation::Put {
+                key: crate::task_store::key(t.id()),
+                value: serde_json::to_vec(t).unwrap(),
+            })
+            .collect();
+        store.commit(&[], &mutations).unwrap();
+        h.request_abort_task(a).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let mut scheduler = h.attach_tasks(Default::default()).unwrap();
+        for _ in 0..3 {
+            assert!(scheduler.tick(0).unwrap());
+            if !scheduler.get(c).unwrap().unwrap().is_terminal() {
+                assert!(!scheduler.get(a).unwrap().unwrap().is_terminal());
+                assert!(!scheduler.get(b).unwrap().unwrap().is_terminal());
+            }
+        }
+        for id in [a, b, c] {
+            assert!(scheduler.get(id).unwrap().unwrap().is_terminal());
+        }
+        assert!(!scheduler.tick(0).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cyclic_legacy_cleanup_recovers_after_racing_admission_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let parent = match owner {
+            TaskOwner::Conversation(id) => id,
+            _ => unreachable!(),
+        };
+        let child = h
+            .ensure_task_owned_subagent(task, owner.clone(), "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        let background = h
+            .ensure_task_owned_subagent(task, owner, "bg", config(), Mode::Background)
+            .unwrap()
+            .child;
+        let nested = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap();
+        let store = h.subagent_store().unwrap();
+        TaskStore::new(store)
+            .save(&[Save::Create(&nested)])
+            .unwrap();
+        let edge = Edge {
+            task: nested.id(),
+            task_owner: TaskOwner::Conversation(child),
+            child: parent,
+            mode: Mode::Foreground,
+        };
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: ownership_edge::edge_key(parent),
+                    value: serde_json::to_vec(&edge).unwrap(),
+                }],
+            )
+            .unwrap();
+
+        // A writer prepared before the abort must not overwrite the persisted
+        // mark, even when the legacy graph contains a cycle.
+        let stale = TaskStore::new(h.subagent_store().unwrap())
+            .load(nested.id())
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut other = h.worker();
+        let b = barrier.clone();
+        let nested_id = nested.id();
+        let admission = std::thread::spawn(move || {
+            b.wait();
+            other.ensure_task_owned_subagent(
+                nested_id,
+                TaskOwner::Conversation(child),
+                "racing",
+                config(),
+                Mode::Foreground,
+            )
+        });
+        let writer_harness = h.worker();
+        let mut competing = stale.clone();
+        let b = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            competing.task.request_abort().unwrap();
+            b.wait();
+            TaskStore::new(writer_harness.subagent_store().unwrap())
+                .save(&[Save::Update(&competing)])
+        });
+        barrier.wait();
+        h.request_abort(parent).unwrap();
+        assert!(matches!(
+            writer.join().unwrap(),
+            Ok(())
+                | Err(crate::task_store::Error::Store(
+                    durable_store::Error::Conflict { .. }
+                ))
+        ));
+        assert!(matches!(
+            TaskStore::new(h.subagent_store().unwrap()).save(&[Save::Update(&stale)]),
+            Err(crate::task_store::Error::Store(
+                durable_store::Error::Conflict { .. }
+            ))
+        ));
+        let admitted = admission.join().unwrap().ok().map(|a| a.child);
+        if let Some(id) = admitted {
+            assert!(h.conversation(id).unwrap().abort_requested);
+        }
+        assert!(!h.conversation(background).unwrap().abort_requested);
+        drop(h);
+
+        let scheduler = Scheduler::open(&path, options()).unwrap();
+        let driver = scheduler.start_tasks(Default::default()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            scheduler.wait_for_idle(parent, &pi_rs_core::CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(driver.get(task).unwrap().unwrap().is_terminal());
+        assert!(driver.get(nested_id).unwrap().unwrap().is_terminal());
+        assert!(!scheduler.conversation(parent).unwrap().abort_requested);
+        assert!(!scheduler.conversation(child).unwrap().abort_requested);
+        assert!(!scheduler.conversation(background).unwrap().abort_requested);
+        if let Some(id) = admitted {
+            assert!(!scheduler.conversation(id).unwrap().abort_requested);
+        }
+        driver.shutdown().unwrap();
+        scheduler.shutdown().await.unwrap();
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        assert!(!reopened.conversation(parent).unwrap().abort_requested);
+        assert!(!reopened.conversation(child).unwrap().abort_requested);
+    }
+
     #[test]
     fn traversal_terminates_on_ownership_cycle() {
         let dir = tempfile::tempdir().unwrap();

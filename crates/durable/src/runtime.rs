@@ -12089,7 +12089,7 @@ impl Scheduler {
                 }
                 let entry = snapshots.get(&Harness::key(id)).ok_or(Error::NotFound)?;
                 let conversation: Conversation = serde_json::from_slice(&entry.value)?;
-                busy |= conversation.is_working();
+                busy |= conversation.is_working() || conversation.abort_requested;
                 busy |= summaries.iter().any(|summary| {
                     summary.operation.auto_place()
                         && summary.operation.session_id() == id
