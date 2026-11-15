@@ -120,8 +120,16 @@ pub fn render(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
     // Pi parses the display gutter on each line independently, including empty
     // line numbers. Preserve that gutter instead of normalizing its padding.
-    static DIFF_LINE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"^([+\-\s])(\s*[0-9]*)\s(.*)$").unwrap());
+    // JavaScript's \s includes the BOM and excludes U+0085; its dot also
+    // excludes CR and Unicode line separators.
+    static DIFF_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"^([+\-\x{0009}-\x{000D}\x{0020}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}])",
+            r"([\x{0009}-\x{000D}\x{0020}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]*[0-9]*)",
+            r"[\x{0009}-\x{000D}\x{0020}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]",
+            r"([^\r\n\x{2028}\x{2029}]*)$"
+        )).unwrap()
+    });
     let rows: Vec<_> = text
         .split('\n')
         .map(|line| {
@@ -325,6 +333,35 @@ mod tests {
                     .spans
                     .iter()
                     .all(|s| s.color == theme.color("toolDiffContext"))
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_diff_uses_ecmascript_whitespace_and_line_terminators() {
+        let theme = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
+        let lines = render_numbered(
+            "-\u{feff}1 old\n+\u{feff}1 new\n-\u{85}1 old\n+\u{85}1 new\n-1 old\rinside\n+1 new\rinside",
+            &theme,
+            80,
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.inverse && span.text == "old")
+        );
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.inverse && span.text == "new")
+        );
+        for line in &lines[2..] {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| !span.inverse && span.color == theme.color("toolDiffContext"))
             );
         }
     }
