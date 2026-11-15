@@ -1128,9 +1128,8 @@ impl View {
             pi_rs::ContextContent::Text(value) => text.push(value.as_str()),
             pi_rs::ContextContent::Blocks(blocks) => {
                 for block in blocks {
-                    match block {
-                        pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
-                        _ => {}
+                    if let pi_rs::ContentBlock::Text { text: value, .. } = block {
+                        text.push(value.as_str());
                     }
                 }
             }
@@ -9139,8 +9138,10 @@ exit {exit}
 
     #[test]
     fn custom_message_blocks_are_joined_like_pi_without_rendering_details() {
-        let mut view = super::View::default();
-        view.graphics = super::Renderer::test_kitty();
+        let mut view = super::View {
+            graphics: super::Renderer::test_kitty(),
+            ..Default::default()
+        };
         use base64::Engine as _;
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(1, 1)
