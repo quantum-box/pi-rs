@@ -32,6 +32,7 @@ pub mod mcp_refresh;
 #[doc(hidden)]
 pub mod oauth_callback;
 pub mod prompt_resources;
+pub mod prompt_template_arguments;
 mod shell_config;
 mod shell_output;
 mod text_edit;
