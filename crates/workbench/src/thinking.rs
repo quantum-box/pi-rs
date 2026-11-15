@@ -128,7 +128,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     .ok()
     .flatten();
     if let Some((levels, reasoning)) = discovered {
-        let known_levels = levels.map(&filter_levels);
+        let known_levels = levels.map(filter_levels);
         let levels = known_levels
             .clone()
             .unwrap_or_else(|| filter_levels(configured.unwrap_or_else(&fallback)));
