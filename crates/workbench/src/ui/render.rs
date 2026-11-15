@@ -264,6 +264,10 @@ pub enum Entry {
     },
     Assistant(String),
     Thinking(String),
+    CustomMessage {
+        custom_type: String,
+        text: String,
+    },
     Summary {
         id: u64,
         kind: SummaryKind,
@@ -369,6 +373,29 @@ impl Entry {
             Self::Assistant(text) => {
                 let mut lines =
                     markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
+                lines.push(Line::default());
+                lines
+            }
+            Self::CustomMessage { custom_type, text } => {
+                let mut label =
+                    Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
+                label.bold = true;
+                let mut lines = vec![Line::default()];
+                lines.extend(wrap(&[label], inner));
+                lines.push(Line::default());
+                let mut body =
+                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
+                for span in body.iter_mut().flat_map(|line| &mut line.spans) {
+                    if span.color == theme.color("text") && !span.dim {
+                        span.color = theme.color("customMessageText");
+                        span.dim = theme.is_dim("customMessageText");
+                    }
+                }
+                lines.extend(body);
+                lines.push(Line::default());
+                for line in &mut lines {
+                    line.background = Some(theme.color("customMessageBg"));
+                }
                 lines.push(Line::default());
                 lines
             }
@@ -2851,6 +2878,56 @@ mod tests {
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
+    }
+
+    #[test]
+    fn custom_message_uses_markdown_theme_and_safe_terminal_output() {
+        let theme = Theme::system();
+        let entry = Entry::CustomMessage {
+            custom_type: "fixture\x1b]bad".into(),
+            text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
+        };
+        for width in [12, 80] {
+            let lines = entry.render(
+                &theme,
+                width,
+                false,
+                true,
+                TranscriptOptions {
+                    padding: 1,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.background == Some(theme.color("customMessageBg")))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.bold
+                        && span.color == theme.color("customMessageLabel")
+                        && span.text.contains("fixture"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.bold && span.text == "bold")
+            );
+            let mut output = Vec::new();
+            for line in lines {
+                line.draw(&mut output, width).unwrap();
+            }
+            assert!(
+                !output
+                    .windows(b"\x1b]0;bad".len())
+                    .any(|part| part == b"\x1b]0;bad")
+            );
+            assert!(!output.contains(&7));
+        }
     }
 
     #[test]

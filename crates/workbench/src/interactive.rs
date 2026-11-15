@@ -1109,7 +1109,10 @@ impl View {
                 !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
             })
             .collect();
-        self.lines.push(Entry::Notice(text));
+        self.append_entry(Entry::Notice(text));
+    }
+    fn append_entry(&mut self, entry: Entry) {
+        self.lines.push(entry);
         if self.lines.len() > 4000 {
             let removed = self.lines.len() - 4000;
             self.lines.drain(..removed);
@@ -1120,14 +1123,14 @@ impl View {
         if !message.display {
             return;
         }
-        let mut text = String::new();
+        let mut text = Vec::new();
         let mut images = Vec::new();
         match &message.content {
-            pi_rs::ContextContent::Text(value) => text.push_str(value),
+            pi_rs::ContextContent::Text(value) => text.push(value.as_str()),
             pi_rs::ContextContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        pi_rs::ContentBlock::Text { text: value, .. } => text.push_str(value),
+                        pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
                         pi_rs::ContentBlock::Image { data, mime_type } => {
                             images.push(pi_rs::ImageContent {
                                 data: data.clone(),
@@ -1139,7 +1142,10 @@ impl View {
                 }
             }
         }
-        self.append(&format!("{}: {}", message.custom_type, text));
+        self.append_entry(Entry::CustomMessage {
+            custom_type: message.custom_type.clone(),
+            text: text.join("\n"),
+        });
         if !images.is_empty() {
             self.add_images(&images);
         }
@@ -1316,6 +1322,7 @@ impl View {
                         | "compacted"
                         | "branch_summary"
                         | "custom_message"
+                        | "custom_message_delivered"
                 )
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
@@ -9136,7 +9143,95 @@ exit {exit}
         message.display = true;
         view.show_custom_message(&message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::Notice(text)] if text == "example: visible content")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "example" && text == "visible content")
+        );
+    }
+
+    #[test]
+    fn custom_message_blocks_are_joined_like_pi_without_rendering_details() {
+        let mut view = super::View::default();
+        let message = pi_rs::CustomMessage {
+            custom_type: "fixture".into(),
+            content: pi_rs::ContextContent::Blocks(vec![
+                pi_rs::ContentBlock::Text {
+                    text: "**first**".into(),
+                    text_signature: None,
+                },
+                pi_rs::ContentBlock::Image {
+                    data: String::new(),
+                    mime_type: "image/png".into(),
+                },
+                pi_rs::ContentBlock::Text {
+                    text: "second".into(),
+                    text_signature: None,
+                },
+            ]),
+            display: true,
+            details: Some(serde_json::json!({"secret": "not displayed"})),
+        };
+        view.show_custom_message(&message);
+        assert!(
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**first**\nsecond")
+        );
+    }
+
+    #[test]
+    fn delivered_custom_messages_are_visible_live_and_on_reopen() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = directory.path().join("session.jsonl");
+        let message = pi_rs::CustomMessage {
+            custom_type: "fixture".into(),
+            content: pi_rs::ContextContent::Text("**live**".into()),
+            display: true,
+            details: None,
+        };
+        let record = pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: 3,
+            id: 1,
+            parent: None,
+            event: pi_rs::Event::CustomMessageDelivered {
+                id: uuid::Uuid::new_v4(),
+                message: message.clone(),
+            },
+        };
+        let delivered_event = serde_json::to_value(&record.event).unwrap();
+        let mut live = super::View::default();
+        live.receive_worker(
+            serde_json::json!({"type": "record", "record": record}),
+            &mut args,
+        );
+        assert!(
+            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
+        );
+        let mut session = pi_rs::Session::open(&args.session).unwrap();
+        session.append_custom_message(message).unwrap();
+        drop(session);
+        let journal = std::fs::read_to_string(&args.session).unwrap();
+        let mut replaced = false;
+        let mut records = Vec::new();
+        for line in journal.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["event"]["type"] == "custom_message" {
+                value["event"] = delivered_event.clone();
+                replaced = true;
+            }
+            records.push(serde_json::to_string(&value).unwrap());
+        }
+        assert!(replaced);
+        std::fs::write(&args.session, format!("{}\n", records.join("\n"))).unwrap();
+        let mut restored = super::View::default();
+        restored.restore(&args).unwrap();
+        let shown: Vec<_> = restored
+            .lines
+            .iter()
+            .filter(|entry| matches!(entry, super::Entry::CustomMessage { .. }))
+            .collect();
+        assert!(
+            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text }] if custom_type == "fixture" && text == "**live**")
         );
     }
 
