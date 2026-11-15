@@ -854,6 +854,8 @@ fn start_share_upload(
 enum TranscriptPanel {
     Summary(u64),
     Skill(usize),
+    Thinking(usize),
+    StreamingThinking,
 }
 
 #[derive(Default)]
@@ -892,6 +894,7 @@ struct View {
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
     thinking: String,
+    thinking_expanded: Option<bool>,
     thinking_items: std::collections::BTreeMap<u64, String>,
     text_items: std::collections::BTreeMap<u64, String>,
     thinking_items_consistent: bool,
@@ -1368,6 +1371,16 @@ impl View {
         }
     }
 
+    fn set_hide_thinking(&mut self, hidden: bool) {
+        self.hide_thinking = hidden;
+        self.thinking_expanded = None;
+        for entry in &mut self.lines {
+            if let Entry::Thinking { expanded, .. } = entry {
+                *expanded = None;
+            }
+        }
+    }
+
     fn panel_at(&self, row: u16) -> Option<TranscriptPanel> {
         self.panel_rows
             .iter()
@@ -1375,14 +1388,21 @@ impl View {
     }
 
     fn panel_expansion(&mut self, panel: TranscriptPanel) -> Option<&mut Option<bool>> {
+        if panel == TranscriptPanel::StreamingThinking {
+            return (!self.thinking.trim().is_empty()).then_some(&mut self.thinking_expanded);
+        }
         let entry = match panel {
             TranscriptPanel::Summary(id) => self.lines.iter_mut().find(
                 |entry| matches!(entry, Entry::Summary { id: candidate, .. } if *candidate == id),
             ),
             TranscriptPanel::Skill(index) => self.lines.get_mut(index),
+            TranscriptPanel::Thinking(index) => self.lines.get_mut(index),
+            TranscriptPanel::StreamingThinking => unreachable!(),
         }?;
-        match entry {
-            Entry::Summary { expanded, .. } | Entry::Skill { expanded, .. } => Some(expanded),
+        match (panel, entry) {
+            (TranscriptPanel::Summary(_), Entry::Summary { expanded, .. })
+            | (TranscriptPanel::Skill(_), Entry::Skill { expanded, .. })
+            | (TranscriptPanel::Thinking(_), Entry::Thinking { expanded, .. }) => Some(expanded),
             _ => None,
         }
     }
@@ -1509,6 +1529,7 @@ impl View {
         self.text_items.clear();
         self.streaming_tools.clear();
         self.thinking.clear();
+        self.thinking_expanded = None;
         self.thinking_items.clear();
         self.draft_images.clear();
         self.clipboard = None;
@@ -1617,7 +1638,10 @@ impl View {
                     if !summary_requests.contains(request_id)
                         && let Some(reasoning) = &metadata.reasoning
                     {
-                        self.lines.push(Entry::Thinking(reasoning.clone()));
+                        self.lines.push(Entry::Thinking {
+                            text: reasoning.clone(),
+                            expanded: None,
+                        });
                     }
                     if let pi_rs::UsageReport::Measured { usage } = usage {
                         self.tokens = self
@@ -1856,6 +1880,7 @@ impl View {
             Some("summary_request_start") => {
                 self.summarizing = true;
                 self.thinking.clear();
+                self.thinking_expanded = None;
                 self.thinking_items.clear();
                 self.streaming.clear();
                 self.text_items.clear();
@@ -1946,7 +1971,9 @@ impl View {
                         let thinking = std::mem::take(&mut self.thinking);
                         self.thinking_items.clear();
                         if !thinking.is_empty() {
-                            self.lines.push(Entry::Thinking(thinking));
+                            self.lines.push(Entry::Thinking { text: thinking, expanded: self.thinking_expanded.take() });
+                        } else {
+                            self.thinking_expanded = None;
                         }
                         let content = event["content"].as_str().unwrap_or_default();
                         if !content.is_empty() {
@@ -2024,8 +2051,12 @@ impl View {
         self.text_items.clear();
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
-            self.lines
-                .push(Entry::Thinking(std::mem::take(&mut self.thinking)));
+            self.lines.push(Entry::Thinking {
+                text: std::mem::take(&mut self.thinking),
+                expanded: self.thinking_expanded.take(),
+            });
+        } else {
+            self.thinking_expanded = None;
         }
         if !self.streaming.is_empty() {
             self.lines
@@ -2135,7 +2166,8 @@ impl View {
                 self.mouse.drag(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
-                let default_expanded = self.expand_tools;
+                let tools_expanded = self.expand_tools;
+                let thinking_expanded = !self.hide_thinking;
                 if let Some(url) = self.released_link(event.column, event.row) {
                     self.panel_press = None;
                     self.mouse.clear_gesture();
@@ -2147,6 +2179,12 @@ impl View {
                     && self.panel_at(row) == Some(panel)
                     && let Some(expanded) = self.panel_expansion(panel)
                 {
+                    let default_expanded = match panel {
+                        TranscriptPanel::Thinking(_) | TranscriptPanel::StreamingThinking => {
+                            thinking_expanded
+                        }
+                        _ => tools_expanded,
+                    };
                     *expanded = Some(!expanded.unwrap_or(default_expanded));
                     self.mouse.clear();
                 } else if self.mouse.release(event.column, event.row)
@@ -2282,16 +2320,31 @@ impl View {
                         .count();
                     panels.push((start..start + panel_height, TranscriptPanel::Skill(index)));
                 }
+                Entry::Thinking { .. } => panels.push((
+                    start..lines.len().saturating_sub(1),
+                    TranscriptPanel::Thinking(index),
+                )),
                 _ => {}
             }
         }
         if !self.thinking.is_empty() {
-            lines.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                body_width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
+            let start = lines.len();
+            lines.extend(
+                Entry::Thinking {
+                    text: self.thinking.clone(),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    body_width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
+            panels.push((
+                start..lines.len().saturating_sub(1),
+                TranscriptPanel::StreamingThinking,
             ));
         }
         if !self.streaming.is_empty() {
@@ -2576,13 +2629,19 @@ impl View {
             })
             .collect();
         if !self.thinking.is_empty() {
-            lines.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
-            ));
+            lines.extend(
+                Entry::Thinking {
+                    text: self.thinking.clone(),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
         }
         if !self.streaming.is_empty() {
             lines.extend(Entry::Assistant(self.streaming.clone()).render(
@@ -2727,13 +2786,19 @@ impl View {
         let mut active = Vec::new();
         if !committing {
             active.extend(pending());
-            active.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
-            ));
+            active.extend(
+                Entry::Thinking {
+                    text: self.thinking.clone(),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
             active.extend(Entry::Assistant(self.streaming.clone()).render(
                 theme,
                 width,
@@ -5579,7 +5644,15 @@ pub(super) async fn run(
                         }
                     }
                     "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
-                    "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
+                    "app.thinking.toggle" => {
+                        let hidden = !view.hide_thinking;
+                        view.set_hide_thinking(hidden);
+                        if let Err(error) =
+                            args.settings.set_user("hideThinkingBlock", json!(hidden))
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.clear" => {
                         if clear_editor_or_exit(&mut view, &mut last_clear, Instant::now()) {
@@ -7394,7 +7467,7 @@ fn select(
             }
             match key.as_str() {
                 "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
-                "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),
+                "hideThinkingBlock" => view.set_hide_thinking(value.as_bool().unwrap_or(false)),
                 "tuiMode" => {
                     args.tui_mode = Some(if value == "regular" {
                         TuiMode::Regular
@@ -8049,6 +8122,111 @@ mod tests {
         assert_eq!(view.thinking, "summaryother");
         view.settle();
         assert!(view.thinking_items.is_empty());
+    }
+
+    #[test]
+    fn thinking_visibility_overrides_survive_settle_and_reset_globally() {
+        use crate::ui::render::Entry;
+        let mut view = super::View::default();
+        view.lines.push(Entry::Thinking {
+            text: "first".into(),
+            expanded: None,
+        });
+        view.lines.push(Entry::Thinking {
+            text: "second".into(),
+            expanded: None,
+        });
+        *view
+            .panel_expansion(super::TranscriptPanel::Thinking(0))
+            .unwrap() = Some(false);
+        assert!(matches!(
+            &view.lines[0],
+            Entry::Thinking {
+                expanded: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.thinking = "streamed".into();
+        *view
+            .panel_expansion(super::TranscriptPanel::StreamingThinking)
+            .unwrap() = Some(false);
+        view.settle();
+        assert!(
+            matches!(&view.lines[2], Entry::Thinking { text, expanded: Some(false) } if text == "streamed")
+        );
+        assert!(
+            view.panel_expansion(super::TranscriptPanel::StreamingThinking)
+                .is_none()
+        );
+        view.set_hide_thinking(true);
+        assert!(view.hide_thinking);
+        assert!(
+            view.lines
+                .iter()
+                .all(|e| matches!(e, Entry::Thinking { expanded: None, .. }))
+        );
+        assert!(view.thinking_expanded.is_none());
+    }
+
+    #[test]
+    fn thinking_mouse_click_toggles_only_the_pressed_panel() {
+        use crate::ui::render::Entry;
+        use clap::Parser;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let args = super::Cli::parse_from(["pi"]);
+        let mut view = super::View::default();
+        view.lines.push(Entry::Thinking {
+            text: "first".into(),
+            expanded: None,
+        });
+        view.lines.push(Entry::Thinking {
+            text: "second".into(),
+            expanded: None,
+        });
+        view.panel_rows
+            .push((2..3, super::TranscriptPanel::Thinking(0)));
+        view.panel_rows
+            .push((4..5, super::TranscriptPanel::Thinking(1)));
+        let event = |kind, row| MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 2), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 2), &args);
+        assert!(matches!(
+            &view.lines[0],
+            Entry::Thinking {
+                expanded: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 4), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Drag(MouseButton::Left), 5), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 5), &args);
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.set_hide_thinking(true);
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 4), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 4), &args);
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking {
+                expanded: Some(true),
+                ..
+            }
+        ));
     }
     #[test]
     fn external_editor_selects_first_nonempty_command() {

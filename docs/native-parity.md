@@ -18,6 +18,11 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Hidden thinking runs display a themed `Thinking...` label. In fullscreen mode,
+clicking a thinking run toggles it independently, including while it streams;
+changing the global visibility setting clears individual overrides. Regular
+mode uses the global visibility setting and does not handle transcript clicks.
+
 Single-line extension input dialogs remove pasted line breaks and expand tabs
 to four spaces, while multiline editor dialogs normalize CRLF and CR to newlines.
 The native one MiB response limit applies after paste sanitization and expansion.
