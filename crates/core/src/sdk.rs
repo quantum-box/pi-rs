@@ -1808,6 +1808,13 @@ impl AgentSession {
         &self.model_name
     }
 
+    /// Provider of the currently selected runtime model, if it has one.
+    /// Legacy provider-less selections return `None`. Together with
+    /// `model_name`, this identifies the client selected for subsequent runs.
+    pub fn model_provider(&self) -> Option<&str> {
+        self.model_provider.as_deref()
+    }
+
     /// Supply a client for a historical model name in this session.
     pub fn register_branch_model(
         &self,

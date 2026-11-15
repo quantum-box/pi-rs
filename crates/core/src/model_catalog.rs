@@ -176,6 +176,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_provider_tracks_switch_and_branch_checkout() {
+        let mut builder = ModelCatalogBuilder::new();
+        let a: Arc<dyn Model> = Arc::new(NamedModel("a"));
+        let b: Arc<dyn Model> = Arc::new(NamedModel("b"));
+        builder.register("provider-a", "shared", a).unwrap();
+        builder.register("provider-b", "shared", b.clone()).unwrap();
+        let catalog = builder.build();
+        let mut session = catalog
+            .session_builder("provider-a", "shared")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert_eq!(
+            (session.model_provider(), session.model_name()),
+            (Some("provider-a"), "shared")
+        );
+        let before = session.journal().unwrap().head();
+        session
+            .set_provider_model(b, "provider-b", "shared")
+            .unwrap();
+        assert_eq!(
+            (session.model_provider(), session.model_name()),
+            (Some("provider-b"), "shared")
+        );
+        session.checkout(before).unwrap();
+        assert_eq!(
+            (session.model_provider(), session.model_name()),
+            (Some("provider-a"), "shared")
+        );
+        session
+            .set_model(Arc::new(NamedModel("legacy")), "legacy")
+            .unwrap();
+        assert_eq!(
+            (session.model_provider(), session.model_name()),
+            (None, "legacy")
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn catalog_session_supports_repeated_prompts_and_reopen() {
         let mut builder = ModelCatalogBuilder::new();
         builder
