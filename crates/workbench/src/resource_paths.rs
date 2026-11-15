@@ -105,6 +105,9 @@ pub fn resolve(
     let mut paths = Vec::new();
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
+        if !skill_file_is_markdown(kind, &path, warnings) {
+            continue;
+        }
         if kind == Kind::Prompt && path.is_dir() {
             append(&mut paths, vec![path]);
             continue;
@@ -152,6 +155,9 @@ pub fn resolve(
             .filter(|entry| !entry.starts_with(['+', '-', '!']))
         {
             let path = absolute(&base, entry);
+            if !skill_file_is_markdown(kind, &path, warnings) {
+                continue;
+            }
             let found = expand(&path, kind, false, warnings)?;
             if found.is_empty() && !path.exists() {
                 warnings.push(format!("Resource {} was not found", path.display()));
@@ -228,6 +234,25 @@ pub fn resolve(
     );
     append(&mut paths, additional_prompts);
     Ok(paths)
+}
+fn skill_file_is_markdown(kind: Kind, path: &Path, warnings: &mut Vec<String>) -> bool {
+    if kind != Kind::Skill {
+        return true;
+    }
+    let normalized = normalize_skill_path(path);
+    let path = normalized.as_path();
+    if path.is_file()
+        && !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
+    {
+        warnings.push(format!(
+            "{}: skill path is not a markdown file",
+            path.display()
+        ));
+        return false;
+    }
+    true
 }
 // Pi's automatic prompt and theme discovery scans visible files directly in
 // the resource root, applying local ignore files. Configured paths use collect.

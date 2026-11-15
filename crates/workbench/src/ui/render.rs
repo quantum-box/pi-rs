@@ -26,6 +26,7 @@ pub struct Span {
     // Search-only text may retain U+0085; `text` is always terminal-safe.
     search_text: Option<String>,
     base_text: bool,
+    thinking_link: bool,
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
@@ -44,6 +45,7 @@ impl Span {
             text: clean(&text),
             search_text,
             base_text: false,
+            thinking_link: false,
             color,
             background: None,
             bold: false,
@@ -470,9 +472,27 @@ impl Entry {
                 if !show_thinking {
                     return vec![];
                 }
-                let mut span = Span::themed(text, theme, "thinkingText");
-                span.italic = true;
-                let mut lines = wrap(&[span], inner);
+                // Pi renders thinking as Markdown, but deliberately excludes it
+                // from the Mermaid transformer. Only default text inherits the
+                // thinking style; explicit Markdown roles keep their colors.
+                let mut lines = markdown_at_depth(
+                    text,
+                    theme,
+                    inner,
+                    0,
+                    super::mermaid::Mermaid::Off,
+                    *HYPERLINKS,
+                    false,
+                );
+                for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+                    if span.base_text {
+                        span.color = theme.color("thinkingText");
+                        span.dim = theme.is_dim("thinkingText");
+                        span.italic = true;
+                    } else if span.thinking_link {
+                        span.italic = true;
+                    }
+                }
                 lines.push(Line::default());
                 lines
             }
@@ -1668,11 +1688,13 @@ fn markdown_at_depth(
                                             .checked_sub(1)
                                             .and_then(|index| SYNTAX_ROLES.get(index))
                                             .map_or("text", |(_, role)| *role);
-                                        Span::themed(
+                                        let mut span = Span::themed(
                                             text.strip_suffix('\n').unwrap_or(text),
                                             theme,
                                             role,
-                                        )
+                                        );
+                                        span.base_text = false;
+                                        span
                                     })
                                     .collect::<Vec<_>>()
                             })
@@ -1843,6 +1865,7 @@ fn markdown_at_depth(
                         (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
                     });
                     span.italic = italic > 0;
+                    span.thinking_link = heading == 0 && !links.is_empty();
                     span.strikethrough = strikethrough > 0;
                     if is_text
                         && links.is_empty()
@@ -1883,6 +1906,7 @@ fn markdown_at_depth(
                             link.set_source(&label);
                             link.color = theme.color("mdLink");
                             link.base_text = false;
+                            link.thinking_link = heading == 0;
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
                             link.hyperlink =
@@ -2886,6 +2910,50 @@ mod tests {
         assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
         let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
         assert!(!Span::themed("muted", &custom, "muted").dim);
+    }
+
+    #[test]
+    fn thinking_renders_markdown_with_thinking_style_and_no_mermaid_transform() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
+        json["colors"]["mdCode"] = json["colors"]["text"].clone();
+        json["colors"]["thinkingText"] = serde_json::json!("#ff0000");
+        let theme = Theme::parse(&json.to_string(), None).unwrap();
+        let entry = Entry::Thinking(
+            "plain **bold** `code` [label](https://example.org) https://example.com\n\n```rust\nlet value = 42;\n```\n\n```mermaid\nflowchart LR\nA --> B\n```".into(),
+        );
+        let options = TranscriptOptions {
+            mermaid: super::super::mermaid::Mermaid::Final,
+            ..Default::default()
+        };
+        assert!(entry.render(&theme, 80, false, false, options).is_empty());
+        let lines = entry.render(&theme, 80, false, true, options);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(spans.iter().any(|s| s.text.contains("plain")
+            && s.italic
+            && s.color == theme.color("thinkingText")));
+        assert!(spans.iter().any(|s| s.text == "bold"
+            && s.bold
+            && s.italic
+            && s.color == theme.color("thinkingText")));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "code" && s.color == theme.color("mdCode"))
+        );
+        assert!(spans.iter().any(|s| s.text.contains("```mermaid")));
+        assert!(spans.iter().any(|s| s.text.contains("A --> B")));
+        for label in ["label", "https://example.com"] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.text == label && s.italic && s.color == theme.color("mdLink")),
+                "{label}"
+            );
+        }
+        assert!(spans.iter().any(|s| s.text.contains("value")
+            && !s.italic
+            && s.color != theme.color("thinkingText")));
     }
 
     #[test]
