@@ -4045,18 +4045,21 @@ mod session_metadata_tests {
                 input_id: None,
             })
             .unwrap();
+        let active = session.head();
+        session.checkout(sibling).unwrap();
         let original_id = session.session_id();
         let mut fork = session.fork_inert_full_history().unwrap().unwrap();
         assert_ne!(fork.session_id(), original_id);
+        assert_eq!(fork.head(), sibling);
         assert_eq!(
             fork.record_metadata(sibling),
             Some(&serde_json::json!({"fixture":"retained"}))
         );
-        fork.checkout(sibling).unwrap();
+        fork.checkout(active).unwrap();
         assert!(
             fork.current_messages()
                 .iter()
-                .any(|m| matches!(m, Message::User { content } if content == "sibling"))
+                .any(|m| matches!(m, Message::User { content } if content == "active"))
         );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fork.jsonl");
