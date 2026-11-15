@@ -268,7 +268,10 @@ pub enum Entry {
         expanded: Option<bool>,
     },
     Assistant(String),
-    Thinking(String),
+    Thinking {
+        text: String,
+        expanded: Option<bool>,
+    },
     CustomMessage {
         custom_type: String,
         text: String,
@@ -468,31 +471,38 @@ impl Entry {
                     .image_width
                     .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
             }
-            Self::Thinking(text) => {
-                if !show_thinking {
+            Self::Thinking { text, expanded } => {
+                if text.trim().is_empty() {
                     return vec![];
                 }
-                // Pi renders thinking as Markdown, but deliberately excludes it
-                // from the Mermaid transformer. Only default text inherits the
-                // thinking style; explicit Markdown roles keep their colors.
-                let mut lines = markdown_at_depth(
-                    text,
-                    theme,
-                    inner,
-                    0,
-                    super::mermaid::Mermaid::Off,
-                    *HYPERLINKS,
-                    false,
-                );
-                for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
-                    if span.base_text {
-                        span.color = theme.color("thinkingText");
-                        span.dim = theme.is_dim("thinkingText");
-                        span.italic = true;
-                    } else if span.thinking_link {
-                        span.italic = true;
+                let mut lines = if !expanded.unwrap_or(show_thinking) {
+                    let mut span = Span::themed("Thinking...", theme, "thinkingText");
+                    span.italic = true;
+                    wrap(&[span], inner)
+                } else {
+                    // Pi renders thinking as Markdown, but deliberately excludes it
+                    // from the Mermaid transformer. Only default text inherits the
+                    // thinking style; explicit Markdown roles keep their colors.
+                    let mut lines = markdown_at_depth(
+                        text,
+                        theme,
+                        inner,
+                        0,
+                        super::mermaid::Mermaid::Off,
+                        *HYPERLINKS,
+                        false,
+                    );
+                    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+                        if span.base_text {
+                            span.color = theme.color("thinkingText");
+                            span.dim = theme.is_dim("thinkingText");
+                            span.italic = true;
+                        } else if span.thinking_link {
+                            span.italic = true;
+                        }
                     }
-                }
+                    lines
+                };
                 lines.push(Line::default());
                 lines
             }
@@ -1521,6 +1531,7 @@ fn markdown_at_depth(
     let mut previous_paragraph_end = None;
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
+    let mut last_rule_separator = None;
     let protected_text = protect_bare_links(text, options);
     let mut events = super::strike::events(text, &protected_text, options)
         .into_iter()
@@ -1966,7 +1977,18 @@ fn markdown_at_depth(
             Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
             Event::Rule => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if lists.is_empty()
+                    && let Some(end) = previous_paragraph_end.take()
+                    && end <= range.start
+                    && text[end..range.start].trim().is_empty()
+                {
+                    lines.push(Line::default());
+                }
                 lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
+                if lists.is_empty() {
+                    last_rule_separator = Some(lines.len());
+                    lines.push(Line::default());
+                }
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "[x] " } else { "[ ] " };
@@ -1988,6 +2010,9 @@ fn markdown_at_depth(
         lines.pop();
     }
     if last_code_separator == lines.len().checked_sub(1) && last_code_separator.is_some() {
+        lines.pop();
+    }
+    if last_rule_separator == lines.len().checked_sub(1) && last_rule_separator.is_some() {
         lines.pop();
     }
     lines
@@ -2026,6 +2051,30 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_dividers_separate_following_blocks_without_a_trailing_blank() {
+        let theme = Theme::system();
+        let render = |text: &str| {
+            markdown(text, &theme, 8)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            render("before\n\n---\n\nafter"),
+            ["before", "", "────────", "", "after"]
+        );
+        assert_eq!(render("---\nafter"), ["────────", "", "after"]);
+        assert_eq!(render("---\n- item"), ["────────", "", "- item"]);
+        assert_eq!(render("---"), ["────────"]);
+        assert_eq!(render("before\n***"), ["before", "", "────────"]);
+    }
+
     #[test]
     fn marked_strike_normalizes_list_and_quote_continuations() {
         let theme = Theme::system();
@@ -2919,14 +2968,21 @@ mod tests {
         json["colors"]["mdCode"] = json["colors"]["text"].clone();
         json["colors"]["thinkingText"] = serde_json::json!("#ff0000");
         let theme = Theme::parse(&json.to_string(), None).unwrap();
-        let entry = Entry::Thinking(
-            "plain **bold** `code` [label](https://example.org) https://example.com\n\n```rust\nlet value = 42;\n```\n\n```mermaid\nflowchart LR\nA --> B\n```".into(),
-        );
+        let entry = Entry::Thinking {
+            text: "plain **bold** `code` [label](https://example.org) https://example.com\n\n```rust\nlet value = 42;\n```\n\n```mermaid\nflowchart LR\nA --> B\n```".into(),
+            expanded: None,
+        };
         let options = TranscriptOptions {
             mermaid: super::super::mermaid::Mermaid::Final,
             ..Default::default()
         };
-        assert!(entry.render(&theme, 80, false, false, options).is_empty());
+        let hidden = entry.render(&theme, 80, false, false, options);
+        assert!(
+            hidden
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|s| s.text == "Thinking...")
+        );
         let lines = entry.render(&theme, 80, false, true, options);
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
         assert!(spans.iter().any(|s| s.text.contains("plain")

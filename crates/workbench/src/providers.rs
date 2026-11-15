@@ -197,11 +197,14 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if bearer
+                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                    Anthropic::with_oauth_token(endpoint, &token)?
+                } else if bearer
                     || matches!(
                         self.id(),
                         "fireworks" | "openrouter" | "minimax" | "minimax-cn"
-                    ) {
+                    )
+                {
                     Anthropic::with_bearer_token(endpoint, &token)?
                 } else {
                     Anthropic::new(endpoint, &token)?
@@ -360,6 +363,14 @@ impl Deferred {
     ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
+            Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
+                super::anthropic_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    None,
+                    false,
+                )
+                .await?,
+            ),
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
@@ -589,6 +600,11 @@ impl Client {
                 } else {
                     client.clone()
                 };
+                let client = if cache_disabled {
+                    client
+                } else {
+                    client.with_default_headers(defaults)
+                };
                 client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {
@@ -642,7 +658,14 @@ impl Client {
                         .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
                         .await
                 } else if let Some(key) = session_cache_key {
+                    // Workbench applies its own model-specific affinity headers.
+                    // Do not let the standalone SDK add a second default set.
                     client
+                        .clone()
+                        .with_default_headers(defaults)
+                        .with_session_affinity_format(
+                            pi_rs::openai::SessionAffinityFormat::Disabled,
+                        )
                         .stream_enriched_in_session_with_identity(
                             uuid::Uuid::nil(),
                             uuid::Uuid::nil(),
@@ -655,6 +678,29 @@ impl Client {
                     Ok(Box::pin(
                         stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
                     ))
+                }
+            }
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
                 }
             }
             Self::Deferred(client) => {

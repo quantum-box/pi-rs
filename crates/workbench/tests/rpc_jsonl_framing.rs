@@ -1,8 +1,69 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+#[test]
+fn rpc_ignores_positional_messages_before_eof() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--mode",
+            "rpc",
+            "ignored first",
+            "ignored second",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{{\"type\":\"get_state\",\"id\":\"live\"}}").unwrap();
+    input.flush().unwrap();
+    let response = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("RPC did not respond while stdin was open: {error}");
+        });
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["id"], "live");
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["messageCount"], 0);
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("RPC process did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    reader.join().unwrap();
+}
 
 #[test]
 fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
@@ -22,6 +83,8 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
             "--no-trust",
             "--mode",
             "rpc",
+            "ignored first",
+            "ignored second",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
@@ -66,6 +129,7 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
     assert_eq!(responses.len(), 9, "{responses:?}");
     assert_eq!(responses[0]["id"], "bad�id");
     assert_eq!(responses[0]["success"], true);
+    assert_eq!(responses[0]["data"]["messageCount"], 0);
     assert_eq!(responses[1]["command"], "parse");
     assert_eq!(responses[1]["success"], false);
     assert_eq!(responses[2]["id"], "a\u{2028}b");

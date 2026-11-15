@@ -180,7 +180,7 @@ fn discover(grants: &PromptReadGrants, filename: &str) -> Result<Option<PromptRe
     Ok(None)
 }
 
-fn read_optional(path: &Path) -> Result<Option<String>> {
+pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     // Opening a FIFO for reading otherwise waits indefinitely for a writer.

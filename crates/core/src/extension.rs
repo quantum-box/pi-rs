@@ -165,6 +165,13 @@ pub struct CustomEntry {
     pub data: Option<Value>,
 }
 
+/// A custom entry and its native journal record ID on the active branch.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CustomEntryRecord {
+    pub id: u64,
+    pub entry: CustomEntry,
+}
+
 fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Value>, D::Error> {
@@ -274,10 +281,56 @@ pub struct ExtensionResources {
 
 struct ResourceDiscoveryHost {
     messages: Arc<dyn ToolHost>,
-    entries: tokio::sync::mpsc::Sender<(
+    entries: tokio::sync::mpsc::Sender<DiscoveryEntryRequest>,
+}
+
+enum DiscoveryEntryRequest {
+    Append(
         CustomEntry,
         tokio::sync::oneshot::Sender<ExtensionResult<()>>,
-    )>,
+    ),
+    List(
+        Option<String>,
+        tokio::sync::oneshot::Sender<ExtensionResult<Vec<CustomEntryRecord>>>,
+    ),
+}
+
+async fn branch_custom_entries(
+    session: &mut crate::Session,
+    custom_type: Option<&str>,
+) -> ExtensionResult<Vec<CustomEntryRecord>> {
+    let mut result = Vec::new();
+    let mut bytes = 2_usize;
+    let mut id = session.head();
+    let mut scanned = 0_usize;
+    while id != 0 {
+        let record = &session.records()[id as usize - 1];
+        id = record.parent.unwrap_or(0);
+        if let crate::Event::CustomEntry { entry } = &record.event
+            && custom_type.is_none_or(|kind| kind == entry.custom_type)
+        {
+            let item = CustomEntryRecord {
+                id: record.id,
+                entry: entry.clone(),
+            };
+            bytes = bytes.saturating_add(
+                serde_json::to_vec(&item)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    + usize::from(!result.is_empty()),
+            );
+            if bytes > 8 * 1024 * 1024 {
+                return Err("custom entry response exceeds 8 MiB".into());
+            }
+            result.push(item);
+        }
+        scanned += 1;
+        if scanned.is_multiple_of(128) {
+            tokio::task::yield_now().await;
+        }
+    }
+    result.reverse();
+    Ok(result)
 }
 
 #[async_trait::async_trait]
@@ -305,12 +358,31 @@ impl ToolHost for ResourceDiscoveryHost {
         crate::journal::validate_custom_entry(&entry).map_err(|error| error.to_string())?;
         let (reply, response) = tokio::sync::oneshot::channel();
         self.entries
-            .send((entry, reply))
+            .send(DiscoveryEntryRequest::Append(entry, reply))
             .await
             .map_err(|_| "resource discovery has finished".to_owned())?;
         response
             .await
             .map_err(|_| "custom entry acknowledgement was lost".to_owned())?
+    }
+    fn supports_custom_entry_read(&self) -> bool {
+        true
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> ExtensionResult<Vec<CustomEntryRecord>> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.entries
+            .send(DiscoveryEntryRequest::List(
+                custom_type.map(str::to_owned),
+                reply,
+            ))
+            .await
+            .map_err(|_| "resource discovery has finished".to_owned())?;
+        response
+            .await
+            .map_err(|_| "custom entry response was lost".to_owned())?
     }
 }
 
@@ -425,6 +497,18 @@ pub trait ToolHost: Send + Sync {
     /// callback returns.
     async fn append_entry(&self, _entry: CustomEntry) -> ExtensionResult<()> {
         Err("custom entry persistence is unavailable".into())
+    }
+    /// Whether the host can read branch-local custom entries.
+    fn supports_custom_entry_read(&self) -> bool {
+        false
+    }
+    /// Read custom entries on the active branch, optionally filtering by type.
+    /// Hosts may reject responses that exceed their bounded transport size.
+    async fn custom_entries(
+        &self,
+        _custom_type: Option<&str>,
+    ) -> ExtensionResult<Vec<CustomEntryRecord>> {
+        Err("custom entry reading is unavailable".into())
     }
     /// Whether stable, extension-supplied message keys are supported here.
     fn supports_keyed_messages(&self) -> bool {
@@ -2122,10 +2206,7 @@ impl Registry {
                 entries: entry_sender,
             });
             enum Request {
-                Entry(
-                    CustomEntry,
-                    tokio::sync::oneshot::Sender<ExtensionResult<()>>,
-                ),
+                Entry(DiscoveryEntryRequest),
                 Message(
                     crate::QueuedCustomMessage,
                     tokio::sync::oneshot::Sender<ExtensionResult<()>>,
@@ -2137,18 +2218,18 @@ impl Registry {
                     extension.discover_resources_with_host(event, states.get(extension.id()), host),
                 );
                 tokio::pin!(future);
-                loop {
+                'discovery: loop {
                     tokio::select! {
                         biased;
                         result = &mut future => break result,
                         request = async {
                             tokio::select! {
-                                Some((entry, reply)) = entries.recv() => Request::Entry(entry, reply),
+                                Some(entry) = entries.recv() => Request::Entry(entry),
                                 Some((message, reply)) = incoming.recv() => Request::Message(message, reply),
                                 else => std::future::pending().await,
                             }
                         } => match request {
-                        Request::Entry(entry, reply) => {
+                        Request::Entry(DiscoveryEntryRequest::Append(entry, reply)) => {
                             if reply.is_closed() { continue; }
                             if let Err(error) = session.ensure_settled() {
                                 let _ = reply.send(Err(error.to_string()));
@@ -2156,6 +2237,15 @@ impl Registry {
                             }
                             let persisted = session.append_custom_entry(entry).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom entry"))));
                             match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                        }
+                        Request::Entry(DiscoveryEntryRequest::List(custom_type, mut reply)) => {
+                            if reply.is_closed() { continue; }
+                            tokio::select! {
+                                biased;
+                                result = &mut future => break 'discovery result,
+                                _ = reply.closed() => {},
+                                records = branch_custom_entries(session, custom_type.as_deref()) => { let _ = reply.send(records); }
+                            }
                         }
                         Request::Message(input, reply) => {
                             let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
@@ -3150,6 +3240,166 @@ mod replacement_tests {
             .await?;
             Ok(DiscoveredResources::default())
         }
+    }
+
+    struct ResourceReadEntryHook;
+    #[async_trait::async_trait]
+    impl Extension for ResourceReadEntryHook {
+        fn id(&self) -> &str {
+            "resource-read"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources_with_host(
+            &self,
+            _: &ResourceDiscoveryEvent,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            assert!(host.supports_custom_entry_read());
+            let previous = host.custom_entries(Some("index")).await?;
+            assert_eq!(previous.len(), 1);
+            assert_eq!(previous[0].entry.data, Some(json!({"value":"keep"})));
+            host.append_entry(CustomEntry {
+                custom_type: "index".into(),
+                data: Some(Value::Null),
+            })
+            .await?;
+            let updated = host.custom_entries(Some("index")).await?;
+            assert_eq!(updated.len(), 2);
+            assert!(updated[0].id < updated[1].id);
+            assert_eq!(updated[1].entry.data, Some(Value::Null));
+            Ok(DiscoveredResources::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_reads_active_branch_custom_entries() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResourceReadEntryHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(CustomEntry {
+                custom_type: "index".into(),
+                data: Some(json!({"value":"keep"})),
+            })
+            .unwrap();
+        session
+            .append_custom_entry(CustomEntry {
+                custom_type: "other".into(),
+                data: None,
+            })
+            .unwrap();
+        let branch_head = session.head();
+        session
+            .append_custom_entry(CustomEntry {
+                custom_type: "index".into(),
+                data: Some(json!({"value":"abandoned"})),
+            })
+            .unwrap();
+        session.checkout(branch_head).unwrap();
+        registry
+            .discover_resources_in_session(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_entry_scan_yields_while_skipping_nonmatching_records() {
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        for _ in 0..300 {
+            session
+                .append(crate::Event::CustomEntry {
+                    entry: CustomEntry {
+                        custom_type: "other".into(),
+                        data: None,
+                    },
+                })
+                .unwrap();
+        }
+        let mut scan = Box::pin(branch_custom_entries(&mut session, Some("missing")));
+        std::future::poll_fn(|cx| {
+            assert!(
+                scan.as_mut().poll(cx).is_pending(),
+                "a long scan must yield"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let past = platform_time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(platform_time::timeout_at(past, scan).await.is_err());
+        assert!(
+            branch_custom_entries(&mut session, Some("missing"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn custom_entry_scan_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        assert_send(branch_custom_entries(&mut session, None));
+    }
+
+    #[tokio::test]
+    async fn custom_entry_scan_enforces_response_limit_without_truncating() {
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        for _ in 0..2 {
+            session
+                .append_custom_entry(CustomEntry {
+                    custom_type: "large".into(),
+                    data: Some(Value::String("x".repeat(4 * 1024 * 1024))),
+                })
+                .unwrap();
+        }
+        assert!(
+            branch_custom_entries(&mut session, Some("large"))
+                .await
+                .unwrap_err()
+                .contains("8 MiB")
+        );
+        assert!(
+            branch_custom_entries(&mut session, Some("other"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_entry_scan_accepts_exact_response_limit() {
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let id = session.head() + 1;
+        let empty = CustomEntryRecord {
+            id,
+            entry: CustomEntry {
+                custom_type: "boundary".into(),
+                data: Some(Value::String(String::new())),
+            },
+        };
+        let overhead = serde_json::to_vec(&vec![empty]).unwrap().len();
+        session
+            .append_custom_entry(CustomEntry {
+                custom_type: "boundary".into(),
+                data: Some(Value::String("x".repeat(8 * 1024 * 1024 - overhead))),
+            })
+            .unwrap();
+        let entries = branch_custom_entries(&mut session, Some("boundary"))
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&entries).unwrap().len(), 8 * 1024 * 1024);
     }
 
     #[tokio::test]

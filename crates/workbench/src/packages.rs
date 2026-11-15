@@ -225,6 +225,8 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
         let Some(package) = revalidate_cached_package(package) else {
             continue;
         };
+        let upstream_package = !remote(&declaration.source)
+            && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
         for (name, paths, target) in [
             (
                 "extensions",
@@ -241,7 +243,7 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 .as_ref()
                 .map(|value| ResourceFilter::new(value, name))
                 .transpose()?;
-            if !remote(&declaration.source) || inherited.is_some() {
+            if inherited.is_some() || upstream_package {
                 for path in paths {
                     let base = inherited
                         .as_ref()
@@ -261,7 +263,11 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 };
                 filter.apply(paths, &package.root, &base)
             };
-            let enabled = evaluate()?;
+            let enabled = match evaluate() {
+                Ok(enabled) => enabled,
+                Err(_) if !remote(&declaration.source) => break,
+                Err(error) => return Err(error),
+            };
             for (path, enabled) in paths.iter().zip(enabled) {
                 if enabled && !target.contains(path) {
                     target.push(path.clone());
@@ -316,6 +322,42 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
         .into_iter()
         .filter(|entry| entry.transient == transient)
     {
+        let local = !remote(&declaration.source);
+        let source_path = Path::new(&declaration.source);
+        let manifest_root = if local && source_path.is_file() {
+            installed
+                .get(&key(&declaration.source))
+                .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
+                .map(|package| package.root)
+                .unwrap_or_else(|| source_path.to_path_buf())
+        } else {
+            source_path.to_path_buf()
+        };
+        let upstream_package =
+            local && local_startup_manifest(&manifest_root).is_ok_and(|(_, upstream)| upstream);
+        let inspect_prior = local
+            && !upstream_package
+            && declaration.inherited.is_none()
+            && ["extensions", "skills", "prompts"].iter().any(|name| {
+                declaration
+                    .value
+                    .get(name)
+                    .and_then(Value::as_array)
+                    .is_some_and(|patterns| {
+                        patterns.iter().any(|pattern| {
+                            pattern.as_str().is_some_and(|pattern| {
+                                let pattern =
+                                    pattern.strip_prefix(['!', '+', '-']).unwrap_or(pattern);
+                                let pattern = pattern
+                                    .strip_prefix("./")
+                                    .or_else(|| pattern.strip_prefix(".\\"))
+                                    .unwrap_or(pattern);
+                                pattern.starts_with("file://")
+                                    && pi_rs_file_url::to_file_path(pattern).is_err()
+                            })
+                        })
+                    })
+            });
         let package = if !remote(&declaration.source) && !Path::new(&declaration.source).is_file() {
             let root = PathBuf::from(&declaration.source);
             if !root.is_dir() {
@@ -332,9 +374,22 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
                 Ok(themes) => themes,
                 Err(_) => continue,
             };
-            let resources = PackageResources {
-                themes,
-                ..PackageResources::default()
+            let resources = if inspect_prior {
+                let cached = installed
+                    .get(&key(&declaration.source))
+                    .and_then(|value| serde_json::from_value::<Installed>(value.clone()).ok())
+                    .and_then(revalidate_cached_package);
+                let mut resources = match cached {
+                    Some(package) => package.resources,
+                    None => collect_package_resources(&root, pi, Vec::new()).unwrap_or_default(),
+                };
+                resources.themes = themes;
+                resources
+            } else {
+                PackageResources {
+                    themes,
+                    ..PackageResources::default()
+                }
             };
             Installed {
                 source: declaration.source.clone(),
@@ -351,6 +406,29 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
         } else {
             continue;
         };
+        if inspect_prior {
+            let prior = [
+                ("extensions", &package.resources.extensions),
+                ("skills", &package.resources.skills),
+                ("prompts", &package.resources.prompts),
+            ];
+            let mut failed = false;
+            for (name, paths) in prior {
+                let Ok(filter) = ResourceFilter::new(&declaration.value, name) else {
+                    continue;
+                };
+                if filter
+                    .apply(paths, &package.root, &vec![false; paths.len()])
+                    .is_err()
+                {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                continue;
+            }
+        }
         let filter = ResourceFilter::new(&declaration.value, "themes")?;
         let inherited = declaration
             .inherited
@@ -358,7 +436,7 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             .map(|value| ResourceFilter::new(value, "themes"))
             .transpose()?;
         let paths = &package.resources.themes;
-        if !remote(&declaration.source) || inherited.is_some() {
+        if inherited.is_some() || upstream_package {
             for path in paths {
                 let base = inherited
                     .as_ref()
@@ -376,7 +454,11 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             };
             filter.apply(paths, &package.root, &base)
         };
-        let enabled = evaluate()?;
+        let enabled = match evaluate() {
+            Ok(enabled) => enabled,
+            Err(_) if !remote(&declaration.source) => continue,
+            Err(error) => return Err(error),
+        };
         for (path, enabled) in paths.iter().zip(enabled) {
             if enabled && !themes.contains(path) {
                 themes.push(path.clone());
@@ -1175,14 +1257,23 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
     }
     let path = if trimmed.starts_with("file://") {
         pi_rs_file_url::to_file_path(trimmed).map_err(Error::Config)?
-    } else if trimmed == "~" || trimmed.starts_with("~/") {
-        let path = trimmed.strip_prefix("~/").unwrap_or("");
-        PathBuf::from(
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .ok_or_else(|| Error::Config("home directory unavailable".into()))?,
-        )
-        .join(path)
+    } else if trimmed == "~"
+        || trimmed.starts_with("~/")
+        || (cfg!(windows) && trimmed.starts_with("~\\"))
+    {
+        // Package source resolution uses HOME when nonempty, then os.homedir().
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(filter_home_dir)
+            .ok_or_else(|| Error::Config("home directory unavailable".into()))?;
+        let suffix = if trimmed == "~" { "" } else { &trimmed[2..] };
+        let expanded = normalize_filter_home(&home, suffix);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            base.join(expanded)
+        }
     } else {
         base.join(trimmed)
     };
@@ -2226,6 +2317,161 @@ mod tests {
     // A private test subprocess: the child owns a connection until it exits,
     // letting the test observe that exact process without relying on PID reuse.
     #[test]
+    fn local_package_filter_error_stops_later_resource_types() {
+        const CHILD: &str = "PI_RS_LOCAL_FILTER_TEST_DIR";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::local_package_filter_error_stops_later_resource_types",
+                    "--nocapture",
+                ])
+                .env(CHILD, temporary.path())
+                .env("PI_RS_HOME", temporary.path().join("agent"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        use clap::Parser;
+        let directory = PathBuf::from(directory);
+        let agent = config::agent_dir();
+        std::fs::create_dir_all(agent.join("packages")).unwrap();
+        let mut index = serde_json::Map::new();
+        let mut sources = Vec::new();
+        for name in ["first", "second"] {
+            let root = directory.join(name);
+            for subdir in ["skills/demo", "prompts", "themes"] {
+                std::fs::create_dir_all(root.join(subdir)).unwrap();
+            }
+            std::fs::write(root.join("skills/demo/SKILL.md"), "skill").unwrap();
+            std::fs::write(root.join("prompts/demo.md"), "prompt").unwrap();
+            std::fs::write(root.join("themes/demo.json"), "{}").unwrap();
+            let source = normalize(&root.to_string_lossy(), &directory).unwrap();
+            let installed = Installed {
+                source: source.clone(),
+                root: PathBuf::from(&source),
+                version: None,
+                resources: collect_package_resources(&root, &json!({}), Vec::new()).unwrap(),
+            };
+            index.insert(key(&source), serde_json::to_value(installed).unwrap());
+            sources.push(source);
+        }
+        let settings = json!({"packages": [
+            {"source": sources[0], "prompts": ["file:///bad%2Fpath"]},
+            {"source": sources[1]}
+        ]});
+        std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
+        let mut args = Cli::parse_from(["pi", "--no-trust"]);
+        args.workspace = directory.clone();
+        // Before package preparation, theme discovery still honors earlier failures.
+        let themes = startup_themes(&args, false).unwrap();
+        assert_eq!(themes.len(), 1);
+        assert!(themes[0].starts_with(&sources[1]));
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(index.clone()).to_string(),
+        )
+        .unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.skills.len(), 2);
+        assert_eq!(resources.prompts.len(), 1);
+        assert_eq!(resources.themes.len(), 1);
+        assert!(resources.themes[0].starts_with(&sources[1]));
+        assert_eq!(startup_themes(&args, false).unwrap(), themes);
+        // An error while evaluating themes preserves earlier prompt resources.
+        let settings = json!({"packages": [
+            {"source": sources[0], "themes": ["file:///bad%2Fpath"]},
+            {"source": sources[1]}
+        ]});
+        std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.prompts.len(), 2);
+        assert_eq!(resources.themes.len(), 1);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        // Startup must not validate unrelated filters when no file URL is involved.
+        let settings = json!({"packages": [
+            {"source": sources[0], "prompts": ["["]}, {"source": sources[1]}
+        ]});
+        std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        // A prior matching pattern short-circuits the invalid URL.
+        let settings = json!({"packages": [
+            {"source": sources[0], "prompts": ["**", "file:///bad%2Fpath"]},
+            {"source": sources[1]}
+        ]});
+        std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 2);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        let settings = json!({"packages": [
+            {"source": sources[0], "prompts": ["file:///bad%2Fpath"]},
+            {"source": sources[1]}
+        ]});
+        std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
+        // Both paths use cached candidates, even when a file has been deleted.
+        std::fs::remove_file(directory.join("first/prompts/demo.md")).unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        // A file added after installation is not a candidate until preparation.
+        index.get_mut(&key(&sources[0])).unwrap()["resources"]["prompts"] = json!([]);
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("first/prompts/demo.md"), "prompt").unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 2);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        // File sources use the cached package root for the upstream-manifest exclusion.
+        let file_root = directory.join("file-source");
+        std::fs::create_dir_all(file_root.join("themes")).unwrap();
+        std::fs::write(file_root.join("themes/demo.json"), "{}").unwrap();
+        std::fs::write(
+            file_root.join("package.json"),
+            json!({"pi":{"themes":["themes"]}}).to_string(),
+        )
+        .unwrap();
+        let file = file_root.join("extension");
+        std::fs::write(&file, "fixture").unwrap();
+        let source = normalize(&file.to_string_lossy(), &directory).unwrap();
+        let root = normalize(&file_root.to_string_lossy(), &directory).unwrap();
+        let installed = Installed {
+            source: source.clone(),
+            root: PathBuf::from(&root),
+            version: None,
+            resources: PackageResources {
+                themes: vec![PathBuf::from(&root).join("themes/demo.json")],
+                ..PackageResources::default()
+            },
+        };
+        let mut file_index = serde_json::Map::new();
+        file_index.insert(key(&source), serde_json::to_value(installed).unwrap());
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(file_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":source,"themes":["-file:///bad%2Fpath"]}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
+        // Without a cache and without candidates the URL is never evaluated.
+        std::fs::remove_file(agent.join("packages/index.json")).unwrap();
+        std::fs::remove_file(directory.join("first/prompts/demo.md")).unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+    }
+
+    #[test]
     fn package_process_fixture() {
         use std::io::{Read, Write};
         let Ok(role) = std::env::var("PI_PACKAGE_TEST_ROLE") else {
@@ -2956,6 +3202,87 @@ mod tests {
             normalize(" ~/pi-package ", directory.path()).unwrap(),
             normalize("~/pi-package", directory.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn package_source_home_fallback_and_relative_base() {
+        const CHILD: &str = "PI_RS_PACKAGE_HOME_CHILD";
+        if let Some(case) = std::env::var_os(CHILD) {
+            let root = std::env::current_dir()
+                .unwrap()
+                .join("package-home-test-base");
+            let actual = normalize("~/child", &root).unwrap();
+            let expected_home = if case == "relative" {
+                root.join("relative-home")
+            } else if (case == "empty" && cfg!(unix)) || (case != "relative" && cfg!(windows)) {
+                root.clone()
+            } else {
+                filter_home_dir().unwrap()
+            };
+            assert_eq!(
+                actual,
+                resolve_source_path(&expected_home.join("child"))
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            assert_eq!(
+                normalize("~", &root).unwrap(),
+                resolve_source_path(&expected_home)
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            let doubled = normalize("~//child", &root).unwrap();
+            let expected_doubled = if case == "empty" && cfg!(unix) {
+                resolve_source_path(Path::new("/child"))
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                actual.clone()
+            };
+            assert_eq!(doubled, expected_doubled);
+            #[cfg(windows)]
+            {
+                assert_eq!(normalize(r"~\child", &root).unwrap(), actual);
+                assert_eq!(normalize(r"~\\child", &root).unwrap(), actual);
+            }
+            return;
+        }
+        for case in ["relative", "empty", "missing"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "packages::tests::package_source_home_fallback_and_relative_base",
+                    "--nocapture",
+                ])
+                .env(CHILD, case);
+            #[cfg(windows)]
+            command.env(
+                "USERPROFILE",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("package-home-test-base"),
+            );
+            match case {
+                "relative" => {
+                    command.env("HOME", "relative-home");
+                }
+                "empty" => {
+                    command.env("HOME", "");
+                }
+                _ => {
+                    command.env_remove("HOME");
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[cfg(unix)]
