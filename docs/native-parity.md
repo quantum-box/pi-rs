@@ -698,10 +698,14 @@ paths require an explicit absolute base; parent components and non-UTF-8 paths
 are rejected so rendering cannot change the file selected by the host. Hidden
 model-invocation skills remain in the snapshot for explicit use. Reads follow
 symlinks and do not grant later file access; no directories, packages or settings
-are discovered implicitly. Each file is capped at 256 KiB. Read, parse and
-duplicate-name errors fail the entire
-load, unlike Pi's per-file warnings and continuation. Hosts own skill invocation
-and must authorize each later file read independently.
+are discovered implicitly. Hosts can explicitly grant recursive directories;
+scans read local ignore files, skip hidden entries and node_modules, and stop at
+an unignored SKILL.md. Directory grants authorize enumeration and ignore-file
+reads and discovered skill-file contents throughout the granted subtree, including symlink targets outside it; they
+are not a sandbox. Scans bound file, entry, ignore-byte, ignore-line and depth
+counts. Each file is capped at 256 KiB. Read, ignore, parse and duplicate-name
+errors fail the entire load, unlike Pi's per-file warnings and continuation.
+Hosts own skill invocation and must authorize each later file read independently.
 
 Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
 files or direct children of explicitly granted directories. No directories,

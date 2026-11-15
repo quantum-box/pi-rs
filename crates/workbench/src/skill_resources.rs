@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 const MAX_SKILL_FILES: usize = 128;
+const MAX_SKILL_DIRECTORY_ENTRIES: usize = 4096;
+const MAX_SKILL_DIRECTORY_DEPTH: usize = 64;
+const MAX_SKILL_IGNORE_LINES: usize = 16_384;
 const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Exact skill files that the host currently permits this load to read.
@@ -61,6 +64,60 @@ impl SkillReadGrants {
             return Err(Error::Config("skill base must be absolute".into()));
         }
         self.load_inner(Some(base))
+    }
+
+    /// Recursively load explicitly granted absolute skill directories. A
+    /// directory containing an unignored `SKILL.md` is a skill root and its
+    /// descendants are not returned. Only root-level legacy `.md` files are
+    /// included. Hidden entries, `node_modules`, and files ignored by local
+    /// `.gitignore`, `.ignore`, or `.fdignore` are skipped. Ignore files are
+    /// read with file and aggregate limits; malformed rules fail the snapshot.
+    /// A directory grant authorizes enumeration and reading ignore files in its
+    /// subtree, including through symlinks to locations outside the directory.
+    /// Symlinks are followed, and grants are not a filesystem sandbox.
+    pub fn load_with_directories(&self, directories: &[PathBuf]) -> Result<SkillResources> {
+        self.load_directories_inner(directories, None)
+    }
+
+    /// Resolve relative file and directory grants against an explicit absolute
+    /// base before scanning. Parent components remain forbidden.
+    pub fn load_with_directories_and_base(
+        &self,
+        directories: &[PathBuf],
+        base: &Path,
+    ) -> Result<SkillResources> {
+        if !base.is_absolute() {
+            return Err(Error::Config("skill base must be absolute".into()));
+        }
+        self.load_directories_inner(directories, Some(base))
+    }
+
+    fn load_directories_inner(
+        &self,
+        directories: &[PathBuf],
+        base: Option<&Path>,
+    ) -> Result<SkillResources> {
+        if directories.len() > MAX_SKILL_FILES || self.files.len() > MAX_SKILL_FILES {
+            return Err(Error::Config("too many skill paths".into()));
+        }
+        let mut files = self.files.clone();
+        let mut budget = ScanBudget::default();
+        for directory in directories {
+            let root = resolve_grant(directory, base)?;
+            if !std::fs::metadata(&root)?.is_dir() {
+                return Err(Error::Config(format!(
+                    "skill directory is not a directory: {}",
+                    root.display()
+                )));
+            }
+            let mut candidates = scan_skill_directory(&root, &mut budget)?;
+            candidates.sort();
+            if files.len().saturating_add(candidates.len()) > MAX_SKILL_FILES {
+                return Err(Error::Config("too many skill files".into()));
+            }
+            files.extend(candidates);
+        }
+        SkillReadGrants { files }.load_inner(base)
     }
 
     fn load_inner(&self, base: Option<&Path>) -> Result<SkillResources> {
@@ -170,6 +227,164 @@ impl SkillReadGrants {
         }
         Ok(result)
     }
+}
+
+#[derive(Default)]
+struct ScanBudget {
+    entries: usize,
+    ignore_bytes: usize,
+    ignore_lines: usize,
+}
+
+struct IgnoreChain {
+    matcher: ignore::gitignore::Gitignore,
+    parent: Option<std::sync::Arc<IgnoreChain>>,
+}
+
+fn ignored(path: &Path, is_dir: bool, chain: &IgnoreChain) -> bool {
+    let mut current = Some(chain);
+    while let Some(node) = current {
+        match node.matcher.matched(path, is_dir) {
+            ignore::Match::Ignore(_) => return true,
+            ignore::Match::Whitelist(_) => return false,
+            ignore::Match::None => current = node.parent.as_deref(),
+        }
+    }
+    false
+}
+
+fn file_kind(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Config(format!(
+            "cannot inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn scan_skill_directory(root: &Path, budget: &mut ScanBudget) -> Result<Vec<PathBuf>> {
+    use std::sync::Arc;
+    let mut pending: Vec<(PathBuf, Option<Arc<IgnoreChain>>, usize)> =
+        vec![(root.to_owned(), None, 0)];
+    let mut candidates = Vec::new();
+    while let Some((directory, inherited, depth)) = pending.pop() {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&directory);
+        for filename in [".gitignore", ".ignore", ".fdignore"] {
+            let path = directory.join(filename);
+            let text = super::prompt_resources::read_optional(&path).map_err(|error| {
+                Error::Config(format!(
+                    "cannot read ignore file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if let Some(text) = text {
+                budget.ignore_bytes = budget
+                    .ignore_bytes
+                    .checked_add(text.len())
+                    .ok_or_else(|| Error::Config("skill ignore files exceed size limit".into()))?;
+                if budget.ignore_bytes > MAX_TOTAL_BYTES {
+                    return Err(Error::Config("skill ignore files exceed size limit".into()));
+                }
+                for line in text.lines() {
+                    budget.ignore_lines += 1;
+                    if budget.ignore_lines > MAX_SKILL_IGNORE_LINES {
+                        return Err(Error::Config("too many skill ignore rules".into()));
+                    }
+                    if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                        continue;
+                    }
+                    // Pi prefixes nested ignore rules with their directory relative to
+                    // the grant root, so a nested basename is anchored there.
+                    let anchored;
+                    let pattern = line.strip_prefix('!').unwrap_or(line);
+                    let line = if depth > 0
+                        && !pattern.starts_with('#')
+                        && !pattern.trim_end_matches('/').contains('/')
+                        && !pattern.is_empty()
+                    {
+                        anchored = if let Some(negated) = line.strip_prefix('!') {
+                            format!("!/{negated}")
+                        } else {
+                            format!("/{line}")
+                        };
+                        anchored.as_str()
+                    } else {
+                        line
+                    };
+                    builder
+                        .add_line(Some(path.clone()), line)
+                        .map_err(|error| {
+                            Error::Config(format!(
+                                "invalid ignore file {}: {error}",
+                                path.display()
+                            ))
+                        })?;
+                }
+            }
+        }
+        let matcher = builder.build().map_err(|error| {
+            Error::Config(format!(
+                "invalid ignore rules in {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let chain = Arc::new(IgnoreChain {
+            matcher,
+            parent: inherited,
+        });
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            budget.entries += 1;
+            if budget.entries > MAX_SKILL_DIRECTORY_ENTRIES {
+                return Err(Error::Config("too many skill directory entries".into()));
+            }
+            entries.push(entry?);
+        }
+        entries.sort_by_key(|entry| entry.file_name());
+        if let Some(entry) = entries.iter().find(|entry| entry.file_name() == "SKILL.md") {
+            let path = entry.path();
+            if file_kind(&path)?.is_some_and(|metadata| metadata.is_file())
+                && !ignored(&path, false, &chain)
+            {
+                candidates.push(path);
+                if candidates.len() > MAX_SKILL_FILES {
+                    return Err(Error::Config("too many skill files".into()));
+                }
+                continue;
+            }
+        }
+        for entry in entries.into_iter().rev() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            let path = entry.path();
+            let Some(metadata) = file_kind(&path)? else {
+                continue;
+            };
+            let is_dir = metadata.is_dir();
+            if ignored(&path, is_dir, &chain) {
+                continue;
+            }
+            if is_dir {
+                if depth >= MAX_SKILL_DIRECTORY_DEPTH {
+                    return Err(Error::Config("skill directory depth limit exceeded".into()));
+                }
+                pending.push((path, Some(chain.clone()), depth + 1));
+            } else if depth == 0
+                && metadata.is_file()
+                && name.to_str().is_some_and(|value| value.ends_with(".md"))
+            {
+                candidates.push(path);
+                if candidates.len() > MAX_SKILL_FILES {
+                    return Err(Error::Config("too many skill files".into()));
+                }
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 fn resolve_grant(path: &Path, base: Option<&Path>) -> Result<PathBuf> {
