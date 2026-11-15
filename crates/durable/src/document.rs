@@ -57,7 +57,7 @@ impl Address {
         key.extend(serde_json::to_vec(&[&self.scope, &self.name, &self.key])?);
         Ok(key)
     }
-    fn from_storage_key(key: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn from_storage_key(key: &[u8]) -> Result<Self, Error> {
         let [scope, name, key] =
             serde_json::from_slice(key.strip_prefix(PREFIX).ok_or(Error::InvalidDocument)?)?;
         Ok(Self { scope, name, key })
@@ -452,7 +452,7 @@ impl<'a> Documents<'a> {
     pub fn get(&self, address: &Address) -> Result<Option<Document>, Error> {
         Self::decode(self.store.get(&address.storage_key()?)?)
     }
-    fn decode(entry: Option<durable_store::Entry>) -> Result<Option<Document>, Error> {
+    pub(crate) fn decode(entry: Option<durable_store::Entry>) -> Result<Option<Document>, Error> {
         entry
             .map(|entry| {
                 let value = serde_json::from_slice::<Value>(&entry.value)?;

@@ -705,7 +705,7 @@ async fn merged_progress_watch_pages_atomic_commits_and_reopens() {
         terminal.commit_sequence
     );
     let mut invalid = serde_json::to_value(&cursor).unwrap();
-    invalid["version"] = serde_json::json!(2);
+    invalid["version"] = serde_json::json!(3);
     let invalid = serde_json::from_value(invalid).unwrap();
     assert!(h.merged_progress(&invalid, NonZeroUsize::MIN).is_err());
     let mut skipped = serde_json::to_value(&cursor).unwrap();
@@ -743,4 +743,235 @@ async fn merged_progress_rejects_unproven_observation_without_advancing() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn merged_watch_groups_documents_and_replays_deletion_after_reopen() {
+    use pi_rs_durable::{
+        document::{Address, Documents, Transaction},
+        runtime::AdmissionOptions,
+    };
+    use std::num::NonZeroUsize;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("docs.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let id;
+    let address;
+    let saved;
+    {
+        let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        address = Address {
+            scope: id.to_string(),
+            name: "note".into(),
+            key: "a".into(),
+        };
+        let second = Address {
+            key: "b".into(),
+            ..address.clone()
+        };
+        let other = Address {
+            scope: "shared".into(),
+            ..address.clone()
+        };
+        let start = h.merged_progress_from_now(id).unwrap();
+        let mut legacy_json = serde_json::to_value(&start).unwrap();
+        legacy_json["version"] = serde_json::json!(1);
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("document_position");
+        let legacy = serde_json::from_value(legacy_json).unwrap();
+        h.submit_with_documents(
+            id,
+            None,
+            "work".into(),
+            AdmissionOptions::default(),
+            |docs| {
+                for item in [&address, &second, &other] {
+                    docs.get(item)?;
+                }
+                for item in [&address, &second, &other] {
+                    docs.put(
+                        item,
+                        serde_json::json!({"value": 1}).as_object().unwrap().clone(),
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let page = h.merged_progress(&start, NonZeroUsize::MIN).unwrap();
+        assert_eq!(page.frames.len(), 1);
+        let frame = &page.frames[0];
+        assert!(frame.observation.is_some());
+        assert_eq!(frame.documents.len(), 2);
+        assert!(
+            frame
+                .documents
+                .iter()
+                .all(|change| change.document.as_ref().unwrap().value["value"] == 1)
+        );
+        assert_eq!(h.merged_progress(&start, NonZeroUsize::MIN).unwrap(), page);
+        let old_page = h.merged_progress(&legacy, NonZeroUsize::MIN).unwrap();
+        assert!(old_page.frames[0].documents.is_empty());
+        assert!(
+            h.merged_progress(&start, NonZeroUsize::new(257).unwrap())
+                .is_err()
+        );
+        saved = page.next;
+        let store = durable_store::Store::open(&path).unwrap();
+        let version = Documents::new(&store)
+            .get(&address)
+            .unwrap()
+            .unwrap()
+            .version;
+        let mut tx = Transaction::new();
+        tx.delete(&address, version).unwrap();
+        tx.commit(&store).unwrap();
+    }
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let encoded = serde_json::to_vec(&saved).unwrap();
+    let restored = serde_json::from_slice(&encoded).unwrap();
+    let page = h.merged_progress(&restored, NonZeroUsize::MIN).unwrap();
+    assert_eq!(page.frames.len(), 1);
+    assert!(page.frames[0].observation.is_none());
+    assert_eq!(page.frames[0].documents.len(), 1);
+    assert_eq!(page.frames[0].documents[0].address, address);
+    assert!(page.frames[0].documents[0].document.is_none());
+    assert!(
+        h.merged_progress(&page.next, NonZeroUsize::MIN)
+            .unwrap()
+            .frames
+            .is_empty()
+    );
+}
+
+#[test]
+fn merged_document_watch_readers_do_not_skip_concurrent_commits() {
+    use pi_rs_durable::document::{Address, Documents, Transaction};
+    use std::num::NonZeroUsize;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("concurrent.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "note".into(),
+        key: "".into(),
+    };
+    let initial = h.merged_progress_from_now(id).unwrap();
+    let writer_path = path.clone();
+    let writer_address = address.clone();
+    let thread = std::thread::spawn(move || {
+        let store = durable_store::Store::open(writer_path).unwrap();
+        for n in 0..30 {
+            let expected = Documents::new(&store)
+                .get(&writer_address)
+                .unwrap()
+                .map_or(durable_store::Expected::Missing, |doc| {
+                    durable_store::Expected::Version(doc.version)
+                });
+            let mut tx = Transaction::new();
+            tx.put(
+                &writer_address,
+                expected,
+                serde_json::json!({"n":n}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(&store).unwrap();
+        }
+    });
+    let mut cursor = initial.clone();
+    let mut frames = Vec::new();
+    loop {
+        let page = h.merged_progress(&cursor, NonZeroUsize::MIN).unwrap();
+        cursor = page.next;
+        if page.frames.is_empty() {
+            if thread.is_finished() {
+                break;
+            }
+            std::thread::yield_now();
+        } else {
+            frames.extend(page.frames);
+        }
+    }
+    thread.join().unwrap();
+    assert_eq!(frames.len(), 30);
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.documents.len(), 1);
+        assert_eq!(
+            frame.documents[0].document.as_ref().unwrap().value["n"],
+            index
+        );
+    }
+    let again = h
+        .merged_progress(&initial, NonZeroUsize::new(64).unwrap())
+        .unwrap();
+    assert_eq!(again.frames, frames);
+    assert_eq!(again.next, cursor);
+}
+
+#[test]
+fn merged_document_frame_limit_fails_without_consuming_cursor() {
+    use pi_rs_durable::document::{Address, Transaction};
+    use std::num::NonZeroUsize;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let cursor = h.merged_progress_from_now(id).unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let mut tx = Transaction::new();
+    for index in 0..257 {
+        let address = Address {
+            scope: id.to_string(),
+            name: "limit".into(),
+            key: index.to_string(),
+        };
+        tx.put(
+            &address,
+            durable_store::Expected::Missing,
+            serde_json::json!({"v":index}).as_object().unwrap(),
+        )
+        .unwrap();
+    }
+    tx.commit(&store).unwrap();
+    for _ in 0..2 {
+        let error = h.merged_progress(&cursor, NonZeroUsize::MIN).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("document commit exceeds merged watch limits")
+        );
+    }
 }

@@ -1282,6 +1282,14 @@ pub struct MergedProgressCursor {
     after_sequence: u64,
     observation_position: u64,
     progress_position: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document_position: Option<u64>,
+}
+/// One conversation-scoped document's final state in a transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergedDocumentChange {
+    pub address: crate::document::Address,
+    pub document: Option<crate::document::Document>,
 }
 /// Records written in one store transaction. No ordering is implied within a frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -1289,6 +1297,8 @@ pub struct MergedProgressFrame {
     pub commit_sequence: u64,
     pub observation: Option<CommittedViewFrame>,
     pub progress: Option<ProgressHistoryFrame>,
+    /// Final document values, with `None` representing deletion.
+    pub documents: Vec<MergedDocumentChange>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergedProgressPage {
@@ -5390,6 +5400,41 @@ impl Harness {
             .into_iter()
             .next())
     }
+    fn merged_document_record(
+        &self,
+        conversation: Uuid,
+        after: u64,
+    ) -> Result<Option<(u64, u64, Vec<MergedDocumentChange>)>, Error> {
+        let scope = conversation.to_string();
+        let mut encoded = serde_json::to_vec(&[scope])?;
+        if encoded.pop() != Some(b']') {
+            return Err(Error::Invalid("invalid document scope".into()));
+        }
+        encoded.push(b',');
+        let mut prefix = b"durable/document/".to_vec();
+        prefix.extend(encoded);
+        let Some((revision, sequence, changes)) = self
+            .owner
+            .store()
+            .next_scoped_document_commit(&prefix, after)?
+        else {
+            return Ok(None);
+        };
+        let changes = changes
+            .into_iter()
+            .map(|(key, entry)| -> Result<_, Error> {
+                let address = crate::document::Address::from_storage_key(&key)?;
+                if address.scope != conversation.to_string() {
+                    return Err(Error::Invalid("document scope mismatch".into()));
+                }
+                Ok(MergedDocumentChange {
+                    address,
+                    document: crate::document::Documents::decode(entry)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((revision, sequence, changes)))
+    }
     /// Start after a consistent current store boundary. Prior progress is not
     /// backfilled; this is explicit even in stores with no legacy metadata.
     pub fn merged_progress_from_now(
@@ -5406,15 +5451,17 @@ impl Harness {
             let progress = crate::observer::Observer::progress_history(store, conversation)
                 .head()?
                 .0;
+            let document_position = store.document_snapshot()?;
             if before != store.commit_sequence()? {
                 continue;
             }
             let cursor = MergedProgressCursor {
-                version: 1,
+                version: 2,
                 conversation,
                 after_sequence: before,
                 observation_position: observation,
                 progress_position: progress,
+                document_position: Some(document_position),
             };
             self.validate_merged_progress_cursor(&cursor)?;
             return Ok(cursor);
@@ -5424,10 +5471,32 @@ impl Harness {
         ))
     }
     fn validate_merged_progress_cursor(&self, cursor: &MergedProgressCursor) -> Result<(), Error> {
-        if cursor.version != 1 || cursor.after_sequence > self.owner.store().commit_sequence()? {
+        if !matches!(cursor.version, 1 | 2)
+            || (cursor.version == 1 && cursor.document_position.is_some())
+            || (cursor.version == 2 && cursor.document_position.is_none())
+            || cursor.after_sequence > self.owner.store().commit_sequence()?
+        {
             return Err(Error::Invalid("invalid merged progress cursor".into()));
         }
         self.load(cursor.conversation)?;
+        if let Some(position) = cursor.document_position {
+            let (boundary, boundary_sequence) = self.owner.store().document_commit_boundary()?;
+            if position < boundary
+                || cursor.after_sequence < boundary_sequence
+                || position > self.owner.store().document_snapshot()?
+            {
+                return Err(Error::Invalid("invalid document tracking boundary".into()));
+            }
+            if position > boundary
+                && self
+                    .owner
+                    .store()
+                    .document_commit_sequence(position)?
+                    .is_none_or(|sequence| sequence > cursor.after_sequence)
+            {
+                return Err(Error::Invalid("untracked document cursor".into()));
+            }
+        }
         if cursor.observation_position > 0 {
             let last = self
                 .merged_observation(cursor.conversation, cursor.observation_position - 1)?
@@ -5461,12 +5530,20 @@ impl Harness {
             self.merged_observation(cursor.conversation, cursor.observation_position)?;
         let progress =
             self.merged_progress_record(cursor.conversation, cursor.progress_position)?;
+        let documents = cursor
+            .document_position
+            .map(|position| self.merged_document_record(cursor.conversation, position))
+            .transpose()?
+            .flatten();
         if observation
             .as_ref()
             .is_some_and(|(sequence, _)| *sequence <= cursor.after_sequence)
             || progress
                 .as_ref()
                 .is_some_and(|frame| frame.commit_sequence <= cursor.after_sequence)
+            || documents
+                .as_ref()
+                .is_some_and(|(_, sequence, _)| *sequence <= cursor.after_sequence)
         {
             return Err(Error::Invalid(
                 "merged cursor skips a committed record".into(),
@@ -5477,6 +5554,7 @@ impl Harness {
             .map(|v| v.0)
             .into_iter()
             .chain(progress.as_ref().map(|v| v.commit_sequence))
+            .chain(documents.as_ref().map(|(_, sequence, _)| *sequence))
             .min();
         let Some(sequence) = sequence.filter(|sequence| *sequence <= through) else {
             return Ok(None);
@@ -5494,6 +5572,13 @@ impl Harness {
             .inspect(|frame| {
                 next.progress_position = frame.cursor.position;
             });
+        let documents = documents
+            .filter(|(_, seq, _)| *seq == sequence)
+            .map(|(revision, _, changes)| {
+                next.document_position = Some(revision);
+                changes
+            })
+            .unwrap_or_default();
         // Runtime writers commit at most one record per source per transaction.
         // If external writes violate that contract, fail instead of splitting it.
         if observation.is_some()
@@ -5514,6 +5599,7 @@ impl Harness {
                 commit_sequence: sequence,
                 observation,
                 progress,
+                documents,
             },
             next,
         )))

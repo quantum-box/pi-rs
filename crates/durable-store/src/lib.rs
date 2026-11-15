@@ -55,6 +55,7 @@ pub enum Error {
     LockPoisoned,
     VersionExhausted,
     InvalidSnapshot,
+    DocumentFrameTooLarge,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -63,7 +64,11 @@ impl fmt::Display for Error {
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::LockPoisoned => write!(f, "store lock poisoned"),
             Self::VersionExhausted => write!(f, "store version exhausted"),
-            Self::InvalidSnapshot => write!(f, "snapshot is newer than document history"),
+            Self::InvalidSnapshot => write!(
+                f,
+                "snapshot is newer than document history or lacks tracking evidence"
+            ),
+            Self::DocumentFrameTooLarge => write!(f, "document commit exceeds merged watch limits"),
         }
     }
 }
@@ -136,6 +141,13 @@ impl Store {
                   AND NOT EXISTS (SELECT 1 FROM durable_application_history_meta WHERE id=1);
             INSERT OR IGNORE INTO durable_application_history_meta(id,first_revision) SELECT 1,revision FROM durable_document_history_meta WHERE id=1;
             COMMIT;")?;
+        // Forward-only proof of which store transaction wrote each document
+        // revision, including delete-only transactions. Do not backfill.
+        conn.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS durable_document_commit_meta (id INTEGER PRIMARY KEY CHECK(id=1), boundary_revision INTEGER NOT NULL, boundary_sequence INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS durable_document_commit_sequences (revision INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE);
+            INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
+            COMMIT;")?;
         Ok(Self {
             connection: Mutex::new(conn),
         })
@@ -160,6 +172,99 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// Migration boundary after which document revision/commit links are recorded.
+    pub fn document_commit_boundary(&self) -> Result<(u64, u64), Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row("SELECT boundary_revision,boundary_sequence FROM durable_document_commit_meta WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+    /// Commit recorded for a document revision, including deletion-only revisions.
+    pub fn document_commit_sequence(&self, revision: u64) -> Result<Option<u64>, Error> {
+        if revision > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT sequence FROM durable_document_commit_sequences WHERE revision=?1",
+                [revision],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    /// Next complete scoped document revision after a forward-only cursor.
+    /// Missing tracking for a matching revision is an error, not a gap.
+    pub fn next_scoped_document_commit(
+        &self,
+        prefix: &[u8],
+        after: u64,
+    ) -> Result<Option<(u64, u64, Vec<DocumentChange>)>, Error> {
+        if !prefix.starts_with(b"durable/document/") || after > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let current: u64 = conn.query_row(
+            "SELECT revision FROM durable_document_history_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if after > current {
+            return Err(Error::InvalidSnapshot);
+        }
+        let revision: Option<u64> = conn.query_row("SELECT MIN(revision) FROM durable_document_history WHERE substr(key,1,?1)=?2 AND revision>?3", params![prefix.len() as i64, prefix, after], |r| r.get(0))?;
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        let sequence: u64 = conn
+            .query_row(
+                "SELECT sequence FROM durable_document_commit_sequences WHERE revision=?1",
+                [revision],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(Error::InvalidSnapshot)?;
+        let mut stmt = conn.prepare("SELECT key,value,version,length(key),coalesce(length(value),0) FROM durable_document_history WHERE revision=?1 AND substr(key,1,?2)=?3 ORDER BY key LIMIT 257")?;
+        let mut rows = stmt.query(params![revision, prefix.len() as i64, prefix])?;
+        let mut changes = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            if changes.len() == 256 {
+                return Err(Error::DocumentFrameTooLarge);
+            }
+            let key_bytes: usize = row.get(3)?;
+            let value_bytes: usize = row.get(4)?;
+            bytes = bytes
+                .checked_add(key_bytes)
+                .and_then(|n| n.checked_add(value_bytes))
+                .ok_or(Error::DocumentFrameTooLarge)?;
+            if bytes > 8 * 1024 * 1024 {
+                return Err(Error::DocumentFrameTooLarge);
+            }
+            let entry = match (
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<u64>>(2)?,
+            ) {
+                (Some(value), Some(version)) => Some(Entry { value, version }),
+                (None, None) => None,
+                _ => return Err(Error::InvalidSnapshot),
+            };
+            let key: Vec<u8> = row.get(0)?;
+            if let Some(entry) = &entry {
+                let committed: Option<u64> = conn
+                    .query_row(
+                        "SELECT sequence FROM durable_commit_versions WHERE key=?1 AND version=?2",
+                        params![&key, entry.version],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if committed != Some(sequence) {
+                    return Err(Error::InvalidSnapshot);
+                }
+            }
+            changes.push((key, entry));
+        }
+        Ok(Some((revision, sequence, changes)))
     }
 
     /// Commit containing this put, including puts later overwritten or deleted.
@@ -697,6 +802,12 @@ impl Store {
         } else {
             None
         };
+        if let (Some(revision), Some(sequence)) = (revision, sequence) {
+            tx.execute(
+                "INSERT INTO durable_document_commit_sequences(revision,sequence) VALUES(?1,?2)",
+                params![revision, sequence],
+            )?;
+        }
         for mutation in mutations {
             match mutation {
                 Mutation::Put { key, value } => {
@@ -768,6 +879,85 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod document_history_tests {
     use super::*;
+
+    #[test]
+    fn document_commit_tracking_fences_missing_delete_evidence() {
+        let store = Store::memory().unwrap();
+        let (boundary, _) = store.document_commit_boundary().unwrap();
+        let key = b"durable/document/example".to_vec();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: b"{}".to_vec(),
+                }],
+            )
+            .unwrap();
+        let (revision, sequence, puts) = store
+            .next_scoped_document_commit(&key, boundary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            store.document_commit_sequence(revision).unwrap(),
+            Some(sequence)
+        );
+        store
+            .commit(&[], &[Mutation::Delete { key: key.clone() }])
+            .unwrap();
+        let (deleted, delete_sequence, changes) = store
+            .next_scoped_document_commit(&key, revision)
+            .unwrap()
+            .unwrap();
+        assert!(delete_sequence > sequence);
+        assert_eq!(changes, vec![(key.clone(), None)]);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM durable_document_commit_sequences WHERE revision=?1",
+                [deleted],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.next_scoped_document_commit(&key, revision),
+            Err(Error::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn oversized_document_commit_fails_without_partial_frame() {
+        let store = Store::memory().unwrap();
+        let (boundary, _) = store.document_commit_boundary().unwrap();
+        let writes: Vec<_> = (0..257)
+            .map(|i| Mutation::Put {
+                key: format!("durable/document/{i:03}").into_bytes(),
+                value: b"{}".to_vec(),
+            })
+            .collect();
+        store.commit(&[], &writes).unwrap();
+        assert!(matches!(
+            store.next_scoped_document_commit(b"durable/document/", boundary),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+        let store = Store::memory().unwrap();
+        let (boundary, _) = store.document_commit_boundary().unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"durable/document/large".to_vec(),
+                    value: vec![b'x'; 8 * 1024 * 1024],
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.next_scoped_document_commit(b"durable/document/", boundary),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+    }
 
     #[test]
     fn application_revisions_preserve_document_watches_and_conflicts() {

@@ -219,21 +219,29 @@ For an append-only cursor stream use `watch_history` instead; it covers only
 records explicitly included in that observation log.
 
 `merged_progress_from_now` captures a consistent store boundary and returns a
-versioned cursor for conversation observations and forward-only progress.
+versioned cursor for conversation observations, forward-only progress, and
+conversation-scoped application documents.
 `merged_progress` pages complete transactions in store commit order, and
 `watch_merged_progress` polls until a page is available; dropping its future
 cancels that wait without consuming the cursor. Boundary capture retries a
 bounded number of times if commits race with attachment. A frame contains the
-validated observation, progress record, or both when they shared a transaction;
-paging never splits a frame. Persist `next` only after processing the page.
+validated observation, progress record, document changes, or any combination
+written in the same transaction; paging never splits a frame. Persist `next` only after processing the page.
 Attachment explicitly starts after the captured boundary: older overwritten
-progress is never reconstructed. Cursors are scoped to the same database and
-conversation; malformed, untracked and skipped source records fail closed.
-This is a pull stream of root-replacement observations and progress states, not
-upstream's windowed Chord diff stream. Application document commits and
-standalone progress writers are not included. Polling is synchronous, retained
-history and individual records are not globally byte-bounded, and pages contain
-at most 256 frames.
+progress and document-to-commit links are never reconstructed. Version 2 cursors
+include documents starting at attachment; existing version 1 cursors retain their
+observation-and-progress-only behavior. Document scope is the UUID string by
+host convention, not an access-control boundary. Each document change is its
+final state or `None` for deletion, with no original mutation order. Missing
+revision-to-commit evidence, including writes from an older store binary after
+the tracking boundary, fails closed. Documents in one frame are capped at 256
+and 8 MiB of encoded keys and values; oversized commits fail without advancing
+the cursor. Cursors are scoped to the same database and conversation; malformed,
+untracked and skipped source records fail closed. This is a pull stream of
+root-replacement observations, progress and document states, not upstream's
+windowed Chord diffs. Standalone progress writers are not included. Polling is
+synchronous, retained history and observation bytes are not globally bounded,
+and pages contain at most 256 frames.
 
 `progress_history_from_now` captures a versioned, conversation-scoped exclusive
 cursor. `progress_history` and `watch_progress_history` page committed generation
