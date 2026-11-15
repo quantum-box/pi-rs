@@ -73,9 +73,6 @@ impl Settings {
         let user_path = agent_dir().join("settings.json");
         Self::load_from_paths(workspace, trusted, &user_path)
     }
-    pub fn reload(&self, workspace: &Path, trusted: bool) -> Result<Self> {
-        self.reload_with_fallback(workspace, trusted, self)
-    }
     pub(super) fn reload_latest(&self, workspace: &Path, trusted: bool) -> Result<Self> {
         let fallback = self.worker_fallback(workspace, trusted);
         let settings =

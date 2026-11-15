@@ -1854,7 +1854,12 @@ pub(super) fn configured_queue_mode(args: &Cli, key: &str) -> Result<QueueMode> 
     )?)
 }
 pub(super) fn initialize_queue_modes(session: &mut Session, args: &mut Cli) -> Result<Vec<String>> {
-    let settings = args.settings.reload(&args.workspace, args.trusted)?;
+    let fallback = args.settings.worker_fallback(&args.workspace, args.trusted);
+    let settings = args.settings.reload_with_fallback(
+        &args.workspace,
+        args.trusted,
+        fallback.as_ref().unwrap_or(&args.settings),
+    )?;
     initialize_queue_modes_from_settings(session, &settings)?;
     let diagnostics = settings.diagnostics().to_vec();
     args.settings.apply_queue_reload(&settings);

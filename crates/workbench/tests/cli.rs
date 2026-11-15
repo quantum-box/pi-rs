@@ -1406,6 +1406,112 @@ fn new_rpc_session_recovers_queue_settings_per_scope() {
 }
 
 #[test]
+fn new_rpc_session_uses_latest_worker_queue_fallback() {
+    for bad_global in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            home.join("models.json"),
+            r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+        )
+        .unwrap();
+        let user = home.join("settings.json");
+        let local = project.join(".pi/settings.json");
+        std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .env("OPENAI_API_KEY", "test-key")
+            .args([
+                "--trust",
+                "--offline",
+                "--no-mcp",
+                "--no-session",
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && sender.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let request = |input: &mut std::process::ChildStdin, id: &str, kind: &str| {
+            writeln!(input, "{}", json!({"id":id,"type":kind})).unwrap();
+            input.flush().unwrap();
+            loop {
+                let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+                if event["id"] == id {
+                    return event;
+                }
+            }
+        };
+        assert!(request(&mut input, "initial", "get_commands")["success"] == true);
+        std::fs::write(&user, r#"{"steeringMode":"one-at-a-time"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"all"}"#).unwrap();
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"model","type":"set_model","provider":"openai","modelId":"second"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+            if event["id"] == "model" {
+                assert_eq!(event["success"], true, "{event}");
+                break;
+            }
+        }
+        assert!(request(&mut input, "intermediate", "get_commands")["success"] == true);
+        if bad_global {
+            std::fs::write(&user, "{").unwrap();
+            std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        } else {
+            std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+            std::fs::write(&local, "{").unwrap();
+        }
+        assert!(request(&mut input, "new", "new_session")["success"] == true);
+        let state = request(&mut input, "state", "get_state");
+        assert_eq!(
+            state["data"]["steeringMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        assert_eq!(
+            state["data"]["followUpMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        drop(input);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        reader.join().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("Invalid settings file"), "{stderr}");
+    }
+}
+
+#[test]
 fn switching_rpc_sessions_keeps_last_good_skill_settings() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
