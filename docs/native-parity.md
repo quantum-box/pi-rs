@@ -4666,6 +4666,11 @@ timed-out inspection falls back to the existing transient classification. Provid
 returned. Bedrock typed SDK errors and non-chat operations retain their separate
 policies.
 
+Native SDK hosts can inspect the configured base system prompt with
+`AgentSession::configured_system_prompt`. Forks copy that value. This accessor
+does not run extension hooks and is not Pi's effective `systemPrompt`; hooks may
+modify individual requests after the configured prompt is read.
+
 ### Native SDK prompt resource factory
 
 `pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
