@@ -4459,6 +4459,8 @@ pinning the catalog's default endpoint.
 
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.
+Redacted Bedrock reasoning emits Pi's fixed placeholder once per block while
+retaining the opaque payload for replay.
 Signed and redacted reasoning is replayed in its original order only when the
 provider, model, text and tool calls still match, including the journal's
 normalization of malformed arguments. For application inference profile ARNs
