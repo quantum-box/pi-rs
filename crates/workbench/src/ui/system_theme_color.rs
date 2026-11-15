@@ -34,6 +34,8 @@ const LAB_LMS: M = [
     [1., -0.1055613458156586, -0.0638541728258133],
     [1., -0.0894841775298119, -1.2914855480194092],
 ];
+// Retain the source constants verbatim to make the upstream conversion auditable.
+#[allow(clippy::excessive_precision)]
 const LMS_RGB: M = [
     [4.0767416360759583, -3.3077115392580629, 0.2309699031821043],
     [-1.2684379732850315, 2.6097573492876882, -0.341319376002657],
