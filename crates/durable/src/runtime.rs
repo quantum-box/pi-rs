@@ -1094,6 +1094,140 @@ fn terminate_tool_round(c: &mut Conversation) -> Result<Phase, Error> {
     })
 }
 
+/// Read-only readiness of a persisted conversation, independent of live workers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversationWake {
+    Ready,
+    /// Parked until a future Unix-millisecond deadline, or an external event.
+    Parked {
+        at: Option<i64>,
+    },
+    /// Persisted state alone cannot determine whether execution can proceed.
+    Unknown,
+}
+
+/// Inspect one persisted conversation without executing or changing it.
+///
+/// This is a best-effort observation, not an atomic reservation: conversation,
+/// signal and child reads may race commits, including from another store handle.
+/// Recheck when acting on it. It excludes running workers, independent summaries,
+/// task scheduling, and recovery or availability of external handlers.
+pub fn conversation_wake(
+    store: &durable_store::Store,
+    id: Uuid,
+    now_millis: i64,
+) -> Result<ConversationWake, Error> {
+    use ConversationWake::{Parked, Ready, Unknown};
+    let entry = store.get(&Harness::key(id))?.ok_or(Error::NotFound)?;
+    let c: Conversation = serde_json::from_slice(&entry.value)?;
+    if c.id != id {
+        return Err(Error::Invalid("conversation identity mismatch".into()));
+    }
+    let tasks = crate::task_store::TaskStore::new(store);
+    if c.abort_requested {
+        // Abort can require cancellation of owned or nested work; the stored
+        // conversation alone does not prove that cleanup has drained.
+        return Ok(Unknown);
+    }
+    let deadline = |at: i64| {
+        if now_millis >= at {
+            Ready
+        } else {
+            Parked { at: Some(at) }
+        }
+    };
+    Ok(match &c.phase {
+        Phase::Idle => {
+            if c.active.is_some()
+                || !c.pending_resets.is_empty()
+                || c.submissions.iter().any(|s| s.status == Status::Queued)
+            {
+                Ready
+            } else {
+                Parked { at: None }
+            }
+        }
+        Phase::Blocked { .. } if c.nested_resume.is_some() => Unknown,
+        Phase::FailedIdle | Phase::Blocked { .. } => Parked { at: None },
+        Phase::RetryWait { .. } => match c.retry_state.deadline_ms {
+            Some(at) if at <= i64::MAX as u64 => deadline(at as i64),
+            _ => Unknown,
+        },
+        Phase::ToolGateSleeping {
+            until_millis,
+            signals,
+            ..
+        } => {
+            if crate::conversation_signal::Inbox::new(store)
+                .prepare_wake(id, signals, *until_millis, now_millis)?
+                .is_some()
+            {
+                Ready
+            } else {
+                Parked { at: *until_millis }
+            }
+        }
+        Phase::YieldTasksWaiting { children, .. } | Phase::HookTasksWaiting { children, .. } => {
+            let mut all_terminal = true;
+            for child in children {
+                let task = tasks
+                    .load(*child)
+                    .map_err(|e| Error::Invalid(format!("task load: {e}")))?
+                    .ok_or_else(|| Error::Invalid(format!("missing hook child: {child}")))?;
+                if task.task.owner() != &crate::task::TaskOwner::Conversation(id) {
+                    return Err(Error::Invalid("hook child owner mismatch".into()));
+                }
+                all_terminal &= task.task.is_terminal();
+            }
+            if all_terminal {
+                Ready
+            } else {
+                Parked { at: None }
+            }
+        }
+        Phase::TaskPending {
+            task, operation_id, ..
+        } => {
+            let child = tasks
+                .load(*task)
+                .map_err(|e| Error::Invalid(format!("task load: {e}")))?
+                .ok_or_else(|| Error::Invalid("task-backed tool task missing".into()))?;
+            if task != operation_id
+                || child.task.owner() != &crate::task::TaskOwner::Conversation(id)
+            {
+                return Err(Error::Invalid("task-backed tool owner mismatch".into()));
+            }
+            // Adapter identity must still be checked by the executor.
+            if child.task.is_terminal() {
+                Unknown
+            } else {
+                Parked { at: None }
+            }
+        }
+        Phase::ModelRunning { .. }
+        | Phase::CompactionRunning { .. }
+        | Phase::ToolRunning { .. }
+        | Phase::Pending { .. } => Unknown,
+        Phase::ModelReady { .. }
+        | Phase::AbandonedModel { .. }
+        | Phase::FailedModel { .. }
+        | Phase::CompactionHook { .. }
+        | Phase::CompactionReady { .. }
+        | Phase::CompactionAbandoned { .. }
+        | Phase::CompactionAccounting { .. }
+        | Phase::CompactionPlacement { .. }
+        | Phase::Accounting { .. }
+        | Phase::Boundary { .. }
+        | Phase::OnYield { .. }
+        | Phase::YieldDecision { .. }
+        | Phase::AfterTools { .. }
+        | Phase::AfterRun { .. }
+        | Phase::Tools { .. }
+        | Phase::ToolPreparing { .. }
+        | Phase::ToolFinished { .. } => Ready,
+    })
+}
+
 impl Conversation {
     /// Whether a replay-safe keyed tool explicitly suspended on pending
     /// nested jobs. An abort keeps the suspension visible until reconciled.
@@ -20794,3 +20928,7 @@ mod document_fork_retry_tests {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "conversation_wake_tests.rs"]
+mod conversation_wake_tests;

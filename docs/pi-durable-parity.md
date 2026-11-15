@@ -395,6 +395,17 @@ writes are outside that protocol. Satisfied waits with blocked definitions do no
 cleanup candidates may still depend on conversations. Fail-fast sibling cleanup
 is not independently represented. See [snapshot tests](../crates/durable/tests/task_wake_snapshot.rs).
 
+**Conversation readiness:** `runtime::conversation_wake(store, id, now)` reads a
+persisted conversation without driving it or consuming signals. It distinguishes
+ready, parked with an optional future deadline, and unknown. Retry and tool-gate
+deadlines, pending signals, and all-terminal hook children are inspected; failed
+idle and blocked phases remain parked. Running operations, external pending work,
+abort cleanup, nested recovery, and terminal task-backed tools with unchecked
+adapter identity are unknown. This is a phase-level hint, not upstream's combined
+`wake()` or `onWake`: it omits worker activity, task scheduling, independent
+summaries, and handler availability. Reads across records are not an atomic
+snapshot; callers must recheck before acting. See [tests](../crates/durable/src/conversation_wake_tests.rs).
+
 Nested pending-job reconciliation is a pi-rs host API with a narrower boundary
 than upstream's nested task scheduler. A host can record a verified terminal
 result or confirmed cancellation against the exact persisted operation and
