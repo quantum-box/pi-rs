@@ -70,6 +70,21 @@ fn synthetic_command_source(command: &pi_rs::RegisteredCommand) -> serde_json::V
     }
 }
 
+fn discovered_resource_source(item: &pi_rs::ExtensionResources, registry: &Registry) -> String {
+    if let Some(name) = item.source.as_ref().and_then(|path| path.file_name()) {
+        let name = name.to_string_lossy();
+        let name = name
+            .strip_suffix(".ts")
+            .or_else(|| name.strip_suffix(".js"))
+            .unwrap_or(&name);
+        format!("extension:{name}")
+    } else if registry.extension_source_is_builtin(&item.extension_id) {
+        format!("extension:builtin:{}", item.extension_id)
+    } else {
+        format!("extension:inline:{}", item.extension_id)
+    }
+}
+
 impl Runtime {
     pub fn share_base(&self) -> super::sessions::ShareContext {
         super::sessions::ShareContext {
@@ -135,13 +150,7 @@ impl Runtime {
         let mut discovered = pi_rs::DiscoveredResources::default();
         let mut origins = ResourceOrigins::default();
         for item in results {
-            let source = item
-                .source
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| item.extension_id.clone());
-            let source = format!("extension:{source}");
+            let source = discovered_resource_source(&item, &self.registry);
             let base_dir = item
                 .source
                 .as_deref()
@@ -1008,6 +1017,44 @@ mod resource_origin_tests {
         assert_eq!(
             synthetic_command_source(inline),
             json!({"path":"<inline:custom>", "source":"inline", "scope":"temporary", "origin":"top-level"})
+        );
+    }
+
+    #[test]
+    fn discovered_resource_sources_distinguish_inline_builtin_and_files() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(pi_rs_extensions::Notes))
+            .unwrap();
+        registry.register(Arc::new(InlineCommand)).unwrap();
+        let mut item = pi_rs::ExtensionResources {
+            extension_id: "custom".into(),
+            source: None,
+            resources: Default::default(),
+        };
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:inline:custom"
+        );
+        item.extension_id = "notes".into();
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:builtin:notes"
+        );
+        item.source = Some("/extensions/example.ts".into());
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:example"
+        );
+        item.source = Some("/extensions/example.js".into());
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:example"
+        );
+        item.source = Some("/extensions/native.exe".into());
+        assert_eq!(
+            discovered_resource_source(&item, &registry),
+            "extension:native.exe"
         );
     }
 

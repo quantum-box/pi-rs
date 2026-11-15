@@ -411,6 +411,8 @@ remain in progress.
 `get_commands` identifies discovered skills and prompt templates with their
 extension source, temporary scope, resolved file path, and executable base
 directory. Resource provenance in other surfaces remains in progress.
+Discovered resources identify inline and built-in extensions separately as
+`extension:inline:<id>` and `extension:builtin:<id>`.
 Extension-provided relative paths resolve from the session working directory;
 home-relative paths and local file URLs are accepted. A missing resource is
 reported without preventing other discovered resources from loading.
