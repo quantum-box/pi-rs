@@ -1125,6 +1125,13 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
         }
         if let Some(check) = documents.checks.iter_mut().find(|c| c.key == other.key) {
             let expected = match (&check.expected, &other.expected) {
+                (Expected::Missing, Expected::MissingBefore(deadline))
+                | (Expected::MissingBefore(deadline), Expected::Missing) => {
+                    Expected::MissingBefore(*deadline)
+                }
+                (Expected::MissingBefore(a), Expected::MissingBefore(b)) => {
+                    Expected::MissingBefore((*a).min(*b))
+                }
                 (Expected::Version(a), Expected::VersionBefore(b, deadline))
                 | (Expected::VersionBefore(b, deadline), Expected::Version(a))
                     if a == b =>
@@ -1297,7 +1304,10 @@ impl Transaction {
         };
         if batch.checks.iter().any(|check| {
             graph_key(&check.key)
-                && check.expected == Expected::Missing
+                && matches!(
+                    check.expected,
+                    Expected::Missing | Expected::MissingBefore(_)
+                )
                 && ((self.checked.contains(&check.key)
                     && writes.contains(&check.key)
                     && !self.written.contains(&check.key))
@@ -1382,12 +1392,13 @@ impl Transaction {
 }
 
 /// A store-bound checked host transaction with provisional typed deliveries.
-/// It supports multiple typed deliveries and an explicit typed-signal wake;
-/// arbitrary task writes for delivery targets remain excluded.
+/// It supports multiple typed deliveries and an explicit typed-signal wake.
+/// Deliveries evaluate task and signal writes already staged in the transaction.
 pub struct HostTransaction<'a> {
     store: &'a Store,
     transaction: Transaction,
     signal_targets: HashSet<Vec<u8>>,
+    wake_targets: HashSet<Vec<u8>>,
     signals: StagedSignals,
 }
 impl<'a> HostTransaction<'a> {
@@ -1396,6 +1407,7 @@ impl<'a> HostTransaction<'a> {
             store,
             transaction: Transaction::new(),
             signal_targets: HashSet::new(),
+            wake_targets: HashSet::new(),
             signals: StagedSignals::new(),
         }
     }
@@ -1410,8 +1422,8 @@ impl<'a> HostTransaction<'a> {
     pub fn delete(&mut self, address: &Address, version: u64) -> Result<(), Error> {
         self.transaction.delete(address, version)
     }
-    /// Compose another checked batch. Writes to signal namespaces or a
-    /// signalled task are rejected; use `signal_at` for typed deliveries.
+    /// Compose a checked batch. Raw signal namespace writes and later writes
+    /// to already-signalled tasks are rejected.
     pub fn append(&mut self, batch: OwnedBatch) -> Result<(), Error> {
         if batch.mutations.iter().any(|mutation| {
             let key = match mutation {
@@ -1425,9 +1437,8 @@ impl<'a> HostTransaction<'a> {
         }
         self.transaction.append(batch)
     }
-    /// Stage typed deliveries. Results remain provisional until commit.
-    /// Raw target task writes cannot be composed in either order; the
-    /// supported transition is `wake_with_signal`.
+    /// Stage typed deliveries after candidate task and signal writes. Results
+    /// remain provisional until commit; later target writes are rejected.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1437,12 +1448,25 @@ impl<'a> HostTransaction<'a> {
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
         let target = crate::task_store::key(task_id);
-        if self.transaction.written.contains(&target) {
+        if self.wake_targets.contains(&target) {
             return Err(Error::SignalComposition);
         }
-        let result = self
-            .signals
-            .signal_at(self.store, task_id, token, key, value, now_millis, None)?;
+        let candidate = self
+            .transaction
+            .mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::Put { key, value } if *key == target => {
+                    Some(serde_json::from_slice(value).map(Some))
+                }
+                Mutation::Delete { key } if *key == target => Some(Ok(None)),
+                _ => None,
+            })
+            .transpose()?;
+        let mutations = self.signals.batch.mutations.clone();
+        let result = self.signals.signal_at_overlay(
+            self.store, task_id, token, key, value, now_millis, None, candidate, &mutations,
+        )?;
         self.signal_targets.insert(target);
         Ok(result)
     }
@@ -1492,6 +1516,7 @@ impl<'a> HostTransaction<'a> {
         transaction.append(graph)?;
         self.signals.batch = signals;
         self.transaction = transaction;
+        self.wake_targets.insert(target.clone());
         self.signal_targets.insert(target);
         Ok(())
     }
@@ -1505,6 +1530,14 @@ impl<'a> HostTransaction<'a> {
             mutations: Vec::new(),
         };
         reconcile_task_checks(&mut self.signals.batch, &mut existing);
+        // Candidate task writes already carry the reconciled pre-commit
+        // check. Do not re-append a Missing check for the same task creation:
+        // Transaction normally rejects independently prepared graph adoption.
+        self.signals.batch.checks.retain(|check| {
+            !(self.signal_targets.contains(&check.key)
+                && self.transaction.written.contains(&check.key)
+                && existing.checks.iter().any(|old| old == check))
+        });
         self.transaction.checks = existing.checks;
         self.transaction.append(self.signals.batch)?;
         self.transaction.commit(self.store)
@@ -1567,6 +1600,32 @@ impl StagedSignals {
         now_millis: i64,
         invocation: Option<&crate::task::Task>,
     ) -> Result<crate::task_store::SignalResult, Error> {
+        self.signal_at_overlay(
+            store,
+            task_id,
+            token,
+            key,
+            value,
+            now_millis,
+            invocation,
+            None,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signal_at_overlay(
+        &mut self,
+        store: &Store,
+        task_id: uuid::Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+        invocation: Option<&crate::task::Task>,
+        candidate: Option<Option<crate::task::Task>>,
+        mutations: &[Mutation],
+    ) -> Result<crate::task_store::SignalResult, Error> {
         let identity = (task_id, token.name().to_owned(), key.to_owned());
         if let Some(previous) = self.keys.get(&identity).copied() {
             match previous {
@@ -1605,8 +1664,15 @@ impl StagedSignals {
         let target = crate::task_store::key(task_id);
         let tasks = crate::task_store::TaskStore::new(store);
         let (result, mut batch, equivalent_version) = loop {
-            let (result, batch) =
-                tasks.prepare_signal_at(task_id, token, key, value.clone(), || now_millis)?;
+            let (result, batch) = tasks.prepare_signal_at_overlay(
+                task_id,
+                token,
+                key,
+                value.clone(),
+                || now_millis,
+                candidate.clone(),
+                mutations,
+            )?;
             let Some(task) = invocation.filter(|task| {
                 task.id() == task_id
                     && task.state() == &crate::task::TaskState::Running
@@ -1676,6 +1742,13 @@ impl StagedSignals {
                 && let Some(existing) = self.batch.checks.iter_mut().find(|c| c.key == check.key)
             {
                 existing.expected = match (&existing.expected, &check.expected) {
+                    (Expected::Missing, Expected::MissingBefore(deadline))
+                    | (Expected::MissingBefore(deadline), Expected::Missing) => {
+                        Expected::MissingBefore(*deadline)
+                    }
+                    (Expected::MissingBefore(a), Expected::MissingBefore(b)) => {
+                        Expected::MissingBefore((*a).min(*b))
+                    }
                     (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
                         Expected::VersionBefore(*a, (*x).min(*y))
                     }
@@ -2378,6 +2451,32 @@ mod nested_entry_tests {
     }
 
     #[test]
+    fn host_overlay_reads_existing_staged_signal_mutation() {
+        use crate::task_store::{SignalResult, SignalToken};
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let target = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        ts.save(&[Save::Create(&target)]).unwrap();
+        let token = SignalToken::new("answer", 1).unwrap();
+        let (status, prepared) = ts
+            .prepare_signal_at(target.id(), &token, "a", json!(1), || 0)
+            .unwrap();
+        assert_eq!(status, SignalResult::Delivered);
+        let mut host = HostTransaction::new(&db);
+        host.signals.batch = prepared;
+        assert_eq!(
+            host.signal_at(target.id(), &token, "a", json!(2), 0)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        host.commit().unwrap();
+        assert_eq!(
+            ts.read_typed_signal(target.id(), &token, "a").unwrap(),
+            Some(json!(1))
+        );
+    }
+
+    #[test]
     fn racing_child_observations_conflict_and_preserve_deadlines() {
         let db = Store::memory().unwrap();
         let store = TaskStore::new(&db);
@@ -2567,10 +2666,16 @@ mod nested_entry_tests {
     #[test]
     fn transaction_rejects_cross_component_missing_edge_in_both_orders() {
         let key = crate::ownership_edge::edge_key(Uuid::from_u128(7));
-        for write_first in [false, true] {
+        for (write_first, timed) in [(false, false), (true, false), (false, true), (true, true)] {
             let check = Check {
                 key: key.clone(),
-                expected: Expected::Missing,
+                expected: if timed {
+                    Expected::MissingBefore(
+                        std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    )
+                } else {
+                    Expected::Missing
+                },
             };
             let read = || OwnedBatch {
                 checks: vec![check.clone()],

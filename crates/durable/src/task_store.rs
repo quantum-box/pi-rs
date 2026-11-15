@@ -769,14 +769,33 @@ impl<'a> TaskStore<'a> {
         token: &SignalToken,
         key_text: &str,
         value: Value,
+        now: impl FnMut() -> i64,
+    ) -> Result<(SignalResult, OwnedBatch), Error> {
+        self.prepare_signal_at_overlay(task_id, token, key_text, value, now, None, &[])
+    }
+
+    /// Prepare against the transaction's candidate target and signal writes,
+    /// while retaining checks against the original committed records.
+    pub(crate) fn prepare_signal_at_overlay(
+        &self,
+        task_id: Uuid,
+        token: &SignalToken,
+        key_text: &str,
+        value: Value,
         mut now: impl FnMut() -> i64,
+        candidate: Option<Option<Task>>,
+        mutations: &[Mutation],
     ) -> Result<(SignalResult, OwnedBatch), Error> {
         let clock_start = std::time::Instant::now();
-        let target = self.load(task_id)?;
+        let stored = self.load(task_id)?;
+        let target = candidate.unwrap_or_else(|| stored.as_ref().map(|item| item.task.clone()));
+        if target.as_ref().is_some_and(|task| task.id() != task_id) {
+            return Err(Error::InvalidKey);
+        }
         let mut batch = OwnedBatch {
             checks: vec![Check {
                 key: key(task_id),
-                expected: target
+                expected: stored
                     .as_ref()
                     .map_or(Expected::Missing, |t| Expected::Version(t.version)),
             }],
@@ -785,8 +804,7 @@ impl<'a> TaskStore<'a> {
         let Some(target) = target else {
             return Ok((SignalResult::NotFound, batch));
         };
-        if target.task.is_terminal() || target.task.abort_requested() || target.task.is_completing()
-        {
+        if target.is_terminal() || target.abort_requested() || target.is_completing() {
             return Ok((SignalResult::Closed, batch));
         }
         if key_text.is_empty() {
@@ -804,8 +822,29 @@ impl<'a> TaskStore<'a> {
             key: revision_key.clone(),
             expected: revision.map_or(Expected::Missing, |e| Expected::Version(e.version)),
         });
-        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
-            let old: Signal = serde_json::from_slice(&entry.value)?;
+        let prefix = signal_task_prefix(task_id);
+        let mut receipts: std::collections::BTreeMap<Vec<u8>, Signal> = self
+            .store
+            .list(&prefix)?
+            .into_iter()
+            .map(|(key, entry)| Ok((key, serde_json::from_slice(&entry.value)?)))
+            .collect::<Result<_, Error>>()?;
+        for mutation in mutations {
+            match mutation {
+                Mutation::Put { key, value } if key.starts_with(&prefix) => {
+                    let candidate: Signal = serde_json::from_slice(value)?;
+                    if candidate.task_id != task_id || *key != signal_key(task_id, candidate.id) {
+                        return Err(Error::InvalidKey);
+                    }
+                    receipts.insert(key.clone(), candidate);
+                }
+                Mutation::Delete { key } if key.starts_with(&prefix) => {
+                    receipts.remove(key);
+                }
+                _ => (),
+            }
+        }
+        for old in receipts.values() {
             if old.typed_key() == signal.typed_key() {
                 return Ok((
                     if old.expired {
@@ -817,7 +856,7 @@ impl<'a> TaskStore<'a> {
                 ));
             }
         }
-        let deadline = match target.task.state() {
+        let deadline = match target.state() {
             TaskState::Waiting(WaitFor::TypedSleep {
                 until_millis: Some(deadline),
                 signals,
@@ -835,7 +874,11 @@ impl<'a> TaskStore<'a> {
             let boundary = clock_start
                 .checked_add(std::time::Duration::from_millis(remaining))
                 .unwrap_or(clock_start);
-            batch.checks[0].expected = Expected::VersionBefore(target.version, boundary);
+            batch.checks[0].expected = stored
+                .as_ref()
+                .map_or(Expected::MissingBefore(boundary), |item| {
+                    Expected::VersionBefore(item.version, boundary)
+                });
         }
         signal.expired = expired;
         let receipt_key = signal_key(task_id, receipt_id);

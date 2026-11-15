@@ -184,10 +184,10 @@ fn host_signal_deadline_and_overlapping_task_writes_fail_closed() {
     let graph = ts.prepare_save(&[Save::Update(&task)]).unwrap();
     let mut before = HostTransaction::new(&store);
     before.append(graph).unwrap();
-    assert!(matches!(
-        before.signal_at(id, &token(), "a", json!(1), 0),
-        Err(Error::SignalComposition)
-    ));
+    assert_eq!(
+        before.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Closed
+    );
     let mut after = HostTransaction::new(&store);
     after.signal_at(id, &token(), "a", json!(1), 0).unwrap();
     let graph = ts.prepare_save(&[Save::Update(&task)]).unwrap();
@@ -1055,5 +1055,215 @@ fn host_wakes_committed_signal_and_scheduler_resumes_after_reopen() {
     assert!(scheduler.tick(0).unwrap());
     assert!(
         matches!(scheduler.get(id).unwrap().unwrap().state(), TaskState::Succeeded(value) if *value == json!("resumed"))
+    );
+}
+
+#[test]
+fn candidate_task_signals_commit_together_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("candidate.db");
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let task = Task::new(
+        Uuid::from_u128(44),
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    let mut tx = HostTransaction::new(&store);
+    tx.append(ts.prepare_save(&[Save::Create(&task)]).unwrap())
+        .unwrap();
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "a", json!(2), 0).unwrap(),
+        SignalResult::Duplicate
+    );
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "b", json!(3), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.commit().unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    assert!(ts.load(task.id()).unwrap().is_some());
+    assert_eq!(
+        ts.read_typed_signal(task.id(), &token(), "a").unwrap(),
+        Some(json!(1))
+    );
+    assert_eq!(
+        ts.read_typed_signal(task.id(), &token(), "b").unwrap(),
+        Some(json!(3))
+    );
+}
+
+#[test]
+fn candidate_terminal_and_abort_override_stored_live_task() {
+    for abort in [false, true] {
+        let store = Store::memory().unwrap();
+        let id = setup(&store, None);
+        let ts = TaskStore::new(&store);
+        let mut candidate = ts.load(id).unwrap().unwrap();
+        if abort {
+            let mut encoded = serde_json::to_value(&candidate.task).unwrap();
+            encoded["abort_requested"] = json!(true);
+            candidate.task = serde_json::from_value(encoded).unwrap();
+        } else {
+            candidate.task.cancel().unwrap();
+        }
+        let mut tx = HostTransaction::new(&store);
+        tx.append(ts.prepare_save(&[Save::Update(&candidate)]).unwrap())
+            .unwrap();
+        assert_eq!(
+            tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+            SignalResult::Closed
+        );
+        tx.commit().unwrap();
+        assert_eq!(ts.read_typed_signal(id, &token(), "a").unwrap(), None);
+        assert!(
+            ts.load(id).unwrap().unwrap().task.abort_requested()
+                || ts.load(id).unwrap().unwrap().task.is_terminal()
+        );
+    }
+}
+
+#[test]
+fn candidate_created_deadline_conflict_rolls_back_everything() {
+    let store = Store::memory().unwrap();
+    let ts = TaskStore::new(&store);
+    let mut task = Task::new(
+        Uuid::from_u128(45),
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    task.start().unwrap();
+    task.wait(WaitFor::TypedSleep {
+        until_millis: Some(1_000),
+        signals: vec![token().key("a").unwrap()],
+    })
+    .unwrap();
+    let mut tx = HostTransaction::new(&store);
+    tx.append(ts.prepare_save(&[Save::Create(&task)]).unwrap())
+        .unwrap();
+    put(&mut tx, 1);
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(matches!(
+        tx.commit(),
+        Err(Error::Store(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(ts.load(task.id()).unwrap().is_none());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    assert_eq!(
+        ts.read_typed_signal(task.id(), &token(), "a").unwrap(),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_signal_kill_fixture() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_CANDIDATE_SIGNAL_DB") else {
+        return;
+    };
+    let store = Store::open(path).unwrap();
+    let ts = TaskStore::new(&store);
+    let task = Task::new(
+        Uuid::from_u128(46),
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    let mut tx = HostTransaction::new(&store);
+    tx.append(ts.prepare_save(&[Save::Create(&task)]).unwrap())
+        .unwrap();
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "b", json!(2), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.commit().unwrap();
+    println!("CANDIDATE_SIGNAL_COMMITTED");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_signal_survives_process_kill() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        time::Duration,
+    };
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "candidate_signal_kill_fixture", "--nocapture"])
+            .env("PI_CANDIDATE_SIGNAL_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let output = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if line.unwrap().contains("CANDIDATE_SIGNAL_COMMITTED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("candidate transaction did not commit");
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let id = Uuid::from_u128(46);
+    assert!(ts.load(id).unwrap().is_some());
+    assert_eq!(
+        ts.read_typed_signal(id, &token(), "a").unwrap(),
+        Some(json!(1))
+    );
+    assert_eq!(
+        ts.read_typed_signal(id, &token(), "b").unwrap(),
+        Some(json!(2))
     );
 }

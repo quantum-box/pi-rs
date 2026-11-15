@@ -9,7 +9,7 @@
 pub mod controls;
 pub mod owner;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     fmt,
     path::Path,
@@ -36,6 +36,8 @@ pub struct Check {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expected {
     Missing,
+    /// Key must remain absent and the monotonic deadline must not elapse.
+    MissingBefore(Instant),
     Version(u64),
     /// Version must match and the monotonic deadline must not have elapsed.
     VersionBefore(u64, Instant),
@@ -1094,6 +1096,7 @@ impl Store {
                 .optional()?;
             let matches = match check.expected {
                 Expected::Missing => version.is_none(),
+                Expected::MissingBefore(deadline) => version.is_none() && Instant::now() < deadline,
                 Expected::Version(v) => version == Some(v),
                 Expected::DocumentRevision(revision) => {
                     let current: u64 = tx.query_row(
@@ -1406,7 +1409,9 @@ impl Store {
         // Recheck time after assembling writes, while still holding the write lock.
         // A failure drops the transaction and rolls back every mutation.
         for check in checks {
-            if let Expected::VersionBefore(_, deadline) = check.expected {
+            if let Expected::VersionBefore(_, deadline) | Expected::MissingBefore(deadline) =
+                check.expected
+            {
                 if Instant::now() >= deadline {
                     return Err(Error::Conflict {
                         key: check.key.clone(),
