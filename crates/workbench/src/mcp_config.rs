@@ -16,6 +16,9 @@ pub enum McpCommand {
         name: String,
         #[arg(short = 'l', long)]
         local: bool,
+        /// Maximum time in seconds for OAuth sign-in.
+        #[arg(long, default_value = "300")]
+        timeout: f64,
         /// Pre-registered client ID. Omit for dynamic registration.
         #[arg(long)]
         client_id: Option<String>,
@@ -505,11 +508,18 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
         McpCommand::Login {
             name,
             local,
+            timeout,
             client_id,
             client_secret_env,
             client_metadata_url,
             scopes,
         } => {
+            let timeout = std::time::Duration::try_from_secs_f64(timeout)
+                .ok()
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| {
+                    Error::Config("--timeout must be a positive number of seconds".into())
+                })?;
             let path = path(args, local);
             let document = config::read_object(&path)?;
             let value = document.get("mcpServers").and_then(|servers| servers.get(&name))
@@ -546,39 +556,44 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 |url: &str| output(json!({"type":"mcp_authorization","name":name,"url":url}));
             let server_oauth = server.oauth.clone();
             let http_options = super::http_proxy::configured_mcp(&args.settings)?;
-            if let Some(metadata_url) = client_metadata_url {
-                pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options(
-                    &name,
-                    url,
-                    &metadata_url,
-                    &scopes,
-                    Some(&http_options),
-                    announce,
-                )
-                .await?;
-            } else if client_id.is_none() && server.oauth_client().is_some() {
-                pi_rs_workbench::mcp_auth::login_configured_with_http_options(
-                    &name,
-                    url,
-                    server.oauth_client(),
-                    None,
-                    &scopes,
-                    Some(&http_options),
-                    announce,
-                )
-                .await?;
-            } else {
-                pi_rs_workbench::mcp_auth::login_with_secret_with_http_options(
-                    &name,
-                    url,
-                    client_id.as_deref(),
-                    client_secret.as_deref(),
-                    &scopes,
-                    Some(&http_options),
-                    announce,
-                )
-                .await?;
-            }
+            tokio::time::timeout(timeout, async {
+                if let Some(metadata_url) = client_metadata_url {
+                    pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options(
+                        &name,
+                        url,
+                        &metadata_url,
+                        &scopes,
+                        Some(&http_options),
+                        announce,
+                    )
+                    .await?;
+                } else if client_id.is_none() && server.oauth_client().is_some() {
+                    pi_rs_workbench::mcp_auth::login_configured_with_http_options(
+                        &name,
+                        url,
+                        server.oauth_client(),
+                        None,
+                        &scopes,
+                        Some(&http_options),
+                        announce,
+                    )
+                    .await?;
+                } else {
+                    pi_rs_workbench::mcp_auth::login_with_secret_with_http_options(
+                        &name,
+                        url,
+                        client_id.as_deref(),
+                        client_secret.as_deref(),
+                        &scopes,
+                        Some(&http_options),
+                        announce,
+                    )
+                    .await?;
+                }
+                Ok::<(), Error>(())
+            })
+            .await
+            .map_err(|_| Error::Config("MCP login timed out".into()))??;
             config::update_object(&path, |document| {
                 let server = document
                     .get_mut("mcpServers")

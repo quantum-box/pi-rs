@@ -9,6 +9,43 @@ use pi_rs::{
 };
 use serde_json::{Value, json};
 
+#[tokio::test]
+async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let config = json!({"mcpServers":{"fixture":{"url":server}}}).to_string();
+    std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let run = |timeout: &str| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["mcp", "login", "fixture", "--timeout", timeout]);
+        command
+    };
+    for invalid in ["0", "-1", "NaN", "inf"] {
+        let output = run(invalid).output().await.unwrap();
+        assert!(!output.status.success(), "accepted {invalid}");
+    }
+    let child = run("0.5").kill_on_drop(true).spawn().unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP login timed out"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
+        config
+    );
+    assert!(!root.path().join("mcp-auth").exists());
+}
+
 #[test]
 fn mcp_add_saves_stdio_and_http_options() {
     let root = tempfile::tempdir().unwrap();
