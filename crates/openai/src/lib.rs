@@ -1869,6 +1869,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn constrained_summary_sends_strict_tools_without_session_cache() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let end = loop {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+                if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + length {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let req = request();
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Require,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(true)
+                .with_session_cache_key("prior-session");
+        let _ = model
+            .stream_detailed_summary_with_tool_declarations(
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                req,
+                &[declaration],
+            )
+            .await;
+        let body = server.join().unwrap();
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
     async fn sdk_constrained_responses_request_sends_strict_schema() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
