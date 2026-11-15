@@ -411,7 +411,9 @@ async fn nested_results_validate_before_return_and_do_not_repeat_after_reopen() 
                 let seen = observed.lock().unwrap();
                 match mode {
                     0 => {
-                        assert!(matches!(&seen[0],Outcome::Structured { data,.. } if data["value"]==7))
+                        assert!(
+                            matches!(&seen[0],Outcome::Structured { data,.. } if data["value"]==7)
+                        )
                     }
                     1 | 2 => assert!(
                         matches!(&seen[0],Outcome::Failed(reason) if reason.contains("invalid_structured_output"))
