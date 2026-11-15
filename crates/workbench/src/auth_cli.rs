@@ -186,6 +186,8 @@ async fn resolve(
         if gateway.model_endpoint().as_str() == endpoint {
             let access = if no_refresh {
                 gateway.cached_access().await?
+            } else if wanted == Some(AuthType::OAuth) {
+                gateway.access_with_minimum(minimum).await?
             } else {
                 gateway.access(minimum).await?
             };

@@ -227,6 +227,21 @@ impl Gateway {
             .map(|(token, _)| token))
     }
 
+    pub(super) async fn access_with_minimum(
+        &self,
+        min_validity: Duration,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .access_with_login_at_before_barrier(
+                auth_path(),
+                min_validity.max(Duration::from_secs(300)),
+                true,
+                || {},
+            )
+            .await?
+            .map(|(token, _)| token))
+    }
+
     pub(super) async fn access_with_login(
         &self,
         min_validity: Duration,
@@ -238,6 +253,17 @@ impl Gateway {
         &self,
         path: PathBuf,
         min_validity: Duration,
+    ) -> Result<Option<(String, String)>> {
+        self.access_with_login_at_before_barrier(path, min_validity, false, || {})
+            .await
+    }
+
+    async fn access_with_login_at_before_barrier(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+        require_minimum: bool,
+        before_barrier: impl FnOnce() + Send + 'static,
     ) -> Result<Option<(String, String)>> {
         let value = super::config::read_auth_object(&path).await?;
         let Some(credential) = self.credential_from_value(&value)? else {
@@ -258,9 +284,12 @@ impl Gateway {
             return Ok(Some(credential.access()));
         }
         let gateway = self.clone();
+        let cancellation = RefreshCancellation::new();
+        let state = cancellation.0.clone();
         tokio::task::spawn_blocking(move || {
             let _radius_guard = radius_guard;
-            let _barrier = super::process::refresh_barrier()?;
+            before_barrier();
+            let _barrier = RefreshCancellation::enter(&state)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -291,6 +320,11 @@ impl Gateway {
                 data.insert("radius".into(), serde_json::to_value(&refreshed)?);
                 Ok(())
             })?;
+            if require_minimum && refreshed.expires <= now().saturating_add(min_validity) {
+                return Err(Error::Config(
+                    "Refreshed Radius credential expires too soon".into(),
+                ));
+            }
             Ok(Some(refreshed.access()))
         })
         .await
@@ -473,6 +507,36 @@ impl Gateway {
             scope: token.scope.or(prior_scope),
             login_id: Some(login_id),
         })
+    }
+}
+
+// Dropping the caller cancels a queued exchange, but an admitted exchange
+// owns the refresh and its locks until the rotated credential is persisted.
+struct RefreshCancellation(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl RefreshCancellation {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+
+    fn enter(state: &std::sync::atomic::AtomicU8) -> Result<super::process::RefreshBarrier> {
+        use std::sync::atomic::Ordering;
+        let barrier =
+            super::process::refresh_barrier_cancellable(|| state.load(Ordering::SeqCst) == 2)?
+                .ok_or(Error::Cancelled)?;
+        state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::Cancelled)?;
+        Ok(barrier)
+    }
+}
+
+impl Drop for RefreshCancellation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -660,6 +724,102 @@ mod tests {
                 .contains("refresh_token=fixture-refresh")
         );
     }
+    // The barrier is deliberately held while the asynchronous caller is cancelled;
+    // only the blocking worker waits for this synchronous guard.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cancelled_queued_refresh_never_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let original = serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string();
+        std::fs::write(&path, &original).unwrap();
+        let barrier = super::super::process::stop_new_refreshes();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn({
+            let path = path.clone();
+            async move {
+                gateway
+                    .access_with_login_at_before_barrier(path, Duration::ZERO, false, || {
+                        let _ = started.send(());
+                    })
+                    .await
+            }
+        });
+        // The blocking worker has started and owns auth.json, but the barrier
+        // prevents admission until after cancellation.
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        drop(barrier);
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::auth_lock::acquire_async(&path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_rotated_token_and_checks_explicit_validity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for require_minimum in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin =
+                Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+                stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            });
+            let gateway = Gateway::build(origin, &[], None).unwrap();
+            let result = gateway
+                .access_with_login_at_before_barrier(
+                    path.clone(),
+                    Duration::from_secs(300),
+                    require_minimum,
+                    || {},
+                )
+                .await;
+            if require_minimum {
+                assert!(result.unwrap_err().to_string().contains("expires too soon"));
+            } else {
+                assert_eq!(result.unwrap().unwrap().0, "new");
+            }
+            server.await.unwrap();
+            let stored = super::super::config::read_auth_object(&path).await.unwrap();
+            assert_eq!(stored["radius"]["refresh"], "rotated");
+            assert_eq!(stored["radius"]["access"], "new");
+        }
+    }
+
     #[tokio::test]
     async fn rotating_refresh_holds_shared_store_lock_until_persisted() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

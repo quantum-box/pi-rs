@@ -39,6 +39,12 @@ pub enum McpCommand {
         #[arg(long)]
         url: Option<String>,
         #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
         bearer_token_env_var: Option<String>,
         /// Authenticate with credentials saved by mcp login.
         #[arg(long)]
@@ -375,6 +381,9 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             name,
             local,
             url,
+            cwd,
+            headers,
+            description,
             bearer_token_env_var,
             oauth,
             exposure,
@@ -398,8 +407,42 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             } else {
                 json!({"command":command[0],"args":command[1..]})
             };
+            if let Some(cwd) = cwd {
+                if value.get("command").is_none() {
+                    return Err(Error::Config("--cwd requires a stdio server".into()));
+                }
+                value["cwd"] = json!(cwd);
+            }
+            if let Some(description) = description {
+                value["description"] = json!(description);
+            }
+            if !headers.is_empty() {
+                if value.get("url").is_none() {
+                    return Err(Error::Config("--header requires an HTTP server".into()));
+                }
+                let mut map = serde_json::Map::new();
+                for item in headers {
+                    let (name, header_value) = item
+                        .split_once('=')
+                        .filter(|(name, _)| !name.is_empty())
+                        .ok_or_else(|| Error::Config("--header expects NAME=VALUE".into()))?;
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| Error::Config("invalid MCP header name".into()))?;
+                    http::header::HeaderValue::from_str(header_value)
+                        .map_err(|_| Error::Config("invalid MCP header value".into()))?;
+                    map.insert(name.as_str().into(), json!(header_value));
+                }
+                value["headers"] = Value::Object(map);
+            }
             if oauth {
-                if value.get("url").is_none() || bearer_token_env_var.is_some() {
+                if value.get("url").is_none()
+                    || bearer_token_env_var.is_some()
+                    || value["headers"].as_object().is_some_and(|headers| {
+                        headers
+                            .keys()
+                            .any(|name| name.eq_ignore_ascii_case("authorization"))
+                    })
+                {
                     return Err(Error::Config(
                         "--oauth requires --url and cannot use --bearer-token-env-var".into(),
                     ));
@@ -417,7 +460,25 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 {
                     return Err(Error::Config("invalid token environment variable".into()));
                 }
-                value["headers"] = json!({"Authorization":format!("Bearer ${{{variable}}}")});
+                let headers = value
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("headers")
+                    .or_insert_with(|| json!({}));
+                let headers = headers.as_object_mut().unwrap();
+                if headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(Error::Config(
+                        "--bearer-token-env-var cannot be combined with an Authorization header"
+                            .into(),
+                    ));
+                }
+                headers.insert(
+                    "Authorization".into(),
+                    json!(format!("Bearer ${{{variable}}}")),
+                );
             }
             if !environment.is_empty() {
                 let mut env = serde_json::Map::new();

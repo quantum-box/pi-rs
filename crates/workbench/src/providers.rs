@@ -579,6 +579,9 @@ impl Client {
                     .stream(request)
                     .await
             }
+            Self::OpenAi(client) if cache_disabled => {
+                client.clone().without_cache().stream(request).await
+            }
             Self::Anthropic(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
             }
@@ -909,7 +912,11 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
+                let (supports_long, explicit_cache) = args
+                    .model_profiles
+                    .responses_cache_support(&args.provider, metadata.as_ref());
                 let client = client
+                    .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_thinking(thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
