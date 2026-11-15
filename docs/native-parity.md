@@ -2998,6 +2998,7 @@ errors and restricted workspace path checks retain their existing behavior.
 The model-facing `write` and `edit` success messages now match Pi and preserve
 the requested path spelling. On Unix, unrestricted local `edit` checks read and
 write access before replacing the file and reports Pi's `EACCES` diagnostic.
+On Windows, a read-only file attribute is rejected before matching edits.
 As with Pi, this check does not prevent external permission or pathname changes
 afterward. The edit result journals its bounded unified patch
 and first changed line separately from model-facing text. The terminal uses

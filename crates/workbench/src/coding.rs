@@ -1340,6 +1340,22 @@ fn local_edit_access(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn unix_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.raw_os_error() {
+        Some(libc::EACCES) => "EACCES",
+        Some(libc::ENOENT) => "ENOENT",
+        Some(libc::ENOTDIR) => "ENOTDIR",
+        Some(libc::ELOOP) => "ELOOP",
+        Some(libc::EROFS) => "EROFS",
+        Some(libc::EPERM) => "EPERM",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
 fn open_local_edit_file(path: &Path) -> Result<std::fs::File> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(Error::Config("expected a regular file".into()));
@@ -2636,19 +2652,13 @@ impl CodingTool {
         check_mutation_cancelled(cancellation)?;
         let display_path = string(args, "path")?;
         let path = self.path(display_path).map_err(|error| match error {
+            #[cfg(unix)]
+            Error::Io(cause) if self.unrestricted => unix_edit_access_error(cause, display_path),
             Error::Io(ref cause)
                 if self.unrestricted && cause.kind() == std::io::ErrorKind::NotFound =>
             {
                 Error::Config(format!(
                     "Could not edit file: {display_path}. Error code: ENOENT."
-                ))
-            }
-            #[cfg(unix)]
-            Error::Io(ref cause)
-                if self.unrestricted && cause.raw_os_error() == Some(libc::EACCES) =>
-            {
-                Error::Config(format!(
-                    "Could not edit file: {display_path}. Error code: EACCES."
                 ))
             }
             error => error,
@@ -2657,15 +2667,14 @@ impl CodingTool {
         check_mutation_cancelled(cancellation)?;
         #[cfg(unix)]
         if self.unrestricted {
-            local_edit_access(&path).map_err(|error| match error.raw_os_error() {
-                Some(libc::EACCES) => Error::Config(format!(
-                    "Could not edit file: {display_path}. Error code: EACCES."
-                )),
-                Some(libc::ENOENT) => Error::Config(format!(
-                    "Could not edit file: {display_path}. Error code: ENOENT."
-                )),
-                _ => error.into(),
-            })?;
+            local_edit_access(&path)
+                .map_err(|error| unix_edit_access_error(error, display_path))?;
+        }
+        #[cfg(windows)]
+        if self.unrestricted && std::fs::metadata(&path)?.permissions().readonly() {
+            return Err(Error::Config(format!(
+                "Could not edit file: {display_path}. Error code: EACCES."
+            )));
         }
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
@@ -4543,6 +4552,55 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_formats_unix_access_codes() {
+        for (errno, code) in [
+            (libc::EROFS, "EROFS"),
+            (libc::ENOTDIR, "ENOTDIR"),
+            (libc::ELOOP, "ELOOP"),
+        ] {
+            assert!(
+                matches!(unix_edit_access_error(std::io::Error::from_raw_os_error(errno), "name"),
+                Error::Config(message) if message == format!("Could not edit file: name. Error code: {code}."))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn edit_rejects_windows_readonly_file_before_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"missing","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
     }
 
     #[cfg(unix)]
