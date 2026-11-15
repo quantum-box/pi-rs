@@ -336,11 +336,31 @@ pub(crate) fn lease_children(
     >,
     crate::runtime::Error,
 > {
+    lease_children_for_resume(store, root, tools, true)
+}
+
+pub(crate) fn lease_children_for_resume(
+    store: &durable_store::Store,
+    root: Uuid,
+    tools: &std::collections::HashMap<String, RegisteredTool>,
+    require_identity: bool,
+) -> Result<
+    Result<
+        Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>,
+        crate::nested_identity::LeaseFailure,
+    >,
+    crate::runtime::Error,
+> {
     let mut leases = Vec::new();
+    let mut any = false;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        any = true;
         let record: Record = serde_json::from_slice(&entry.value)?;
         let Some(identity) = record.durable_identity.as_deref() else {
-            return Ok(Err(crate::nested_identity::LeaseFailure::Mismatch));
+            if require_identity {
+                return Ok(Err(crate::nested_identity::LeaseFailure::Mismatch));
+            }
+            continue;
         };
         let Some(reg) = tools.get(&record.name) else {
             return Ok(Err(crate::nested_identity::LeaseFailure::Mismatch));
@@ -354,32 +374,11 @@ pub(crate) fn lease_children(
         };
         leases.push(lease);
     }
-    if leases.is_empty() {
+    if !any {
         Ok(Err(crate::nested_identity::LeaseFailure::Mismatch))
     } else {
         Ok(Ok(leases))
     }
-}
-
-pub(crate) fn children_identity_busy(
-    store: &durable_store::Store,
-    root: Uuid,
-    tools: &std::collections::HashMap<String, RegisteredTool>,
-) -> Result<bool, crate::runtime::Error> {
-    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
-        let record: Record = serde_json::from_slice(&entry.value)?;
-        if let (Some(identity), Some(reg)) =
-            (record.durable_identity.as_deref(), tools.get(&record.name))
-        {
-            if matches!(
-                crate::nested_identity::checked_lease(&reg.tool, identity),
-                Err(crate::nested_identity::LeaseFailure::Busy)
-            ) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 // Automatic replay is restricted to a root with only terminal records and at

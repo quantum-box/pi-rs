@@ -456,6 +456,12 @@ enum DispatchIdentity {
     Other,
     Task(crate::task_tool::Identity),
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NestedResumeDecision {
+    Ready,
+    Busy,
+    NotReady,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum PreparedKeyedVersion {
@@ -9749,12 +9755,12 @@ impl Harness {
         }
         Ok(Some((continuation, children, handlers)))
     }
-    fn prepare_nested_resume(&self, c: &mut Conversation) -> Result<bool, Error> {
+    fn prepare_nested_resume(&self, c: &mut Conversation) -> Result<NestedResumeDecision, Error> {
         if c.abort_requested {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         }
         let Some(resume) = c.nested_resume.clone() else {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         };
         let Phase::Blocked {
             tool_panicked: false,
@@ -9766,44 +9772,76 @@ impl Harness {
             ..
         } = c.phase.clone()
         else {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         };
         if operation_id != resume.operation_id
             || (resume.unsafe_park.is_none()
                 && resume.restarts.saturating_add(1) >= self.options.restart_limit)
         {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         }
         let Some(call) = calls.get(index) else {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         };
         if !model_tool_selected(c, &call.name) {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         }
         let tools = self.resolved_tools(c)?;
         let Some(reg) = tools.get(&call.name) else {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         };
-        let unsafe_park = resume.unsafe_park.as_ref().is_some_and(|proof| {
-            resume.explicit_suspend
+        let _parent_lease = if let Some(proof) = resume.unsafe_park.as_ref() {
+            if !(resume.explicit_suspend
                 && resume.pending_wake.is_some()
                 && proof.attempt.operation_id == operation_id
                 && !proof.attempt.attempt_id.is_nil()
                 && c.tool_attempt() == Some(proof.attempt)
-                && reg.replay == ReplayPolicy::Unsafe
-                && crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref()
-                    == Some(&proof.identity)
-        });
+                && reg.replay == ReplayPolicy::Unsafe)
+            {
+                return Ok(NestedResumeDecision::NotReady);
+            }
+            let lease =
+                match crate::nested_identity::checked_lease(&reg.tool, &proof.identity.identity) {
+                    Ok(lease) => lease,
+                    Err(crate::nested_identity::LeaseFailure::Busy) => {
+                        return Ok(NestedResumeDecision::Busy);
+                    }
+                    Err(crate::nested_identity::LeaseFailure::Mismatch) => {
+                        return Ok(NestedResumeDecision::NotReady);
+                    }
+                };
+            if crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref() != Some(&proof.identity)
+            {
+                return Ok(NestedResumeDecision::NotReady);
+            }
+            Some(lease)
+        } else {
+            None
+        };
+        let unsafe_park = resume.unsafe_park.is_some();
         let safe_replay = resume.unsafe_park.is_none() && reg.replay == ReplayPolicy::Safe;
-        if !crate::nested::children_match(self.owner.store(), operation_id, &tools, unsafe_park)?
-            || !(unsafe_park || safe_replay)
+        if !(unsafe_park || safe_replay)
             || dispatch_identity(&reg.tool).ok() != Some(resume.dispatch_identity.clone())
             || (resume.explicit_suspend
                 && crate::nested::has_staged_results(self.owner.store(), operation_id)?)
             || !crate::nested::resolved_for_replay(self.owner.store(), operation_id)?
         {
-            return Ok(false);
+            return Ok(NestedResumeDecision::NotReady);
         }
+        let _child_leases = match crate::nested::lease_children_for_resume(
+            self.owner.store(),
+            operation_id,
+            &tools,
+            unsafe_park,
+        )? {
+            Ok(leases) => leases,
+            Err(crate::nested_identity::LeaseFailure::Busy) => {
+                return Ok(NestedResumeDecision::Busy);
+            }
+            Err(crate::nested_identity::LeaseFailure::Mismatch) => {
+                return Ok(NestedResumeDecision::NotReady);
+            }
+        };
         // An unsafe parked invocation ended normally. Merely waking or
         // recovering before its next claim is not an interrupted execution.
         let next_restarts = if unsafe_park {
@@ -9831,7 +9869,7 @@ impl Harness {
             replay_ready: true,
             dispatch_identity: Some(resume.dispatch_identity),
         };
-        Ok(true)
+        Ok(NestedResumeDecision::Ready)
     }
     fn consume_independent_summary(
         &mut self,
@@ -10070,16 +10108,23 @@ impl Harness {
                     continue;
                 }
             }
-            if self.prepare_nested_resume(&mut c)? {
-                match self.save(&c, Expected::Version(version)) {
-                    Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
-                    Err(error) => return Err(error),
-                    Ok(()) => {
-                        #[cfg(test)]
-                        stop_at_unsafe_park_boundary("wake-saved", &c);
+            match self.prepare_nested_resume(&mut c)? {
+                NestedResumeDecision::Ready => {
+                    match self.save(&c, Expected::Version(version)) {
+                        Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
+                        Err(error) => return Err(error),
+                        Ok(()) => {
+                            #[cfg(test)]
+                            stop_at_unsafe_park_boundary("wake-saved", &c);
+                        }
                     }
+                    continue;
                 }
-                continue;
+                NestedResumeDecision::Busy => {
+                    *identity_busy = true;
+                    return Ok(());
+                }
+                NestedResumeDecision::NotReady => (),
             }
             match c.phase.clone() {
                 Phase::Idle => {
@@ -16156,10 +16201,17 @@ async fn poll_suspended_nested(
     }
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
-        if crate::nested::children_identity_busy(worker.owner.store(), *operation_id, &tools)? {
-            return Ok(true);
-        }
-        return worker.prepare_nested_resume(&mut state.clone());
+        #[cfg(test)]
+        unsafe_park_boundary_tests::checkpoint(id, "before-final-resume").await;
+        return match worker.prepare_nested_resume(&mut state.clone())? {
+            NestedResumeDecision::Ready => Ok(true),
+            NestedResumeDecision::Busy => {
+                #[cfg(test)]
+                unsafe_park_boundary_tests::checkpoint(id, "final-resume-busy").await;
+                Ok(true)
+            }
+            NestedResumeDecision::NotReady => Ok(false),
+        };
     }
     let mut polls = Vec::new();
     for job in jobs {

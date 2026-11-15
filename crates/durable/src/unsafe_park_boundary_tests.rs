@@ -401,6 +401,105 @@ async fn suspended_poll_retries_busy_parent_and_child_without_worker_lock() {
     }
 }
 
+#[tokio::test]
+async fn final_resume_retries_parent_and_child_busy_after_last_child_settles() {
+    for mode in ["unsafe-parent", "unsafe-child", "safe-child"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = if mode == "safe-child" {
+            ReplayPolicy::Safe
+        } else {
+            ReplayPolicy::Unsafe
+        };
+        let (opts, parent, child) = options_with_handles(root, 1, false, policy);
+        let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let before_poll = install(id, "before-suspended-poll");
+        let final_check = install(id, "before-final-resume");
+        let busy = install(id, "final-resume-busy");
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), before_poll.reached.notified())
+            .await
+            .unwrap();
+        let operation = scheduler.blocked(id).unwrap().unwrap().0;
+        let store = scheduler.harness.owner.store();
+        let (_, conversation_version) = scheduler.harness.load(id).unwrap();
+        let job = crate::nested::pending_polls(store, operation)
+            .unwrap()
+            .pop()
+            .unwrap();
+        job.commit(
+            store,
+            Harness::key(id),
+            conversation_version,
+            Outcome::Succeeded("result".into()),
+            &Default::default(),
+        )
+        .unwrap();
+        before_poll.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), final_check.reached.notified())
+            .await
+            .unwrap();
+        let old_attempt = scheduler.conversation(id).unwrap().tool_attempt();
+        let target = if mode == "unsafe-parent" {
+            parent
+        } else {
+            child
+        };
+        let identity = if mode == "unsafe-parent" {
+            "test-parent/tenant-a"
+        } else {
+            "test-backend:child:v1"
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(target.update(Some(identity.into()), || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        final_check.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), busy.reached.notified())
+            .await
+            .unwrap();
+        let lock = scheduler
+            .harness
+            .owner
+            .conversation_controls()
+            .get(id)
+            .worker;
+        let guard = tokio::time::timeout(Duration::from_secs(2), lock.lock())
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            scheduler.conversation(id).unwrap().tool_attempt(),
+            old_attempt,
+            "{mode}"
+        );
+        assert_eq!(count(root, "wake-effects"), 0, "{mode}");
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap().is_ok());
+        busy.release.notify_one();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none(), "{mode}");
+        assert_eq!(count(root, "child-effects"), 1, "{mode}");
+        assert_eq!(count(root, "wake-effects"), 1, "{mode}");
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
 fn strip_pending_identity(scheduler: &Scheduler, id: Uuid) {
     let operation = scheduler.blocked(id).unwrap().unwrap().0;
     let store = scheduler.harness.owner.store();

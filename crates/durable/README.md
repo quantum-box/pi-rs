@@ -441,6 +441,9 @@ On resume, the parent and all child allocations are pinned from claim through
 the checked result commit, even if the extension registry is replaced.
 Older executors do not enforce these new preparation proofs and must not resume
 records written by this implementation.
+The final resume decision after the last child settles also distinguishes a
+temporarily busy identity from a mismatch, and retries without redispatching the
+settled child.
 The standalone `Harness` does not run a background timer; its caller must
 drive it again after an identity becomes available.
 The committed checkpoint and original attempt identity fence the park; a new
