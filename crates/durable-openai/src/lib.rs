@@ -6,7 +6,9 @@ use pi_rs_core::{
     Error, Message, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{
+    DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt, ProviderResultRequest,
+};
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
@@ -19,8 +21,17 @@ pub struct OpenAiResponsesAdapter {
     client: Client,
     endpoint: Url,
     token: String,
+    model_inputs: pi_rs_durable::tool_projection::ModelInputs,
 }
 impl OpenAiResponsesAdapter {
+    /// Override the bundled model image profile using an upstream-shaped descriptor.
+    pub fn set_model_descriptor(
+        &mut self,
+        model: impl Into<String>,
+        descriptor: &Value,
+    ) -> Result<()> {
+        self.model_inputs.insert(model, descriptor)
+    }
     /// Accept HTTPS or numeric-loopback HTTP. The caller controls the endpoint and token.
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         let endpoint =
@@ -52,6 +63,7 @@ impl OpenAiResponsesAdapter {
             client,
             endpoint,
             token,
+            model_inputs: Default::default(),
         })
     }
 }
@@ -200,15 +212,21 @@ fn durable_payload(durable: &DurableRequest) -> Result<Value> {
     Ok(body)
 }
 
-fn tool_payload(request: &DurableToolRequest) -> Result<Value> {
+fn result_payload(
+    request: &ProviderResultRequest,
+    profile: Option<pi_rs_durable::images::ModelImageProfile>,
+) -> Result<Value> {
+    use pi_rs_durable::tool_projection::{self, Block};
     request.validate_bindings()?;
-    let mut body = durable_payload(&request.request)?;
+    let request = tool_projection::project_request(request, profile);
+    let tool = &request.request;
+    let mut body = durable_payload(&tool.request)?;
     let input = body["input"]
         .as_array_mut()
         .ok_or_else(|| Error::Config("invalid input".into()))?;
-    for (&index, binding) in &request.tool_blocks {
-        let Message::Tool { call_id, .. } = &request.request.request.messages[index] else {
-            unreachable!()
+    for (index, message) in tool.request.request.messages.iter().enumerate() {
+        let Message::Tool { call_id, .. } = message else {
+            continue;
         };
         let positions: Vec<_> = input
             .iter()
@@ -221,16 +239,32 @@ fn tool_payload(request: &DurableToolRequest) -> Result<Value> {
         if positions.len() != 1 {
             return Err(Error::Config("ambiguous tool result call ID".into()));
         }
-        let mut sample = request.request.request.clone();
-        sample.messages = vec![Message::User {
-            content: String::new(),
-        }];
-        let user = DurableRequest {
-            request: sample,
-            blocks: [(0, binding.clone())].into_iter().collect(),
+        let mut texts = Vec::new();
+        let mut images = Vec::new();
+        for block in tool_projection::blocks(tool, index, true)? {
+            match block {
+                Block::Text(text) => texts.push(text),
+                Block::Image { image, detail } => images.push((image, detail)),
+            }
+        }
+        let text = texts.join("\n");
+        let output = if images.is_empty() {
+            json!(if tool_projection::has_text(&text) {
+                text.as_str()
+            } else {
+                "(no tool output)"
+            })
+        } else {
+            let mut values = Vec::new();
+            if tool_projection::has_text(&text) {
+                values.push(json!({"type":"input_text","text":text}));
+            }
+            for (image, detail) in images {
+                values.push(json!({"type":"input_image","detail":detail.as_deref().unwrap_or("auto"),"image_url":format!("data:{};base64,{}",image.mime_type,image.data)}));
+            }
+            json!(values)
         };
-        let encoded = durable_payload(&user)?;
-        input[positions[0]]["output"] = encoded["input"][0]["content"].clone();
+        input[positions[0]]["output"] = output;
     }
     Ok(body)
 }
@@ -265,6 +299,43 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl ProviderAdapter for OpenAiResponsesAdapter {
+    fn id(&self) -> &str {
+        "openai-responses-api/v1"
+    }
+    fn image_profile(&self, model: &str) -> Option<pi_rs_durable::images::ModelImageProfile> {
+        self.model_inputs.profile(self.id(), model)
+    }
+    fn supports_tool_result_metadata(&self) -> bool {
+        true
+    }
+    async fn prepare_with_result_metadata(
+        &self,
+        _: &ProviderAttempt,
+        request: &ProviderResultRequest,
+    ) -> Result<Value> {
+        result_payload(
+            request,
+            self.image_profile(&request.request.request.request.model),
+        )
+    }
+    fn validate_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request.request, body)?;
+        if body.get("input")
+            != result_payload(
+                request,
+                self.image_profile(&request.request.request.request.model),
+            )?
+            .get("input")
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn supports_durable_tool_blocks(&self) -> bool {
         true
     }
@@ -273,7 +344,13 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         _: &ProviderAttempt,
         request: &DurableToolRequest,
     ) -> Result<Value> {
-        tool_payload(request)
+        result_payload(
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+            self.image_profile(&request.request.request.model),
+        )
     }
     fn validate_with_tool_blocks(
         &self,
@@ -281,14 +358,14 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         request: &DurableToolRequest,
         body: &Value,
     ) -> Result<()> {
-        self.validate(attempt, &request.request.request, body)?;
-        if body.get("input") != tool_payload(request)?.get("input") {
-            return Err(Error::Config("provider hook changed durable input".into()));
-        }
-        Ok(())
-    }
-    fn id(&self) -> &str {
-        "openai-responses-api/v1"
+        self.validate_with_result_metadata(
+            attempt,
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+            body,
+        )
     }
     fn supports_durable_blocks(&self) -> bool {
         true
@@ -298,7 +375,10 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         _: &ProviderAttempt,
         request: &DurableRequest,
     ) -> Result<Value> {
-        durable_payload(request)
+        result_payload(
+            &pi_rs_durable::tool_projection::wrap_durable(request),
+            self.image_profile(&request.request.model),
+        )
     }
     fn validate_durable(
         &self,
@@ -307,14 +387,28 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         body: &Value,
     ) -> Result<()> {
         self.validate(attempt, &request.request, body)?;
-        if !request.blocks.is_empty() && body.get("input") != durable_payload(request)?.get("input")
+        if (!request.blocks.is_empty()
+            || request
+                .request
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. })))
+            && body.get("input")
+                != result_payload(
+                    &pi_rs_durable::tool_projection::wrap_durable(request),
+                    self.image_profile(&request.request.model),
+                )?
+                .get("input")
         {
             return Err(Error::Config("provider hook changed durable input".into()));
         }
         Ok(())
     }
     async fn prepare(&self, _: &ProviderAttempt, request: &ModelRequest) -> Result<Value> {
-        Ok(payload(request, "openai"))
+        result_payload(
+            &pi_rs_durable::tool_projection::wrap_plain(request),
+            self.image_profile(&request.model),
+        )
     }
     fn validate(&self, _: &ProviderAttempt, request: &ModelRequest, body: &Value) -> Result<()> {
         let fail = || Error::Config("invalid or unauthorized Responses request body".into());

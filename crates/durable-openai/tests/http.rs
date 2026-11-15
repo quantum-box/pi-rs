@@ -444,7 +444,14 @@ async fn runtime_never_dispatches_incomplete_or_empty_calls() {
                 Status::Unanswered { .. }
             ));
             assert!(
-                matches!(conversation.messages.last(), Some(Message::Tool { call_id, content, .. }) if call_id == "c" && content.contains("truncated"))
+                matches!(conversation.messages.last(), Some(Message::Tool { call_id, .. }) if call_id == "c")
+            );
+            let result = &conversation.content_blocks[&(conversation.messages.len() - 1)];
+            assert!(
+                result.blocks[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("truncated")
             );
         }
         rx.recv().unwrap();
@@ -966,7 +973,7 @@ async fn tool_blocks_reach_http_in_order_and_reject_hook_tampering() {
             .find(|v| v["type"] == "function_call_output")
             .unwrap()["output"]
             .clone(),
-        json!([{"type":"input_text","text":"first"},{"type":"input_image","image_url":"data:image/png;base64,aGk="},{"type":"input_text","text":"last"}])
+        json!([{"type":"input_text","text":"first\nlast"},{"type":"input_image","detail":"auto","image_url":"data:image/png;base64,aGk="}])
     );
     adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
     let mut changed = body.clone();
@@ -1142,8 +1149,166 @@ async fn persisted_tool_blocks_resume_to_http_without_reexecution() {
     assert_eq!(result["call_id"], "c1");
     assert_eq!(
         result["output"],
-        json!([{"type":"input_text","text":"first"},{"type":"input_image","image_url":"data:image/png;base64,aGk="},{"type":"input_text","text":"last"}])
+        json!([{"type":"input_text","text":"first\nlast"},{"type":"input_image","detail":"auto","image_url":"data:image/png;base64,aGk="}])
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn upstream_tool_status_and_image_profile_fixtures() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let mut adapter = OpenAiResponsesAdapter::new("http://127.0.0.1:1", "key".into()).unwrap();
+    let builtin = adapter.image_profile("gpt-4").unwrap().supports_images;
+    adapter
+        .set_model_descriptor(
+            "gpt-4",
+            &json!({"input": if builtin { vec!["text"] } else { vec!["text", "image"] }}),
+        )
+        .unwrap();
+    assert_eq!(
+        adapter.image_profile("gpt-4").unwrap().supports_images,
+        !builtin
+    );
+    let a = attempt();
+    let req = ordered_tool_request();
+    for error in [None, Some(false), Some(true)] {
+        let status = error
+            .map(|v| [(2, v)].into_iter().collect())
+            .unwrap_or_default();
+        let result = ProviderResultRequest {
+            request: req.clone(),
+            tool_errors: status,
+        };
+        let body = adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap();
+        let item = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(
+            item["output"],
+            json!([{"type":"input_text","text":"first\nlast"},{"type":"input_image","detail":"auto","image_url":"data:image/png;base64,aGk="}])
+        );
+        assert!(item.get("is_error").is_none());
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .unwrap();
+    }
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text"]}))
+        .unwrap();
+    assert!(!adapter.image_profile("test").unwrap().supports_images);
+    let result = ProviderResultRequest {
+        request: req.clone(),
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let mut body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    let item = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(
+        item["output"],
+        "first\n(tool image omitted: model does not support images)\nlast"
+    );
+    assert!(!body.to_string().contains("aGk="));
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    body["input"] = json!([]);
+    assert!(
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .is_err()
+    );
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text","image"]}))
+        .unwrap();
+    assert!(adapter.image_profile("test").unwrap().supports_images);
+    assert!(
+        adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("aGk=")
+    );
+    assert!(
+        adapter
+            .set_model_descriptor("test", &json!({"input":"image"}))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn status_aware_body_reaches_fake_http() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        ),
+        false,
+    );
+    let adapter = OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let result = ProviderResultRequest {
+        request: ordered_tool_request(),
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &result.request.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}
+
+mod lifecycle {
+    use super::*;
+    const LIFECYCLE_CALL: &str = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}]}}\n\n";
+    const LIFECYCLE_DONE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+    fn lifecycle_adapter(url: &str) -> std::sync::Arc<dyn pi_rs_durable::model::ProviderAdapter> {
+        let mut adapter = OpenAiResponsesAdapter::new(url, "fixture-secret".into()).unwrap();
+        adapter
+            .set_model_descriptor(
+                "test",
+                &json!({"input":["text"],"inputLimits":{"images":{"resize":{"maxWidth":512}}}}),
+            )
+            .unwrap();
+        std::sync::Arc::new(adapter)
+    }
+    fn lifecycle_assert(body: &Value) {
+        let item = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["type"] == "function_call_output")
+            .unwrap();
+        assert!(item.get("is_error").is_none());
+        assert_eq!(
+            item["output"],
+            "before\n(tool image omitted: model does not support images)\nafter"
+        );
+    }
+    include!("../../durable/tests/fixtures/provider_tool_lifecycle.rs");
 }

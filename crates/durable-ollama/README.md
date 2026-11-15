@@ -10,3 +10,17 @@ Only numeric loopback HTTP origins are accepted; proxies and redirects are disab
 Legacy function definitions and alternate output-token limit fields are rejected, and `n` may only be 1. When usage is reported, both input and output counts must be present. Completed tool calls must include unique IDs, names, and an arguments field; malformed argument JSON remains available to the runtime for its normal tool-error handling.
 
 Parity is intentionally partial: there is no native Ollama NDJSON, authentication, remote endpoint, provider compatibility settings, sampling configuration API, replay of reasoning details, cache retention/accounting, model discovery/loading progress, or finish-reason inference. Reasoning text and basic usage are returned, but provider replay and detailed accounting are not. Tool results and user images use the existing provider's OpenAI-compatible encoding. A successful completion requires a finish reason and `[DONE]`; malformed, truncated, or error streams fail. This implementation is independent and may drift from the ordinary provider.
+
+The adapter consumes durable tool-result status and model image profiles. A host
+can call `set_model_descriptor(model, descriptor)` with an upstream-shaped
+`input` array; this overrides the bundled profile (if any), and must be
+reapplied after reopening. For a known text-only profile the runtime projects
+images to upstream placeholder text on a request copy; stored blocks remain
+unchanged. Unknown profiles retain the image-capable behavior. The adapter
+checks the projected body after provider hooks. Metadata without a provable
+occurrence binding fails closed; missing legacy metadata remains unknown.
+
+As in upstream OpenAI-compatible chat completions, text blocks are joined and
+all tool images in a batch follow in a user message. The protocol has no
+separate tool error flag. This adapter does not automatically discover Ollama
+model capabilities.

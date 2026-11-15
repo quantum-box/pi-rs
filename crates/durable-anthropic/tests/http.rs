@@ -478,3 +478,205 @@ async fn tool_blocks_reach_http_in_order_and_reject_hook_tampering() {
     assert_eq!(rx.recv().unwrap(), body);
     thread.join().unwrap();
 }
+
+#[tokio::test]
+async fn upstream_tool_status_and_image_profile_fixtures() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let mut adapter = AnthropicAdapter::new("http://127.0.0.1:1", "key".into()).unwrap();
+    let builtin = adapter
+        .image_profile("claude-fable-5")
+        .unwrap()
+        .supports_images;
+    adapter
+        .set_model_descriptor(
+            "claude-fable-5",
+            &json!({"input": if builtin { vec!["text"] } else { vec!["text", "image"] }}),
+        )
+        .unwrap();
+    assert_eq!(
+        adapter
+            .image_profile("claude-fable-5")
+            .unwrap()
+            .supports_images,
+        !builtin
+    );
+    let a = attempt();
+    let req = ordered_tool_request();
+    for error in [None, Some(false), Some(true)] {
+        let result = ProviderResultRequest {
+            request: req.clone(),
+            tool_errors: error
+                .map(|v| [(2, v)].into_iter().collect())
+                .unwrap_or_default(),
+        };
+        let body = adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap();
+        let content = body["messages"][2]["content"].as_array().unwrap();
+        let item = &content[0];
+        match error {
+            Some(v) => assert_eq!(item["is_error"], v),
+            None => assert!(item.get("is_error").is_none()),
+        }
+        if error == Some(true) {
+            assert_eq!(
+                item["content"],
+                "first\n(image attached after the tool results)\nlast"
+            );
+            assert_eq!(
+                content[1]["text"],
+                "Images from the error result of tool call c1 (read):"
+            );
+            assert_eq!(content[2]["source"]["data"], "aGk=");
+        } else {
+            assert_eq!(item["content"][1]["source"]["data"], "aGk=");
+        }
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .unwrap();
+    }
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text"]}))
+        .unwrap();
+    let result = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let mut body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    assert_eq!(
+        body["messages"][2]["content"][0]["content"],
+        "first\n(tool image omitted: model does not support images)\nlast"
+    );
+    assert!(body["messages"][2]["content"].as_array().unwrap().len() == 1);
+    assert!(!body.to_string().contains("aGk="));
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    body["messages"][2]["content"][0]["is_error"] = json!(false);
+    assert!(
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .is_err()
+    );
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text","image"]}))
+        .unwrap();
+    assert!(adapter.image_profile("test").unwrap().supports_images);
+}
+
+#[tokio::test]
+async fn status_aware_body_reaches_fake_http() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    );
+    let adapter = AnthropicAdapter::new(&url, "fixture-secret".into()).unwrap();
+    let a = attempt();
+    let result = ProviderResultRequest {
+        request: ordered_tool_request(),
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &result.request.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}
+
+mod lifecycle {
+    use super::*;
+    const LIFECYCLE_CALL: &str = "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"read\",\"input\":{}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+    const LIFECYCLE_DONE: &str = "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+    fn lifecycle_adapter(url: &str) -> std::sync::Arc<dyn pi_rs_durable::model::ProviderAdapter> {
+        let mut adapter = AnthropicAdapter::new(url, "fixture-secret".into()).unwrap();
+        adapter
+            .set_model_descriptor(
+                "test",
+                &json!({"input":["text"],"inputLimits":{"images":{"resize":{"maxWidth":512}}}}),
+            )
+            .unwrap();
+        std::sync::Arc::new(adapter)
+    }
+    fn lifecycle_assert(body: &Value) {
+        let item = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|v| v["content"].as_array().unwrap())
+            .find(|v| v["type"] == "tool_result")
+            .unwrap();
+        assert_eq!(item["is_error"], true);
+        assert_eq!(
+            item["content"],
+            "before\n(tool image omitted: model does not support images)\nafter"
+        );
+    }
+    include!("../../durable/tests/fixtures/provider_tool_lifecycle.rs");
+}
+
+#[tokio::test]
+async fn error_images_follow_all_consecutive_tool_results() {
+    use pi_rs_durable::{model::ProviderResultRequest, transcript::MessageContentBlocks};
+    let adapter = AnthropicAdapter::new("http://127.0.0.1:1", "key".into()).unwrap();
+    let a = attempt();
+    let mut req = ordered_tool_request();
+    if let Message::Assistant { calls, .. } = &mut req.request.request.messages[1] {
+        calls.push(pi_rs_core::ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+    }
+    req.request.request.messages.push(Message::Tool {
+        call_id: "c2".into(),
+        content: String::new(),
+    });
+    req.tool_blocks.insert(
+        3,
+        MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![json!({"type":"image","mimeType":"image/png","data":"aGk="})],
+        },
+    );
+    let result = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true), (3, false)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    let content = body["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "tool_result");
+    assert_eq!(content[0]["is_error"], true);
+    assert_eq!(content[1]["type"], "tool_result");
+    assert_eq!(content[1]["tool_use_id"], "c2");
+    assert_eq!(content[1]["is_error"], false);
+    assert_eq!(content[1]["content"][0]["text"], "(see attached image)");
+    assert_eq!(
+        content[2]["text"],
+        "Images from the error result of tool call c1 (read):"
+    );
+    assert_eq!(content[3]["source"]["data"], "aGk=");
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+}

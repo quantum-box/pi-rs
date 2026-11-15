@@ -11,3 +11,17 @@ Validation fixes the model, streaming, `store: false`, authorized tool definitio
 This adapter does not implement ChatGPT plan OAuth, token refresh, custom headers or proxies, model discovery, non-streaming responses, background mode, server-side conversation state, built-in/hosted tools, arbitrary custom provider identities, or the full Responses API. It has no configuration API for reasoning or sampling; trusted hooks may supply the allowed fields. Unknown SSE event types are ignored as in the existing provider and unsupported output modalities are not surfaced as text. Usage is limited to the existing provider's counters. HTTP errors expose status only rather than reading provider error bodies, so specialized ChatGPT plan quota classification is unavailable. It is independently maintained and may drift from the ordinary provider and upstream pi.
 
 Ordered durable user blocks support text and base64 images in their original order, with optional image `detail` (`low`, `high`, or `auto`). Empty arrays and other block metadata are rejected before dispatch. Provider hooks may change other supported request fields, but cannot rewrite `input` when durable blocks are present.
+
+The adapter consumes durable tool-result status and model image profiles. A host
+can call `set_model_descriptor(model, descriptor)` with an upstream-shaped
+`input` array; this overrides the bundled profile (if any), and must be
+reapplied after reopening. For a known text-only profile the runtime projects
+images to upstream placeholder text on a request copy; stored blocks remain
+unchanged. Unknown profiles retain the image-capable behavior. The adapter
+checks the projected body after provider hooks. Metadata without a provable
+occurrence binding fails closed; missing legacy metadata remains unknown.
+
+As in upstream Responses, text blocks are joined by newlines and images follow
+in `function_call_output`; no independent error flag is present on the wire.
+Image detail defaults to `auto`; the existing explicit detail extension remains
+supported.

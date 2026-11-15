@@ -1511,25 +1511,29 @@ harness.append_user_blocks(id, blocks)?;
 
 `FittedImages::Unchanged` means the caller keeps the original array; `FittedImages::Fitted` supplies replacement content and notes. For tool results, `create_fit_images_extension` installs a block-aware hook. The runtime runs hooks that opt in with `supports_runtime_tool_blocks` after its existing string and `after_tool_result` hooks, before committing the result. Such hooks receive the text result as an initial block and can replace it with ordered text/image blocks; the existing result channels are exposed read-only in `extra`, with structured output validated against any configured schema first. Nested calls run the same opt-in chain with `nested: true`; `call_keyed_with_blocks` and `call_keyed_unpolled_with_blocks` return persisted ordered blocks to their parent. Legacy outcome-only calls fail closed if blocks would be lost. The built-in image fitter still skips nested results, fitting only model-facing results. The fitter uses host-supplied limits and appends an `info` diagnostic with code `image`. Hooks may replay after interruption; their effects must be idempotent. Legacy hooks do not run twice and block-hook failures stop the transition. Existing core tools still return text, so producing image blocks requires a block-aware hook; there is no built-in Photon processor.
 
-Ordered tool blocks are stored with their tool occurrence and reconstructed after restart, with the tool call ID intact. Full validated forks preserve them. Manual, threshold, overflow and independent compaction also support tool-block contexts when every selected hook opts into ordered blocks and separately returns true from `supports_compaction_tool_blocks`. This separate opt-in prevents existing user-block-only hooks from accidentally interpreting a tool placeholder as empty output. Summaries include tool text in block order and omit images; retained tool blocks keep their occurrence IDs and call IDs, including across forks and reopen. Reset starts a fresh context and retains the blocks in history. Concurrent independent placement rejects changed block snapshots. Provider delivery requires an adapter implementing and opting into `DurableToolRequest`; OpenAI Responses, Anthropic Messages and Ollama encode ordered text/image results. The Google adapter defaults to upstream pi's projection: text blocks are joined with newlines and images are separated; older Gemini models receive images in a following user message. Original blocks remain in durable storage, but their interleaving is not preserved in this provider request. An explicit `GoogleAdapter::new_ordered_tool_blocks` uses a distinct adapter ID and Gemini image references to preserve ordering; its Google wire representation intentionally differs from upstream. The core model path rejects tool blocks. Before-request hooks receive `tool_content_blocks` and cannot replace it or the message list; provider-body hooks remain subject to adapter validation. Existing transcripts are not refitted after a model change or restart.
+Ordered tool blocks are stored with their tool occurrence and reconstructed after restart, with the tool call ID intact. Full validated forks preserve them. Manual, threshold, overflow and independent compaction also support tool-block contexts when every selected hook opts into ordered blocks and separately returns true from `supports_compaction_tool_blocks`. This separate opt-in prevents existing user-block-only hooks from accidentally interpreting a tool placeholder as empty output. Summaries include tool text in block order and omit images; retained tool blocks keep their occurrence IDs and call IDs, including across forks and reopen. Reset starts a fresh context and retains the blocks in history. Concurrent independent placement rejects changed block snapshots. Provider delivery requires an adapter implementing and opting into `DurableToolRequest`; OpenAI Responses joins text and sends images in its function output; Ollama joins text and sends images in a following user message. Anthropic retains successful result blocks in order and moves error-result images after the complete tool-result batch. The Google adapter defaults to upstream pi's projection: text blocks are joined with newlines and images are separated; older Gemini models receive images in a following user message. Original blocks remain in durable storage, but their interleaving is not preserved in this provider request. An explicit `GoogleAdapter::new_ordered_tool_blocks` uses a distinct adapter ID and Gemini image references to preserve ordering; its Google wire representation intentionally differs from upstream. The core model path rejects tool blocks. Before-request hooks receive `tool_content_blocks` and cannot replace it or the message list; provider-body hooks remain subject to adapter validation. Existing transcripts are not refitted after a model change or restart.
 
 The bundled adapters reject unsupported metadata and ambiguous call IDs before
 sending; Google upstream-compatible mode also accepts empty tool output arrays.
 They validate the complete provider message sequence after body hooks, so a hook
 cannot alter, drop or reorder a bound result.
-Ollama tool content arrays require a recent server that preserves images in
-`tool` messages; older compatible servers may reject them. These adapters do not
-probe model vision support. A provider can reject an otherwise valid image or
-model combination; no silent fallback is performed. Google's host may configure model `input` descriptors; text-only models omit
-tool-result images, while unknown models retain the previous image-capable
-default. Google receives the persisted `is_error` state for both text and block
-results and emits the upstream `error` key. Legacy results with no metadata use
-`output`. If a reused call ID cannot be associated with a unique occurrence,
+Adapters use the bundled image-profile snapshot where available and host-supplied
+model descriptors can override it. Ollama has no bundled model catalog; unknown
+models retain their previous image-capable behavior. These adapters do not probe
+model vision support. A provider can reject an otherwise valid image or
+model combination; no silent fallback is performed. Hosts may configure model
+`input` descriptors; text-only models receive an omission placeholder in place
+of tool-result images, while unknown profiles retain the previous image-capable
+default. Google and Anthropic receive persisted `is_error` state for both text and block
+results and emit their upstream `error` or `is_error` fields. OpenAI Responses and
+Ollama consume the metadata but have no corresponding upstream wire flag; the
+error text is sent as the tool output. A legacy result with no status metadata
+uses the provider's default treatment of an unknown status. If a reused call ID cannot be associated with a unique occurrence,
 request preparation fails closed. A metadata-aware adapter persists even a
 single-text tool result as a block, binding its occurrence ID to operation
 metadata. Consequently that context uses the existing tool-block compaction and
-hook opt-in requirements. Legacy metadata without an occurrence binding fails closed rather than being
-matched by call ID. When status metadata is forwarded, a
+hook opt-in requirements. Legacy metadata without an occurrence binding fails
+closed rather than being matched by call ID. When status metadata is forwarded, a
 before-request hook cannot replace the message list. Descriptors are host-owned
 and must be restored on reopen. The ordered opt-in requires
 recognized Gemini 3+ model IDs and PNG, JPEG or WebP images, and uses

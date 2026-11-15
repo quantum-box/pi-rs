@@ -7,7 +7,9 @@ use pi_rs_core::{
     Error, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
     ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{
+    DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt, ProviderResultRequest,
+};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
@@ -20,8 +22,17 @@ pub struct AnthropicAdapter {
     client: Client,
     endpoint: Url,
     key: String,
+    model_inputs: pi_rs_durable::tool_projection::ModelInputs,
 }
 impl AnthropicAdapter {
+    /// Override the bundled model image profile using an upstream-shaped descriptor.
+    pub fn set_model_descriptor(
+        &mut self,
+        model: impl Into<String>,
+        descriptor: &Value,
+    ) -> Result<()> {
+        self.model_inputs.insert(model, descriptor)
+    }
     pub fn new(endpoint: &str, key: String) -> Result<Self> {
         let url =
             Url::parse(endpoint).map_err(|_| Error::Config("invalid Anthropic endpoint".into()))?;
@@ -52,55 +63,166 @@ impl AnthropicAdapter {
             client,
             endpoint: url,
             key,
+            model_inputs: Default::default(),
         })
     }
 }
 
-fn tool_payload(request: &DurableToolRequest) -> Result<Value> {
+fn result_payload(
+    request: &ProviderResultRequest,
+    profile: Option<pi_rs_durable::images::ModelImageProfile>,
+) -> Result<Value> {
+    use pi_rs_core::Message;
+    use pi_rs_durable::tool_projection::{self, Block};
+    use serde_json::json;
     request.validate_bindings()?;
+    let request = tool_projection::project_request(request, profile);
+    let tool = &request.request;
     let mut body = encode::encode_request_with_blocks(
-        request.request.request.clone(),
+        tool.request.request.clone(),
         SCOPE,
-        Some(&request.request),
+        Some(&tool.request),
     )?;
-    for (&index, binding) in &request.tool_blocks {
-        let pi_rs_core::Message::Tool { call_id, .. } = &request.request.request.messages[index]
-        else {
-            unreachable!()
-        };
-        let mut sample = request.request.request.clone();
-        sample.messages = vec![pi_rs_core::Message::User {
-            content: String::new(),
-        }];
-        let user = DurableRequest {
-            request: sample,
-            blocks: [(0, binding.clone())].into_iter().collect(),
-        };
-        let content = encode::encode_request_with_blocks(user.request.clone(), SCOPE, Some(&user))?
-            ["messages"][0]["content"]
-            .clone();
-        let messages = body["messages"]
-            .as_array_mut()
-            .ok_or_else(|| Error::Config("invalid messages".into()))?;
-        let mut found = 0;
-        for message in messages {
-            if let Some(blocks) = message["content"].as_array_mut() {
-                for block in blocks {
-                    if block["type"] == "tool_result" && block["tool_use_id"] == *call_id {
-                        found += 1;
-                        block["content"] = content.clone();
-                    }
-                }
+    let mut by_id = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    for msg in &tool.request.request.messages {
+        if let Message::Assistant { calls, .. } = msg {
+            for call in calls {
+                names.insert(call.id.clone(), call.name.clone());
             }
         }
-        if found != 1 {
+    }
+    for (index, msg) in tool.request.request.messages.iter().enumerate() {
+        let Message::Tool { call_id, .. } = msg else {
+            continue;
+        };
+        let blocks = tool_projection::blocks(tool, index, false)?;
+        let status = request.tool_errors.get(&index).copied();
+        let mut extras = Vec::new();
+        let content_blocks = if status == Some(true)
+            && blocks.iter().any(|b| matches!(b, Block::Image { .. }))
+        {
+            let mut images = Vec::new();
+            for b in &blocks {
+                if let Block::Image { image, .. } = b {
+                    images.push(json!({"type":"image","source":{"type":"base64","media_type":image.mime_type,"data":image.data}}));
+                }
+            }
+            let name = names
+                .get(call_id)
+                .ok_or_else(|| Error::Config("tool result has no preceding call".into()))?;
+            extras.push(json!({"type":"text","text":format!("Images from the error result of tool call {call_id} ({name}):")}));
+            extras.extend(images);
+            tool_projection::omit_images(blocks, "(image attached after the tool results)")
+        } else {
+            blocks
+        };
+        let has_images = content_blocks
+            .iter()
+            .any(|b| matches!(b, Block::Image { .. }));
+        let content = if !has_images {
+            json!(
+                content_blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        } else {
+            let mut result = Vec::new();
+            if !content_blocks.iter().any(|b| matches!(b, Block::Text(_))) {
+                result.push(json!({"type":"text","text":"(see attached image)"}));
+            }
+            for b in content_blocks {
+                result.push(match b { Block::Text(text) => json!({"type":"text","text":text}), Block::Image { image, .. } => json!({"type":"image","source":{"type":"base64","media_type":image.mime_type,"data":image.data}}) });
+            }
+            json!(result)
+        };
+        let mut result = json!({"type":"tool_result","tool_use_id":call_id,"content":content});
+        if let Some(status) = status {
+            result["is_error"] = json!(status);
+        }
+        if by_id.insert(call_id.clone(), (result, extras)).is_some() {
             return Err(Error::Config("ambiguous tool result call ID".into()));
         }
+    }
+    let mut used = std::collections::BTreeSet::new();
+    for message in body["messages"]
+        .as_array_mut()
+        .ok_or_else(|| Error::Config("invalid messages".into()))?
+    {
+        let Some(blocks) = message["content"].as_array_mut() else {
+            continue;
+        };
+        let mut out = Vec::new();
+        let mut extras = Vec::new();
+        for block in std::mem::take(blocks) {
+            if block["type"] == "tool_result" {
+                let id = block["tool_use_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::Config("invalid tool result ID".into()))?;
+                let (result, after) = by_id
+                    .get(id)
+                    .ok_or_else(|| Error::Config("unknown tool result".into()))?;
+                if !used.insert(id.to_owned()) {
+                    return Err(Error::Config("ambiguous tool result call ID".into()));
+                }
+                out.push(result.clone());
+                extras.extend(after.iter().cloned());
+            } else {
+                out.append(&mut extras);
+                out.push(block);
+            }
+        }
+        out.append(&mut extras);
+        *blocks = out;
+    }
+    if used.len() != by_id.len() {
+        return Err(Error::Config("missing tool result".into()));
     }
     Ok(body)
 }
 #[async_trait::async_trait]
 impl ProviderAdapter for AnthropicAdapter {
+    fn image_profile(&self, model: &str) -> Option<pi_rs_durable::images::ModelImageProfile> {
+        self.model_inputs.profile(self.id(), model)
+    }
+    fn supports_tool_result_metadata(&self) -> bool {
+        true
+    }
+    async fn prepare_with_result_metadata(
+        &self,
+        _: &ProviderAttempt,
+        request: &ProviderResultRequest,
+    ) -> Result<Value> {
+        result_payload(
+            request,
+            self.image_profile(&request.request.request.request.model),
+        )
+    }
+    fn validate_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request.request, body)?;
+        if body.get("messages")
+            != result_payload(
+                request,
+                self.image_profile(&request.request.request.request.model),
+            )?
+            .get("messages")
+        {
+            return Err(Error::Config(
+                "provider hook changed durable input or status".into(),
+            ));
+        }
+        Ok(())
+    }
     fn supports_durable_tool_blocks(&self) -> bool {
         true
     }
@@ -109,7 +231,13 @@ impl ProviderAdapter for AnthropicAdapter {
         _: &ProviderAttempt,
         request: &DurableToolRequest,
     ) -> Result<Value> {
-        tool_payload(request)
+        result_payload(
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+            self.image_profile(&request.request.request.model),
+        )
     }
     fn validate_with_tool_blocks(
         &self,
@@ -117,11 +245,14 @@ impl ProviderAdapter for AnthropicAdapter {
         request: &DurableToolRequest,
         body: &Value,
     ) -> Result<()> {
-        self.validate(attempt, &request.request.request, body)?;
-        if body.get("messages") != tool_payload(request)?.get("messages") {
-            return Err(Error::Config("provider hook changed durable input".into()));
-        }
-        Ok(())
+        self.validate_with_result_metadata(
+            attempt,
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+            body,
+        )
     }
     fn supports_durable_blocks(&self) -> bool {
         true
@@ -131,7 +262,10 @@ impl ProviderAdapter for AnthropicAdapter {
         _: &ProviderAttempt,
         request: &DurableRequest,
     ) -> Result<Value> {
-        encode::encode_request_with_blocks(request.request.clone(), SCOPE, Some(request))
+        result_payload(
+            &pi_rs_durable::tool_projection::wrap_durable(request),
+            self.image_profile(&request.request.model),
+        )
     }
     fn validate_durable(
         &self,
@@ -140,12 +274,16 @@ impl ProviderAdapter for AnthropicAdapter {
         body: &Value,
     ) -> Result<()> {
         self.validate(attempt, &request.request, body)?;
-        if !request.blocks.is_empty()
+        if (!request.blocks.is_empty()
+            || request
+                .request
+                .messages
+                .iter()
+                .any(|m| matches!(m, pi_rs_core::Message::Tool { .. })))
             && body.get("messages")
-                != encode::encode_request_with_blocks(
-                    request.request.clone(),
-                    SCOPE,
-                    Some(request),
+                != result_payload(
+                    &pi_rs_durable::tool_projection::wrap_durable(request),
+                    self.image_profile(&request.request.model),
                 )?
                 .get("messages")
         {
@@ -157,7 +295,10 @@ impl ProviderAdapter for AnthropicAdapter {
         "anthropic-messages/v1"
     }
     async fn prepare(&self, _: &ProviderAttempt, request: &ModelRequest) -> Result<Value> {
-        encode::encode_request(request.clone(), SCOPE)
+        result_payload(
+            &pi_rs_durable::tool_projection::wrap_plain(request),
+            self.image_profile(&request.model),
+        )
     }
     fn validate(&self, _: &ProviderAttempt, request: &ModelRequest, body: &Value) -> Result<()> {
         let fail = || Error::Config("invalid or unauthorized Anthropic request body".into());

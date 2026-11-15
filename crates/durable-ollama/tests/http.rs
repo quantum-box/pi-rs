@@ -483,12 +483,13 @@ async fn ollama_tool_blocks_preserve_order_and_reject_hook_tampering() {
     let a = attempt();
     let req = ordered_tool_request();
     let mut body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
-    assert_eq!(
-        body["messages"][2]["content"],
-        json!([{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}},{"type":"text","text":"last"}])
-    );
+    assert_eq!(body["messages"][2]["content"], json!("first\nlast"));
     adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
-    body["messages"][2]["content"][0]["text"] = json!("changed");
+    assert_eq!(
+        body["messages"][3]["content"],
+        json!([{"type":"text","text":"Attached image(s) from tool result:"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}])
+    );
+    body["messages"][2]["content"] = json!("changed");
     assert!(adapter.validate_with_tool_blocks(&a, &req, &body).is_err());
 }
 
@@ -514,4 +515,181 @@ async fn ollama_tool_result_reaches_fake_http_in_order() {
     .unwrap();
     assert_eq!(rx.recv().unwrap(), body);
     thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn upstream_tool_status_and_image_profile_fixtures() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let mut adapter = OllamaAdapter::new("http://127.0.0.1:1").unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    for error in [None, Some(false), Some(true)] {
+        let result = ProviderResultRequest {
+            request: req.clone(),
+            tool_errors: error
+                .map(|v| [(2, v)].into_iter().collect())
+                .unwrap_or_default(),
+        };
+        let body = adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap();
+        assert_eq!(body["messages"][2]["content"], "first\nlast");
+        assert!(body["messages"][2].get("is_error").is_none());
+        assert_eq!(
+            body["messages"][3]["content"][0]["text"],
+            "Attached image(s) from tool result:"
+        );
+        assert_eq!(
+            body["messages"][3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGk="
+        );
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .unwrap();
+    }
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text"]}))
+        .unwrap();
+    let result = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let mut body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    assert_eq!(
+        body["messages"][2]["content"],
+        "first\n(tool image omitted: model does not support images)\nlast"
+    );
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    assert!(!body.to_string().contains("aGk="));
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    body["messages"][2]["content"] = json!("changed");
+    assert!(
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .is_err()
+    );
+    adapter
+        .set_model_descriptor("test", &json!({"input":["text","image"]}))
+        .unwrap();
+    assert!(adapter.image_profile("test").unwrap().supports_images);
+}
+
+#[tokio::test]
+async fn status_aware_body_reaches_fake_http() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let (url, rx, thread) = server(
+        http(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ),
+        false,
+    );
+    let adapter = OllamaAdapter::new(&url).unwrap();
+    let a = attempt();
+    let result = ProviderResultRequest {
+        request: ordered_tool_request(),
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
+    collect_generation(
+        adapter.dispatch(&a, &result.request.request.request, body.clone()),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), body);
+    thread.join().unwrap();
+}
+
+mod lifecycle {
+    use super::*;
+    const LIFECYCLE_CALL: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    const LIFECYCLE_DONE: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    fn lifecycle_adapter(url: &str) -> std::sync::Arc<dyn pi_rs_durable::model::ProviderAdapter> {
+        let mut adapter = OllamaAdapter::new(url).unwrap();
+        adapter
+            .set_model_descriptor(
+                "test",
+                &json!({"input":["text"],"inputLimits":{"images":{"resize":{"maxWidth":512}}}}),
+            )
+            .unwrap();
+        std::sync::Arc::new(adapter)
+    }
+    fn lifecycle_assert(body: &Value) {
+        let item = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["role"] == "tool")
+            .unwrap();
+        assert!(item.get("is_error").is_none());
+        assert_eq!(
+            item["content"],
+            "before\n(tool image omitted: model does not support images)\nafter"
+        );
+    }
+    include!("../../durable/tests/fixtures/provider_tool_lifecycle.rs");
+}
+
+#[tokio::test]
+async fn consecutive_tool_images_follow_the_entire_result_batch() {
+    use pi_rs_durable::{model::ProviderResultRequest, transcript::MessageContentBlocks};
+    let adapter = OllamaAdapter::new("http://127.0.0.1:1").unwrap();
+    let a = attempt();
+    let mut req = ordered_tool_request();
+    if let Message::Assistant { calls, .. } = &mut req.request.request.messages[1] {
+        calls.push(pi_rs_core::ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+    }
+    req.request.request.messages.push(Message::Tool {
+        call_id: "c2".into(),
+        content: String::new(),
+    });
+    req.tool_blocks.insert(
+        3,
+        MessageContentBlocks {
+            message_id: Uuid::new_v4(),
+            blocks: vec![json!({"type":"image","mimeType":"image/png","data":"YmI="})],
+        },
+    );
+    let result = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true), (3, false)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &result)
+        .await
+        .unwrap();
+    assert_eq!(body["messages"][2]["content"], "first\nlast");
+    assert_eq!(body["messages"][3]["content"], "(see attached image)");
+    assert_eq!(
+        body["messages"][4]["content"][0]["text"],
+        "Attached image(s) from tool result:"
+    );
+    assert_eq!(
+        body["messages"][4]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,aGk="
+    );
+    assert_eq!(
+        body["messages"][4]["content"][2]["image_url"]["url"],
+        "data:image/png;base64,YmI="
+    );
+    adapter
+        .validate_with_result_metadata(&a, &result, &body)
+        .unwrap();
 }

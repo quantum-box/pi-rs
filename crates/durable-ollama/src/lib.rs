@@ -6,7 +6,9 @@ use pi_rs_core::{
     Error, Message, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result,
     ToolCall, ToolCallDelta, Usage,
 };
-use pi_rs_durable::model::{DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt};
+use pi_rs_durable::model::{
+    DurableRequest, DurableToolRequest, ProviderAdapter, ProviderAttempt, ProviderResultRequest,
+};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,8 +18,17 @@ use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 pub struct OllamaAdapter {
     client: Client,
     endpoint: Url,
+    model_inputs: pi_rs_durable::tool_projection::ModelInputs,
 }
 impl OllamaAdapter {
+    /// Override the bundled model image profile using an upstream-shaped descriptor.
+    pub fn set_model_descriptor(
+        &mut self,
+        model: impl Into<String>,
+        descriptor: &Value,
+    ) -> Result<()> {
+        self.model_inputs.insert(model, descriptor)
+    }
     /// Accepts a numeric loopback base URL, e.g. `http://127.0.0.1:11434`.
     pub fn new(base: &str) -> Result<Self> {
         let mut endpoint =
@@ -46,11 +57,52 @@ impl OllamaAdapter {
             .read_timeout(Duration::from_secs(120))
             .build()
             .map_err(|_| Error::Config("could not create HTTP client".into()))?;
-        Ok(Self { client, endpoint })
+        Ok(Self {
+            client,
+            endpoint,
+            model_inputs: Default::default(),
+        })
     }
 }
 #[async_trait::async_trait]
 impl ProviderAdapter for OllamaAdapter {
+    fn image_profile(&self, model: &str) -> Option<pi_rs_durable::images::ModelImageProfile> {
+        self.model_inputs.profile(self.id(), model)
+    }
+    fn supports_tool_result_metadata(&self) -> bool {
+        true
+    }
+    async fn prepare_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+    ) -> Result<Value> {
+        let mut body = self
+            .prepare(attempt, &request.request.request.request)
+            .await?;
+        body["messages"] = json!(result_messages(
+            request,
+            self.image_profile(&request.request.request.request.model)
+        )?);
+        Ok(body)
+    }
+    fn validate_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+        body: &Value,
+    ) -> Result<()> {
+        self.validate(attempt, &request.request.request.request, body)?;
+        if body.get("messages")
+            != Some(&json!(result_messages(
+                request,
+                self.image_profile(&request.request.request.request.model)
+            )?))
+        {
+            return Err(Error::Config("provider hook changed durable input".into()));
+        }
+        Ok(())
+    }
     fn supports_durable_tool_blocks(&self) -> bool {
         true
     }
@@ -59,9 +111,14 @@ impl ProviderAdapter for OllamaAdapter {
         attempt: &ProviderAttempt,
         request: &DurableToolRequest,
     ) -> Result<Value> {
-        let mut body = self.prepare_durable(attempt, &request.request).await?;
-        body["messages"] = json!(tool_messages(request)?);
-        Ok(body)
+        self.prepare_with_result_metadata(
+            attempt,
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+        )
+        .await
     }
     fn validate_with_tool_blocks(
         &self,
@@ -69,11 +126,14 @@ impl ProviderAdapter for OllamaAdapter {
         request: &DurableToolRequest,
         body: &Value,
     ) -> Result<()> {
-        self.validate(attempt, &request.request.request, body)?;
-        if body.get("messages") != Some(&json!(tool_messages(request)?)) {
-            return Err(Error::Config("provider hook changed durable input".into()));
-        }
-        Ok(())
+        self.validate_with_result_metadata(
+            attempt,
+            &ProviderResultRequest {
+                request: request.clone(),
+                tool_errors: Default::default(),
+            },
+            body,
+        )
     }
     fn supports_durable_blocks(&self) -> bool {
         true
@@ -84,7 +144,10 @@ impl ProviderAdapter for OllamaAdapter {
         request: &DurableRequest,
     ) -> Result<Value> {
         let mut body = self.prepare(attempt, &request.request).await?;
-        body["messages"] = json!(durable_messages(request)?);
+        body["messages"] = json!(result_messages(
+            &pi_rs_durable::tool_projection::wrap_durable(request),
+            self.image_profile(&request.request.model)
+        )?);
         Ok(body)
     }
     fn validate_durable(
@@ -94,8 +157,17 @@ impl ProviderAdapter for OllamaAdapter {
         body: &Value,
     ) -> Result<()> {
         self.validate(attempt, &request.request, body)?;
-        if !request.blocks.is_empty()
-            && body.get("messages") != Some(&json!(durable_messages(request)?))
+        if (!request.blocks.is_empty()
+            || request
+                .request
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. })))
+            && body.get("messages")
+                != Some(&json!(result_messages(
+                    &pi_rs_durable::tool_projection::wrap_durable(request),
+                    self.image_profile(&request.request.model)
+                )?))
         {
             return Err(Error::Config("provider hook changed durable input".into()));
         }
@@ -105,12 +177,10 @@ impl ProviderAdapter for OllamaAdapter {
         "ollama-local-openai/v1"
     }
     async fn prepare(&self, _: &ProviderAttempt, request: &ModelRequest) -> Result<Value> {
-        let messages: Vec<_> = request
-            .messages
-            .clone()
-            .into_iter()
-            .flat_map(encode_message)
-            .collect();
+        let messages = result_messages(
+            &pi_rs_durable::tool_projection::wrap_plain(request),
+            self.image_profile(&request.model),
+        )?;
         let tools: Vec<_> = request
             .tools
             .iter()
@@ -296,35 +366,66 @@ fn durable_messages(durable: &DurableRequest) -> Result<Vec<Value>> {
     Ok(messages)
 }
 
-fn tool_messages(request: &DurableToolRequest) -> Result<Vec<Value>> {
+fn result_messages(
+    request: &ProviderResultRequest,
+    profile: Option<pi_rs_durable::images::ModelImageProfile>,
+) -> Result<Vec<Value>> {
+    use pi_rs_durable::tool_projection::{self, Block};
     request.validate_bindings()?;
-    let mut messages = durable_messages(&request.request)?;
-    for (&index, binding) in &request.tool_blocks {
-        let Message::Tool { call_id, .. } = &request.request.request.messages[index] else {
-            unreachable!()
-        };
-        let mut sample = request.request.request.clone();
-        sample.messages = vec![Message::User {
-            content: String::new(),
-        }];
-        let user = DurableRequest {
-            request: sample,
-            blocks: [(0, binding.clone())].into_iter().collect(),
-        };
-        let encoded = durable_messages(&user)?;
-        let content = encoded[0]["content"].clone();
-        let mut found = 0;
-        for message in &mut messages {
-            if message["role"] == "tool" && message["tool_call_id"] == *call_id {
-                found += 1;
-                message["content"] = content.clone();
-            }
+    let request = tool_projection::project_request(request, profile);
+    let durable = &request.request;
+    let mut result = Vec::new();
+    let mut images = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, message) in durable.request.request.messages.iter().enumerate() {
+        if !matches!(message, Message::Tool { .. }) && !images.is_empty() {
+            let mut content =
+                vec![json!({"type":"text","text":"Attached image(s) from tool result:"})];
+            content.append(&mut images);
+            result.push(json!({"role":"user","content":content}));
         }
-        if found != 1 {
-            return Err(Error::Config("ambiguous tool result call ID".into()));
+        if let Message::Tool { call_id, .. } = message {
+            if !seen.insert(call_id.clone()) {
+                return Err(Error::Config("ambiguous tool result call ID".into()));
+            }
+            let mut texts = Vec::new();
+            let mut found_image = false;
+            for block in tool_projection::blocks(durable, index, false)? {
+                match block {
+                    Block::Text(text) => texts.push(text),
+                    Block::Image { image, .. } => {
+                        found_image = true;
+                        images.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",image.mime_type,image.data)}}));
+                    }
+                }
+            }
+            let text = texts.join("\n");
+            let text = if tool_projection::has_text(&text) {
+                text.as_str()
+            } else if found_image {
+                "(see attached image)"
+            } else {
+                "(no tool output)"
+            };
+            result.push(json!({"role":"tool","tool_call_id":call_id,"content":text}));
+        } else if let Some(binding) = durable.request.blocks.get(&index) {
+            let mut sample = durable.request.request.clone();
+            sample.messages = vec![message.clone()];
+            let user = DurableRequest {
+                request: sample,
+                blocks: [(0, binding.clone())].into_iter().collect(),
+            };
+            result.extend(durable_messages(&user)?);
+        } else {
+            result.extend(encode_message(message.clone()));
         }
     }
-    Ok(messages)
+    if !images.is_empty() {
+        let mut content = vec![json!({"type":"text","text":"Attached image(s) from tool result:"})];
+        content.append(&mut images);
+        result.push(json!({"role":"user","content":content}));
+    }
+    Ok(result)
 }
 
 fn encode_message(message: Message) -> Vec<Value> {
