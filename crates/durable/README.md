@@ -543,6 +543,10 @@ Current limits and differences from upstream Pi Durable:
   process-local and excludes direct harness drives and persisted waiting work.
   `WorkerActivity::subscribe` supplies coalesced lifecycle snapshots; slow
   readers can skip transitions. It is not an `onWake` or durable-idleness API.
+- `Scheduler::subscribe_changes` combines local store commit and worker
+  notifications into coalesced hints. Attach before inspecting state; the
+  returned commit sequence and worker list are not an atomic wake snapshot.
+  Writes through another SQLite connection do not generate these hints.
 - `Driver::wake_snapshot(now)` reads task definitions and durable waits under
   the task gate without waiting for the handler-held scheduler mutex. It does
   not include conversation deadlines or provide `onWake` notifications.

@@ -12584,6 +12584,58 @@ pub struct Scheduler {
     summary_blocked: Vec<Uuid>,
 }
 
+/// A coalesced hint that persistent state or a local worker changed.
+/// These two views are not an atomic wake decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchedulerChange {
+    pub commit_sequence: u64,
+    pub workers: Vec<crate::worker_activity::Worker>,
+}
+
+/// Subscription to the scheduler's local persistent and worker changes.
+pub struct SchedulerChanges {
+    commits: durable_store::CommitUpdates,
+    workers: crate::worker_activity::WorkerUpdates,
+    commits_closed: bool,
+    workers_closed: bool,
+}
+
+impl SchedulerChanges {
+    /// Read the latest values and mark them observed. They may have changed
+    /// independently and do not prove durable idleness.
+    pub fn current(&mut self) -> SchedulerChange {
+        SchedulerChange {
+            commit_sequence: self.commits.current(),
+            workers: self.workers.current(),
+        }
+    }
+
+    /// Wait for a change from either source. Slow readers can miss intermediate
+    /// transitions and should inspect current durable state after each hint.
+    pub async fn changed(&mut self) -> Option<SchedulerChange> {
+        loop {
+            if self.commits_closed && self.workers_closed {
+                return None;
+            }
+            tokio::select! {
+                result = self.commits.changed(), if !self.commits_closed => {
+                    if result.is_err() {
+                        self.commits_closed = true;
+                        continue;
+                    }
+                }
+                result = self.workers.changed(), if !self.workers_closed => {
+                    if result.is_err() {
+                        self.workers_closed = true;
+                        continue;
+                    }
+                }
+            }
+            return Some(self.current());
+        }
+    }
+}
+
 struct SummaryTask {
     cancel: CancellationToken,
     join: tokio::task::JoinHandle<Result<(), crate::summary_worker::Error>>,
@@ -12593,6 +12645,16 @@ impl Scheduler {
     /// Observe live executors shared with the attached task driver.
     pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
         self.harness.worker_activity()
+    }
+    /// Subscribe before inspecting state to avoid missing local mutations or
+    /// worker transitions. External SQLite connections are not observed.
+    pub fn subscribe_changes(&self) -> Result<SchedulerChanges, Error> {
+        Ok(SchedulerChanges {
+            commits: self.harness.owner.store().subscribe_commits()?,
+            workers: self.harness.activity.subscribe(),
+            commits_closed: false,
+            workers_closed: false,
+        })
     }
     /// Wait for a persisted submission settlement. Dropping or cancelling the
     /// wait leaves the submission untouched. The conversation is polled every
