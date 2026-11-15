@@ -1,5 +1,13 @@
 use pi_rs_workbench::skill_resources::{SkillReadGrants, SkillReader};
 
+fn normalized_display(path: &std::path::Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str())
+        .collect::<std::path::PathBuf>()
+        .display()
+        .to_string()
+}
+
 #[test]
 fn loads_explicit_skill_snapshot_and_renders_only_visible_skills() {
     let root = tempfile::tempdir().unwrap();
@@ -24,7 +32,7 @@ fn loads_explicit_skill_snapshot_and_renders_only_visible_skills() {
     let rendered = snapshot.render(SkillReader::Read).unwrap();
     assert!(rendered.contains("Use the read tool to load a skill's file"));
     assert!(rendered.contains("Read &lt;a&gt; &amp; &quot;b&quot;"));
-    assert!(rendered.contains(&visible.display().to_string()));
+    assert!(rendered.contains(&normalized_display(&visible)));
     assert!(!rendered.contains("private"));
     assert!(
         snapshot
@@ -139,7 +147,7 @@ fn relative_paths_require_explicit_absolute_base_and_resolve_before_rendering() 
         loaded
             .render(SkillReader::Read)
             .unwrap()
-            .contains(&path.display().to_string())
+            .contains(&normalized_display(&path))
     );
 }
 
@@ -159,8 +167,8 @@ fn errors_identify_bad_and_duplicate_skill_paths() {
     let message = grants.load().unwrap_err().to_string();
     assert!(
         message.contains("same")
-            && message.contains(&one.display().to_string())
-            && message.contains(&two.display().to_string())
+            && message.contains(&normalized_display(&one))
+            && message.contains(&normalized_display(&two))
     );
     std::fs::write(&two, "---\ndescription: [\n---\nbody").unwrap();
     assert!(
@@ -168,7 +176,7 @@ fn errors_identify_bad_and_duplicate_skill_paths() {
             .load()
             .unwrap_err()
             .to_string()
-            .contains(&two.display().to_string())
+            .contains(&normalized_display(&two))
     );
 }
 
