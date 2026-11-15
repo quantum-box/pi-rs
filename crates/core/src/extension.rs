@@ -296,7 +296,7 @@ enum DiscoveryEntryRequest {
 }
 
 async fn branch_custom_entries(
-    session: &crate::Session,
+    session: &mut crate::Session,
     custom_type: Option<&str>,
 ) -> ExtensionResult<Vec<CustomEntryRecord>> {
     let mut result = Vec::new();
@@ -3327,7 +3327,7 @@ mod replacement_tests {
                 })
                 .unwrap();
         }
-        let mut scan = Box::pin(branch_custom_entries(&session, Some("missing")));
+        let mut scan = Box::pin(branch_custom_entries(&mut session, Some("missing")));
         std::future::poll_fn(|cx| {
             assert!(
                 scan.as_mut().poll(cx).is_pending(),
@@ -3339,11 +3339,18 @@ mod replacement_tests {
         let past = platform_time::Instant::now() - std::time::Duration::from_secs(1);
         assert!(platform_time::timeout_at(past, scan).await.is_err());
         assert!(
-            branch_custom_entries(&session, Some("missing"))
+            branch_custom_entries(&mut session, Some("missing"))
                 .await
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn custom_entry_scan_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        assert_send(branch_custom_entries(&mut session, None));
     }
 
     #[tokio::test]
@@ -3358,13 +3365,13 @@ mod replacement_tests {
                 .unwrap();
         }
         assert!(
-            branch_custom_entries(&session, Some("large"))
+            branch_custom_entries(&mut session, Some("large"))
                 .await
                 .unwrap_err()
                 .contains("8 MiB")
         );
         assert!(
-            branch_custom_entries(&session, Some("other"))
+            branch_custom_entries(&mut session, Some("other"))
                 .await
                 .unwrap()
                 .is_empty()
@@ -3389,7 +3396,7 @@ mod replacement_tests {
                 data: Some(Value::String("x".repeat(8 * 1024 * 1024 - overhead))),
             })
             .unwrap();
-        let entries = branch_custom_entries(&session, Some("boundary"))
+        let entries = branch_custom_entries(&mut session, Some("boundary"))
             .await
             .unwrap();
         assert_eq!(serde_json::to_vec(&entries).unwrap().len(), 8 * 1024 * 1024);
