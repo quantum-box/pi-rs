@@ -1173,13 +1173,8 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
             "native packages use Cargo, git, or local paths".into(),
         ));
     }
-    let path = if trimmed.starts_with("file:") {
-        let invalid = || Error::Config("invalid local package file URL".into());
-        let url = reqwest::Url::parse(trimmed).map_err(|_| invalid())?;
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(invalid());
-        }
-        url.to_file_path().map_err(|_| invalid())?
+    let path = if trimmed.starts_with("file://") {
+        pi_rs_file_url::to_file_path(trimmed).map_err(Error::Config)?
     } else if trimmed == "~"
         || trimmed.starts_with("~/")
         || (cfg!(windows) && trimmed.starts_with("~\\"))
@@ -3711,6 +3706,45 @@ mod tests {
                 "git:github.com/example/demo"
             );
         }
+    }
+
+    #[test]
+    fn local_package_file_urls_match_node_path_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("native package");
+        std::fs::create_dir(&package).unwrap();
+        let url = reqwest::Url::from_directory_path(&package).unwrap();
+        let expected = normalize("native package", root.path()).unwrap();
+        assert_eq!(
+            normalize(&format!("{url}?ignored=%2F#%FF"), root.path()).unwrap(),
+            expected
+        );
+        assert!(matches_source(
+            &json!(format!("{url}?ignored#fragment")),
+            &expected,
+            root.path()
+        ));
+        for (tail, error) in [
+            ("a%2Fb", "encoded"),
+            ("a%ZZ", "URI malformed"),
+            ("a%FF", "URI malformed"),
+        ] {
+            assert!(
+                normalize(&format!("{url}{tail}"), root.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains(error)
+            );
+        }
+        #[cfg(windows)]
+        assert!(normalize(&format!("{url}a%5Cb"), root.path()).is_err());
+        #[cfg(unix)]
+        assert_eq!(
+            normalize("file:local", root.path()).unwrap(),
+            resolve_source_path(&root.path().join("file:local"))
+                .unwrap()
+                .to_string_lossy()
+        );
     }
 
     #[test]

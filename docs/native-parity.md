@@ -18,6 +18,10 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Visible thinking blocks render Markdown with the thinking text style and
+preserve the Markdown theme's explicit colors. As in Pi, Mermaid fences in
+thinking remain code rather than being transformed into diagrams.
+
 OpenAI Responses streams both reasoning text and reasoning summary text as
 thinking deltas. Completed reasoning items retain their summary when present,
 otherwise their content or streamed text, in the completed turn metadata.
@@ -112,6 +116,9 @@ without `defaultProvider` are still accepted.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt and explicit-directory context resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
+
+Local package `file://` sources ignore URL query and fragment components and
+reject malformed path escapes and encoded separators, as Pi does.
 
 ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
 minimum lifetime for bearer-token export. A refreshed credential is saved
@@ -382,6 +389,8 @@ a context extension. Expanding it would exceed a host or extension limit;
 there is no separate answer budget and headroom to expand. Raising both
 `--max-output-tokens` and `--output-budget` permits a larger thinking budget
 within those limits.
+Adaptive Messages requests also explicitly request summarized thinking, as Pi
+does, including for providers whose default display differs.
 
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable
@@ -420,7 +429,14 @@ is active cannot yet execute immediately. A model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
-blocks, tool calls, tool results and turn boundaries. Tool-call deltas expose
+blocks, tool calls, tool results and turn boundaries.
+Failed live assistant messages include a fixed `errorMessage` based on the
+native failure classification, including cancellation and retryable failures.
+Unlike Pi, native live failures do not retain provider error text in the journal
+or include it in that field, and historical message snapshots do not reconstruct
+every failed live attempt. Imported Pi records preserve their original error text.
+Other error and retry notifications retain their own diagnostics.
+Tool-call deltas expose
 incremental argument previews, including nested objects, arrays and partial
 strings. The fullscreen and regular terminals also show the prepared tool and
 its partial path, command or pattern while the model streams it. Completed
@@ -847,6 +863,11 @@ files follow the process umask and edits preserve existing permissions. File
 mutations run off the async runtime and check cancellation while holding the
 per-file lock, including immediately before committing the replacement.
 Lock acquisition also observes cancellation while another writer is active.
+The built-in local `write` uses atomic replacement. Unlike Pi's in-place write,
+it can replace a read-only file when the parent directory permits replacement,
+requires permission to create and replace entries in that directory, and leaves
+other hard links pointing at the old file. A permission preflight alone cannot
+bind the check to the file that a later pathname replacement will affect.
 RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
@@ -880,6 +901,8 @@ while scanning a single long line. Directory listing runs off the async
 runtime and checks for cancellation during enumeration and metadata reads.
 It sorts lowercased filenames with Unicode collation, using the process
 locale for language-specific ordering before applying the entry limit.
+On Unix, an unrestricted directory listing denied by the operating system
+reports Pi's `EACCES` scandir message with the requested absolute path.
 Local and injected `ls` select the locale in Node's environment order:
 `LC_ALL`, `LC_MESSAGES`, then `LANG`, including an explicitly empty value.
 
@@ -1225,6 +1248,17 @@ operations retain individual journal records, use the same validation and
 policies, and preserve uncertainty after cancellation. Tests cover denied and
 invalid calls, concurrent reads and blocked replay after interruption. This is
 the execution boundary for the pending codemode sandbox.
+
+### Codemode OpenAI Decisions checkpoint
+
+Codemode supports OpenAI Decisions classifier models, including the pinned
+GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
+and the Decisions-specific 504 retry exclusion. Native image validation and
+endpoint-bound credentials continue to apply. Classifier usage identifies its
+calculated costs as estimates with `totalFromProvider: false`.
+An OpenAI key explicitly saved for `/v1/responses`, including by the provider
+key UI, does not authorize `/v1/decisions`; use an endpointless Pi auth entry or
+`OPENAI_API_KEY` for the official Decisions endpoint.
 
 ### Native codemode checkpoint
 
@@ -1815,6 +1849,10 @@ interface. Embedded applications supply an `ExtensionUi` through the registry
 or `SessionBuilder::ui`. Native executable extensions use the same correlated
 host protocol for select, confirm, input and multiline editor dialogs, notices,
 status entries, above/below-editor widgets, window titles and editor text.
+Widgets appear in registration order within each position; replacing or moving
+a widget places it last at its destination, as in Pi.
+Native widgets retain the existing 64-widget and 128-line limits, and do not
+yet match Pi's ten-line truncation, text styling, or fixed fullscreen placement.
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
@@ -2601,6 +2639,10 @@ with chunked multibyte output; other local-tool parity gaps remain open.
 
 ### Grep context and line-limit checkpoint
 
+Invalid regular expressions in unrestricted local `grep` include the `rg:`
+prefix used by Pi's ripgrep diagnostic. Unsupported look-around and
+backreferences include ripgrep's PCRE2 suggestion.
+
 Grep now emits a separate context block for each match, including repeated lines
 where adjacent matches overlap. The matching marker belongs to that block's
 center; a neighboring match uses the context marker. Pending blocks flush at EOF,
@@ -3042,8 +3084,9 @@ An unrestricted local `read` of a missing path now reports the resolved path
 in Pi's `ENOENT: no such file or directory, access '…'` diagnostic. This also
 identifies the requested file when a parent directory is missing. On Unix, a
 non-directory parent reports Pi's `ENOTDIR` access diagnostic with the requested
-path. Other I/O errors and restricted workspace path checks retain their existing
-behavior.
+path. An inaccessible file or parent reports the requested path in Pi's
+`EACCES` access diagnostic. Other I/O errors and restricted workspace path
+checks retain their existing behavior.
 
 ### Write and edit result checkpoint
 
@@ -3298,6 +3341,9 @@ is enabled. A PTY fixture covers all three settings and the flag override in
 fullscreen and regular modes.
 
 ### Native Anthropic provider checkpoint
+
+An Anthropic fallback marker before output is accepted; a fallback after any
+text, thinking, or tool block fails the attempt, as in Pi.
 
 `--provider anthropic` or an `anthropic/<model>` reference selects the native
 Messages API. The standard endpoint reads `ANTHROPIC_API_KEY`. An explicit
@@ -3779,6 +3825,14 @@ uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
 APIs do not have a session owner; hosts that need message delivery use their
 session-owned counterparts.
+Discovery callbacks invoked through `Registry::discover_resources_in_session`
+can also use `ToolHost::append_entry` to persist branch-local custom entries.
+Both in-process and executable extensions receive this capability. The callback
+is acknowledged after the entry is committed; the entry does not enter model
+context. Other callbacks do not yet support this API.
+Discovery callbacks do not yet have a branch-entry read API for restoring
+previously stored custom data. An executable request already dispatched when
+its callback ends can still commit; queued requests are rejected after closure.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message
@@ -4511,6 +4565,8 @@ pinning the catalog's default endpoint.
 
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.
+Redacted Bedrock reasoning emits Pi's fixed placeholder once per block while
+retaining the opaque payload for replay.
 Signed and redacted reasoning is replayed in its original order only when the
 provider, model, text and tool calls still match, including the journal's
 normalization of malformed arguments. For application inference profile ARNs
@@ -4718,6 +4774,11 @@ timed-out inspection falls back to the existing transient classification. Provid
 returned. Bedrock typed SDK errors and non-chat operations retain their separate
 policies.
 
+Native SDK hosts can inspect the configured base system prompt with
+`AgentSession::configured_system_prompt`. Forks copy that value. This accessor
+does not run extension hooks and is not Pi's effective `systemPrompt`; hooks may
+modify individual requests after the configured prompt is read.
+
 ### Native SDK prompt resource factory
 
 `pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
@@ -4768,3 +4829,9 @@ The SDK model catalog can enumerate its host-registered provider/model identitie
 in deterministic order for host model pickers. This lists the immutable catalog
 snapshot, not Pi's discovered model registry or a live credential availability
 check. The host remains responsible for rebuilding it when authorization changes.
+
+### Explicit skill file diagnostics checkpoint
+
+Explicit skill files must end in `.md`; other files produce a diagnostic while
+the remaining skills continue loading. The check uses the supplied filename
+before following symlinks, matching Pi.
