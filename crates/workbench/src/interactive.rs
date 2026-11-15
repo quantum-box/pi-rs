@@ -162,6 +162,7 @@ struct ColorQueries {
     color_queries: std::collections::VecDeque<ColorQuery>,
     color_requery: bool,
     disabled: bool,
+    last_appearance_report: Option<bool>,
 }
 
 impl Terminal {
@@ -341,6 +342,21 @@ impl ColorQueries {
         output.write_all(query.as_bytes())?;
         output.flush()?;
         Ok(())
+    }
+
+    fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
+        let previous = self.last_appearance_report.replace(dark);
+        // The first report may be the response to ?996n sent at startup.
+        // It cannot be distinguished from a simultaneous notification.
+        let initial_report = previous.is_none()
+            && self
+                .color_queries
+                .front()
+                .is_some_and(|query| Some(query.started) == self.initial_started);
+        if !initial_report {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(previous.is_some_and(|value| value != dark))
     }
 
     fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
@@ -3584,6 +3600,29 @@ fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
 }
 
 #[cfg(any(unix, windows))]
+fn handle_terminal_appearance(
+    colors: &mut ColorQueries,
+    theme: &mut Theme,
+    dark: bool,
+    output: &mut dyn Write,
+) -> Result<(bool, bool)> {
+    let changed_report = colors.appearance_report(dark, output)?;
+    let invalidate = colors.disabled && changed_report;
+    if invalidate {
+        crate::ui::theme::invalidate_terminal_default_colors();
+        crate::ui::theme::clear_terminal_palette();
+    }
+    let (changed, redraw) = apply_terminal_appearance(theme, dark);
+    if invalidate && theme.name == "system" && !redraw {
+        *theme = Theme::system();
+    }
+    Ok((
+        changed || invalidate,
+        redraw || (invalidate && theme.name == "system"),
+    ))
+}
+
+#[cfg(any(unix, windows))]
 fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
     if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
         *theme = Theme::system();
@@ -4461,13 +4500,17 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        let (changed, redraw_system) = apply_terminal_appearance(&mut theme, dark);
+                        let (changed, redraw_system) = if let Some(terminal) = &mut _terminal {
+                            handle_terminal_appearance(
+                                &mut terminal.colors,
+                                &mut theme,
+                                dark,
+                                &mut std::io::stdout(),
+                            )?
+                        } else {
+                            apply_terminal_appearance(&mut theme, dark)
+                        };
                         dirty |= redraw_system;
-                        if let Some(terminal) = &mut _terminal {
-                            terminal
-                                .colors
-                                .query_terminal_colors(&mut std::io::stdout())?;
-                        }
                         changed
                     }
                     crate::ui::input::InputEvent::TerminalColor {
@@ -10282,6 +10325,7 @@ exit {exit}
             }]),
             color_requery: false,
             disabled: false,
+            last_appearance_report: None,
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -10391,6 +10435,69 @@ exit {exit}
         set_terminal_color(false, 255, 255, 255);
         let refreshed = super::Theme::system();
         assert!(matches!(refreshed.color("accent"), Color::Rgb { .. }));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn initial_appearance_report_does_not_discard_initial_colors() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        let initial_len = output.len();
+        // A late initial appearance response may follow an OSC reply.
+        assert!(colors.accepts_color_reply(16, &mut output).unwrap());
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(2);
+        colors.initial_started = Some(colors.color_queries.front().unwrap().started);
+        assert!(!colors.appearance_report(true, &mut output).unwrap());
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        assert_eq!(output.len(), initial_len);
+        // A subsequent appearance report must still schedule a refresh.
+        assert!(colors.appearance_report(false, &mut output).unwrap());
+        assert!(colors.color_requery);
+        assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn handoff_appearance_change_invalidates_only_on_new_report() {
+        const CHILD: &str = "PI_RS_HANDOFF_APPEARANCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::handoff_appearance_change_invalidates_only_on_new_report",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{reset_terminal_background, set_terminal_color};
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let original = theme.color("accent");
+        assert!(matches!(original, Color::Rgb { .. }));
+        let mut colors = super::ColorQueries::default();
+        // The terminal's dark background can differ from its light OS appearance.
+        colors.last_appearance_report = Some(false);
+        colors.disable_after_handoff();
+        let (_, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut std::io::sink())
+                .unwrap();
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), original);
+        // A changed report invalidates the stale background even when the new
+        // report happens to match the old background's inferred appearance.
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, true, &mut std::io::sink())
+                .unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
     }
 
     #[cfg(any(unix, windows))]

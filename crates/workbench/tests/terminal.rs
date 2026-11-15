@@ -56,7 +56,15 @@ impl Drop for Process {
     }
 }
 fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    output_until_with_timeout(master, Duration::from_secs(10), predicate);
+}
+
+fn output_until_with_timeout(
+    master: &mut File,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
     while Instant::now() < deadline {
@@ -135,6 +143,93 @@ fn typing_redraws_in_a_synchronized_frame() {
             })
         });
     }
+}
+
+#[test]
+fn initial_appearance_report_keeps_late_color_replies() {
+    let root = tempfile::tempdir().unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _process = Process(
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env_remove("NO_COLOR")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--use-theme",
+                "system",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until_with_timeout(&mut master, Duration::from_secs(30), |text| {
+        assert!(!text.contains("\x1b[38;2;"));
+        text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
+    });
+    // No DA1: the first appearance report is delayed past the 100 ms
+    // initial fallback and arrives after the foreground reply.
+    master.write_all(b"\x1b]10;rgb:ffff/ffff/ffff\x07").unwrap();
+    std::thread::sleep(Duration::from_millis(160));
+    // Discard already-rendered startup frames before observing the response.
+    let mut pre_response = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => pre_response.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => panic!("terminal read failed: {error}"),
+        }
+    }
+    assert!(!String::from_utf8_lossy(&pre_response).contains("\x1b[38;2;"));
+    master
+        .write_all(b"\x1b[?997;1n\x1b]11;rgb:0000/0000/0000\x07")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[38;2;"));
 }
 
 #[test]

@@ -1089,6 +1089,12 @@ keeps stale responses out of a later query but means a terminal that never sends
 DA1 cannot refresh colors during that session. After an external editor or
 suspend hands terminal ownership away, further color queries are disabled for
 the session: another owner may consume the old DA1 or leave an unrelated one.
+If a later appearance report changes, stale colors are cleared and the reported
+light/dark mode is used with the ANSI fallback. A repeated report does not discard
+colors: a terminal's colors can intentionally differ from the OS appearance.
+The first appearance report received during the initial color query is treated as
+the startup status report, not a color change; the protocol
+does not distinguish this report from a simultaneous notification.
 These restrictions differ from Pi's behavior. The boundary assumes the terminal sends each query's color responses before its
 DA1; arbitrary reordering or unrelated DA1 replies cannot be disambiguated,
 because these protocols contain no request identifiers.
