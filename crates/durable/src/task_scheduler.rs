@@ -1249,6 +1249,13 @@ fn request_abort_subtree_with(
                 });
             }
         }
+        for task_id in &ids {
+            let (check, mutation) =
+                crate::ownership_edge::prepare_abort_fence(ts.store(), &TaskOwner::Task(*task_id))
+                    .map_err(task_store::Error::from)?;
+            batch.checks.push(check);
+            batch.mutations.push(mutation);
+        }
         before_commit();
         match ts
             .store()
@@ -1277,6 +1284,56 @@ mod tests {
             .unwrap()
             .registered(kind.into(), safe)
     }
+    #[test]
+    fn repeated_abort_fences_prepared_child_without_rewriting_reservation() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        let mut root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(100)),
+            "job",
+            true,
+            4,
+        );
+        root.request_abort().unwrap();
+        scheduler.ts().save(&[Save::Create(&root)]).unwrap();
+        let version = scheduler.ts().load(root.id()).unwrap().unwrap().version;
+        let child = task(2, TaskOwner::Task(root.id()), "job", true, 4);
+        let owner = scheduler.owner();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let store = owner.store();
+            let batch = TaskStore::new(store)
+                .prepare_save(&[Save::Create(&child)])
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            store.commit(&batch.checks, &batch.mutations)
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        scheduler.request_abort(root.id()).unwrap();
+        assert_eq!(
+            scheduler.ts().load(root.id()).unwrap().unwrap().version,
+            version
+        );
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            thread.join().unwrap(),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(scheduler.ts().load(Uuid::from_u128(2)).unwrap().is_none());
+        drop(scheduler);
+        let reopened = Scheduler::open(&path, Registry::default()).unwrap();
+        assert!(reopened.ts().load(Uuid::from_u128(2)).unwrap().is_none());
+    }
+
     #[test]
     fn repeated_abort_retries_when_marked_task_changes() {
         use std::sync::mpsc;

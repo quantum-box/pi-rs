@@ -441,13 +441,20 @@ impl<'a> TaskStore<'a> {
         let mut seen_tasks = std::collections::HashSet::from([task.id()]);
         let mut seen_conversations = std::collections::HashSet::new();
         let mut next = task.owner().clone();
+        let mut fence_scope = true;
         loop {
+            if fence_scope {
+                checks.push(crate::ownership_edge::abort_fence_check(self.store, &next)?);
+            }
             match next {
                 TaskOwner::Task(id) => {
                     if !seen_tasks.insert(id) {
                         return Err(Error::InvalidOwnership);
                     }
                     if let Some(parent) = created.get(&id) {
+                        if parent.is_background() {
+                            fence_scope = false;
+                        }
                         next = parent.owner().clone();
                     } else {
                         let parent = self.load(id)?;
@@ -458,7 +465,12 @@ impl<'a> TaskStore<'a> {
                                 .map_or(Expected::Missing, |p| Expected::Version(p.version)),
                         });
                         match parent {
-                            Some(parent) => next = parent.task.owner().clone(),
+                            Some(parent) => {
+                                if parent.task.is_background() {
+                                    fence_scope = false;
+                                }
+                                next = parent.task.owner().clone();
+                            }
                             None => return Ok(checks),
                         }
                     }
@@ -480,6 +492,9 @@ impl<'a> TaskStore<'a> {
                         Some(entry) => {
                             let edge = crate::ownership_edge::decode(&key, entry)
                                 .map_err(|_| Error::InvalidOwnership)?;
+                            if edge.edge.mode == crate::ownership_edge::Mode::Background {
+                                fence_scope = false;
+                            }
                             let owner = if let Some(owner) = created.get(&edge.edge.task) {
                                 (*owner).clone()
                             } else {

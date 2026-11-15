@@ -8142,6 +8142,16 @@ impl Harness {
                 });
             }
             batch.checks.extend(edge_checks);
+            for owner in tasks
+                .iter()
+                .copied()
+                .map(TaskOwner::Task)
+                .chain(conversations.iter().copied().map(TaskOwner::Conversation))
+            {
+                let (check, mutation) = crate::ownership_edge::prepare_abort_fence(store, &owner)?;
+                batch.checks.push(check);
+                batch.mutations.push(mutation);
+            }
             for (id, generation) in generation_updates {
                 batch.mutations.push(Mutation::Put {
                     key: crate::subagent::generation_key(id),

@@ -12,6 +12,44 @@ use uuid::Uuid;
 
 pub(crate) const PREFIX: &[u8] = b"durable/conversation-owner/";
 
+// Separate from task versions: repeated abort must invalidate prepared graph
+// writes without invalidating an in-flight task cleanup reservation.
+const ABORT_FENCE_PREFIX: &[u8] = b"durable/ownership-abort-fence/v1/";
+
+fn abort_fence_key(owner: &TaskOwner) -> Vec<u8> {
+    let mut key = ABORT_FENCE_PREFIX.to_vec();
+    let (kind, id) = match owner {
+        TaskOwner::Task(id) => (b't', id),
+        TaskOwner::Conversation(id) => (b'c', id),
+    };
+    key.push(kind);
+    key.extend_from_slice(id.as_bytes());
+    key
+}
+
+pub(crate) fn abort_fence_check(
+    store: &Store,
+    owner: &TaskOwner,
+) -> Result<Check, durable_store::Error> {
+    let key = abort_fence_key(owner);
+    let expected = store
+        .get(&key)?
+        .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+    Ok(Check { key, expected })
+}
+
+pub(crate) fn prepare_abort_fence(
+    store: &Store,
+    owner: &TaskOwner,
+) -> Result<(Check, Mutation), durable_store::Error> {
+    let check = abort_fence_check(store, owner)?;
+    let mutation = Mutation::Put {
+        key: check.key.clone(),
+        value: vec![1],
+    };
+    Ok((check, mutation))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
     Foreground,
@@ -315,7 +353,11 @@ pub(crate) fn owner_chain_from(
     let mut checks = Vec::new();
     let mut seen_tasks = HashSet::new();
     let mut seen_conversations = HashSet::new();
+    let mut fence_scope = true;
     loop {
+        if fence_scope {
+            checks.push(abort_fence_check(store, &next)?);
+        }
         match next {
             TaskOwner::Task(id) => {
                 if !seen_tasks.insert(id) {
@@ -326,6 +368,9 @@ pub(crate) fn owner_chain_from(
                     key: task_store::key(id),
                     expected: Expected::Version(stored.version),
                 });
+                if stored.task.is_background() {
+                    fence_scope = false;
+                }
                 next = stored.task.owner().clone();
             }
             TaskOwner::Conversation(id) => {
@@ -336,6 +381,9 @@ pub(crate) fn owner_chain_from(
                 match store.get(&key)? {
                     Some(entry) => {
                         let stored = decode(&key, entry)?;
+                        if stored.edge.mode == Mode::Background {
+                            fence_scope = false;
+                        }
                         checks.push(Check {
                             key,
                             expected: Expected::Version(stored.version),
