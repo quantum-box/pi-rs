@@ -1510,6 +1510,14 @@ mod tests {
     #[test]
     fn cancelled_mcp_request_waiting_for_refresh_lock_does_not_commit() {
         use std::time::Duration;
+        struct NotifyDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = FileCredentials {
             path: directory.path().join("credentials.json"),
@@ -1529,6 +1537,7 @@ mod tests {
         held.lock().unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1536,9 +1545,11 @@ mod tests {
         let task = runtime.block_on(async move {
             let task = tokio::spawn(async move {
                 crate::mcp_refresh::run(async move {
+                    let _finished = NotifyDrop(Some(finished_tx));
                     entered_tx.send(()).unwrap();
-                    let _guard = store.acquire_refresh_guard().await.unwrap();
-                    let _ = committed_tx.send(());
+                    if let Ok(_guard) = store.acquire_refresh_guard().await {
+                        let _ = committed_tx.send(());
+                    }
                 })
                 .await
             });
@@ -1549,16 +1560,20 @@ mod tests {
             })
             .await
             .unwrap();
-            task.abort_handle()
+            task
         });
-        task.abort();
+        runtime.block_on(async {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
         drop(runtime);
-        std::thread::sleep(Duration::from_millis(100));
         held.unlock().unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("cancelled refresh task did not finish");
         assert!(
-            committed_rx
-                .recv_timeout(Duration::from_millis(250))
-                .is_err()
+            committed_rx.try_recv().is_err(),
+            "cancelled refresh was admitted"
         );
     }
 

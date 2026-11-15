@@ -26,6 +26,7 @@ jobs:
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs cancelled_refresh_survives_runtime_shutdown_and_persists_rotation
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs rotating_refresh_holds_shared_store_lock_until_persisted
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib cancelled_runtime_persists_rotated_mcp_refresh_token
+      - run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib cancelled_mcp_request_waiting_for_refresh_lock_does_not_commit
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs standalone_share_
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --bin pi-rs backend::share_context_tests
       - run: cargo +1.89.0 test --locked -p pi-rs-workbench --lib private_share_store
