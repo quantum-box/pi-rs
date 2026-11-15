@@ -152,6 +152,13 @@ pub enum Status {
     Done { answer: String },
     Unanswered { reason: String },
 }
+/// Persisted record of the most recent run that ended without an answer.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunFailure {
+    pub inputs: Vec<Uuid>,
+    pub reason: String,
+}
+
 /// Durable outcome of an idle manual compaction operation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ManualCompactionStatus {
@@ -746,6 +753,9 @@ pub struct Conversation {
     #[serde(default)]
     compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
+    /// Most recent failed run; lifecycle clearing is not yet implemented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_failure: Option<RunFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_attempt: Option<ToolAttempt>,
     #[serde(default)]
@@ -4911,6 +4921,7 @@ impl Harness {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            run_failure: None,
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,
@@ -5228,6 +5239,7 @@ impl Harness {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            run_failure: None,
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,
@@ -16108,6 +16120,17 @@ fn finish_abort(c: &mut Conversation) {
     }
 }
 fn finish_failure(c: &mut Conversation, reason: String) {
+    let inputs: Vec<_> = c.submissions
+        .iter()
+        .filter(|s| s.status == Status::Running)
+        .map(|s| s.id)
+        .collect();
+    if !inputs.is_empty() {
+        c.run_failure = Some(RunFailure {
+            inputs,
+            reason: reason.clone(),
+        });
+    }
     c.active = None;
     for s in &mut c.submissions {
         if s.status == Status::Running {
@@ -16130,6 +16153,24 @@ mod scheduler_tests {
     use pi_rs_core::{ModelEvent, ModelRequest, ModelStream};
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn failed_run_record_round_trips_with_settled_inputs() {
+        let mut c = Harness::empty_conversation(Uuid::new_v4(), config());
+        let id = Uuid::new_v4();
+        c.admit_initial_input(id, "work".into());
+        finish_failure(&mut c, "model failed".into());
+        let saved = serde_json::to_vec(&c).unwrap();
+        let restored: Conversation = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            restored.run_failure,
+            Some(RunFailure {
+                inputs: vec![id],
+                reason: "model failed".into(),
+            })
+        );
+        assert!(matches!(&restored.submissions[0].status, Status::Unanswered { reason } if reason == "model failed"));
+    }
 
     #[test]
     fn tool_status_bindings_use_occurrences_and_reject_ambiguous_legacy_ids() {
@@ -19590,6 +19631,7 @@ mod scheduler_tests {
             overflow_compaction_attempted: false,
             compaction_return_turns: None,
             active: None,
+            run_failure: None,
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,
