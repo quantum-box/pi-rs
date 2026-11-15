@@ -347,6 +347,30 @@ fn list_json_collision_identifies_project_source() {
     assert!(error.contains(".pi") && error.contains("mcp.json") && error.contains("a_b"));
 }
 
+#[test]
+fn list_json_reports_invalid_name_from_each_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let data = json!({"mcpServers":{"bad name":{"command":"ignored","enabled":false}}}).to_string();
+    std::fs::write(home.join("mcp.json"), &data).unwrap();
+    std::fs::write(project.join("mcp.json"), &data).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--trust", "mcp", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = data["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2);
+    assert!(errors[0].as_str().unwrap().contains("home"));
+    assert!(errors[1].as_str().unwrap().contains(".pi"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn list_json_fails_when_stdout_cannot_be_written() {

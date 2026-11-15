@@ -81,6 +81,13 @@ type ScopedConfigurations = (
     Vec<String>,
 );
 
+fn valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
 fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok((
@@ -121,7 +128,7 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
         .unwrap_or_default();
     if strict {
         servers.retain(|name, value| {
-            if report_server_config(value).is_none() {
+            if !valid_server_name(name) || report_server_config(value).is_none() {
                 configuration_errors.push(format!(
                     "{}: invalid MCP server configuration for {name}",
                     user_path.display()
@@ -165,7 +172,10 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
                     let full = ["command", "url", "type"]
                         .iter()
                         .any(|key| entry.get(*key).is_some());
-                    if !entry.is_object() || (full && report_server_config(entry).is_none()) {
+                    if !valid_server_name(name)
+                        || !entry.is_object()
+                        || (full && report_server_config(entry).is_none())
+                    {
                         configuration_errors.push(format!(
                             "{}: invalid MCP server configuration for {name}",
                             project_path.display()
@@ -571,11 +581,7 @@ async fn list_json(args: &Cli) -> Result<()> {
         };
         let project = project_definitions.contains(&name);
         let source = if project { &project_path } else { &global_path };
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-        {
+        if !valid_server_name(&name) {
             errors.push(format!(
                 "{}: invalid MCP server name {name}",
                 source.display()
