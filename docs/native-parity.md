@@ -2690,6 +2690,8 @@ Imported custom messages remain model context and support branch-local context
 edits. RPC session entries keep the original Pi representation without
 duplicating the converted journal records. Codemode store entries also continue
 to restore their branch-local state.
+The default terminal rendering joins text blocks and omits image blocks, as Pi
+does; the journal and model context retain the images.
 Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
 Imported message-form branch summaries use Pi's summary context framing while

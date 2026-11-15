@@ -1124,19 +1124,12 @@ impl View {
             return;
         }
         let mut text = Vec::new();
-        let mut images = Vec::new();
         match &message.content {
             pi_rs::ContextContent::Text(value) => text.push(value.as_str()),
             pi_rs::ContextContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
                         pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
-                        pi_rs::ContentBlock::Image { data, mime_type } => {
-                            images.push(pi_rs::ImageContent {
-                                data: data.clone(),
-                                mime_type: mime_type.clone(),
-                            })
-                        }
                         _ => {}
                     }
                 }
@@ -1146,9 +1139,6 @@ impl View {
             custom_type: message.custom_type.clone(),
             text: text.join("\n"),
         });
-        if !images.is_empty() {
-            self.add_images(&images);
-        }
     }
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
@@ -9150,6 +9140,12 @@ exit {exit}
     #[test]
     fn custom_message_blocks_are_joined_like_pi_without_rendering_details() {
         let mut view = super::View::default();
+        view.graphics = super::Renderer::test_kitty();
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
         let message = pi_rs::CustomMessage {
             custom_type: "fixture".into(),
             content: pi_rs::ContextContent::Blocks(vec![
@@ -9158,7 +9154,7 @@ exit {exit}
                     text_signature: None,
                 },
                 pi_rs::ContentBlock::Image {
-                    data: String::new(),
+                    data: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
                     mime_type: "image/png".into(),
                 },
                 pi_rs::ContentBlock::Text {

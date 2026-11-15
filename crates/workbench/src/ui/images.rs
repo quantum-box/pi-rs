@@ -268,6 +268,13 @@ impl Default for Renderer {
     }
 }
 impl Renderer {
+    #[cfg(test)]
+    pub(crate) fn test_kitty() -> Self {
+        Self {
+            protocol: Some(Protocol::Kitty),
+            ..Self::default()
+        }
+    }
     pub fn enabled(&self) -> bool {
         self.protocol.is_some()
     }
