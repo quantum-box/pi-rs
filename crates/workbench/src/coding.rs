@@ -6576,6 +6576,16 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(Error::Config(message)) if message == "Command aborted"));
+        let result = direct
+            .invoke(
+                json!({"command":"true"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Failed(message) if message == "Command aborted"));
         let result = factory
             .invoke(
                 json!({"command":"true"}),
