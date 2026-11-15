@@ -1508,12 +1508,39 @@ fn command_cancellable(
 
         _ => {
             let command = match request.get("type") {
-                Some(Value::String(name)) => name.clone(),
-                Some(value) => value.to_string(),
+                Some(value) => js_command_string(value)?,
                 None => "undefined".into(),
             };
             Err(Error::Config(format!("Unknown command: {command}")))
         }
+    }
+}
+
+// The upstream diagnostic interpolates the unvalidated JSON value in a JS
+// template literal. Array joining treats null elements as empty strings.
+fn js_command_string(value: &Value) -> Result<String> {
+    match value {
+        Value::Null => Ok("null".into()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(ryu_js::Buffer::new()
+            .format(value.as_f64().expect("JSON number"))
+            .to_owned()),
+        Value::String(value) => Ok(value.clone()),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                if value.is_null() {
+                    Ok(String::new())
+                } else {
+                    js_command_string(value)
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|values| values.join(",")),
+        Value::Object(value) if value.contains_key("toString") => Err(Error::Config(
+            "Cannot convert object to primitive value".into(),
+        )),
+        Value::Object(_) => Ok("[object Object]".into()),
     }
 }
 
