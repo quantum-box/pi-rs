@@ -18,6 +18,11 @@ without adding a trailing blank line after a final heading.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Hidden thinking runs display a themed `Thinking...` label. In fullscreen mode,
+clicking a thinking run toggles it independently, including while it streams;
+changing the global visibility setting clears individual overrides. Regular
+mode uses the global visibility setting and does not handle transcript clicks.
+
 Visible thinking blocks render Markdown with the thinking text style and
 preserve the Markdown theme's explicit colors. As in Pi, Mermaid fences in
 thinking remain code rather than being transformed into diagrams.
