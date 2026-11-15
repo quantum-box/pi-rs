@@ -470,3 +470,178 @@ async fn explicit_result_rewrite_is_validated_and_survives_hook_interruption() {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
+
+struct SavedHost(Arc<std::sync::Mutex<Option<KeyedHost>>>);
+#[async_trait::async_trait]
+impl KeyedTool for SavedHost {
+    fn spec(&self) -> ToolSpec {
+        spec("job")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        host.diagnostic(diagnostic("in time")).unwrap();
+        *self.0.lock().unwrap() = Some(host);
+        Outcome::Succeeded("done".into()).into()
+    }
+}
+#[tokio::test]
+async fn completed_attempt_rejects_late_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = Arc::new(std::sync::Mutex::new(None));
+    let options = Options {
+        model: Arc::new(FakeModel("job")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(SavedHost(saved.clone())))
+                .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        saved
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .diagnostic(diagnostic("too late"))
+            .is_err()
+    );
+    let c = h.conversation(id).unwrap();
+    assert_eq!(c.tool_results[0].diagnostics.len(), 1);
+    assert_eq!(c.tool_results[0].diagnostics[0].message, "in time");
+}
+
+struct SavedNestedParent(Arc<std::sync::Mutex<Option<KeyedHost>>>);
+#[async_trait::async_trait]
+impl KeyedTool for SavedNestedParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let child = host
+            .call_keyed_with_diagnostics("child-key", "child", json!({}))
+            .await;
+        assert_eq!(child.diagnostics.len(), 1);
+        *self.0.lock().unwrap() = Some(host);
+        Outcome::Succeeded("done".into()).into()
+    }
+}
+#[tokio::test]
+async fn sealed_parent_cannot_read_nested_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = Arc::new(std::sync::Mutex::new(None));
+    let child_count = Arc::new(AtomicUsize::new(0));
+    let options = Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(SavedNestedParent(saved.clone())))
+                .register(ReplayPolicy::Unsafe),
+            Arc::new(KeyedToolAdapter::new(Child(child_count.clone())))
+                .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let host = saved.lock().unwrap().as_ref().unwrap().clone();
+    let later = host
+        .call_keyed_with_diagnostics("child-key", "child", json!({}))
+        .await;
+    assert!(matches!(later.outcome, Outcome::Unknown(_)));
+    assert!(later.diagnostics.is_empty());
+    assert_eq!(child_count.load(Ordering::SeqCst), 1);
+}
+
+struct InvalidChild;
+#[async_trait::async_trait]
+impl KeyedTool for InvalidChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        _: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        Outcome::Structured {
+            data: json!("invalid"),
+            attachments: vec![],
+        }
+        .into()
+    }
+}
+struct CaptureChild(Arc<std::sync::Mutex<Option<pi_rs_durable::nested::KeyedResult>>>);
+#[async_trait::async_trait]
+impl KeyedTool for CaptureChild {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let result = host
+            .call_keyed_with_diagnostics("child-key", "child", json!({}))
+            .await;
+        *self.0.lock().unwrap() = Some(result);
+        Outcome::Succeeded("done".into()).into()
+    }
+}
+#[tokio::test]
+async fn nested_schema_failure_includes_error_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let options = Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(CaptureChild(captured.clone())))
+                .register(ReplayPolicy::Unsafe),
+            Arc::new(KeyedToolAdapter::new(InvalidChild)).register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(dir.path().join("db"), options).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.set_tool_output_schema(id, "child".into(), Some(json!({"type":"integer"})))
+        .unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let result = captured.lock().unwrap();
+    let result = result.as_ref().unwrap();
+    assert!(matches!(result.outcome, Outcome::Failed(_)));
+    assert_eq!(
+        result.diagnostics[0].code.as_deref(),
+        Some("invalid_structured_output")
+    );
+    assert_eq!(result.diagnostics[0].severity, DiagnosticSeverity::Error);
+}

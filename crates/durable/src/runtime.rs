@@ -3522,14 +3522,15 @@ impl Harness {
         {
             state.pending_tool_result = Some(state.tool_results.remove(position));
         }
-        if !matches!(state.phase, Phase::ToolFinished { .. }) {
+        if !matches!(state.phase, Phase::ToolFinished { .. })
+            && let Some(prior) = old
+        {
             for metadata in &mut state.tool_results {
-                if old.is_none_or(|prior| {
-                    !prior
-                        .tool_results
-                        .iter()
-                        .any(|r| r.operation_id == metadata.operation_id)
-                }) {
+                if !prior
+                    .tool_results
+                    .iter()
+                    .any(|r| r.operation_id == metadata.operation_id)
+                {
                     validate_tool_metadata(&state.tool_filters, metadata);
                 }
             }
@@ -14202,6 +14203,35 @@ mod scheduler_tests {
             system_prompt: "".into(),
             max_output_tokens: 10,
         }
+    }
+
+    #[test]
+    fn new_fork_seed_does_not_revalidate_legacy_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let mut state = Harness::empty_conversation(Uuid::new_v4(), config());
+        state
+            .tool_filters
+            .output_schemas
+            .insert("allowed".into(), serde_json::json!({"type":"integer"}));
+        state.tool_results.push(ToolResultMetadata {
+            operation_id: Uuid::new_v4(),
+            call_id: "legacy".into(),
+            tool: "allowed".into(),
+            is_error: false,
+            redacted: false,
+            metadata_truncated: false,
+            schema_validated: false,
+            details: None,
+            structured_output: None,
+            attachments: Vec::new(),
+            diagnostics: Vec::new(),
+        });
+        h.save(&state, Expected::Missing).unwrap();
+        let saved = h.conversation(state.id).unwrap();
+        assert!(!saved.tool_results[0].schema_validated);
+        assert!(saved.tool_results[0].diagnostics.is_empty());
     }
 
     #[tokio::test]

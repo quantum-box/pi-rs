@@ -433,7 +433,20 @@ impl NestedHost {
         arguments: Value,
     ) -> KeyedResult {
         let outcome = self.call_keyed(key, name, arguments.clone()).await;
-        let diagnostics = if valid_key(key) {
+        // Keep the invocation open while reading its private checkpoint. A
+        // detached caller must not read diagnostics after the host is sealed.
+        let lifecycle = match self.shared.lifecycle.lock() {
+            Ok(lifecycle) if !lifecycle.sealed && !lifecycle.closed.contains(&self.parent) => {
+                lifecycle
+            }
+            _ => {
+                return KeyedResult {
+                    outcome: self.fail("nested host sealed or failed"),
+                    diagnostics: Vec::new(),
+                };
+            }
+        };
+        let mut diagnostics = if valid_key(key) {
             match self
                 .shared
                 .owner
@@ -463,6 +476,25 @@ impl NestedHost {
         } else {
             Vec::new()
         };
+        if let Outcome::Failed(reason) = &outcome
+            && !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == crate::runtime::DiagnosticSeverity::Error)
+        {
+            diagnostics.push(crate::runtime::ToolDiagnostic {
+                severity: crate::runtime::DiagnosticSeverity::Error,
+                code: Some(
+                    if reason.starts_with("invalid_structured_output:") {
+                        "invalid_structured_output"
+                    } else {
+                        "tool_error"
+                    }
+                    .into(),
+                ),
+                message: reason.clone(),
+            });
+        }
+        drop(lifecycle);
         KeyedResult {
             outcome,
             diagnostics,

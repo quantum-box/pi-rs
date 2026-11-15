@@ -634,7 +634,7 @@ registration metadata. Legacy after-tool text replacements conservatively
 withhold metadata. An opt-in `Hook::after_tool_result` receives all result
 channels and can explicitly replace them; its chain runs after the legacy text
 hook chain, and the replacement is bounded and schema-validated before publication.
-Nested calls do not run this hook chain.
+Nested calls and legacy checkpoints without result metadata do not run this hook chain.
 Earlier history already published before this feature cannot be retroactively
 redacted, and previously streamed output cannot be retracted.
 
