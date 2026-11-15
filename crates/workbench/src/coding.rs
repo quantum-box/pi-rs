@@ -3181,6 +3181,32 @@ pub fn prepare_image_with_resize(
     prepare_image_with_resize_cancellable(original, resize, None)
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageCheckpoint {
+    Thumbnail,
+    Png,
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMAGE_CANCEL_AT: std::cell::RefCell<Option<(ImageCheckpoint, pi_rs::CancellationToken)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cancel_at_image_checkpoint(checkpoint: ImageCheckpoint) {
+    IMAGE_CANCEL_AT.with(|slot| {
+        let pending = slot.borrow_mut().take();
+        if let Some((target, token)) = pending {
+            if target == checkpoint {
+                token.cancel();
+            } else {
+                *slot.borrow_mut() = Some((target, token));
+            }
+        }
+    });
+}
+
 fn prepare_image_with_resize_cancellable(
     original: image::DynamicImage,
     resize: bool,
@@ -3194,6 +3220,8 @@ fn prepare_image_with_resize_cancellable(
     } else {
         original
     };
+    #[cfg(test)]
+    cancel_at_image_checkpoint(ImageCheckpoint::Thumbnail);
     crate::image_profile::check_cancelled(cancellation)?;
     let limit = if resize {
         512 * 1024
@@ -3205,6 +3233,8 @@ fn prepare_image_with_resize_cancellable(
         png.clear();
         crate::image_profile::check_cancelled(cancellation)?;
         let encoded = resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png);
+        #[cfg(test)]
+        cancel_at_image_checkpoint(ImageCheckpoint::Png);
         crate::image_profile::check_cancelled(cancellation)?;
         encoded.map_err(|error| Error::Config(error.to_string()))?;
         if png.len() <= limit {
@@ -3644,41 +3674,52 @@ mod tests {
     }
 
     #[test]
-    fn restricted_image_cancellation_preserves_output_and_decode_errors() {
+    fn restricted_image_cancels_after_thumbnail_and_png_encoding() {
         let image = image::DynamicImage::new_rgb8(2001, 2);
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        for checkpoint in [ImageCheckpoint::Thumbnail, ImageCheckpoint::Png] {
+            let token = pi_rs::CancellationToken::new();
+            IMAGE_CANCEL_AT.with(|slot| *slot.borrow_mut() = Some((checkpoint, token.clone())));
+            let reader = image::ImageReader::with_format(
+                Cursor::new(encoded.clone()),
+                image::ImageFormat::Png,
+            );
+            assert!(matches!(
+                normalize_image_cancellable(reader, Some(&token)),
+                Err(Error::Cancelled)
+            ));
+            assert!(token.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn restricted_image_preserves_dimensions_pixels_and_decode_errors() {
+        let pixels = image::RgbImage::from_pixel(4000, 2000, image::Rgb([12, 34, 56]));
         let mut bytes = Cursor::new(Vec::new());
-        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        let bytes = bytes.into_inner();
-        let reader =
-            || image::ImageReader::with_format(Cursor::new(bytes.clone()), image::ImageFormat::Png);
-        let expected = normalize_image(reader()).unwrap();
-        let token = pi_rs::CancellationToken::new();
-        let actual = normalize_image_cancellable(reader(), Some(&token)).unwrap();
-        assert_eq!(
-            (
-                actual.source_width,
-                actual.source_height,
-                actual.width,
-                actual.height
-            ),
-            (
-                expected.source_width,
-                expected.source_height,
-                expected.width,
-                expected.height
-            )
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let reader = image::ImageReader::with_format(
+            Cursor::new(bytes.into_inner()),
+            image::ImageFormat::Png,
         );
-        assert_eq!(actual.png, expected.png);
+        let token = pi_rs::CancellationToken::new();
+        let actual = normalize_image_cancellable(reader, Some(&token)).unwrap();
+        assert_eq!((actual.source_width, actual.source_height), (4000, 2000));
+        assert_eq!((actual.width, actual.height), (2000, 1000));
+        let decoded = image::load_from_memory(&actual.png).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2000, 1000));
+        assert_eq!(*decoded.get_pixel(0, 0), image::Rgb([12, 34, 56]));
+        assert_eq!(*decoded.get_pixel(1000, 500), image::Rgb([12, 34, 56]));
 
         let invalid =
-            || image::ImageReader::with_format(Cursor::new(vec![0u8; 8]), image::ImageFormat::Png);
-        let expected = normalize_image(invalid()).err().unwrap().to_string();
-        let actual = normalize_image_cancellable(invalid(), Some(&token))
-            .err()
-            .unwrap()
-            .to_string();
-        assert_eq!(actual, expected);
-        assert!(actual.contains("cannot decode image:"));
+            image::ImageReader::with_format(Cursor::new(vec![0u8; 8]), image::ImageFormat::Png);
+        assert!(matches!(normalize_image_cancellable(invalid, Some(&token)),
+            Err(Error::Config(message)) if message.starts_with("cannot decode image:") && message.contains("PNG")));
     }
 
     #[test]
