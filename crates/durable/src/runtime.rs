@@ -9749,7 +9749,8 @@ impl Harness {
                     == Some(&proof.identity)
         });
         let safe_replay = resume.unsafe_park.is_none() && reg.replay == ReplayPolicy::Safe;
-        if !(unsafe_park || safe_replay)
+        if !crate::nested::children_match(self.owner.store(), operation_id, &tools, unsafe_park)?
+            || !(unsafe_park || safe_replay)
             || dispatch_identity(&reg.tool).ok() != Some(resume.dispatch_identity.clone())
             || (resume.explicit_suspend
                 && crate::nested::has_staged_results(self.owner.store(), operation_id)?)
@@ -11755,6 +11756,24 @@ impl Harness {
                     let mut explicitly_suspended = false;
                     let mut parked_checkpoint = None;
                     let mut empty_park_controls = false;
+                    let mut unsafe_children_match = false;
+                    let mut park_return_failure = None;
+                    let started_unsafe_identity = (replay == ReplayPolicy::Unsafe)
+                        .then(|| {
+                            tools
+                                .get(&call.name)
+                                .and_then(|reg| crate::keyed_tool::unsafe_park_identity(&reg.tool))
+                        })
+                        .flatten();
+                    // Identity-bound host changes wait until this invocation
+                    // and its park/result commit have both finished.
+                    let _unsafe_parent_lease = if let (Some(identity), Some(reg)) =
+                        (started_unsafe_identity.as_ref(), tools.get(&call.name))
+                    {
+                        crate::nested_identity::lease(&reg.tool, &identity.identity)
+                    } else {
+                        None
+                    };
                     let task_adapter = tools
                         .get(&call.name)
                         .and_then(|reg| crate::task_tool::lookup(&reg.tool));
@@ -11782,15 +11801,17 @@ impl Harness {
                             .filter(|resume| resume.operation_id == operation_id)
                             .and_then(|resume| resume.unsafe_park.as_ref())
                     {
-                        let valid = c.active_tool_attempt().is_some_and(|attempt| {
-                            attempt.operation_id == operation_id
-                                && attempt != proof.attempt
-                                && !attempt.attempt_id.is_nil()
-                        }) && tools.get(&call.name).is_some_and(|reg| {
-                            reg.replay == ReplayPolicy::Unsafe
-                                && crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref()
-                                    == Some(&proof.identity)
-                        });
+                        let valid = _unsafe_parent_lease.is_some()
+                            && c.active_tool_attempt().is_some_and(|attempt| {
+                                attempt.operation_id == operation_id
+                                    && attempt != proof.attempt
+                                    && !attempt.attempt_id.is_nil()
+                            })
+                            && tools.get(&call.name).is_some_and(|reg| {
+                                reg.replay == ReplayPolicy::Unsafe
+                                    && crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref()
+                                        == Some(&proof.identity)
+                            });
                         if !valid {
                             c.nested_resume = None;
                             c.phase = Phase::Blocked {
@@ -11961,10 +11982,30 @@ impl Harness {
                                                 })?
                                                 .eq(&crate::reset::ToolControl::default());
                                         }
+                                        if explicitly_suspended {
+                                            if let Some(Ok(reply)) = &reply {
+                                                if matches!(
+                                                    reply.outcome,
+                                                    Outcome::Failed(_) | Outcome::Skipped(_)
+                                                ) {
+                                                    park_return_failure =
+                                                        Some(reply.outcome.tool_content());
+                                                }
+                                            }
+                                            if replay == ReplayPolicy::Unsafe {
+                                                unsafe_children_match =
+                                                    crate::nested::children_match(
+                                                        self.owner.store(),
+                                                        operation_id,
+                                                        &tools,
+                                                        true,
+                                                    )?;
+                                            }
+                                        }
                                         nested_resume_candidate = inspection.is_err()
                                             && host.only_pending_failure()
                                             && !tool_panicked
-                                            && matches!(&reply, Some(Ok(reply)) if reply.state.is_none() && !matches!(reply.outcome, Outcome::Unknown(_) | Outcome::Pending { .. }));
+                                            && matches!(&reply, Some(Ok(reply)) if reply.state.is_none() && !matches!(reply.outcome, Outcome::Unknown(_) | Outcome::Pending { .. } | Outcome::Failed(_) | Outcome::Skipped(_)));
                                         match inspection {
                                             Ok(()) => match reply {
                                                 Some(Ok(reply)) => reply,
@@ -11993,8 +12034,14 @@ impl Harness {
                                             Err(error) => {
                                                 *control.lock().expect("control mutex poisoned") =
                                                     Default::default();
+                                                let detail = park_return_failure
+                                                    .as_ref()
+                                                    .map(|message| {
+                                                        format!("; parent returned {message}")
+                                                    })
+                                                    .unwrap_or_default();
                                                 Outcome::Unknown(format!(
-                                                    "nested tool requires reconciliation: {error}"
+                                                    "nested tool requires reconciliation: {error}{detail}"
                                                 ))
                                                 .into()
                                             }
@@ -12055,6 +12102,8 @@ impl Harness {
                                 && explicitly_suspended
                                 && parked_checkpoint.is_some()
                                 && empty_park_controls
+                                && unsafe_children_match
+                                && _unsafe_parent_lease.is_some()
                             {
                                 c.active_tool_attempt()
                                     .filter(|attempt| !attempt.attempt_id.is_nil())
@@ -12064,6 +12113,9 @@ impl Harness {
                                             .filter(|reg| reg.replay == ReplayPolicy::Unsafe)
                                             .and_then(|reg| {
                                                 crate::keyed_tool::unsafe_park_identity(&reg.tool)
+                                            })
+                                            .filter(|identity| {
+                                                Some(identity) == started_unsafe_identity.as_ref()
                                             })
                                             .map(|identity| UnsafeParkProof { attempt, identity })
                                     })
@@ -12564,6 +12616,37 @@ impl Harness {
             ));
         }
         crate::nested::pending_jobs(self.owner.store(), root)
+    }
+    /// Bind a legacy pending reference only after independently verifying its
+    /// actual backend and tenant. This performs no remote lookup. Existing
+    /// bindings cannot be changed; reconcile instead if they are incorrect.
+    pub fn bind_nested_pending_identity(
+        &mut self,
+        id: Uuid,
+        root: Uuid,
+        operation: Uuid,
+        reference: &str,
+        identity: &str,
+    ) -> Result<(), Error> {
+        let (c, version) = self.load(id)?;
+        if c.abort_requested
+            || !matches!(c.phase, Phase::Blocked { operation_id, .. } if operation_id == root)
+        {
+            return Err(Error::Invalid(
+                "conversation is not available for nested identity binding".into(),
+            ));
+        }
+        let tools = self.resolved_tools(&c)?;
+        crate::nested::bind_pending_identity(
+            self.owner.store(),
+            (Self::key(id), version),
+            root,
+            operation,
+            reference,
+            identity,
+            &tools,
+            |name| caller_allowed(&c, name, false),
+        )
     }
     /// Record a terminal observation for a nested pending job. An authoritative
     /// cancellation should be supplied as a failed outcome by the host after the
@@ -14168,6 +14251,20 @@ impl Scheduler {
     ) -> Result<Vec<crate::nested::PendingJob>, Error> {
         self.harness.nested_pending_jobs(id, root)
     }
+    /// Bind an operator-verified legacy pending reference and schedule a recheck.
+    pub fn bind_nested_pending_identity(
+        &mut self,
+        id: Uuid,
+        root: Uuid,
+        operation: Uuid,
+        reference: &str,
+        identity: &str,
+    ) -> Result<(), Error> {
+        self.harness
+            .bind_nested_pending_identity(id, root, operation, reference, identity)?;
+        self.schedule(id);
+        Ok(())
+    }
     pub fn reconcile_nested_pending(
         &mut self,
         id: Uuid,
@@ -15547,8 +15644,37 @@ async fn poll_suspended_nested(
     if state.abort_requested || !state.nested_suspended() {
         return Ok(false);
     }
-    let Phase::Blocked { operation_id, .. } = &state.phase else {
+    let Phase::Blocked {
+        operation_id,
+        calls,
+        index,
+        ..
+    } = &state.phase
+    else {
         return Ok(false);
+    };
+    let tools = worker.resolved_tools(&state)?;
+    let unsafe_parent = if let Some(proof) = state
+        .nested_resume
+        .as_ref()
+        .and_then(|resume| resume.unsafe_park.as_ref())
+    {
+        let Some(call) = calls.get(*index) else {
+            return Ok(false);
+        };
+        let Some(reg) = tools.get(&call.name) else {
+            return Ok(false);
+        };
+        if reg.replay != ReplayPolicy::Unsafe
+            || state.tool_attempt() != Some(proof.attempt)
+            || crate::keyed_tool::unsafe_park_identity(&reg.tool).as_ref() != Some(&proof.identity)
+            || !crate::nested::children_match(worker.owner.store(), *operation_id, &tools, true)?
+        {
+            return Ok(false);
+        }
+        Some((reg.tool.clone(), proof.identity.clone()))
+    } else {
+        None
     };
     match fenced_poll(
         async {
@@ -15626,7 +15752,6 @@ async fn poll_suspended_nested(
     if jobs.is_empty() {
         return worker.prepare_nested_resume(&mut state.clone());
     }
-    let tools = worker.resolved_tools(&state)?;
     let mut polls = Vec::new();
     for job in jobs {
         let Some(reg) = tools.get(job.name()) else {
@@ -15634,6 +15759,7 @@ async fn poll_suspended_nested(
         };
         if !caller_allowed(&state, job.name(), false)
             || reg.replay != job.policy()
+            || !job.matches_identity(&reg.tool)
             || !reg.tool.can_poll()
         {
             continue;
@@ -15642,27 +15768,73 @@ async fn poll_suspended_nested(
         let gate = worker.execution_gate.as_ref();
         let schemas = &state.tool_filters.output_schemas;
         let owner = &worker.owner;
+        let unsafe_parent = unsafe_parent.clone();
         polls.push(async move {
+            let Some(expected) = job.expected_identity() else {
+                return Ok(false);
+            };
+            let Some(identity_lease) = crate::nested_identity::lease(&tool, expected) else {
+                return Ok(false);
+            };
+            let _parent_lease = if let Some((parent, expected)) = &unsafe_parent {
+                let Some(lease) = crate::nested_identity::lease(parent, &expected.identity) else {
+                    return Ok(false);
+                };
+                Some(lease)
+            } else {
+                None
+            };
+            if unsafe_parent.as_ref().is_some_and(|(parent, expected)| {
+                crate::keyed_tool::unsafe_park_identity(parent).as_ref() != Some(expected)
+            }) {
+                return Ok(false);
+            }
             let polled = fenced_poll(
                 std::panic::AssertUnwindSafe(crate::poll::poll_once(
-                    tool.as_ref(), job.operation(), job.reference(), cancel, Duration::from_secs(120),
-                )).catch_unwind(),
+                    tool.as_ref(),
+                    job.operation(),
+                    job.reference(),
+                    cancel,
+                    Duration::from_secs(120),
+                ))
+                .catch_unwind(),
                 gate,
                 cancel,
-            ).await;
+            )
+            .await;
+            if unsafe_parent.as_ref().is_some_and(|(parent, expected)| {
+                crate::keyed_tool::unsafe_park_identity(parent).as_ref() != Some(expected)
+            }) {
+                return Ok(false);
+            }
             let outcome = match polled {
-                Some(Ok(crate::poll::PollResult::Outcome(Outcome::Unknown(_)))) => return Ok(false),
+                Some(Ok(crate::poll::PollResult::Outcome(Outcome::Unknown(_)))) => {
+                    return Ok(false);
+                }
                 Some(Ok(crate::poll::PollResult::Outcome(outcome))) => outcome,
-                Some(Err(panic)) => { crate::extension::discard_panic_payload(panic); return Ok(false); },
+                Some(Err(panic)) => {
+                    crate::extension::discard_panic_payload(panic);
+                    return Ok(false);
+                }
                 _ => return Ok(false),
             };
-            match fenced_poll(async move {
-                job.commit(owner.store(), Harness::key(id), version, outcome, schemas)
-            }, gate, cancel).await {
-                Some(Ok(())) | Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => Ok(true),
-                Some(Err(error)) => Err(error),
-                None => Ok(false),
-            }
+            let result =
+                match fenced_poll(
+                    async move {
+                        job.commit(owner.store(), Harness::key(id), version, outcome, schemas)
+                    },
+                    gate,
+                    cancel,
+                )
+                .await
+                {
+                    Some(Ok(()))
+                    | Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => Ok(true),
+                    Some(Err(error)) => Err(error),
+                    None => Ok(false),
+                };
+            drop(identity_lease);
+            result
         });
     }
     let joined = futures_util::future::join_all(polls);
@@ -19843,7 +20015,7 @@ mod scheduler_tests {
                 parked_attempt
             };
             let identity: crate::keyed_tool::UnsafeParkIdentity = serde_json::from_value(serde_json::json!({
-                "spec": {"name":"parent", "description":"", "parameters":{"type":"object"}}, "version":1
+                "spec": {"name":"parent", "description":"", "parameters":{"type":"object"}}, "version":1, "identity":"test-parent"
             })).unwrap();
             state.tool_attempt = Some(current_attempt);
             state.abort_requested = scenario == "abort";
@@ -19922,7 +20094,7 @@ mod scheduler_tests {
             state.tool_attempt = Some(attempt);
             if scenario == "stale" {
                 let identity: crate::keyed_tool::UnsafeParkIdentity = serde_json::from_value(serde_json::json!({
-                    "spec": {"name":"parent", "description":"", "parameters":{"type":"object"}}, "version":1
+                    "spec": {"name":"parent", "description":"", "parameters":{"type":"object"}}, "version":1, "identity":"test-parent"
                 })).unwrap();
                 state.nested_resume = Some(NestedResume {
                     operation_id,

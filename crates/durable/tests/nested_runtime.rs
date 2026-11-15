@@ -13,6 +13,12 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+fn identified<T: pi_rs_core::Tool + 'static>(tool: Arc<T>) -> Arc<T> {
+    let erased: Arc<dyn pi_rs_core::Tool> = tool.clone();
+    let identity = format!("test-backend:{}:v1", erased.spec().name);
+    let _ = pi_rs_durable::nested_identity::register(&erased, Some(identity));
+    tool
+}
 struct FakeModel;
 #[async_trait]
 impl Model for FakeModel {
@@ -971,10 +977,10 @@ async fn nested_pending_is_polled_to_completion_without_redispatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let cancel = CancellationToken::new();
-    let child = Arc::new(PendingNested {
+    let child = identified::<PendingNested>(Arc::new(PendingNested {
         invoked: AtomicUsize::new(0),
         polled: AtomicUsize::new(0),
-    });
+    }));
     let options = || Options {
         model: Arc::new(FakeModel),
         tools: vec![
@@ -1064,10 +1070,10 @@ fn process_options(root: &std::path::Path, worker: bool) -> Options {
                 replay: ReplayPolicy::Safe,
             },
             RegisteredTool {
-                tool: Arc::new(ProcessPending {
+                tool: identified::<ProcessPending>(Arc::new(ProcessPending {
                     root: root.into(),
                     worker,
-                }),
+                })),
                 replay: ReplayPolicy::Unsafe,
             },
         ],
@@ -1245,14 +1251,15 @@ impl Tool for AbortPolling {
 async fn runtime_abort_stops_nested_poll_and_preserves_pending_journal_on_reopen() {
     use pi_rs_durable::runtime::Scheduler;
     use std::time::Duration;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let child = Arc::new(AbortPolling {
+    let child = identified::<AbortPolling>(Arc::new(AbortPolling {
         started: tokio::sync::Semaphore::new(0),
         stopped: Arc::new(tokio::sync::Semaphore::new(0)),
         ids: std::sync::Mutex::new(vec![]),
         invoked: AtomicUsize::new(0),
-    });
+    }));
     let opts = || Options {
         model: Arc::new(FakeModel),
         tools: vec![
@@ -1443,10 +1450,10 @@ impl Tool for UnknownPoll {
 async fn unknown_poll_blocks_parent_and_preserves_reference_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let child = Arc::new(UnknownPoll {
+    let child = identified::<UnknownPoll>(Arc::new(UnknownPoll {
         invoked: AtomicUsize::new(0),
         polled: AtomicUsize::new(0),
-    });
+    }));
     let opts = || Options {
         model: Arc::new(FakeModel),
         tools: vec![
@@ -1551,10 +1558,10 @@ async fn confirmed_nested_result_replays_safe_parent_after_reopen_without_child_
     let parent = Arc::new(ReattachingParent {
         calls: AtomicUsize::new(0),
     });
-    let child = Arc::new(UnknownPoll {
+    let child = identified::<UnknownPoll>(Arc::new(UnknownPoll {
         invoked: AtomicUsize::new(0),
         polled: AtomicUsize::new(0),
-    });
+    }));
     let opts = || Options {
         model: Arc::new(FakeModel),
         tools: vec![
@@ -1611,10 +1618,10 @@ async fn confirmed_nested_result_never_replays_unsafe_parent() {
     let parent = Arc::new(ReattachingParent {
         calls: AtomicUsize::new(0),
     });
-    let child = Arc::new(UnknownPoll {
+    let child = identified::<UnknownPoll>(Arc::new(UnknownPoll {
         invoked: AtomicUsize::new(0),
         polled: AtomicUsize::new(0),
-    });
+    }));
     let opts = Options {
         model: Arc::new(FakeModel),
         tools: vec![
@@ -1668,10 +1675,10 @@ async fn scheduler_reattaches_after_confirmation_but_never_after_abort() {
         let parent = Arc::new(ReattachingParent {
             calls: AtomicUsize::new(0),
         });
-        let child = Arc::new(UnknownPoll {
+        let child = identified::<UnknownPoll>(Arc::new(UnknownPoll {
             invoked: AtomicUsize::new(0),
             polled: AtomicUsize::new(0),
-        });
+        }));
         let opts = Options {
             model: Arc::new(FakeModel),
             tools: vec![
@@ -1752,10 +1759,10 @@ async fn reattachment_rechecks_current_parent_replay_policy_after_reopen() {
     let parent = Arc::new(ReattachingParent {
         calls: AtomicUsize::new(0),
     });
-    let child = Arc::new(UnknownPoll {
+    let child = identified::<UnknownPoll>(Arc::new(UnknownPoll {
         invoked: AtomicUsize::new(0),
         polled: AtomicUsize::new(0),
-    });
+    }));
     let opts = |policy| Options {
         model: Arc::new(FakeModel),
         tools: vec![
@@ -1878,13 +1885,13 @@ async fn keyed_pending_batch_polls_concurrently_and_reattaches_after_reopen() {
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let child = Arc::new(ParallelJobs {
+    let child = identified::<ParallelJobs>(Arc::new(ParallelJobs {
         invocations: std::sync::Mutex::new(vec![]),
         polls: std::sync::Mutex::new(vec![]),
         started: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         unknown: false,
-    });
+    }));
     let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
         ParallelParent,
     ));
@@ -1945,13 +1952,13 @@ async fn keyed_pending_batch_abort_preserves_both_references_without_redispatch(
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let child = Arc::new(ParallelJobs {
+    let child = identified::<ParallelJobs>(Arc::new(ParallelJobs {
         invocations: std::sync::Mutex::new(vec![]),
         polls: std::sync::Mutex::new(vec![]),
         started: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         unknown: false,
-    });
+    }));
     let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
         ParallelParent,
     ));
@@ -2024,13 +2031,13 @@ async fn keyed_pending_batch_abort_preserves_both_references_without_redispatch(
 async fn keyed_batch_waits_for_every_confirmed_job_before_parent_reattaches() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::new();
-    let child = Arc::new(ParallelJobs {
+    let child = identified::<ParallelJobs>(Arc::new(ParallelJobs {
         invocations: std::sync::Mutex::new(vec![]),
         polls: std::sync::Mutex::new(vec![]),
         started: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(2),
         unknown: true,
-    });
+    }));
     let parent = Arc::new(pi_rs_durable::keyed_tool::KeyedToolAdapter::new(
         ParallelParent,
     ));
@@ -2139,10 +2146,10 @@ fn process_batch_options(root: &std::path::Path, hang: bool) -> Options {
         tools: vec![
             parent.register(ReplayPolicy::Safe),
             RegisteredTool {
-                tool: Arc::new(ProcessParallelJobs {
+                tool: identified::<ProcessParallelJobs>(Arc::new(ProcessParallelJobs {
                     root: root.into(),
                     hang,
-                }),
+                })),
                 replay: ReplayPolicy::Unsafe,
             },
         ],

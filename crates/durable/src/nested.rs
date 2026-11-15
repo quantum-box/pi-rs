@@ -39,6 +39,8 @@ struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before_gate: Option<BeforeGate>,
     policy: ReplayPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    durable_identity: Option<String>,
     operation_id: Uuid,
     outcome: Option<Outcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,7 +112,20 @@ pub(crate) struct PendingPoll {
     record: Record,
 }
 
+fn durable_tool_identity(tool: &std::sync::Arc<dyn pi_rs_core::Tool>) -> Option<String> {
+    crate::nested_identity::current(tool)
+}
+
 impl PendingPoll {
+    pub(crate) fn matches_identity(&self, tool: &std::sync::Arc<dyn pi_rs_core::Tool>) -> bool {
+        self.record
+            .durable_identity
+            .as_ref()
+            .is_some_and(|identity| durable_tool_identity(tool).as_ref() == Some(identity))
+    }
+    pub(crate) fn expected_identity(&self) -> Option<&str> {
+        self.record.durable_identity.as_deref()
+    }
     pub(crate) fn name(&self) -> &str {
         &self.record.name
     }
@@ -213,6 +228,105 @@ pub(crate) fn pending_jobs(
         }
     }
     Ok(jobs)
+}
+
+/// Bind only a legacy unbound pending reference after an operator has
+/// independently verified the remote job and its backend identity.
+pub(crate) fn bind_pending_identity(
+    store: &durable_store::Store,
+    conversation: (Vec<u8>, u64),
+    root: Uuid,
+    operation: Uuid,
+    reference: &str,
+    identity: &str,
+    tools: &std::collections::HashMap<String, RegisteredTool>,
+    allowed: impl Fn(&str) -> bool,
+) -> Result<(), crate::runtime::Error> {
+    let invalid =
+        || crate::runtime::Error::Invalid("nested pending identity binding does not match".into());
+    let mut found = None;
+    for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.operation_id == operation {
+            if found.is_some() {
+                return Err(invalid());
+            }
+            found = Some((key, entry, record));
+        }
+    }
+    let (key, entry, mut record) = found.ok_or_else(invalid)?;
+    if !matches!(&record.outcome, Some(Outcome::Pending { reference: r }) if r == reference)
+        || record.staged_outcome.is_some()
+        || !allowed(&record.name)
+    {
+        return Err(invalid());
+    }
+    let reg = tools.get(&record.name).ok_or_else(invalid)?;
+    if reg.replay != record.policy || !reg.tool.can_poll() {
+        return Err(invalid());
+    }
+    let _lease = crate::nested_identity::lease(&reg.tool, identity).ok_or_else(invalid)?;
+    if record
+        .durable_identity
+        .as_deref()
+        .is_some_and(|old| old != identity)
+    {
+        return Err(invalid());
+    }
+    let mutation = if record.durable_identity.is_none() {
+        record.durable_identity = Some(identity.to_owned());
+        vec![Mutation::Put {
+            key: key.clone(),
+            value: serde_json::to_vec(&record)?,
+        }]
+    } else {
+        vec![]
+    };
+    store.commit(
+        &[
+            Check {
+                key: conversation.0,
+                expected: Expected::Version(conversation.1),
+            },
+            Check {
+                key,
+                expected: Expected::Version(entry.version),
+            },
+        ],
+        &mutation,
+    )?;
+    Ok(())
+}
+
+/// Recheck bound child identities before replay. Legacy unbound children may
+/// be used only by safe parents after authoritative reconciliation; unsafe
+/// parents require every child to have a matching identity.
+pub(crate) fn children_match(
+    store: &durable_store::Store,
+    root: Uuid,
+    tools: &std::collections::HashMap<String, RegisteredTool>,
+    require_identity: bool,
+) -> Result<bool, crate::runtime::Error> {
+    let mut any = false;
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        any = true;
+        let Some(identity) = record.durable_identity.as_ref() else {
+            if require_identity {
+                return Ok(false);
+            }
+            continue;
+        };
+        let Some(reg) = tools.get(&record.name) else {
+            return Ok(false);
+        };
+        if record.policy != reg.replay
+            || durable_tool_identity(&reg.tool).as_ref() != Some(identity)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(any)
 }
 
 // Automatic replay is restricted to a root with only terminal records and at
@@ -1277,12 +1391,26 @@ impl NestedHost {
             Some(v) => v,
             None => return self.fail(format!("nested tool unavailable: {name}")),
         };
+        // Bind the recorded identity to the backend that actually executes,
+        // including preparation and the durable outcome commit.
+        let identity_lease = match crate::nested_identity::execution_lease(&reg.tool) {
+            Ok(lease) => lease,
+            Err(()) => return self.fail("nested tool identity is busy"),
+        };
+        let dispatch_identity = identity_lease.as_ref().and_then(|guard| (**guard).clone());
         let (mut record, _version) = if let Some(entry) = entry {
             let record: Record = match serde_json::from_slice(&entry.value) {
                 Ok(v) => v,
                 Err(e) => return self.fail(format!("invalid nested record: {e}")),
             };
-            if record.name != name || record.arguments != arguments || record.policy != reg.replay {
+            if record.name != name
+                || record.arguments != arguments
+                || record.policy != reg.replay
+                || record
+                    .durable_identity
+                    .as_ref()
+                    .is_some_and(|identity| dispatch_identity.as_ref() != Some(identity))
+            {
                 return self.fail("nested call identity, arguments, or replay policy changed");
             }
             if let Some(outcome) = &record.outcome {
@@ -1333,6 +1461,7 @@ impl NestedHost {
                 before_pending: self.shared.hooks.is_some(),
                 before_gate: None,
                 policy: reg.replay,
+                durable_identity: dispatch_identity,
                 operation_id: invocation.operation_id,
                 outcome: None,
                 staged_outcome: None,
@@ -1989,6 +2118,14 @@ impl NestedHost {
         reg: &RegisteredTool,
     ) -> Outcome {
         loop {
+            let Some(expected) = record.durable_identity.as_deref() else {
+                return self
+                    .pending_failure("nested poll identity missing; pending reference retained");
+            };
+            let Some(identity_lease) = crate::nested_identity::lease(&reg.tool, expected) else {
+                return self
+                    .pending_failure("nested poll identity changed; pending reference retained");
+            };
             let Some(Outcome::Pending { reference }) = &record.outcome else {
                 return self.fail("invalid nested pending record");
             };
@@ -2053,6 +2190,7 @@ impl NestedHost {
             ) {
                 return self.fail(format!("nested poll result commit: {e}"));
             }
+            drop(identity_lease);
             if staged {
                 return self.finish_staged(key, record).await;
             }
@@ -2144,6 +2282,7 @@ mod tests {
                 wake: None,
             }),
             policy: ReplayPolicy::Unsafe,
+            durable_identity: None,
             operation_id: Uuid::new_v4(),
             outcome: None,
             staged_outcome: None,
@@ -2232,6 +2371,7 @@ mod tests {
             before_pending: false,
             before_gate: None,
             policy: ReplayPolicy::Unsafe,
+            durable_identity: None,
             operation_id: operation,
             outcome: Some(Outcome::Pending {
                 reference: "opaque".into(),
@@ -2334,6 +2474,8 @@ mod tests {
         tool: Arc<Polling>,
         cancel: CancellationToken,
     ) -> Arc<NestedHost> {
+        let erased: Arc<dyn pi_rs_core::Tool> = tool.clone();
+        let _ = crate::nested_identity::register(&erased, Some("test-backend:polling:v1".into()));
         NestedHost::new(
             Arc::new(OwnedStore::open(path).unwrap()),
             root,

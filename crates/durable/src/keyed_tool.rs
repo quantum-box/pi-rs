@@ -83,6 +83,11 @@ pub trait KeyedTool: Send + Sync {
     fn unsafe_park_version(&self) -> Option<u32> {
         None
     }
+    /// Non-secret host identity binding implementation, configuration and tenant.
+    /// Change it whenever a parked invocation must not resume against this tool.
+    fn unsafe_park_identity(&self) -> Option<String> {
+        None
+    }
     async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
         Ok(arguments)
     }
@@ -396,8 +401,27 @@ impl<T: StreamedTool> KeyedTool for StreamedToolAdapter<T> {
 pub(crate) struct UnsafeParkIdentity {
     spec: ToolSpec,
     version: u32,
+    #[serde(default)]
+    pub(crate) identity: String,
 }
-type RegistryEntry = (Weak<dyn Tool>, Weak<()>, Option<UnsafeParkIdentity>);
+trait UnsafeParkIdentitySource: Send + Sync {
+    fn current_unsafe_park_identity(&self) -> Option<UnsafeParkIdentity>;
+}
+impl<T: KeyedTool> UnsafeParkIdentitySource for KeyedToolAdapter<T> {
+    fn current_unsafe_park_identity(&self) -> Option<UnsafeParkIdentity> {
+        let version = self.0.unsafe_park_version().filter(|v| *v > 0)?;
+        let identity = self
+            .0
+            .unsafe_park_identity()
+            .filter(|s| !s.is_empty() && s.len() <= 1024)?;
+        Some(UnsafeParkIdentity {
+            spec: self.0.spec(),
+            version,
+            identity,
+        })
+    }
+}
+type RegistryEntry = (Weak<dyn Tool>, Weak<()>, Weak<dyn UnsafeParkIdentitySource>);
 static REGISTRY: OnceLock<Mutex<Vec<RegistryEntry>>> = OnceLock::new();
 
 fn registered_identity(tool: &Arc<dyn Tool>) -> Option<Arc<()>> {
@@ -412,15 +436,22 @@ fn registered_identity(tool: &Arc<dyn Tool>) -> Option<Arc<()>> {
 }
 
 pub(crate) fn unsafe_park_identity(tool: &Arc<dyn Tool>) -> Option<UnsafeParkIdentity> {
-    let spec = tool.spec();
-    let mut entries = REGISTRY.get_or_init(Default::default).lock().ok()?;
-    entries.retain(|(tool, identity, _)| tool.strong_count() > 0 && identity.strong_count() > 0);
-    entries.iter().find_map(|(registered, _, identity)| {
-        let registered = registered.upgrade()?;
-        Arc::ptr_eq(&registered, tool)
-            .then(|| identity.clone().filter(|identity| identity.spec == spec))
-            .flatten()
-    })
+    let source = {
+        let mut entries = REGISTRY.get_or_init(Default::default).lock().ok()?;
+        entries
+            .retain(|(tool, identity, _)| tool.strong_count() > 0 && identity.strong_count() > 0);
+        entries.iter().find_map(|(registered, _, source)| {
+            let registered = registered.upgrade()?;
+            Arc::ptr_eq(&registered, tool)
+                .then(|| source.upgrade())
+                .flatten()
+        })?
+    };
+    // A failed host update clears the binding before the tool's partially
+    // updated configuration can be consulted.
+    let bound = crate::nested_identity::current(tool)?;
+    let identity = source.current_unsafe_park_identity()?;
+    (identity.spec == tool.spec() && identity.identity == bound).then_some(identity)
 }
 
 pub struct KeyedToolAdapter<T>(pub T, Arc<()>);
@@ -448,18 +479,11 @@ impl<T> KeyedToolAdapter<T> {
             .iter()
             .any(|(registered, _, _)| registered.ptr_eq(&Arc::downgrade(&tool)))
         {
-            let park_identity = self
-                .0
-                .unsafe_park_version()
-                .filter(|version| *version > 0)
-                .map(|version| UnsafeParkIdentity {
-                    spec: self.0.spec(),
-                    version,
-                });
+            let source: Arc<dyn UnsafeParkIdentitySource> = self.clone();
             entries.push((
                 Arc::downgrade(&tool),
                 Arc::downgrade(&self.1),
-                park_identity,
+                Arc::downgrade(&source),
             ));
         }
         crate::runtime::RegisteredTool { tool, replay }

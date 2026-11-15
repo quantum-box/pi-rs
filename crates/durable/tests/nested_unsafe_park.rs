@@ -72,6 +72,7 @@ struct Parent {
     root: PathBuf,
     stage: String,
     version: Option<u32>,
+    identity: String,
 }
 #[async_trait]
 impl KeyedTool for Parent {
@@ -81,6 +82,9 @@ impl KeyedTool for Parent {
             spec.description = "changed".into();
         }
         spec
+    }
+    fn unsafe_park_identity(&self) -> Option<String> {
+        Some(self.identity.clone())
     }
     fn unsafe_park_version(&self) -> Option<u32> {
         self.version
@@ -125,7 +129,11 @@ impl KeyedTool for Parent {
             host.suspend_pending_with_checkpoint(json!({"child":child.operation_id}))
                 .unwrap();
         }
-        Outcome::Succeeded("discarded".into()).into()
+        match self.stage.as_str() {
+            "return-failed" => Outcome::Failed("parent explicit failure".into()).into(),
+            "return-skipped" => Outcome::Skipped("parent explicit skip".into()).into(),
+            _ => Outcome::Succeeded("discarded".into()).into(),
+        }
     }
     async fn invoke_controlled(
         &self,
@@ -158,6 +166,7 @@ impl Tool for Child {
         true
     }
     async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        log(&self.0, "child-polls");
         std::fs::write(self.0.join("poll-entered"), b"ready").unwrap();
         Some(if self.0.join("finish").exists() {
             Outcome::Succeeded("result".into())
@@ -169,17 +178,39 @@ impl Tool for Child {
     }
 }
 fn options(root: &Path, stage: &str, version: Option<u32>) -> Options {
+    options_custom(
+        root,
+        stage,
+        version,
+        "test-parent/tenant-a",
+        Some("test-backend:child:v1"),
+        ReplayPolicy::Unsafe,
+    )
+}
+fn options_custom(
+    root: &Path,
+    stage: &str,
+    version: Option<u32>,
+    parent_id: &str,
+    child_id: Option<&str>,
+    policy: ReplayPolicy,
+) -> Options {
+    let parent = Arc::new(KeyedToolAdapter::new(Parent {
+        root: root.into(),
+        stage: stage.into(),
+        version,
+        identity: parent_id.into(),
+    }))
+    .register(policy);
+    pi_rs_durable::nested_identity::register(&parent.tool, Some(parent_id.into())).unwrap();
+    let child: Arc<dyn Tool> = Arc::new(Child(root.into()));
+    pi_rs_durable::nested_identity::register(&child, child_id.map(str::to_owned)).unwrap();
     Options {
         model: Arc::new(ModelStub),
         tools: vec![
-            Arc::new(KeyedToolAdapter::new(Parent {
-                root: root.into(),
-                stage: stage.into(),
-                version,
-            }))
-            .register(ReplayPolicy::Unsafe),
+            parent,
             RegisteredTool {
-                tool: Arc::new(Child(root.into())),
+                tool: child,
                 replay: ReplayPolicy::Unsafe,
             },
         ],
@@ -188,6 +219,7 @@ fn options(root: &Path, stage: &str, version: Option<u32>) -> Options {
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     }
 }
+
 async fn until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(15), async {
         while !condition() {
@@ -361,14 +393,6 @@ async fn unsafe_park_abort_or_definition_change_fences_resume() {
         let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
         if mode == "abort" {
             scheduler.abort(id).unwrap();
-        } else {
-            let root_op = scheduler.blocked(id).unwrap().unwrap().0;
-            until(|| {
-                scheduler
-                    .nested_pending_jobs(id, root_op)
-                    .is_ok_and(|jobs| jobs.is_empty())
-            })
-            .await;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(count(root, "initial-effects"), 1);
@@ -496,4 +520,555 @@ async fn abort_after_unsafe_wake_started_never_replays_it_on_reopen() {
         (1, 1, 1)
     );
     reopened.shutdown().await.unwrap();
+}
+
+async fn start_parked(root: &Path, opts: Options) -> (Scheduler, Uuid, Uuid) {
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| {
+        scheduler
+            .conversation(id)
+            .is_ok_and(|c| c.nested_suspended())
+            && root.join("poll-entered").exists()
+    })
+    .await;
+    let root_op = scheduler.blocked(id).unwrap().unwrap().0;
+    (scheduler, id, root_op)
+}
+
+#[tokio::test]
+async fn reopen_rejects_same_spec_different_parent_or_child_tenant_for_safe_and_unsafe() {
+    for mode in ["unsafe-parent", "unsafe-child", "safe-child"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = if mode == "safe-child" {
+            ReplayPolicy::Safe
+        } else {
+            ReplayPolicy::Unsafe
+        };
+        let (scheduler, id, _) = start_parked(
+            root,
+            options_custom(
+                root,
+                "finish",
+                Some(1),
+                "parent/tenant-a",
+                Some("child/tenant-a"),
+                policy,
+            ),
+        )
+        .await;
+        scheduler.shutdown().await.unwrap();
+        let before = count(root, "child-polls");
+        std::fs::write(root.join("finish"), b"ready").unwrap();
+        let parent_id = if mode == "unsafe-parent" {
+            "parent/tenant-b"
+        } else {
+            "parent/tenant-a"
+        };
+        let child_id = if mode.ends_with("child") {
+            "child/tenant-b"
+        } else {
+            "child/tenant-a"
+        };
+        let scheduler = Scheduler::open(
+            root.join("db"),
+            options_custom(root, "finish", Some(1), parent_id, Some(child_id), policy),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            count(root, "child-polls"),
+            before,
+            "{mode}: wrong backend was polled"
+        );
+        assert_eq!(count(root, "wake-effects"), 0, "{mode}");
+        assert!(
+            scheduler.conversation(id).unwrap().nested_suspended(),
+            "{mode}"
+        );
+        scheduler.shutdown().await.unwrap();
+        let mut scheduler = Scheduler::open(
+            root.join("db"),
+            options_custom(
+                root,
+                "finish",
+                Some(1),
+                "parent/tenant-a",
+                Some("child/tenant-a"),
+                policy,
+            ),
+        )
+        .unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none(), "{mode}");
+        assert_eq!(
+            (
+                count(root, "initial-effects"),
+                count(root, "wake-effects"),
+                count(root, "child-effects")
+            ),
+            (1, 1, 1),
+            "{mode}"
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn legacy_pending_requires_operator_verified_binding_for_safe_and_unsafe() {
+    use durable_store::{Check, Expected, Mutation, Store};
+    for policy in [ReplayPolicy::Safe, ReplayPolicy::Unsafe] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (scheduler, id, root_op) = start_parked(
+            root,
+            options_custom(
+                root,
+                "finish",
+                Some(1),
+                "parent/tenant-a",
+                Some("child/tenant-a"),
+                policy,
+            ),
+        )
+        .await;
+        let job = scheduler
+            .nested_pending_jobs(id, root_op)
+            .unwrap()
+            .pop()
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
+        let store = Store::open(root.join("db")).unwrap();
+        let (key, entry) = store
+            .list(format!("nested/{root_op}/").as_bytes())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut record: Value = serde_json::from_slice(&entry.value).unwrap();
+        record.as_object_mut().unwrap().remove("durable_identity");
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(store);
+        let before = count(root, "child-polls");
+        std::fs::write(root.join("finish"), b"ready").unwrap();
+        let mut scheduler = Scheduler::open(
+            root.join("db"),
+            options_custom(
+                root,
+                "finish",
+                Some(1),
+                "parent/tenant-a",
+                Some("child/tenant-a"),
+                policy,
+            ),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            count(root, "child-polls"),
+            before,
+            "legacy backend was polled"
+        );
+        assert!(
+            scheduler
+                .bind_nested_pending_identity(
+                    id,
+                    root_op,
+                    job.operation_id,
+                    "wrong",
+                    "child/tenant-a"
+                )
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .bind_nested_pending_identity(
+                    id,
+                    root_op,
+                    job.operation_id,
+                    &job.reference,
+                    "child/tenant-b"
+                )
+                .is_err()
+        );
+        scheduler
+            .bind_nested_pending_identity(
+                id,
+                root_op,
+                job.operation_id,
+                &job.reference,
+                "child/tenant-a",
+            )
+            .unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none());
+        assert_eq!(
+            (
+                count(root, "initial-effects"),
+                count(root, "wake-effects"),
+                count(root, "child-effects")
+            ),
+            (1, 1, 1)
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[derive(Clone)]
+struct MutableSettings(Arc<std::sync::Mutex<(Option<u32>, Option<String>)>>);
+struct MutableParent {
+    inner: Parent,
+    settings: MutableSettings,
+}
+#[async_trait]
+impl KeyedTool for MutableParent {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+    fn unsafe_park_version(&self) -> Option<u32> {
+        self.settings.0.lock().unwrap().0
+    }
+    fn unsafe_park_identity(&self) -> Option<String> {
+        self.settings.0.lock().unwrap().1.clone()
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        self.inner.invoke(args, context, state, host).await
+    }
+}
+fn mutable_options(
+    root: &Path,
+) -> (
+    Options,
+    pi_rs_durable::nested_identity::IdentityHandle,
+    pi_rs_durable::nested_identity::IdentityHandle,
+    MutableSettings,
+) {
+    let settings = MutableSettings(Arc::new(std::sync::Mutex::new((
+        Some(1),
+        Some("parent/tenant-a".into()),
+    ))));
+    let parent = Arc::new(KeyedToolAdapter::new(MutableParent {
+        inner: Parent {
+            root: root.into(),
+            stage: "finish".into(),
+            version: Some(1),
+            identity: "parent/tenant-a".into(),
+        },
+        settings: settings.clone(),
+    }))
+    .register(ReplayPolicy::Unsafe);
+    let parent_handle =
+        pi_rs_durable::nested_identity::register(&parent.tool, Some("parent/tenant-a".into()))
+            .unwrap();
+    let child: Arc<dyn Tool> = Arc::new(Child(root.into()));
+    let child_handle =
+        pi_rs_durable::nested_identity::register(&child, Some("child/tenant-a".into())).unwrap();
+    (
+        Options {
+            model: Arc::new(ModelStub),
+            tools: vec![
+                parent,
+                RegisteredTool {
+                    tool: child,
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            restart_limit: 8,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        parent_handle,
+        child_handle,
+        settings,
+    )
+}
+async fn update_when_idle(
+    handle: &pi_rs_durable::nested_identity::IdentityHandle,
+    identity: &str,
+    apply: impl Fn(),
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if handle.update(Some(identity.into()), &apply).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn same_arc_live_identity_version_and_optout_changes_are_fenced() {
+    for mode in [
+        "parent-version",
+        "parent-optout",
+        "parent-tenant",
+        "child-tenant",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (opts, parent_handle, child_handle, settings) = mutable_options(root);
+        let (mut scheduler, id, _) = start_parked(root, opts).await;
+        let config = settings.0.clone();
+        match mode {
+            "parent-version" => {
+                update_when_idle(&parent_handle, "parent/tenant-a", move || {
+                    config.lock().unwrap().0 = Some(2)
+                })
+                .await
+            }
+            "parent-optout" => {
+                update_when_idle(&parent_handle, "parent/tenant-a", move || {
+                    config.lock().unwrap().0 = None
+                })
+                .await
+            }
+            "parent-tenant" => {
+                update_when_idle(&parent_handle, "parent/tenant-b", move || {
+                    config.lock().unwrap().1 = Some("parent/tenant-b".into())
+                })
+                .await
+            }
+            _ => update_when_idle(&child_handle, "child/tenant-b", || {}).await,
+        }
+        let before = count(root, "child-polls");
+        std::fs::write(root.join("finish"), b"ready").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            count(root, "child-polls"),
+            before,
+            "{mode}: wrong backend was polled"
+        );
+        assert_eq!(count(root, "wake-effects"), 0, "{mode}");
+        assert!(scheduler.conversation(id).unwrap().nested_suspended());
+        let config = settings.0.clone();
+        update_when_idle(&parent_handle, "parent/tenant-a", move || {
+            *config.lock().unwrap() = (Some(1), Some("parent/tenant-a".into()))
+        })
+        .await;
+        update_when_idle(&child_handle, "child/tenant-a", || {}).await;
+        scheduler.schedule(id);
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none(), "{mode}");
+        assert_eq!(
+            (
+                count(root, "initial-effects"),
+                count(root, "wake-effects"),
+                count(root, "child-effects")
+            ),
+            (1, 1, 1),
+            "{mode}"
+        );
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_or_skipped_reply_after_suspend_never_hides_failure_or_resumes() {
+    for policy in [ReplayPolicy::Safe, ReplayPolicy::Unsafe] {
+        for stage in ["return-failed", "return-skipped"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let mut scheduler = Scheduler::open(
+                root.join("db"),
+                options_custom(
+                    root,
+                    stage,
+                    Some(1),
+                    "parent/tenant-a",
+                    Some("child/tenant-a"),
+                    policy,
+                ),
+            )
+            .unwrap();
+            let id = scheduler
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 100,
+                })
+                .unwrap();
+            scheduler.submit(id, None, "work".into()).unwrap();
+            until(|| scheduler.blocked(id).unwrap().is_some()).await;
+            let (_, reason) = scheduler.blocked(id).unwrap().unwrap();
+            assert!(
+                reason.contains(if stage == "return-failed" {
+                    "parent explicit failure"
+                } else {
+                    "parent explicit skip"
+                }),
+                "{reason}"
+            );
+            assert!(!scheduler.conversation(id).unwrap().nested_suspended());
+            std::fs::write(root.join("finish"), b"ready").unwrap();
+            scheduler.schedule(id);
+            wait(&mut scheduler, id).await;
+            assert_eq!(count(root, "wake-effects"), 0);
+            scheduler.shutdown().await.unwrap();
+        }
+    }
+}
+
+struct ReentrantParent {
+    inner: Parent,
+    handle: Arc<std::sync::Mutex<Option<pi_rs_durable::nested_identity::IdentityHandle>>>,
+}
+#[async_trait]
+impl KeyedTool for ReentrantParent {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+    fn unsafe_park_version(&self) -> Option<u32> {
+        Some(1)
+    }
+    fn unsafe_park_identity(&self) -> Option<String> {
+        Some("parent/tenant-a".into())
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let handle = self.handle.lock().unwrap().clone().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.update(Some("parent/tenant-b".into()), || panic!("busy update ran")),
+        )
+        .await
+        .expect("parent identity update hung");
+        assert!(result.is_err());
+        log(&self.inner.root, "parent-busy");
+        self.inner.invoke(args, context, state, host).await
+    }
+}
+struct ReentrantChild {
+    root: PathBuf,
+    handle: Arc<std::sync::Mutex<Option<pi_rs_durable::nested_identity::IdentityHandle>>>,
+}
+#[async_trait]
+impl Tool for ReentrantChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        let handle = self.handle.lock().unwrap().clone().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.update(Some("child/tenant-b".into()), || panic!("busy update ran")),
+        )
+        .await
+        .expect("child identity update hung");
+        assert!(result.is_err());
+        log(&self.root, "child-invoke-busy");
+        Outcome::Pending {
+            reference: "remote".into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        let handle = self.handle.lock().unwrap().clone().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.update(Some("child/tenant-b".into()), || panic!("busy update ran")),
+        )
+        .await
+        .expect("poll identity update hung");
+        assert!(result.is_err());
+        log(&self.root, "child-busy");
+        Some(if self.root.join("finish").exists() {
+            Outcome::Succeeded("result".into())
+        } else {
+            Outcome::Pending {
+                reference: "remote".into(),
+            }
+        })
+    }
+}
+#[tokio::test]
+async fn identity_update_from_parent_and_poll_returns_busy_without_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let parent_slot = Arc::new(std::sync::Mutex::new(None));
+    let child_slot = Arc::new(std::sync::Mutex::new(None));
+    let parent = Arc::new(KeyedToolAdapter::new(ReentrantParent {
+        inner: Parent {
+            root: root.into(),
+            stage: "finish".into(),
+            version: Some(1),
+            identity: "parent/tenant-a".into(),
+        },
+        handle: parent_slot.clone(),
+    }))
+    .register(ReplayPolicy::Unsafe);
+    *parent_slot.lock().unwrap() = Some(
+        pi_rs_durable::nested_identity::register(&parent.tool, Some("parent/tenant-a".into()))
+            .unwrap(),
+    );
+    let child: Arc<dyn Tool> = Arc::new(ReentrantChild {
+        root: root.into(),
+        handle: child_slot.clone(),
+    });
+    *child_slot.lock().unwrap() = Some(
+        pi_rs_durable::nested_identity::register(&child, Some("child/tenant-a".into())).unwrap(),
+    );
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent,
+            RegisteredTool {
+                tool: child,
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| count(root, "child-busy") > 0).await;
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(count(root, "parent-busy"), 2);
+    assert_eq!(count(root, "child-invoke-busy"), 1);
+    assert!(count(root, "child-busy") >= 1);
+    scheduler.shutdown().await.unwrap();
 }

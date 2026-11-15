@@ -373,6 +373,35 @@ The runtime persists it with the outcome and ends the run without another model
 request only when every result in the nonempty tool round requests termination.
 The last defined handoff in model call order (including empty text) appends a reset after after-tools tasks and before queued boundary items. It starts a new model context while preserving history. Controls are persisted with tool outcomes and survive reopen; nested calls do not control their caller’s round.
 
+**Nested pending identity migration.** Automatic polling of nested pending jobs
+now requires a durable host-supplied identity for the exact registered child
+`Arc<dyn Tool>`, for both replay-safe and unsafe parents. Before starting or
+reopening the scheduler, call `nested_identity::register(&registered.tool,
+Some(identity))` on each nested backend. The non-secret identity is persisted
+in plaintext and must distinguish the implementation, backend configuration and
+tenant; restore the same identity for the same backend. A duplicate registration
+for a live allocation is rejected. Keep the returned `IdentityHandle`, and make
+all configuration, tenant and unsafe-parent version changes inside its
+`update(new_identity, || { /* change configuration */ })` callback. Updates
+return a busy error rather than wait while an invocation or poll holds a lease;
+retry after it finishes. The identity is cleared before the callback, so a
+panic leaves the tool unbound. Never mutate backend configuration outside this
+handle or change it during a call.
+
+This intentionally changes older behavior: an unbound or changed-identity
+nested pending job is not automatically polled, including for replay-safe
+parents. Existing accepted references and jobs are retained. The runtime cannot
+safely recover the old automatic behavior from a legacy record alone: it
+contains no proof of which backend or tenant accepted the reference. Operators can
+inspect `nested_pending_jobs`, verify the remote reference and tenant through an
+independent authoritative channel, then explicitly call
+`bind_nested_pending_identity(conversation, root, operation, reference,
+identity)` with the current registered identity. The checked bind only fills a
+missing identity; it refuses to replace a different existing binding, does not
+contact the backend, and schedules a recheck. Alternatively, use
+`reconcile_nested_pending` or `cancel_nested_pending` after independently
+confirming a terminal outcome. The runtime cannot verify the operator's claim.
+
 A root `KeyedTool` can use
 `call_keyed_unpolled_with_id` to retrieve a nested journal operation ID and
 `suspend_pending_with_checkpoint` to persist up to 64 KiB of JSON alongside
@@ -388,8 +417,11 @@ parent must return normally without state or controls. A replay-safe parent must
 make its own effects replay-safe. A parent registered unsafe must explicitly opt
 in with a positive `unsafe_park_version`, branch on `pending_wake()` before
 repeating pre-park effects, and leave no detached effects running after return.
-The host must bump that version when the implementation or checkpoint meaning
-changes and restore the same spec, version, and unsafe policy after reopen.
+The host must supply `unsafe_park_identity()` matching the identity registered
+for the parent, bump the version when implementation or checkpoint meaning
+changes, and restore the same parent and child identities, spec, version and
+unsafe policy after reopen. Unsafe parks require identities for every recorded
+nested child; legacy unbound children cannot automatically resume them.
 The committed checkpoint and original attempt identity fence the park; a new
 attempt is claimed before resumption. Process death after that claim is an
 interrupted unsafe invocation and requires reconciliation (or follows the
@@ -400,7 +432,11 @@ wake branch and any destination-side idempotency remain the host's responsibilit
 Conversation abort fences polling and replay
 but does not cancel an accepted external job, which remains available for
 explicit reconciliation. This is not upstream's `wait: false`, `ToolPark`,
-`any` wake, or independently executing child task.
+`any` wake, or independently executing child task. Unlike upstream's distinct
+`ToolPark` return type, this API requests suspension before returning a normal
+reply. If that reply is `Failed` or `Skipped`, the suspension is rejected and
+the failure is included in the blocked reason; the still-pending child must be
+reconciled before parent settlement. It is never hidden by a later wake.
 
 Pending nested jobs are resolved by tool name and replay policy; their stored
 references are not bound to an implementation or tenant identity. On reopen,

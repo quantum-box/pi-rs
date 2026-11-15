@@ -72,6 +72,9 @@ impl KeyedTool for BoundaryParent {
         }
         s
     }
+    fn unsafe_park_identity(&self) -> Option<String> {
+        Some("test-parent/tenant-a".into())
+    }
     fn unsafe_park_version(&self) -> Option<u32> {
         Some(self.version)
     }
@@ -138,17 +141,21 @@ impl Tool for BoundaryChild {
     }
 }
 fn options(root: &Path, version: u32, changed_spec: bool, policy: ReplayPolicy) -> Options {
+    let parent = Arc::new(KeyedToolAdapter::new(BoundaryParent {
+        root: root.into(),
+        version,
+        changed_spec,
+    }))
+    .register(policy);
+    crate::nested_identity::register(&parent.tool, Some("test-parent/tenant-a".into())).unwrap();
+    let child: Arc<dyn Tool> = Arc::new(BoundaryChild(root.into()));
+    crate::nested_identity::register(&child, Some("test-backend:child:v1".into())).unwrap();
     Options {
         model: Arc::new(BoundaryModel),
         tools: vec![
-            Arc::new(KeyedToolAdapter::new(BoundaryParent {
-                root: root.into(),
-                version,
-                changed_spec,
-            }))
-            .register(policy),
+            parent,
             RegisteredTool {
-                tool: Arc::new(BoundaryChild(root.into())),
+                tool: child,
                 replay: ReplayPolicy::Unsafe,
             },
         ],

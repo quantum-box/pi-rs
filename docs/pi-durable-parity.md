@@ -645,3 +645,30 @@ same-value rewrites, deadline and abort fences, staged effects, runtime updates
 and process death after the held outcome commits. A process death before that
 commit still follows the recorded replay policy and cannot recover an
 uncommitted non-replay-safe external effect.
+### Identity-bound nested pending recovery
+
+Both safe and unsafe parents now require the exact nested tool allocation to be
+registered with a non-secret, host-declared implementation/configuration/tenant
+identity before automatic polling. Identity is captured on child admission and
+rechecked under a nonblocking read lease through the poll and its checked
+commit. `IdentityHandle::update` takes a nonblocking write lease, returns busy
+instead of deadlocking on reentry, and clears the identity before calling the
+host's configuration update so a panic fails closed. The host must perform all
+configuration changes under that handle. An unsafe parent additionally binds
+its own live, host-declared identity and version; it is checked at invocation,
+park, poll and wake, not cached by allocation. The host must restore equivalent
+identity registrations before reopening.
+
+This is an intentional compatibility change: old nested pending records with
+no identity no longer auto-poll, even for safe parents. An operator who has
+independently verified the original backend and reference can use
+`bind_nested_pending_identity` to bind a missing identity to the currently
+registered tool; the reference, operation and conversation versions are checked.
+A conflicting existing binding cannot be overwritten. Authoritative terminal
+reconciliation remains available instead. A bind is a host assertion and does
+not itself verify the remote system.
+
+Upstream returns either `ToolPark` or a result. This API first requests a park
+and then returns a normal reply. A `Failed` or `Skipped` reply rejects the
+park and is preserved in the blocked reason while unresolved children require
+reconciliation; it cannot cause an automatic wake that hides the failure.

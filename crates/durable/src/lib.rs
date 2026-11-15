@@ -22,6 +22,7 @@ mod keyed_child;
 pub mod keyed_tool;
 pub mod model;
 pub mod nested;
+pub mod nested_identity;
 #[allow(dead_code)] // Storage protocol only; no scheduler or executor handoff.
 mod nested_suspension;
 pub mod observer;
