@@ -124,9 +124,10 @@ impl Scanner {
         {
             return None;
         }
+        let directory_only = pattern.ends_with('/') || pattern.rsplit('/').next() == Some(".");
         let normalized = pattern
             .split('/')
-            .filter(|part| *part != ".")
+            .filter(|part| !part.is_empty() && *part != ".")
             .collect::<Vec<_>>()
             .join("/");
         let matcher = globset::GlobBuilder::new(&normalized)
@@ -155,7 +156,9 @@ impl Scanner {
                 return None;
             }
             let relative = entry.path().strip_prefix(root).ok()?;
-            if matcher.is_match(relative) {
+            if matcher.is_match(relative)
+                && (!directory_only || entry.file_type().is_some_and(|kind| kind.is_dir()))
+            {
                 matches.push(entry.into_path());
             }
         }
@@ -396,7 +399,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("prompts")).unwrap();
         std::fs::write(root.path().join("prompts/demo.md"), "prompt").unwrap();
-        for pattern in ["./prompts/*.md", "prompts/./*.md"] {
+        for pattern in ["./prompts/*.md", "prompts/./*.md", "./prompts//*.md"] {
             std::fs::write(
                 root.path().join("package.json"),
                 serde_json::json!({"pi":{"prompts":[pattern]}}).to_string(),
@@ -405,6 +408,28 @@ mod tests {
             assert_eq!(
                 candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
                 vec![root.path().join("prompts/demo.md")]
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_directory_globs_exclude_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("prompts/sub")).unwrap();
+        std::fs::write(root.path().join("prompts/file.md"), "prompt").unwrap();
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.path().join("prompts/link")).unwrap();
+        for pattern in ["prompts/*/", "prompts/*/."] {
+            let mut scanner = Scanner {
+                count: 0,
+                ignore_bytes: 0,
+                active: HashSet::new(),
+            };
+            assert_eq!(
+                scanner.glob(root.path(), pattern).unwrap(),
+                vec![root.path().join("prompts/sub")]
             );
         }
     }
