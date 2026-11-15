@@ -101,7 +101,7 @@ without `defaultProvider` are still accepted.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -4611,3 +4611,33 @@ classifiable; incomplete values and unrelated metadata are ignored. Failed or
 timed-out inspection falls back to the existing transient classification. Provider error bodies are not logged or
 returned. Bedrock typed SDK errors and non-chat operations retain their separate
 policies.
+
+### Native SDK prompt resource factory
+
+`pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
+prompt resource part of Pi's `DefaultResourceLoader` to native hosts. Each
+`load` accepts current `PromptReadGrants`: an optional working directory for
+`.pi/SYSTEM.md` and `.pi/APPEND_SYSTEM.md`, and an optional agent directory for
+the corresponding global files. Nothing is read without a grant. As in the
+[pinned loader](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/src/core/resource-loader.ts),
+project files take precedence independently for each category, and explicit
+system or append values replace discovery. File values have a UTF-8 BOM removed
+and carry their source path. An empty system prompt uses the host default; an
+explicit empty append list suppresses discovery.
+
+The host must obtain and reevaluate its own permissions and choose the paths;
+grants permit ordinary filesystem reads including symlink targets and are not a
+sandbox. Loading is synchronous, so GUI hosts should run it off their UI thread.
+The returned snapshot is independent of later loads: apply it to a
+`SessionBuilder`, or compose and explicitly set an idle session's system prompt.
+Revoking a grant affects future loads, not snapshots or sessions already given
+content. A failed load returns an error without modifying an earlier snapshot.
+
+This is a focused native API, not a complete Pi resource loader. It does not
+load skills, prompt templates, extensions, context files, themes, or settings;
+it does not interpret an explicit string as a filename. Unlike Pi's fallback
+for unreadable prompt files, invalid UTF-8, oversized files, and read failures
+are errors. Unix file opens are nonblocking and validate the opened handle before
+reading, so a FIFO is rejected. The host supplies the default prompt and any Pi-specific context
+formatting; `compose` joins nonempty appendices with blank lines. Existing CLI
+loading remains independent.
