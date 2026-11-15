@@ -1454,7 +1454,7 @@ fn has_live_owned(
             if conversation.id != edge.edge.child {
                 return Err(Error::Ownership);
             }
-            if conversation.abort_requested {
+            if conversation.abort_requested || conversation.is_working() {
                 return Ok(true);
             }
             for child in tasks.iter().filter(|item| {

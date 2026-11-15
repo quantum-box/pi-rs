@@ -386,6 +386,71 @@ mod tests {
             .unwrap();
         (task.id(), owner)
     }
+    #[tokio::test]
+    async fn completing_owner_waits_for_active_owned_conversation() {
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        use futures_util::{StreamExt, stream};
+        use pi_rs_core::ModelEvent;
+
+        struct Answer;
+        #[async_trait]
+        impl Model for Answer {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])
+                .boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options();
+        opts.model = Arc::new(Answer);
+        let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let root = Task::new(
+            Uuid::from_u128(1),
+            owner.clone(),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("root".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&root)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap();
+        h.submit(child.child, None, "hello".into()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("root", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("root")))
+        });
+        let mut scheduler = Scheduler::attach(h.owner.clone(), registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(serde_json::json!("root"))
+        );
+        assert!(!scheduler.tick(0).unwrap());
+        h.resume_conversation(child.child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(serde_json::json!("root"))
+        );
+    }
     #[test]
     fn completing_owner_tracks_work_added_to_owned_conversation() {
         use crate::task::TaskState;
