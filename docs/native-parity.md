@@ -3967,7 +3967,8 @@ own endpoint. No live OpenRouter account was used.
 ### Chat model connection and compatibility
 
 Codemode's chat-model catalogue includes declared input modalities, reasoning
-capability and maximum output tokens when that metadata is available.
+capability, thinking-level mappings and maximum output tokens when that
+metadata is available.
 
 Configured chat models can select their own endpoint and request headers.
 Startup credentials remain bound to the original provider and endpoint after

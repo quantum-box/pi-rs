@@ -1832,7 +1832,7 @@ mod tests {
     fn chat_catalogue_preserves_declared_capabilities() {
         use clap::Parser;
         let config = json!({"providers":{"relay":{"baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "models":[
-            {"id":"fixture", "name":"Fixture", "reasoning":true, "input":["image"], "contextWindow":4096, "maxTokens":1024},
+            {"id":"fixture", "name":"Fixture", "reasoning":true, "input":["image"], "contextWindow":4096, "maxTokens":1024, "thinkingLevelMap":{"low":"lite","high":"deep","xhigh":null}},
             {"id":"plain", "reasoning":false, "input":["text"], "contextWindow":2048, "maxTokens":512}
         ]}}});
         let mut args = Cli::parse_from(["pi"]);
@@ -1849,6 +1849,10 @@ mod tests {
         assert_eq!(fixture["reasoning"], true);
         assert_eq!(fixture["maxTokens"], 1024);
         assert_eq!(fixture["contextWindow"], 4096);
+        assert_eq!(
+            fixture["thinkingLevelMap"],
+            json!({"low":"lite","high":"deep","xhigh":null})
+        );
         let plain = operation
             .chat_models(Some("relay"), Some("plain"), false)
             .pop()
@@ -1863,6 +1867,12 @@ mod tests {
         assert_eq!(built_in["input"], json!(["text", "image"]));
         assert_eq!(built_in["reasoning"], true);
         assert_eq!(built_in["maxTokens"], 128000);
+        let mapped = operation
+            .chat_models(Some("openai"), Some("gpt-5"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(mapped["thinkingLevelMap"]["high"], "high");
+        assert!(mapped["thinkingLevelMap"]["xhigh"].is_null());
     }
 
     #[tokio::test]
