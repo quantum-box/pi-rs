@@ -1435,31 +1435,36 @@ fn validate_wait_graph(
         .map(|item| (item.task.id(), &item.task))
         .collect();
     let edges = crate::ownership_edge::EdgeStore::new(store);
-    let mut pending = targets.to_vec();
+    let mut pending: Vec<_> = targets.iter().map(|id| (*id, false)).collect();
     let mut seen = HashSet::new();
-    while let Some(id) = pending.pop() {
+    while let Some((id, through_ownership)) = pending.pop() {
         if id == waiter {
             return Err(Error::Ownership);
         }
-        if !seen.insert(id) || new_children.contains(&id) {
+        if new_children.contains(&id) {
             continue;
         }
         let task = by_id.get(&id).ok_or(Error::Ownership)?;
-        if task.is_terminal() {
+        // A terminal wait target is already settled, but a terminal task
+        // reached through ownership can lead to an owned conversation with
+        // newly admitted live work.
+        if task.is_terminal() && !through_ownership {
             continue;
         }
-        if !task.abort_requested()
+        if !seen.insert(id) {
+            continue;
+        }
+        if !task.is_terminal()
+            && !task.abort_requested()
             && let TaskState::Waiting(
                 WaitFor::Tasks(on) | WaitFor::TasksAny(on) | WaitFor::TasksFailFast(on),
             ) = task.state()
         {
-            pending.extend(on.iter().copied());
+            pending.extend(on.iter().map(|id| (*id, false)));
         }
         pending.extend(tasks.iter().filter_map(|child| {
-            (child.task.owner() == &TaskOwner::Task(id)
-                && !child.task.is_background()
-                && !child.task.is_terminal())
-            .then_some(child.task.id())
+            (child.task.owner() == &TaskOwner::Task(id) && !child.task.is_background())
+                .then_some((child.task.id(), true))
         }));
         for edge in edges
             .children(id)
@@ -1471,9 +1476,8 @@ fn validate_wait_graph(
             if edge.edge.mode == crate::ownership_edge::Mode::Foreground {
                 pending.extend(tasks.iter().filter_map(|child| {
                     (child.task.owner() == &TaskOwner::Conversation(edge.edge.child)
-                        && !child.task.is_background()
-                        && !child.task.is_terminal())
-                    .then_some(child.task.id())
+                        && !child.task.is_background())
+                    .then_some((child.task.id(), true))
                 }));
             }
         }
