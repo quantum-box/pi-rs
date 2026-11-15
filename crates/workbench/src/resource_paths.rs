@@ -55,6 +55,26 @@ fn executable(path: &Path) -> bool {
 fn has_pattern(value: &str) -> bool {
     value.contains(['*', '?', '[', '{'])
 }
+// Windows may collapse a patterned component followed by `..` during a
+// metadata check. Test the literal prefix first, preserving real bracket names.
+fn wildcard_parent_path(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    let mut patterned = false;
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) && patterned && !prefix.exists() {
+            return true;
+        }
+        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        {
+            patterned = true;
+        }
+        prefix.push(component.as_os_str());
+    }
+    false
+}
 pub fn skill_path(args: &Cli, value: &str) -> Option<PathBuf> {
     let workspace = args
         .workspace
@@ -109,7 +129,12 @@ pub fn resolve(
         let patterned = pattern_path.components().any(|component| {
             matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
         });
-        let path = if kind == Kind::Prompt && !patterned {
+        let path = if kind == Kind::Prompt
+            && !patterned
+            && path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
             normalize_resource_path(&path)
         } else {
             path
@@ -134,7 +159,7 @@ pub fn resolve(
         if !skill_file_is_markdown(kind, &path, warnings) {
             continue;
         }
-        if kind == Kind::Prompt && path.is_dir() {
+        if kind == Kind::Prompt && !wildcard_parent_path(&path) && path.is_dir() {
             append(&mut paths, vec![path]);
             continue;
         }
@@ -352,9 +377,11 @@ fn expand(
     } else {
         path
     };
-    if path.exists() || !path.components().any(|component| {
+    let patterned = path.components().any(|component| {
         matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
-    }) {
+    });
+    let literal_exists = !wildcard_parent_path(path) && path.exists();
+    if literal_exists || !patterned {
         return collect(path, kind, required, warnings);
     }
     let pattern = path.to_string_lossy().replace('\\', "/");

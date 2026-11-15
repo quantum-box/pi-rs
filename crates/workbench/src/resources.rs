@@ -1780,14 +1780,33 @@ mod tests {
         let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.prompts["valid"].body, "available");
         assert!(resources.warnings.is_empty(), "{:?}", resources.warnings);
-        for pattern in ["no-match-*.md", "no-match-*/../valid.md"] {
+        std::fs::write(root.join("literal[1].md"), "literal").unwrap();
+        args.prompt_template = vec!["literal[1].md".into()];
+        assert_eq!(
+            Resources::load(&args).unwrap().prompts["literal[1]"].body,
+            "literal"
+        );
+        std::fs::create_dir(root.join("literal[dir]")).unwrap();
+        args.prompt_template = vec!["literal[dir]/../valid.md".into()];
+        assert_eq!(
+            Resources::load(&args).unwrap().prompts["valid"].body,
+            "available"
+        );
+        for pattern in [
+            "no-match-*.md",
+            "no-match-*/../valid.md",
+            "no-match-*/../.",
+            "[ab]/../valid.md",
+            "{a,b}/../.",
+        ] {
             args.prompt_template = vec![pattern.into()];
             assert!(
                 Resources::load(&args)
                     .err()
                     .unwrap()
                     .to_string()
-                    .contains("matched no files")
+                    .contains("matched no files"),
+                "pattern {pattern:?} should not resolve"
             );
         }
     }
