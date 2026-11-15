@@ -584,7 +584,7 @@ mod tests {
             });
             let mut headers = HeaderMap::new();
             if explicit {
-                headers.insert("session_id", "explicit".parse().unwrap());
+                headers.insert("session-id", "explicit".parse().unwrap());
             }
             let model = WorkbenchModel {
                 client: Client::OpenAi(
@@ -597,7 +597,7 @@ mod tests {
                 ),
                 block_images: false,
                 supports_images: None,
-                session_affinity: &["session_id", "x-client-request-id"],
+                session_affinity: &["session-id", "x-client-request-id"],
                 price: None,
             };
             let request = ModelRequest {
@@ -626,10 +626,10 @@ mod tests {
                 !summary
             );
             assert_eq!(
-                headers.contains("session_id: session-one\r\n"),
+                headers.contains("session-id: session-one\r\n"),
                 !summary && !explicit
             );
-            assert_eq!(headers.contains("session_id: explicit\r\n"), explicit);
+            assert_eq!(headers.contains("session-id: explicit\r\n"), explicit);
         }
     }
 

@@ -1182,7 +1182,7 @@ impl Profiles {
         match (adapter, format) {
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
             (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
-                &["session_id", "x-client-request-id"]
+                &["session-id", "x-client-request-id"]
             }
             (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) => &["x-client-request-id"],
             (Adapter::Anthropic, _) => &["x-session-affinity"],
@@ -1649,7 +1649,7 @@ mod tests {
         let provider = profiles.provider("custom").unwrap();
         assert_eq!(
             profiles.session_affinity(&provider, "default", "https://example.test"),
-            ["session_id", "x-client-request-id"]
+            ["session-id", "x-client-request-id"]
         );
         assert_eq!(
             profiles.session_affinity(&provider, "router", "https://example.test"),
@@ -1675,7 +1675,7 @@ mod tests {
         for (base, expected) in [
             (
                 "https://OPENROUTER.AI/v1",
-                &["session_id", "x-client-request-id"][..],
+                &["session-id", "x-client-request-id"][..],
             ),
             (
                 "https://example.com/openrouter.ai/../v1",
