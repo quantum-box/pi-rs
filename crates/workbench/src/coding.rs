@@ -2635,6 +2635,16 @@ impl CodingTool {
         })?;
         let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
+        if self.unrestricted {
+            open_local_edit_file(&path).map_err(|error| match error {
+                Error::Io(ref cause) if cause.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Error::Config(format!(
+                        "Could not edit file: {display_path}. Error code: EACCES."
+                    ))
+                }
+                error => error,
+            })?;
+        }
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
         if !self.unrestricted && output.len() as u64 > MAX_FILE_BYTES {
@@ -4437,6 +4447,45 @@ mod tests {
             tool.kind = kind;
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_rejects_read_only_file_even_with_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
+            );
+            assert_eq!(content, "before\n");
         }
     }
 
