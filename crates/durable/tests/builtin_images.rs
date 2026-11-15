@@ -653,3 +653,252 @@ async fn malformed_webp_orientation_does_not_change_valid_image() {
         base64::engine::general_purpose::STANDARD.encode(&input)
     );
 }
+
+#[tokio::test]
+async fn transformed_grayscale_and_sixteen_bit_png_use_rgba8_like_photon() {
+    let fixtures = [
+        DynamicImage::ImageLuma8(image::GrayImage::from_pixel(8, 6, image::Luma([128]))),
+        DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+            8,
+            6,
+            image::Rgba([0xffffu16, 0x8000, 0, 0xffff]),
+        )),
+    ];
+    for image in fixtures {
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        let bytes = bytes.into_inner();
+        let preserved = BuiltinImageProcessor
+            .prepare(&bytes, "image/png", ImageLimits::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved.data,
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+        let result = BuiltinImageProcessor
+            .prepare(
+                &bytes,
+                "image/png",
+                ImageLimits {
+                    max_width: 4,
+                    ..ImageLimits::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.mime_type, "image/png");
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&result.data)
+            .unwrap();
+        let decoder = image::ImageReader::with_format(Cursor::new(data), ImageFormat::Png)
+            .into_decoder()
+            .unwrap();
+        assert_eq!(
+            image::ImageDecoder::color_type(&decoder),
+            image::ColorType::Rgba8
+        );
+    }
+}
+
+#[tokio::test]
+async fn resized_formats_follow_upstream_encoding_preference() {
+    for (format, mime, expected) in [
+        (ImageFormat::Png, "image/png", "image/png"),
+        (ImageFormat::Jpeg, "image/jpeg", "image/jpeg"),
+        (ImageFormat::Gif, "image/gif", "image/png"),
+        (ImageFormat::WebP, "image/webp", "image/png"),
+        (ImageFormat::Bmp, "image/bmp", "image/png"),
+    ] {
+        let input = fixture(8, 6, format);
+        let result = BuiltinImageProcessor
+            .prepare(
+                &input,
+                mime,
+                ImageLimits {
+                    max_width: 4,
+                    ..ImageLimits::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.mime_type, expected, "{mime}");
+        assert_eq!(
+            (decoded(&result).width(), decoded(&result).height()),
+            (4, 3)
+        );
+        assert_eq!(
+            result.converted_from.as_deref(),
+            (mime != expected).then_some(mime)
+        );
+    }
+    let jpeg = fixture(8, 6, ImageFormat::Jpeg);
+    let result = BuiltinImageProcessor
+        .prepare(
+            &jpeg,
+            "image/jpeg",
+            ImageLimits {
+                max_width: 4,
+                max_bytes: 200,
+                ..ImageLimits::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.mime_type, "image/png");
+    assert_eq!(result.converted_from.as_deref(), Some("image/jpeg"));
+    assert!(result.data.len() <= 200);
+}
+
+#[tokio::test]
+async fn jpeg_qualities_are_attempted_in_upstream_order() {
+    let mut pixels = RgbaImage::new(128, 128);
+    let mut seed = 0x3210_abcd_u32;
+    for pixel in pixels.pixels_mut() {
+        let mut channels = [0u8; 4];
+        for channel in channels.iter_mut().take(3) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *channel = seed as u8;
+        }
+        channels[3] = 255;
+        *pixel = Rgba(channels);
+    }
+    let image = DynamicImage::ImageRgba8(pixels);
+    let mut png = Cursor::new(Vec::new());
+    image.write_to(&mut png, ImageFormat::Png).unwrap();
+    let png = png.into_inner();
+    let mut candidates = Vec::new();
+    for quality in [80, 70, 55, 40] {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(&image)
+            .unwrap();
+        candidates.push(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    for i in 0..candidates.len() {
+        let limit = candidates[i].len();
+        assert!(base64::engine::general_purpose::STANDARD.encode(&png).len() > limit);
+        if i > 0 {
+            assert!(candidates[i - 1].len() > limit);
+        }
+        let result = BuiltinImageProcessor
+            .prepare(
+                &png,
+                "image/png",
+                ImageLimits {
+                    max_bytes: limit,
+                    ..ImageLimits::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.mime_type, "image/jpeg");
+        assert_eq!(result.data, candidates[i], "quality index {i}");
+        assert!(result.resized.is_none());
+    }
+}
+
+#[tokio::test]
+async fn byte_budget_retries_at_three_quarters_of_previous_size() {
+    use image::imageops::FilterType;
+    let mut pixels = RgbaImage::new(128, 128);
+    let mut seed = 0x4a1b_2c3d_u32;
+    for pixel in pixels.pixels_mut() {
+        let mut channels = [0u8; 4];
+        for channel in channels.iter_mut().take(3) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *channel = seed as u8;
+        }
+        channels[3] = 255;
+        *pixel = Rgba(channels);
+    }
+    let original = DynamicImage::ImageRgba8(pixels);
+    let mut input = Cursor::new(Vec::new());
+    original.write_to(&mut input, ImageFormat::Png).unwrap();
+    let scaled = original.resize_exact(96, 96, FilterType::Lanczos3);
+    let jpeg = |image: &DynamicImage, quality| {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(image)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let expected = jpeg(&scaled, 40);
+    let limit = expected.len();
+    assert!(jpeg(&original, 40).len() > limit);
+    assert!(jpeg(&scaled, 55).len() > limit);
+    let result = BuiltinImageProcessor
+        .prepare(
+            &input.into_inner(),
+            "image/png",
+            ImageLimits {
+                max_bytes: limit,
+                ..ImageLimits::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.data, expected);
+    assert_eq!(result.mime_type, "image/jpeg");
+    let resized = result.resized.unwrap();
+    assert_eq!(
+        (
+            resized.from.width,
+            resized.from.height,
+            resized.to.width,
+            resized.to.height
+        ),
+        (128, 128, 96, 96)
+    );
+}
+
+#[tokio::test]
+async fn animated_gif_is_preserved_when_unchanged_and_resized_from_first_frame() {
+    use image::AnimationDecoder;
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        for color in [Rgba([255, 0, 0, 255]), Rgba([0, 255, 0, 255])] {
+            encoder
+                .encode_frame(image::Frame::new(RgbaImage::from_pixel(8, 6, color)))
+                .unwrap();
+        }
+    }
+    let preserved = BuiltinImageProcessor
+        .prepare(&bytes, "image/gif", ImageLimits::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        preserved.data,
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(&bytes)).unwrap();
+    assert_eq!(decoder.into_frames().collect_frames().unwrap().len(), 2);
+    let changed = BuiltinImageProcessor
+        .prepare(
+            &bytes,
+            "image/gif",
+            ImageLimits {
+                max_width: 4,
+                ..ImageLimits::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.mime_type, "image/png");
+    let result = decoded(&changed).to_rgba8();
+    assert_eq!((result.width(), result.height()), (4, 3));
+    assert_eq!(*result.get_pixel(2, 1), Rgba([255, 0, 0, 255]));
+}

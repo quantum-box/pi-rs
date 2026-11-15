@@ -82,7 +82,7 @@ fn prepare(bytes: &[u8], mime: &str, limits: ImageLimits) -> Option<PreparedImag
         ImageFormat::Jpeg => decoder.orientation().unwrap_or(Orientation::NoTransforms),
         _ => Orientation::NoTransforms,
     };
-    let mut image = DynamicImage::from_decoder(decoder).ok()?;
+    let image = DynamicImage::from_decoder(decoder).ok()?;
     if orientation == Orientation::NoTransforms
         && actual != "image/bmp"
         && width <= limits.max_width
@@ -96,6 +96,9 @@ fn prepare(bytes: &[u8], mime: &str, limits: ImageLimits) -> Option<PreparedImag
             converted_from: None,
         });
     }
+    // Photon prepares transformed images through an 8-bit RGBA buffer.
+    // Preserve the original bytes above for images that need no transformation.
+    let mut image = DynamicImage::ImageRgba8(image.into_rgba8());
     image.apply_orientation(orientation);
     let from = Dimensions {
         width: image.width(),
@@ -109,14 +112,15 @@ fn prepare(bytes: &[u8], mime: &str, limits: ImageLimits) -> Option<PreparedImag
         height: ((from.height as f64 * scale).round() as u32).max(1),
     };
     loop {
-        let scaled = if to == from {
-            image.clone()
-        } else {
-            image.resize_exact(to.width, to.height, FilterType::Lanczos3)
-        };
-        if let Some((output, output_mime)) =
-            encode(&scaled, actual == "image/jpeg", limits.max_bytes)
-        {
+        // As upstream does, encode the original buffer directly when no resize
+        // is needed; cloning it can double peak memory for a large image.
+        let scaled =
+            (to != from).then(|| image.resize_exact(to.width, to.height, FilterType::Lanczos3));
+        if let Some((output, output_mime)) = encode(
+            scaled.as_ref().unwrap_or(&image),
+            actual == "image/jpeg",
+            limits.max_bytes,
+        ) {
             return Some(PreparedImage {
                 data: base64::engine::general_purpose::STANDARD.encode(output),
                 mime_type: output_mime.into(),
