@@ -295,6 +295,34 @@ fn invalid_remote_filters_follow_package_settings_order() {
         );
         sources.push(source);
     }
+    let listed = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--no-trust",
+            "-e",
+            &sources[0],
+            "-e",
+            &sources[1],
+            "-e",
+            &sources[0],
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(listed.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["source"], sources[0]);
+    assert_eq!(lines[1]["source"], sources[1]);
     for reverse in [false, true] {
         let z = serde_json::json!({"source":sources[0], "prompts":["file:///bad%2Fpath"]});
         let a = serde_json::json!({"source":sources[1], "prompts":["file:///bad%ZZ"]});
@@ -352,6 +380,16 @@ fn invalid_remote_filters_follow_package_settings_order() {
             .to_string(),
     )
     .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("PI_OFFLINE", "1")
+        .args(["--trust", "--no-mcp", "--print", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("encoded"), "{stderr}");
     std::fs::write(
         project.join("settings.json"),
         serde_json::json!({"packages":[

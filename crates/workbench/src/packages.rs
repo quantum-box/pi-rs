@@ -1101,6 +1101,9 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     {
         let source = normalize(entry, &args.workspace)?;
         let identity = source_identity(&source);
+        if order.get(&identity).is_some_and(|(scope, _)| *scope == 2) {
+            continue;
+        }
         order.insert(identity.clone(), (2, position));
         result.insert(
             identity,
