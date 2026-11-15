@@ -125,39 +125,70 @@ pub fn normalize_strict_tool_arguments(
     schema: &Value,
     arguments: &Value,
 ) -> Result<Value, StrictSchemaError> {
-    strict_tool_schema(schema, |_, _| false)?;
+    strict_tool_schema(schema, |key, _| {
+        matches!(key, "$dynamicRef" | "$recursiveRef")
+    })?;
+    let plan = NullNormalizationPlan::build(schema, schema.get("$schema"))?;
     let mut normalized = arguments.clone();
-    drop_optional_nulls(schema, &mut normalized);
+    plan.apply(&mut normalized);
     Ok(normalized)
 }
 
-fn drop_optional_nulls(schema: &Value, value: &mut Value) {
-    if let Some(items) = value.as_array_mut() {
-        if let Some(item_schema) = schema.get("items") {
-            for item in items {
-                drop_optional_nulls(item_schema, item);
+#[derive(Default)]
+struct NullNormalizationPlan {
+    fields: Vec<(String, bool, Self)>,
+    items: Option<Box<Self>>,
+}
+
+impl NullNormalizationPlan {
+    fn build(schema: &Value, dialect: Option<&Value>) -> Result<Self, StrictSchemaError> {
+        let mut plan = Self::default();
+        if let Some(item) = schema.get("items") {
+            plan.items = Some(Box::new(Self::build(item, dialect)?));
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            let required = schema.get("required").and_then(Value::as_array);
+            for (key, property) in properties {
+                let is_required =
+                    required.is_some_and(|items| items.iter().any(|v| v.as_str() == Some(key)));
+                let rejects_null = if is_required {
+                    false
+                } else {
+                    let mut candidate = property.clone();
+                    if let (Some(dialect), Some(object)) = (dialect, candidate.as_object_mut()) {
+                        object.insert("$schema".into(), dialect.clone());
+                    }
+                    let validator = jsonschema::validator_for(&candidate).map_err(|error| {
+                        StrictSchemaError(format!(
+                            "cannot validate optional property {key}: {error}"
+                        ))
+                    })?;
+                    !validator.is_valid(&Value::Null)
+                };
+                plan.fields
+                    .push((key.clone(), rejects_null, Self::build(property, dialect)?));
             }
         }
-        return;
+        Ok(plan)
     }
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return;
-    };
-    let required = schema.get("required").and_then(Value::as_array);
-    for (key, property_schema) in properties {
-        let is_required =
-            required.is_some_and(|items| items.iter().any(|v| v.as_str() == Some(key)));
-        let remove = !is_required
-            && object.get(key) == Some(&Value::Null)
-            && jsonschema::validator_for(property_schema)
-                .is_ok_and(|validator| !validator.is_valid(&Value::Null));
-        if remove {
-            object.remove(key);
-        } else if let Some(item) = object.get_mut(key) {
-            drop_optional_nulls(property_schema, item);
+
+    fn apply(&self, value: &mut Value) {
+        if let Some(items) = value.as_array_mut() {
+            if let Some(plan) = &self.items {
+                for item in items {
+                    plan.apply(item);
+                }
+            }
+            return;
+        }
+        if let Some(object) = value.as_object_mut() {
+            for (key, rejects_null, plan) in &self.fields {
+                if *rejects_null && object.get(key) == Some(&Value::Null) {
+                    object.remove(key);
+                } else if let Some(item) = object.get_mut(key) {
+                    plan.apply(item);
+                }
+            }
         }
     }
 }
@@ -390,6 +421,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn null_normalization_uses_root_dialect_and_rejects_dynamic_refs() {
+        let mut schema = json!({"$schema":"http://json-schema.org/draft-04/schema#","type":"object","properties":{
+            "optional":{"type":["string","null"],"const":"x"}
+        }});
+        let arguments = json!({"optional":null});
+        assert_eq!(
+            normalize_strict_tool_arguments(&schema, &arguments).unwrap(),
+            arguments
+        );
+        schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        assert_eq!(
+            normalize_strict_tool_arguments(&schema, &arguments).unwrap(),
+            json!({})
+        );
+        let dynamic =
+            json!({"type":"object","properties":{"x":{"type":"string","$dynamicRef":"#node"}}});
+        assert!(normalize_strict_tool_arguments(&dynamic, &json!({"x":null})).is_err());
     }
 
     #[test]
