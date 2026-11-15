@@ -354,3 +354,328 @@ mod tests {
         assert!(open_in_profile(&root.0).is_err());
     }
 }
+
+/// Experimental Windows mutex gate. It is deliberately not wired to `open`.
+/// The caller must inspect `abandoned` and recover persistent state before use.
+#[cfg(windows)]
+pub(crate) mod windows_mutex {
+    use std::{
+        ffi::c_void,
+        io,
+        ptr::null_mut,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
+        Security::Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+        },
+        Security::{
+            ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+            GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        },
+        System::Threading::{
+            CreateMutexExW, GetCurrentProcess, MUTEX_MODIFY_STATE, OpenProcessToken, ReleaseMutex,
+            SYNCHRONIZATION_READ_CONTROL, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+        },
+    };
+
+    const RIGHTS: u32 =
+        SYNCHRONIZATION_SYNCHRONIZE | SYNCHRONIZATION_READ_CONTROL | MUTEX_MODIFY_STATE;
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    struct Local(*mut c_void);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    fn denied(msg: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, msg)
+    }
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // Own the aligned TokenUser buffer while its SID pointer is in use.
+    struct User {
+        _buffer: Vec<usize>,
+        sid: PSID,
+        text: String,
+    }
+    fn user() -> io::Result<User> {
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Handle(token);
+        let mut len = 0u32;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut len);
+        }
+        if len == 0 || len > 1024 * 1024 {
+            return Err(denied("invalid token user size"));
+        }
+        let mut buffer = vec![0usize; (len as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                len,
+                &mut len,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        if sid.is_null() {
+            return Err(denied("missing token SID"));
+        }
+        let mut text = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let allocated = Local(text.cast());
+        let mut n = 0usize;
+        while n < 256 && unsafe { *text.add(n) } != 0 {
+            n += 1;
+        }
+        if n == 256 {
+            return Err(denied("invalid SID string"));
+        }
+        let text = String::from_utf16(unsafe { std::slice::from_raw_parts(text, n) })
+            .map_err(|_| denied("invalid SID string"))?;
+        drop(allocated);
+        Ok(User {
+            _buffer: buffer,
+            sid,
+            text,
+        })
+    }
+
+    fn descriptor(user: &User) -> io::Result<Local> {
+        // One explicit ACE, no inheritance, granting only requested rights.
+        let sddl = wide(&format!(
+            "O:{}D:P(A;;0x{:08x};;;{})",
+            user.text, RIGHTS, user.text
+        ));
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Local(sd))
+    }
+
+    fn validate(handle: HANDLE, user: &User) -> io::Result<()> {
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut sd,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let sd = Local(sd);
+        let mut owner: PSID = null_mut();
+        let mut defaulted = 0;
+        if unsafe { GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) } == 0
+            || owner.is_null()
+            || unsafe { EqualSid(owner, user.sid) } == 0
+        {
+            return Err(denied("mutex owner does not match user"));
+        }
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err(denied("mutex DACL is not protected"));
+        }
+        let mut present = 0;
+        let mut dacl: *mut ACL = null_mut();
+        if unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) } == 0
+            || present == 0
+            || dacl.is_null()
+            || unsafe { (*dacl).AceCount } != 1
+        {
+            return Err(denied("unexpected mutex DACL"));
+        }
+        let mut ace: *mut c_void = null_mut();
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+            return Err(denied("invalid mutex ACE"));
+        }
+        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        // ACE type zero is ACCESS_ALLOWED_ACE_TYPE. Reject inherited, callback,
+        // deny, multiple, or otherwise unfamiliar ACEs rather than interpreting them.
+        if unsafe { (*ace).Header.AceType } != 0
+            || unsafe { (*ace).Header.AceFlags } != 0
+            || unsafe { (*ace).Mask } != RIGHTS
+            || unsafe { (*ace).Header.AceSize } < 12
+        {
+            return Err(denied("unexpected mutex ACE"));
+        }
+        let ace_sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<u8>() };
+        // SID has an eight-byte header followed by at most 15 subauthorities.
+        // Check its claimed extent before passing it to EqualSid.
+        if unsafe { (*ace).Header.AceSize } < 16 {
+            return Err(denied("truncated mutex SID"));
+        }
+        let count = unsafe { *ace_sid.add(1) } as usize;
+        let available = unsafe { (*ace).Header.AceSize } as usize - 8;
+        if count > 15 || 8 + count * 4 > available {
+            return Err(denied("invalid mutex SID extent"));
+        }
+        if unsafe { EqualSid(ace_sid.cast(), user.sid) } == 0 {
+            return Err(denied("mutex ACE SID does not match user"));
+        }
+        Ok(())
+    }
+
+    fn open_mutex() -> io::Result<Handle> {
+        let user = user()?;
+        let sd = descriptor(&user)?;
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: 0,
+        };
+        let name = wide(&format!("Global\\pi-rs-mcp-config-v1-{}", user.text));
+        let mutex = unsafe { CreateMutexExW(&attrs, name.as_ptr(), 0, RIGHTS) };
+        if mutex.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mutex = Handle(mutex);
+        // Validate new and already-existing objects; supplied attributes do not
+        // replace the security descriptor of an existing named mutex.
+        validate(mutex.0, &user)?;
+        Ok(mutex)
+    }
+
+    /// Owns an open mutex on a dedicated thread; dropping requests release.
+    pub(crate) struct Guard {
+        release: Option<mpsc::Sender<bool>>,
+        pub(crate) abandoned: bool,
+        recovered: bool,
+    }
+    impl Guard {
+        /// Call only after persistent state has been checked and repaired.
+        pub(crate) fn mark_recovered(&mut self) {
+            self.recovered = true;
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(self.recovered);
+            }
+        }
+    }
+    struct Cancel(Arc<AtomicBool>);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Cancellation-safe before ownership: dropping this future stops the
+    /// waiting worker. After acquisition, retain Guard until all writes finish.
+    pub(crate) async fn acquire() -> io::Result<Guard> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = Cancel(cancelled.clone());
+        let (result_tx, result_rx) = mpsc::sync_channel::<io::Result<bool>>(1);
+        let (release_tx, release_rx) = mpsc::channel::<bool>();
+        std::thread::Builder::new()
+            .name("pi-mcp-gate".into())
+            .spawn(move || {
+                let result = (|| -> io::Result<()> {
+                    let mutex = open_mutex()?;
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        let wait = unsafe { WaitForSingleObject(mutex.0, 50) };
+                        match wait {
+                            WAIT_TIMEOUT => continue,
+                            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                                // result conveys whether recovery is required. The owning
+                                // thread releases even if the async receiver is dropped.
+                                let _ = result_tx.send(Ok(wait == WAIT_ABANDONED));
+                                let recovered = release_rx.recv().unwrap_or(false);
+                                // Preserve abandonment for existing handles when a caller
+                                // disappears before recovery. If this is the last handle,
+                                // Windows destroys the object and the indication is lost;
+                                // persistent crash recovery needs a separate protocol.
+                                if wait == WAIT_ABANDONED && !recovered {
+                                    return Ok(());
+                                }
+                                if unsafe { ReleaseMutex(mutex.0) } == 0 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                return Ok(());
+                            }
+                            WAIT_FAILED => return Err(io::Error::last_os_error()),
+                            _ => return Err(denied("unexpected mutex wait result")),
+                        }
+                    }
+                })();
+                if let Err(error) = result {
+                    let _ = result_tx.send(Err(error));
+                }
+            })?;
+        loop {
+            match result_rx.try_recv() {
+                Ok(Ok(abandoned)) => {
+                    return Ok(Guard {
+                        release: Some(release_tx),
+                        abandoned,
+                        recovered: !abandoned,
+                    });
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::other("mutex worker exited"));
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+            }
+        }
+    }
+}
