@@ -1290,6 +1290,9 @@ An OpenAI key explicitly saved for `/v1/responses`, including by the provider
 key UI, does not authorize `/v1/decisions`; use an endpointless Pi auth entry or
 `OPENAI_API_KEY` for the official Decisions endpoint.
 
+Codemode reserves its four concurrent model-call slots for classifier and image
+inference; model discovery and resolution remain available while those slots are full.
+
 ### Native codemode checkpoint
 
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
