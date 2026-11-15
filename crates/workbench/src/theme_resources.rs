@@ -10,7 +10,8 @@ const MAX_FILES: usize = 64;
 const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_VARIABLE_DEPTH: usize = 128;
 
-/// Exact files the host authorizes this load to read. Symlinks are followed;
+/// Exact absolute files the host authorizes this load to read. Paths cannot
+/// contain parent components. Symlinks are followed;
 /// a grant also authorizes the target and is not a filesystem sandbox.
 #[derive(Clone, Debug, Default)]
 pub struct ThemeReadGrants {
@@ -60,6 +61,15 @@ impl ThemeReadGrants {
         let mut names = HashSet::new();
         let mut themes = Vec::with_capacity(self.files.len());
         for path in &self.files {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(Error::Config(
+                    "theme file path must be absolute without parent components".into(),
+                ));
+            }
             let text = crate::prompt_resources::read_optional(path)?.ok_or_else(|| {
                 Error::Config(format!("theme file is missing: {}", path.display()))
             })?;

@@ -5075,7 +5075,7 @@ error. This is a point-in-time check, not a guarantee of later availability.
 ### Native SDK theme snapshots
 
 `pi_rs_workbench::theme_resources::ThemeReadGrants` loads an ordered snapshot
-from explicitly granted files only. It shares schema validation and color
+from explicitly granted absolute files without parent components. It shares schema validation and color
 resolution with the interactive frontend and exposes each name, source path and
 resolved color roles without selecting a theme or probing the terminal. Reads
 are synchronous, bounded, follow symlinks, and are not a filesystem sandbox.

@@ -76,6 +76,18 @@ fn failures_reject_the_whole_snapshot() {
     assert!(grants(vec![a; 65]).load().is_err());
     assert!(grants(vec![dir.path().to_owned()]).load().is_err());
     assert!(grants(vec![]).load().unwrap().themes().is_empty());
+    for path in [
+        PathBuf::from("relative.json"),
+        dir.path().join("../theme.json"),
+    ] {
+        assert!(
+            grants(vec![path])
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("theme file path must be absolute without parent components")
+        );
+    }
 }
 
 #[test]
@@ -130,4 +142,18 @@ fn grants_follow_symlinks_and_reject_fifos() {
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
     assert!(grants(vec![fifo]).load().is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_ambiguous_theme_paths_are_rejected() {
+    for path in [r"C:theme.json", r"\theme.json"] {
+        assert!(
+            grants(vec![path.into()])
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("theme file path must be absolute without parent components")
+        );
+    }
 }
