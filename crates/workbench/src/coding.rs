@@ -2863,7 +2863,21 @@ impl CodingTool {
         let mut grep = if is_find {
             None
         } else {
-            let grep = crate::file_search::Grep::new(args, limit)?;
+            let grep = crate::file_search::Grep::new(args, limit).map_err(|error| match error {
+                Error::Config(message)
+                    if self.unrestricted && message.starts_with("regex parse error:") =>
+                {
+                    let advice = if message.contains("look-around")
+                        || message.contains("backreferences")
+                    {
+                        "\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."
+                    } else {
+                        ""
+                    };
+                    Error::Config(format!("rg: {message}{advice}"))
+                }
+                error => error,
+            })?;
             Some(if base.is_file() {
                 grep.with_explicit_file()
             } else {
@@ -4565,6 +4579,80 @@ mod tests {
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
         }
+    }
+
+    #[tokio::test]
+    async fn grep_reports_ripgrep_regex_parse_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "text").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let result = tool
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(
+                json!({"pattern":"(?=a)","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:(?=a))\n       ^^^\nerror: look-around, including look-ahead and look-behind, is not supported\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."),
+            "{result:?}"
+        );
+        for pattern in [r"\1", "backreferences["] {
+            let result = tool
+                .invoke(
+                    json!({"pattern":pattern,"path":"file.txt"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Failed(message)
+                if message.ends_with("\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around.")),
+                "{result:?}"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: regex parse error:")),
+            "{result:?}"
+        );
     }
 
     #[cfg(unix)]
