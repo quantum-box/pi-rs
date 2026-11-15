@@ -190,6 +190,7 @@ struct SessionSnapshot {
     entries: Option<super::rpc_entries::Cursor>,
     share_base: Option<Arc<super::sessions::ShareContext>>,
     share_pending: bool,
+    share_path: Option<PathBuf>,
 }
 
 impl SessionSnapshot {
@@ -206,6 +207,7 @@ impl SessionSnapshot {
             entries,
             share_base: None,
             share_pending: false,
+            share_path: None,
         }
     }
 
@@ -307,6 +309,19 @@ impl SessionSnapshot {
             .as_mut()
             .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
     }
+}
+
+// A request on this private worker channel may not nominate another journal,
+// even if that file happens to contain the same initial records. This textual
+// binding is not a filesystem identity or cross-process authentication proof.
+fn validate_share_path(snapshot: &Mutex<SessionSnapshot>, path: &std::path::Path) -> Result<()> {
+    let snapshot = snapshot.lock().expect("session snapshot");
+    if snapshot.share_path.as_deref() != Some(path) {
+        return Err(Error::Config(
+            "Share request belongs to another session path".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -717,10 +732,10 @@ async fn run_worker(
     }
     .records()
     .to_vec();
-    let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
-        initial_records,
-        args.mode == Some(super::OutputMode::Rpc),
-    )));
+    let mut initial_snapshot =
+        SessionSnapshot::new(initial_records, args.mode == Some(super::OutputMode::Rpc));
+    initial_snapshot.share_path = Some(args.session.clone());
+    let snapshot = Arc::new(Mutex::new(initial_snapshot));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
@@ -994,10 +1009,12 @@ async fn run_worker(
             args.thinking = thinking;
             args.session = session;
             runtime.configure_model_options(&args, reported_thinking)?;
-            snapshot
-                .lock()
-                .expect("session snapshot")
-                .refresh(&Session::open(&args.session)?);
+            {
+                let current = Session::open(&args.session)?;
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                snapshot.share_path = Some(args.session.clone());
+                snapshot.refresh(&current);
+            }
             if switched {
                 notify_session_lifecycle(
                     &args,
@@ -1787,14 +1804,23 @@ fn read_requests(
                             control_response("get_share_context", id, Err(error));
                             return;
                         }
+                        if let Err(error) = validate_share_path(&snapshot, &session) {
+                            control_response("get_share_context", id, Err(error));
+                            return;
+                        }
+                        let path_for_read = session.clone();
                         let captured = share_snapshot_and_journal_background(
                             active,
-                            snapshot,
+                            snapshot.clone(),
                             slots,
                             journal_key,
-                            move || Session::snapshot(session).ok(),
+                            move || Session::snapshot(path_for_read).ok(),
                         )
-                        .await;
+                        .await
+                        .and_then(|captured| {
+                            validate_share_path(&snapshot, &session)?;
+                            Ok(captured)
+                        });
                         let result = match captured {
                             Ok((snapshot, journal)) if include_journal => {
                                 if let Err(error) = respond_share_capture_background(
