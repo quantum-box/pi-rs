@@ -1440,7 +1440,8 @@ scripts and errors to direct callers.
 Fractional explicit timeouts retain output already received. Shell execution
 has no separate default timeout, while the caller's configured tool deadline
 continues to apply. A shell that exits while descendants hold its output pipes
-returns after a bounded drain period. Unit and CLI fixtures cover line/byte
+returns after both pipes close or 100 ms without further output. Output from
+an active descendant resets that idle period. Unit and CLI fixtures cover line/byte
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
 
 ### Text paging checkpoint

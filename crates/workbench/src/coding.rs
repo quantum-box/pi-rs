@@ -1613,6 +1613,8 @@ struct LocalBashOperations {
     shell: ShellConfig,
 }
 
+const SHELL_POST_EXIT_IDLE: Duration = Duration::from_millis(100);
+
 #[async_trait::async_trait]
 impl BashOperations for LocalBashOperations {
     fn is_local(&self) -> bool {
@@ -1678,12 +1680,13 @@ impl BashOperations for LocalBashOperations {
                 _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
                 result = process.wait(), if status.is_none() => {
                     status = Some(result?);
-                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                 },
                 _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     let count = count?; stdout_open = count != 0;
                     if count != 0 {
+                        if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
                         tokio::select! {
                             biased;
                             _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
@@ -1695,6 +1698,7 @@ impl BashOperations for LocalBashOperations {
                 count = stderr.read(&mut stderr_buffer), if stderr_open => {
                     let count = count?; stderr_open = count != 0;
                     if count != 0 {
+                        if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
                         tokio::select! {
                             biased;
                             _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
@@ -3057,11 +3061,14 @@ impl CodingTool {
                     status = Some(result?);
                     process.finished = true;
                     // Descendants may retain inherited pipes after the shell exits.
-                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                 }
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
                     stdout_open = count != 0;
+                    if count != 0 && status.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
@@ -3081,6 +3088,9 @@ impl CodingTool {
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
+                    if count != 0 && status.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
@@ -6083,6 +6093,54 @@ mod tests {
         .unwrap();
         assert_eq!(result.output.script, "done");
         assert!(result.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_draining_active_descendants_after_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let command = "(i=0; while [ $i -lt 12 ]; do printf 'out%s\\n' \"$i\"; printf 'err%s\\n' \"$i\" >&2; sleep 0.04; i=$((i+1)); done) & exit 0";
+        let local = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            local.shell(
+                &json!({"command":command}),
+                &pi_rs::CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.status.success());
+        assert!(result.output.script.contains("out11\n"));
+        assert!(result.output.script.contains("err11\n"));
+
+        let backend = create_bash_tool(
+            root.path(),
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            backend.invoke(
+                json!({"command":command}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let output = result.tool_content();
+        assert!(output.contains("out11\n"), "{output:?}");
+        assert!(output.contains("err11\n"), "{output:?}");
     }
 
     #[tokio::test]
