@@ -2081,17 +2081,38 @@ async fn merged_watch_retains_opt_in_document_batches_atomically_across_reopen()
         serde_json::json!(["s", ["n"], 2]),
         serde_json::json!(["a", ["text"], "🚀"]),
         serde_json::json!(["p", ["items"], 1, 0, [2]]),
+        serde_json::json!(["s", ["items", 2], {"text":"😀hello", "list":[0,1,2]}]),
+        serde_json::json!(["t", ["items", 2, "text"], 2]),
+        serde_json::json!(["a", ["items", 2, "text"], "!"]),
+        serde_json::json!(["p", ["items", 2, "list"], 99, 99, [3]]),
+        serde_json::json!(["m", ["items", 2, "list"], [3, 2, 1, 0]]),
     ];
     let second_ops = vec![serde_json::json!(["s", ["n"], 3])];
     let av = Documents::new(&store).get(&a).unwrap().unwrap().version;
     let bv = Documents::new(&store).get(&b).unwrap().unwrap().version;
+    let mut invalid = Transaction::new();
+    assert!(
+        invalid
+            .apply_operations(
+                &store,
+                &a,
+                av,
+                &[
+                    serde_json::json!(["s", ["items", 1], "😀"]),
+                    serde_json::json!(["t", ["items", 1], 1]),
+                ]
+            )
+            .is_err()
+    );
+    invalid.commit(&store).unwrap();
+    assert_eq!(Documents::new(&store).get(&a).unwrap().unwrap().version, av);
     let mut winner = Transaction::new();
     winner.apply_operations(&store, &a, av, &first_ops).unwrap();
     winner
         .apply_operations(&store, &b, bv, &second_ops)
         .unwrap();
     let mut loser = Transaction::new();
-    loser.apply_operations(&store, &a, av, &second_ops).unwrap();
+    loser.apply_operations(&store, &a, av, &first_ops).unwrap();
     winner.commit(&store).unwrap();
     assert!(loser.commit(&store).is_err());
     let page = watch.next_operations().await.unwrap().unwrap();
@@ -2113,7 +2134,7 @@ async fn merged_watch_retains_opt_in_document_batches_atomically_across_reopen()
         if address == &a {
             assert_eq!(
                 serde_json::json!(change.document.as_ref().unwrap().value),
-                serde_json::json!({"n":2,"text":"start🚀","items":[1,2]})
+                serde_json::json!({"n":2,"text":"start🚀","items":[1,2,{"text":"hello!","list":[3,2,1,0]}]})
             );
         }
     }

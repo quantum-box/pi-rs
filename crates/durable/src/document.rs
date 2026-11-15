@@ -91,8 +91,69 @@ struct StoredOperations {
     ops: Vec<Value>,
 }
 
-// A deliberately bounded subset of decoded upstream Chord ops. Object-only
-// paths avoid JS array index and UTF-16 truncation ambiguities.
+// Chord numbers are JavaScript numbers. Larger integer inputs cannot be
+// represented exactly, even if serde_json can hold them as u64.
+fn chord_index(value: &Value) -> Result<usize, Error> {
+    const MAX_SAFE: u64 = 9_007_199_254_740_991;
+    let number = if let Some(n) = value.as_u64() {
+        n
+    } else if let Some(n) = value.as_f64() {
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > MAX_SAFE as f64 {
+            return Err(Error::InvalidOperations);
+        }
+        n as u64
+    } else {
+        return Err(Error::InvalidOperations);
+    };
+    if number > MAX_SAFE {
+        return Err(Error::InvalidOperations);
+    }
+    usize::try_from(number).map_err(|_| Error::InvalidOperations)
+}
+
+fn path_segment(value: &Value) -> Result<String, Error> {
+    if let Some(key) = value.as_str() {
+        if matches!(key, "__proto__" | "constructor" | "prototype") {
+            return Err(Error::InvalidOperations);
+        }
+        Ok(key.to_owned())
+    } else {
+        Ok(chord_index(value)?.to_string())
+    }
+}
+
+fn resolve_path<'a>(mut value: &'a mut Value, path: &[Value]) -> Result<&'a mut Value, Error> {
+    for segment in path {
+        value = match value {
+            Value::Object(object) => object.get_mut(&path_segment(segment)?),
+            Value::Array(array) => array.get_mut(chord_index(segment)?),
+            _ => None,
+        }
+        .ok_or(Error::InvalidOperations)?;
+    }
+    Ok(value)
+}
+
+fn truncate_utf16(text: &mut String, offset: usize) -> Result<(), Error> {
+    let mut units = 0usize;
+    let mut byte = text.len();
+    for (index, ch) in text.char_indices() {
+        if units == offset {
+            byte = index;
+            break;
+        }
+        let next = units + ch.len_utf16();
+        if offset < next {
+            return Err(Error::InvalidOperations);
+        }
+        units = next;
+    }
+    text.replace_range(..byte, "");
+    Ok(())
+}
+
+// Apply decoded Chord operations with bounded work. We reject paths that would
+// produce sparse arrays and UTF-16 slices that would create lone surrogates.
 fn apply_operations(base: &Map<String, Value>, ops: &[Value]) -> Result<Map<String, Value>, Error> {
     if ops.is_empty()
         || ops.len() > 128
@@ -109,76 +170,115 @@ fn apply_operations(base: &Map<String, Value>, ops: &[Value]) -> Result<Map<Stri
             .and_then(Value::as_str)
             .ok_or(Error::InvalidOperations)?;
         if verb == "r" && tuple.len() == 2 {
-            if !tuple[1].is_object() {
+            root = tuple[1].clone();
+        } else {
+            let path = tuple
+                .get(1)
+                .and_then(Value::as_array)
+                .ok_or(Error::InvalidOperations)?;
+            if path.len() > 8 {
                 return Err(Error::InvalidOperations);
             }
-            root = tuple[1].clone();
-            continue;
+            // Validate even paths whose target will not be reached.
+            for segment in path {
+                path_segment(segment)?;
+            }
+            if matches!(verb, "p" | "m") {
+                let array = resolve_path(&mut root, path)?
+                    .as_array_mut()
+                    .ok_or(Error::InvalidOperations)?;
+                match (verb, tuple.len()) {
+                    ("p", 5) => {
+                        let start = chord_index(&tuple[2])?.min(array.len());
+                        let count = chord_index(&tuple[3])?.min(array.len() - start);
+                        let items = tuple[4].as_array().ok_or(Error::InvalidOperations)?;
+                        array.splice(start..start + count, items.iter().cloned());
+                    }
+                    ("m", 3) => {
+                        let permutation = tuple[2].as_array().ok_or(Error::InvalidOperations)?;
+                        if permutation.len() != array.len() {
+                            return Err(Error::InvalidOperations);
+                        }
+                        let mut seen = vec![false; array.len()];
+                        let mut reordered = Vec::with_capacity(array.len());
+                        for item in permutation {
+                            let index = chord_index(item)?;
+                            if index >= array.len() || seen[index] {
+                                return Err(Error::InvalidOperations);
+                            }
+                            seen[index] = true;
+                            reordered.push(array[index].clone());
+                        }
+                        *array = reordered;
+                    }
+                    _ => return Err(Error::InvalidOperations),
+                }
+            } else {
+                let (last, parents) = path.split_last().ok_or(Error::InvalidOperations)?;
+                let parent = resolve_path(&mut root, parents)?;
+                match parent {
+                    Value::Object(object) => {
+                        let key = path_segment(last)?;
+                        match (verb, tuple.len()) {
+                            ("s", 3) => {
+                                object.insert(key, tuple[2].clone());
+                            }
+                            ("d", 2) => {
+                                object.remove(&key);
+                            }
+                            ("a", 3) | ("t", 3) => {
+                                let Some(Value::String(text)) = object.get_mut(&key) else {
+                                    return Err(Error::InvalidOperations);
+                                };
+                                if verb == "a" {
+                                    text.push_str(
+                                        tuple[2].as_str().ok_or(Error::InvalidOperations)?,
+                                    );
+                                } else {
+                                    truncate_utf16(text, chord_index(&tuple[2])?)?;
+                                }
+                            }
+                            _ => return Err(Error::InvalidOperations),
+                        }
+                    }
+                    Value::Array(array) => {
+                        let index = chord_index(last)?;
+                        if index > array.len() {
+                            return Err(Error::InvalidOperations);
+                        }
+                        match (verb, tuple.len()) {
+                            ("s", 3) => {
+                                if index == array.len() {
+                                    array.push(tuple[2].clone());
+                                } else {
+                                    array[index] = tuple[2].clone();
+                                }
+                            }
+                            ("d", 2) if index < array.len() => {
+                                array.remove(index);
+                            }
+                            ("a", 3) | ("t", 3) if index < array.len() => {
+                                let Some(Value::String(text)) = array.get_mut(index) else {
+                                    return Err(Error::InvalidOperations);
+                                };
+                                if verb == "a" {
+                                    text.push_str(
+                                        tuple[2].as_str().ok_or(Error::InvalidOperations)?,
+                                    );
+                                } else {
+                                    truncate_utf16(text, chord_index(&tuple[2])?)?;
+                                }
+                            }
+                            _ => return Err(Error::InvalidOperations),
+                        }
+                    }
+                    _ => return Err(Error::InvalidOperations),
+                }
+            }
         }
-        let path = tuple
-            .get(1)
-            .and_then(Value::as_array)
-            .ok_or(Error::InvalidOperations)?;
-        if path.is_empty() || path.len() > 8 {
+        if serde_json::to_vec(&root)?.len() > 2_097_152 {
             return Err(Error::InvalidOperations);
         }
-        let mut parent = &mut root;
-        for segment in &path[..path.len() - 1] {
-            let key = segment
-                .as_str()
-                .filter(|s| !matches!(*s, "__proto__" | "constructor" | "prototype"))
-                .ok_or(Error::InvalidOperations)?;
-            parent = parent
-                .as_object_mut()
-                .and_then(|o| o.get_mut(key))
-                .ok_or(Error::InvalidOperations)?;
-        }
-        let key = path
-            .last()
-            .and_then(Value::as_str)
-            .filter(|s| !matches!(*s, "__proto__" | "constructor" | "prototype"))
-            .ok_or(Error::InvalidOperations)?;
-        let object = parent.as_object_mut().ok_or(Error::InvalidOperations)?;
-        match (verb, tuple.len()) {
-            ("s", 3) => {
-                object.insert(key.into(), tuple[2].clone());
-            }
-            ("d", 2) => {
-                object.remove(key);
-            }
-            ("a", 3) => {
-                let suffix = tuple[2].as_str().ok_or(Error::InvalidOperations)?;
-                let Value::String(text) = object.get_mut(key).ok_or(Error::InvalidOperations)?
-                else {
-                    return Err(Error::InvalidOperations);
-                };
-                text.push_str(suffix);
-            }
-            ("p", 5) => {
-                let start = tuple[2]
-                    .as_u64()
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or(Error::InvalidOperations)?;
-                let count = tuple[3]
-                    .as_u64()
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or(Error::InvalidOperations)?;
-                let items = tuple[4].as_array().ok_or(Error::InvalidOperations)?;
-                let array = object
-                    .get_mut(key)
-                    .and_then(Value::as_array_mut)
-                    .ok_or(Error::InvalidOperations)?;
-                let end = start
-                    .checked_add(count)
-                    .filter(|end| *end <= array.len())
-                    .ok_or(Error::InvalidOperations)?;
-                array.splice(start..end, items.iter().cloned());
-            }
-            _ => return Err(Error::InvalidOperations),
-        }
-    }
-    if serde_json::to_vec(&root)?.len() > 2_097_152 {
-        return Err(Error::InvalidOperations);
     }
     root.as_object().cloned().ok_or(Error::InvalidOperations)
 }
@@ -2117,5 +2217,62 @@ mod fork_current_tests {
             docs.fork_policy(&copied).unwrap().unwrap().policy,
             ForkPolicy::Copy
         );
+    }
+}
+
+#[cfg(test)]
+mod chord_application_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn nested_arrays_unicode_and_splice_match_chord() {
+        let base = json!({"rows":[{"v":["a😀z", 1, 2]}], "0":"number key"});
+        let ops = vec![
+            json!(["t", ["rows", 0, "v", 0], 3]),
+            json!(["a", ["rows", 0, "v", 0], "!"]),
+            json!(["s", ["rows", 0, "v", 3], 4]),
+            json!(["d", ["rows", 0, "v", 1]]),
+            json!(["p", ["rows", 0, "v"], 99, 99, [5]]),
+            json!(["m", ["rows", 0, "v"], [3, 2, 1, 0]]),
+            json!(["s", [0], "number segment"]),
+        ];
+        assert_eq!(
+            Value::Object(apply_operations(base.as_object().unwrap(), &ops).unwrap()),
+            json!({"rows":[{"v":[5,4,2,"z!"]}],"0":"number segment"})
+        );
+        let clamp = vec![json!(["p", ["rows", 0, "v"], 1, 99, []])];
+        assert_eq!(
+            apply_operations(base.as_object().unwrap(), &clamp).unwrap()["rows"][0]["v"],
+            json!(["a😀z"])
+        );
+        let root = vec![
+            json!(["r", [1, 2]]),
+            json!(["p", [], 1, 0, [3]]),
+            json!(["m", [], [2, 1, 0]]),
+            json!(["r",{"ok":true}]),
+        ];
+        assert_eq!(
+            apply_operations(base.as_object().unwrap(), &root).unwrap()["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn rejects_surrogate_splits_sparse_arrays_unsafe_paths_and_bad_permutations() {
+        let base = json!({"a":["😀z",1]});
+        for op in [
+            json!(["t", ["a", 0], 1]),
+            json!(["s", ["a", 3], 0]),
+            json!(["s", ["a", "0"], 0]),
+            json!(["s", ["__proto__"], 0]),
+            json!(["m", ["a"], [0, 0]]),
+            json!(["p", ["a"], 9007199254740992u64, 0, []]),
+        ] {
+            assert!(apply_operations(base.as_object().unwrap(), &[op]).is_err());
+        }
+        let result =
+            apply_operations(base.as_object().unwrap(), &[json!(["t", ["a", 0], 99])]).unwrap();
+        assert_eq!(result["a"][0], "");
     }
 }

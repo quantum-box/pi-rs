@@ -298,10 +298,13 @@ returns it with `MergedDocumentOperations::actual == true` only after verifying
 its commit and result against the predecessor. Existing writes, creations,
 deletions, missing or invalid evidence use the prior derived/replacement or
 retirement behavior and report `actual == false`; no old batches are backfilled.
-This bounded subset accepts decoded `r`, `s`, `d`, `a`, and `p` operations on
-object paths, with at most 128 operations, eight path segments, 1 MiB of batch
-JSON, and a 2 MiB document. Array index paths, string truncation, permutation,
-and wire-compressed operations are unsupported. Operation evidence is retained
+This bounded subset accepts decoded `r`, `s`, `d`, `a`, `t`, `p`, and `m`
+operations over nested object and array paths, with at most 128 operations,
+eight path segments, 1 MiB of batch JSON, and a 2 MiB intermediate value.
+String truncation uses upstream's UTF-16 code-unit offsets; cuts that would
+produce an unpaired surrogate are rejected. Sparse array writes, unsafe path
+segments, numbers outside JavaScript's safe integer range, and wire-compressed
+operations are rejected. Operation evidence is retained
 as immutable store data; it is not garbage collected. Observation and record
 sizes remain subject to the existing merged-watch limits. Conversion errors do
 not advance the watch cursor.
