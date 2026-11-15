@@ -10482,9 +10482,11 @@ exit {exit}
         let mut theme = super::Theme::system();
         let original = theme.color("accent");
         assert!(matches!(original, Color::Rgb { .. }));
-        let mut colors = super::ColorQueries::default();
         // The terminal's dark background can differ from its light OS appearance.
-        colors.last_appearance_report = Some(false);
+        let mut colors = super::ColorQueries {
+            last_appearance_report: Some(false),
+            ..Default::default()
+        };
         colors.disable_after_handoff();
         let (_, redraw) =
             super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut std::io::sink())
