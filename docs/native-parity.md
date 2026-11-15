@@ -1682,6 +1682,10 @@ results in both terminal modes. Image normalization shares the local read
 implementation, preserves alpha and avoids upscaling. Kitty uploads are reused
 on redraw and resize. Fullscreen exit releases owned images, while regular
 mode retains them in scrollback. Unsupported terminals retain text notices.
+Empty terminal-identification environment variables do not enable image
+protocols or imply an active tmux session, matching Pi's detection behavior.
+`PI_IMAGE_PROTOCOL` is case-insensitive, and `TERM=xterm-kitty` alone does not
+override another terminal's image protocol.
 
 A PTY fixture verifies both protocols, user and tool images, cached redraw,
 cleanup and terminal restoration. Protocol bytes were checked without a GUI
