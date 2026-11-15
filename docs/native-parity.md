@@ -4814,3 +4814,9 @@ The SDK model catalog can enumerate its host-registered provider/model identitie
 in deterministic order for host model pickers. This lists the immutable catalog
 snapshot, not Pi's discovered model registry or a live credential availability
 check. The host remains responsible for rebuilding it when authorization changes.
+
+### Explicit skill file diagnostics checkpoint
+
+Explicit skill files must end in `.md`; other files produce a diagnostic while
+the remaining skills continue loading. The check uses the supplied filename
+before following symlinks, matching Pi.
