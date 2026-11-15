@@ -1006,8 +1006,8 @@ local `grep` also accepts match limits above 100,000. Context searches spool
 match positions and accounting records to temporary storage, keeping output
 and match bookkeeping memory bounded while counting every selected result.
 Temporary-storage failures are reported as I/O errors. Scoped tools retain
-their 100,000-match ceiling. The accepted limit remains a positive integer
-representable by the host, while Pi's schema accepts numbers.
+their 100,000-match ceiling. Unrestricted local grep accepts numeric limits,
+clamps them to at least one and uses Pi's numeric comparison and notices.
 
 ### Model-selection checkpoint
 
