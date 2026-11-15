@@ -508,8 +508,13 @@ Current limits and differences from upstream Pi Durable:
   commits the receipt, wake reason, task and document writes. Consumption of an
   existing receipt also advances its signal-revision fence. An abort, competing
   delivery or deadline conflict rolls all back. Ambiguous duplicate records and
-  consumed wait keys fail closed. Time-only/expiration wakes, arbitrary task
-  writes and raw signal-namespace writes remain excluded. After staging the
+  consumed wait keys fail closed. `wake_at(task_id, now_millis)` also supports
+  deadline wakes for typed sleeps: an available value wins, otherwise at or
+  after the deadline it atomically expires missing keys (or records a time-only
+  wake for an empty key list). A not-yet-due wait returns an error without
+  staging changes. The supplied time must use the scheduler's clock; this API
+  does not create a timer. Arbitrary task writes and raw signal-namespace writes
+  remain excluded. After staging the
   wake, further signals to that target are rejected. Callers retry the entire transaction with a fresh
   clock after conflicts. Unlike upstream `Tx`, sequential signal calls remain
   allowed after a staged delivery; the explicit atomic wake is a pi-rs API, not

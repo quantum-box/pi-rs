@@ -1244,6 +1244,15 @@ impl<'a> HostTransaction<'a> {
     /// available key in wait order. The transition and consumption are atomic.
     /// This does not perform time-only or deadline-expiration wakes.
     pub fn wake_with_signal(&mut self, task_id: uuid::Uuid) -> Result<(), Error> {
+        self.prepare_wake(task_id, None)
+    }
+    /// Wake a typed sleep using the supplied scheduler clock. Available signals
+    /// take precedence; otherwise the deadline is due at `now_millis >= until`.
+    /// A not-yet-due wait returns an error without modifying the transaction.
+    pub fn wake_at(&mut self, task_id: uuid::Uuid, now_millis: i64) -> Result<(), Error> {
+        self.prepare_wake(task_id, Some(now_millis))
+    }
+    fn prepare_wake(&mut self, task_id: uuid::Uuid, now_millis: Option<i64>) -> Result<(), Error> {
         let target = crate::task_store::key(task_id);
         if self.transaction.written.contains(&target) {
             return Err(Error::SignalComposition);
@@ -1254,8 +1263,11 @@ impl<'a> HostTransaction<'a> {
             checks: self.signals.batch.checks.clone(),
             mutations: self.signals.batch.mutations.clone(),
         };
-        let mut graph = crate::task_store::TaskStore::new(self.store)
-            .prepare_staged_signal_wake(task_id, &mut signals)?;
+        let mut graph = crate::task_store::TaskStore::new(self.store).prepare_staged_signal_wake(
+            task_id,
+            &mut signals,
+            now_millis,
+        )?;
         let mut transaction = Transaction {
             checks: self.transaction.checks.clone(),
             mutations: self.transaction.mutations.clone(),

@@ -846,16 +846,20 @@ impl<'a> TaskStore<'a> {
         &self,
         task_id: Uuid,
         signals: &mut OwnedBatch,
+        now_millis: Option<i64>,
     ) -> Result<OwnedBatch, Error> {
         let snapshot = self.load(task_id)?.ok_or(Error::SignalTargetNotFound)?;
         if snapshot.task.abort_requested() || snapshot.task.is_terminal() {
             return Err(Error::SignalTargetClosed);
         }
-        let (keys, typed_sleep) = match snapshot.task.state() {
-            TaskState::Waiting(WaitFor::TypedSignal(key)) => (std::slice::from_ref(key), false),
-            TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) if !signals.is_empty() => {
-                (signals.as_slice(), true)
+        let (keys, typed_sleep, deadline) = match snapshot.task.state() {
+            TaskState::Waiting(WaitFor::TypedSignal(key)) => {
+                (std::slice::from_ref(key), false, None)
             }
+            TaskState::Waiting(WaitFor::TypedSleep {
+                signals,
+                until_millis,
+            }) => (signals.as_slice(), true, *until_millis),
             _ => return Err(Error::InvalidOwnedBatch),
         };
         let revision_key = signal_revision_key(task_id);
@@ -900,54 +904,104 @@ impl<'a> TaskStore<'a> {
                 return Err(Error::SignalKeyMismatch);
             }
         }
-        let selected = keys
-            .iter()
-            .find_map(|key| {
-                candidates.iter().position(|(_, _, _, signal)| {
-                    !signal.expired && signal.typed_key() == Some(key)
-                })
-            })
-            .ok_or(Error::InvalidOwnedBatch)?;
-        let (index, stored_key, version, mut signal) = candidates.swap_remove(selected);
-        let selected_key = signal.typed_key().ok_or(Error::InvalidOwnedBatch)?.clone();
+        let selected = keys.iter().find_map(|key| {
+            candidates
+                .iter()
+                .position(|(_, _, _, signal)| !signal.expired && signal.typed_key() == Some(key))
+        });
+        let deadline_due = typed_sleep
+            && deadline
+                .zip(now_millis)
+                .is_some_and(|(deadline, now)| now >= deadline);
+        if selected.is_none() && !deadline_due {
+            return Err(Error::InvalidOwnedBatch);
+        }
         let mut next = snapshot.clone();
-        next.task
-            .wake_with_signal(signal.id)
-            .map_err(Error::Transition)?;
-        if typed_sleep {
+        if let Some(index) = selected {
+            let signal = &candidates[index].3;
             next.task
-                .set_typed_wake(crate::task::TypedWake::Signal(selected_key));
+                .wake_with_signal(signal.id)
+                .map_err(Error::Transition)?;
+            if typed_sleep {
+                next.task.set_typed_wake(crate::task::TypedWake::Signal(
+                    signal.typed_key().ok_or(Error::InvalidOwnedBatch)?.clone(),
+                ));
+            }
+        } else {
+            next.task.wake().map_err(Error::Transition)?;
+            next.task.set_typed_wake(if keys.is_empty() {
+                crate::task::TypedWake::Time
+            } else {
+                crate::task::TypedWake::Expired
+            });
         }
         let mut batch = self.prepare_save(&[Save::Update(&next)])?;
         batch.checks.push(Check {
             key: revision_key.clone(),
             expected: revision.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
         });
-        signal.consumed = true;
-        let value = serde_json::to_vec(&signal)?;
-        if let Some(index) = index {
-            if let Mutation::Put { value: staged, .. } = &mut signals.mutations[index] {
-                *staged = value;
+        let mut signal_changed = false;
+        if let Some(selected) = selected {
+            let (index, stored_key, version, mut signal) = candidates.swap_remove(selected);
+            signal.consumed = true;
+            let value = serde_json::to_vec(&signal)?;
+            if let Some(index) = index {
+                if let Mutation::Put { value: staged, .. } = &mut signals.mutations[index] {
+                    *staged = value;
+                }
+            } else {
+                batch.checks.push(Check {
+                    key: stored_key.clone(),
+                    expected: Expected::Version(version.ok_or(Error::InvalidOwnedBatch)?),
+                });
+                batch.mutations.push(Mutation::Put {
+                    key: stored_key,
+                    value,
+                });
+                signal_changed = true;
             }
         } else {
-            batch.checks.push(Check {
-                key: stored_key.clone(),
-                expected: Expected::Version(version.ok_or(Error::InvalidOwnedBatch)?),
-            });
-            batch.mutations.push(Mutation::Put {
-                key: stored_key,
-                value,
-            });
-            // Consumption is also a signal-state change. Reuse the staged bump
-            // if present; otherwise add one under the revision fence.
-            if !signals.mutations.iter().any(
-                |mutation| matches!(mutation, Mutation::Put { key, .. } if *key == revision_key),
-            ) {
-                batch.mutations.push(Mutation::Put {
-                    key: revision_key,
-                    value: vec![],
+            for key in keys {
+                if candidates
+                    .iter()
+                    .any(|(_, _, _, signal)| signal.typed_key() == Some(key))
+                {
+                    continue;
+                }
+                let id = Uuid::new_v4();
+                let signal = Signal {
+                    id,
+                    task_id,
+                    name: key.signal.clone(),
+                    payload: Value::Null,
+                    consumed: false,
+                    expired: true,
+                    typed: Some(TypedSignal {
+                        key: key.clone(),
+                        version: 1,
+                    }),
+                };
+                let stored_key = signal_key(task_id, id);
+                batch.checks.push(Check {
+                    key: stored_key.clone(),
+                    expected: Expected::Missing,
                 });
+                batch.mutations.push(Mutation::Put {
+                    key: stored_key,
+                    value: serde_json::to_vec(&signal)?,
+                });
+                signal_changed = true;
             }
+        }
+        if signal_changed
+            && !signals.mutations.iter().any(
+                |mutation| matches!(mutation, Mutation::Put { key, .. } if *key == revision_key),
+            )
+        {
+            batch.mutations.push(Mutation::Put {
+                key: revision_key,
+                value: vec![],
+            });
         }
         Ok(batch)
     }

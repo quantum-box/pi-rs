@@ -172,7 +172,7 @@ fn commit_reopen_and_wake() {
 fn competing_delivery_rolls_back_then_replays_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    setup(&path, Some(100));
+    setup(&path, Some(60_000));
     let results = Arc::new(Mutex::new(vec![]));
     let mut s = Scheduler::open(&path, registry(&path, 1, results.clone())).unwrap();
     s.submit(&task(1, "sender")).unwrap();
@@ -212,7 +212,7 @@ fn competing_delivery_rolls_back_then_replays_duplicate() {
 fn closing_target_rolls_back_then_replays_closed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    setup(&path, Some(100));
+    setup(&path, Some(60_000));
     let results = Arc::new(Mutex::new(vec![]));
     let mut s = Scheduler::open(&path, registry(&path, 2, results.clone())).unwrap();
     s.submit(&task(1, "sender")).unwrap();
