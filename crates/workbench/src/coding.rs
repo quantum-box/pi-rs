@@ -3634,6 +3634,7 @@ mod tests {
         }
         impl BufRead for CancelOnRead {
             fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.token.cancel();
                 self.data.fill_buf()
             }
             fn consume(&mut self, amount: usize) {
