@@ -51,3 +51,27 @@ fn fallback_description_truncates_in_utf16_units() {
     let templates = TemplateReadGrants { files: vec![file] }.load().unwrap();
     assert_eq!(templates[0].description, format!("{}...", "a".repeat(60)));
 }
+
+#[test]
+fn invalid_utf8_and_oversized_template_fail() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("test.md");
+    let grants = TemplateReadGrants {
+        files: vec![path.clone()],
+    };
+    std::fs::write(&path, [0xff]).unwrap();
+    assert!(grants.load().is_err());
+    std::fs::write(&path, vec![b'x'; 256 * 1024 + 1]).unwrap();
+    assert!(grants.load().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_template_is_rejected_without_waiting_for_a_writer() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("pipe.md");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    assert!(TemplateReadGrants { files: vec![path] }.load().is_err());
+}
