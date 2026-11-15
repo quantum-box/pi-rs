@@ -323,7 +323,7 @@ mod tests {
         let image = json!({"type":"image","data":"aGk=","mimeType":"image/png","detail":"high"});
         let p = processor(Ok(Some(prepared("aGk=", "image/png"))));
         assert_eq!(
-            fit_images(&[image.clone()], ImageLimits::default(), &p)
+            fit_images(std::slice::from_ref(&image), ImageLimits::default(), &p)
                 .await
                 .unwrap(),
             FittedImages::Unchanged
