@@ -6,6 +6,39 @@ use serde_json::{Value, json};
 #[error("{0}")]
 pub struct StrictSchemaError(String);
 
+/// Whether strict tool sampling may fall back to ordinary tool calling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictToolPolicy {
+    /// Use strict mode only when the provider and schema support it.
+    Prefer,
+    /// Fail rather than send an unconstrained tool.
+    Require,
+}
+
+/// Resolve a strict schema for a tool, applying its fallback policy.
+pub fn resolve_strict_tool_schema(
+    name: &str,
+    schema: &Value,
+    policy: StrictToolPolicy,
+    supported: bool,
+    unsupported: impl Fn(&str, &Value) -> bool,
+) -> Result<Option<Value>, StrictSchemaError> {
+    let failure = if supported {
+        match strict_tool_schema(schema, unsupported) {
+            Ok(schema) => return Ok(Some(schema)),
+            Err(error) => error.0,
+        }
+    } else {
+        "strict tools are unsupported".into()
+    };
+    match policy {
+        StrictToolPolicy::Prefer => Ok(None),
+        StrictToolPolicy::Require => Err(StrictSchemaError(format!(
+            "Tool \"{name}\" requires JSON-schema constrained sampling, but {failure}."
+        ))),
+    }
+}
+
 /// Clone a tool schema and make object properties required and closed.
 ///
 /// Optional properties are made nullable. `unsupported` checks additional
@@ -211,6 +244,44 @@ fn make_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_policy_falls_back_only_when_preferred() {
+        let schema = json!({"type":"object","properties":{"x":{"$ref":"#/x"}}});
+        for supported in [false, true] {
+            assert_eq!(
+                resolve_strict_tool_schema(
+                    "tool",
+                    &schema,
+                    StrictToolPolicy::Prefer,
+                    supported,
+                    |_, _| false
+                )
+                .unwrap(),
+                None
+            );
+            assert!(
+                resolve_strict_tool_schema(
+                    "tool",
+                    &schema,
+                    StrictToolPolicy::Require,
+                    supported,
+                    |_, _| false
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Tool \"tool\" requires JSON-schema constrained sampling")
+            );
+        }
+        let valid = json!({"type":"object","properties":{"x":{"type":"string"}}});
+        for policy in [StrictToolPolicy::Prefer, StrictToolPolicy::Require] {
+            assert!(
+                resolve_strict_tool_schema("tool", &valid, policy, true, |_, _| false)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
 
     #[test]
     fn converts_nested_objects_and_preserves_original() {
