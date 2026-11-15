@@ -29,7 +29,10 @@ impl ModelClientFactory {
     /// Construct a client for an exact registered provider and endpoint.
     /// The host must authorize the endpoint and manage the lifetime of any
     /// returned client. Replacing a snapshot does not revoke existing clients.
-    /// Native adapter defaults disable redirects and implicit proxy discovery.
+    /// Responses and Messages endpoints are complete request URLs; Gemini uses
+    /// an API base URL and appends its model-specific streaming path. Granting a
+    /// Gemini base authorizes those derived paths. Model discovery probes,
+    /// redirects, and implicit proxy discovery are disabled.
     pub fn client(
         &self,
         api: NativeModelApi,
@@ -58,15 +61,18 @@ impl ModelClientFactory {
             }
             (NativeModelApi::AnthropicMessages, HostCredentialKind::ApiKey) => Ok(Arc::new(
                 pi_rs::anthropic::Anthropic::new(endpoint, credential.secret())?
-                    .with_provider(provider, endpoint),
+                    .with_provider(provider, endpoint)
+                    .with_context_probe(false),
             )),
             (NativeModelApi::AnthropicMessages, HostCredentialKind::Bearer) => Ok(Arc::new(
                 pi_rs::anthropic::Anthropic::with_bearer_token(endpoint, credential.secret())?
-                    .with_provider(provider, endpoint),
+                    .with_provider(provider, endpoint)
+                    .with_context_probe(false),
             )),
             (NativeModelApi::GoogleGemini, HostCredentialKind::ApiKey) => Ok(Arc::new(
                 pi_rs::google::Google::new(endpoint, credential.secret())?
-                    .with_provider(provider, endpoint),
+                    .with_provider(provider, endpoint)
+                    .with_context_probe(false),
             )),
             _ => Err(Error::Config(
                 "credential kind is not supported for this model API".into(),

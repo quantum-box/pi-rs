@@ -955,7 +955,8 @@ Native SDK hosts can construct OpenAI Responses, ChatGPT Responses, Anthropic
 Messages and Gemini clients from an explicitly supplied credential snapshot,
 provider identity and endpoint, then register them in a host-owned model catalog.
 The factory does not perform implicit credential or model discovery, OAuth
-refresh, proxy discovery, or network I/O at construction. Hosts own endpoint
+refresh, proxy discovery, model metadata probes, or network I/O at construction. Gemini
+uses a base URL and appends model-specific streaming paths. Hosts own endpoint
 policy and existing clients outlive replacement of the credential snapshot.
 
 
