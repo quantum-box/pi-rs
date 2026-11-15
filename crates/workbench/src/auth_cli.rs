@@ -141,7 +141,14 @@ async fn resolve(
         if wanted.is_some_and(|wanted| wanted != kind) {
             return Ok(None);
         }
-        let value = if matches!(credential, super::model_auth::Credential::ChatGpt) {
+        let value = if matches!(credential, super::model_auth::Credential::AnthropicOAuth) {
+            super::anthropic_auth::access(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
+        } else if matches!(credential, super::model_auth::Credential::ChatGpt) {
             super::chatgpt_auth::access_options(
                 &args.settings,
                 (wanted == Some(AuthType::OAuth)).then_some(minimum),

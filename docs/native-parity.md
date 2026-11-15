@@ -4381,6 +4381,17 @@ capabilities without an additional Models API probe.
 
 ### Native Anthropic authorization header checkpoint
 
+Pi-compatible Anthropic subscription credentials already present in
+`auth.json` are bound to the official Messages endpoint and refreshed under
+the auth lock. OAuth requests use Pi's subscription headers, identity and
+tool-name mapping. To avoid ambiguous dispatch, native rejects tool names
+that differ only in case. Interactive Anthropic OAuth login and live
+subscription acceptance remain open.
+Opaque Anthropic replay is shared between API-key and OAuth authentication
+at the official endpoint, while custom endpoints use separate replay scopes;
+legacy custom-endpoint replay without a matching scope falls back to the
+ordinary message and tool-call representation.
+
 The standard Anthropic Messages endpoint accepts an explicitly supplied
 `ANTHROPIC_AUTH_TOKEN` as an Authorization bearer credential. Stored and
 configured keys retain precedence. The header token takes priority over

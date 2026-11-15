@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod anthropic_auth;
 mod attachments;
 mod auth_cli;
 mod auth_lock;

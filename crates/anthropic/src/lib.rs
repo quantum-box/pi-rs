@@ -66,6 +66,7 @@ pub struct Anthropic {
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
     auth: (HeaderName, HeaderValue),
+    oauth: bool,
     provider: Arc<str>,
     replay_scope: Arc<str>,
     headers: HeaderMap,
@@ -95,6 +96,25 @@ impl Anthropic {
             ));
         }
         Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
+    }
+
+    /// Connect using Anthropic subscription OAuth credentials.
+    pub fn with_oauth_token(endpoint: &str, token: &str) -> Result<Self> {
+        let mut client = Self::with_bearer_token(endpoint, token)?;
+        let official = client.endpoint.as_str() == DEFAULT_ENDPOINT;
+        let test_loopback = cfg!(test)
+            && client.endpoint.scheme() == "http"
+            && matches!(
+                client.endpoint.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]")
+            );
+        if !official && !test_loopback {
+            return Err(Error::Config(
+                "Anthropic OAuth requires the official endpoint".into(),
+            ));
+        }
+        client.oauth = true;
+        Ok(client)
     }
 
     fn connect(endpoint: &str, name: HeaderName, credential: &str) -> Result<Self> {
@@ -127,13 +147,19 @@ impl Anthropic {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| Error::Config("could not build Anthropic HTTP client".into()))?;
+        let replay_scope: Arc<str> = if endpoint.as_str() == DEFAULT_ENDPOINT {
+            Arc::from("anthropic")
+        } else {
+            pi_rs_core::endpoint_replay_scope("anthropic", endpoint.as_str()).into()
+        };
         Ok(Self {
             client,
             http_proxies: Vec::new(),
             endpoint,
             auth: (name, value),
+            oauth: false,
             provider: Arc::from("anthropic"),
-            replay_scope: Arc::from("anthropic"),
+            replay_scope,
             headers: HeaderMap::new(),
             catalog: Default::default(),
             probe_context: true,
@@ -340,10 +366,24 @@ impl Anthropic {
     }
 
     fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request
+        let request = request
             .header("anthropic-version", API_VERSION)
-            .header(self.auth.0.clone(), self.auth.1.clone())
-            .headers(self.headers.clone())
+            .header(self.auth.0.clone(), self.auth.1.clone());
+        let request = if self.oauth {
+            let request = request
+                .header("accept", "application/json")
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("user-agent", "claude-cli/2.1.280")
+                .header("x-app", "cli");
+            if self.headers.contains_key("anthropic-beta") {
+                request
+            } else {
+                request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            }
+        } else {
+            request
+        };
+        request.headers(self.headers.clone())
     }
 
     /// Return paginated models in server order and retain their metadata for this client.
@@ -859,6 +899,69 @@ fn apply_cache_control(body: &mut Value, retention: CacheRetention, cache_tools:
     }
 }
 
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+fn oauth_tool_name(name: &str) -> &str {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .unwrap_or(name)
+}
+
+fn prepare_oauth_request(body: &mut Value, retention: CacheRetention) {
+    let mut identity =
+        json!({"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."});
+    if let Some(control) = retention.anthropic_control() {
+        identity["cache_control"] = control;
+    }
+    let mut system = vec![identity];
+    match body.get_mut("system").map(Value::take) {
+        Some(Value::String(text)) => system.push(json!({"type":"text","text":text})),
+        Some(Value::Array(blocks)) => system.extend(blocks),
+        _ => {}
+    }
+    body["system"] = Value::Array(system);
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            if let Some(name) = tool["name"].as_str() {
+                tool["name"] = json!(oauth_tool_name(name));
+            }
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(blocks) = message["content"].as_array_mut() {
+                for block in blocks {
+                    if block["type"] == "tool_use"
+                        && let Some(name) = block["name"].as_str()
+                    {
+                        block["name"] = json!(oauth_tool_name(name));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn text_block(content: String) -> Option<Value> {
     (!content.is_empty()).then(|| json!({"type":"text","text":content}))
 }
@@ -1221,6 +1324,22 @@ impl Model for Anthropic {
             provider.as_ref() == "openrouter" || self.endpoint.host_str() == Some("openrouter.ai");
         let replay_scope = self.replay_scope.clone();
         let edited_scope = pi_rs_core::endpoint_replay_scope(&replay_scope, self.endpoint.as_str());
+        let oauth_tool_names: Vec<String> = if self.oauth {
+            let names: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
+            for (index, name) in names.iter().enumerate() {
+                if names[..index]
+                    .iter()
+                    .any(|other| other.eq_ignore_ascii_case(name))
+                {
+                    return Err(Error::Config(
+                        "Anthropic OAuth tool names must be unique ignoring case".into(),
+                    ));
+                }
+            }
+            names
+        } else {
+            Vec::new()
+        };
         let mut body = encode_request(
             request,
             &replay_scope,
@@ -1228,6 +1347,9 @@ impl Model for Anthropic {
             self.allow_empty_signature,
         )?;
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
+        if self.oauth {
+            prepare_oauth_request(&mut body, self.cache_retention);
+        }
         if let Some(level) = self.thinking_level.as_deref() {
             configure_thinking(
                 &mut body,
@@ -1325,12 +1447,15 @@ impl Model for Anthropic {
                         }
                         if block["type"] == "tool_use" {
                             let id = required(&block["id"], "tool ID")?;
-                            let name = required(&block["name"], "tool name")?;
+                            let wire_name = required(&block["name"], "tool name")?;
+                            let name = oauth_tool_names.iter().find(|name| name.eq_ignore_ascii_case(wire_name)).map_or(wire_name, String::as_str);
                             if calls.len() >= 64 {
                                 Err(Error::Model("too many Anthropic tool calls".into()))?;
                             }
+                            let mut raw = block.clone();
+                            raw["name"] = json!(name);
                             calls.insert(index, Call {
-                                id: id.into(), name: name.into(), raw: block.clone(),
+                                id: id.into(), name: name.into(), raw,
                                 fragments: String::new(), complete: false,
                             });
                             report(Progress::PreparingTool);
@@ -1523,6 +1648,164 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oauth_and_api_key_replay_share_only_the_official_endpoint() {
+        let oauth = Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret").unwrap();
+        let api_key = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let custom = Anthropic::new("https://other.example/v1/messages", "key").unwrap();
+        assert_eq!(oauth.replay_scope, api_key.replay_scope);
+        assert_ne!(oauth.replay_scope, custom.replay_scope);
+        let request = ModelRequest {
+            model: "claude".into(),
+            tools: vec![],
+            max_output_tokens: 16,
+            messages: vec![Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: oauth.replay_scope.to_string(),
+                        model: "claude".into(),
+                    },
+                    blocks: vec![
+                        json!({"type":"thinking","thinking":"secret","signature":"signed"}),
+                        json!({"type":"text","text":"answer"}),
+                    ],
+                })),
+            }],
+        };
+        let same = encode_request(request.clone(), &api_key.replay_scope, "", false).unwrap();
+        let other = encode_request(request, &custom.replay_scope, "", false).unwrap();
+        assert!(same.to_string().contains("secret"));
+        assert!(!other.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn oauth_credentials_are_rejected_for_untrusted_endpoints() {
+        assert!(
+            Anthropic::with_oauth_token("https://example.com/v1/messages", "sk-ant-oat-secret")
+                .is_err()
+        );
+        assert!(Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret").is_ok());
+    }
+
+    #[tokio::test]
+    async fn oauth_rejects_ambiguous_tool_names_before_network() {
+        let model = Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret")
+            .unwrap()
+            .with_context_probe(false);
+        let spec = |name: &str| pi_rs_core::ToolSpec {
+            name: name.into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![spec("read"), spec("Read")],
+            max_output_tokens: 16,
+        };
+        assert!(model.stream(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn oauth_round_trip_uses_canonical_wire_names_and_restores_local_tool() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let n = socket.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..pos]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|n| n.parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= pos + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let pos = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let headers = String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer fixture-oauth"));
+            assert!(headers.contains("anthropic-beta: claude-code-20250219,oauth-2025-04-20"));
+            let body: Value = serde_json::from_slice(&request[pos + 4..]).unwrap();
+            assert_eq!(body["tools"][0]["name"], "Read");
+            assert_eq!(
+                body["system"][0]["text"],
+                "You are Claude Code, Anthropic's official CLI for Claude."
+            );
+            let events = [
+                json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"Read","input":{}}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+                json!({"type":"message_stop"}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model =
+            Anthropic::with_oauth_token(&format!("http://{address}/v1/messages"), "fixture-oauth")
+                .unwrap()
+                .with_context_probe(false);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![pi_rs_core::ToolSpec {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            max_output_tokens: 16,
+        };
+        let mut stream = model.stream(request).await.unwrap();
+        let mut observed = false;
+        while let Some(event) = stream.next().await {
+            if let ModelEvent::Complete { calls, .. } = event.unwrap() {
+                assert_eq!(calls[0].name, "read");
+                observed = true;
+            }
+        }
+        assert!(observed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn oauth_request_adds_identity_and_maps_tool_names() {
+        let mut body = json!({"system":"project instructions", "tools":[{"name":"read"},{"name":"custom"}], "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"one","name":"read","input":{}}]}]});
+        super::prepare_oauth_request(&mut body, pi_rs_core::CacheRetention::None);
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"][1]["text"], "project instructions");
+        assert_eq!(body["tools"][0]["name"], "Read");
+        assert_eq!(body["tools"][1]["name"], "custom");
+        assert_eq!(body["messages"][0]["content"][0]["name"], "Read");
+    }
+
     #[tokio::test]
     async fn fallback_is_only_allowed_before_output_blocks() {
         use std::io::{Read, Write};
