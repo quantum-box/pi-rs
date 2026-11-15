@@ -429,9 +429,16 @@ Before claiming a resumed unsafe attempt, the runtime leases the parent and all
 child identities through handler execution and the checked result commit.
 An identity mismatch at claim blocks for reconciliation. A temporarily busy
 identity releases the conversation worker lock and retries on a bounded timer;
-abort and shutdown can proceed while it waits. For an initially busy unsafe
-invocation the persisted attempt records that its handler has not started; the
-marker is cleared before dispatch, after which a crash remains uncertain.
+abort and shutdown can proceed while it waits. For a registered unsafe tool,
+the lease is acquired and the host identity, specification, version and policy
+are persisted before argument preparation and before-tool hooks. The same tool
+allocation remains leased through dispatch and the checked result commit. A
+previous experimental busy-attempt marker without a preparation identity cannot
+prove which definition prepared its arguments and requires reconciliation.
+On resume, the parent and all child allocations are pinned from claim through
+the checked result commit, even if the extension registry is replaced.
+Older executors do not enforce these new preparation proofs and must not resume
+records written by this implementation.
 The standalone `Harness` does not run a background timer; its caller must
 drive it again after an identity becomes available.
 The committed checkpoint and original attempt identity fence the park; a new

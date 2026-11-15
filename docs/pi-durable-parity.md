@@ -660,7 +660,10 @@ its own live, host-declared identity and version; it is checked at invocation,
 park, poll and wake, not cached by allocation. The host must restore equivalent
 identity registrations before reopening.
 Unsafe resume leases the parent and all child identities before claiming an
-attempt and retains them through its checked result commit. Older experimental
+attempt and pins those exact tool allocations through its checked result commit.
+Registered unsafe initial dispatch leases and records its parent definition
+before argument preparation and before-tool hooks. An older busy-attempt marker
+without that preparation proof requires reconciliation. Older experimental
 unsafe park proofs without parent identity fail closed even after child binding;
 they require authoritative parent reconciliation.
 

@@ -1266,7 +1266,7 @@ async fn initial_unsafe_parent_waits_for_busy_identity_and_rejects_invalidated_i
                     .contains("identity unavailable")
             );
         } else {
-            until(|| scheduler.conversation(id).unwrap().tool_attempt().is_some()).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             assert_eq!(count(root, "initial-effects"), 0);
             release.unwrap().send(()).unwrap();
             assert!(writer.unwrap().join().unwrap().is_ok());

@@ -406,8 +406,12 @@ pub(crate) struct UnsafeParkIdentity {
 }
 trait UnsafeParkIdentitySource: Send + Sync {
     fn current_unsafe_park_identity(&self) -> Option<UnsafeParkIdentity>;
+    fn definition_version(&self) -> Option<u32>;
 }
 impl<T: KeyedTool> UnsafeParkIdentitySource for KeyedToolAdapter<T> {
+    fn definition_version(&self) -> Option<u32> {
+        self.0.unsafe_park_version()
+    }
     fn current_unsafe_park_identity(&self) -> Option<UnsafeParkIdentity> {
         let version = self.0.unsafe_park_version().filter(|v| *v > 0)?;
         let identity = self
@@ -423,6 +427,21 @@ impl<T: KeyedTool> UnsafeParkIdentitySource for KeyedToolAdapter<T> {
 }
 type RegistryEntry = (Weak<dyn Tool>, Weak<()>, Weak<dyn UnsafeParkIdentitySource>);
 static REGISTRY: OnceLock<Mutex<Vec<RegistryEntry>>> = OnceLock::new();
+
+pub(crate) fn definition_version(tool: &Arc<dyn Tool>) -> Option<Option<u32>> {
+    let source = {
+        let mut entries = REGISTRY.get_or_init(Default::default).lock().ok()?;
+        entries
+            .retain(|(tool, identity, _)| tool.strong_count() > 0 && identity.strong_count() > 0);
+        entries.iter().find_map(|(registered, _, source)| {
+            let registered = registered.upgrade()?;
+            Arc::ptr_eq(&registered, tool)
+                .then(|| source.upgrade())
+                .flatten()
+        })?
+    };
+    Some(source.definition_version())
+}
 
 fn registered_identity(tool: &Arc<dyn Tool>) -> Option<Arc<()>> {
     let mut entries = REGISTRY.get_or_init(Default::default).lock().ok()?;

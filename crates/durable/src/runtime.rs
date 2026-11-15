@@ -457,6 +457,30 @@ enum DispatchIdentity {
     Task(crate::task_tool::Identity),
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+enum PreparedKeyedVersion {
+    Ordinary,
+    Keyed(Option<u32>),
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PreparedIdentity {
+    operation_id: Uuid,
+    identity: String,
+    spec: ToolSpec,
+    version: PreparedKeyedVersion,
+    policy: ReplayPolicy,
+}
+fn prepared_identity(operation_id: Uuid, reg: &RegisteredTool, identity: &str) -> PreparedIdentity {
+    PreparedIdentity {
+        operation_id,
+        identity: identity.to_owned(),
+        spec: reg.tool.spec(),
+        version: crate::keyed_tool::definition_version(&reg.tool)
+            .map_or(PreparedKeyedVersion::Ordinary, PreparedKeyedVersion::Keyed),
+        policy: reg.replay,
+    }
+}
+
 fn dispatch_identity(tool: &Arc<dyn pi_rs_core::Tool>) -> Result<DispatchIdentity, Error> {
     match crate::task_tool::lookup(tool) {
         Some(adapter) => adapter
@@ -754,6 +778,10 @@ pub struct Conversation {
     tool_attempt: Option<ToolAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity_wait_attempt: Option<ToolAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_identity: Option<PreparedIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_preparation_required: Option<Uuid>,
     #[serde(default)]
     pub abort_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4952,6 +4980,8 @@ impl Harness {
             active: None,
             tool_attempt: None,
             identity_wait_attempt: None,
+            prepared_identity: None,
+            identity_preparation_required: None,
             abort_requested: false,
             nested_resume: None,
             phase: Phase::Idle,
@@ -5270,6 +5300,8 @@ impl Harness {
             active: None,
             tool_attempt: None,
             identity_wait_attempt: None,
+            prepared_identity: None,
+            identity_preparation_required: None,
             abort_requested: false,
             nested_resume: None,
             phase: Phase::Idle,
@@ -9942,6 +9974,12 @@ impl Harness {
         let mut unsafe_resume_leases: Option<(
             ToolAttempt,
             Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>,
+            HashMap<String, RegisteredTool>,
+        )> = None;
+        let mut preparation_lease: Option<(
+            Uuid,
+            RegisteredTool,
+            tokio::sync::OwnedRwLockReadGuard<Option<String>>,
         )> = None;
         loop {
             if cancel.is_cancelled() {
@@ -9949,9 +9987,25 @@ impl Harness {
                 return Err(Error::Interrupted);
             }
             let (mut c, mut version) = self.load(id)?;
+            if c.identity_wait_attempt
+                .is_some_and(|attempt| Some(attempt) != c.active_tool_attempt())
+            {
+                c.identity_wait_attempt = None;
+            }
+            if c.prepared_identity.as_ref().is_some_and(|proof| !matches!(&c.phase,
+                Phase::ToolPreparing { operation_id, .. } | Phase::ToolGateSleeping { operation_id, .. } | Phase::ToolRunning { operation_id, .. } | Phase::Blocked { operation_id, .. } | Phase::Pending { operation_id, .. } if *operation_id == proof.operation_id)) {
+                c.prepared_identity = None;
+            }
+            if c.identity_preparation_required.is_some_and(|operation| !matches!(&c.phase,
+                Phase::ToolPreparing { operation_id, .. } | Phase::ToolGateSleeping { operation_id, .. } | Phase::ToolRunning { operation_id, .. } | Phase::Blocked { operation_id, .. } | Phase::Pending { operation_id, .. } if *operation_id == operation)) {
+                c.identity_preparation_required = None;
+            }
+            if preparation_lease.as_ref().is_some_and(|(operation, _, _)| {
+                !matches!(&c.phase, Phase::ToolPreparing { operation_id, .. } | Phase::ToolRunning { operation_id, .. } if operation_id == operation)
+            }) { preparation_lease = None; }
             if unsafe_resume_leases
                 .as_ref()
-                .is_some_and(|(attempt, _)| c.active_tool_attempt() != Some(*attempt))
+                .is_some_and(|(attempt, _, _)| c.active_tool_attempt() != Some(*attempt))
             {
                 unsafe_resume_leases = None;
             }
@@ -11314,6 +11368,23 @@ impl Harness {
                         .filter(|_| model_tool_selected(&c, &calls[index].name))
                     {
                         let operation_id = Uuid::new_v4();
+                        if reg.replay == ReplayPolicy::Unsafe
+                            && !matches!(
+                                crate::nested_identity::execution_lease(&reg.tool),
+                                Ok(None)
+                            )
+                        {
+                            c.identity_preparation_required = Some(operation_id);
+                            c.phase = Phase::ToolPreparing {
+                                turns,
+                                calls,
+                                index,
+                                operation_id,
+                                wake: None,
+                            };
+                            self.save(&c, Expected::Version(version))?;
+                            continue;
+                        }
                         let invocation = Invocation {
                             operation_id,
                             call: calls[index].clone(),
@@ -11453,6 +11524,15 @@ impl Harness {
                         .get(&call.name)
                         .filter(|_| model_tool_selected(&c, &call.name))
                     else {
+                        if c.identity_preparation_required == Some(operation_id)
+                            || c.prepared_identity
+                                .as_ref()
+                                .is_some_and(|p| p.operation_id == operation_id)
+                        {
+                            c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "unsafe parent preparation tool unavailable; reconciliation required".into(), arguments: Some(serde_json::Value::Null) };
+                            self.save(&c, Expected::Version(version))?;
+                            continue;
+                        }
                         let arguments = pi_rs_core::parse_tool_arguments(&call.arguments)
                             .unwrap_or(serde_json::Value::Null);
                         record_tool_result(
@@ -11474,6 +11554,71 @@ impl Harness {
                         self.save(&c, Expected::Version(version))?;
                         continue;
                     };
+                    if reg.replay == ReplayPolicy::Unsafe {
+                        match crate::nested_identity::execution_lease(&reg.tool) {
+                            Err(()) => {
+                                if c.identity_preparation_required != Some(operation_id) {
+                                    c.identity_preparation_required = Some(operation_id);
+                                    self.save(&c, Expected::Version(version))?;
+                                }
+                                *identity_busy = true;
+                                return Ok(());
+                            }
+                            Ok(Some(lease)) => {
+                                let Some(identity) = lease.as_deref() else {
+                                    c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "registered unsafe parent identity unavailable before preparation; reconciliation required".into(), arguments: Some(serde_json::Value::Null) };
+                                    self.save(&c, Expected::Version(version))?;
+                                    continue;
+                                };
+                                let proof = prepared_identity(operation_id, reg, identity);
+                                if c.prepared_identity
+                                    .as_ref()
+                                    .is_some_and(|old| old != &proof)
+                                {
+                                    c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "unsafe parent preparation identity changed; reconciliation required".into(), arguments: Some(serde_json::Value::Null) };
+                                    self.save(&c, Expected::Version(version))?;
+                                    continue;
+                                }
+                                if c.prepared_identity.is_none() {
+                                    c.prepared_identity = Some(proof);
+                                    self.save(&c, Expected::Version(version))?;
+                                    let (fresh, fresh_version) = self.load(id)?;
+                                    c = fresh;
+                                    version = fresh_version;
+                                }
+                                preparation_lease = Some((operation_id, reg.clone(), lease));
+                            }
+                            Ok(None)
+                                if c.identity_preparation_required == Some(operation_id)
+                                    || c.prepared_identity
+                                        .as_ref()
+                                        .is_some_and(|p| p.operation_id == operation_id) =>
+                            {
+                                c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "unsafe parent preparation identity missing; reconciliation required".into(), arguments: Some(serde_json::Value::Null) };
+                                self.save(&c, Expected::Version(version))?;
+                                continue;
+                            }
+                            Ok(None) => (),
+                        }
+                    } else if c.identity_preparation_required == Some(operation_id)
+                        || c.prepared_identity
+                            .as_ref()
+                            .is_some_and(|p| p.operation_id == operation_id)
+                    {
+                        c.phase = Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason:
+                                "unsafe parent preparation policy changed; reconciliation required"
+                                    .into(),
+                            arguments: Some(serde_json::Value::Null),
+                        };
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
+                    }
                     let invocation = Invocation {
                         operation_id,
                         call: call.clone(),
@@ -11796,7 +11941,7 @@ impl Harness {
                                     continue;
                                 }
                             };
-                            Some(leases)
+                            Some((leases, tools))
                         } else {
                             None
                         };
@@ -11809,17 +11954,31 @@ impl Harness {
                             *replay_ready = false;
                         }
                         self.save(&c, Expected::Version(version))?;
-                        unsafe_resume_leases = leases.map(|leases| (attempt, leases));
+                        unsafe_resume_leases =
+                            leases.map(|(leases, tools)| (attempt, leases, tools));
                         #[cfg(test)]
                         if replay == ReplayPolicy::Unsafe {
                             stop_at_unsafe_park_boundary("attempt-claimed", &c);
+                            unsafe_park_boundary_tests::checkpoint(id, "after-claim").await;
                         }
                         continue;
                     }
                     let call = calls
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
-                    let tools = self.resolved_tools(&c)?;
+                    let mut tools = match &unsafe_resume_leases {
+                        Some((attempt, _, tools)) if Some(*attempt) == c.active_tool_attempt() => {
+                            tools.clone()
+                        }
+                        _ => self.resolved_tools(&c)?,
+                    };
+                    if unsafe_resume_leases.is_none() {
+                        if let Some((prepared_operation, reg, _)) = &preparation_lease {
+                            if *prepared_operation == operation_id {
+                                tools.insert(call.name.clone(), reg.clone());
+                            }
+                        }
+                    }
                     let search_candidates = if tools
                         .get(&call.name)
                         .is_some_and(|reg| crate::tool_search::is_search(&reg.tool))
@@ -11890,6 +12049,31 @@ impl Harness {
                     } else {
                         None
                     };
+                    let saved_preparation = c
+                        .prepared_identity
+                        .as_ref()
+                        .filter(|p| p.operation_id == operation_id);
+                    let preparation_matches = match saved_preparation {
+                        Some(saved) => {
+                            tools
+                                .get(&call.name)
+                                .zip(_unsafe_parent_lease.as_ref())
+                                .and_then(|(reg, lease)| {
+                                    lease.as_deref().map(|identity| {
+                                        prepared_identity(operation_id, reg, identity)
+                                    })
+                                })
+                                .as_ref()
+                                == Some(saved)
+                        }
+                        None => c.identity_wait_attempt.is_none(),
+                    };
+                    if !preparation_matches {
+                        c.identity_wait_attempt = None;
+                        c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "unsafe parent preparation identity missing or changed; reconciliation required".into(), arguments: Some(arguments) };
+                        self.save(&c, Expected::Version(version))?;
+                        continue;
+                    }
                     if c.identity_wait_attempt.is_some() {
                         c.identity_wait_attempt = None;
                         self.save(&c, Expected::Version(version))?;
@@ -11932,9 +12116,11 @@ impl Harness {
                             .and_then(|resume| resume.unsafe_park.as_ref())
                     {
                         let valid = _unsafe_parent_lease.is_some()
-                            && unsafe_resume_leases.as_ref().is_some_and(|(attempt, _)| {
-                                Some(*attempt) == c.active_tool_attempt()
-                            })
+                            && unsafe_resume_leases
+                                .as_ref()
+                                .is_some_and(|(attempt, _, _)| {
+                                    Some(*attempt) == c.active_tool_attempt()
+                                })
                             && crate::nested::children_match(
                                 self.owner.store(),
                                 operation_id,
@@ -20160,6 +20346,8 @@ mod scheduler_tests {
             abort_requested: false,
             nested_resume: None,
             identity_wait_attempt: None,
+            prepared_identity: None,
+            identity_preparation_required: None,
             phase: Phase::Idle,
         };
         let mut latest = base.clone();
