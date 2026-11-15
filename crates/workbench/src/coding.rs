@@ -2158,7 +2158,8 @@ impl Tool for CodingTool {
             Err(Error::Config(message))
                 if self.unrestricted
                     && matches!(self.kind, Kind::Read { .. })
-                    && message.starts_with("ENOENT: no such file or directory, access '") =>
+                    && (message.starts_with("ENOENT: no such file or directory, access '")
+                        || message.starts_with("ENOTDIR: not a directory, access '")) =>
             {
                 Outcome::Failed(message)
             }
@@ -2299,6 +2300,15 @@ impl CodingTool {
             {
                 Error::Config(format!(
                     "ENOENT: no such file or directory, access '{}'",
+                    path.display()
+                ))
+            } else if self.unrestricted
+                && cfg!(unix)
+                && error.kind() == std::io::ErrorKind::NotADirectory
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "ENOTDIR: not a directory, access '{}'",
                     path.display()
                 ))
             } else if error.kind() == std::io::ErrorKind::NotFound
@@ -4501,6 +4511,39 @@ mod tests {
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_non_directory_parent_with_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file"), "contents").unwrap();
+        std::os::unix::fs::symlink("file", root.join("alias")).unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"alias/child"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == &format!("ENOTDIR: not a directory, access '{}'", root.join("alias/child").display())),
+            "{result:?}"
+        );
     }
 
     #[cfg(unix)]
