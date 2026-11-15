@@ -1224,6 +1224,9 @@ script line numbers. The native JSON code argument differs from Pi's
 provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
+Classifier results include their API and invocation timestamp even if the
+request fails early or is cancelled, as they do on successful requests.
+
 ### Resource selection checkpoint
 
 `--no-skills`, `--no-prompt-templates`, `--no-context-files`, `--no-themes`,
