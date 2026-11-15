@@ -2127,7 +2127,7 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"integer","minimum":1}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::Find => (
@@ -2987,8 +2987,13 @@ impl CodingTool {
         };
         let limit = args["limit"]
             .as_u64()
-            .unwrap_or(if is_find { 1000 } else { 100 })
-            .min(100_000) as usize;
+            .unwrap_or(if is_find { 1000 } else { 100 });
+        let limit = if is_find || !self.unrestricted {
+            limit.min(100_000)
+        } else {
+            limit
+        };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
@@ -4709,6 +4714,41 @@ mod tests {
                 .await;
             assert!(outcome.tool_content().starts_with("fixture-1- before\n"));
         }
+    }
+
+    #[test]
+    fn unrestricted_grep_accepts_more_than_one_hundred_thousand_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let count = 100_001usize;
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(count)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({"pattern":"needle", "limit":200_000, "context":1});
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+        match tool
+            .search(&args, &pi_rs::CancellationToken::new())
+            .unwrap()
+        {
+            Outcome::SucceededWithDetails { details, .. } => {
+                assert!(details.get("matchLimitReached").is_none());
+                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+            }
+            other => panic!("expected truncated result with details, got {other:?}"),
+        }
+        tool.unrestricted = false;
+        assert!(
+            !jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
     }
 
     #[tokio::test]
