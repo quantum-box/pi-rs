@@ -94,6 +94,7 @@ struct Branch {
     entry_start: u64,
     context_target: Option<u64>,
     calls: BTreeMap<String, Uuid>,
+    missing_ancestors: bool,
     model: String,
     provider: Option<String>,
     thinking: Option<String>,
@@ -389,6 +390,11 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     let mut previous = None;
     let mut legacy_ids: Vec<String> = Vec::new();
     let entry_count = entries.len();
+    let source_ids: std::collections::BTreeSet<_> = entries
+        .iter()
+        .skip(1)
+        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .collect();
     for (index, entry) in entries.into_iter().enumerate().skip(1) {
         importer.timestamp = entry["timestamp"].as_str().map(str::to_owned);
         let id = if version == 1 {
@@ -414,10 +420,17 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             entry["parentId"].as_str()
         };
         let mut branch = match parent {
-            Some(parent) => branches
-                .get(parent)
-                .cloned()
-                .ok_or_else(|| Error::Session(format!("missing imported parent {parent}")))?,
+            Some(parent) => match branches.get(parent) {
+                Some(branch) => branch.clone(),
+                // Pi exposes a genuinely missing parent as a separate tree root.
+                // Do not silently sever a forward reference or a cycle.
+                None if !source_ids.contains(parent) => {
+                    let mut branch = root.clone();
+                    branch.missing_ancestors = true;
+                    branch
+                }
+                None => return Err(Error::Session(format!("missing imported parent {parent}"))),
+            },
             None => root.clone(),
         };
         // Pi v1 stored compaction boundaries as indices into the full file,
@@ -444,6 +457,17 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 migrated["firstKeptEntryId"] = Value::String(target.clone());
                 converted_entry = Some(migrated);
             }
+        }
+        if entry["type"] == "compaction"
+            && (branch.missing_ancestors
+                || entry["firstKeptEntryId"]
+                    .as_str()
+                    .and_then(|target| branches.get(target))
+                    .is_some_and(|target| target.missing_ancestors))
+        {
+            return Err(Error::Session(
+                "cannot import compaction involving an orphaned branch".into(),
+            ));
         }
         let events = convert(
             converted_entry.as_ref().unwrap_or(&entry),
@@ -1702,6 +1726,85 @@ mod tests {
             branch_selection(&reopened, |_, _| Some(true)),
             virtual_selection
         );
+    }
+
+    #[test]
+    fn missing_parent_import_preserves_orphan_branch_and_source() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"other branch"}}),
+            json!({"type":"message","id":"orphan","parentId":"missing","message":{"role":"user","content":"recovered"}}),
+            json!({"type":"message","id":"child","parentId":"orphan","message":{"role":"user","content":"next"}}),
+        ]).unwrap();
+        let check = |session: &pi_rs::Session| {
+            let source = |id: &str| {
+                session
+                    .records()
+                    .iter()
+                    .find(|record| {
+                        matches!(&record.event,
+                Event::SourceEntry { entry, .. } if entry["id"] == id)
+                    })
+                    .unwrap()
+            };
+            let orphan_id = source("orphan").id.to_string();
+            let child_id = source("child").id.to_string();
+            assert!(
+                matches!(&source("orphan").event, Event::SourceEntry { entry, .. } if entry["parentId"] == "missing")
+            );
+            let tree = super::super::rpc_entries::Entries::new(session).tree();
+            let orphan = tree["tree"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["entry"]["id"] == orphan_id)
+                .unwrap();
+            assert!(orphan["entry"]["parentId"].is_null());
+            assert_eq!(orphan["children"][0]["entry"]["id"], child_id);
+            let messages = session.current_messages();
+            let text = messages
+                .iter()
+                .filter_map(|m| match m {
+                    pi_rs::Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(text, ["recovered", "next"]);
+        };
+        check(&session);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopened.jsonl");
+        session.export_jsonl(&path).unwrap();
+        check(&read(&path).unwrap());
+    }
+
+    #[test]
+    fn import_rejects_compaction_boundary_on_another_branch() {
+        assert!(import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"other"}}),
+            json!({"type":"message","id":"b","parentId":"missing","message":{"role":"user","content":"orphan"}}),
+            json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100}),
+        ]).is_err());
+    }
+
+    #[test]
+    fn import_rejects_compaction_referring_to_orphan_from_another_branch() {
+        assert!(import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":"missing","message":{"role":"user","content":"orphan"}}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other"}}),
+            json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100}),
+        ]).is_err());
+    }
+
+    #[test]
+    fn import_rejects_forward_parent_reference() {
+        assert!(import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"child","parentId":"later","message":{"role":"user","content":"child"}}),
+            json!({"type":"message","id":"later","parentId":null,"message":{"role":"user","content":"parent"}}),
+        ]).is_err());
     }
 
     #[test]

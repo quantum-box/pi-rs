@@ -1255,6 +1255,11 @@ including branch topology, completed tool results, reasoning, usage, names,
 labels, compaction boundaries and branch-local codemode store values. User and tool-result images reach the model
 adapter as image content. Previously completed tools remain recorded results;
 unfinished imported calls remain uncertain and require reconciliation.
+A source entry with a missing parent is recovered as a separate native branch;
+its original parent ID remains in the retained source entry, while RPC presents
+it as a root. Missing ancestors may contain unrecoverable state or tool calls;
+orphan tool results and compactions involving orphaned branches are still rejected.
+Forward parent references are also rejected.
 
 Context edits are projected onto future model context while the imported raw
 entries remain available. Remaining specialized message variants and system
