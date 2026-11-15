@@ -1069,6 +1069,13 @@ This is a native embedding control rather than an upstream Pi API.
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 
+Owned SDK sessions expose configured extension command names, collision-resolved
+invocations, descriptions, and source provenance for host command pickers. Hosts
+combine these with their own built-in commands, skills and prompt templates, and
+explicitly route an invocation through `invoke_registered_command`; unlike Pi,
+`prompt` does not dispatch slash commands. Source paths are lossy UTF-8 display
+strings. The list does not reflect temporary per-request registry refreshes.
+
 Owned sessions restore the registered model client as well as the model name
 when reopening, navigating branches, or forking. Context-window queries and
 idle input hooks use that branch's client too. Register clients for historical
