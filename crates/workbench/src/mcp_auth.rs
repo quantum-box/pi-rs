@@ -825,6 +825,7 @@ pub async fn login_configured_with_http_options(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn login_configured_inner(
     name: &str,
     url: &str,
@@ -880,6 +881,7 @@ async fn login_configured_inner(
 
 /// CLI login with an absolute deadline covering all preparation. Once the
 /// credential commit begins it runs to completion, even after the deadline.
+#[allow(clippy::too_many_arguments)]
 pub async fn login_with_secret_with_http_options_and_deadline(
     name: &str,
     url: &str,
@@ -913,6 +915,7 @@ pub async fn login_with_secret_with_http_options_and_deadline(
 }
 
 /// Deadline-aware CLI login using a hosted client metadata document.
+#[allow(clippy::too_many_arguments)]
 pub async fn login_with_metadata_with_http_options_and_deadline(
     name: &str,
     url: &str,
@@ -944,6 +947,7 @@ pub async fn login_with_metadata_with_http_options_and_deadline(
 }
 
 /// Deadline-aware CLI login using configured client settings.
+#[allow(clippy::too_many_arguments)]
 pub async fn login_configured_with_http_options_and_deadline(
     name: &str,
     url: &str,
