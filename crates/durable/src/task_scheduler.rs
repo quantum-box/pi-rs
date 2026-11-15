@@ -292,8 +292,13 @@ pub struct Scheduler {
     validator: Option<crate::runtime::Harness>,
     poisoned: bool,
     failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
+    activity: crate::worker_activity::WorkerActivity,
 }
 impl Scheduler {
+    /// Observe live handler invocations without acquiring the scheduler lock.
+    pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
+        self.activity.clone()
+    }
     pub(crate) fn owner(&self) -> Arc<OwnedStore> {
         self.attachment.owner.clone()
     }
@@ -334,6 +339,7 @@ impl Scheduler {
             validator: None,
             poisoned: false,
             failed_migrations: HashMap::new(),
+            activity: Default::default(),
         };
         scheduler.reconcile()?;
         Ok(scheduler)
@@ -364,6 +370,7 @@ impl Scheduler {
         self.replace_registry_locked(registry)
     }
     pub(crate) fn bind_harness(&mut self, harness: crate::runtime::Harness) {
+        self.activity = harness.worker_activity();
         self.validator = Some(harness);
     }
     pub(crate) fn replace_registry_locked(&mut self, registry: Registry) -> Result<(), Error> {
@@ -780,6 +787,9 @@ impl Scheduler {
                     self.poisoned = false;
                     return Ok(true);
                 }
+                let _activity = self
+                    .activity
+                    .enter(crate::worker_activity::WorkerKind::Task, snapshot.task.id());
                 let running = self
                     .ts()
                     .load(snapshot.task.id())?
@@ -821,6 +831,9 @@ impl Scheduler {
         if !self.reserve_resolved(&snapshot)? {
             return Ok(true);
         }
+        let _activity = self
+            .activity
+            .enter(crate::worker_activity::WorkerKind::Task, snapshot.task.id());
         let running = self
             .ts()
             .load(snapshot.task.id())?

@@ -528,6 +528,11 @@ Current limits and differences from upstream Pi Durable:
   ordering and atomically fence task and signal revisions. Consuming a receipt
   advances the signal revision; mismatched record identities and ambiguous
   duplicate typed receipts fail closed instead of selecting one arbitrarily.
+- `worker_activity()` observes live task handler attempts and scheduled
+  conversation drivers (including poll sleeps) without locking the task
+  scheduler. It is process-local and excludes queued lock contenders, direct
+  harness drives, summary workers and persisted waiting work. It is not an
+  `onWake` or durable-idleness API.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.

@@ -35,6 +35,7 @@ pub enum Error {
 }
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
+    activity: crate::worker_activity::WorkerActivity,
     owner: Arc<OwnedStore>,
     state: Mutex<State>,
     wake: Condvar,
@@ -87,6 +88,7 @@ impl Driver {
         harness: Option<crate::runtime::Harness>,
     ) -> Self {
         let owner = scheduler.owner();
+        let activity = scheduler.worker_activity();
         let policies = scheduler.policies();
         let definitions = scheduler.definitions();
         let (notify_tx, notify_rx) = mpsc::sync_channel(1);
@@ -94,6 +96,7 @@ impl Driver {
         let _ = notify_tx.try_send(());
         let shared = Arc::new(Shared {
             scheduler: Mutex::new(scheduler),
+            activity,
             owner,
             state: Mutex::new(State {
                 policies,
@@ -174,6 +177,10 @@ impl Driver {
             .lock()
             .map_err(|_| Error::Poisoned)?
             .take())
+    }
+    /// Observe live task and, when attached, conversation executors.
+    pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
+        self.shared.activity.clone()
     }
     pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
         Arc::downgrade(&self.shared)
@@ -817,6 +824,7 @@ mod tests {
         let shared = Arc::new(Shared {
             owner: owner.clone(),
             state: Mutex::new(State::default()),
+            activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: None,
@@ -972,6 +980,7 @@ mod tests {
             .unwrap();
         let shared = Shared {
             owner,
+            activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
@@ -1066,6 +1075,7 @@ mod tests {
         let shared = Arc::new(Shared {
             owner: scheduler.owner(),
             state: Mutex::new(State::default()),
+            activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: None,
@@ -1137,6 +1147,7 @@ mod tests {
                 definitions: scheduler.definitions(),
                 ..State::default()
             }),
+            activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: None,
@@ -1416,6 +1427,7 @@ mod tests {
                 definitions: scheduler.definitions(),
                 ..State::default()
             }),
+            activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: Some(Mutex::new(harness.worker())),

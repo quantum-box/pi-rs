@@ -2266,6 +2266,7 @@ pub struct Harness {
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
     execution_gate: Option<Arc<std::sync::Mutex<()>>>,
     task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
+    activity: crate::worker_activity::WorkerActivity,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 /// A snapshot of all store changes for one or more conversation saves.
@@ -2682,6 +2683,7 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
             task_driver: Arc::new(std::sync::Mutex::new(None)),
+            activity: Default::default(),
             clock: Arc::new(wall_time_millis),
         };
         harness.recover()?;
@@ -2704,6 +2706,7 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
             task_driver: self.task_driver.clone(),
+            activity: self.activity.clone(),
             clock: self.clock.clone(),
         }
     }
@@ -6370,6 +6373,10 @@ impl Harness {
         crate::conversation_signal::Inbox::new(self.owner.store())
             .send_with_clock(signal, self.clock.as_ref())?;
         Ok(())
+    }
+    /// Observe live task and conversation executors without waiting on their locks.
+    pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
+        self.activity.clone()
     }
     /// Attach one generic task scheduler to the same locked store. Its owner
     /// guard survives this handle; callers explicitly drive its ticks.
@@ -12165,6 +12172,10 @@ struct SummaryTask {
 }
 
 impl Scheduler {
+    /// Observe live executors shared with the attached task driver.
+    pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
+        self.harness.worker_activity()
+    }
     /// Wait for a persisted submission settlement. Dropping or cancelling the
     /// wait leaves the submission untouched. The conversation is polled every
     /// 100 ms; blocked work may require host intervention or a task driver.
@@ -14084,6 +14095,9 @@ pub(crate) async fn drive_scheduled<'a>(
     guard: &mut Option<tokio::sync::MutexGuard<'a, ()>>,
     errors: Option<&std::sync::Mutex<HashMap<Uuid, String>>>,
 ) -> Result<(), Error> {
+    let activity = worker
+        .activity
+        .enter(crate::worker_activity::WorkerKind::Conversation, id);
     let next_poll = worker.owner.conversation_controls().get(id).next_poll;
     if cancel.is_cancelled() {
         return Ok(());
@@ -14135,6 +14149,7 @@ pub(crate) async fn drive_scheduled<'a>(
             if !retry || cancel.is_cancelled() {
                 return Ok(());
             }
+            activity.set(crate::worker_activity::WorkerPhase::Waiting);
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(Duration::from_secs(1)) => (),
@@ -14144,6 +14159,7 @@ pub(crate) async fn drive_scheduled<'a>(
                 _ = cancel.cancelled() => return Ok(()),
                 guard = lock.lock() => guard,
             });
+            activity.set(crate::worker_activity::WorkerPhase::Running);
             continue;
         }
         let should_poll = if state.abort_requested && !matches!(state.phase, Phase::Blocked { .. })
@@ -14188,6 +14204,7 @@ pub(crate) async fn drive_scheduled<'a>(
                 .expect("deadline set while holding worker lock");
             // No dispatch future remains live at this persisted wait boundary.
             drop(guard.take());
+            activity.set(crate::worker_activity::WorkerPhase::Waiting);
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep_until(deadline) => (),
@@ -14197,6 +14214,7 @@ pub(crate) async fn drive_scheduled<'a>(
                 _ = cancel.cancelled() => return Ok(()),
                 guard = lock.lock() => guard,
             });
+            activity.set(crate::worker_activity::WorkerPhase::Running);
             if cancel.is_cancelled() {
                 return Ok(());
             }

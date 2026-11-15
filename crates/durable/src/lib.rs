@@ -51,3 +51,4 @@ pub mod tool;
 pub mod tool_progress;
 pub mod tool_search;
 pub mod transcript;
+pub mod worker_activity;

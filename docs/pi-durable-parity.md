@@ -366,6 +366,8 @@ body rebuilds are not intercepted; adapters must avoid hidden rebuilds or guard
 them themselves. This interface does not retrofit built-in provider clients,
 settlement, exactly-once network execution, or automatic adapter installation.
 
+**Live executor observation:** `worker_activity()` returns a shared in-process view of task handler attempts and scheduled conversation drivers, including conversation poll sleeps. Guards disappear on completion, cancellation or unwind; multiple drivers of one conversation have separate entries. It does not include queued workers before their conversation lock, independent summary jobs, direct `Harness` drives, durable waiting tasks, or recovery work. Empty does not imply durable idleness, and the view alone cannot implement upstream `onWake` or an atomic wake decision. See [worker activity tests](../crates/durable/tests/worker_activity.rs).
+
 **Generic task wake hints and snapshot:** `Driver::subscribe_wake` supplies a
 single initially signaled, capacity-one coalescing channel. `wake_snapshot(now)`
 inspects generic task readiness, blocked definitions and the nearest future
