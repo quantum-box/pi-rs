@@ -25,6 +25,7 @@ pub(super) struct Profiles {
 struct Profile {
     provider: Provider,
     endpoint: String,
+    base_url: Option<String>,
     provider_endpoints: BTreeSet<String>,
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
@@ -878,6 +879,7 @@ impl Profiles {
                     Profile {
                         provider,
                         endpoint,
+                        base_url: profile.base_url,
                         provider_endpoints,
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
@@ -1137,24 +1139,39 @@ impl Profiles {
             .entries
             .get(provider.id())
             .map(|profile| &profile.compat);
-        let model = self.model(provider, model);
-        let model = model.as_ref().map(|model| &model.compat);
+        let metadata = self.model(provider, model);
+        let model_compat = metadata.as_ref().map(|model| &model.compat);
         let openrouter = provider.id() == "openrouter"
             || if adapter == Adapter::OpenAiResponses {
-                endpoint.contains("openrouter.ai")
+                let raw = self.entries.get(provider.id()).and_then(|profile| {
+                    let selected = profile
+                        .model_endpoints
+                        .get(model)
+                        .map_or(profile.endpoint.as_str(), String::as_str);
+                    if selected != endpoint {
+                        return None;
+                    }
+                    profile
+                        .models
+                        .iter()
+                        .find(|item| item.id == model)
+                        .and_then(|item| item.base_url.as_deref())
+                        .or(profile.base_url.as_deref())
+                });
+                raw.unwrap_or(endpoint).contains("openrouter.ai")
             } else {
                 reqwest::Url::parse(endpoint)
                     .ok()
                     .is_some_and(|url| url.host_str() == Some("openrouter.ai"))
             };
-        let send = model
+        let send = model_compat
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
             .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
         if !send {
             return &[];
         }
-        let format = model
+        let format = model_compat
             .and_then(|compat| compat.session_affinity_format)
             .or_else(|| profile.and_then(|compat| compat.session_affinity_format))
             .unwrap_or(if openrouter {
@@ -1655,6 +1672,26 @@ mod tests {
             profiles.session_affinity(&provider, "default", "https://edge.openrouter.ai/api/v1"),
             ["x-session-id"]
         );
+        for (base, expected) in [
+            (
+                "https://OPENROUTER.AI/v1",
+                &["session_id", "x-client-request-id"][..],
+            ),
+            (
+                "https://example.com/openrouter.ai/../v1",
+                &["x-session-id"][..],
+            ),
+        ] {
+            let configured = Profiles::parse(&json!({"providers":{"proxy":{
+                "api":"openai-responses", "baseUrl":base, "models":[{"id":"m"}]
+            }}}))
+            .unwrap();
+            let selected = configured.provider("proxy").unwrap();
+            assert_eq!(
+                configured.session_affinity(&selected, "m", configured.endpoint(&selected)),
+                expected
+            );
+        }
         let chatgpt = profiles.provider("openai-chatgpt").unwrap();
         assert!(
             profiles
