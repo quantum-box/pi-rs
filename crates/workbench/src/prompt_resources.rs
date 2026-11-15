@@ -100,7 +100,7 @@ impl ContextReadGrants {
                     Err(error) => return Err(error.into()),
                 }
                 if let Some(text) = read_optional(&path)? {
-                    if seen.insert(path.canonicalize()?) {
+                    if seen.insert(path.clone()) {
                         files.push(ContextResource { text, path });
                     }
                     break;
