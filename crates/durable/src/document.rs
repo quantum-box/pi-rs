@@ -1510,13 +1510,6 @@ impl<'a> TaskDocuments<'a> {
         arguments: &Value,
         child: crate::task::Task,
     ) -> Result<uuid::Uuid, String> {
-        if self
-            .keyed_children
-            .iter()
-            .any(|(existing, _, _)| existing == key)
-        {
-            return Err("key already staged in this invocation".into());
-        }
         let parent = crate::task_store::TaskStore::new(self.store)
             .load(self.task.id())
             .map_err(|e| e.to_string())?
@@ -1527,6 +1520,17 @@ impl<'a> TaskDocuments<'a> {
         let prepared =
             crate::keyed_child::prepare(self.store, &parent, key, tool, arguments, &child)
                 .map_err(|e| e.to_string())?;
+        if let Some((_, _, existing)) = self
+            .keyed_children
+            .iter()
+            .find(|(existing, _, _)| existing == key)
+        {
+            return if existing.same_identity(&prepared) {
+                Ok(existing.child)
+            } else {
+                Err("key already belongs to a different child identity".into())
+            };
+        }
         let id = prepared.child;
         self.keyed_children.push((key.into(), child, prepared));
         Ok(id)
@@ -1540,6 +1544,16 @@ impl<'a> TaskDocuments<'a> {
         child: crate::task::Task,
         handler: std::sync::Arc<dyn crate::task_scheduler::Handler>,
     ) -> Result<uuid::Uuid, String> {
+        if self
+            .keyed_children
+            .iter()
+            .any(|(existing, _, _)| existing == key)
+        {
+            match self.keyed_child_handlers.get(key) {
+                Some(existing) if std::sync::Arc::ptr_eq(existing, &handler) => {}
+                _ => return Err("key already staged with a different handler".into()),
+            }
+        }
         let id = self.stage_keyed_child(key, tool, arguments, child)?;
         self.keyed_child_handlers.insert(key.to_owned(), handler);
         Ok(id)

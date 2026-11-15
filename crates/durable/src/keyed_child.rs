@@ -55,8 +55,15 @@ struct Record {
 
 pub(crate) struct Prepared {
     pub(crate) child: Uuid,
+    identity: Identity,
     pub(crate) checks: Vec<Check>,
     pub(crate) mutations: Vec<Mutation>,
+}
+
+impl Prepared {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
 }
 
 /// Commit staged task documents and a keyed park together. The caller must
@@ -249,6 +256,7 @@ pub(crate) fn prepare(
         }
         return Ok(Prepared {
             child: record.child,
+            identity,
             checks: vec![
                 parent_check,
                 Check {
@@ -279,11 +287,12 @@ pub(crate) fn prepare(
         key,
         value: serde_json::to_vec(&Record {
             child: child.id(),
-            identity,
+            identity: identity.clone(),
         })?,
     });
     Ok(Prepared {
         child: child.id(),
+        identity,
         checks: batch.checks,
         mutations: batch.mutations,
     })

@@ -55,6 +55,7 @@ fn spec(name: &str) -> ToolSpec {
 struct Parent {
     fast: Arc<TaskTool>,
     altered_fast: Arc<TaskTool>,
+    wrong_handler: Arc<TaskTool>,
     slow: Arc<TaskTool>,
     ids: Arc<Mutex<Option<(Uuid, Uuid, Uuid)>>>,
 }
@@ -78,6 +79,28 @@ impl Handler for Parent {
             let a = self
                 .fast
                 .stage_child(task, docs, "fast", json!({"job":"fast"}))?;
+            if self
+                .fast
+                .stage_child(task, docs, "fast", json!({"job":"fast"}))?
+                != a
+            {
+                return Err("staged child identity changed".into());
+            }
+            if self
+                .fast
+                .stage_child(task, docs, "fast", json!({"job":"changed"}))
+                .is_ok()
+                || self
+                    .altered_fast
+                    .stage_child(task, docs, "fast", json!({"job":"fast"}))
+                    .is_ok()
+                || self
+                    .wrong_handler
+                    .stage_child(task, docs, "fast", json!({"job":"fast"}))
+                    .is_ok()
+            {
+                return Err("conflicting staged child accepted".into());
+            }
             let b = self
                 .slow
                 .stage_child(task, docs, "slow", json!({"job":"slow"}))?;
@@ -183,6 +206,13 @@ impl Fixture {
         let mut altered_spec = spec("fast-tool");
         altered_spec.description = "changed".into();
         let altered_fast = Arc::new(TaskTool::new(altered_spec, "fast", true, 1, fast.clone()));
+        let wrong_handler = Arc::new(TaskTool::new(
+            spec("fast-tool"),
+            "fast",
+            true,
+            1,
+            Arc::new(|_: &Task| Ok(Step::Succeed(json!("wrong")))),
+        ));
         let slow_tool = Arc::new(TaskTool::new(
             spec("slow-tool"),
             "slow",
@@ -194,6 +224,7 @@ impl Fixture {
         let parent: Arc<dyn Handler> = Arc::new(Parent {
             fast: fast_tool,
             altered_fast,
+            wrong_handler,
             slow: slow_tool,
             ids: ids.clone(),
         });

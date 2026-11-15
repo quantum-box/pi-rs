@@ -364,7 +364,9 @@ registered TaskTool under a stable key. Return a task wait step to commit the
 child and checkpoint together; on wake, `ended_children` and `get_owned_child`
 expose the frozen wake IDs and checked results. The driver verifies the child
 handler, version and replay policy before admission. This handler-only API does
-not add asynchronous child dispatch to `KeyedHost`.
+not add asynchronous child dispatch to `KeyedHost`. Repeating a key within the
+same handler invocation returns the same child ID when its definition, input and
+handler match; conflicting reuse fails without replacing the staged child.
 
 `KeyedTool::invoke_controlled` can return termination and handoff controls with its reply.
 The runtime persists it with the outcome and ends the run without another model
