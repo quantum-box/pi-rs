@@ -4032,9 +4032,9 @@ is acknowledged after the entry is committed; the entry does not enter model
 context.
 Idle session start, shutdown, and name-change notifications delivered through
 the session-owned lifecycle API also support custom entries. Single-command
-workbench startup and shutdown use this path. Other callback types, persistent
-workers, and the owned SDK's scoped startup use their existing host paths and
-do not yet expose it.
+workbench startup and shutdown use this path. The owned SDK also exposes entry
+access to scoped startup and idle input callbacks through their session owner.
+Persistent workers and other callback types do not yet expose it.
 These callbacks can read active-branch custom entries, optionally filtered
 by type, including entries appended earlier in the callback. Responses over
 8 MiB are rejected. An executable
