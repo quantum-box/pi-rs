@@ -8,7 +8,7 @@ use base64::{
 use serde_json::{Value, json};
 
 /// Model image limits; `max_bytes` measures the length of base64 data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImageLimits {
     pub max_width: u32,
     pub max_height: u32,
@@ -96,6 +96,61 @@ impl ImageLimitsCatalog {
             self.limits(snapshot["config"]["model"].as_str().unwrap_or(""))
         })
     }
+}
+
+/// Image capability and fitting limits for one concrete model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelImageProfile {
+    pub supports_images: bool,
+    pub limits: ImageLimits,
+}
+
+/// Lookup in the bundled pi-rs model catalog. Unknown providers and models
+/// return `None`, rather than guessing their input capabilities.
+pub fn builtin_model_image_profile(adapter_id: &str, model: &str) -> Option<ModelImageProfile> {
+    let provider = match adapter_id {
+        "openai-responses-api/v1" => "openai",
+        "anthropic-messages/v1" => "anthropic",
+        "google-generative-ai/v1" | "google-generative-ai-ordered-tool-blocks/v1" => "google",
+        _ => return None,
+    };
+    let model = if provider == "google" {
+        model.strip_prefix("models/").unwrap_or(model)
+    } else {
+        model
+    };
+    let catalog: Value =
+        serde_json::from_str(include_str!("../assets/model-image-profiles.json")).ok()?;
+    let descriptor = catalog
+        .get(provider)?
+        .as_array()?
+        .iter()
+        .find(|v| v["id"].as_str() == Some(model))?;
+    let input = descriptor.get("input")?.as_array()?;
+    let mut limits = ImageLimitsCatalog::default();
+    limits.insert(model, descriptor).ok()?;
+    Some(ModelImageProfile {
+        supports_images: input.iter().any(|v| v.as_str() == Some("image")),
+        limits: limits.limits(model),
+    })
+}
+
+/// Create a fit hook using the selected adapter's model profile at tool completion.
+/// Unknown profiles use the upstream default limits.
+pub fn create_model_fit_images_extension(
+    processor: std::sync::Arc<dyn ImageProcessor>,
+) -> crate::extension::Extension {
+    create_fit_images_extension(
+        processor,
+        std::sync::Arc::new(|snapshot| {
+            snapshot
+                .get("_model_image_profile")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<ModelImageProfile>(v).ok())
+                .map(|p| p.limits)
+                .unwrap_or_default()
+        }),
+    )
 }
 
 #[cfg(feature = "builtin-images")]
@@ -591,5 +646,170 @@ mod tests {
         png.extend_from_slice(&[0; 17]);
         png.extend_from_slice(b"\0\0\0\x08acTL");
         assert_eq!(detect_image_mime_type(&png), None);
+    }
+}
+
+const USER_IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
+const TOOL_IMAGE_OMITTED: &str = "(tool image omitted: model does not support images)";
+
+fn project_blocks(blocks: &mut Vec<Value>, placeholder: &str) {
+    let mut projected = Vec::with_capacity(blocks.len());
+    let mut previous_placeholder = false;
+    for block in std::mem::take(blocks) {
+        if block["type"] == "image" {
+            if !previous_placeholder {
+                projected.push(json!({"type": "text", "text": placeholder}));
+            }
+            previous_placeholder = true;
+        } else {
+            previous_placeholder = block["type"] == "text" && block["text"] == placeholder;
+            projected.push(block);
+        }
+    }
+    *blocks = projected;
+}
+
+/// Project only the outgoing copy. Transcript bindings and raw history stay intact.
+pub(crate) fn project_nonvision_request(
+    request: &mut pi_rs_core::ModelRequest,
+    blocks: &mut std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    tool_blocks: &mut std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+) {
+    for binding in blocks.values_mut() {
+        project_blocks(&mut binding.blocks, USER_IMAGE_OMITTED);
+    }
+    for binding in tool_blocks.values_mut() {
+        project_blocks(&mut binding.blocks, TOOL_IMAGE_OMITTED);
+    }
+    for message in &mut request.messages {
+        match message {
+            pi_rs_core::Message::UserWithImages { content, images } if !images.is_empty() => {
+                let content = if content.is_empty() {
+                    USER_IMAGE_OMITTED.to_owned()
+                } else {
+                    format!("{content}\n{USER_IMAGE_OMITTED}")
+                };
+                *message = pi_rs_core::Message::User { content };
+            }
+            pi_rs_core::Message::Tool { content, .. } => {
+                // Legacy tools can embed images in data.content, which core adapters extract.
+                // Replace only images core would otherwise extract; keep the JSON envelope.
+                if let Ok(mut value) = serde_json::from_str::<Value>(content) {
+                    if let Some(items) = value
+                        .get_mut("data")
+                        .and_then(|v| v.get_mut("content"))
+                        .and_then(Value::as_array_mut)
+                    {
+                        let mut previous = false;
+                        let mut changed = false;
+                        let mut out = Vec::with_capacity(items.len());
+                        for block in std::mem::take(items) {
+                            let extracted = block["type"] == "image"
+                                && block["data"]
+                                    .as_str()
+                                    .is_some_and(|s| s.len() <= 8 * 1024 * 1024)
+                                && matches!(
+                                    block["mimeType"].as_str(),
+                                    Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                                );
+                            if extracted {
+                                changed = true;
+                                if !previous {
+                                    out.push(json!({"type":"text", "text": TOOL_IMAGE_OMITTED}));
+                                }
+                                previous = true;
+                            } else {
+                                previous =
+                                    block["type"] == "text" && block["text"] == TOOL_IMAGE_OMITTED;
+                                out.push(block);
+                            }
+                        }
+                        *items = out;
+                        if changed {
+                            *content = value.to_string();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_profile_tests {
+    use super::*;
+    #[test]
+    fn legacy_and_ordered_images_are_projected_only_in_request_copy() {
+        use pi_rs_core::{ImageContent, Message};
+        let image = json!({"type":"image","data":"aGk=","mimeType":"image/png"});
+        let mut request = crate::model::model_request(
+            "test",
+            vec![
+                Message::UserWithImages {
+                    content: "hello".into(),
+                    images: vec![ImageContent {
+                        data: "aGk=".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                },
+                Message::Tool {
+                    call_id: "1".into(),
+                    content: json!({"data":{"content":[image.clone()]}}).to_string(),
+                },
+            ],
+            vec![],
+            100,
+        );
+        let original = request.clone();
+        let binding = crate::transcript::MessageContentBlocks {
+            message_id: uuid::Uuid::new_v4(),
+            blocks: vec![image.clone(), image],
+        };
+        let mut blocks = std::collections::BTreeMap::from([(0, binding.clone())]);
+        let mut tools = std::collections::BTreeMap::new();
+        project_nonvision_request(&mut request, &mut blocks, &mut tools);
+        assert!(
+            matches!(&request.messages[0], Message::User { content } if content.contains(USER_IMAGE_OMITTED))
+        );
+        assert!(
+            matches!(&request.messages[1], Message::Tool { content, .. } if content.contains(TOOL_IMAGE_OMITTED) && !content.contains("aGk="))
+        );
+        assert_eq!(blocks[&0].blocks.len(), 1);
+        assert_eq!(binding.blocks.len(), 2);
+        assert!(matches!(
+            &original.messages[0],
+            Message::UserWithImages { .. }
+        ));
+    }
+    #[test]
+    fn catalog_and_nonvision_projection() {
+        assert!(
+            !builtin_model_image_profile("openai-responses-api/v1", "o3-mini")
+                .unwrap()
+                .supports_images
+        );
+        assert!(
+            builtin_model_image_profile("openai-responses-api/v1", "gpt-4o")
+                .unwrap()
+                .supports_images
+        );
+        assert!(builtin_model_image_profile("unknown", "gpt-4o").is_none());
+        assert!(builtin_model_image_profile("openai-responses-api/v1", "not-in-catalog").is_none());
+        let mut blocks = vec![
+            json!({"type":"text", "text":"before"}),
+            json!({"type":"image", "data":"a"}),
+            json!({"type":"image", "data":"b"}),
+            json!({"type":"text", "text":"after"}),
+        ];
+        project_blocks(&mut blocks, USER_IMAGE_OMITTED);
+        assert_eq!(
+            blocks,
+            vec![
+                json!({"type":"text", "text":"before"}),
+                json!({"type":"text", "text": USER_IMAGE_OMITTED}),
+                json!({"type":"text", "text":"after"})
+            ]
+        );
     }
 }

@@ -1524,3 +1524,30 @@ recognized Gemini 3+ model IDs and PNG, JPEG or WebP images, and uses
 interpretation of this representation have not been tested. Non-text/image
 output, provider-specific block metadata, and model-specific image conversion
 are not implemented.
+
+### Model image profiles
+
+Durable adapters resolve model image profiles for each generation. The default
+`ProviderAdapter::image_profile` uses exact model IDs in a snapshot of pi-rs
+workbench's bundled `builtin-chat-models.json` for the OpenAI Responses,
+Anthropic Messages and Google adapter identities (Google also accepts the
+`models/` prefix). This snapshot can age; a custom or OpenAI-compatible endpoint
+must override the method when its capabilities differ. Unknown adapters and
+models return `None`, preserving the previous behavior; Ollama discovery is
+not wired to this catalog. Core `Model` does not expose modality or resize limits,
+so the core-only model path cannot resolve them automatically.
+
+For a known text-only model, durable replaces user and tool images with upstream
+placeholder text in the outgoing request copy, including images in legacy tool
+JSON. Ordered image runs collapse to one placeholder. The stored transcript and
+its original blocks remain intact. Existing request and provider hooks still run;
+the adapter validates the projected request after provider-body hooks.
+
+Install `create_model_fit_images_extension` with an image processor to use the
+selected adapter's current model limits for model-facing tool results before
+they are stored. A custom adapter can provide its own profile; unknown models
+use the upstream default limits. `Harness::model_image_profile` exposes the
+selected profile to hosts preparing user images with `fit_image` or `fit_images`
+before admission. User image fitting remains explicit and existing history is
+not refitted on model changes. Model input limits are based on catalog metadata,
+not runtime probing, and do not imply provider acceptance.

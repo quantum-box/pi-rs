@@ -682,6 +682,121 @@ async fn yield_blocks_reopen_and_dispatch_in_order() {
 }
 
 #[tokio::test]
+async fn nonvision_catalog_projects_images_on_real_adapter_after_reopen() {
+    use pi_rs_durable::{
+        extension::Extension,
+        recovery::UncertainPolicy,
+        runtime::{Config, Harness, Options, Status},
+    };
+    use std::sync::Arc;
+    let events = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+    let (url, first_rx, first_thread) = server(http(events), false);
+    let options = || Options {
+        model: Arc::new(UnusedModel),
+        tools: vec![],
+        restart_limit: 3,
+        max_turns: 3,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cancel = CancellationToken::new();
+    let hook = Arc::new(ContinueBlocks {
+        cancel: cancel.clone(),
+        yields: std::sync::atomic::AtomicUsize::new(0),
+        before: std::sync::atomic::AtomicUsize::new(0),
+        seen: std::sync::Mutex::new(vec![]),
+    });
+    let extension = || Extension {
+        name: "blocks".into(),
+        hooks: vec![hook.clone()],
+        ..Default::default()
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "o3-mini".into(),
+            system_prompt: "system".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.select_extensions(id, vec!["blocks".into()]).unwrap();
+    assert!(
+        h.submit_and_run(id, None, "initial".into(), &cancel)
+            .await
+            .is_err()
+    );
+    first_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    first_thread.join().unwrap();
+    drop(h);
+    let (url, rx, thread) = server(http(events), false);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let reopened = h.conversation(id).unwrap();
+    let binding = reopened.content_blocks.values().next().unwrap().clone();
+    assert_eq!(binding.blocks[1]["detail"], json!("high"));
+    h.install_provider_adapter(Arc::new(
+        OpenAiResponsesAdapter::new(&url, "fixture-secret".into()).unwrap(),
+    ))
+    .unwrap();
+    h.install_extension(extension()).unwrap();
+    assert!(
+        h.conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .any(|b| b.blocks.len() == 3)
+    );
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let body = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let content = &body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["role"] == "user" && v["content"].is_array())
+        .unwrap()["content"];
+    assert_eq!(
+        content,
+        &json!([
+            {"type":"input_text","text":"first"},
+            {"type":"input_text","text":"(image omitted: model does not support images)"},
+            {"type":"input_text","text":"last"}
+        ])
+    );
+    assert_eq!(body["temperature"], json!(0.25));
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .content_blocks
+            .values()
+            .next()
+            .unwrap()
+            .message_id,
+        binding.message_id
+    );
+    assert!(matches!(
+        h.conversation(id).unwrap().submissions[0].status,
+        Status::Done { .. }
+    ));
+    assert_eq!(hook.seen.lock().unwrap().len(), 2);
+    let fork = h.fork(id).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().content_blocks,
+        h.conversation(id).unwrap().content_blocks
+    );
+    // This fixture's extension has not declared block-aware compaction support.
+    assert!(h.request_manual_compaction(id, 0, None).is_err());
+    thread.join().unwrap();
+}
+
+#[tokio::test]
 async fn ordered_block_encoder_rejects_unrepresentable_metadata_and_hook_rewrite() {
     use pi_rs_durable::{model::DurableRequest, transcript::MessageContentBlocks};
     use std::collections::BTreeMap;

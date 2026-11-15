@@ -2969,6 +2969,19 @@ impl Harness {
         self.provider_adapter = Some(adapter);
         Ok(())
     }
+    /// Resolve the current model's image profile for admission-time fitting.
+    /// Returns None when the selected adapter or model is unknown.
+    pub fn model_image_profile(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::images::ModelImageProfile>, Error> {
+        let (c, _) = self.load(id)?;
+        Ok(self
+            .provider_adapter
+            .as_ref()
+            .filter(|a| c.provider_adapter.as_deref() == Some(a.id()))
+            .and_then(|a| a.image_profile(&c.config.model)))
+    }
     /// Persist opt-in for a settled conversation. Reopen requires the same adapter ID.
     pub fn select_provider_adapter(&mut self, id: Uuid, enabled: bool) -> Result<(), Error> {
         let (mut c, version) = self.load(id)?;
@@ -9749,6 +9762,20 @@ impl Harness {
                             "before-request cannot replace messages with durable blocks".into(),
                         ));
                     }
+                    if let Some(profile) = self
+                        .provider_adapter
+                        .as_ref()
+                        .filter(|a| c.provider_adapter.as_deref() == Some(a.id()))
+                        .and_then(|a| a.image_profile(&request.model))
+                        .filter(|p| !p.supports_images)
+                    {
+                        let _ = profile;
+                        crate::images::project_nonvision_request(
+                            &mut request,
+                            &mut blocks,
+                            &mut tool_blocks,
+                        );
+                    }
                     let durable_request = crate::model::DurableRequest {
                         request: request.clone(),
                         blocks,
@@ -11257,7 +11284,15 @@ impl Harness {
                     content,
                 } => {
                     let selected = self.selected_extensions(&c)?;
-                    let snapshot = serde_json::to_value(&c)?;
+                    let mut snapshot = serde_json::to_value(&c)?;
+                    if let Some(profile) = self
+                        .provider_adapter
+                        .as_ref()
+                        .filter(|a| c.provider_adapter.as_deref() == Some(a.id()))
+                        .and_then(|a| a.image_profile(&c.config.model))
+                    {
+                        snapshot["_model_image_profile"] = serde_json::to_value(profile)?;
+                    }
                     let memo = self.extension_memo(operation_id)?;
                     let context = crate::extension::Context {
                         snapshot: &snapshot,

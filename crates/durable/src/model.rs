@@ -207,6 +207,11 @@ pub trait ProviderAdapter: Send + Sync {
         }
         self.validate_with_tool_blocks(attempt, &request.request, body)
     }
+    /// Resolve image capabilities for the selected model. Override for custom
+    /// endpoints or a newer catalog. Unknown capability preserves existing behavior.
+    fn image_profile(&self, model: &str) -> Option<crate::images::ModelImageProfile> {
+        crate::images::builtin_model_image_profile(self.id(), model)
+    }
     /// Stable, versioned identity used to bind persisted conversations.
     fn id(&self) -> &str;
     async fn prepare(

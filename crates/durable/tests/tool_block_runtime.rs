@@ -188,6 +188,16 @@ impl pi_rs_durable::model::ProviderAdapter for Adapter {
     fn supports_durable_tool_blocks(&self) -> bool {
         true
     }
+    fn image_profile(&self, model: &str) -> Option<pi_rs_durable::images::ModelImageProfile> {
+        (model == "nonvision").then_some(pi_rs_durable::images::ModelImageProfile {
+            supports_images: false,
+            limits: pi_rs_durable::images::ImageLimits {
+                max_width: 23,
+                max_height: 24,
+                max_bytes: 1000,
+            },
+        })
+    }
     async fn prepare(
         &self,
         _: &pi_rs_durable::model::ProviderAttempt,
@@ -1285,4 +1295,72 @@ async fn builtin_fitter_uses_conversation_model_limits_for_tool_output() {
     let h = Harness::open_paused(&path, options()).unwrap();
     assert_eq!(h.conversation(id).unwrap().content_blocks, c.content_blocks);
     assert_eq!(adapter.0.lock().unwrap().len(), 2);
+}
+
+struct ProfileFit(std::sync::Mutex<Vec<pi_rs_durable::images::ImageLimits>>);
+#[async_trait]
+impl pi_rs_durable::images::ImageProcessor for ProfileFit {
+    async fn prepare(
+        &self,
+        _: &[u8],
+        _: &str,
+        limits: pi_rs_durable::images::ImageLimits,
+    ) -> Result<Option<pi_rs_durable::images::PreparedImage>, String> {
+        self.0.lock().unwrap().push(limits);
+        Ok(Some(pi_rs_durable::images::PreparedImage {
+            data: "bmV3".into(),
+            mime_type: "image/png".into(),
+            resized: None,
+            converted_from: None,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn adapter_profile_fits_and_projects_without_losing_stored_tool_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = setup(&path);
+    let adapter = Arc::new(Adapter::default());
+    let processor = Arc::new(ProfileFit(Default::default()));
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    h.install_extension(pi_rs_durable::images::create_model_fit_images_extension(
+        processor.clone(),
+    ))
+    .unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "nonvision".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["blocks".into(), "fit-images".into()])
+        .unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    assert_eq!(
+        h.model_image_profile(id).unwrap().unwrap().limits.max_width,
+        23
+    );
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(processor.0.lock().unwrap()[0].max_width, 23);
+    let c = h.conversation(id).unwrap();
+    let (index, binding) = c
+        .content_blocks
+        .iter()
+        .find(|(i, _)| matches!(c.messages.get(**i), Some(Message::Tool { .. })))
+        .unwrap();
+    assert_eq!(binding.blocks[1]["data"], "bmV3");
+    let delivered = &adapter.0.lock().unwrap()[1]["tool_blocks"][(index + 1).to_string()]["blocks"];
+    assert_eq!(
+        delivered[1]["text"],
+        "(tool image omitted: model does not support images)"
+    );
+    assert!(delivered.to_string().find("bmV3").is_none());
+    let expected = c.content_blocks.clone();
+    drop(h);
+    let h = setup(&path);
+    assert_eq!(h.conversation(id).unwrap().content_blocks, expected);
 }
