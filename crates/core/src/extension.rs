@@ -1737,7 +1737,8 @@ pub trait Extension: Send + Sync {
 }
 
 /// Origin known to the host for an extension-provided command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExtensionCommandSourceKind {
     Builtin,
     Inline,
