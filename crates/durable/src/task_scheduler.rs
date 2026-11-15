@@ -789,9 +789,8 @@ impl Scheduler {
             {
                 // A held failure is cancellation intent. Persist the mark and
                 // cascade before letting any descendant execute again.
-                if self.validator.is_some() {
+                if let Some(harness) = self.validator.as_mut() {
                     drop(gate);
-                    let harness = self.validator.as_mut().unwrap();
                     owner
                         .conversation_controls()
                         .fence(|| harness.abort_owned_graph(None, Some(snapshot.task.id())))
