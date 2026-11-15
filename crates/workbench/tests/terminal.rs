@@ -1205,13 +1205,24 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
             ])
             .env("PI_RS_HOME", &home)
             .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    output_until(&mut master, |text| text.contains("Resume session"));
+    output_until(&mut master, |text| {
+        text.contains("Resume session") && text.contains("\x1b]11;?\x07") && text.contains("\x1b[c")
+    });
+    // A background response arriving after the initial timeout must repaint the
+    // selector, while the RPC stdout remains a clean JSON protocol stream.
+    std::thread::sleep(Duration::from_millis(160));
+    master
+        .write_all(b"\x1b]11;rgb:0000/0000/0000\x1b\\")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[38;2;"));
+    master.write_all(b"\x1b[?1;2c").unwrap();
     master.write_all(b"Resume Fixture").unwrap();
     output_until(&mut master, |text| {
         text.contains("Resume session") && text.contains("Resume Fixture")
@@ -1320,10 +1331,19 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
     );
     output_until(&mut master, |text| text.contains("Resume session"));
     master.write_all(b"\x1b").unwrap();
+    // The selector has already begun to close when a slow terminal replies.
+    // Its bounded cleanup must consume the reply before restoring raw mode.
+    std::thread::sleep(Duration::from_millis(60));
+    master
+        .write_all(b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?1;2c")
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut terminal_output = Vec::new();
     while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
         let mut buffer = [0; 8192];
-        let _ = master.read(&mut buffer);
+        if let Ok(count) = master.read(&mut buffer) {
+            terminal_output.extend_from_slice(&buffer[..count]);
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
@@ -1333,6 +1353,12 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
             .unwrap()
             .is_some_and(|status| status.success())
     );
+    let mut buffer = [0; 8192];
+    if let Ok(count) = master.read(&mut buffer) {
+        terminal_output.extend_from_slice(&buffer[..count]);
+    }
+    assert!(String::from_utf8_lossy(&terminal_output).contains("\x1b[?2031l"));
+    assert!(!String::from_utf8_lossy(&terminal_output).contains("rgb:0000"));
     let mut output = String::new();
     process
         .0

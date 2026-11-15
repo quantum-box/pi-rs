@@ -26,6 +26,24 @@ pub fn finish_terminal_colors_pending() -> bool {
     TERMINAL_COLORS_PENDING.swap(false, Ordering::Relaxed)
 }
 
+#[cfg(any(unix, windows))]
+pub struct PendingTerminalColors;
+
+#[cfg(any(unix, windows))]
+impl PendingTerminalColors {
+    pub fn new() -> Self {
+        mark_terminal_colors_pending();
+        Self
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for PendingTerminalColors {
+    fn drop(&mut self) {
+        finish_terminal_colors_pending();
+    }
+}
+
 struct PaletteState {
     current: Option<[[u8; 3]; 16]>,
     pending: [Option<[u8; 3]>; 16],
