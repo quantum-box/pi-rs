@@ -93,7 +93,17 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
     }
     let mut configuration_errors = Vec::new();
     let user_path = config::agent_dir().join("mcp.json");
-    let user = config::read_object(&user_path)?;
+    let user = match config::read_object(&user_path) {
+        Ok(user) => user,
+        Err(_) if strict => {
+            configuration_errors.push(format!(
+                "{}: could not read or parse MCP configuration",
+                user_path.display()
+            ));
+            Default::default()
+        }
+        Err(error) => return Err(error),
+    };
     if strict
         && user
             .get("mcpServers")
@@ -112,7 +122,10 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
     if strict {
         servers.retain(|name, value| {
             if report_server_config(value).is_none() {
-                configuration_errors.push(format!("invalid MCP server configuration for {name}"));
+                configuration_errors.push(format!(
+                    "{}: invalid MCP server configuration for {name}",
+                    user_path.display()
+                ));
                 false
             } else {
                 true
@@ -124,7 +137,17 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
     let mut project_overrides = BTreeSet::new();
     if args.trusted {
         let project_path = args.workspace.join(".pi/mcp.json");
-        let project = config::read_object(&project_path)?;
+        let project = match config::read_object(&project_path) {
+            Ok(project) => project,
+            Err(_) if strict => {
+                configuration_errors.push(format!(
+                    "{}: could not read or parse MCP configuration",
+                    project_path.display()
+                ));
+                Default::default()
+            }
+            Err(error) => return Err(error),
+        };
         if strict
             && project
                 .get("mcpServers")
@@ -143,8 +166,10 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
                         .iter()
                         .any(|key| entry.get(*key).is_some());
                     if !entry.is_object() || (full && report_server_config(entry).is_none()) {
-                        configuration_errors
-                            .push(format!("invalid MCP server configuration for {name}"));
+                        configuration_errors.push(format!(
+                            "{}: invalid MCP server configuration for {name}",
+                            project_path.display()
+                        ));
                         false
                     } else {
                         true

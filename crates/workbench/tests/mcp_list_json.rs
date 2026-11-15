@@ -215,6 +215,46 @@ fn list_json_rejects_non_object_mcp_servers() {
 }
 
 #[test]
+fn list_json_keeps_other_source_when_a_file_is_malformed() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["--trust", "mcp", "list", "--json"])
+            .output()
+            .unwrap()
+    };
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"global":{"command":"ignored","enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(project.join("mcp.json"), "{not-json").unwrap();
+    let output = run();
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["servers"][0]["name"], "global");
+    assert!(data["errors"][0].as_str().unwrap().contains(".pi"));
+    assert!(data["errors"][0].as_str().unwrap().contains("mcp.json"));
+    std::fs::write(home.join("mcp.json"), "{not-json").unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"local":{"command":"ignored","enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = run();
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["servers"][0]["name"], "local");
+    assert!(data["errors"][0].as_str().unwrap().contains("home"));
+}
+
+#[test]
 fn list_json_keeps_global_on_invalid_project_replacement_and_redacts_values() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
