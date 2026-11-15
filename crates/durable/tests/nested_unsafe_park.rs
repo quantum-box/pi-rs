@@ -98,6 +98,12 @@ impl KeyedTool for Parent {
     ) -> ToolReply {
         if let Some(wake) = host.pending_wake() {
             log(&self.root, "wake-effects");
+            if self.stage == "pause-wake" {
+                std::fs::write(self.root.join("wake-running"), b"ready").unwrap();
+                while !self.root.join("release-wake").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             if self.stage == "wake" {
                 std::fs::write(self.root.join("wake-running"), b"ready").unwrap();
                 std::future::pending::<()>().await;
@@ -107,7 +113,16 @@ impl KeyedTool for Parent {
                 .await
                 .unwrap();
             assert_eq!(wake.checkpoint, json!({"child":child.operation_id}));
-            assert_eq!(wake.ended, vec![child.operation_id]);
+            if self.root.join("two-children").exists() {
+                let second = host
+                    .call_keyed_unpolled_with_id("child2", "child2", json!({}))
+                    .await
+                    .unwrap();
+                assert!(wake.ended.contains(&child.operation_id));
+                assert!(wake.ended.contains(&second.operation_id));
+            } else {
+                assert_eq!(wake.ended, vec![child.operation_id]);
+            }
             return match child.outcome {
                 Outcome::Succeeded(value) => Outcome::Succeeded(format!("resumed:{value}")).into(),
                 other => Outcome::Failed(format!("unexpected child: {other:?}")).into(),
@@ -119,6 +134,13 @@ impl KeyedTool for Parent {
             .await
             .unwrap();
         assert!(matches!(child.outcome, Outcome::Pending { .. }));
+        if self.root.join("two-children").exists() {
+            let second = host
+                .call_keyed_unpolled_with_id("child2", "child2", json!({}))
+                .await
+                .unwrap();
+            assert!(matches!(second.outcome, Outcome::Pending { .. }));
+        }
         if self.stage == "before-park" {
             std::fs::write(self.root.join("before-park"), b"ready").unwrap();
             std::future::pending::<()>().await;
@@ -151,6 +173,30 @@ impl KeyedTool for Parent {
     }
 }
 struct Child(PathBuf);
+struct SecondChild(PathBuf);
+#[async_trait]
+impl Tool for SecondChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child2")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        Outcome::Pending {
+            reference: "remote2".into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        Some(if self.0.join("finish").exists() {
+            Outcome::Succeeded("result2".into())
+        } else {
+            Outcome::Pending {
+                reference: "remote2".into(),
+            }
+        })
+    }
+}
 #[async_trait]
 impl Tool for Child {
     fn spec(&self) -> ToolSpec {
@@ -777,6 +823,100 @@ async fn legacy_pending_safe_polls_but_unsafe_requires_verified_binding() {
     }
 }
 
+#[tokio::test]
+async fn old_unsafe_proof_without_parent_identity_stays_blocked_after_child_bind() {
+    use durable_store::{Check, Expected, Mutation, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (scheduler, id, root_op) = start_parked(
+        root,
+        options_custom(
+            root,
+            "finish",
+            Some(1),
+            "parent/tenant-a",
+            Some("child/tenant-a"),
+            ReplayPolicy::Unsafe,
+        ),
+    )
+    .await;
+    let job = scheduler
+        .nested_pending_jobs(id, root_op)
+        .unwrap()
+        .pop()
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+    let store = Store::open(root.join("db")).unwrap();
+    let entries = store.list(b"").unwrap();
+    let mut changed_proof = false;
+    let mut changed_child = false;
+    for (key, entry) in entries {
+        let Ok(mut value) = serde_json::from_slice::<Value>(&entry.value) else {
+            continue;
+        };
+        let mut changed = false;
+        if let Some(identity) = value
+            .pointer_mut("/nested_resume/unsafe_park/identity")
+            .and_then(Value::as_object_mut)
+        {
+            changed_proof = identity.remove("identity").is_some();
+            changed = changed_proof;
+        }
+        if key.starts_with(format!("nested/{root_op}/").as_bytes()) {
+            changed_child = value
+                .as_object_mut()
+                .unwrap()
+                .remove("durable_identity")
+                .is_some();
+            changed |= changed_child;
+        }
+        if changed {
+            store
+                .commit(
+                    &[Check {
+                        key: key.clone(),
+                        expected: Expected::Version(entry.version),
+                    }],
+                    &[Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&value).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
+    }
+    assert!(changed_proof && changed_child);
+    drop(store);
+    let before = count(root, "child-polls");
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let mut scheduler = Scheduler::open(
+        root.join("db"),
+        options_custom(
+            root,
+            "finish",
+            Some(1),
+            "parent/tenant-a",
+            Some("child/tenant-a"),
+            ReplayPolicy::Unsafe,
+        ),
+    )
+    .unwrap();
+    scheduler
+        .bind_nested_pending_identity(
+            id,
+            root_op,
+            job.operation_id,
+            &job.reference,
+            "child/tenant-a",
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(count(root, "child-polls"), before);
+    assert_eq!(count(root, "wake-effects"), 0);
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    scheduler.shutdown().await.unwrap();
+}
+
 #[derive(Clone)]
 struct MutableSettings(Arc<std::sync::Mutex<(Option<u32>, Option<String>)>>);
 struct MutableParent {
@@ -806,6 +946,7 @@ impl KeyedTool for MutableParent {
 }
 fn mutable_options(
     root: &Path,
+    stage: &str,
 ) -> (
     Options,
     pi_rs_durable::nested_identity::IdentityHandle,
@@ -819,7 +960,7 @@ fn mutable_options(
     let parent = Arc::new(KeyedToolAdapter::new(MutableParent {
         inner: Parent {
             root: root.into(),
-            stage: "finish".into(),
+            stage: stage.into(),
             version: Some(1),
             identity: "parent/tenant-a".into(),
         },
@@ -877,7 +1018,7 @@ async fn same_arc_live_identity_version_and_optout_changes_are_fenced() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (opts, parent_handle, child_handle, settings) = mutable_options(root);
+        let (opts, parent_handle, child_handle, settings) = mutable_options(root, "finish");
         let (mut scheduler, id, _) = start_parked(root, opts).await;
         let config = settings.0.clone();
         match mode {
@@ -934,7 +1075,47 @@ async fn same_arc_live_identity_version_and_optout_changes_are_fenced() {
 }
 
 #[tokio::test]
-async fn failed_or_skipped_reply_after_suspend_never_hides_failure_or_resumes() {
+async fn unsafe_wake_holds_all_child_and_parent_leases_during_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("two-children"), b"yes").unwrap();
+    let (mut opts, parent, child, _) = mutable_options(root, "pause-wake");
+    let second: Arc<dyn Tool> = Arc::new(SecondChild(root.into()));
+    let second_handle =
+        pi_rs_durable::nested_identity::register(&second, Some("child2/tenant-a".into())).unwrap();
+    opts.tools.push(RegisteredTool {
+        tool: second,
+        replay: ReplayPolicy::Unsafe,
+    });
+    let (mut scheduler, id, _) = start_parked(root, opts).await;
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    until(|| root.join("wake-running").exists()).await;
+    for (handle, identity) in [
+        (&parent, "parent/tenant-b"),
+        (&child, "child/tenant-b"),
+        (&second_handle, "child2/tenant-b"),
+    ] {
+        assert!(
+            handle
+                .update(Some(identity.into()), || panic!("lease allowed update"))
+                .await
+                .is_err()
+        );
+    }
+    std::fs::write(root.join("release-wake"), b"ready").unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        second_handle
+            .update(Some("child2/tenant-a".into()), || {})
+            .await
+            .is_ok()
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_or_skipped_after_suspend_preserves_safe_and_unsafe_contracts() {
     for policy in [ReplayPolicy::Safe, ReplayPolicy::Unsafe] {
         for stage in ["return-failed", "return-skipped"] {
             let dir = tempfile::tempdir().unwrap();
@@ -961,6 +1142,15 @@ async fn failed_or_skipped_reply_after_suspend_never_hides_failure_or_resumes() 
             scheduler.submit(id, None, "work".into()).unwrap();
             until(|| scheduler.blocked(id).unwrap().is_some()).await;
             let (_, reason) = scheduler.blocked(id).unwrap().unwrap();
+            if policy == ReplayPolicy::Safe {
+                assert!(scheduler.conversation(id).unwrap().nested_suspended());
+                std::fs::write(root.join("finish"), b"ready").unwrap();
+                wait(&mut scheduler, id).await;
+                assert!(scheduler.blocked(id).unwrap().is_none());
+                assert_eq!(count(root, "wake-effects"), 1);
+                scheduler.shutdown().await.unwrap();
+                continue;
+            }
             assert!(
                 reason.contains(if stage == "return-failed" {
                     "parent explicit failure"
@@ -1016,6 +1206,121 @@ impl KeyedTool for ReentrantParent {
 struct ReentrantChild {
     root: PathBuf,
     handle: Arc<std::sync::Mutex<Option<pi_rs_durable::nested_identity::IdentityHandle>>>,
+}
+
+#[tokio::test]
+async fn initial_unsafe_parent_waits_for_busy_identity_and_rejects_invalidated_identity() {
+    for invalidated in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (opts, parent, _, _) = mutable_options(root, "finish");
+        if invalidated {
+            let handle = parent.clone();
+            assert!(
+                tokio::spawn(async move {
+                    handle
+                        .update(Some("parent/tenant-a".into()), || {
+                            panic!("interrupted update")
+                        })
+                        .await
+                })
+                .await
+                .is_err()
+            );
+        }
+        let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let mut writer = None;
+        let mut release = None;
+        if !invalidated {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let handle = parent.clone();
+            writer = Some(std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(handle.update(Some("parent/tenant-a".into()), || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }))
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release = Some(release_tx);
+        }
+        scheduler.submit(id, None, "work".into()).unwrap();
+        if invalidated {
+            until(|| scheduler.blocked(id).unwrap().is_some()).await;
+            assert!(
+                scheduler
+                    .blocked(id)
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .contains("identity unavailable")
+            );
+        } else {
+            until(|| scheduler.conversation(id).unwrap().tool_attempt().is_some()).await;
+            assert_eq!(count(root, "initial-effects"), 0);
+            release.unwrap().send(()).unwrap();
+            assert!(writer.unwrap().join().unwrap().is_ok());
+            until(|| root.join("poll-entered").exists()).await;
+        }
+        assert_eq!(count(root, "initial-effects"), usize::from(!invalidated));
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn safe_unbound_child_poll_holds_registered_identity_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let slot = Arc::new(std::sync::Mutex::new(None));
+    let parent = Arc::new(KeyedToolAdapter::new(Parent {
+        root: root.into(),
+        stage: "finish".into(),
+        version: Some(1),
+        identity: "parent/tenant-a".into(),
+    }))
+    .register(ReplayPolicy::Safe);
+    let child: Arc<dyn Tool> = Arc::new(ReentrantChild {
+        root: root.into(),
+        handle: slot.clone(),
+    });
+    *slot.lock().unwrap() = Some(pi_rs_durable::nested_identity::register(&child, None).unwrap());
+    let opts = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent,
+            RegisteredTool {
+                tool: child,
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| count(root, "child-busy") > 0).await;
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    scheduler.shutdown().await.unwrap();
 }
 #[async_trait]
 impl Tool for ReentrantChild {

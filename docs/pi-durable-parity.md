@@ -659,6 +659,10 @@ configuration changes under that handle. An unsafe parent additionally binds
 its own live, host-declared identity and version; it is checked at invocation,
 park, poll and wake, not cached by allocation. The host must restore equivalent
 identity registrations before reopening.
+Unsafe resume leases the parent and all child identities before claiming an
+attempt and retains them through its checked result commit. Older experimental
+unsafe park proofs without parent identity fail closed even after child binding;
+they require authoritative parent reconciliation.
 
 For compatibility, unbound pending jobs under replay-safe parents retain legacy
 polling; their records cannot verify the backend or tenant, so the host must
@@ -672,6 +676,6 @@ reconciliation remains available instead. A bind is a host assertion and does
 not itself verify the remote system.
 
 Upstream returns either `ToolPark` or a result. This API first requests a park
-and then returns a normal reply. A `Failed` or `Skipped` reply rejects the
+and then returns a normal reply. For unsafe parents, a `Failed` or `Skipped` reply rejects the
 park and is preserved in the blocked reason while unresolved children require
-reconciliation; it cannot cause an automatic wake that hides the failure.
+reconciliation. Safe parents retain the existing suspension behavior.

@@ -7,6 +7,36 @@ use pi_rs_core::{
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+struct Checkpoint {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+type Checkpoints = std::collections::HashMap<(Uuid, &'static str), Arc<Checkpoint>>;
+static CHECKPOINTS: std::sync::OnceLock<std::sync::Mutex<Checkpoints>> = std::sync::OnceLock::new();
+fn install(id: Uuid, stage: &'static str) -> Arc<Checkpoint> {
+    let point = Arc::new(Checkpoint {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    CHECKPOINTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert((id, stage), point.clone());
+    point
+}
+pub(super) async fn checkpoint(id: Uuid, stage: &'static str) {
+    let point = CHECKPOINTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&(id, stage));
+    if let Some(point) = point {
+        point.reached.notify_one();
+        point.release.notified().await;
+    }
+}
+
 struct BoundaryModel;
 #[async_trait::async_trait]
 impl pi_rs_core::Model for BoundaryModel {
@@ -141,28 +171,47 @@ impl Tool for BoundaryChild {
     }
 }
 fn options(root: &Path, version: u32, changed_spec: bool, policy: ReplayPolicy) -> Options {
+    options_with_handles(root, version, changed_spec, policy).0
+}
+fn options_with_handles(
+    root: &Path,
+    version: u32,
+    changed_spec: bool,
+    policy: ReplayPolicy,
+) -> (
+    Options,
+    crate::nested_identity::IdentityHandle,
+    crate::nested_identity::IdentityHandle,
+) {
     let parent = Arc::new(KeyedToolAdapter::new(BoundaryParent {
         root: root.into(),
         version,
         changed_spec,
     }))
     .register(policy);
-    crate::nested_identity::register(&parent.tool, Some("test-parent/tenant-a".into())).unwrap();
+    let parent_handle =
+        crate::nested_identity::register(&parent.tool, Some("test-parent/tenant-a".into()))
+            .unwrap();
     let child: Arc<dyn Tool> = Arc::new(BoundaryChild(root.into()));
-    crate::nested_identity::register(&child, Some("test-backend:child:v1".into())).unwrap();
-    Options {
-        model: Arc::new(BoundaryModel),
-        tools: vec![
-            parent,
-            RegisteredTool {
-                tool: child,
-                replay: ReplayPolicy::Unsafe,
-            },
-        ],
-        restart_limit: 8,
-        max_turns: 8,
-        uncertain_policy: UncertainPolicy::RequireReconciliation,
-    }
+    let child_handle =
+        crate::nested_identity::register(&child, Some("test-backend:child:v1".into())).unwrap();
+    (
+        Options {
+            model: Arc::new(BoundaryModel),
+            tools: vec![
+                parent,
+                RegisteredTool {
+                    tool: child,
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            restart_limit: 8,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        },
+        parent_handle,
+        child_handle,
+    )
 }
 async fn until(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -178,6 +227,93 @@ async fn wait(scheduler: &mut Scheduler, id: Uuid) {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn busy_identity_does_not_claim_and_leases_survive_until_commit() {
+    for busy_parent in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (opts, parent, child) = options_with_handles(root, 1, false, ReplayPolicy::Unsafe);
+        let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        until(|| {
+            scheduler
+                .conversation(id)
+                .is_ok_and(|c| c.nested_suspended())
+                && root.join("poll-entered").exists()
+        })
+        .await;
+        let before_claim = install(id, "before-claim");
+        let busy = install(id, "lease-busy");
+        let result = install(id, "before-result-commit");
+        std::fs::write(root.join("release"), b"ready").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), before_claim.reached.notified())
+            .await
+            .unwrap();
+        let parked_attempt = scheduler.conversation(id).unwrap().tool_attempt();
+        let target = if busy_parent {
+            parent.clone()
+        } else {
+            child.clone()
+        };
+        let identity = if busy_parent {
+            "test-parent/tenant-a"
+        } else {
+            "test-backend:child:v1"
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(target.update(Some(identity.into()), || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        before_claim.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), busy.reached.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler.conversation(id).unwrap().tool_attempt(),
+            parked_attempt
+        );
+        assert_eq!(count(root, "wake-effects"), 0);
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap().is_ok());
+        busy.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), result.reached.notified())
+            .await
+            .unwrap();
+        assert_eq!(count(root, "wake-effects"), 1);
+        assert!(
+            parent
+                .update(Some("changed".into()), || panic!("parent lease lost"))
+                .await
+                .is_err()
+        );
+        assert!(
+            child
+                .update(Some("changed".into()), || panic!("child lease lost"))
+                .await
+                .is_err()
+        );
+        result.release.notify_one();
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none());
+        scheduler.shutdown().await.unwrap();
+    }
 }
 struct Kill(std::process::Child);
 impl Drop for Kill {

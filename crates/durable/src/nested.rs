@@ -329,6 +329,33 @@ pub(crate) fn children_match(
     Ok(any)
 }
 
+/// Lease all recorded child identities before an unsafe parent claims its
+/// next attempt. Nonblocking acquisition avoids lock-order deadlocks.
+pub(crate) fn lease_children(
+    store: &durable_store::Store,
+    root: Uuid,
+    tools: &std::collections::HashMap<String, RegisteredTool>,
+) -> Result<Option<Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>>, crate::runtime::Error> {
+    let mut leases = Vec::new();
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        let Some(identity) = record.durable_identity.as_deref() else {
+            return Ok(None);
+        };
+        let Some(reg) = tools.get(&record.name) else {
+            return Ok(None);
+        };
+        if record.policy != reg.replay {
+            return Ok(None);
+        }
+        let Some(lease) = crate::nested_identity::lease(&reg.tool, identity) else {
+            return Ok(None);
+        };
+        leases.push(lease);
+    }
+    Ok((!leases.is_empty()).then_some(leases))
+}
+
 // Automatic replay is restricted to a root with only terminal records and at
 // least one explicitly resolved job. Unresolved descendants remain barriers.
 pub(crate) fn resolved_for_replay(
@@ -2126,7 +2153,15 @@ impl NestedHost {
                 };
                 Some(lease)
             } else {
-                None
+                match crate::nested_identity::execution_lease(&reg.tool) {
+                    Ok(Some(lease)) => Some(lease),
+                    Ok(None) => None,
+                    _ => {
+                        return self.pending_failure(
+                            "nested poll identity unavailable; pending reference retained",
+                        );
+                    }
+                }
             };
             let Some(Outcome::Pending { reference }) = &record.outcome else {
                 return self.fail("invalid nested pending record");

@@ -391,7 +391,8 @@ handle or change it during a call.
 
 For compatibility, a replay-safe parent's unbound legacy job continues to poll:
 the host must restore the original backend and tenant because such a record
-cannot prove either. A bound job with missing or changed registration never
+cannot prove either. If that tool has an identity handle, polling holds its
+read lease even for an unbound legacy record. A bound job with missing or changed registration never
 polls. An unsafe park cannot poll or resume with any unbound child. Operators can
 inspect `nested_pending_jobs`, verify the remote reference and tenant through an
 independent authoritative channel, then explicitly call
@@ -422,6 +423,10 @@ for the parent, bump the version when implementation or checkpoint meaning
 changes, and restore the same parent and child identities, spec, version and
 unsafe policy after reopen. Unsafe parks require identities for every recorded
 nested child; legacy unbound children cannot automatically resume them.
+Experimental older unsafe park proofs without a parent identity cannot be
+recovered by binding children: authoritative parent reconciliation is required.
+Before claiming a resumed unsafe attempt, the runtime leases the parent and all
+child identities through handler execution and the checked result commit.
 The committed checkpoint and original attempt identity fence the park; a new
 attempt is claimed before resumption. Process death after that claim is an
 interrupted unsafe invocation and requires reconciliation (or follows the
@@ -434,9 +439,10 @@ but does not cancel an accepted external job, which remains available for
 explicit reconciliation. This is not upstream's `wait: false`, `ToolPark`,
 `any` wake, or independently executing child task. Unlike upstream's distinct
 `ToolPark` return type, this API requests suspension before returning a normal
-reply. If that reply is `Failed` or `Skipped`, the suspension is rejected and
+reply. For an unsafe parent, if that reply is `Failed` or `Skipped`, the suspension is rejected and
 the failure is included in the blocked reason; the still-pending child must be
-reconciled before parent settlement. It is never hidden by a later wake.
+reconciled before parent settlement. A replay-safe parent retains its earlier
+behavior and may suspend after such a reply.
 
 Pending nested jobs are resolved by tool name and replay policy; their stored
 references are not bound to an implementation or tenant identity. On reopen,
