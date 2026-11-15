@@ -1367,9 +1367,10 @@ impl SessionBuilder {
                 Ok(())
             },
         )?;
-        if let Some((_, name, client)) = resolved {
+        if let Some((provider, name, client)) = resolved {
             self.model = client;
             self.model_name = name;
+            self.model_provider = Some(provider);
         }
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
@@ -1400,6 +1401,7 @@ impl SessionBuilder {
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
+            model_provider: self.model_provider,
             system_prompt: self.system_prompt,
             registry,
             limits: self.limits,
@@ -1434,6 +1436,7 @@ impl SessionBuilder {
 pub struct AgentSession {
     model: Arc<dyn Model>,
     model_name: String,
+    model_provider: Option<String>,
     system_prompt: String,
     registry: Arc<Registry>,
     limits: Limits,
@@ -1452,6 +1455,11 @@ pub struct AgentSession {
 #[derive(Clone)]
 enum BranchResolution {
     Registered,
+    Inherited {
+        provider: String,
+        model: String,
+        client: Arc<dyn Model>,
+    },
     Historical {
         provider: String,
         model: String,
@@ -1472,6 +1480,13 @@ impl AgentSession {
     }
     fn resolve_branch_model(&self, journal: &Session, target: u64) -> Result<BranchResolution> {
         let Some((provider, name, _)) = journal.model_identity_at(target) else {
+            if let Some(provider) = &self.model_provider {
+                return Ok(BranchResolution::Inherited {
+                    provider: provider.clone(),
+                    model: self.model_name.clone(),
+                    client: self.model.clone(),
+                });
+            }
             return Ok(BranchResolution::Registered);
         };
         if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some() {
@@ -1519,6 +1534,7 @@ impl AgentSession {
             })?;
         self.model = model;
         self.model_name = name;
+        self.model_provider = provider.map(str::to_owned);
         self.refresh_run_config();
         Ok(())
     }
@@ -1754,6 +1770,7 @@ impl AgentSession {
         }
         self.model = model;
         self.model_name = name;
+        self.model_provider = provider.map(str::to_owned);
         self.refresh_run_config();
         Ok(())
     }
@@ -1888,7 +1905,12 @@ impl AgentSession {
                 .try_lock()
                 .map_err(|_| Error::Session("session journal is in use".into()))?;
             let revoked = match &resolution {
-                BranchResolution::Fallback {
+                BranchResolution::Inherited {
+                    provider,
+                    model,
+                    client,
+                }
+                | BranchResolution::Fallback {
                     provider,
                     model,
                     client,
@@ -1932,7 +1954,7 @@ impl AgentSession {
             )
         };
         match resolution {
-            BranchResolution::Historical { .. } => {
+            BranchResolution::Historical { .. } | BranchResolution::Inherited { .. } => {
                 self.model_fallback = None;
             }
             BranchResolution::Fallback {
@@ -1959,6 +1981,7 @@ impl AgentSession {
         {
             self.model = client;
             self.model_name = model;
+            self.model_provider = provider;
             self.refresh_run_config();
         }
         emit(
@@ -2026,6 +2049,17 @@ impl AgentSession {
         let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tree_resolution = match &resolution {
             BranchResolution::Registered => None,
+            BranchResolution::Inherited {
+                provider,
+                model,
+                client,
+            } => Some(crate::agent::TreeModelResolution {
+                provider: provider.clone(),
+                model: model.clone(),
+                client: client.clone(),
+                fallback: true,
+                revoked: revoked.clone(),
+            }),
             BranchResolution::Historical {
                 provider,
                 model,
@@ -2213,6 +2247,7 @@ impl AgentSession {
                 }
                 self.model = model;
                 self.model_name = replacement;
+                self.model_provider = replacement_provider;
                 self.refresh_run_config();
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
             } else {
@@ -2527,7 +2562,8 @@ impl AgentSession {
         let selection = session.model_identity_at(session.head());
         let (provider, model_name, model) = if let Some((provider, name, _)) = selection {
             let model = match &resolution {
-                BranchResolution::Historical { client, .. }
+                BranchResolution::Inherited { client, .. }
+                | BranchResolution::Historical { client, .. }
                 | BranchResolution::Fallback { client, .. } => Some(client.clone()),
                 BranchResolution::Registered => {
                     branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
@@ -2540,12 +2576,11 @@ impl AgentSession {
         } else {
             // A fork before the first model selection still uses the source's
             // active client. Preserve its qualified identity when it is known.
-            let journal = self.journal()?;
-            let provider = journal
-                .model_identity_at(journal.head())
-                .and_then(|(provider, name, _)| (name == self.model_name).then_some(provider))
-                .flatten();
-            (provider, self.model_name.clone(), self.model.clone())
+            (
+                self.model_provider.clone(),
+                self.model_name.clone(),
+                self.model.clone(),
+            )
         };
         session
             .auto_compaction_control()
@@ -2577,7 +2612,12 @@ impl AgentSession {
         );
         fork.registry = self.registry.clone();
         match resolution {
-            BranchResolution::Historical {
+            BranchResolution::Inherited {
+                provider,
+                model,
+                client,
+            }
+            | BranchResolution::Historical {
                 provider,
                 model,
                 client,

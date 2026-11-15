@@ -189,7 +189,7 @@ mod tests {
             })
             .unwrap();
         let before_selection = journal.head();
-        let session = catalog
+        let mut session = catalog
             .session_builder("a", "shared")
             .unwrap()
             .build(journal)
@@ -198,6 +198,21 @@ mod tests {
         assert_eq!(fork.prompt("one").await.unwrap(), "first");
         assert_eq!(fork.prompt("two").await.unwrap(), "first");
         fork.close().await.unwrap();
+        session.checkout(before_selection).unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.prompt("fork one").await.unwrap(), "first");
+        assert_eq!(fork.prompt("fork two").await.unwrap(), "first");
+        fork.close().await.unwrap();
+        assert_eq!(session.prompt("one").await.unwrap(), "first");
+        assert_eq!(session.prompt("two").await.unwrap(), "first");
+        session
+            .navigate_tree(before_selection, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("tree one").await.unwrap(), "first");
+        assert_eq!(session.prompt("tree two").await.unwrap(), "first");
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
