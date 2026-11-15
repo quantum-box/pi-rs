@@ -6662,7 +6662,8 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
                 json!(
                     [3, 5, 7, 10, 15, 20]
                         .into_iter()
-                        .find(|count| *count > autocomplete_items)
+                        .skip_while(|count| *count != autocomplete_items)
+                        .nth(1)
                         .unwrap_or(3)
                 ),
             ),
