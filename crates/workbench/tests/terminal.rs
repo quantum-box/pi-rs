@@ -2458,36 +2458,93 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
             .spawn()
             .unwrap(),
     );
-    output_until(&mut master, |text| text.contains("Enter to send"));
+    fn wait_terminal(
+        master: &mut File,
+        label: &str,
+        initial: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut output = initial.as_bytes().to_vec();
+        let mut buffer = [0; 8192];
+        loop {
+            match master.read(&mut buffer) {
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+                {
+                    ()
+                }
+                Err(error) => panic!("{label}: terminal read failed: {error}"),
+            }
+            let text = String::from_utf8_lossy(&output);
+            if predicate(&text) {
+                return text.into_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label}: timed out; terminal: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn wait_request(
+        master: &mut File,
+        receiver: &std::sync::mpsc::Receiver<String>,
+        label: &str,
+    ) -> (String, String) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            if let Ok(body) = receiver.try_recv() {
+                return (body, String::from_utf8_lossy(&output).into_owned());
+            }
+            match master.read(&mut buffer) {
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+                {
+                    ()
+                }
+                Err(error) => panic!("{label}: terminal read failed: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label}: timed out; terminal: {}",
+                String::from_utf8_lossy(&output)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    wait_terminal(&mut master, "startup", "", |text| {
+        text.contains("Enter to send")
+    });
     std::fs::write(&settings, serde_json::json!({"skills":[skill]}).to_string()).unwrap();
     master.write_all(b"first request\r").unwrap();
-    let first = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    let (first, observed) = wait_request(&mut master, &receiver, "first request");
     assert!(first.contains("unique-reload-skill-description"), "{first}");
-    output_until(&mut master, |text| text.contains("done"));
-    std::thread::sleep(Duration::from_secs(1));
+    let idle = |text: &str| {
+        let frame = text.rsplit("\x1b[?2026h").next().unwrap_or_default();
+        frame.contains("done") && frame.contains("\x1b[?2026l") && !frame.contains("Escで取消")
+    };
+    if !idle(&observed) {
+        wait_terminal(&mut master, "first response idle", &observed, idle);
+    }
     std::fs::write(&settings, "{").unwrap();
     master.write_all(b"/reload\r").unwrap();
-    output_until(&mut master, |text| text.contains("Reloaded settings"));
-    std::thread::sleep(Duration::from_secs(1));
+    loop {
+        let output = wait_terminal(&mut master, "reload", "", |text| {
+            text.contains("Reloaded settings")
+                || text.contains("Wait for the shell command to finish")
+        });
+        if output.contains("Reloaded settings") {
+            break;
+        }
+        master.write_all(b"\r").unwrap();
+    }
     master.write_all(b"hello\r").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let body = loop {
-        if let Ok(body) = receiver.try_recv() {
-            break body;
-        }
-        assert!(Instant::now() < deadline, "second request timed out");
-        let mut buffer = [0; 8192];
-        match master.read(&mut buffer) {
-            Ok(_) => (),
-            Err(error)
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
-            {
-                ()
-            }
-            Err(error) => panic!("terminal read failed: {error}"),
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let (body, _) = wait_request(&mut master, &receiver, "second request");
     assert!(body.contains("unique-reload-skill-description"), "{body}");
     server.join().unwrap();
 }
