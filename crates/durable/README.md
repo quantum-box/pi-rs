@@ -1276,7 +1276,11 @@ indefinitely. A non-replay-safe handler instead fails with a reconciliation
 reason because its external effects may already have happened. An abort that
 arrives during the invocation fences its output. Other task conflicts and
 storage errors still poison the scheduler and require reopening; storage errors
-can have an unknown outcome. The reservation is a separate durable commit,
+can have an unknown outcome. If owned-subagent admission only rewrites the
+running reservation unchanged, the scheduler commits the existing handler
+result against the refreshed version without rerunning it. Admission and the
+post-handler graph decision share a gate; independently observed document and
+child checks still apply. The reservation is a separate durable commit,
 so a crash can leave the old checkpoint running. External effects require their
 own idempotency or reconciliation. Unlike upstream's transaction callback,
 this synchronous task callback supports conversation-owned application entries

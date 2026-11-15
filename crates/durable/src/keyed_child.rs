@@ -57,6 +57,7 @@ struct Record {
 
 pub(crate) struct Prepared {
     pub(crate) child: Uuid,
+    pub(crate) parent_version: u64,
     identity: Identity,
     pub(crate) checks: Vec<Check>,
     pub(crate) mutations: Vec<Mutation>,
@@ -262,6 +263,7 @@ pub(crate) fn prepare(
         }
         return Ok(Prepared {
             child: record.child,
+            parent_version: parent.version,
             identity,
             checks: vec![
                 parent_check,
@@ -298,6 +300,7 @@ pub(crate) fn prepare(
     });
     Ok(Prepared {
         child: child.id(),
+        parent_version: parent.version,
         identity,
         checks: batch.checks,
         mutations: batch.mutations,

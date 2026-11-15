@@ -1039,6 +1039,16 @@ impl Scheduler {
             self.poisoned = false;
             return Ok(true);
         }
+        if current.task != running.task {
+            return Err(task_store::Error::Store(durable_store::Error::Conflict {
+                key: task_store::key(running.task.id()),
+            })
+            .into());
+        }
+        // Admission may have rewritten an identical reservation while the
+        // handler ran. The gate keeps cooperating admissions out until commit.
+        let original_version = running.version;
+        let running = current.clone();
         let step = match result {
             Ok(step) => step,
             Err(reason) if running.task.is_task_tool() => {
@@ -1054,7 +1064,17 @@ impl Scheduler {
             self.poisoned = false;
             return Ok(true);
         }
-        let staged = std::mem::take(&mut documents.keyed_children);
+        let mut staged = std::mem::take(&mut documents.keyed_children);
+        let parent_key = task_store::key(running.task.id());
+        for (_, _, prepared) in &mut staged {
+            for check in &mut prepared.checks {
+                if check.key == parent_key
+                    && check.expected == durable_store::Expected::Version(prepared.parent_version)
+                {
+                    check.expected = durable_store::Expected::Version(running.version);
+                }
+            }
+        }
         for (key, child, _) in &staged {
             let reg = self.registered(child)?;
             if reg.version != child.definition_version()
@@ -1210,6 +1230,21 @@ impl Scheduler {
             }
             Err(error) => return Err(error.into()),
         };
+        // Checks observed at reservation are equivalent to the reloaded task.
+        // Preserve independently observed versions and any deadline.
+        for check in &mut document_batch.checks {
+            if check.key == parent_key {
+                match &mut check.expected {
+                    durable_store::Expected::Version(version)
+                    | durable_store::Expected::VersionBefore(version, _)
+                        if *version == original_version =>
+                    {
+                        *version = running.version
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut document_keys: HashSet<_> = document_batch
             .checks
             .iter()
@@ -1219,7 +1254,6 @@ impl Scheduler {
         // Both use the captured version, so aborts and competing graph writers
         // fence the whole transaction, without a self-conflict.
         let mut graph = self.ts().prepare_save(&batch)?;
-        let parent_key = task_store::key(running.task.id());
         for (_, _, prepared) in staged {
             for check in prepared.checks {
                 document_keys.insert(check.key.clone());
@@ -5000,8 +5034,11 @@ mod tests {
         {
             let mut s = Scheduler::open(&path, registry()).unwrap();
             s.submit(&parent).unwrap();
-            assert!(s.tick(0).is_err());
-            assert!(matches!(s.tick(0), Err(Error::Poisoned)));
+            assert!(s.tick(0).unwrap());
+            assert_eq!(
+                s.get(parent.id()).unwrap().unwrap().state(),
+                &TaskState::Ready
+            );
         }
         let mut s = Scheduler::open(&path, registry()).unwrap();
         s.tick(0).unwrap();
