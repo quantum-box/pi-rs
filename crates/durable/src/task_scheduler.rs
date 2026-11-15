@@ -1224,6 +1224,16 @@ impl Scheduler {
         drop(gate);
         let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
         let result = handler.run_with_documents(&running.task, &mut documents);
+        self.settle_handler_result(running, result, documents)
+    }
+
+    fn settle_handler_result(
+        &mut self,
+        running: task_store::StoredTask,
+        result: Result<Step, String>,
+        mut documents: crate::document::TaskDocuments<'_>,
+    ) -> Result<bool, Error> {
+        let owner = self.owner();
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         // An abort can commit while the synchronous handler is running. Its
         // output (including proposed children) must never cross that fence.
