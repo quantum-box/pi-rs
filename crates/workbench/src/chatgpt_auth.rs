@@ -59,9 +59,6 @@ pub(super) fn list_accounts() -> Result<Vec<(String, String, bool)>> {
         })
         .collect())
 }
-fn auth_path() -> std::path::PathBuf {
-    super::config::agent_dir().join("auth.json")
-}
 fn sessions_path() -> std::path::PathBuf {
     super::config::agent_dir().join("chatgpt-sessions.json")
 }
