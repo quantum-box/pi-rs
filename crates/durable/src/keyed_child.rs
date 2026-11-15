@@ -95,6 +95,7 @@ fn prepare_park_with_documents(
         return Err(Error::DocumentContext);
     }
     let mut transaction = crate::document::Transaction::new();
+    documents.stage_acquisitions(&mut transaction)?;
     let mut document_batch = documents.into_batch()?;
     let mut park = prepare_park_any(store, parent, checkpoint, keys)?;
     crate::document::reconcile_task_checks(&mut document_batch, &mut park);
@@ -382,6 +383,37 @@ mod tests {
         )
         .unwrap();
         docs
+    }
+
+    #[test]
+    fn keyed_park_commits_typed_document_acquisition() {
+        let db = Store::memory().unwrap();
+        let parent = registered_parent(&db, true);
+        let (parent, _, _) = admit_pair(&db, &parent);
+        let mut docs = crate::document::TaskDocuments::new(&db, &parent.task).unwrap();
+        docs.acquire_owned(&address()).unwrap();
+        docs.put(
+            &address(),
+            json!({"saved": true}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        prepare_park_with_documents(&db, &parent, cp("parked"), &["a"], docs)
+            .unwrap()
+            .commit(&db)
+            .unwrap();
+        let key = address().storage_key().unwrap();
+        assert_eq!(
+            db.task_document_owner(&key).unwrap(),
+            Some(parent.task.id())
+        );
+        assert_eq!(
+            crate::document::Documents::new(&db)
+                .get(&address())
+                .unwrap()
+                .unwrap()
+                .value["saved"],
+            true
+        );
     }
 
     #[test]

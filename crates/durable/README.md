@@ -1684,6 +1684,15 @@ operations; the watch ends after its terminal retirement is consumed. If the
 document was already absent, it ends after the available changes are drained.
 This does not implement upstream document definitions, incarnation semantics,
 observer lifecycle, or automatic wakeups. Raw writes to ownership metadata are
-internal protocol operations. Direct SQLite writes bypass this protocol. Each
-store commit currently scans ownership metadata, so large deployments should
-account for its cost.
+stored in a dedicated SQLite table; ordinary store byte keys are not reserved.
+Direct SQLite writes bypass this protocol. Each store commit currently scans
+ownership metadata, so large deployments should account for its cost.
+
+Databases used with the earlier experimental byte-key ownership implementation
+must be migrated explicitly before writes resume. Stop all old writers, identify
+the genuine owned document keys and task IDs, then call
+`Store::migrate_legacy_task_documents` with the complete set. It validates the
+old records and tasks and migrates the supplied set atomically. Old byte keys
+remain ordinary untouched keys: they are ambiguous with arbitrary user data and
+are never auto-migrated. Without this explicit migration those old records do
+not enforce ownership. Do not use old writers after migration.

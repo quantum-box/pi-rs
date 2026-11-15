@@ -88,15 +88,12 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-/// Metadata key for explicit ownership of one exact document storage key.
-/// This namespace is internal to the task-document protocol.
-pub fn task_document_owner_key(document_key: &[u8]) -> Result<Vec<u8>, Error> {
-    if !document_key.starts_with(b"durable/document/") {
-        return Err(Error::InvalidSnapshot);
-    }
-    let mut key = b"durable/task-document-owner/".to_vec();
-    key.extend_from_slice(document_key);
-    Ok(key)
+/// Explicit acquisition of an exact document key in the same transaction as
+/// ordinary checked mutations. This is not a key in the generic store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDocumentAcquisition {
+    pub document_key: Vec<u8>,
+    pub owner: uuid::Uuid,
 }
 
 fn task_terminal(value: &[u8]) -> Option<bool> {
@@ -173,6 +170,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version>=0));
             INSERT OR IGNORE INTO durable_store_meta(id, version) VALUES(1, 0);
             CREATE TABLE IF NOT EXISTS durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS durable_task_document_owners (document_key BLOB PRIMARY KEY NOT NULL, owner BLOB NOT NULL) WITHOUT ROWID;")?;
         // The version boundary distinguishes pre-migration writes, whose commit
         // grouping is unknowable, from all subsequently recorded puts.
         conn.execute_batch("BEGIN IMMEDIATE;
@@ -223,6 +221,105 @@ impl Store {
             commits,
         })
     }
+    /// Read explicit ownership metadata; ordinary byte keys are not interpreted.
+    pub fn task_document_owner(&self, document_key: &[u8]) -> Result<Option<uuid::Uuid>, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let owner: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT owner FROM durable_task_document_owners WHERE document_key=?1",
+                [document_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        owner
+            .map(|owner| uuid::Uuid::from_slice(&owner).map_err(|_| Error::InvalidSnapshot))
+            .transpose()
+    }
+    /// Explicitly migrate caller-identified ownership records written by the
+    /// experimental byte-key implementation. The caller must first stop all
+    /// older writers. Ordinary lookalike keys are never migrated implicitly.
+    /// All listed records migrate atomically, and their byte keys remain intact.
+    pub fn migrate_legacy_task_documents(
+        &self,
+        acquisitions: &[TaskDocumentAcquisition],
+    ) -> Result<(), Error> {
+        if acquisitions.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut seen = std::collections::HashSet::new();
+        for item in acquisitions {
+            let doc = &item.document_key;
+            if !doc.starts_with(b"durable/document/") || !seen.insert(doc.clone()) {
+                return Err(Error::InvalidSnapshot);
+            }
+            let mut legacy = b"durable/task-document-owner/".to_vec();
+            legacy.extend_from_slice(doc);
+            let old: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM durable_store_entries WHERE key=?1",
+                    [&legacy],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if old.as_deref() != Some(item.owner.as_bytes().as_slice()) {
+                return Err(Error::Conflict { key: legacy });
+            }
+            let owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_task_document_owners WHERE document_key=?1)",
+                [doc],
+                |r| r.get(0),
+            )?;
+            if owned {
+                return Err(Error::Conflict { key: doc.clone() });
+            }
+            let mut task_key = b"durable/task/".to_vec();
+            task_key.extend_from_slice(item.owner.as_bytes());
+            let task: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM durable_store_entries WHERE key=?1",
+                    [&task_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let state = task
+                .as_deref()
+                .filter(|v| task_id_matches(v, item.owner.as_bytes()))
+                .and_then(task_terminal)
+                .ok_or_else(|| Error::Conflict {
+                    key: task_key.clone(),
+                })?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+                [doc],
+                |r| r.get(0),
+            )?;
+            if state && exists {
+                return Err(Error::Conflict { key: doc.clone() });
+            }
+        }
+        for item in acquisitions {
+            tx.execute(
+                "INSERT INTO durable_task_document_owners(document_key,owner) VALUES(?1,?2)",
+                params![&item.document_key, item.owner.as_bytes().as_slice()],
+            )?;
+        }
+        let previous: i64 = tx.query_row(
+            "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let sequence = previous.checked_add(1).ok_or(Error::VersionExhausted)?;
+        tx.execute(
+            "UPDATE durable_commit_meta SET sequence=?1 WHERE id=1",
+            [sequence],
+        )?;
+        tx.commit()?;
+        self.commits.send_replace(sequence as u64);
+        Ok(())
+    }
+
     /// Subscribe at a store sequence without racing a commit on this instance.
     /// Writes through another connection do not generate notifications here.
     pub fn subscribe_commits(&self) -> Result<CommitUpdates, Error> {
@@ -921,7 +1018,7 @@ impl Store {
     /// All checks are evaluated against the pre-commit state; mutations apply
     /// in order. A failed check rolls back the complete batch.
     pub fn commit(&self, checks: &[Check], mutations: &[Mutation]) -> Result<(), Error> {
-        self.commit_inner(checks, mutations, None)
+        self.commit_inner(checks, mutations, &[], None)
     }
 
     /// Commit the original atomic batch only if no put under the supplied
@@ -934,13 +1031,35 @@ impl Store {
         prefixes: &[&[u8]],
         boundary: u64,
     ) -> Result<(), Error> {
-        self.commit_inner(checks, mutations, Some((prefixes, boundary)))
+        self.commit_inner(checks, mutations, &[], Some((prefixes, boundary)))
+    }
+
+    /// Commit explicit document acquisitions with ordinary checked mutations.
+    pub fn commit_with_task_documents(
+        &self,
+        checks: &[Check],
+        mutations: &[Mutation],
+        acquisitions: &[TaskDocumentAcquisition],
+    ) -> Result<(), Error> {
+        self.commit_inner(checks, mutations, acquisitions, None)
+    }
+    /// As above, with a graph put fence for scheduler finalization.
+    pub fn commit_task_documents_with_prefix_put_fence(
+        &self,
+        checks: &[Check],
+        mutations: &[Mutation],
+        acquisitions: &[TaskDocumentAcquisition],
+        prefixes: &[&[u8]],
+        boundary: u64,
+    ) -> Result<(), Error> {
+        self.commit_inner(checks, mutations, acquisitions, Some((prefixes, boundary)))
     }
 
     fn commit_inner(
         &self,
         checks: &[Check],
         mutations: &[Mutation],
+        acquisitions: &[TaskDocumentAcquisition],
         prefix_fence: Option<(&[&[u8]], u64)>,
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
@@ -1028,51 +1147,38 @@ impl Store {
         // Ownership is explicit metadata keyed by the exact document key. No
         // existing scope string is interpreted as a task scope. All validation,
         // candidate resolution, and retirement happen under this write lock.
-        let marker_prefix = b"durable/task-document-owner/";
         let mut owners = std::collections::HashMap::<Vec<u8>, Vec<u8>>::new();
         {
-            let end = prefix_end(marker_prefix).ok_or(Error::InvalidSnapshot)?;
             let mut stmt =
-                tx.prepare("SELECT key,value FROM durable_store_entries WHERE key>=?1 AND key<?2")?;
-            let rows = stmt.query_map(params![marker_prefix.as_slice(), end], |r| {
+                tx.prepare("SELECT document_key,owner FROM durable_task_document_owners")?;
+            let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
             })?;
             for row in rows {
-                let (marker, owner) = row?;
-                let doc = marker
-                    .strip_prefix(marker_prefix)
-                    .ok_or(Error::InvalidSnapshot)?
-                    .to_vec();
+                let (doc, owner) = row?;
                 if !doc.starts_with(b"durable/document/") || owner.len() != 16 {
                     return Err(Error::InvalidSnapshot);
                 }
                 owners.insert(doc, owner);
             }
         }
-        for mutation in mutations {
-            let (key, value) = match mutation {
-                Mutation::Put { key, value } => (key, Some(value)),
-                Mutation::Delete { key } => (key, None),
-            };
-            if let Some(doc) = key.strip_prefix(marker_prefix) {
-                let value = value.ok_or(Error::InvalidSnapshot)?;
-                if !doc.starts_with(b"durable/document/") || value.len() != 16 {
-                    return Err(Error::InvalidSnapshot);
-                }
-                if owners.contains_key(doc) {
-                    return Err(Error::Conflict { key: key.clone() });
-                }
-                // Explicit acquisition never silently takes over an existing host document.
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
-                    [doc],
-                    |r| r.get(0),
-                )?;
-                if exists {
-                    return Err(Error::Conflict { key: doc.to_vec() });
-                }
-                owners.insert(doc.to_vec(), value.clone());
+        for acquisition in acquisitions {
+            let doc = &acquisition.document_key;
+            if !doc.starts_with(b"durable/document/") {
+                return Err(Error::InvalidSnapshot);
             }
+            if owners.contains_key(doc) {
+                return Err(Error::Conflict { key: doc.clone() });
+            }
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+                [doc],
+                |r| r.get(0),
+            )?;
+            if exists {
+                return Err(Error::Conflict { key: doc.clone() });
+            }
+            owners.insert(doc.clone(), acquisition.owner.as_bytes().to_vec());
         }
         let mut task_candidates = std::collections::HashMap::<Vec<u8>, Option<Vec<u8>>>::new();
         for mutation in mutations {
@@ -1082,9 +1188,7 @@ impl Store {
             };
             if let Some(id) = key.strip_prefix(b"durable/task/") {
                 if id.len() == 16 && owners.values().any(|owner| owner.as_slice() == id) {
-                    if task_candidates.insert(id.to_vec(), value).is_some() {
-                        return Err(Error::InvalidSnapshot);
-                    }
+                    task_candidates.insert(id.to_vec(), value);
                 }
             }
         }
@@ -1137,28 +1241,12 @@ impl Store {
                 return Err(Error::Conflict { key: task_key });
             }
         }
-        for mutation in mutations {
-            if let Mutation::Put { key, value: owner } = mutation {
-                if key.starts_with(marker_prefix) && states[owner] {
-                    let mut task_key = b"durable/task/".to_vec();
-                    task_key.extend_from_slice(owner);
-                    let previous: Option<Vec<u8>> = tx
-                        .query_row(
-                            "SELECT value FROM durable_store_entries WHERE key=?1",
-                            [&task_key],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    // A terminal candidate is allowed only when this commit
-                    // actually settles a previously live (or newly created) task.
-                    if !task_candidates.contains_key(owner)
-                        || previous
-                            .as_deref()
-                            .is_some_and(|value| task_terminal(value) != Some(false))
-                    {
-                        return Err(Error::Conflict { key: task_key });
-                    }
-                }
+        for acquisition in acquisitions {
+            let owner = acquisition.owner.as_bytes().as_slice();
+            if states[owner] && !settling.contains(owner) {
+                return Err(Error::Conflict {
+                    key: acquisition.document_key.clone(),
+                });
             }
         }
         let mut effective = Vec::with_capacity(mutations.len());
@@ -1179,7 +1267,8 @@ impl Store {
                     if !settling.contains(owner) {
                         return Err(Error::Conflict { key: key.clone() });
                     }
-                    continue; // terminal candidate retires both prior and staged content
+                    // Keep the mutation in order; a retirement appended below
+                    // makes the final document state absent in this transaction.
                 }
             }
             effective.push(mutation.clone());
@@ -1191,13 +1280,26 @@ impl Store {
                     [doc],
                     |r| r.get(0),
                 )?;
-                if exists {
+                if exists
+                    || mutations
+                        .iter()
+                        .any(|mutation| matches!(mutation, Mutation::Put { key, .. } if key == doc))
+                {
                     effective.push(Mutation::Delete { key: doc.clone() });
                 }
             }
         }
         let mutations = effective.as_slice();
-        let sequence = if mutations.is_empty() {
+        for acquisition in acquisitions {
+            tx.execute(
+                "INSERT INTO durable_task_document_owners(document_key,owner) VALUES(?1,?2)",
+                params![
+                    &acquisition.document_key,
+                    acquisition.owner.as_bytes().as_slice()
+                ],
+            )?;
+        }
+        let sequence = if mutations.is_empty() && acquisitions.is_empty() {
             None
         } else {
             let previous: i64 = tx.query_row(

@@ -17,7 +17,7 @@ not a receipt for the committed version.
 
 `subscribe_commits` attaches to the current store-wide commit sequence and
 delivers coalesced notifications after successful local commits containing
-mutations, including deletes. Failed or read-only batches do not notify. The
+mutations, including deletes, or explicit task-document acquisitions. Failed or read-only batches do not notify. The
 subscription returns owned sequence values rather than lock guards; slow readers
 can skip intermediate commits. It observes only writes through that `Store`
 instance, not writes by another SQLite connection. Reattaching reads the
@@ -36,3 +36,11 @@ https://github.com/earendil-works/pi/blob/main/packages/durable/docs/spec.md
 
 The SQLite tables are `durable_store_meta(id, version)` and
 `durable_store_entries(key, value, version)`; they are implementation details.
+
+Task-document ownership uses a dedicated SQLite table and typed acquisition;
+no byte-key prefix is reserved for ownership metadata. When an address is
+explicitly acquired, its task and document mutations are checked at commit and
+the final task candidate governs retirement. The byte mutations that are
+accepted still run in their supplied order. See the durable crate README for
+the protocol and explicit migration from the earlier experimental byte-key
+implementation.

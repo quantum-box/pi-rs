@@ -1153,6 +1153,7 @@ impl Scheduler {
             (!prepared.mutations.is_empty()).then_some(Save::Create(child))
         }));
         let mut transaction = crate::document::Transaction::new();
+        documents.stage_acquisitions(&mut transaction)?;
         let mut document_batch = match documents.into_batch() {
             Ok(batch) => batch,
             Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {

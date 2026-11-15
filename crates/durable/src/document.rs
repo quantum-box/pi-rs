@@ -824,9 +824,10 @@ impl<'a> Documents<'a> {
         &self,
         address: &Address,
     ) -> Result<(DocumentRevision, TaskDocumentWatch<'a>), Error> {
-        let marker = durable_store::task_document_owner_key(&address.storage_key()?)?;
-        let entry = self.store.get(&marker)?.ok_or(Error::InvalidBatch)?;
-        let owner = uuid::Uuid::from_slice(&entry.value).map_err(|_| Error::InvalidBatch)?;
+        let owner = self
+            .store
+            .task_document_owner(&address.storage_key()?)?
+            .ok_or(Error::InvalidBatch)?;
         let (initial, inner) = self.watch(address)?;
         let last = initial.document.clone();
         Ok((
@@ -846,9 +847,10 @@ impl<'a> Documents<'a> {
         address: &Address,
         cursor: u64,
     ) -> Result<TaskDocumentWatch<'a>, Error> {
-        let marker = durable_store::task_document_owner_key(&address.storage_key()?)?;
-        let entry = self.store.get(&marker)?.ok_or(Error::InvalidBatch)?;
-        let owner = uuid::Uuid::from_slice(&entry.value).map_err(|_| Error::InvalidBatch)?;
+        let owner = self
+            .store
+            .task_document_owner(&address.storage_key()?)?
+            .ok_or(Error::InvalidBatch)?;
         let last = self.get_at(address, cursor)?;
         let inner = self.resume_watch(address, cursor)?;
         Ok(TaskDocumentWatch {
@@ -1085,6 +1087,7 @@ pub struct Transaction {
     mutations: Vec<Mutation>,
     checked: HashSet<Vec<u8>>,
     written: HashSet<Vec<u8>>,
+    acquisitions: Vec<durable_store::TaskDocumentAcquisition>,
 }
 
 // Independently prepared task and signal-revision observations can race.
@@ -1147,17 +1150,19 @@ impl Transaction {
         task: uuid::Uuid,
     ) -> Result<(), Error> {
         let doc = address.storage_key()?;
-        let marker = durable_store::task_document_owner_key(&doc)?;
-        self.append(OwnedBatch {
-            checks: vec![Check {
-                key: marker.clone(),
-                expected: Expected::Missing,
-            }],
-            mutations: vec![Mutation::Put {
-                key: marker,
-                value: task.as_bytes().to_vec(),
-            }],
-        })
+        if self
+            .acquisitions
+            .iter()
+            .any(|item| item.document_key == doc)
+        {
+            return Err(Error::InvalidBatch);
+        }
+        self.acquisitions
+            .push(durable_store::TaskDocumentAcquisition {
+                document_key: doc,
+                owner: task,
+            });
+        Ok(())
     }
     /// Apply and retain a bounded decoded Chord batch against an existing version.
     /// The operation record and document update commit atomically; stale bases fail.
@@ -1284,13 +1289,14 @@ impl Transaction {
         Ok(())
     }
     pub fn commit(self, store: &Store) -> Result<(), Error> {
-        store.commit(&self.checks, &self.mutations)?;
+        store.commit_with_task_documents(&self.checks, &self.mutations, &self.acquisitions)?;
         Ok(())
     }
     pub(crate) fn commit_task_graph(self, store: &Store, version: u64) -> Result<(), Error> {
-        store.commit_with_prefix_put_fence(
+        store.commit_task_documents_with_prefix_put_fence(
             &self.checks,
             &self.mutations,
+            &self.acquisitions,
             &[
                 crate::task_store::PREFIX,
                 crate::ownership_edge::PREFIX,
@@ -1400,6 +1406,7 @@ impl<'a> HostTransaction<'a> {
             mutations: self.transaction.mutations.clone(),
             checked: self.transaction.checked.clone(),
             written: self.transaction.written.clone(),
+            acquisitions: self.transaction.acquisitions.clone(),
         };
         let mut existing = OwnedBatch {
             checks: std::mem::take(&mut transaction.checks),
@@ -1732,9 +1739,9 @@ impl<'a> TaskDocuments<'a> {
             return self.get(address);
         }
         let doc = self.get(address)?;
-        let key = durable_store::task_document_owner_key(&address.storage_key()?)?;
-        match self.store.get(&key)? {
-            Some(entry) if entry.value == self.task.id().as_bytes() => {}
+        let key = address.storage_key()?;
+        match self.store.task_document_owner(&key)? {
+            Some(owner) if owner == self.task.id() => {}
             Some(_) => return Err(Error::InvalidBatch),
             None if doc.is_none() => {
                 self.acquired.insert(address.clone());
@@ -1934,6 +1941,12 @@ impl<'a> TaskDocuments<'a> {
             });
         Ok(id)
     }
+    pub(crate) fn stage_acquisitions(&self, transaction: &mut Transaction) -> Result<(), Error> {
+        for address in &self.acquired {
+            transaction.acquire_task_document(address, self.task.id())?;
+        }
+        Ok(())
+    }
     pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
         // Only the scheduler can validate and commit staged keyed children.
         if !self.keyed_children.is_empty() {
@@ -1943,17 +1956,6 @@ impl<'a> TaskDocuments<'a> {
             checks: Vec::new(),
             mutations: Vec::new(),
         };
-        for address in &self.acquired {
-            let key = durable_store::task_document_owner_key(&address.storage_key()?)?;
-            batch.checks.push(Check {
-                key: key.clone(),
-                expected: Expected::Missing,
-            });
-            batch.mutations.push(Mutation::Put {
-                key,
-                value: self.task.id().as_bytes().to_vec(),
-            });
-        }
         for address in self.reads.keys() {
             let key = address.storage_key()?;
             batch.checks.push(Check {

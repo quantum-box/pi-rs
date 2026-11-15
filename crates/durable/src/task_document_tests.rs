@@ -405,9 +405,11 @@ fn acquisition_prepared_before_terminal_or_host_creation_fails_atomically() {
         } else {
             assert_eq!(doc.unwrap().value["host"], true);
         }
-        let marker =
-            durable_store::task_document_owner_key(&address.storage_key().unwrap()).unwrap();
-        assert!(db.get(&marker).unwrap().is_none());
+        assert!(
+            db.task_document_owner(&address.storage_key().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -499,4 +501,172 @@ fn acquired_document_write_racing_terminal_is_retired_or_rejected() {
         assert!(result.is_ok() || matches!(result, Err(durable_store::Error::Conflict { .. })));
         assert!(Documents::new(&db).get(&address).unwrap().is_none());
     }
+}
+
+#[test]
+fn ordered_raw_task_candidates_control_retirement_without_losing_puts() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::{Expected, Mutation, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ordered.db");
+    let db = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&db);
+    let root = task(
+        1,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    ts.save(&[Save::Create(&root)]).unwrap();
+    let address = Address {
+        scope: "ordered".into(),
+        name: "doc".into(),
+        key: "".into(),
+    };
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&address, root.id()).unwrap();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v": 1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let mut terminal = root.clone();
+    terminal.start().unwrap();
+    terminal.succeed(json!(1)).unwrap();
+    let task_key = crate::task_store::key(root.id());
+    let document_key = address.storage_key().unwrap();
+    let before = db.put_version().unwrap();
+    db.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&terminal).unwrap(),
+            },
+            Mutation::Delete {
+                key: task_key.clone(),
+            },
+            Mutation::Put {
+                key: document_key.clone(),
+                value: br#"{"v":2}"#.to_vec(),
+            },
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&root).unwrap(),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.put_version().unwrap(), before + 3);
+    assert_eq!(
+        Documents::new(&db).get(&address).unwrap().unwrap().value["v"],
+        2
+    );
+    let (_, mut watch) = Documents::new(&db).watch_task_document(&address).unwrap();
+    let before = db.put_version().unwrap();
+    db.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&root).unwrap(),
+            },
+            Mutation::Put {
+                key: document_key.clone(),
+                value: br#"{"v":3}"#.to_vec(),
+            },
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&terminal).unwrap(),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.put_version().unwrap(), before + 3);
+    assert!(Documents::new(&db).get(&address).unwrap().is_none());
+    let frame = watch.poll(1).unwrap().pop().unwrap();
+    assert!(frame.retired && watch.ended());
+    assert_eq!(frame.document.unwrap().value["v"], 2);
+    drop(watch);
+    drop(db);
+    let db = Store::open(&path).unwrap();
+    assert!(Documents::new(&db).get(&address).unwrap().is_none());
+    assert_eq!(
+        db.task_document_owner(&document_key).unwrap(),
+        Some(root.id())
+    );
+}
+
+#[test]
+fn explicit_legacy_migration_is_atomic_preserves_keys_and_restores_retirement() {
+    use crate::document::{Address, Documents};
+    use durable_store::{Mutation, Store, TaskDocumentAcquisition};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let db = Store::open(&path).unwrap();
+    let root = task(
+        1,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    TaskStore::new(&db).save(&[Save::Create(&root)]).unwrap();
+    let address = Address {
+        scope: "old".into(),
+        name: "doc".into(),
+        key: "".into(),
+    };
+    let key = address.storage_key().unwrap();
+    let mut legacy = b"durable/task-document-owner/".to_vec();
+    legacy.extend_from_slice(&key);
+    db.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: legacy.clone(),
+                value: root.id().as_bytes().to_vec(),
+            },
+            Mutation::Put {
+                key: key.clone(),
+                value: br#"{"v":1}"#.to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    drop(db);
+    let db = Store::open(&path).unwrap();
+    let item = TaskDocumentAcquisition {
+        document_key: key.clone(),
+        owner: root.id(),
+    };
+    let missing = TaskDocumentAcquisition {
+        document_key: b"durable/document/missing".to_vec(),
+        owner: root.id(),
+    };
+    assert!(
+        db.migrate_legacy_task_documents(&[item.clone(), missing])
+            .is_err()
+    );
+    assert_eq!(db.task_document_owner(&key).unwrap(), None);
+    db.migrate_legacy_task_documents(&[item]).unwrap();
+    assert_eq!(
+        db.get(&legacy).unwrap().unwrap().value,
+        root.id().as_bytes()
+    );
+    let (_, mut watch) = Documents::new(&db).watch_task_document(&address).unwrap();
+    let ts = TaskStore::new(&db);
+    let current = ts.load(root.id()).unwrap().unwrap();
+    ts.update(&current, |task| {
+        task.start()?;
+        task.succeed(json!(0))
+    })
+    .unwrap();
+    let frames = watch.poll(1).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].retired && watch.ended());
+    assert!(Documents::new(&db).get(&address).unwrap().is_none());
 }

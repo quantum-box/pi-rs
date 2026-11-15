@@ -562,3 +562,62 @@ fn process_exit_rolls_back_sequence_and_mappings() {
     store.commit(&[], &[put(b"b", b"recovered")]).unwrap();
     assert_eq!(store.commit_for_version(b"b", 2).unwrap(), Some(2));
 }
+
+#[test]
+fn arbitrary_legacy_owner_prefix_and_ordered_task_mutations_survive_reopen() {
+    use durable_store::{Mutation, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("arbitrary.db");
+    let legacy = b"durable/task-document-owner/not-metadata".to_vec();
+    let task = [b"durable/task/".as_slice(), &[42; 16]].concat();
+    let lookalike = b"durable/task-document-owner/durable/document/[\"s\",\"n\",\"k\"]".to_vec();
+    // Simulate a database written before the ownership table existed.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE durable_store_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_store_meta VALUES (1, 2); CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL) WITHOUT ROWID;").unwrap();
+        conn.execute(
+            "INSERT INTO durable_store_entries VALUES (?1,?2,1)",
+            rusqlite::params![&legacy, b"opaque".as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO durable_store_entries VALUES (?1,?2,2)",
+            rusqlite::params![&lookalike, vec![42u8; 16]],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    store
+        .commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: task.clone(),
+                    value: b"first".to_vec(),
+                },
+                Mutation::Delete { key: task.clone() },
+                Mutation::Put {
+                    key: task.clone(),
+                    value: b"last".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+    let version = store.get(&task).unwrap().unwrap().version;
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.get(&legacy).unwrap().unwrap().value, b"opaque");
+    assert_eq!(store.get(&lookalike).unwrap().unwrap().value, vec![42; 16]);
+    let entry = store.get(&task).unwrap().unwrap();
+    assert_eq!(entry.value, b"last");
+    assert_eq!(entry.version, version);
+    store
+        .commit(
+            &[],
+            &[Mutation::Delete {
+                key: legacy.clone(),
+            }],
+        )
+        .unwrap();
+    assert!(store.get(&legacy).unwrap().is_none());
+}
