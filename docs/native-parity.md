@@ -4048,6 +4048,10 @@ walker semantics as ripgrep, including workspace-relative patterns. Explicit
 file targets still work with exclusion globs. Native `find` honors
 `.fdignore` and omits Git metadata directories while retaining ordinary
 hidden files and dependency directories.
+Unrestricted local `find` follows Pi's fd-line trimming for terminal
+ECMAScript whitespace, so a returned filename ending in such whitespace may
+not name the original file. Newlines and carriage returns in a filename also
+split it into separate output lines. Scoped `find` preserves its filename spelling.
 [fd manual](https://github.com/sharkdp/fd/blob/master/doc/fd.1)
 
 ### CLI credential checks
