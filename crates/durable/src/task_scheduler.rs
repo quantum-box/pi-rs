@@ -5348,6 +5348,141 @@ mod tests {
         assert_eq!(current.checkpoint().phase, "external");
     }
 
+    // A new live child changes a successful terminal result into a held result.
+    // Until the checked transaction can be rebuilt, document the safe fallback,
+    // including an identical running-task rewrite from concurrent admission.
+    #[test]
+    fn successful_non_replay_safe_result_with_late_child_is_not_rebased() {
+        use crate::document::{Address, Documents, TaskDocuments, Transaction};
+        use durable_store::Expected;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Staging {
+            owned: Address,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.acquire_owned(&self.owned).unwrap();
+                docs.put(
+                    &self.owned,
+                    json!({"value":"staged"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("success")))
+            }
+        }
+        for identical_rewrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let owned = Address {
+                scope: "late-child".into(),
+                name: "owned".into(),
+                key: "".into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let aborts = Arc::new(AtomicUsize::new(0));
+            let observed = aborts.clone();
+            let mut registry = Registry::default();
+            registry.register(
+                "parent",
+                false,
+                Staging {
+                    owned: owned.clone(),
+                    calls: calls.clone(),
+                },
+            );
+            registry.register_with_abort(
+                "child",
+                false,
+                |_: &Task| panic!("late child must not run"),
+                move |_: &Task| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step::Succeed(json!(null)))
+                },
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let root = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                false,
+                3,
+            );
+            let child = task(2, TaskOwner::Task(root.id()), "child", false, 3);
+            scheduler.ts().save(&[Save::Create(&root)]).unwrap();
+            let mut tx = Transaction::new();
+            tx.acquire_task_document(&owned, root.id()).unwrap();
+            tx.put(
+                &owned,
+                Expected::Missing,
+                json!({"value":"original"}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(scheduler.owner().store()).unwrap();
+            let once = Arc::new(AtomicBool::new(false));
+            scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+                if !once.swap(true, Ordering::SeqCst) {
+                    let ts = TaskStore::new(store);
+                    ts.save(&[Save::Create(&child)]).unwrap();
+                    if identical_rewrite {
+                        let current = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+                        ts.update(&current, |_| Ok(())).unwrap();
+                    }
+                }
+            }));
+            let outcome = scheduler.tick(0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let ts = scheduler.ts();
+            let state = ts.load(root.id()).unwrap().unwrap().task;
+            assert_eq!(
+                Documents::new(scheduler.owner().store())
+                    .get(&owned)
+                    .unwrap()
+                    .unwrap()
+                    .value["value"],
+                "original"
+            );
+            if identical_rewrite {
+                assert!(outcome.is_err());
+                assert_eq!(state.state(), &TaskState::Running);
+                assert_eq!(aborts.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    ts.load(Uuid::from_u128(2)).unwrap().unwrap().task.state(),
+                    &TaskState::Ready
+                );
+            } else {
+                assert!(outcome.unwrap());
+                assert!(
+                    matches!(state.state(), TaskState::CompletingFailed(reason) if reason.contains("document conflict"))
+                );
+                for _ in 0..8 {
+                    scheduler.tick(0).unwrap();
+                    if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                        break;
+                    }
+                }
+                assert!(matches!(
+                    scheduler.get(root.id()).unwrap().unwrap().state(),
+                    TaskState::Failed(_)
+                ));
+                assert_eq!(aborts.load(Ordering::SeqCst), 1);
+                assert!(
+                    Documents::new(scheduler.owner().store())
+                        .get(&owned)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
     #[test]
     fn result_graph_conflicts_retry_without_replaying_handler() {
         use crate::document::{Address, Documents, TaskDocuments, Transaction};

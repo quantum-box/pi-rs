@@ -616,3 +616,17 @@ running synchronous handler is allowed to return before its abort cleanup and
 terminal transition. The attached runtime also drains foreground child-owned
 conversations; standalone scheduling rejects those graphs. Legacy explicit
 `cancel` retains its immediate-cancellation semantics.
+
+**Late ownership limitation:** If a non-replay-safe handler returns success but
+an owned child appears after the scheduler prepared `Succeeded`, the graph fence
+prevents that terminal commit. The current implementation does not reconstruct
+the batch as `Completing`: it discards staged effects and holds a reconciliation
+failure while the child is drained. An identical rewrite of the running task in
+the same window instead yields a checked conflict and requires reopen. The
+later foundation's same-value admission rebase (`8a9383861`, `03d991e84`) is
+not present in this branch. Supporting the successful result requires integrating
+that rebase with task-attempt identity, self-signal and keyed-child checks, the
+original document and signal observations, and atomic task-document retirement;
+rebuilding only the task mutation would not establish those invariants. The
+`successful_non_replay_safe_result_with_late_child_is_not_rebased` regression
+covers both cases and verifies that staged document writes are not published.
