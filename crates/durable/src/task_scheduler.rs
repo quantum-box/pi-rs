@@ -1212,6 +1212,7 @@ impl Scheduler {
         }));
         let mut transaction = crate::document::Transaction::new();
         documents.stage_acquisitions(&mut transaction)?;
+        documents.rebase_self_signal_check(running.version);
         let mut document_batch = match documents.into_batch() {
             Ok(batch) => batch,
             Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {

@@ -648,6 +648,247 @@ mod tests {
         }
     }
 
+    #[test]
+    fn self_signals_survive_multiple_identical_admissions() {
+        use crate::document::TaskDocuments;
+        use crate::task_scheduler::{Handler, Registry, Step};
+        use crate::task_store::{SignalResult, SignalToken};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Parent {
+            harness: std::sync::Mutex<Harness>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let token = SignalToken::new("answer", 1).unwrap();
+                for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+                    assert_eq!(
+                        docs.signal_at(task.id(), &token, name, serde_json::json!(index), 0)
+                            .unwrap(),
+                        SignalResult::Delivered
+                    );
+                    self.harness
+                        .lock()
+                        .unwrap()
+                        .ensure_task_owned_subagent(
+                            task.id(),
+                            task.owner().clone(),
+                            name,
+                            config(),
+                            Mode::Background,
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(Step::Continue(Checkpoint {
+                    phase: "saved".into(),
+                    data: serde_json::Value::Null,
+                }))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = harness.create_conversation(config()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "parent",
+            false,
+            Parent {
+                harness: std::sync::Mutex::new(harness.worker()),
+                calls: calls.clone(),
+            },
+        );
+        let mut scheduler =
+            crate::task_scheduler::Scheduler::attach(harness.owner.clone(), registry).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(83),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        scheduler.submit(&task).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler
+                .get(task.id())
+                .unwrap()
+                .unwrap()
+                .checkpoint()
+                .phase,
+            "saved"
+        );
+        let ts = TaskStore::new(harness.owner.store());
+        let token = SignalToken::new("answer", 1).unwrap();
+        for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+            assert_eq!(
+                ts.read_typed_signal(task.id(), &token, name).unwrap(),
+                Some(serde_json::json!(index))
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_child_parent_reload_retries_only_identical_running_task() {
+        use crate::document::TaskDocuments;
+        use crate::task::{TaskState, WaitFor};
+        use crate::task_scheduler::{Handler, Registry, Step};
+        struct Parent {
+            harness: std::sync::Mutex<Harness>,
+            change: u8,
+        }
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = Task::new(
+                    Uuid::from_u128(85),
+                    TaskOwner::Task(task.id()),
+                    Checkpoint {
+                        phase: "child".into(),
+                        data: serde_json::Value::Null,
+                    },
+                    1,
+                )
+                .unwrap()
+                .registered("child".into(), true);
+                let mut injected = false;
+                let result = docs.stage_keyed_child_after_load(
+                    "key",
+                    "tool",
+                    child.input(),
+                    child.clone(),
+                    || {
+                        if injected {
+                            return;
+                        }
+                        injected = true;
+                        let mut h = self.harness.lock().unwrap();
+                        h.ensure_task_owned_subagent(
+                            task.id(),
+                            task.owner().clone(),
+                            "race",
+                            config(),
+                            Mode::Background,
+                        )
+                        .unwrap();
+                        if self.change != 0 {
+                            let ts = TaskStore::new(h.owner.store());
+                            let parent = ts.load(task.id()).unwrap().unwrap();
+                            ts.update(&parent, |t| {
+                                if self.change == 1 {
+                                    t.request_abort()
+                                } else {
+                                    t.advance(Checkpoint {
+                                        phase: "changed".into(),
+                                        data: serde_json::Value::Null,
+                                    })
+                                }
+                            })
+                            .unwrap();
+                        }
+                    },
+                );
+                if self.change != 0 {
+                    assert!(result.is_err());
+                    return Ok(Step::Succeed(serde_json::json!("discard")));
+                }
+                let id = result?;
+                Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "waiting".into(),
+                        data: serde_json::Value::Null,
+                    },
+                    condition: WaitFor::TasksAny(vec![id]),
+                    children: vec![],
+                })
+            }
+        }
+        for change in 0..=2 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+            let conversation = harness.create_conversation(config()).unwrap();
+            let mut registry = Registry::default();
+            registry.register(
+                "parent",
+                false,
+                Parent {
+                    harness: std::sync::Mutex::new(harness.worker()),
+                    change,
+                },
+            );
+            registry.register("child", true, |_: &Task| {
+                Ok(Step::Succeed(serde_json::Value::Null))
+            });
+            let mut scheduler =
+                crate::task_scheduler::Scheduler::attach(harness.owner.clone(), registry).unwrap();
+            let task = Task::new(
+                Uuid::from_u128(84),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .unwrap()
+            .registered("parent".into(), false);
+            scheduler.submit(&task).unwrap();
+            let result = scheduler.tick(0);
+            if change == 2 {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap());
+            }
+            let saved = TaskStore::new(harness.owner.store())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .task;
+            match change {
+                0 => {
+                    assert_eq!(
+                        saved.state(),
+                        &TaskState::Waiting(WaitFor::TasksAny(vec![Uuid::from_u128(85)]))
+                    );
+                    assert!(scheduler.get(Uuid::from_u128(85)).unwrap().is_some());
+                }
+                1 => {
+                    assert!(saved.abort_requested());
+                    assert_eq!(saved.state(), &TaskState::Ready);
+                    assert!(scheduler.get(Uuid::from_u128(85)).unwrap().is_none());
+                }
+                _ => {
+                    assert_eq!(saved.checkpoint().phase, "changed");
+                    assert!(
+                        TaskStore::new(harness.owner.store())
+                            .load(Uuid::from_u128(85))
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn admission_during_handler_does_not_stop_the_driver() {
         use crate::task::TaskState;

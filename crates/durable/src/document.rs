@@ -1392,7 +1392,7 @@ impl<'a> HostTransaction<'a> {
         }
         let result = self
             .signals
-            .signal_at(self.store, task_id, token, key, value, now_millis)?;
+            .signal_at(self.store, task_id, token, key, value, now_millis, None)?;
         self.signal_targets.insert(target);
         Ok(result)
     }
@@ -1491,6 +1491,8 @@ enum StagedSignalStatus {
 struct StagedSignals {
     batch: OwnedBatch,
     keys: HashMap<(uuid::Uuid, String, String), StagedSignalStatus>,
+    equivalent_self_versions: HashSet<u64>,
+    canonical_self_version: Option<u64>,
 }
 impl StagedSignals {
     fn new() -> Self {
@@ -1500,6 +1502,8 @@ impl StagedSignals {
                 mutations: Vec::new(),
             },
             keys: HashMap::new(),
+            equivalent_self_versions: HashSet::new(),
+            canonical_self_version: None,
         }
     }
     fn signal_at(
@@ -1510,6 +1514,7 @@ impl StagedSignals {
         key: &str,
         value: Value,
         now_millis: i64,
+        invocation: Option<&crate::task::Task>,
     ) -> Result<crate::task_store::SignalResult, Error> {
         let identity = (task_id, token.name().to_owned(), key.to_owned());
         if let Some(previous) = self.keys.get(&identity).copied() {
@@ -1546,13 +1551,54 @@ impl StagedSignals {
                 StagedSignalStatus::Invalid => {}
             }
         }
-        let (result, batch) = crate::task_store::TaskStore::new(store).prepare_signal_at(
-            task_id,
-            token,
-            key,
-            value,
-            || now_millis,
-        )?;
+        let target = crate::task_store::key(task_id);
+        let tasks = crate::task_store::TaskStore::new(store);
+        let (result, mut batch, equivalent_version) = loop {
+            let (result, batch) =
+                tasks.prepare_signal_at(task_id, token, key, value.clone(), || now_millis)?;
+            let Some(task) = invocation.filter(|task| {
+                task.id() == task_id
+                    && task.state() == &crate::task::TaskState::Running
+                    && !task.abort_requested()
+            }) else {
+                break (result, batch, None);
+            };
+            let observed = batch
+                .checks
+                .iter()
+                .find(|check| check.key == target)
+                .and_then(|check| match check.expected {
+                    Expected::Version(version) | Expected::VersionBefore(version, _) => {
+                        Some(version)
+                    }
+                    _ => None,
+                });
+            let Some(version) = observed else {
+                break (result, batch, None);
+            };
+            let current = tasks.load(task_id)?;
+            match current {
+                Some(current) if current.task == *task && current.version == version => {
+                    break (result, batch, Some(version));
+                }
+                Some(current) if current.task == *task => continue,
+                _ => break (result, batch, None),
+            }
+        };
+        if let Some(version) = equivalent_version {
+            self.equivalent_self_versions.insert(version);
+            let canonical = *self.canonical_self_version.get_or_insert(version);
+            for check in &mut batch.checks {
+                if check.key == target {
+                    match &mut check.expected {
+                        Expected::Version(v) | Expected::VersionBefore(v, _) if *v == version => {
+                            *v = canonical
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let staged_status = match result {
             crate::task_store::SignalResult::Invalid => StagedSignalStatus::Invalid,
             crate::task_store::SignalResult::NotFound => StagedSignalStatus::NotFound,
@@ -1613,6 +1659,22 @@ impl StagedSignals {
         self.keys.insert(identity, staged_status);
         Ok(result)
     }
+
+    fn rebase_self_check(&mut self, task: uuid::Uuid, version: u64) {
+        let key = crate::task_store::key(task);
+        for check in &mut self.batch.checks {
+            if check.key == key {
+                match &mut check.expected {
+                    Expected::Version(v) | Expected::VersionBefore(v, _)
+                        if self.equivalent_self_versions.contains(v) =>
+                    {
+                        *v = version
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Checked document operations at one invocation-wide immutable revision.
@@ -1669,16 +1731,84 @@ impl<'a> TaskDocuments<'a> {
         arguments: &Value,
         child: crate::task::Task,
     ) -> Result<uuid::Uuid, String> {
-        let parent = crate::task_store::TaskStore::new(self.store)
-            .load(self.task.id())
-            .map_err(|e| e.to_string())?
-            .ok_or("parent missing")?;
-        if parent.task != self.task {
-            return Err("parent changed during invocation".into());
-        }
-        let prepared =
-            crate::keyed_child::prepare(self.store, &parent, key, tool, arguments, &child)
-                .map_err(|e| e.to_string())?;
+        self.stage_keyed_child_inner(key, tool, arguments, child, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_keyed_child_after_load<F: FnMut()>(
+        &mut self,
+        key: &str,
+        tool: &str,
+        arguments: &Value,
+        child: crate::task::Task,
+        after_load: F,
+    ) -> Result<uuid::Uuid, String> {
+        self.stage_keyed_child_inner(key, tool, arguments, child, after_load)
+    }
+
+    fn stage_keyed_child_inner<F: FnMut()>(
+        &mut self,
+        key: &str,
+        tool: &str,
+        arguments: &Value,
+        child: crate::task::Task,
+        mut after_load: F,
+    ) -> Result<uuid::Uuid, String> {
+        let tasks = crate::task_store::TaskStore::new(self.store);
+        let prepared = loop {
+            let parent = tasks
+                .load(self.task.id())
+                .map_err(|e| e.to_string())?
+                .ok_or("parent missing")?;
+            if parent.task != self.task
+                || parent.task.abort_requested()
+                || parent.task.state() != &crate::task::TaskState::Running
+            {
+                return Err("parent changed during invocation".into());
+            }
+            after_load();
+            match crate::keyed_child::prepare(self.store, &parent, key, tool, arguments, &child) {
+                Ok(prepared) => {
+                    let parent_key = crate::task_store::key(parent.task.id());
+                    if prepared
+                        .checks
+                        .iter()
+                        .filter(|check| check.key == parent_key)
+                        .all(|check| check.expected == Expected::Version(parent.version))
+                    {
+                        break prepared;
+                    }
+                    // Preparation may have read the owner a second time while
+                    // assembling child-creation checks. Rebuild the whole
+                    // prepared batch only after verifying the same invocation.
+                    let current = tasks
+                        .load(self.task.id())
+                        .map_err(|e| e.to_string())?
+                        .ok_or("parent missing")?;
+                    if current.version == parent.version
+                        || current.task != self.task
+                        || current.task.abort_requested()
+                        || current.task.state() != &crate::task::TaskState::Running
+                    {
+                        return Err("parent changed during invocation".into());
+                    }
+                }
+                Err(crate::keyed_child::Error::ParentClosed) => {
+                    let current = tasks
+                        .load(self.task.id())
+                        .map_err(|e| e.to_string())?
+                        .ok_or("parent missing")?;
+                    if current.version == parent.version
+                        || current.task != self.task
+                        || current.task.abort_requested()
+                        || current.task.state() != &crate::task::TaskState::Running
+                    {
+                        return Err("parent changed during invocation".into());
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
         if let Some((_, _, existing)) = self
             .keyed_children
             .iter()
@@ -1817,8 +1947,15 @@ impl<'a> TaskDocuments<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
-        self.signals
-            .signal_at(self.store, task_id, token, key, value, now_millis)
+        self.signals.signal_at(
+            self.store,
+            task_id,
+            token,
+            key,
+            value,
+            now_millis,
+            Some(&self.task),
+        )
     }
 
     /// Stage an immutable application record with this task as its author.
@@ -1969,6 +2106,9 @@ impl<'a> TaskDocuments<'a> {
             transaction.acquire_task_document(address, self.task.id())?;
         }
         Ok(())
+    }
+    pub(crate) fn rebase_self_signal_check(&mut self, version: u64) {
+        self.signals.rebase_self_check(self.task.id(), version);
     }
     pub(crate) fn into_batch(self) -> Result<OwnedBatch, Error> {
         // Only the scheduler can validate and commit staged keyed children.
