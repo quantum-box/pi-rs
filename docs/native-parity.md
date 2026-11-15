@@ -1072,15 +1072,15 @@ Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
 arrive. Requeries retain the last complete palette until a complete replacement
 arrives, including after an appearance notification or incomplete reply. Color
-requests are serialized and coalesced. An incomplete query holds the next
-request until its device-attributes (DA1) marker or all 18 targets reply;
-timeout alone cannot identify late OSC replies. A terminal that sends neither
-all replies nor DA1 can leave later queries pending, retaining the last complete
-palette. Completed queries allow a new request without DA1; late markers are
-counted separately. Because replies and markers have no request IDs, a missing
-old marker can be confused with a new one, and duplicate or reordered old color
-replies after completion cannot be attributed reliably. Pi also relies on ordered
-DA1 replies, but uses a shorter timeout and accepts late replies.
+requests are serialized and coalesced until the preceding device-attributes
+(DA1) marker arrives, including when all color targets have answered. If a
+refresh is waiting and DA1 does not arrive within two seconds, stale replies are
+quarantined and the refresh stays queued until the old marker arrives. This
+keeps stale responses out of a later query but means a terminal that never sends
+DA1 cannot refresh colors during that session. This differs from Pi's behavior.
+The boundary assumes the terminal sends each query's color responses before its
+DA1; arbitrary reordering or unrelated DA1 replies cannot be disambiguated,
+because these protocols contain no request identifiers.
 On an appearance notification, the last reported foreground, background, and
 complete palette remain in effect until replacement replies arrive, as in Pi.
 The reported appearance is used when no background is known.

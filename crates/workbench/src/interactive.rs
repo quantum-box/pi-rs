@@ -161,7 +161,6 @@ struct ColorQueries {
     initial_started: Option<Instant>,
     color_queries: std::collections::VecDeque<ColorQuery>,
     color_requery: bool,
-    completed_color_markers: usize,
 }
 
 impl Terminal {
@@ -295,13 +294,11 @@ impl Terminal {
 #[cfg(any(unix, windows))]
 impl ColorQueries {
     fn query_terminal_colors(&mut self, output: &mut dyn Write) -> Result<()> {
-        // Never overlap an incomplete query with a new request; OSC replies
-        // contain no query identifier. A complete query may precede its DA1.
+        // Only DA1 separates consecutive queries. All color replies alone do not
+        // establish whether a late marker belongs to this request or the next.
         if let Some(query) = self.color_queries.front() {
-            self.color_requery = true;
-            if query.replied == (1 << 18) - 1 {
-                self.completed_color_markers = self.completed_color_markers.saturating_add(1);
-                return self.finish_color_query(output);
+            if !query.quarantined {
+                self.color_requery = true;
             }
             return Ok(());
         }
@@ -323,7 +320,7 @@ impl ColorQueries {
         Ok(())
     }
 
-    fn accepts_color_reply(&mut self, target: u8, output: &mut dyn Write) -> Result<bool> {
+    fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
         let Some(query) = self.color_queries.front_mut() else {
             return Ok(false);
         };
@@ -331,10 +328,6 @@ impl ColorQueries {
         let flag = 1_u32 << target;
         let fresh = query.replied & flag == 0;
         query.replied |= flag;
-        if query.replied == (1 << 18) - 1 && self.color_requery {
-            self.completed_color_markers = self.completed_color_markers.saturating_add(1);
-            self.finish_color_query(output)?;
-        }
         Ok(is_latest && fresh)
     }
 
@@ -347,12 +340,7 @@ impl ColorQueries {
     }
 
     fn receive_color_marker(&mut self, output: &mut dyn Write) -> Result<()> {
-        if self.completed_color_markers > 0 {
-            self.completed_color_markers -= 1;
-            Ok(())
-        } else {
-            self.finish_color_query(output)
-        }
+        self.finish_color_query(output)
     }
 
     fn poll_color_timeout(&mut self) -> Result<()> {
@@ -361,8 +349,8 @@ impl ColorQueries {
             && !query.quarantined
             && query.started.elapsed() >= Duration::from_secs(2)
         {
-            // An incomplete query remains isolated until DA1 or all targets
-            // have replied; a timeout alone cannot identify late OSC replies.
+            // A timeout is not a response boundary. Keep the refresh queued
+            // until DA1, and reject stale color replies in the meantime.
             query.quarantined = true;
         }
         Ok(())
@@ -10241,7 +10229,6 @@ exit {exit}
                 quarantined: false,
             }]),
             color_requery: false,
-            completed_color_markers: 0,
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -10355,135 +10342,45 @@ exit {exit}
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn timed_out_color_query_quarantines_old_replies_until_marker() {
-        let mut terminal = super::ColorQueries {
-            initial_started: Some(std::time::Instant::now()),
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now() - std::time::Duration::from_secs(3),
-                replied: 1 << 1,
-                quarantined: false,
-            }]),
-            color_requery: true,
-            completed_color_markers: 0,
-        };
-        terminal.poll_color_timeout().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(terminal.color_queries[0].quarantined);
-        // Late replies from the old request are never accepted into a new palette.
-        let mut accepted = Vec::new();
-        for index in 0..16 {
-            if terminal
-                .accepts_color_reply(index, &mut std::io::sink())
-                .unwrap()
-            {
-                accepted.push((index, "old"));
-            }
+    fn color_requery_waits_for_marker_even_after_all_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        for target in 0..18 {
+            assert!(colors.accepts_color_reply(target, &mut output).unwrap());
         }
-        assert!(accepted.is_empty());
-        assert!(
-            !terminal
-                .accepts_color_reply(16, &mut std::io::sink())
-                .unwrap()
-        );
-        assert!(terminal.color_requery);
-        // Seventeen replies are insufficient to start the queued query.
-        assert!(terminal.color_queries[0].quarantined);
-        assert!(
-            !terminal
-                .accepts_color_reply(17, &mut std::io::sink())
-                .unwrap()
-        );
-        assert!(!terminal.color_requery);
-        assert_eq!(terminal.completed_color_markers, 1);
-        // The old marker must not finish the newly issued query.
-        terminal.receive_color_marker(&mut std::io::sink()).unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(!terminal.color_requery);
-        for index in 0..18 {
-            assert!(
-                terminal
-                    .accepts_color_reply(index, &mut std::io::sink())
-                    .unwrap()
-            );
-            accepted.push((index, "new"));
-            assert!(
-                !terminal
-                    .accepts_color_reply(index, &mut std::io::sink())
-                    .unwrap()
-            );
-        }
-        assert_eq!(accepted.len(), 18);
-        assert!(accepted.iter().all(|(_, source)| *source == "new"));
-        terminal.receive_color_marker(&mut std::io::sink()).unwrap();
-        assert!(terminal.color_queries.is_empty());
+        let first_len = output.len();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(colors.color_queries.is_empty());
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn complete_color_query_allows_requery_without_da1() {
-        let mut terminal = super::ColorQueries {
-            initial_started: Some(std::time::Instant::now()),
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: (1 << 18) - 1,
-                quarantined: false,
-            }]),
-            color_requery: false,
-            completed_color_markers: 0,
-        };
-        terminal
-            .query_terminal_colors(&mut std::io::sink())
-            .unwrap();
-        assert_eq!(terminal.completed_color_markers, 1);
-        assert_eq!(terminal.color_queries[0].replied, 0);
-        // A late marker for the completed request cannot end the new query.
-        terminal.receive_color_marker(&mut std::io::sink()).unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        for index in 0..18 {
-            assert!(
-                terminal
-                    .accepts_color_reply(index, &mut std::io::sink())
-                    .unwrap()
-            );
-        }
-        terminal.receive_color_marker(&mut std::io::sink()).unwrap();
-        assert!(terminal.color_queries.is_empty());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn missing_old_color_marker_does_not_end_incomplete_new_query() {
-        let mut terminal = super::ColorQueries {
-            initial_started: Some(std::time::Instant::now()),
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: (1 << 18) - 1,
-                quarantined: false,
-            }]),
-            color_requery: false,
-            completed_color_markers: 0,
-        };
-        terminal
-            .query_terminal_colors(&mut std::io::sink())
-            .unwrap();
-        assert!(
-            terminal
-                .accepts_color_reply(0, &mut std::io::sink())
-                .unwrap()
-        );
-        // The marker could belong to either request; keep the new query open.
-        terminal.receive_color_marker(&mut std::io::sink()).unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(
-            !terminal
-                .accepts_color_reply(0, &mut std::io::sink())
-                .unwrap()
-        );
-        assert!(
-            terminal
-                .accepts_color_reply(1, &mut std::io::sink())
-                .unwrap()
-        );
+    fn missing_marker_preserves_queued_retry_until_boundary_returns() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(3);
+        colors.poll_color_timeout().unwrap();
+        let first_len = output.len();
+        assert!(colors.color_queries[0].quarantined);
+        assert!(colors.color_requery);
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        // The late boundary releases the queued refresh exactly once.
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
     }
 
     #[test]
