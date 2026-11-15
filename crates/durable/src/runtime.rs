@@ -3358,8 +3358,8 @@ impl Harness {
         }
         let mut ids = std::collections::HashSet::new();
         for submission in &state.submissions {
-            if let Some(binding) = &submission.input_blocks {
-                if submission.kind != SubmissionKind::Input
+            if let Some(binding) = &submission.input_blocks
+                && (submission.kind != SubmissionKind::Input
                     || !submission.content.is_empty()
                     || binding.message_id.is_nil()
                     || !ids.insert(binding.message_id)
@@ -3367,10 +3367,9 @@ impl Harness {
                         serde_json::Value::Array(binding.blocks.clone()),
                         false,
                     )
-                    .is_none()
-                {
-                    return Err(Error::Invalid("invalid fitted input binding".into()));
-                }
+                    .is_none())
+            {
+                return Err(Error::Invalid("invalid fitted input binding".into()));
             }
         }
         Ok(())
