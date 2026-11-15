@@ -1430,6 +1430,26 @@ impl View {
                         self.add_images(images);
                     }
                 }
+                pi_rs::Event::ImportedUnattributedToolResult {
+                    call_id,
+                    tool_name,
+                    content,
+                    is_error,
+                    details,
+                    ..
+                } => {
+                    let outcome = sessions::unattributed_outcome(content, *is_error, details);
+                    self.lines.push(Entry::Tool {
+                        id: format!("unattributed-{}", record.id),
+                        name: format!("{tool_name} (unattributed, call {call_id})"),
+                        arguments: String::new(),
+                        output: display_tool_result(&outcome),
+                        failed: *is_error,
+                        finished: true,
+                        parts: Vec::new(),
+                        numbered_diff: false,
+                    });
+                }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
                         id: format!("shell-{}", record.id),
@@ -3471,7 +3491,9 @@ fn slash(
                         pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
                             TreeEntryKind::User
                         }
-                        pi_rs::Event::ToolFinished { .. } | pi_rs::Event::ToolReconciled { .. } => {
+                        pi_rs::Event::ToolFinished { .. }
+                        | pi_rs::Event::ToolReconciled { .. }
+                        | pi_rs::Event::ImportedUnattributedToolResult { .. } => {
                             TreeEntryKind::Tool
                         }
                         pi_rs::Event::Assistant { content, .. }
@@ -7535,6 +7557,19 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unattributed_text_block_result_displays_patch_details() {
+        let content = pi_rs::ContextContent::Blocks(vec![pi_rs::ContentBlock::Text {
+            text: "applied".into(),
+            text_signature: None,
+        }]);
+        let outcome = super::sessions::unattributed_outcome(
+            &content,
+            false,
+            &Some(serde_json::json!({"patch":"+new line"})),
+        );
+        assert_eq!(super::display_tool_result(&outcome), "applied\n+new line");
+    }
     #[test]
     fn external_editor_selects_first_nonempty_command() {
         assert_eq!(

@@ -188,6 +188,10 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             .filter(|source| source["type"] != "compaction")
             .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
             .unwrap_or(value);
+        let mut value = value;
+        if matches!(record.event, Event::ImportedUnattributedToolResult { .. }) {
+            value["nativeUnattributed"] = json!(true);
+        }
         visible.push(value);
         native.push(message);
     }

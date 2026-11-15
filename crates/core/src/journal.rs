@@ -163,6 +163,14 @@ pub enum Event {
         format: String,
         entry: serde_json::Value,
     },
+    /// An imported result whose reused call ID cannot identify one operation.
+    ImportedUnattributedToolResult {
+        call_id: String,
+        tool_name: String,
+        content: crate::ContextContent,
+        is_error: bool,
+        details: Option<serde_json::Value>,
+    },
     /// Replace or omit one message in future model context, preserving raw history.
     ContextEdited {
         target: u64,
@@ -2609,6 +2617,7 @@ fn validate_context_edit(
                 | Event::UserWithImages { .. }
                 | Event::ToolFinished { .. }
                 | Event::ToolReconciled { .. }
+                | Event::ImportedUnattributedToolResult { .. }
         )
     {
         return Err(Error::Session(
@@ -3389,6 +3398,18 @@ fn conversation_entries_since_inner(
             })
             .collect()
     };
+    let unattributed: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ImportedUnattributedToolResult {
+                call_id,
+                tool_name,
+                is_error,
+                ..
+            } => Some((record.id, (call_id, tool_name, is_error))),
+            _ => None,
+        })
+        .collect();
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
@@ -3398,6 +3419,10 @@ fn conversation_entries_since_inner(
                 Message::User {
                     content: content.clone(),
                 },
+            )),
+            Event::ImportedUnattributedToolResult { content, .. } => messages.push((
+                record.id,
+                project_content(Message::User { content: String::new() }, content),
             )),
             Event::BashExecution { execution } if !execution.exclude_from_context => {
                 messages.push((
@@ -3499,6 +3524,18 @@ fn conversation_entries_since_inner(
             None => Some((source, message)),
         })
         .map(|(source, mut message)| {
+            if let Some((call_id, tool_name, is_error)) = unattributed.get(&source) {
+                let status = if **is_error { "error" } else { "success" };
+                let label = format!(
+                    "Historical unattributed tool result ({tool_name}, call {call_id}, {status}):\n"
+                );
+                match &mut message {
+                    Message::User { content } | Message::UserWithImages { content, .. } => {
+                        content.insert_str(0, &label)
+                    }
+                    _ => {}
+                }
+            }
             if let (Some(omitted), Message::Assistant { calls, replay, .. }) =
                 (omitted_calls.get(&source), &mut message)
             {

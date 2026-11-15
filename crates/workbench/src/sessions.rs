@@ -501,6 +501,24 @@ pub fn html(session: &Session) -> String {
                     }
                 }
             }
+            Event::ImportedUnattributedToolResult {
+                call_id,
+                tool_name,
+                content,
+                is_error,
+                details,
+                ..
+            } => {
+                html.push_str(&format!(
+                    "<p>Unattributed tool result: {} (call {}, {})</p>",
+                    escape(tool_name),
+                    escape(call_id),
+                    if *is_error { "error" } else { "success" }
+                ));
+                html.push_str(&tool_html(&unattributed_outcome(
+                    content, *is_error, details,
+                )));
+            }
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 html.push_str(&tool_html(outcome))
             }
@@ -767,6 +785,43 @@ fn images_html(images: &[pi_rs::ImageContent]) -> String {
         "<img alt=\"Attached image\" style=\"max-width:100%;height:auto\" src=\"data:{};base64,{}\">", image.mime_type, image.data
     )).collect()
 }
+pub(super) fn unattributed_outcome(
+    content: &pi_rs::ContextContent,
+    is_error: bool,
+    details: &Option<serde_json::Value>,
+) -> pi_rs::Outcome {
+    match content {
+        pi_rs::ContextContent::Text(text) => pi_rs::Outcome::TextResult {
+            output: text.clone(),
+            is_error,
+            details: details.clone(),
+        },
+        pi_rs::ContextContent::Blocks(blocks)
+            if blocks
+                .iter()
+                .all(|block| matches!(block, pi_rs::ContentBlock::Text { .. })) =>
+        {
+            pi_rs::Outcome::TextResult {
+                output: blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                is_error,
+                details: details.clone(),
+            }
+        }
+        pi_rs::ContextContent::Blocks(blocks) => pi_rs::Outcome::StructuredWithDetails {
+            data: serde_json::json!({"content":blocks,"isError":is_error}),
+            attachments: Vec::new(),
+            details: details.clone().unwrap_or(serde_json::Value::Null),
+        },
+    }
+}
+
 fn tool_html(outcome: &pi_rs::Outcome) -> String {
     let mut value = serde_json::to_value(outcome).expect("serializable outcome");
     let mut images = Vec::new();
@@ -838,6 +893,19 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                 .or_else(|| data["output"].as_str().map(Cow::Borrowed)),
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 Some(Cow::Owned(outcome.tool_content()))
+            }
+            Event::ImportedUnattributedToolResult { content, .. } => {
+                Some(Cow::Owned(match content {
+                    pi_rs::ContextContent::Text(text) => text.clone(),
+                    pi_rs::ContextContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }))
             }
             Event::ModelFinished {
                 failure: Some(_),
