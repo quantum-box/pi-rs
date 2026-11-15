@@ -47,6 +47,44 @@ pub struct DurableRequest {
     pub blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
 }
 
+/// Ordered tool results indexed into the request, separate from user blocks.
+/// A bound tool message must have empty content and retains its call ID.
+#[derive(Clone, Debug)]
+pub struct DurableToolRequest {
+    pub request: DurableRequest,
+    pub tool_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+}
+
+impl DurableToolRequest {
+    /// Check occurrence identities and tool placeholders before asking an adapter to encode.
+    pub fn validate_bindings(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        for (&index, binding) in &self.request.blocks {
+            if index >= self.request.request.messages.len()
+                || binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+            {
+                return Err(Error::Config("invalid durable occurrence identity".into()));
+            }
+        }
+        for (&index, binding) in &self.tool_blocks {
+            if self.request.blocks.contains_key(&index)
+                || !matches!(self.request.request.messages.get(index), Some(Message::Tool { call_id, content }) if !call_id.is_empty() && content.is_empty())
+                || binding.message_id.is_nil()
+                || !ids.insert(binding.message_id)
+                || crate::content::UserContent::from_yield(
+                    serde_json::Value::Array(binding.blocks.clone()),
+                    false,
+                )
+                .is_none()
+            {
+                return Err(Error::Config("invalid durable tool block binding".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An opt-in host implementation for one provider. `dispatch` must send exactly
 /// the validated body and enforce its own authorization, budgets and endpoint
 /// restrictions. Preparation must not send a request. Errors fail closed.
@@ -80,6 +118,40 @@ pub trait ProviderAdapter: Send + Sync {
             ));
         }
         self.validate(attempt, &request.request, body)
+    }
+    /// Explicitly opt in to encoding ordered tool result blocks without loss.
+    fn supports_durable_tool_blocks(&self) -> bool {
+        false
+    }
+    /// Prepare a body with tool blocks. Existing adapters reject them by default.
+    async fn prepare_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+    ) -> Result<serde_json::Value> {
+        request.validate_bindings()?;
+        if !request.tool_blocks.is_empty() {
+            return Err(Error::Config(
+                "durable tool content blocks unsupported by provider".into(),
+            ));
+        }
+        self.prepare_durable(attempt, &request.request).await
+    }
+    /// Validate the exact body after provider hooks; tool-block adapters must
+    /// enforce preservation of every ordered block and associated call ID.
+    fn validate_with_tool_blocks(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &DurableToolRequest,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        request.validate_bindings()?;
+        if !request.tool_blocks.is_empty() {
+            return Err(Error::Config(
+                "durable tool content blocks unsupported by provider".into(),
+            ));
+        }
+        self.validate_durable(attempt, &request.request, body)
     }
     /// Stable, versioned identity used to bind persisted conversations.
     fn id(&self) -> &str;

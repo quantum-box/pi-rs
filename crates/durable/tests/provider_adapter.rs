@@ -521,3 +521,74 @@ async fn runtime_owner_management_validates_parent_and_tool_policy() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn tool_block_adapter_contract_fails_closed_for_legacy_providers() {
+    use pi_rs_core::Message;
+    use pi_rs_durable::model::{DurableRequest, DurableToolRequest};
+    use pi_rs_durable::transcript::MessageContentBlocks;
+    use std::collections::BTreeMap;
+    let attempt = ProviderAttempt {
+        session_id: uuid::Uuid::new_v4(),
+        request_id: uuid::Uuid::new_v4(),
+        turn: 0,
+        retries: 0,
+        restarts: 0,
+    };
+    let adapter = Fake::default();
+    let request = ModelRequest {
+        model: "fake".into(),
+        messages: vec![Message::Tool {
+            call_id: "call".into(),
+            content: String::new(),
+        }],
+        tools: vec![],
+        max_output_tokens: 10,
+    };
+    let binding = MessageContentBlocks {
+        message_id: uuid::Uuid::new_v4(),
+        blocks: vec![json!({"type":"image", "data":"aGk=", "mimeType":"image/png"})],
+    };
+    let mut durable = DurableToolRequest {
+        request: DurableRequest {
+            request,
+            blocks: BTreeMap::new(),
+        },
+        tool_blocks: BTreeMap::from([(0, binding.clone())]),
+    };
+    assert!(durable.validate_bindings().is_ok());
+    assert!(!adapter.supports_durable_tool_blocks());
+    assert!(
+        adapter
+            .prepare_with_tool_blocks(&attempt, &durable)
+            .await
+            .is_err()
+    );
+    assert!(
+        adapter
+            .validate_with_tool_blocks(&attempt, &durable, &json!({"model":"fake"}))
+            .is_err()
+    );
+    durable.request.request.messages[0] = Message::Tool {
+        call_id: "call".into(),
+        content: "hidden".into(),
+    };
+    assert!(durable.validate_bindings().is_err());
+    durable.request.request.messages[0] = Message::Tool {
+        call_id: "call".into(),
+        content: String::new(),
+    };
+    durable.request.blocks.insert(0, binding);
+    assert!(durable.validate_bindings().is_err());
+    durable.request.blocks.clear();
+    durable.tool_blocks.clear();
+    let body = adapter
+        .prepare_with_tool_blocks(&attempt, &durable)
+        .await
+        .unwrap();
+    assert!(
+        adapter
+            .validate_with_tool_blocks(&attempt, &durable, &body)
+            .is_ok()
+    );
+}
