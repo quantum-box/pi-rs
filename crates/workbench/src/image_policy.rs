@@ -464,8 +464,22 @@ mod tests {
             for enriched in [false, true] {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let address = listener.local_addr().unwrap();
+                listener.set_nonblocking(true).unwrap();
                 let server = std::thread::spawn(move || {
-                    let (mut socket, _) = listener.accept().unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                         .unwrap();

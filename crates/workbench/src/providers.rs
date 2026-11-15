@@ -658,9 +658,14 @@ impl Client {
                         .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
                         .await
                 } else if let Some(key) = session_cache_key {
+                    // Workbench applies its own model-specific affinity headers.
+                    // Do not let the standalone SDK add a second default set.
                     client
                         .clone()
                         .with_default_headers(defaults)
+                        .with_session_affinity_format(
+                            pi_rs::openai::SessionAffinityFormat::Disabled,
+                        )
                         .stream_enriched_in_session_with_identity(
                             uuid::Uuid::nil(),
                             uuid::Uuid::nil(),
