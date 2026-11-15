@@ -426,6 +426,10 @@ mod tests {
         }
         assert!(Query::new(r"re:^(?=\.)\.$").score(&doc(".")).is_some());
         assert!(Query::new(r"re:^(.)\1$").score(&doc("\r\r")).is_none());
+        let combined = Query::new(r"re:^(?=\w)..$");
+        assert!(combined.score(&doc("aZ")).is_some());
+        assert!(combined.score(&doc("a\r")).is_none());
+        assert!(combined.score(&doc("éZ")).is_none());
         assert_eq!(js_regex_dots("(?s:.)", "(?s:.)"), "(?s:.)");
         assert_eq!(js_regex_dots("[.]", "[.]"), "[.]");
         assert!(Query::new(r"re:(?s)^.$").score(&doc("\n")).is_some());
