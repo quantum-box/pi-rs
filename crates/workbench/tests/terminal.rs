@@ -973,7 +973,19 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
-    output_until(&mut master, |text| text.contains("resume-draft"));
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b]11;?"));
+        text.contains("resume-draft") && text.contains("\x1b[>4;2m")
+    });
+    // An old or foreign DA1 and late OSC must not launch another query after
+    // the shell owned the terminal, and ordinary input must still be usable.
+    master
+        .write_all(b"\x1b[?1;2c\x1b]11;rgb:ffff/ffff/ffff\x07-after-resume")
+        .unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b]11;?"));
+        text.contains("-after-resume")
+    });
     master.write_all(b"\x15/quit\r").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
