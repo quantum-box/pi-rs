@@ -1507,11 +1507,18 @@ cannot alter, drop or reorder a bound result.
 Ollama tool content arrays require a recent server that preserves images in
 `tool` messages; older compatible servers may reject them. These adapters do not
 probe model vision support. A provider can reject an otherwise valid image or
-model combination; no silent fallback is performed. Google's default assumes the
-chosen model accepts images, since this adapter has no model input catalog;
-upstream filters images for models without image input.
-Tool-result error status is not carried by the core request, so this adapter
-cannot reproduce upstream's `error` response key. The ordered opt-in requires
+model combination; no silent fallback is performed. Google's host may configure model `input` descriptors; text-only models omit
+tool-result images, while unknown models retain the previous image-capable
+default. Google receives the persisted `is_error` state for both text and block
+results and emits the upstream `error` key. Legacy results with no metadata use
+`output`. If a reused call ID cannot be associated with a unique occurrence,
+request preparation fails closed. A metadata-aware adapter persists even a
+single-text tool result as a block, binding its occurrence ID to operation
+metadata. Consequently that context uses the existing tool-block compaction and
+hook opt-in requirements. Legacy metadata without an occurrence binding fails closed rather than being
+matched by call ID. When status metadata is forwarded, a
+before-request hook cannot replace the message list. Descriptors are host-owned
+and must be restored on reopen. The ordered opt-in requires
 recognized Gemini 3+ model IDs and PNG, JPEG or WebP images, and uses
 `$ref` entries in an ordered JSON output array; live model acceptance and
 interpretation of this representation have not been tested. Non-text/image

@@ -657,3 +657,353 @@ async fn reopen_cannot_silently_switch_tool_result_mode() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+#[tokio::test]
+async fn tool_error_and_model_input_fixtures_follow_upstream() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let a = attempt();
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/upstream_tool_metadata.json")).unwrap();
+    for fixture in fixtures.as_array().unwrap() {
+        let model = fixture["model"].as_str().unwrap();
+        let images_allowed = fixture["image_input"].as_bool().unwrap();
+        let is_error = fixture["is_error"].as_bool().unwrap();
+        let image_only = fixture["image_only"].as_bool().unwrap();
+        let mut adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
+        adapter
+            .set_model_descriptor(
+                model,
+                &if images_allowed {
+                    json!({"input":["text","image"]})
+                } else {
+                    json!({"input":["text"]})
+                },
+            )
+            .unwrap();
+        let mut req = ordered_tool_request();
+        req.request.request.model = model.into();
+        if image_only {
+            req.tool_blocks.get_mut(&2).unwrap().blocks =
+                vec![json!({"type":"image","data":"aGk=","mimeType":"image/png"})];
+        }
+        let result = ProviderResultRequest {
+            request: req,
+            tool_errors: [(2, is_error)].into_iter().collect(),
+        };
+        let mut body = adapter
+            .prepare_with_result_metadata(&a, &result)
+            .await
+            .unwrap();
+        let response = &body["contents"][2]["parts"][0]["functionResponse"];
+        let key = if is_error { "error" } else { "output" };
+        let other = if is_error { "output" } else { "error" };
+        let text = fixture["expected"].as_str().unwrap();
+        assert_eq!(response["response"][key], text);
+        assert!(response["response"].get(other).is_none());
+        if images_allowed && model.starts_with("gemini-3") {
+            assert_eq!(response["parts"][0]["inlineData"]["data"], "aGk=");
+        }
+        if !images_allowed {
+            assert!(!body.to_string().contains("aGk="));
+        }
+        if images_allowed && model.starts_with("gemini-2") {
+            assert_eq!(
+                body["contents"][3]["parts"][1]["inlineData"]["data"],
+                "aGk="
+            );
+        }
+        adapter
+            .validate_with_result_metadata(&a, &result, &body)
+            .unwrap();
+        body["contents"][2]["parts"][0]["functionResponse"]["response"] =
+            json!({"output":"tampered"});
+        assert!(
+            adapter
+                .validate_with_result_metadata(&a, &result, &body)
+                .is_err()
+        );
+    }
+    let mut adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
+    for invalid in [
+        json!({}),
+        json!({"input":"image"}),
+        json!({"input":["image",3]}),
+        json!({"input":["audio"]}),
+    ] {
+        assert!(adapter.set_model_descriptor("m", &invalid).is_err());
+    }
+}
+
+#[tokio::test]
+async fn tool_status_also_applies_to_plain_results_and_ordered_mode() {
+    use pi_rs_durable::model::ProviderResultRequest;
+    let a = attempt();
+    let mut adapter = GoogleAdapter::new_ordered_tool_blocks("http://127.0.0.1:1", "key").unwrap();
+    let req = ordered_tool_request();
+    let request = ProviderResultRequest {
+        request: req,
+        tool_errors: [(2, true)].into_iter().collect(),
+    };
+    let body = adapter
+        .prepare_with_result_metadata(&a, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["response"]["error"][0],
+        "first"
+    );
+    adapter
+        .set_model_descriptor("gemini-3-flash", &json!({"input":["text"]}))
+        .unwrap();
+    let body = adapter
+        .prepare_with_result_metadata(&a, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["response"]["error"],
+        json!(["first", "last"])
+    );
+    assert!(!body.to_string().contains("aGk="));
+    let mut plain = request.clone();
+    plain.request.tool_blocks.clear();
+    if let Message::Tool { content, .. } = &mut plain.request.request.request.messages[2] {
+        *content = "failure".into();
+    }
+    let body = adapter
+        .prepare_with_result_metadata(&a, &plain)
+        .await
+        .unwrap();
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["response"]["error"],
+        "failure"
+    );
+    let mut invalid = plain;
+    invalid.tool_errors.insert(1, true);
+    assert!(
+        adapter
+            .prepare_with_result_metadata(&a, &invalid)
+            .await
+            .is_err()
+    );
+}
+
+struct UnusedModel;
+#[async_trait::async_trait]
+impl pi_rs_core::Model for UnusedModel {
+    async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+        panic!("provider must handle the request")
+    }
+}
+struct ImageTool(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait::async_trait]
+impl pi_rs_core::Tool for ImageTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: pi_rs_core::ToolContext) -> pi_rs_core::Outcome {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        pi_rs_core::Outcome::Failed("failure".into())
+    }
+}
+struct ImageBlocks(std::sync::atomic::AtomicBool, bool, bool);
+#[async_trait::async_trait]
+impl pi_rs_durable::extension::Hook for ImageBlocks {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
+    async fn after_tool_result(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if !self.2 {
+            return Ok(None);
+        }
+        let mut result = result.clone();
+        result.is_error = false;
+        Ok(Some(result))
+    }
+    async fn after_tool_blocks(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolBlockResult,
+        _: bool,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+        let mut result = result.clone();
+        if !self.1 {
+            result.output = vec![
+                json!({"type":"text","text":"first"}),
+                json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                json!({"type":"text","text":"last"}),
+            ];
+        }
+        Ok(Some(result))
+    }
+    async fn generation(
+        &self,
+        event: pi_rs_durable::extension::GenerationEvent,
+        value: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::GenerationDecision, String> {
+        use pi_rs_durable::extension::{GenerationDecision, GenerationEvent};
+        if event == GenerationEvent::BeforeRequest
+            && value.get("tool_content_blocks").is_some()
+            && self.0.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut changed = value.clone();
+            changed["tool_content_blocks"] = json!({});
+            return Ok(GenerationDecision::Replace(changed));
+        }
+        Ok(GenerationDecision::Pass)
+    }
+}
+#[tokio::test]
+async fn failed_tool_result_reopens_and_reaches_google_http() {
+    use pi_rs_durable::{
+        extension::Extension,
+        recovery::{ReplayPolicy, UncertainPolicy},
+        runtime::{Config, Harness, Options, RegisteredTool},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    for (plain, images_allowed, missing_tool, flip) in [
+        (false, true, false, false),
+        (true, true, false, false),
+        (false, false, false, false),
+        (true, true, true, false),
+        (false, true, false, true),
+    ] {
+        let first = Box::leak(sse(r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","id":"c1","args":{}}}]},"finishReason":"STOP"}]}"#).into_boxed_str());
+        let (url, server1) = server(first, false).await;
+        let path = std::env::temp_dir().join(format!("pi-google-block-{}", Uuid::new_v4()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = || Options {
+            model: Arc::new(UnusedModel),
+            tools: if missing_tool {
+                vec![]
+            } else {
+                vec![RegisteredTool {
+                    tool: Arc::new(ImageTool(calls.clone())),
+                    replay: ReplayPolicy::Unsafe,
+                }]
+            },
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let hook = Arc::new(ImageBlocks(AtomicBool::new(true), plain, flip));
+        let extension = || Extension {
+            name: "blocks".into(),
+            hooks: vec![hook.clone()],
+            ..Default::default()
+        };
+        let adapter = |endpoint: &str| {
+            let mut adapter = GoogleAdapter::new(endpoint, "secret-key").unwrap();
+            if !images_allowed {
+                adapter
+                    .set_model_descriptor("gemini-3-flash", &json!({"input":["text"]}))
+                    .unwrap();
+            }
+            Arc::new(adapter)
+        };
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(adapter(&url)).unwrap();
+        h.install_extension(extension()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "gemini-3-flash".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.select_extensions(id, vec!["blocks".into()]).unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        server1.await.unwrap();
+        drop(h);
+        hook.0.store(false, Ordering::SeqCst);
+        let final_response = Box::leak(
+            sse(
+                r#"{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]}"#,
+            )
+            .into_boxed_str(),
+        );
+        let (url, server2) = server(final_response, false).await;
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(adapter(&url)).unwrap();
+        h.install_extension(extension()).unwrap();
+        let before = h.conversation(id).unwrap().content_blocks;
+        let binding = before
+            .values()
+            .find(|b| b.blocks.len() == if plain { 1 } else { 3 })
+            .unwrap();
+        let expected_text = if plain {
+            binding.blocks[0]["text"].as_str().unwrap().to_owned()
+        } else {
+            "first\nlast".to_owned()
+        };
+        let occurrence_id = binding.message_id;
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let bytes = server2.await.unwrap();
+        let split = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let sent: Value = serde_json::from_slice(&bytes[split + 4..]).unwrap();
+        let response = sent["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|x| x["parts"].as_array().unwrap())
+            .find_map(|x| x.get("functionResponse"))
+            .unwrap();
+        assert_eq!(
+            response["response"][if flip { "output" } else { "error" }],
+            expected_text
+        );
+        if plain || !images_allowed {
+            assert!(response.get("parts").is_none());
+        } else {
+            assert_eq!(response["parts"][0]["inlineData"]["data"], "aGk=");
+        }
+        let result_metadata = h
+            .conversation(id)
+            .unwrap()
+            .tool_results
+            .into_iter()
+            .find(|m| m.call_id == "c1")
+            .unwrap();
+        assert_eq!(result_metadata.is_error, !flip);
+        assert_eq!(result_metadata.content_block_id, Some(occurrence_id));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if missing_tool { 0 } else { 1 }
+        );
+        assert_eq!(h.conversation(id).unwrap().content_blocks, before);
+        let fork = h.fork(id).unwrap();
+        let forked = h.conversation(fork).unwrap();
+        assert_eq!(forked.content_blocks, before);
+        let forked_meta = forked
+            .tool_results
+            .iter()
+            .find(|m| m.call_id == "c1")
+            .unwrap();
+        assert_eq!(forked_meta.content_block_id, Some(occurrence_id));
+        assert_eq!(forked_meta.is_error, !flip);
+        drop(h);
+        for suffix in ["", "-wal", "-shm", ".owner"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+}

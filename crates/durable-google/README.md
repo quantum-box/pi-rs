@@ -17,9 +17,17 @@ response for Gemini 3+ or unrecognized model IDs, or placed in an immediately
 following user message for older Gemini models. Whitespace-only text becomes
 `(see attached image)` when images exist, otherwise empty text. This loses
 text/image interleaving only in the provider request; persisted blocks remain
-unchanged. This adapter has no model input catalog, so it assumes image support,
-where upstream drops images for text-only models. The durable core request has
-no tool-result error flag, so the upstream `error` key is not reproduced.
+unchanged. Hosts may call `set_model_descriptor(model, &json!({"input":
+["text", "image"]}))` before installing the adapter. A descriptor whose input
+contains only `text` omits tool-result images as upstream does; unknown models
+retain the historical image-capable default. Descriptors are host configuration,
+not persisted, and must be supplied again on reopen. The durable runtime passes
+committed tool error status to this adapter, which emits `error` rather than
+`output`. Legacy results without metadata use `output`; ambiguous reused call
+IDs without provable occurrence bindings fail closed. New text-only results are
+also stored as durable blocks to bind their status, so the existing tool-block
+compaction and hook opt-in requirements apply. Legacy status without an occurrence binding fails closed rather than being
+guessed.
 
 For explicit order preservation, construct
 `GoogleAdapter::new_ordered_tool_blocks(base_url, api_key)` and select its
@@ -29,3 +37,9 @@ instead of the upstream representation. It requires recognized Gemini 3+
 models for images, supports PNG, JPEG and WebP, and rejects empty result arrays.
 The separate identity prevents silently changing the mode on reopen. Fake HTTP
 tests verify the body but not real provider acceptance or model interpretation.
+
+Provider hooks cannot modify result status, associated messages or tool blocks;
+the adapter validates the complete projected contents before dispatch. The
+status-aware route also covers plain text tool results. Metadata is only passed
+to adapters that explicitly opt in to `ProviderResultRequest`; other adapters
+retain their earlier behavior.

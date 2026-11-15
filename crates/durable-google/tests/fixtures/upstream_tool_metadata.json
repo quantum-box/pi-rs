@@ -1,0 +1,7 @@
+[
+  {"model":"gemini-3-flash","image_input":true,"is_error":true,"image_only":false,"expected":"first\nlast"},
+  {"model":"gemini-3-flash","image_input":false,"is_error":true,"image_only":false,"expected":"first\nlast"},
+  {"model":"gemini-2.5-flash","image_input":true,"is_error":true,"image_only":true,"expected":"(see attached image)"},
+  {"model":"gemini-2.5-flash","image_input":false,"is_error":false,"image_only":true,"expected":""},
+  {"model":"gemini-3-flash","image_input":true,"is_error":false,"image_only":false,"expected":"first\nlast"}
+]

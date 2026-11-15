@@ -748,6 +748,9 @@ pub struct ToolResultMetadata {
     pub operation_id: Uuid,
     pub call_id: String,
     pub tool: String,
+    /// Occurrence ID of a block-valued result; absent in legacy or text results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_block_id: Option<Uuid>,
     pub is_error: bool,
     #[serde(default)]
     pub redacted: bool,
@@ -840,6 +843,7 @@ fn record_tool_result(
         operation_id,
         call_id: call.id.clone(),
         tool: call.name.clone(),
+        content_block_id: None,
         is_error: matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_)),
         redacted: false,
         metadata_truncated,
@@ -850,6 +854,40 @@ fn record_tool_result(
         diagnostics,
     });
     Ok(())
+}
+
+/// Resolve statuses only when one committed occurrence can be proved. Unknown
+/// legacy statuses remain absent; ambiguous reused IDs never acquire a guess.
+fn tool_error_bindings(c: &Conversation) -> Result<std::collections::BTreeMap<usize, bool>, Error> {
+    let mut statuses = std::collections::BTreeMap::new();
+    for (index, message) in c.messages.iter().enumerate() {
+        let Message::Tool { call_id, .. } = message else {
+            continue;
+        };
+        let candidates: Vec<_> = c
+            .tool_results
+            .iter()
+            .filter(|m| m.call_id == *call_id)
+            .collect();
+        let block_id = c.content_blocks.get(&index).map(|b| b.message_id);
+        let exact: Vec<_> = candidates
+            .iter()
+            .filter(|m| block_id.is_some() && m.content_block_id == block_id)
+            .collect();
+        let found = if exact.len() == 1 {
+            Some(*exact[0])
+        } else if candidates.is_empty() {
+            None
+        } else {
+            return Err(Error::Invalid(
+                "ambiguous durable tool result metadata".into(),
+            ));
+        };
+        if let Some(metadata) = found {
+            statuses.insert(index + 1, metadata.is_error);
+        }
+    }
+    Ok(statuses)
 }
 
 pub(crate) fn local_schema_references(value: &serde_json::Value) -> bool {
@@ -2831,6 +2869,58 @@ impl Harness {
             .and_then(|id| self.provider_adapter.as_ref().filter(|a| a.id() == id))
             .is_some_and(|a| a.supports_durable_blocks())
     }
+    fn status_aware(&self, c: &Conversation) -> bool {
+        c.provider_adapter
+            .as_ref()
+            .and_then(|id| self.provider_adapter.as_ref().filter(|a| a.id() == id))
+            .is_some_and(|a| a.supports_tool_result_metadata())
+    }
+    /// Append a finalized result and bind the operation identity when the
+    /// selected provider consumes result metadata.
+    fn append_tool_with_status(
+        &self,
+        c: &mut Conversation,
+        calls: &[ToolCall],
+        index: usize,
+        operation_id: Uuid,
+        content: String,
+    ) -> Result<(), Error> {
+        if !self.status_aware(c) {
+            return append_tool(c, calls, index, content);
+        }
+        let metadata = c
+            .tool_results
+            .iter_mut()
+            .find(|m| m.operation_id == operation_id)
+            .ok_or_else(|| Error::Invalid("missing tool result metadata".into()))?;
+        let message_id = Uuid::new_v4();
+        metadata.content_block_id = Some(message_id);
+        let position = c.messages.len();
+        append_tool(c, calls, index, String::new())?;
+        c.content_blocks.insert(
+            position,
+            crate::transcript::MessageContentBlocks {
+                message_id,
+                blocks: vec![serde_json::json!({"type":"text","text":content})],
+            },
+        );
+        Ok(())
+    }
+    fn append_skipped_with_status(
+        &self,
+        c: &mut Conversation,
+        calls: &[ToolCall],
+        index: usize,
+        reason: &str,
+    ) -> Result<(), Error> {
+        let outcome = Outcome::Skipped(reason.into());
+        if !self.status_aware(c) {
+            return append_tool(c, calls, index, outcome.tool_content());
+        }
+        let operation_id = Uuid::new_v4();
+        record_tool_result(c, calls, index, operation_id, &outcome, Vec::new())?;
+        self.append_tool_with_status(c, calls, index, operation_id, outcome.tool_content())
+    }
     fn supports_context_blocks(&self, c: &Conversation) -> bool {
         let adapter = c
             .provider_adapter
@@ -2870,6 +2960,11 @@ impl Harness {
     ) -> Result<(), Error> {
         if adapter.id().trim().is_empty() {
             return Err(Error::Invalid("empty provider adapter identity".into()));
+        }
+        if adapter.supports_tool_result_metadata() && !adapter.supports_durable_tool_blocks() {
+            return Err(Error::Invalid(
+                "tool-result metadata requires durable tool blocks".into(),
+            ));
         }
         self.provider_adapter = Some(adapter);
         Ok(())
@@ -8731,13 +8826,13 @@ impl Harness {
                     let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
                     record_tool_result(&mut c, &calls, index, operation_id, &outcome, reported)?;
                     let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
-                    append_tool(&mut c, &calls, index, content)?;
+                    self.append_tool_with_status(&mut c, &calls, index, operation_id, content)?;
                     for i in index + 1..calls.len() {
-                        append_tool(
+                        self.append_skipped_with_status(
                             &mut c,
                             &calls,
                             i,
-                            Outcome::Skipped("aborted before dispatch".into()).tool_content(),
+                            "aborted before dispatch",
                         )?;
                     }
                 }
@@ -8766,6 +8861,7 @@ impl Harness {
             Phase::ToolFinished {
                 calls,
                 index,
+                operation_id,
                 mut content,
                 ..
             } => {
@@ -8782,26 +8878,16 @@ impl Harness {
                 }
                 // The effect already committed; retain its result even if an
                 // after-tool hook was interrupted by the abort.
-                append_tool(&mut c, &calls, index, content)?;
+                self.append_tool_with_status(&mut c, &calls, index, operation_id, content)?;
                 for i in index + 1..calls.len() {
-                    append_tool(
-                        &mut c,
-                        &calls,
-                        i,
-                        Outcome::Skipped("aborted before dispatch".into()).tool_content(),
-                    )?;
+                    self.append_skipped_with_status(&mut c, &calls, i, "aborted before dispatch")?;
                 }
             }
             Phase::Tools { calls, index, .. }
             | Phase::ToolPreparing { calls, index, .. }
             | Phase::ToolGateSleeping { calls, index, .. } => {
                 for i in index..calls.len() {
-                    append_tool(
-                        &mut c,
-                        &calls,
-                        i,
-                        Outcome::Skipped("aborted before dispatch".into()).tool_content(),
-                    )?;
+                    self.append_skipped_with_status(&mut c, &calls, i, "aborted before dispatch")?;
                 }
             }
             _ => (),
@@ -9589,6 +9675,16 @@ impl Harness {
                             _ => return Err(crate::transcript::Error::Corrupt.into()),
                         }
                     }
+                    let metadata_adapter = c
+                        .provider_adapter
+                        .as_ref()
+                        .and_then(|id| self.provider_adapter.as_ref().filter(|a| a.id() == id))
+                        .is_some_and(|a| a.supports_tool_result_metadata());
+                    let tool_errors = if metadata_adapter {
+                        tool_error_bindings(&c)?
+                    } else {
+                        Default::default()
+                    };
                     let original_messages = request.messages.clone();
                     if !c.extensions.is_empty() {
                         let selected = self.selected_extensions(&c)?;
@@ -9646,7 +9742,7 @@ impl Harness {
                                 Error::Invalid(format!("invalid before-request messages: {e}"))
                             })?;
                     }
-                    if (!blocks.is_empty() || !tool_blocks.is_empty())
+                    if (!blocks.is_empty() || !tool_blocks.is_empty() || !tool_errors.is_empty())
                         && request.messages != original_messages
                     {
                         return Err(Error::Invalid(
@@ -9662,6 +9758,11 @@ impl Harness {
                         tool_blocks,
                     };
                     tool_request.validate_bindings()?;
+                    let result_request = crate::model::ProviderResultRequest {
+                        request: tool_request.clone(),
+                        tool_errors,
+                    };
+                    result_request.validate_bindings()?;
                     let prepared = if let Some(adapter_id) = &c.provider_adapter {
                         let adapter = self
                             .provider_adapter
@@ -9682,7 +9783,11 @@ impl Harness {
                         };
                         let mut body = fenced_poll(
                             async {
-                                if tool_request.tool_blocks.is_empty() {
+                                if adapter.supports_tool_result_metadata() {
+                                    adapter
+                                        .prepare_with_result_metadata(&attempt, &result_request)
+                                        .await
+                                } else if tool_request.tool_blocks.is_empty() {
                                     adapter.prepare_durable(&attempt, &durable_request).await
                                 } else {
                                     adapter
@@ -9733,7 +9838,13 @@ impl Harness {
                                 "provider body must be an object within the size limit".into(),
                             ));
                         }
-                        if tool_request.tool_blocks.is_empty() {
+                        if adapter.supports_tool_result_metadata() {
+                            adapter.validate_with_result_metadata(
+                                &attempt,
+                                &result_request,
+                                &body,
+                            )?;
+                        } else if tool_request.tool_blocks.is_empty() {
                             adapter.validate_durable(&attempt, &durable_request, &body)?;
                         } else {
                             adapter.validate_with_tool_blocks(&attempt, &tool_request, &body)?;
@@ -9998,12 +10109,11 @@ impl Harness {
                     if response.is_truncated() && !response.calls.is_empty() {
                         c.messages.push(response.assistant_message());
                         for index in 0..response.calls.len() {
-                            append_tool(
+                            self.append_skipped_with_status(
                                 &mut c,
                                 &response.calls,
                                 index,
-                                Outcome::Skipped("tool call truncated before dispatch".into())
-                                    .tool_content(),
+                                "tool call truncated before dispatch",
                             )?;
                         }
                         finish_failure(&mut c, "truncated tool calls".into());
@@ -10418,7 +10528,13 @@ impl Harness {
                                     &outcome,
                                     Vec::new(),
                                 )?;
-                                append_tool(&mut c, &calls, index, outcome.tool_content())?;
+                                self.append_tool_with_status(
+                                    &mut c,
+                                    &calls,
+                                    index,
+                                    operation_id,
+                                    outcome.tool_content(),
+                                )?;
                                 c.phase = Phase::Tools {
                                     turns,
                                     calls,
@@ -10427,15 +10543,22 @@ impl Harness {
                             }
                         }
                     } else {
+                        let operation_id = Uuid::new_v4();
                         record_tool_result(
                             &mut c,
                             &calls,
                             index,
-                            Uuid::new_v4(),
+                            operation_id,
                             &Outcome::Skipped("tool unavailable".into()),
                             Vec::new(),
                         )?;
-                        append_tool(&mut c, &calls, index, "tool unavailable".into())?;
+                        self.append_tool_with_status(
+                            &mut c,
+                            &calls,
+                            index,
+                            operation_id,
+                            "tool unavailable".into(),
+                        )?;
                         c.phase = Phase::Tools {
                             turns,
                             calls,
@@ -11320,16 +11443,28 @@ impl Harness {
                             .as_object()
                             .is_some_and(|o| o.len() == 2)
                         && block_result.output[0]["type"] == "text";
-                    if simple {
+                    // A metadata-aware adapter requires a persistent occurrence ID
+                    // even for a single text block, so a later fork or compaction
+                    // cannot attach another call's status to it.
+                    let needs_occurrence = self.status_aware(&c);
+                    if simple && !needs_occurrence {
                         content = block_result.output[0]["text"].as_str().unwrap().to_owned();
                         append_tool(&mut c, &calls, index, content)?;
                     } else {
                         let position = c.messages.len();
                         append_tool(&mut c, &calls, index, String::new())?;
+                        let message_id = Uuid::new_v4();
+                        if let Some(metadata) = c
+                            .tool_results
+                            .iter_mut()
+                            .find(|m| m.operation_id == operation_id)
+                        {
+                            metadata.content_block_id = Some(message_id);
+                        }
                         c.content_blocks.insert(
                             position,
                             crate::transcript::MessageContentBlocks {
-                                message_id: Uuid::new_v4(),
+                                message_id,
                                 blocks: block_result.output,
                             },
                         );
@@ -11652,19 +11787,26 @@ impl Harness {
             if !self.conversation_tasks(c.id)?.is_empty() {
                 return Err(Error::Invalid("owned task cleanup is still pending".into()));
             }
-            append_tool(&mut c, &calls, index, outcome.tool_content())?;
+            self.append_tool_with_status(
+                &mut c,
+                &calls,
+                index,
+                operation_id,
+                outcome.tool_content(),
+            )?;
             for i in index + 1..calls.len() {
-                append_tool(
-                    &mut c,
-                    &calls,
-                    i,
-                    Outcome::Skipped("aborted before dispatch".into()).tool_content(),
-                )?;
+                self.append_skipped_with_status(&mut c, &calls, i, "aborted before dispatch")?;
             }
             c.abort_requested = false;
             finish_abort(&mut c);
         } else if c.extensions.is_empty() {
-            append_tool(&mut c, &calls, index, outcome.tool_content())?;
+            self.append_tool_with_status(
+                &mut c,
+                &calls,
+                index,
+                operation_id,
+                outcome.tool_content(),
+            )?;
             c.phase = Phase::Tools {
                 turns,
                 calls,
@@ -14781,6 +14923,60 @@ mod scheduler_tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Semaphore;
 
+    #[test]
+    fn tool_status_bindings_use_occurrences_and_reject_ambiguous_legacy_ids() {
+        let mut c = Harness::empty_conversation(Uuid::new_v4(), config());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        c.messages = vec![
+            Message::Tool {
+                call_id: "same".into(),
+                content: String::new(),
+            },
+            Message::Tool {
+                call_id: "same".into(),
+                content: String::new(),
+            },
+        ];
+        for (index, id, is_error) in [(0, first, true), (1, second, false)] {
+            c.content_blocks.insert(
+                index,
+                crate::transcript::MessageContentBlocks {
+                    message_id: id,
+                    blocks: vec![],
+                },
+            );
+            c.tool_results.push(ToolResultMetadata {
+                operation_id: Uuid::new_v4(),
+                call_id: "same".into(),
+                tool: "test".into(),
+                content_block_id: Some(id),
+                is_error,
+                redacted: false,
+                metadata_truncated: false,
+                schema_validated: true,
+                details: None,
+                structured_output: None,
+                attachments: vec![],
+                diagnostics: vec![],
+            });
+        }
+        assert_eq!(
+            tool_error_bindings(&c).unwrap(),
+            [(1, true), (2, false)].into_iter().collect()
+        );
+        c.tool_results[0].content_block_id = None;
+        assert!(tool_error_bindings(&c).is_err());
+        c.messages.truncate(1);
+        c.tool_results.truncate(1);
+        c.content_blocks.clear();
+        assert!(tool_error_bindings(&c).is_err());
+        c.context_generation = Some(Uuid::new_v4());
+        assert!(tool_error_bindings(&c).is_err());
+        c.tool_results.clear();
+        assert!(tool_error_bindings(&c).unwrap().is_empty());
+    }
+
     struct GatedModel {
         started: Arc<Semaphore>,
         release: Arc<Semaphore>,
@@ -14836,6 +15032,7 @@ mod scheduler_tests {
             operation_id: Uuid::new_v4(),
             call_id: "legacy".into(),
             tool: "allowed".into(),
+            content_block_id: None,
             is_error: false,
             redacted: false,
             metadata_truncated: false,

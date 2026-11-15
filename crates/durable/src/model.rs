@@ -55,6 +55,23 @@ pub struct DurableToolRequest {
     pub tool_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
 }
 
+/// Tool-result statuses indexed by request message position. Missing entries
+/// mean legacy or unavailable metadata, never an inferred success.
+#[derive(Clone, Debug)]
+pub struct ProviderResultRequest {
+    pub request: DurableToolRequest,
+    pub tool_errors: std::collections::BTreeMap<usize, bool>,
+}
+impl ProviderResultRequest {
+    pub fn validate_bindings(&self) -> Result<()> {
+        self.request.validate_bindings()?;
+        if self.tool_errors.keys().any(|i| !matches!(self.request.request.request.messages.get(*i), Some(Message::Tool { call_id, .. }) if !call_id.is_empty())) {
+            return Err(Error::Config("invalid tool result metadata binding".into()));
+        }
+        Ok(())
+    }
+}
+
 impl DurableToolRequest {
     /// Check occurrence identities and tool placeholders before asking an adapter to encode.
     pub fn validate_bindings(&self) -> Result<()> {
@@ -155,6 +172,40 @@ pub trait ProviderAdapter: Send + Sync {
             ));
         }
         self.validate_durable(attempt, &request.request, body)
+    }
+    /// Opt in to receiving status metadata for tool-result occurrences. Such
+    /// adapters must also support durable tool blocks: even text-only results
+    /// are stored as blocks to bind their status across fork and compaction.
+    fn supports_tool_result_metadata(&self) -> bool {
+        false
+    }
+    async fn prepare_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+    ) -> Result<serde_json::Value> {
+        request.validate_bindings()?;
+        if !request.tool_errors.is_empty() {
+            return Err(Error::Config(
+                "tool result metadata unsupported by provider".into(),
+            ));
+        }
+        self.prepare_with_tool_blocks(attempt, &request.request)
+            .await
+    }
+    fn validate_with_result_metadata(
+        &self,
+        attempt: &ProviderAttempt,
+        request: &ProviderResultRequest,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        request.validate_bindings()?;
+        if !request.tool_errors.is_empty() {
+            return Err(Error::Config(
+                "tool result metadata unsupported by provider".into(),
+            ));
+        }
+        self.validate_with_tool_blocks(attempt, &request.request, body)
     }
     /// Stable, versioned identity used to bind persisted conversations.
     fn id(&self) -> &str;
