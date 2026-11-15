@@ -1133,7 +1133,7 @@ enum Command {
     Package(packages::PackageCommand),
     Mcp {
         #[command(subcommand)]
-        command: mcp_config::McpCommand,
+        command: Box<mcp_config::McpCommand>,
     },
     /// Check or print a configured provider credential.
     Auth {
@@ -1693,7 +1693,7 @@ async fn execute(
         return backend::run(args, ready).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
-        return mcp_config::command(&args, command.clone()).await;
+        return mcp_config::command(&args, command.as_ref().clone()).await;
     }
     match args.command.as_ref() {
         Some(Command::Login {
