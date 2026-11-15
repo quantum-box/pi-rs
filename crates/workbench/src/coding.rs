@@ -2238,6 +2238,13 @@ fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'st
         .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
 }
 
+fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(&mut get)
+        .unwrap_or_default()
+}
+
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
@@ -2676,11 +2683,7 @@ impl CodingTool {
             let entry = entry?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        let locale = ["LC_ALL", "LANG"]
-            .into_iter()
-            .filter_map(|key| std::env::var(key).ok())
-            .find(|value| !value.is_empty())
-            .unwrap_or_default();
+        let locale = directory_locale(|key| std::env::var(key).ok());
         let collator = directory_collator(&locale)?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
         let mut results = Vec::new();
@@ -5452,6 +5455,31 @@ mod tests {
             sort("C.UTF-8", vec!["Zeta", "Älmhult"]),
             ["Älmhult", "Zeta"]
         );
+    }
+
+    #[test]
+    fn directory_locale_uses_node_message_locale_precedence() {
+        let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
+            directory_locale(|key| match key {
+                "LC_ALL" => all.map(str::to_owned),
+                "LC_MESSAGES" => messages.map(str::to_owned),
+                "LANG" => lang.map(str::to_owned),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")),
+            "sv_SE.UTF-8"
+        );
+        assert_eq!(
+            select(Some("en_US.UTF-8"), Some("sv_SE.UTF-8"), None),
+            "en_US.UTF-8"
+        );
+        assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
+        assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
+        let collator =
+            directory_collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8"))).unwrap();
+        assert!(collator.compare("z", "ä").is_lt());
     }
 
     #[cfg(unix)]
