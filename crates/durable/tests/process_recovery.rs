@@ -9,7 +9,7 @@ use std::{
 };
 
 use pi_rs_durable::{
-    task::{Checkpoint, Task, TaskOwner, TaskState},
+    task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor},
     task_scheduler::{Error, Registry, Scheduler, Step},
 };
 use serde_json::json;
@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 const TASK: Uuid = Uuid::from_u128(1);
 const OWNER: Uuid = Uuid::from_u128(2);
+const FAST_CHILD: Uuid = Uuid::from_u128(3);
+const SLOW_CHILD: Uuid = Uuid::from_u128(4);
 
 fn checkpoint(phase: &str) -> Checkpoint {
     Checkpoint {
@@ -55,6 +57,120 @@ fn recovery_child() {
     }
     assert!(scheduler.tick(0).unwrap());
     panic!("blocked handler returned");
+}
+
+#[test]
+fn held_outcome_child() {
+    let Ok(path) = std::env::var("PI_HELD_CHILD_DB") else {
+        return;
+    };
+    let fail = std::env::var_os("PI_HELD_FAIL").is_some();
+    let mut registry = Registry::default();
+    registry.register("parent", true, move |task: &Task| {
+        if task.checkpoint().phase == "first" {
+            let child = |id, kind: &str| {
+                Task::new(id, TaskOwner::Task(TASK), checkpoint("first"), 3)
+                    .unwrap()
+                    .registered(kind.into(), true)
+            };
+            Ok(Step::Wait {
+                checkpoint: checkpoint("second"),
+                condition: WaitFor::TasksAny(vec![FAST_CHILD, SLOW_CHILD]),
+                children: vec![child(FAST_CHILD, "fast"), child(SLOW_CHILD, "slow")],
+            })
+        } else if fail {
+            Ok(Step::Fail("held failure".into()))
+        } else {
+            Ok(Step::Succeed(json!("held success")))
+        }
+    });
+    registry.register("fast", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    registry.register_with_abort(
+        "slow",
+        true,
+        |_: &Task| panic!("slow child ran before hold"),
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+    );
+    let mut scheduler = Scheduler::open(path, registry).unwrap();
+    let root = Task::new(TASK, TaskOwner::Conversation(OWNER), checkpoint("first"), 3)
+        .unwrap()
+        .registered("parent".into(), true);
+    scheduler.submit(&root).unwrap();
+    for _ in 0..3 {
+        assert!(scheduler.tick(0).unwrap());
+    }
+    let state = scheduler.get(TASK).unwrap().unwrap();
+    assert!(matches!(
+        state.state(),
+        TaskState::Completing(_) | TaskState::CompletingFailed(_)
+    ));
+    println!("CHILD_HELD_OUTCOME");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn held_outcomes_resume_after_process_death() {
+    for fail in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "held_outcome_child", "--nocapture"])
+            .env("PI_HELD_CHILD_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if fail {
+            command.env("PI_HELD_FAIL", "1");
+        } else {
+            command.env_remove("PI_HELD_FAIL");
+        }
+        let mut child = KillOnDrop(command.spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("CHILD_HELD_OUTCOME") {
+                    let _ = tx.send(());
+                    break;
+                }
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("held outcome not committed");
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        let mut registry = Registry::default();
+        registry.register_with_abort(
+            "slow",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!("done"))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        for _ in 0..5 {
+            if scheduler.get(TASK).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            assert!(scheduler.tick(0).unwrap());
+        }
+        let root = scheduler.get(TASK).unwrap().unwrap();
+        if fail {
+            assert_eq!(root.state(), &TaskState::Failed("held failure".into()));
+            assert_eq!(
+                scheduler.get(SLOW_CHILD).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+        } else {
+            assert_eq!(root.state(), &TaskState::Succeeded(json!("held success")));
+            assert_eq!(
+                scheduler.get(SLOW_CHILD).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("done"))
+            );
+        }
+    }
 }
 
 struct KillOnDrop(Child);
