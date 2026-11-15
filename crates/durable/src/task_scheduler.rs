@@ -1806,6 +1806,50 @@ mod tests {
     }
 
     #[test]
+    fn aborting_external_waiter_does_not_abort_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register_with_abort(
+            "waiter",
+            true,
+            |_: &Task| {
+                Ok(Step::Wait {
+                    checkpoint: cp("wait"),
+                    condition: WaitFor::TasksAny(vec![Uuid::from_u128(2)]),
+                    children: vec![],
+                })
+            },
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!("other"))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "waiter", true, 3))
+            .unwrap();
+        scheduler.submit(&task(2, owner, "other", true, 3)).unwrap();
+        scheduler.tick(0).unwrap();
+        scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+        assert!(
+            !scheduler
+                .get(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("other"))
+        );
+    }
+
+    #[test]
     fn external_wait_rejects_wait_and_ownership_cycles() {
         for owner_cycle in [false, true] {
             let dir = tempfile::tempdir().unwrap();
