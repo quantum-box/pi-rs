@@ -568,7 +568,11 @@ where
                 state.token.is_none() && state.queued == 0
             };
             let current = if idle { read() } else { None };
-            let result =
+            let result = if idle && current.is_none() {
+                Err(Error::Config(
+                    "Live session journal is unavailable; try sharing again".into(),
+                ))
+            } else {
                 snapshot_and_session_for_share_with_hook(&active, &snapshot, current, || {})
                     .and_then(|(share, journal, stamp)| {
                         finalize_share_capture(
@@ -579,7 +583,8 @@ where
                             stamp,
                             journal_key,
                         )
-                    });
+                    })
+            };
             let _ = send.send(result);
         })
         .map_err(|_| Error::Config("Share context reader could not start".into()))?;
@@ -2173,7 +2178,7 @@ mod share_context_tests {
             Arc::new(Mutex::new(worker)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Some(key),
-            || None,
+            move || Some(session),
         )
         .await
         .unwrap();
@@ -2768,6 +2773,25 @@ mod share_context_tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn idle_share_rejects_unreadable_journal_instead_of_using_memory() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let error = share_snapshot_background(
+            Arc::new(Mutex::new(ControlState::default())),
+            Arc::new(Mutex::new(initial)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            || None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("journal is unavailable"));
     }
 
     #[tokio::test(flavor = "current_thread")]
