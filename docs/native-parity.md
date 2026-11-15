@@ -1091,8 +1091,10 @@ using a complete terminal palette when available. At interactive startup the
 system theme stays grayscale until all color targets reply, the color query's
 device-attributes marker arrives, or its 100 ms initial timeout, then uses the
 available colors. The startup session selector queries its controlling terminal
-and also applies late replies. Late replies are
-applied incrementally; query aggregation still differs from Pi.
+and applies late replies while it is open. It stops reading as soon as the user
+leaves, preserving subsequent terminal input; replies arriving after that handoff
+are left for the next terminal owner. Late replies are applied incrementally;
+query aggregation still differs from Pi.
 Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.

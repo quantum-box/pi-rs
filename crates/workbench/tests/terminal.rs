@@ -1177,7 +1177,7 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
         0
     );
     let mut master = unsafe { File::from_raw_fd(master_fd) };
-    let _slave = unsafe { File::from_raw_fd(slave_fd) };
+    let mut slave = unsafe { File::from_raw_fd(slave_fd) };
     let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
     assert_eq!(
         unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
@@ -1222,12 +1222,24 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
         .write_all(b"\x1b]11;rgb:0000/0000/0000\x1b\\")
         .unwrap();
     output_until(&mut master, |text| text.contains("\x1b[38;2;"));
-    master.write_all(b"\x1b[?1;2c").unwrap();
     master.write_all(b"Resume Fixture").unwrap();
     output_until(&mut master, |text| {
         text.contains("Resume session") && text.contains("Resume Fixture")
     });
-    master.write_all(b"\r").unwrap();
+    // Keep DA1 outstanding and queue input for the next terminal owner in the
+    // same write as the selection, so read-ahead cannot silently swallow it.
+    master.write_all(b"\rnext shell command\n").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?1049l"));
+    let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut queued = [0; 128];
+    let count = slave
+        .read(&mut queued)
+        .expect("next owner's terminal input");
+    assert_eq!(&queued[..count], b"next shell command\n");
     process
         .0
         .stdin
@@ -1331,12 +1343,6 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
     );
     output_until(&mut master, |text| text.contains("Resume session"));
     master.write_all(b"\x1b").unwrap();
-    // The selector has already begun to close when a slow terminal replies.
-    // Its bounded cleanup must consume the reply before restoring raw mode.
-    std::thread::sleep(Duration::from_millis(60));
-    master
-        .write_all(b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?1;2c")
-        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut terminal_output = Vec::new();
     while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
@@ -1358,7 +1364,6 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
         terminal_output.extend_from_slice(&buffer[..count]);
     }
     assert!(String::from_utf8_lossy(&terminal_output).contains("\x1b[?2031l"));
-    assert!(!String::from_utf8_lossy(&terminal_output).contains("rgb:0000"));
     let mut output = String::new();
     process
         .0

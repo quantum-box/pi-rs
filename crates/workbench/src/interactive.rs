@@ -3623,32 +3623,11 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     struct PickerTerminal {
         output: Box<dyn Write>,
         input: Option<crate::ui::input::Reader>,
-        #[cfg(any(unix, windows))]
-        markers_outstanding: usize,
     }
     impl Drop for PickerTerminal {
         fn drop(&mut self) {
-            // Give an outstanding query a bounded chance to deliver its end
-            // marker before returning the controlling terminal to another mode.
-            #[cfg(any(unix, windows))]
-            if self.markers_outstanding > 0
-                && let Some(input) = &mut self.input
-            {
-                let started = Instant::now();
-                let limit = Duration::from_millis(200);
-                while started.elapsed() < limit {
-                    match input.next(limit.saturating_sub(started.elapsed())) {
-                        Ok(Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes)) => {
-                            self.markers_outstanding -= 1;
-                            if self.markers_outstanding == 0 {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                        _ => {}
-                    }
-                }
-            }
+            // Do not consume input during handoff: it may belong to the shell
+            // or the next mode, even while a terminal reply is outstanding.
             #[cfg(any(unix, windows))]
             let _ = execute!(self.output, Print("\x1b[?2031l"));
             let _ = execute!(
@@ -3665,8 +3644,6 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     let mut screen = PickerTerminal {
         output,
         input: None,
-        #[cfg(any(unix, windows))]
-        markers_outstanding: 0,
     };
     execute!(
         screen.output,
@@ -3674,7 +3651,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         EnableBracketedPaste,
         Hide
     )?;
-    screen.input = Some(crate::ui::input::Reader::new()?);
+    screen.input = Some(crate::ui::input::Reader::new_for_handoff()?);
     let keys = Keys::load()?;
     #[cfg(any(unix, windows))]
     let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
@@ -3683,7 +3660,6 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         crate::ui::theme::reset_terminal_background();
         let mut colors = ColorQueries::default();
         execute!(screen.output, Print("\x1b[?2031h\x1b[?996n"))?;
-        screen.markers_outstanding = 1;
         colors.query_terminal_colors(&mut screen.output)?;
         colors
     };
@@ -3776,13 +3752,10 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
                         let (changed, redraw) = apply_terminal_appearance(&mut theme, dark);
                         appearance_changed = changed;
                         dirty |= redraw;
-                        screen.markers_outstanding = screen.markers_outstanding.max(1);
                         colors.query_terminal_colors(&mut screen.output)?;
                     }
                     _ => unreachable!(),
                 }
-                screen.markers_outstanding =
-                    colors.color_queries.len() + colors.completed_color_markers;
                 dirty |= settle_complete_colors(&colors, &mut theme);
                 if appearance_changed
                     && args
