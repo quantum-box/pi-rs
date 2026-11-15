@@ -74,8 +74,12 @@ fn accept_model_request(listener: TcpListener) -> (std::net::TcpStream, Value) {
 
 #[test]
 fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
-    for (missing_model_credentials, pending_trust) in [(false, false), (true, false), (false, true)]
-    {
+    for (missing_model_credentials, pending_trust, checkpoint) in [
+        (false, false, false),
+        (false, false, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
         let root = tempfile::tempdir().unwrap();
         if pending_trust {
             std::fs::create_dir_all(root.path().join(".agents/skills/example")).unwrap();
@@ -83,11 +87,33 @@ fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
         let path = root.path().join("session.jsonl");
         let prompt = root.path().join("system.txt");
         std::fs::write(&prompt, "Unique standalone share prompt").unwrap();
-        let mut session = pi_rs::Session::open(&path).unwrap();
-        session
-            .append_user_with_images("hello".into(), Vec::new(), None)
-            .unwrap();
-        drop(session);
+        if checkpoint {
+            let initial = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let mut records = initial.records().to_vec();
+            records.push(pi_rs::Record {
+                timestamp: None,
+                run_id: None,
+                version: records[0].version,
+                id: 2,
+                parent: Some(1),
+                event: pi_rs::Event::SystemCheckpoint {
+                    content: "Checkpoint prompt".into(),
+                    sections: Vec::new(),
+                    tools_added: Vec::new(),
+                    tools_removed: Vec::new(),
+                },
+            });
+            let mut session = pi_rs::Session::from_records(records).unwrap();
+            session
+                .append_user_with_images("hello".into(), Vec::new(), None)
+                .unwrap();
+            session.export_jsonl(&path).unwrap();
+        } else {
+            let mut session = pi_rs::Session::open(&path).unwrap();
+            session
+                .append_user_with_images("hello".into(), Vec::new(), None)
+                .unwrap();
+        }
         let original = std::fs::read(&path).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1/artifacts", listener.local_addr().unwrap());
@@ -187,7 +213,11 @@ fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
                 metadata["data"]["systemPrompt"]
                     .as_str()
                     .unwrap()
-                    .contains("Unique standalone share prompt")
+                    .contains(if checkpoint {
+                        "Checkpoint prompt"
+                    } else {
+                        "Unique standalone share prompt"
+                    })
             );
             assert!(
                 metadata["data"]["tools"]
@@ -196,6 +226,9 @@ fn standalone_radius_share_includes_live_metadata_without_changing_journal() {
                     .iter()
                     .any(|tool| tool["name"] == "read" && tool["parameters"].is_object())
             );
+            if checkpoint {
+                assert_eq!(metadata["data"]["tools"].as_array().unwrap().len(), 1);
+            }
         }
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
