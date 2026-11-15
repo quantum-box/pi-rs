@@ -7,6 +7,7 @@ use super::{
     math_data as data,
     math_layout::{self, LayoutNode, MARKER_END, MARKER_START, PROTECTED_SPACE},
 };
+use unicode_width::UnicodeWidthStr;
 
 const NAMED_START: char = '\u{f0004}';
 const NAMED_END: char = '\u{f0005}';
@@ -104,6 +105,42 @@ fn root(value: &str, sign: &str) -> String {
     } else {
         format!("{sign}({value})")
     }
+}
+
+// Equivalent to Pi's split on `\\\\` and its optional `[spacing]` suffix.
+fn environment_rows(body: &str) -> Vec<&str> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = body[start..].find("\\\\") {
+        let at = start + offset;
+        rows.push(&body[start..at]);
+        start = at + 2;
+        if body[start..].starts_with('[')
+            && let Some(end) = body[start + 1..].find(']')
+            && !body[start + 1..start + 1 + end].contains('\n')
+        {
+            start += end + 2;
+        }
+    }
+    rows.push(&body[start..]);
+    rows
+}
+
+fn strip_column_spec(body: &str) -> &str {
+    let start = body.len() - body.trim_start_matches(js_whitespace).len();
+    let rest = &body[start..];
+    if let Some(group) = rest.strip_prefix('{')
+        && let Some(end) = group.find('}')
+    {
+        &group[end + 1..]
+    } else {
+        body
+    }
+}
+
+fn case_value(row: &[String]) -> &str {
+    let text = row.first().map_or("", String::as_str);
+    trim_end_js(text).strip_suffix(',').unwrap_or(text)
 }
 fn normalize_output(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
@@ -649,11 +686,253 @@ impl<'a, 'n> Parser<'a, 'n> {
         }
         if spaced { format!(" {out} ") } else { out }
     }
-    // Environment parsing is implemented separately; unknown environments
-    // must fail closed so original source survives in the final integration.
-    fn environment(&mut self) -> String {
+    fn raw_group(&mut self) -> Option<String> {
+        self.skip(|c| matches!(c, ' ' | '\t'));
+        if self.pop() != Some('{') {
+            self.supported = false;
+            return None;
+        }
+        let start = self.pos;
+        let mut depth = 1usize;
+        while let Some(ch) = self.pop() {
+            if ch == '\\' {
+                self.pop();
+                continue;
+            }
+            if ch == '{' {
+                depth += 1;
+            }
+            if ch == '}' {
+                depth -= 1;
+            }
+            if depth == 0 {
+                return Some(self.source[start..self.pos - 1].to_owned());
+            }
+        }
         self.supported = false;
-        String::new()
+        None
+    }
+
+    fn environment(&mut self) -> String {
+        let Some(name) = self.raw_group().filter(|s| !s.is_empty()) else {
+            return String::new();
+        };
+        let end_marker = format!("\\end{{{name}}}");
+        let Some(end) = self.source[self.pos..].find(&end_marker) else {
+            self.supported = false;
+            return String::new();
+        };
+        let body = self.source[self.pos..self.pos + end].to_owned();
+        self.pos += end + end_marker.len();
+        if ["equation", "equation*", "displaymath"].contains(&name.as_str()) {
+            return trim_js(&self.nested(&body, true)).to_owned();
+        }
+        if [
+            "aligned",
+            "align",
+            "align*",
+            "alignedat",
+            "alignat",
+            "alignat*",
+            "gather",
+            "gathered",
+            "multline",
+            "multline*",
+            "split",
+        ]
+        .contains(&name.as_str())
+        {
+            let aligned_at = ["alignedat", "alignat", "alignat*"].contains(&name.as_str());
+            let body = if aligned_at {
+                strip_column_spec(&body)
+            } else {
+                &body
+            };
+            let mut result = Vec::new();
+            for row in environment_rows(body) {
+                let cells: Vec<_> = row.split('&').collect();
+                let input = if aligned_at {
+                    cells
+                        .chunks(2)
+                        .map(|pair| pair.join(""))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    cells.join("")
+                };
+                let rendered = self.nested(&input, true);
+                let rendered = trim_js(&rendered);
+                if !rendered.is_empty() {
+                    result.push(rendered.to_owned());
+                }
+            }
+            return result.join("\n");
+        }
+        if ["cases", "cases*"].contains(&name.as_str()) {
+            return self.cases(&body);
+        }
+        if [
+            "array",
+            "matrix",
+            "smallmatrix",
+            "pmatrix",
+            "bmatrix",
+            "Bmatrix",
+            "vmatrix",
+            "Vmatrix",
+        ]
+        .contains(&name.as_str())
+        {
+            let body = if name == "array" {
+                strip_column_spec(&body)
+            } else {
+                &body
+            };
+            return self.matrix(&name, body);
+        }
+        self.supported = false;
+        body
+    }
+
+    fn environment_cells(&mut self, body: &str) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        for row in environment_rows(body) {
+            let mut cells = Vec::new();
+            for cell in row.split('&') {
+                let rendered = self.nested(cell, false);
+                cells.push(trim_js(&rendered).to_owned());
+            }
+            if cells.iter().any(|cell| !cell.is_empty()) {
+                rows.push(cells);
+            }
+        }
+        rows
+    }
+
+    fn cases(&mut self, body: &str) -> String {
+        let rows = self.environment_cells(body);
+        let max_width = rows
+            .iter()
+            .map(|row| UnicodeWidthStr::width(case_value(row)))
+            .max()
+            .unwrap_or(0);
+        let mut contents = Vec::new();
+        for row in &rows {
+            let value = case_value(row);
+            let condition = row.get(1).map_or("", String::as_str);
+            if condition.is_empty() {
+                contents.push(value.to_owned());
+                continue;
+            }
+            let lower = condition.to_ascii_lowercase();
+            let named = ["if", "when", "for", "otherwise"].iter().any(|word| {
+                lower.strip_prefix(word).is_some_and(|rest| {
+                    rest.chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                })
+            });
+            let padding = max_width.saturating_sub(UnicodeWidthStr::width(value));
+            contents.push(format!(
+                "{value}{}{condition_prefix}{condition}",
+                PROTECTED_SPACE.to_string().repeat(padding),
+                condition_prefix = if named { " " } else { " if " }
+            ));
+        }
+        if contents.len() <= 1 {
+            return contents
+                .first()
+                .map_or_else(String::new, |s| format!("⎧ {s}"));
+        }
+        let middle = contents.len() / 2;
+        let mut visual: Vec<Option<String>> = contents.into_iter().map(Some).collect();
+        if visual.len() % 2 == 0 {
+            visual.insert(middle, None);
+        }
+        let last = visual.len() - 1;
+        let lines = visual
+            .into_iter()
+            .enumerate()
+            .map(|(i, content)| {
+                let delimiter = if i == 0 {
+                    "⎧"
+                } else if i == last {
+                    "⎩"
+                } else {
+                    "⎨"
+                };
+                content.map_or_else(
+                    || delimiter.to_owned(),
+                    |content| format!("{delimiter} {content}"),
+                )
+            })
+            .collect();
+        self.push_node(LayoutNode::Matrix {
+            lines,
+            baseline: middle,
+        })
+    }
+
+    fn matrix(&mut self, name: &str, body: &str) -> String {
+        let matrix = self.environment_cells(body);
+        let count = matrix.iter().map(Vec::len).max().unwrap_or(0);
+        let widths: Vec<_> = (0..count)
+            .map(|column| {
+                matrix
+                    .iter()
+                    .map(|row| UnicodeWidthStr::width(row.get(column).map_or("", String::as_str)))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let rows: Vec<_> = matrix
+            .iter()
+            .map(|row| {
+                (0..count)
+                    .map(|column| {
+                        let cell = row.get(column).map_or("", String::as_str);
+                        format!(
+                            "{cell}{}",
+                            PROTECTED_SPACE.to_string().repeat(
+                                widths[column].saturating_sub(UnicodeWidthStr::width(cell))
+                            )
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" │ ")
+            })
+            .collect();
+        let delimiters = match name {
+            "pmatrix" => Some(["⎛", "⎞", "⎜", "⎟", "⎝", "⎠"]),
+            "bmatrix" => Some(["⎡", "⎤", "⎢", "⎥", "⎣", "⎦"]),
+            "Bmatrix" => Some(["⎧", "⎫", "⎨", "⎬", "⎩", "⎭"]),
+            "vmatrix" => Some(["│"; 6]),
+            "Vmatrix" => Some(["║"; 6]),
+            _ => None,
+        };
+        let last = rows.len().saturating_sub(1);
+        let lines: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                if let Some(d) = delimiters {
+                    let (left, right) = if i == 0 {
+                        (d[0], d[1])
+                    } else if i == last {
+                        (d[4], d[5])
+                    } else {
+                        (d[2], d[3])
+                    };
+                    format!("{left} {row} {right}")
+                } else {
+                    row
+                }
+            })
+            .collect();
+        if lines.len() <= 1 {
+            return lines.into_iter().next().unwrap_or_default();
+        }
+        self.push_node(LayoutNode::Matrix { lines, baseline: 0 })
     }
 }
 
@@ -684,6 +963,22 @@ pub(super) fn render(source: &str, display: bool) -> Option<String> {
 mod tests {
     use super::*;
     #[test]
+    fn matches_pinned_pi_math_renderer_fixtures() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/math/pi-v150-render.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let source = case["source"].as_str().unwrap();
+            let display = case["display"].as_bool().unwrap();
+            assert_eq!(
+                render(source, display).as_deref(),
+                case["expected"].as_str(),
+                "source={source:?}, display={display}"
+            );
+        }
+    }
+    #[test]
     fn inline_math_matches_common_reference_expressions() {
         for (source, expected) in [
             (r"\mathbb{C}^3 \to \mathbb{C}^3", "ℂ³ → ℂ³"),
@@ -703,5 +998,25 @@ mod tests {
             render(r"E \approx \frac{0.1\ \text{lux}}{100\ \text{lm/W}}", true).as_deref(),
             Some("    0.1 lux\nE ≈ ────────\n    100 lm/W")
         );
+    }
+    #[test]
+    fn display_matrix_and_cases_match_pi_layout() {
+        assert_eq!(
+            render(
+                r"A=\begin{pmatrix}\pi & 0\\0 & \frac{1}{\pi}\end{pmatrix}.",
+                true
+            )
+            .as_deref(),
+            Some("A = ⎛ π │ 0   ⎞\n    ⎝ 0 │ 1/π ⎠.")
+        );
+        assert_eq!(
+            render(
+                r"f(x)=\begin{cases}x, & if x<0\\-x & otherwise\end{cases}",
+                true
+            )
+            .as_deref(),
+            Some("       ⎧ x  if x < 0\nf(x) = ⎨\n       ⎩ -x otherwise")
+        );
+        assert_eq!(render(r"\begin{unknown}x\end{unknown}", true), None);
     }
 }
