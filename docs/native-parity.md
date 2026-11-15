@@ -3791,7 +3791,8 @@ selects `thinking_token_budget`, `thinking_budget`, or `thinking_budget_tokens`;
 Model compatibility overrides provider values. The selected thinking level uses
 Pi's default or configured `thinkingBudgets`, capped to leave 1,024 tokens for
 the answer within the host's output limit. Off and non-reasoning models omit the
-field. Chat-template `thinking.budget` variables remain unsupported. The request
+field. Discovered Ollama reasoning capability is carried through the RPC and
+interactive worker to the request. Chat-template `thinking.budget` variables remain unsupported. The request
 field is covered by loopback tests; no live compatible server was used.
 
 Loopback RPC checks exercised model and endpoint switching, header and key

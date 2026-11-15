@@ -651,7 +651,7 @@ impl Worker {
                 "cannot change sessions while a shell command is running".into(),
             ));
         }
-        self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"reported_thinking":super::thinking::reported(args).is_some(),"session":args.session}))?;
+        self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"reported_thinking":super::thinking::reported(args).is_some(),"reported_reasoning":super::thinking::adopted_reasoning(args),"session":args.session}))?;
         self.compacting = request["type"] == "compact";
         self.send(request)?;
         self.session = args.session.clone();

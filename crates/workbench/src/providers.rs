@@ -761,7 +761,7 @@ impl Client {
                     .chat_compatibility(&args.provider, configured.as_ref());
                 let client = client.with_chat_compatibility(
                     compatibility,
-                    configured.as_ref().and_then(|model| model.reasoning),
+                    super::thinking::adopted_reasoning(args),
                     thinking.is_some_and(|level| level != "off"),
                     configured
                         .as_ref()
