@@ -557,6 +557,21 @@ impl Session {
         Self::from_records(records)
     }
 
+    /// Read a complete journal snapshot without repairing or locking it.
+    /// Reject incomplete tails and length changes observed during the read.
+    pub fn snapshot_complete(path: impl AsRef<Path>) -> Result<Self> {
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        let (records, read_bytes, incomplete) = read_complete_records((&mut file).take(length))?;
+        if incomplete || read_bytes != length || file.metadata()?.len() != length {
+            return Err(Error::Session("journal changed or is incomplete".into()));
+        }
+        if records.is_empty() {
+            return Err(Error::Session("journal has no committed header".into()));
+        }
+        Self::from_records(records)
+    }
+
     /// Restore a validated, in-memory snapshot without mutating its source.
     pub fn from_records(records: Vec<Record>) -> Result<Self> {
         Self::with_store(MemoryStore { records })
@@ -4269,10 +4284,12 @@ mod snapshot_tests {
             .unwrap();
         let head = session.head();
         drop(session);
+        assert_eq!(Session::snapshot_complete(&path).unwrap().head(), head);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"{\"incomplete\":\"").unwrap();
         drop(file);
         let before = std::fs::read(&path).unwrap();
+        assert!(Session::snapshot_complete(&path).is_err());
         let snapshot = Session::snapshot(&path).unwrap();
         assert_eq!(snapshot.head(), head);
         assert_eq!(snapshot.current_messages().len(), 1);

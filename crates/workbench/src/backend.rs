@@ -1819,7 +1819,7 @@ fn read_requests(
                             snapshot.clone(),
                             slots,
                             journal_key,
-                            move || Session::snapshot(path_for_read).ok(),
+                            move || Session::snapshot_complete(path_for_read).ok(),
                         )
                         .await
                         .and_then(|captured| {

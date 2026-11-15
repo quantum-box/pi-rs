@@ -322,6 +322,30 @@ fn worker_returns_keyed_share_journal_tag() {
         "worker returned stale journal: {missing}"
     );
     std::fs::rename(&moved, &path).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"incomplete\":")
+        .unwrap();
+    let incomplete = std::fs::read(&path).unwrap();
+    writeln!(input, "{}", json!({"id":"incomplete", "type":"get_share_context", "session":path, "journal_key":key, "include_journal":true})).unwrap();
+    input.flush().unwrap();
+    let response = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "incomplete" {
+            break event;
+        }
+    };
+    assert_eq!(
+        response["success"], false,
+        "worker accepted incomplete journal: {response}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), incomplete);
+    std::fs::write(&path, original).unwrap();
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     drop(input);
     while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
