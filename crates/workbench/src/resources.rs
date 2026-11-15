@@ -916,12 +916,11 @@ mod tests {
                 .contains("Existing prompt: world")
         );
         assert!(resources.themes.contains(&theme.canonicalize().unwrap()));
-        assert!(
-            resources
-                .warnings
-                .iter()
-                .any(|warning| warning.contains(&missing.display().to_string()))
-        );
+        assert!(resources.warnings.iter().any(|warning| {
+            warning
+                .replace('\\', "/")
+                .contains(&missing.to_string_lossy().replace('\\', "/"))
+        }));
     }
     use super::*;
     #[test]
@@ -1077,8 +1076,8 @@ mod tests {
                 || warning.contains(&format!("using {}", prompt_b.display()))
         }));
 
-        // A missing path triggers individual-load recovery; both later files
-        // must still report the winner from the original resource set.
+        // A missing path is diagnosed while the later files still report the
+        // winner from the original resource set.
         let mut recovered = discovered.clone();
         recovered.skill_paths.push(root.join("missing/SKILL.md"));
         let resources = Resources::load_with_discovered(&args, &recovered).unwrap();
@@ -1281,6 +1280,74 @@ mod tests {
             warning.contains("skill path is not a markdown file")
                 && warning.contains("instruction.txt")
         }));
+    }
+
+    #[test]
+    fn missing_explicit_skill_warns_and_preserves_other_resources() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
+        let valid = directory.path().join("valid.md");
+        std::fs::write(
+            &valid,
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().to_owned();
+        args.skill = vec![
+            missing.to_string_lossy().into(),
+            valid.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing.md")
+                    && warning.contains("skill path does not exist"))
+        );
+        args.skill = vec![directory.path().join("none-*.md").to_string_lossy().into()];
+        assert!(Resources::load(&args).is_err());
+    }
+
+    #[test]
+    fn missing_skill_under_workspace_with_glob_characters_is_not_a_glob() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace[1]");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("valid.md"),
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.skill = vec!["missing/file.md".into(), "valid.md".into()];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skill path does not exist"))
+        );
     }
 
     #[cfg(unix)]

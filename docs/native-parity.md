@@ -4839,3 +4839,7 @@ check. The host remains responsible for rebuilding it when authorization changes
 Explicit skill files must end in `.md`; other files produce a diagnostic while
 the remaining skills continue loading. The check uses the supplied filename
 before following symlinks, matching Pi.
+Missing explicit skill paths also warn and leave other resources available.
+Unmatched explicit glob patterns remain errors as a native extension.
+For missing paths, glob metacharacters outside the working-directory prefix are
+interpreted as patterns; this preserves native glob precedence for ambiguous paths.
