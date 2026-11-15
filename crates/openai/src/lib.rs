@@ -1807,20 +1807,20 @@ mod tests {
                 strict: pi_rs_core::StrictToolPolicy::Prefer,
             }),
         };
-        let strict = constrained_tools(&req, &[declaration.clone()], true).unwrap();
+        let strict = constrained_tools(&req, std::slice::from_ref(&declaration), true).unwrap();
         assert_eq!(strict[0]["strict"], true);
         assert_eq!(strict[0]["parameters"]["required"], json!(["path"]));
         assert_eq!(
             strict[0]["parameters"]["properties"]["path"]["anyOf"][1],
             json!({"type":"null"})
         );
-        let fallback = constrained_tools(&req, &[declaration.clone()], false).unwrap();
+        let fallback = constrained_tools(&req, std::slice::from_ref(&declaration), false).unwrap();
         assert!(fallback[0].get("strict").is_none());
         assert_eq!(fallback[0]["parameters"], req.tools[0].parameters);
         declaration.constrained_sampling = Some(pi_rs_core::ToolConstraint::JsonSchema {
             strict: pi_rs_core::StrictToolPolicy::Require,
         });
-        assert!(constrained_tools(&req, &[declaration.clone()], false).is_err());
+        assert!(constrained_tools(&req, std::slice::from_ref(&declaration), false).is_err());
         declaration.spec.name = "other".into();
         assert!(constrained_tools(&req, &[declaration], true).is_err());
     }
@@ -1843,7 +1843,7 @@ mod tests {
                     uuid::Uuid::nil(),
                     "s",
                     req.clone(),
-                    &[declaration.clone()]
+                    std::slice::from_ref(&declaration)
                 )
                 .await
                 .is_err()

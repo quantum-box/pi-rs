@@ -957,7 +957,7 @@ mod declaration_dispatch_tests {
                     Uuid::nil(),
                     "id",
                     request.clone(),
-                    &[declaration.clone()]
+                    std::slice::from_ref(&declaration)
                 )
                 .await
                 .is_ok()
@@ -972,7 +972,7 @@ mod declaration_dispatch_tests {
                     Uuid::nil(),
                     "id",
                     request.clone(),
-                    &[declaration.clone()]
+                    std::slice::from_ref(&declaration)
                 )
                 .await
                 .is_err()
@@ -983,7 +983,7 @@ mod declaration_dispatch_tests {
                     Uuid::nil(),
                     Uuid::nil(),
                     request.clone(),
-                    &[declaration.clone()]
+                    std::slice::from_ref(&declaration)
                 )
                 .await
                 .is_err()
