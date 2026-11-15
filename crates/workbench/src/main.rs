@@ -1136,7 +1136,7 @@ enum Command {
     Package(packages::PackageCommand),
     Mcp {
         #[command(subcommand)]
-        command: mcp_config::McpCommand,
+        command: Box<mcp_config::McpCommand>,
     },
     /// Check or print a configured provider credential.
     Auth {
@@ -1468,7 +1468,7 @@ async fn run_cli() -> i32 {
         let managed = args.list_models.is_none() && matches!(&args.command,
             None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
         );
-        let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command: mcp_config::McpCommand::Login { .. } }));
+        let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
         if managed {
@@ -1603,12 +1603,8 @@ async fn execute(
         );
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
-        if matches!(
-            &args.command,
-            Some(Command::Mcp {
-                command: mcp_config::McpCommand::Login { .. }
-            })
-        ) {
+        if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
+        {
             tokio::select! {
                 result = model_selection::catalogs(&args, true) => result?,
                 _ = args.mcp_login_cancel.cancelled() => return Err(Error::Cancelled),
@@ -1717,7 +1713,7 @@ async fn execute(
         return backend::run(args, ready).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
-        return mcp_config::command(&args, command.clone()).await;
+        return mcp_config::command(&args, command.as_ref().clone()).await;
     }
     match args.command.as_ref() {
         Some(Command::Login {

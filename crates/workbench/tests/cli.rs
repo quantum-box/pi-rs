@@ -89,6 +89,160 @@ async fn mcp_login_sigint_cancels_discovery() {
 }
 
 #[test]
+fn mcp_add_persists_oauth_client_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "https://example.com/mcp",
+        "--oauth-client-id",
+        "client",
+        "--oauth-client-secret",
+        "${CLIENT_SECRET}",
+        "--oauth-callback-port",
+        "12345",
+        "--oauth-client-name",
+        "client name",
+        "--oauth-client-registration",
+        "dcr",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = root.path().join("mcp.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["remote"]["oauth"],
+        json!({"clientId":"client","clientSecret":"${CLIENT_SECRET}","callbackPort":12345,"clientName":"client name","clientRegistration":"dcr"})
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--oauth-client-id",
+            "client",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-secret",
+            "secret",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-registration",
+            "cimd",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-callback-port",
+            "0",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--header",
+            "authorization=Bearer token",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
+fn mcp_added_oauth_secret_reference_is_resolved_for_login() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |args: &[&str], secret: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_TEST_MCP_SECRET")
+            .args(args);
+        if let Some(secret) = secret {
+            command.env("PI_RS_TEST_MCP_SECRET", secret);
+        }
+        command.output().unwrap()
+    };
+    let added = command(
+        &[
+            "mcp",
+            "add",
+            "fixture",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-secret",
+            "${PI_RS_TEST_MCP_SECRET}",
+        ],
+        None,
+    );
+    assert!(added.status.success());
+    let path = root.path().join("mcp.json");
+    let before = std::fs::read(&path).unwrap();
+    let missing = command(&["mcp", "login", "fixture"], None);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("missing environment variable PI_RS_TEST_MCP_SECRET")
+    );
+    let resolved = command(&["mcp", "login", "fixture"], Some("private-fixture-secret"));
+    assert!(!resolved.status.success());
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("missing environment variable"));
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("private-fixture-secret"));
+    assert!(!String::from_utf8_lossy(&resolved.stdout).contains("private-fixture-secret"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!String::from_utf8_lossy(&before).contains("private-fixture-secret"));
+}
+
+#[test]
 fn mcp_logout_local_targets_trusted_project_credentials() {
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
