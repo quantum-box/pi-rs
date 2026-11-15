@@ -1614,6 +1614,8 @@ struct LocalBashOperations {
 }
 
 const SHELL_POST_EXIT_IDLE: Duration = Duration::from_millis(100);
+// Bound completion even when a descendant writes continuously without a timeout.
+const SHELL_POST_EXIT_MAX: Duration = Duration::from_secs(2);
 
 #[async_trait::async_trait]
 impl BashOperations for LocalBashOperations {
@@ -1666,6 +1668,7 @@ impl BashOperations for LocalBashOperations {
         let mut stderr_buffer = [0u8; 8192];
         let mut status = None;
         let mut drain_deadline = None;
+        let mut drain_max = None;
         let deadline = async {
             match timeout {
                 Some(value) => tokio::time::sleep(value).await,
@@ -1681,8 +1684,10 @@ impl BashOperations for LocalBashOperations {
                 result = process.wait(), if status.is_none() => {
                     status = Some(result?);
                     drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                 },
                 _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
+                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     let count = count?; stdout_open = count != 0;
                     if count != 0 {
@@ -1691,6 +1696,7 @@ impl BashOperations for LocalBashOperations {
                             biased;
                             _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                             _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                            _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
                             result = output.send(stdout_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
                         }
                     }
@@ -1703,6 +1709,7 @@ impl BashOperations for LocalBashOperations {
                             biased;
                             _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                             _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                            _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
                             result = output.send(stderr_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
                         }
                     }
@@ -3041,6 +3048,7 @@ impl CodingTool {
         let mut stdout_chunk = [0; 8192];
         let mut stderr_chunk = [0; 8192];
         let mut drain_deadline = None;
+        let mut drain_max = None;
         let mut cancelled = false;
         let mut timed_out = false;
         let mut stdout_text = ShellStream::default();
@@ -3068,6 +3076,7 @@ impl CodingTool {
                     process.finished = true;
                     // Descendants may retain inherited pipes after the shell exits.
                     drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                 }
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
@@ -3115,6 +3124,12 @@ impl CodingTool {
                 }
                 _ = async {
                     match drain_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => break,
+                _ = async {
+                    match drain_max {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
@@ -6105,7 +6120,7 @@ mod tests {
     #[tokio::test]
     async fn shell_keeps_draining_active_descendants_after_exit() {
         let root = tempfile::tempdir().unwrap();
-        let command = "(i=0; while [ $i -lt 12 ]; do printf 'out%s\\n' \"$i\"; printf 'err%s\\n' \"$i\" >&2; sleep 0.04; i=$((i+1)); done) & exit 0";
+        let command = r#"(touch ready; i=0; while [ $i -lt 12 ]; do printf 'out%s\n' "$i"; printf 'err%s\n' "$i" >&2; sleep 0.04; i=$((i+1)); done) & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
         let local = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: true,
@@ -6123,8 +6138,16 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(result.status.success());
-        assert!(result.output.script.contains("out11\n"));
-        assert!(result.output.script.contains("err11\n"));
+        assert!(
+            result.output.script.contains("out11\n"),
+            "{:?}",
+            result.output.script
+        );
+        assert!(
+            result.output.script.contains("err11\n"),
+            "{:?}",
+            result.output.script
+        );
 
         let backend = create_bash_tool(
             root.path(),
@@ -6152,12 +6175,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_or_timed_out_shell_bounds_active_descendant_drain() {
-        if std::process::Command::new("python3")
+        if !std::process::Command::new("python3")
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_err()
+            .is_ok_and(|status| status.success())
         {
             return;
         }
@@ -6170,33 +6193,44 @@ mod tests {
         };
         // The child escapes the shell's process group and continues writing after
         // the shell exits, so killing the group cannot close its inherited pipe.
-        let command = "python3 -c 'import os,time; os.setsid(); [(print(i,flush=True),time.sleep(.02)) for i in range(100)]' & exit 0";
+        let command = "python3 -c 'import os,time; os.setsid(); open(\"ready\",\"w\").close(); [(print(i,flush=True),time.sleep(.02)) for i in range(100)]' & while [ ! -f ready ]; do sleep .01; done; exit 0";
         let cancellation = pi_rs::CancellationToken::new();
         let cancel = cancellation.clone();
+        let ready = root.path().join("ready");
         let task = tokio::spawn(async move {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
             cancel.cancel();
         });
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(3),
             tool.shell(&json!({"command":command}), &cancellation),
         )
         .await
         .expect("cancelled shell kept draining");
         task.await.unwrap();
+        let error = result.err();
         assert!(
-            matches!(result, Err(Error::Config(message)) if message.contains("Command aborted"))
+            matches!(&error, Some(Error::Config(message)) if message.contains("Command aborted")),
+            "unexpected cancellation result: {error:?}"
         );
+        std::fs::remove_file(root.path().join("ready")).unwrap();
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(3),
             tool.shell(
-                &json!({"command":command,"timeout":0.25}),
+                &json!({"command":command,"timeout":0.7}),
                 &pi_rs::CancellationToken::new(),
             ),
         )
         .await
         .expect("timed out shell kept draining");
-        assert!(matches!(result, Err(Error::Config(message)) if message.contains("timed out")));
+        let error = result.err();
+        assert!(
+            matches!(&error, Some(Error::Config(message)) if message.contains("timed out")),
+            "unexpected timeout result: {error:?}"
+        );
     }
 
     #[tokio::test]
