@@ -6152,6 +6152,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_or_timed_out_shell_bounds_active_descendant_drain() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
             root: root.path().to_path_buf(),
