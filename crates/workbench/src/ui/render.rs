@@ -1929,6 +1929,35 @@ fn markdown_at_depth(
                     }
                 }
             }
+            Event::InlineMath(raw) => {
+                let rendered = super::math_tokenizer::inline(&raw)
+                    .filter(|token| !token.pending && token.raw_len == raw.len())
+                    .and_then(|token| super::math_parser::render(&raw[token.text], false))
+                    .unwrap_or_else(|| raw.to_string());
+                if let Some((_, label, _)) = links.last_mut() {
+                    label.push_str(&raw);
+                }
+                let mut span = Span::themed(
+                    rendered,
+                    theme,
+                    if heading > 0 {
+                        "mdHeading"
+                    } else if !links.is_empty() {
+                        "mdLink"
+                    } else {
+                        "text"
+                    },
+                );
+                span.bold = bold > 0 || heading > 0;
+                span.underline = heading == 1 || !links.is_empty();
+                span.hyperlink = links.last().and_then(|(url, _, _)| {
+                    (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                });
+                span.italic = italic > 0;
+                span.thinking_link = heading == 0 && !links.is_empty();
+                span.strikethrough = strikethrough > 0;
+                spans.push(span);
+            }
             Event::Code(text) => {
                 if let Some((_, label, _)) = links.last_mut() {
                     label.push_str(&text);
@@ -2026,6 +2055,45 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_math_renders_without_consuming_currency_code_or_incomplete_source() {
+        let theme = Theme::system();
+        let rendered = |source: &str| {
+            markdown(source, &theme, 120)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rendered(r"A $\mathbb{C}^3 \to \mathbb{C}^3$, $\frac{1}{2}$ and \(s \to \infty\)."),
+            ["A ℂ³ → ℂ³, 1/2 and s → ∞."]
+        );
+        assert_eq!(
+            rendered("Costs $5 and $10; use `$x$` and $HOME/$USER."),
+            ["Costs $5 and $10; use $x$ and $HOME/$USER."]
+        );
+        assert_eq!(
+            rendered(r"Unknown $x + \unknown{y}$ and \(x^2"),
+            [r"Unknown $x + \unknown{y}$ and \(x^2"]
+        );
+        assert_eq!(rendered(r"- Formula: $F_1 = u^2$"), ["- Formula: F₁ = u²"]);
+        assert_eq!(rendered(r"Escaped \$x-y\$."), ["Escaped $x-y$."]);
+        let lines = markdown(r"~~$x_1$~~", &theme, 120);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "x₁" && span.strikethrough)
+        );
+        let table = rendered("| Value |\n| --- |\n| $\\mathbb{C}^3$ |").join("\n");
+        assert!(table.contains("ℂ³"), "{table}");
+    }
+
     #[test]
     fn marked_strike_normalizes_list_and_quote_continuations() {
         let theme = Theme::system();

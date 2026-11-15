@@ -255,6 +255,10 @@ impl<'a, 'n> Parser<'a, 'n> {
         self.depth += 1;
         let mut out = String::new();
         while let Some(c) = self.peek() {
+            if super::strike::frame_expired() {
+                self.supported = false;
+                break;
+            }
             if Some(c) == end {
                 self.pop();
                 self.depth -= 1;

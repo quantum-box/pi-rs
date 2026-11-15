@@ -30,7 +30,7 @@ pub(crate) fn frame_budget() -> FrameBudget {
     FrameBudget(FRAME_DEADLINE.with(|cell| cell.replace(Some(Instant::now() + FRAME_TIME))))
 }
 
-fn frame_expired() -> bool {
+pub(super) fn frame_expired() -> bool {
     FRAME_DEADLINE.with(|cell| {
         cell.get()
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -407,11 +407,12 @@ fn token_nodes(
         } else {
             let event = match kind {
                 "codespan" => Event::Code(text.to_owned().into()),
+                "latex" => Event::InlineMath(raw.to_owned().into()),
                 "escape" | "text" => Event::Text(text.to_owned().into()),
                 "br" => Event::HardBreak,
                 "html" => Event::InlineHtml(raw.to_owned().into()),
-                // Pi displays unhandled inline tokens, including images and
-                // unsupported math, from their raw source.
+                // Pi displays unhandled inline tokens, including images,
+                // from their raw source.
                 _ => Event::Text(raw.to_owned().into()),
             };
             result.push(Node::Leaf((event, span)));
@@ -586,7 +587,7 @@ fn inline_run(
     let Some(source) = original.get(start..end) else {
         return nodes;
     };
-    if !source.contains("~~") || source.len() > MAX_RUN_BYTES || frame_expired() {
+    if !needs_inline_lexer(source) || source.len() > MAX_RUN_BYTES || frame_expired() {
         return nodes;
     }
     // Marked's block table lexer removes a backslash before each pipe before
@@ -612,6 +613,15 @@ fn inline_run(
     tokens
         .and_then(|tokens| token_nodes(&tokens, &source, &offsets, original, start, cell_end))
         .unwrap_or(nodes)
+}
+
+fn needs_inline_lexer(source: &str) -> bool {
+    if source.contains("~~") {
+        return true;
+    }
+    source.char_indices().any(|(index, c)| {
+        matches!(c, '$' | '\\') && super::math_tokenizer::inline(&source[index..]).is_some()
+    })
 }
 fn rewrite(
     nodes: Vec<Node>,
@@ -677,7 +687,7 @@ fn rewrite(
 
 pub(super) fn events(original: &str, parsed: &str, options: Options) -> Vec<Spanned> {
     let parser = Parser::new_ext(parsed, options);
-    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !original.contains("~~") {
+    if original.len() > MAX_DOCUMENT_BYTES || frame_expired() || !needs_inline_lexer(original) {
         return parser
             .into_offset_iter()
             .map(|(event, range)| (event.into_static(), range))

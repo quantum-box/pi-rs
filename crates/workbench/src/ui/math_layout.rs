@@ -10,6 +10,9 @@ const MAX_LAYOUT_WORK: usize = 2 * 1024 * 1024;
 struct Budget(usize);
 impl Budget {
     fn charge(&mut self, amount: usize) -> Option<()> {
+        if super::strike::frame_expired() {
+            return None;
+        }
         self.0 = self.0.checked_sub(amount)?;
         Some(())
     }
@@ -152,9 +155,13 @@ fn node_layout(
             let content_width = width(operator)
                 .max(lower.as_deref().map_or(0, width))
                 .max(upper.as_deref().map_or(0, width));
+            let max_bytes = operator
+                .len()
+                .max(lower.as_ref().map_or(0, String::len))
+                .max(upper.as_ref().map_or(0, String::len));
             budget.area(
                 1 + usize::from(lower.is_some()) + usize::from(upper.is_some()),
-                content_width.checked_mul(4)?.checked_add(1)?,
+                content_width.checked_add(max_bytes)?.checked_add(1)?,
             )?;
             let mut lines = Vec::new();
             if let Some(text) = upper {
@@ -378,6 +385,12 @@ mod tests {
             });
         }
         assert!(render(&marker(24), &nodes).is_none());
+        let nodes = vec![LayoutNode::Operator {
+            operator: "\u{301}".repeat(4096),
+            lower: None,
+            upper: None,
+        }];
+        assert!(render(&marker(0).repeat(300), &nodes).is_none());
     }
 
     #[test]
