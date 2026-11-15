@@ -729,6 +729,28 @@ pub struct ToolFilters {
     pub model_excluded: Vec<String>,
     pub deferred: Vec<String>,
     pub model_add: Vec<String>,
+    /// Overrides by tool name. Missing names permit both caller kinds.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub callers: std::collections::BTreeMap<String, ToolCallers>,
+}
+
+/// Caller kinds permitted to invoke an enabled tool.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallers {
+    Both,
+    ModelOnly,
+    ToolsOnly,
+    Neither,
+}
+
+impl ToolCallers {
+    fn model(self) -> bool {
+        matches!(self, Self::Both | Self::ModelOnly)
+    }
+    fn tools(self) -> bool {
+        matches!(self, Self::Both | Self::ToolsOnly)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1633,9 +1655,10 @@ pub(crate) fn validate_allowed_tools(names: &Option<Vec<String>>) -> Result<(), 
 }
 
 fn model_tool_selected(c: &Conversation, name: &str) -> bool {
-    c.allowed_tools
-        .as_ref()
-        .is_none_or(|names| names.iter().any(|n| n == name))
+    caller_allowed(c, name, true)
+        && c.allowed_tools
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == name))
         && !c.tool_filters.excluded.iter().any(|n| n == name)
         && match &c.model_tools {
             Some(names) => names.iter().any(|n| n == name),
@@ -1645,6 +1668,16 @@ fn model_tool_selected(c: &Conversation, name: &str) -> bool {
                         || c.tool_filters.model_add.iter().any(|n| n == name))
             }
         }
+}
+
+fn caller_allowed(c: &Conversation, name: &str, model: bool) -> bool {
+    c.tool_filters.callers.get(name).is_none_or(|callers| {
+        if model {
+            callers.model()
+        } else {
+            callers.tools()
+        }
+    })
 }
 
 pub(crate) fn default_subagent_tools(options: &Options) -> Vec<String> {
@@ -1961,6 +1994,7 @@ impl Harness {
     }
     fn ordered_tool_specs(&self, c: &Conversation) -> Result<Vec<ToolSpec>, Error> {
         let mut tools = self.resolved_tools(c)?;
+        tools.retain(|name, _| caller_allowed(c, name, true));
         if let Some(allowed) = c.model_tools.as_ref() {
             return Ok(allowed
                 .iter()
@@ -2129,6 +2163,39 @@ impl Harness {
             ));
         }
         c.tool_filters.deferred = names;
+        self.save(&c, Expected::Version(version))
+    }
+    /// Set caller kinds for a registered tool on a settled conversation.
+    /// None removes the override and restores the default of both callers.
+    pub fn set_tool_callers(
+        &mut self,
+        id: Uuid,
+        name: String,
+        callers: Option<ToolCallers>,
+    ) -> Result<(), Error> {
+        let (mut c, version) = self.load(id)?;
+        if !matches!(c.phase, Phase::Idle | Phase::FailedIdle) || c.active.is_some() {
+            return Err(Error::Invalid(
+                "tool caller selection requires a settled conversation".into(),
+            ));
+        }
+        if name.is_empty()
+            || (!self.tools.contains_key(&name)
+                && !self
+                    .selected_extensions(&c)?
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.spec().name == name))
+        {
+            return Err(Error::Invalid(
+                "tool caller selection requires a registered tool".into(),
+            ));
+        }
+        if let Some(callers) = callers {
+            c.tool_filters.callers.insert(name, callers);
+        } else {
+            c.tool_filters.callers.remove(&name);
+        }
         self.save(&c, Expected::Version(version))
     }
     /// Select installed names for a settled conversation, preserving their order.
@@ -9337,7 +9404,11 @@ impl Harness {
                                 match crate::nested::NestedHost::new(
                                     self.owner.clone(),
                                     operation_id,
-                                    tools.values().cloned().collect(),
+                                    tools
+                                        .iter()
+                                        .filter(|(name, _)| caller_allowed(&c, name, false))
+                                        .map(|(_, tool)| tool.clone())
+                                        .collect(),
                                     cancel.child_token(),
                                     Duration::from_secs(120),
                                     8,
@@ -10708,6 +10779,14 @@ impl Scheduler {
     }
     pub fn set_deferred_tools(&mut self, id: Uuid, names: Vec<String>) -> Result<(), Error> {
         self.harness.set_deferred_tools(id, names)
+    }
+    pub fn set_tool_callers(
+        &mut self,
+        id: Uuid,
+        name: String,
+        callers: Option<ToolCallers>,
+    ) -> Result<(), Error> {
+        self.harness.set_tool_callers(id, name, callers)
     }
     pub fn set_queue_modes(&mut self, id: Uuid, modes: QueueModes) -> Result<(), Error> {
         self.harness.set_queue_modes(id, modes)

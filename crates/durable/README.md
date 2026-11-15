@@ -522,7 +522,19 @@ updates require a settled conversation. Unlike upstream's registration-level
 deferred metadata, these declarations are set per conversation, and unset host
 tools are ordered by name. Selection APIs reject empty or duplicate names.
 There is no built-in deferred-tool search; a host tool can return `add_tools`.
-Per-tool caller permissions remain unsupported.
+`Harness::set_tool_callers` and `Scheduler::set_tool_callers` persist a
+registered tool's caller override for a settled conversation: `Both`,
+`ModelOnly`, `ToolsOnly`, or `Neither`; `None` restores the default of both.
+Model-only tools are omitted from nested tool discovery and execution, while
+tools-only tools are omitted from model requests and model-issued calls. Enabled
+and model filters remain additional restrictions, and loading a tool cannot
+override its caller permission. Names must refer to a currently registered host
+or selected extension tool. Overrides survive reopen and forks, and are visible
+in hook conversation snapshots. A denied nested call follows the existing
+conservative nested failure path and can require parent reconciliation.
+Unlike upstream registration-level caller metadata, these overrides are
+conversation-scoped and apply by name, including to a replacement registered
+under that name; hosts must maintain the policy when registrations change.
 
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
