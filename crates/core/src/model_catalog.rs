@@ -205,6 +205,21 @@ mod tests {
             (session.model_provider().unwrap(), session.model_name()),
             (Some("provider-a"), "shared")
         );
+        {
+            let mut journal = session.journal().unwrap();
+            journal
+                .select_provider_model(Some("provider-b"), "shared", None)
+                .unwrap();
+        }
+        assert!(session.model_provider().is_err());
+        session
+            .set_provider_model(
+                catalog.get("provider-b", "shared").unwrap(),
+                "provider-b",
+                "shared",
+            )
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("provider-b"));
         session
             .set_model(Arc::new(NamedModel("legacy")), "legacy")
             .unwrap();

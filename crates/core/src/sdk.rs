@@ -1809,12 +1809,19 @@ impl AgentSession {
     }
 
     /// Provider of the selected runtime model. Legacy provider-less selections
-    /// return `None`. An unavailable historical model returns an error instead
-    /// of exposing the builder's unrelated default provider.
+    /// return `None`. Returns an error if the journal is busy, the historical
+    /// model is unavailable, or direct journal changes have not been reconciled.
     pub fn model_provider(&self) -> Result<Option<&str>> {
-        if !self.model_identity_resolved {
+        let journal = self.journal()?;
+        let matches_selection =
+            journal
+                .model_identity_at(journal.head())
+                .is_none_or(|(provider, name, _)| {
+                    provider.as_deref() == self.model_provider.as_deref() && name == self.model_name
+                });
+        if !self.model_identity_resolved || !matches_selection {
             return Err(Error::Config(
-                "current session model is not registered".into(),
+                "current session model is not registered or reconciled".into(),
             ));
         }
         Ok(self.model_provider.as_deref())
