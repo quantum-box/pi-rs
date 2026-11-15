@@ -1085,8 +1085,11 @@ On an appearance notification, the last reported foreground, background, and
 complete palette remain in effect until replacement replies arrive, as in Pi.
 The reported appearance is used when no background is known.
 When the background is unknown, the system theme retains ANSI-indexed colors
-even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
-to be implemented. Custom
+even if the palette is available, matching Pi's fallback. With a known background,
+the system theme generates Pi's OKHSL color families and contrast-solved roles,
+using a complete terminal palette when available. Native applies terminal color
+replies incrementally; Pi initially renders in grayscale until its query finishes.
+Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
 
