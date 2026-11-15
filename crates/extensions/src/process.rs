@@ -3725,12 +3725,15 @@ async fn dispatch_inner(
             }
         }
         ProtocolRequest::BeforeSessionTransition { event, state } => {
-            if host.supports_custom_messages() {
-                encode(
-                    extension
-                        .before_session_transition_with_host(&event, state.as_ref(), host)
-                        .await,
-                )
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .before_session_transition_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
             } else {
                 encode(
                     extension
@@ -5938,6 +5941,58 @@ else:
         let restored = pi_rs_core::Session::from_records(session.records().to_vec()).unwrap();
         assert!(restored.branch().iter().any(|record| matches!(&record.event,
             pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "fixture" && entry.data == Some(serde_json::json!({"count":7}))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_transition_reads_and_appends_entry_before_veto() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transition-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    result={'id':'transition-hook','dependencies':[],'commands':[],'tools':[],'session_transition_hook':True,'transition_hook_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['has_custom_entries'] and frame['has_custom_entry_read'] and frame['request']['type']=='before_session_transition'
+    print(json.dumps({'type':'list_custom_entries','custom_type':'transition'}),flush=True)
+    assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'value':1}
+    print(json.dumps({'type':'append_entry','entry':{'customType':'transition','data':{'value':2}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':True}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "transition".into(),
+                data: Some(serde_json::json!({"value":1})),
+            })
+            .unwrap();
+        let entry_id = session.head();
+        let cancelled = registry
+            .session_transition_cancelled_in_session(
+                &pi_rs_core::BeforeSessionTransition::Fork {
+                    entry_id,
+                    position: pi_rs_core::ForkPosition::At,
+                },
+                &mut session,
+                Duration::from_secs(5),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(cancelled);
+        assert!(session.branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "transition" && entry.data == Some(serde_json::json!({"value":2}))
         )));
     }
 
