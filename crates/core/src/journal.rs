@@ -564,6 +564,9 @@ impl Session {
     pub fn supports_record_metadata(&self) -> bool {
         self.store.supports_record_metadata()
     }
+    pub(crate) fn encoded_record_limit(&self) -> Option<usize> {
+        self.store.encoded_record_limit()
+    }
     pub fn retry_control(&self) -> crate::RetryControl {
         self.retry.clone()
     }

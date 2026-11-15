@@ -4509,8 +4509,9 @@ impl Agent<'_> {
         };
         // Reserve room for the record envelope and other metadata, and keep a
         // fixed ceiling even when many individual paths are valid.
+        let store_limit = session.encoded_record_limit().unwrap_or(16 * 1024 * 1024);
         let file_budget = (4 * 1024 * 1024usize).min(
-            (16 * 1024 * 1024usize)
+            store_limit
                 .saturating_sub(4096)
                 .saturating_sub(serde_json::to_vec(&event)?.len()),
         );
@@ -7281,6 +7282,116 @@ mod tree_tests {
         let inherited =
             crate::compaction_files::FileOperations::collect(&reopened, Some(reopened.head()));
         assert!(inherited.bounded_details(4 * 1024 * 1024).1);
+    }
+
+    #[tokio::test]
+    async fn custom_store_limit_bounds_generated_file_details() {
+        struct LimitedStore(crate::MemoryStore);
+        impl crate::SessionStore for LimitedStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+            fn supports_record_metadata(&self) -> bool {
+                true
+            }
+            fn encoded_record_limit(&self) -> Option<usize> {
+                Some(256 * 1024)
+            }
+            fn load_record_metadata(
+                &mut self,
+            ) -> Result<std::collections::BTreeMap<u64, serde_json::Value>> {
+                crate::SessionStore::load_record_metadata(&mut self.0)
+            }
+            fn append_with_metadata(
+                &mut self,
+                record: &Record,
+                metadata: Option<&serde_json::Value>,
+            ) -> Result<()> {
+                let mut value = serde_json::to_value(record)?;
+                if let Some(metadata) = metadata {
+                    value["piRsRecordMetadata"] = metadata.clone();
+                }
+                if serde_json::to_vec(&value)?.len() + 1 > 256 * 1024 {
+                    return Err(Error::Session("fixture record too large".into()));
+                }
+                crate::SessionStore::append_with_metadata(&mut self.0, record, metadata)
+            }
+        }
+        let mut session = Session::with_store(LimitedStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        for index in 0..4 {
+            let path = format!("{index}{}", "x".repeat(80_000));
+            let call = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":path}).to_string(),
+                },
+            };
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![call.clone()],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: call.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let id = session
+            .records()
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let metadata = session.record_metadata(id).unwrap();
+        assert_eq!(metadata["nativeFileDetailsTruncated"], true);
+        let retained = metadata["details"]["modifiedFiles"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(retained > 0 && retained < 4);
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
     }
 
     struct RecoverySettlementModel {
