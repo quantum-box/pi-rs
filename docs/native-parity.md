@@ -1449,6 +1449,10 @@ The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
 prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
 malformed UTF-8 in text attachments is decoded with replacement characters.
+Attachment file tags contain the literal resolved filename, including `&`,
+quotes and angle brackets, matching Pi's model-visible prompt text. Native
+canonicalizes paths for local reads, so a symlink or Windows canonical path
+can still differ from Pi's lexically resolved filename.
 For CLI attachments, image detection does not infer a format from the file
 extension. Malformed PNG headers and animated PNGs detected within the first
 4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection

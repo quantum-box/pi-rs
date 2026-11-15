@@ -27,12 +27,7 @@ pub fn expand(
             continue;
         }
         let (content, attached) = tools.read_attachment_lossy(&path)?;
-        let name = path
-            .to_string_lossy()
-            .replace('&', "&amp;")
-            .replace('"', "&quot;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
+        let name = path.to_string_lossy();
         if attached.is_empty() {
             let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
             files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
@@ -58,6 +53,40 @@ pub fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_tags_preserve_literal_filename_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("research & notes.txt"), "text").unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(directory.path().join("picture & notes.png"))
+            .unwrap();
+        let (text, images) = expand(
+            &[
+                "@research & notes.txt".into(),
+                "@picture & notes.png".into(),
+            ],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            text.contains("research & notes.txt\">\ntext\n</file>\n"),
+            "{text}"
+        );
+        assert!(text.contains("picture & notes.png\"></file>\n"), "{text}");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_tags_do_not_escape_quotes_or_angle_brackets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a\"<b>.txt"), "text").unwrap();
+        let (text, _) = expand(&["@a\"<b>.txt".into()], directory.path(), false, None).unwrap();
+        assert!(text.contains("a\"<b>.txt\">\ntext\n</file>\n"), "{text}");
+    }
 
     #[test]
     fn empty_files_are_skipped_and_text_attachment_boms_are_removed() {
