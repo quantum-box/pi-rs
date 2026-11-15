@@ -661,7 +661,7 @@ pub struct Conversation {
     #[serde(skip)]
     pending_tool_result: Option<ToolResultMetadata>,
     pub messages: Vec<Message>,
-    /// Lossless block arrays indexed by their active message position.
+    /// Lossless user or tool block arrays indexed by active message position.
     /// Reconstructed from the transcript; never serialized in the snapshot.
     #[serde(skip)]
     pub content_blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
@@ -2756,6 +2756,21 @@ impl Harness {
             .and_then(|id| self.provider_adapter.as_ref().filter(|a| a.id() == id))
             .is_some_and(|a| a.supports_durable_blocks())
     }
+    fn supports_context_blocks(&self, c: &Conversation) -> bool {
+        let adapter = c
+            .provider_adapter
+            .as_ref()
+            .and_then(|id| self.provider_adapter.as_ref().filter(|a| a.id() == id));
+        c.content_blocks
+            .keys()
+            .all(|index| match c.messages.get(*index) {
+                Some(Message::User { .. }) => adapter.is_some_and(|a| a.supports_durable_blocks()),
+                Some(Message::Tool { .. }) => {
+                    adapter.is_some_and(|a| a.supports_durable_tool_blocks())
+                }
+                _ => false,
+            })
+    }
     fn append_yield(c: &mut Conversation, input: crate::content::UserContent, durable: bool) {
         if durable && let crate::content::UserContent::Blocks(blocks) = &input {
             let index = c.messages.len();
@@ -3651,6 +3666,21 @@ impl Harness {
                     && state.messages == proof.messages
             })
         });
+        if let Some(previous) = old
+            && previous
+                .content_blocks
+                .keys()
+                .any(|index| matches!(previous.messages.get(*index), Some(Message::Tool { .. })))
+            && !reset_proven
+            && (!state.messages.starts_with(&previous.messages)
+                || previous.context_generation != state.context_generation
+                || previous
+                    .content_blocks
+                    .iter()
+                    .any(|(index, binding)| state.content_blocks.get(index) != Some(binding)))
+        {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if let Some(previous) = old {
             for (id, expected_blocks) in &previous.pending_reset_blocks {
                 if state.pending_reset_blocks.get(id) == Some(expected_blocks) {
@@ -3717,7 +3747,7 @@ impl Harness {
         for (&index, binding) in &state.content_blocks {
             if !matches!(
                 state.messages.get(index),
-                Some(Message::User { content }) if content.is_empty()
+                Some(Message::User { content } | Message::Tool { content, .. }) if content.is_empty()
             ) || binding.message_id.is_nil()
                 || !block_ids.insert(binding.message_id)
                 || crate::content::UserContent::from_yield(
@@ -7327,6 +7357,12 @@ impl Harness {
         keep_recent_tokens: usize,
         instructions: Option<&str>,
     ) -> Result<Option<crate::compact::Preparation>, Error> {
+        if c.content_blocks
+            .keys()
+            .any(|index| matches!(c.messages.get(*index), Some(Message::Tool { .. })))
+        {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
         if c.content_blocks.is_empty() {
             return Ok(crate::compact::prepare(
                 &c.messages,
@@ -7549,7 +7585,7 @@ impl Harness {
                 None
             };
             let (mut c, version) = self.load(id)?;
-            if !c.content_blocks.is_empty() && !self.supports_blocks(&c) {
+            if !self.supports_context_blocks(&c) {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
             if request_id.as_ref().is_some_and(|key| {
@@ -7722,7 +7758,7 @@ impl Harness {
                     };
                 }
             }
-            if !c.content_blocks.is_empty() && !self.supports_blocks(&c) {
+            if !self.supports_context_blocks(&c) {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
             if c.active.is_some()
@@ -9246,7 +9282,7 @@ impl Harness {
                     }
                 }
                 Phase::ModelReady { turns } => {
-                    if !c.content_blocks.is_empty() && !self.supports_blocks(&c) {
+                    if !self.supports_context_blocks(&c) {
                         return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
                     }
                     if !matches!(
@@ -9377,11 +9413,19 @@ impl Harness {
                     let specs = self.ordered_tool_specs(&c)?;
                     let mut request =
                         model_request(&c.config.model, messages, specs, c.config.max_output_tokens);
-                    let blocks: std::collections::BTreeMap<_, _> = c
-                        .content_blocks
-                        .iter()
-                        .map(|(index, binding)| (index + 1, binding.clone()))
-                        .collect();
+                    let mut blocks = std::collections::BTreeMap::new();
+                    let mut tool_blocks = std::collections::BTreeMap::new();
+                    for (index, binding) in &c.content_blocks {
+                        match c.messages.get(*index) {
+                            Some(Message::User { .. }) => {
+                                blocks.insert(index + 1, binding.clone());
+                            }
+                            Some(Message::Tool { .. }) => {
+                                tool_blocks.insert(index + 1, binding.clone());
+                            }
+                            _ => return Err(crate::transcript::Error::Corrupt.into()),
+                        }
+                    }
                     let original_messages = request.messages.clone();
                     if !c.extensions.is_empty() {
                         let selected = self.selected_extensions(&c)?;
@@ -9394,6 +9438,9 @@ impl Harness {
                         let mut value = serde_json::json!({"messages": request.messages});
                         if !blocks.is_empty() {
                             value["content_blocks"] = serde_json::to_value(&blocks)?;
+                        }
+                        if !tool_blocks.is_empty() {
+                            value["tool_content_blocks"] = serde_json::to_value(&tool_blocks)?;
                         }
                         let (value, _, _, reports) = fenced_poll(
                             selected.generation(
@@ -9419,6 +9466,15 @@ impl Harness {
                                 "before-request cannot replace durable content bindings".into(),
                             ));
                         }
+                        if !tool_blocks.is_empty()
+                            && value.get("tool_content_blocks")
+                                != Some(&serde_json::to_value(&tool_blocks)?)
+                        {
+                            return Err(Error::Invalid(
+                                "before-request cannot replace durable tool content bindings"
+                                    .into(),
+                            ));
+                        }
                         request.messages =
                             serde_json::from_value(value.get("messages").cloned().ok_or_else(
                                 || Error::Invalid("before-request hook omitted messages".into()),
@@ -9427,7 +9483,9 @@ impl Harness {
                                 Error::Invalid(format!("invalid before-request messages: {e}"))
                             })?;
                     }
-                    if !blocks.is_empty() && request.messages != original_messages {
+                    if (!blocks.is_empty() || !tool_blocks.is_empty())
+                        && request.messages != original_messages
+                    {
                         return Err(Error::Invalid(
                             "before-request cannot replace messages with durable blocks".into(),
                         ));
@@ -9436,6 +9494,11 @@ impl Harness {
                         request: request.clone(),
                         blocks,
                     };
+                    let tool_request = crate::model::DurableToolRequest {
+                        request: durable_request.clone(),
+                        tool_blocks,
+                    };
+                    tool_request.validate_bindings()?;
                     let prepared = if let Some(adapter_id) = &c.provider_adapter {
                         let adapter = self
                             .provider_adapter
@@ -9455,7 +9518,15 @@ impl Harness {
                             restarts,
                         };
                         let mut body = fenced_poll(
-                            adapter.prepare_durable(&attempt, &durable_request),
+                            async {
+                                if tool_request.tool_blocks.is_empty() {
+                                    adapter.prepare_durable(&attempt, &durable_request).await
+                                } else {
+                                    adapter
+                                        .prepare_with_tool_blocks(&attempt, &tool_request)
+                                        .await
+                                }
+                            },
                             self.execution_gate.as_ref(),
                             cancel,
                         )
@@ -9499,10 +9570,16 @@ impl Harness {
                                 "provider body must be an object within the size limit".into(),
                             ));
                         }
-                        adapter.validate_durable(&attempt, &durable_request, &body)?;
+                        if tool_request.tool_blocks.is_empty() {
+                            adapter.validate_durable(&attempt, &durable_request, &body)?;
+                        } else {
+                            adapter.validate_with_tool_blocks(&attempt, &tool_request, &body)?;
+                        }
                         Some((adapter, attempt, body))
                     } else {
-                        if !durable_request.blocks.is_empty() {
+                        if !durable_request.blocks.is_empty()
+                            || !tool_request.tool_blocks.is_empty()
+                        {
                             return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
                         }
                         None
@@ -10924,6 +11001,7 @@ impl Harness {
                             metadata.metadata_truncated = false;
                             metadata.schema_validated = false;
                         }
+                        validate_tool_metadata(&c.tool_filters, &mut metadata);
                         if is_pending {
                             c.tool_results.push(metadata);
                         } else if let Some(existing) = c
@@ -10931,11 +11009,108 @@ impl Harness {
                             .iter_mut()
                             .find(|item| item.operation_id == operation_id)
                         {
-                            validate_tool_metadata(&c.tool_filters, &mut metadata);
                             *existing = metadata;
                         }
                     }
-                    append_tool(&mut c, &calls, index, content)?;
+                    let metadata = c
+                        .tool_results
+                        .iter()
+                        .find(|m| m.operation_id == operation_id);
+                    let mut extra = std::collections::BTreeMap::new();
+                    if let Some(metadata) = metadata {
+                        extra.insert("isError".into(), serde_json::json!(metadata.is_error));
+                        if let Some(details) = &metadata.details {
+                            extra.insert("details".into(), details.clone());
+                        }
+                        if let Some(data) = &metadata.structured_output {
+                            extra.insert("structuredOutput".into(), data.clone());
+                        }
+                        extra.insert(
+                            "attachments".into(),
+                            serde_json::to_value(&metadata.attachments)?,
+                        );
+                    }
+                    let block_result = crate::extension::ToolBlockResult {
+                        output: vec![serde_json::json!({"type":"text", "text":content})],
+                        diagnostics: metadata.map(|m| m.diagnostics.clone()).unwrap_or_default(),
+                        extra,
+                    };
+                    let original_block_result = block_result.clone();
+                    let (block_result, reports) = fenced_poll(
+                        selected.runtime_after_tool_blocks(&hook_call, block_result, &context),
+                        self.execution_gate.as_ref(),
+                        cancel,
+                    )
+                    .await
+                    .ok_or(Error::Interrupted)?
+                    .map_err(Error::Invalid)?;
+                    self.subagent_store()?;
+                    if cancel.is_cancelled() {
+                        self.failed = true;
+                        return Err(Error::Interrupted);
+                    }
+                    if !reports.is_empty() {
+                        self.record_extension_reports(
+                            c.id,
+                            operation_id,
+                            "after_tool_blocks",
+                            reports,
+                        )?;
+                        return Err(Error::Invalid("block-aware after-tool hook failed".into()));
+                    }
+                    if block_result != original_block_result
+                        && (block_result.diagnostics.len() > 32
+                            || block_result.diagnostics.iter().any(|d| {
+                                d.message.len() > 4096
+                                    || d.code.as_ref().is_some_and(|code| code.len() > 256)
+                            })
+                            || serde_json::to_vec(&block_result.diagnostics)?.len() > 65_536
+                            || serde_json::to_vec(&block_result.output)?.len() > 8 * 1024 * 1024)
+                    {
+                        return Err(Error::Invalid(
+                            "block-aware tool result exceeds limits".into(),
+                        ));
+                    }
+                    if let Some(metadata) = c
+                        .tool_results
+                        .iter_mut()
+                        .find(|m| m.operation_id == operation_id)
+                    {
+                        if block_result != original_block_result
+                            && serde_json::to_vec(&(
+                                &metadata.details,
+                                &metadata.structured_output,
+                                &metadata.attachments,
+                                &block_result.diagnostics,
+                            ))?
+                            .len()
+                                > 65_536
+                        {
+                            return Err(Error::Invalid(
+                                "block-aware tool metadata exceeds limits".into(),
+                            ));
+                        }
+                        metadata.diagnostics = block_result.diagnostics;
+                    }
+                    let simple = block_result.output.len() == 1
+                        && block_result.output[0]
+                            .as_object()
+                            .is_some_and(|o| o.len() == 2)
+                        && block_result.output[0]["type"] == "text";
+                    if simple {
+                        content = block_result.output[0]["text"].as_str().unwrap().to_owned();
+                        append_tool(&mut c, &calls, index, content)?;
+                    } else {
+                        let position = c.messages.len();
+                        append_tool(&mut c, &calls, index, String::new())?;
+                        c.content_blocks.insert(
+                            position,
+                            crate::transcript::MessageContentBlocks {
+                                message_id: Uuid::new_v4(),
+                                blocks: block_result.output,
+                            },
+                        );
+                    }
                     c.phase = Phase::Tools {
                         turns,
                         calls,

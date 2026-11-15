@@ -69,7 +69,7 @@ struct Entry {
     content_blocks: Option<Vec<MessageContentBlocks>>,
 }
 
-/// Ordered content for one user-message occurrence in a runtime transcript change.
+/// Ordered content for one user or tool-message occurrence in a runtime transcript change.
 /// The message identity is validated against the corresponding record value.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -526,9 +526,20 @@ fn valid_block_bindings(value: &Value, blocks: &[MessageContentBlocks]) -> bool 
             && crate::content::UserContent::from_yield(Value::Array(block.blocks.clone()), false)
                 .is_some()
             && occurrences.get(&block.message_id).is_some_and(|message| {
-                message.get("role").and_then(Value::as_str) == Some("user")
-                    && message.get("content").and_then(Value::as_str) == Some("")
-                    && message.as_object().is_some_and(|object| object.len() == 2)
+                message.get("content").and_then(Value::as_str) == Some("")
+                    && message.as_object().is_some_and(|object| {
+                        match message.get("role").and_then(Value::as_str) {
+                            Some("user") => object.len() == 2,
+                            Some("tool") => {
+                                object.len() == 3
+                                    && message
+                                        .get("call_id")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|s| !s.is_empty())
+                            }
+                            _ => false,
+                        }
+                    })
             })
     })
 }
@@ -651,6 +662,41 @@ mod tests {
             ),
             Err(Error::UnsupportedContentBlocks)
         ));
+    }
+
+    #[test]
+    fn tool_blocks_require_empty_bound_tool_with_call_id() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let transcript = Transcript::new(&db, id);
+        let message_id = Uuid::new_v4();
+        let binding = MessageContentBlocks {
+            message_id,
+            blocks: vec![json!({"type":"image", "data":"aGk=", "mimeType":"image/png"})],
+        };
+        for message in [
+            json!({"role":"tool", "call_id":"", "content":""}),
+            json!({"role":"tool", "call_id":"c", "content":"hidden"}),
+            json!({"role":"tool", "call_id":"c", "content":"", "extra":1}),
+        ] {
+            let value = json!({"AppendV2":{"ids":[message_id], "messages":[message]}});
+            assert!(matches!(
+                transcript.prepare_append_with_blocks(&value, vec![binding.clone()]),
+                Err(Error::Corrupt)
+            ));
+        }
+        let value = json!({"AppendV2":{"ids":[message_id], "messages":[{"role":"tool", "call_id":"c", "content":""}]}});
+        commit(
+            &db,
+            transcript
+                .prepare_append_with_blocks(&value, vec![binding.clone()])
+                .unwrap(),
+        );
+        let page = transcript
+            .read_with_blocks(&transcript.snapshot().unwrap(), NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(page.records[0].content_blocks, Some(vec![binding]));
     }
 
     #[test]

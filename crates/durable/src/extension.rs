@@ -306,6 +306,10 @@ pub trait Hook: Send + Sync {
     ) -> Result<Option<ToolResult>, String> {
         Ok(None)
     }
+    /// Opt in to the runtime block hook after legacy and structured hooks have run.
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        false
+    }
     /// Block-aware result hook for hosts that can persist and deliver blocks.
     /// Legacy string hooks are bridged only for one plain text block.
     async fn after_tool_blocks(
@@ -727,7 +731,8 @@ impl Resolved {
         (result, replaced, reports)
     }
     /// Run ordered block-aware hooks. The caller must durably persist the returned
-    /// result before exposing it to a model. This is not wired to `Harness` yet.
+    /// result before exposing it to a model. Harness uses its own opt-in chain
+    /// after its legacy and structured result hooks.
     pub async fn after_tool_blocks(
         &self,
         call: &ToolCall,
@@ -751,6 +756,44 @@ impl Resolved {
                     )),
                     Ok(None) => (),
                     Err(err) => reports.push(failure(&e.name, "after_tool", err)),
+                }
+            }
+        }
+        Ok((result, reports))
+    }
+    pub(crate) async fn runtime_after_tool_blocks(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        ctx: &Context<'_>,
+    ) -> Result<(ToolBlockResult, Vec<Report>), String> {
+        if !result.valid() {
+            return Err("invalid tool output blocks".into());
+        }
+        let mut reports = vec![];
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                match protect(async {
+                    if hook.supports_runtime_tool_blocks() {
+                        hook.after_tool_blocks(call, &result, false, ctx).await
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await
+                {
+                    Ok(Some(value)) if value.valid() && value.extra == result.extra => {
+                        result = value
+                    }
+                    Ok(Some(_)) => reports.push(failure(
+                        &extension.name,
+                        "after_tool_blocks",
+                        "invalid block result or metadata replacement".into(),
+                    )),
+                    Ok(None) => (),
+                    Err(error) => {
+                        reports.push(failure(&extension.name, "after_tool_blocks", error))
+                    }
                 }
             }
         }

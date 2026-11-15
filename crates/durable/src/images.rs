@@ -276,6 +276,9 @@ pub fn create_fit_images_extension(
 
 #[async_trait::async_trait]
 impl crate::extension::Hook for FitToolImages {
+    fn supports_runtime_tool_blocks(&self) -> bool {
+        true
+    }
     async fn after_tool_blocks(
         &self,
         _call: &crate::extension::ToolCall,
