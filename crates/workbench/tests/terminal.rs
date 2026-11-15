@@ -229,6 +229,8 @@ fn initial_appearance_report_keeps_late_color_replies() {
     master
         .write_all(b"\x1b[?997;1n\x1b]11;rgb:0000/0000/0000\x07")
         .unwrap();
+    // Pi applies the accumulated late result when its query reaches DA1.
+    master.write_all(b"\x1b[?1;2c").unwrap();
     output_until(&mut master, |text| text.contains("\x1b[38;2;"));
 }
 

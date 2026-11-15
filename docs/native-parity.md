@@ -1222,8 +1222,10 @@ device-attributes marker arrives, or its 100 ms initial timeout, then uses the
 available colors. The startup session selector does not issue color or appearance
 queries: it can hand off directly to RPC, print mode, or the shell, where delayed
 responses would otherwise leak as input. It uses the available fallback theme.
-In interactive mode, late replies are applied incrementally; query aggregation
-still differs from Pi.
+In interactive mode, foreground, background and complete palettes are collected
+per query. A 100 ms timeout applies the partial snapshot; a later DA1 or the
+final color response applies the cumulative snapshot once, matching Pi's color
+aggregation while retaining the serialized DA1 safety policy described above.
 Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
