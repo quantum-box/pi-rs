@@ -1296,6 +1296,100 @@ pub(crate) async fn test_oauth_client(
 mod tests {
     use super::*;
 
+    // Drain the complete HTTP request before replying. Closing a socket with
+    // unread request bytes can reset the connection and discard the response.
+    fn read_refresh_request(socket: &mut std::net::TcpStream, mut on_partial: impl FnMut(usize)) {
+        use std::io::Read as _;
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut chunk = [0; 1024];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).expect("read refresh headers");
+            assert!(count > 0, "refresh request ended before its headers");
+            data.extend_from_slice(&chunk[..count]);
+            assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if let Some(index) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+        assert!(
+            headers.starts_with("POST /token "),
+            "unexpected request line"
+        );
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("refresh request content length");
+        assert!(length <= 64 * 1024 - header_end, "refresh body too large");
+        if data.len() > header_end && data.len() < header_end + length {
+            on_partial(data.len() - header_end);
+        }
+        while data.len() < header_end + length {
+            let count = socket.read(&mut chunk).expect("read refresh body");
+            assert!(count > 0, "refresh request ended before its body");
+            data.extend_from_slice(&chunk[..count]);
+            assert!(data.len() <= 64 * 1024, "refresh request too large");
+            if data.len() < header_end + length {
+                on_partial(data.len() - header_end);
+            }
+        }
+        let body = std::str::from_utf8(&data[header_end..header_end + length]).unwrap();
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("refresh_token=old-refresh"));
+    }
+
+    fn direct_fixture_options() -> crate::mcp::HttpOptionsWithProxyHosts {
+        crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: Vec::new(),
+                idle_timeout: None,
+            },
+            proxy_hosts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_fixture_waits_for_the_complete_request_body() {
+        use std::io::Write as _;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_refresh_request(&mut socket, |received| {
+                partial_tx.send(received).unwrap();
+            });
+            done_tx.send(()).unwrap();
+        });
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let body = "grant_type=refresh_token&refresh_token=old-refresh";
+        write!(
+            client,
+            "POST /token HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.write_all(&body.as_bytes()[..10]).unwrap();
+        let received = partial_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(received > 0 && received <= 10);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        client.write_all(&body.as_bytes()[10..]).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+    }
+
     async fn fixture_headers<R: tokio::io::AsyncBufRead + Unpin>(
         reader: &mut R,
         deadline: std::time::Duration,
@@ -1446,9 +1540,9 @@ mod tests {
     #[test]
     fn refresh_saves_token_and_only_dispatches_for_live_callers() {
         use rmcp::transport::streamable_http_client::{AuthRequiredError, StreamableHttpError};
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         for (reactive, cancel) in [(false, true), (true, true), (false, false), (true, false)] {
             let dir = tempfile::tempdir().unwrap();
@@ -1475,8 +1569,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let server = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                let mut request = [0; 4096];
-                assert!(socket.read(&mut request).unwrap() > 0);
+                read_refresh_request(&mut socket, |_| {});
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let body =
@@ -1495,7 +1588,8 @@ mod tests {
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let task = runtime.as_ref().unwrap().block_on(async move {
                 let url = format!("http://{address}");
-                let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+                let options = direct_fixture_options();
+                let mut manager = oauth_manager(&format!("{url}/mcp"), Some(&options)).await.unwrap();
                 manager.set_metadata(serde_json::from_value(serde_json::json!({
                     "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
                     "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
@@ -1503,6 +1597,7 @@ mod tests {
                 manager.configure_client_id("fixture").unwrap();
                 manager.set_credential_store(task_store);
                 let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager), Arc::default());
+                let manager = client.0.auth_manager.clone();
                 let task = tokio::spawn(async move {
                     let result = client.call(reactive.then(|| "old".to_owned()), |_| {
                         let index = task_calls.fetch_add(1, Ordering::SeqCst);
@@ -1517,8 +1612,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
                 }).await.unwrap();
-                task.abort_handle()
+                (task.abort_handle(), manager)
             });
+            let (task, manager) = task;
             if cancel {
                 task.abort();
                 drop(runtime.take());
@@ -1541,13 +1637,22 @@ mod tests {
                 });
             }
             drop(runtime);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !String::from_utf8_lossy(&std::fs::read(&store.path).unwrap()).contains("rotated")
-            {
-                assert!(Instant::now() < deadline, "rotated token was not saved");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            let observer = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            observer.block_on(async {
+                // Both proactive and reactive refreshes hold this mutex until
+                // their HTTP response and credential save have completed.
+                let _manager = tokio::time::timeout(Duration::from_secs(5), manager.lock())
+                    .await
+                    .expect("refresh worker did not finish");
+                assert!(
+                    String::from_utf8_lossy(&std::fs::read(&store.path).unwrap())
+                        .contains("rotated"),
+                    "refresh worker finished without saving the rotated token (reactive={reactive}, cancel={cancel})"
+                );
+            });
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 usize::from(reactive) + usize::from(!cancel),
@@ -1558,8 +1663,8 @@ mod tests {
 
     #[test]
     fn cancelled_runtime_persists_rotated_mcp_refresh_token() {
-        use std::io::{Read as _, Write as _};
-        use std::time::{Duration, Instant};
+        use std::io::Write as _;
+        use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let store = FileCredentials {
             path: directory.path().join("credentials.json"),
@@ -1583,8 +1688,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut request = [0; 4096];
-            assert!(socket.read(&mut request).unwrap() > 0);
+            read_refresh_request(&mut socket, |_| {});
             started_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let body = r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
@@ -1595,16 +1699,22 @@ mod tests {
             .build()
             .unwrap();
         let task_store = store.clone();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
         let task = runtime.block_on(async move {
             let url = format!("http://{address}");
-            let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+            let options = direct_fixture_options();
+            let mut manager = oauth_manager(&format!("{url}/mcp"), Some(&options)).await.unwrap();
             manager.set_metadata(serde_json::from_value(serde_json::json!({
                 "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
                 "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
             })).unwrap());
             manager.configure_client_id("fixture").unwrap();
             manager.set_credential_store(task_store);
-            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move { manager.refresh_token().await }).await });
+            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move {
+                let result = manager.refresh_token().await;
+                let _ = worker_tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                result
+            }).await });
             tokio::time::timeout(Duration::from_secs(5), async {
                 while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
             }).await.unwrap();
@@ -1614,18 +1724,15 @@ mod tests {
         drop(runtime);
         release_tx.send(()).unwrap();
         server.join().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let bytes = std::fs::read(&store.path).unwrap();
-            if String::from_utf8_lossy(&bytes).contains("rotated") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "rotated refresh token was not persisted"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        worker_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refresh worker did not finish")
+            .expect("refresh worker failed");
+        let bytes = std::fs::read(&store.path).unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("rotated"),
+            "refresh worker finished without persisting the rotated token"
+        );
     }
 
     #[test]
