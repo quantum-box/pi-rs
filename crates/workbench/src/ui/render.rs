@@ -2241,6 +2241,13 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "x²");
         let source = "$$\\frac{123456789}{123456789}$$";
         assert!(rendered(source, 8).join("\n").contains("$$"));
+        assert_eq!(
+            rendered("before\n$$x^2$$\nafter", 80),
+            ["before", "", "x²", "", "after"]
+        );
+        assert_eq!(rendered("$$x$$\n$$y$$", 80), ["x", "", "y"]);
+        assert_eq!(rendered("\\[\nx^2", 80), ["\\[", "x^2"]);
+        assert_eq!(rendered("$$\\unknown{x}$$", 80), ["$$\\unknown{x}$$"]);
     }
 
     #[test]
