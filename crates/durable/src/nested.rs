@@ -37,8 +37,17 @@ struct Record {
     policy: ReplayPolicy,
     operation_id: Uuid,
     outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<crate::runtime::ToolDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolution: Option<Resolution>,
+}
+
+/// A nested outcome with diagnostics committed for that keyed child.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyedResult {
+    pub outcome: Outcome,
+    pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -204,6 +213,75 @@ struct Shared {
     non_pending_failure: AtomicBool,
     idle: tokio::sync::Notify,
 }
+struct NestedDiagnostic {
+    shared: Arc<Shared>,
+    key: Vec<u8>,
+    operation: Uuid,
+}
+impl NestedDiagnostic {
+    fn storage_error(&self, error: impl std::fmt::Display) -> String {
+        self.shared
+            .non_pending_failure
+            .store(true, Ordering::Release);
+        self.shared.failed.store(true, Ordering::Release);
+        error.to_string()
+    }
+}
+impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
+    fn record(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String> {
+        let store = self.shared.owner.store();
+        loop {
+            if self.shared.cancellation.is_cancelled() {
+                return Err("nested attempt cancelled".into());
+            }
+            if self
+                .shared
+                .lifecycle
+                .lock()
+                .map_err(|_| "nested lifecycle lock poisoned")?
+                .closed
+                .contains(&self.operation)
+            {
+                return Err("nested attempt is no longer active".into());
+            }
+            let entry = store
+                .get(&self.key)
+                .map_err(|e| self.storage_error(e))?
+                .ok_or_else(|| self.storage_error("nested intent missing"))?;
+            let mut record: Record =
+                serde_json::from_slice(&entry.value).map_err(|e| self.storage_error(e))?;
+            if record.operation_id != self.operation || record.outcome.is_some() {
+                return Err("nested attempt is no longer active".into());
+            }
+            if record.diagnostics.len() >= 32 {
+                return Err("too many tool diagnostics".into());
+            }
+            record.diagnostics.push(diagnostic.clone());
+            let value = serde_json::to_vec(&record).map_err(|e| self.storage_error(e))?;
+            if serde_json::to_vec(&record.diagnostics)
+                .map_err(|e| e.to_string())?
+                .len()
+                > 65_536
+            {
+                return Err("tool diagnostics exceed size limit".into());
+            }
+            match store.commit(
+                &[Check {
+                    key: self.key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key: self.key.clone(),
+                    value,
+                }],
+            ) {
+                Ok(()) => return Ok(()),
+                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(error) => return Err(self.storage_error(error)),
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct Lifecycle {
     sealed: bool,
@@ -347,6 +425,48 @@ impl NestedHost {
         }
         self.call_inner(Some(key), name, arguments, false, true)
             .await
+    }
+    pub async fn call_keyed_with_diagnostics(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> KeyedResult {
+        let outcome = self.call_keyed(key, name, arguments.clone()).await;
+        let diagnostics = if valid_key(key) {
+            match self
+                .shared
+                .owner
+                .store()
+                .get(&self.explicit_key(self.parent, key))
+            {
+                Ok(Some(entry)) => match serde_json::from_slice::<Record>(&entry.value) {
+                    Ok(record) if record.name == name && record.arguments == arguments => {
+                        record.diagnostics
+                    }
+                    Ok(_) => Vec::new(),
+                    Err(error) => {
+                        return KeyedResult {
+                            outcome: self.fail(format!("nested diagnostic record: {error}")),
+                            diagnostics: Vec::new(),
+                        };
+                    }
+                },
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    return KeyedResult {
+                        outcome: self.fail(format!("nested diagnostic read: {error}")),
+                        diagnostics: Vec::new(),
+                    };
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        KeyedResult {
+            outcome,
+            diagnostics,
+        }
     }
     /// Admit up to eight distinct keyed calls in order, then poll their persisted
     /// pending jobs concurrently. The parent remains active until all polls stop.
@@ -601,7 +721,7 @@ impl NestedHost {
             Some(v) => v,
             None => return self.fail(format!("nested tool unavailable: {name}")),
         };
-        let (record, version) = if let Some(entry) = entry {
+        let (record, _version) = if let Some(entry) = entry {
             let record: Record = match serde_json::from_slice(&entry.value) {
                 Ok(v) => v,
                 Err(e) => return self.fail(format!("invalid nested record: {e}")),
@@ -652,6 +772,7 @@ impl NestedHost {
                 policy: reg.replay,
                 operation_id: invocation.operation_id,
                 outcome: None,
+                diagnostics: Vec::new(),
                 resolution: None,
             };
             let value = match serde_json::to_vec(&record) {
@@ -705,11 +826,18 @@ impl NestedHost {
         } else {
             return self.fail("nested lifecycle lock poisoned");
         }
-        let reply = crate::keyed_tool::scope(
+        let sink = Arc::new(NestedDiagnostic {
+            shared: self.shared.clone(),
+            key: key.clone(),
+            operation: record.operation_id,
+        });
+        let reply = crate::keyed_tool::scope_with_control(
             child.clone(),
             reg.tool.clone(),
             invocation.operation_id,
             child.clone(),
+            Arc::new(Mutex::new(Default::default())),
+            (Some(sink), None),
             crate::tool::execute(
                 reg.tool.as_ref(),
                 &invocation,
@@ -735,22 +863,42 @@ impl NestedHost {
             return self.fail("nested descendant requires reconciliation");
         }
         let mut completed = record;
-        completed.outcome = Some(outcome.clone());
-        let value = match serde_json::to_vec(&completed) {
-            Ok(v) => v,
-            Err(e) => return self.fail(e.to_string()),
-        };
-        if let Err(e) = store.commit(
-            &[Check {
-                key: key.clone(),
-                expected: Expected::Version(version),
-            }],
-            &[Mutation::Put {
-                key: key.clone(),
-                value,
-            }],
-        ) {
-            return self.fail(format!("nested result commit: {e}"));
+        loop {
+            let entry = match store.get(&key) {
+                Ok(Some(entry)) => entry,
+                _ => return self.fail("nested result intent missing"),
+            };
+            let current: Record = match serde_json::from_slice(&entry.value) {
+                Ok(record) => record,
+                Err(e) => return self.fail(e.to_string()),
+            };
+            if current.operation_id != completed.operation_id
+                || current.outcome.is_some()
+                || current.name != completed.name
+                || current.arguments != completed.arguments
+            {
+                return self.fail("nested result intent changed");
+            }
+            completed = current;
+            completed.outcome = Some(outcome.clone());
+            let value = match serde_json::to_vec(&completed) {
+                Ok(v) => v,
+                Err(e) => return self.fail(e.to_string()),
+            };
+            match store.commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value,
+                }],
+            ) {
+                Ok(()) => break,
+                Err(durable_store::Error::Conflict { .. }) => continue,
+                Err(e) => return self.fail(format!("nested result commit: {e}")),
+            }
         }
         if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
             let version = match store.get(&key) {
@@ -911,6 +1059,7 @@ mod tests {
             outcome: Some(Outcome::Pending {
                 reference: "opaque".into(),
             }),
+            diagnostics: Vec::new(),
             resolution: None,
         };
         store

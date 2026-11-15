@@ -177,6 +177,16 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
 }
+/// The finalized channels an opt-in after-tool hook may replace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolResult {
+    pub output: String,
+    pub is_error: bool,
+    pub details: Option<Value>,
+    pub structured_output: Option<Value>,
+    pub attachments: Vec<pi_rs_core::AttachmentRef>,
+    pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sleep {
     pub signals: Vec<String>,
@@ -265,6 +275,15 @@ pub trait Hook: Send + Sync {
         _result: &Value,
         _ctx: &Context<'_>,
     ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// Replace all result channels explicitly. Runs after the legacy text hooks.
+    async fn after_tool_result(
+        &self,
+        _call: &ToolCall,
+        _result: &ToolResult,
+        _ctx: &Context<'_>,
+    ) -> Result<Option<ToolResult>, String> {
         Ok(None)
     }
     async fn generation(
@@ -607,6 +626,50 @@ impl Resolved {
             }
         }
         (result, reports)
+    }
+    pub async fn after_tool_result(
+        &self,
+        call: &ToolCall,
+        mut result: ToolResult,
+        ctx: &Context<'_>,
+    ) -> (ToolResult, bool, Vec<Report>) {
+        let mut reports = Vec::new();
+        let mut replaced = false;
+        for extension in &self.extensions {
+            for hook in &extension.hooks {
+                match protect(async { hook.after_tool_result(call, &result, ctx).await }).await {
+                    Ok(Some(value)) => {
+                        let valid_diagnostics = value.diagnostics.len() <= 32
+                            && value.diagnostics.iter().all(|d| {
+                                d.message.len() <= 4096
+                                    && d.code.as_ref().is_none_or(|code| code.len() <= 256)
+                            });
+                        let bounded = serde_json::to_vec(&(
+                            &value.details,
+                            &value.structured_output,
+                            &value.attachments,
+                            &value.diagnostics,
+                        ))
+                        .is_ok_and(|bytes| bytes.len() <= 65_536);
+                        if valid_diagnostics && bounded {
+                            result = value;
+                            replaced = true;
+                        } else {
+                            reports.push(failure(
+                                &extension.name,
+                                "after_tool_result",
+                                "replacement metadata exceeds limits".into(),
+                            ));
+                        }
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        reports.push(failure(&extension.name, "after_tool_result", error))
+                    }
+                }
+            }
+        }
+        (result, replaced, reports)
     }
     /// Request replacements pass down the chain; the first onYield decision wins.
     /// Returned task requests are only collected, never scheduled here.

@@ -1,0 +1,472 @@
+use futures_util::{StreamExt, stream};
+use pi_rs_core::{
+    CancellationToken, Message, Model, ModelEvent, ModelRequest, ModelStream, Outcome, ToolCall,
+    ToolContext, ToolSpec,
+};
+use pi_rs_durable::{
+    extension::{Context, Extension, Hook},
+    keyed_tool::{KeyedHost, KeyedTool, KeyedToolAdapter},
+    recovery::{ReplayPolicy, UncertainPolicy},
+    runtime::{Config, DiagnosticSeverity, Harness, Options, ToolDiagnostic},
+};
+use serde_json::{Value, json};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+struct FakeModel(&'static str);
+#[async_trait::async_trait]
+impl Model for FakeModel {
+    async fn stream(&self, req: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+        let done = req
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { .. }));
+        let calls = if done {
+            vec![]
+        } else {
+            vec![ToolCall {
+                id: "call".into(),
+                name: self.0.into(),
+                arguments: "{}".into(),
+            }]
+        };
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("done".into())),
+            Ok(ModelEvent::Complete { calls, usage: None }),
+        ])
+        .boxed())
+    }
+}
+fn spec(name: &str) -> ToolSpec {
+    ToolSpec {
+        name: name.into(),
+        description: String::new(),
+        parameters: json!({"type":"object"}),
+    }
+}
+fn config() -> Config {
+    Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 64,
+    }
+}
+fn diagnostic(message: &str) -> ToolDiagnostic {
+    ToolDiagnostic {
+        severity: DiagnosticSeverity::Warn,
+        message: message.into(),
+        code: Some("checkpoint".into()),
+    }
+}
+struct Unsettled {
+    mode: u8,
+    count: Arc<AtomicUsize>,
+    cancel: CancellationToken,
+}
+#[async_trait::async_trait]
+impl KeyedTool for Unsettled {
+    fn spec(&self) -> ToolSpec {
+        spec("job")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        host.diagnostic(diagnostic("private checkpoint")).unwrap();
+        match self.mode {
+            0 => Outcome::Pending {
+                reference: "external".into(),
+            }
+            .into(),
+            1 => Outcome::Unknown("uncertain".into()).into(),
+            _ => {
+                self.cancel.cancel();
+                std::future::pending().await
+            }
+        }
+    }
+}
+struct Redact;
+#[async_trait::async_trait]
+impl Hook for Redact {
+    async fn after_tool(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        _: &Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        Ok(Some(json!("REDACTED")))
+    }
+}
+fn opts(mode: u8, count: Arc<AtomicUsize>, cancel: CancellationToken) -> Options {
+    Options {
+        model: Arc::new(FakeModel("job")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(Unsettled {
+                mode,
+                count,
+                cancel,
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 3,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn pending_unknown_and_interrupted_diagnostics_survive_reopen_and_fork() {
+    for mode in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let count = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let id;
+        {
+            let mut h =
+                Harness::open_paused(&path, opts(mode, count.clone(), cancel.clone())).unwrap();
+            id = h.create_conversation(config()).unwrap();
+            let result = h.submit_and_run(id, None, "go".into(), &cancel).await;
+            if mode == 2 {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+        }
+        let mut h = Harness::open(
+            &path,
+            opts(mode, count.clone(), CancellationToken::new()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let op = h.blocked(id).unwrap().unwrap().0;
+        assert!(h.conversation(id).unwrap().tool_results.is_empty());
+        h.reconcile(id, op, Outcome::Succeeded("confirmed".into()))
+            .unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let c = h.conversation(id).unwrap();
+        assert_eq!(c.tool_results.len(), 1);
+        assert_eq!(
+            c.tool_results[0].diagnostics[0].message,
+            "private checkpoint"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let fork = h.fork(id).unwrap();
+        assert_eq!(h.conversation(fork).unwrap().tool_results, c.tool_results);
+        let hist = h
+            .history(
+                id,
+                pi_rs_durable::observer::Cursor(0),
+                std::num::NonZeroUsize::new(1000).unwrap(),
+            )
+            .unwrap();
+        assert!(hist.records.iter().any(|event| {
+            event.value["tool_results"]
+                .to_string()
+                .contains("private checkpoint")
+        }));
+    }
+}
+#[tokio::test]
+async fn reconciled_diagnostics_are_withheld_by_legacy_redaction_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let count = Arc::new(AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, opts(0, count.clone(), cancel.clone())).unwrap();
+        h.install_extension(Extension {
+            name: "redact".into(),
+            hooks: vec![Arc::new(Redact)],
+            ..Default::default()
+        })
+        .unwrap();
+        id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["redact".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &cancel)
+            .await
+            .unwrap();
+    }
+    let mut h = Harness::open_paused(&path, opts(0, count.clone(), cancel)).unwrap();
+    h.install_extension(Extension {
+        name: "redact".into(),
+        hooks: vec![Arc::new(Redact)],
+        ..Default::default()
+    })
+    .unwrap();
+    let op = h.blocked(id).unwrap().unwrap().0;
+    h.reconcile(id, op, Outcome::Succeeded("raw".into()))
+        .unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(c.tool_results[0].redacted);
+    assert!(!format!("{:?}", c.tool_results).contains("private checkpoint"));
+    assert!(
+        !h.history(
+            id,
+            pi_rs_durable::observer::Cursor(0),
+            std::num::NonZeroUsize::new(1000).unwrap()
+        )
+        .unwrap()
+        .records
+        .iter()
+        .any(|event| event.value.to_string().contains("private checkpoint"))
+    );
+}
+
+struct Child(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl KeyedTool for Child {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        host.diagnostic(diagnostic("nested checkpoint")).unwrap();
+        Outcome::Succeeded("child result".into()).into()
+    }
+}
+struct Parent {
+    calls: Arc<AtomicUsize>,
+    cancel: CancellationToken,
+}
+#[async_trait::async_trait]
+impl KeyedTool for Parent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        let result = host
+            .call_keyed_with_diagnostics("child-key", "child", json!({}))
+            .await;
+        assert!(matches!(result.outcome,Outcome::Succeeded(ref v) if v=="child result"));
+        assert_eq!(result.diagnostics.len(), 1);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.cancel.cancel();
+            std::future::pending().await
+        } else {
+            host.diagnostic(result.diagnostics[0].clone()).unwrap();
+            Outcome::Succeeded("parent result".into()).into()
+        }
+    }
+}
+#[tokio::test]
+async fn nested_diagnostics_reattach_after_parent_interruption_without_child_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let parent = Arc::new(AtomicUsize::new(0));
+    let child = Arc::new(AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let id;
+    let options = |token: CancellationToken| Options {
+        model: Arc::new(FakeModel("parent")),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(Parent {
+                calls: parent.clone(),
+                cancel: token,
+            }))
+            .register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(Child(child.clone()))).register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    {
+        let mut h = Harness::open_paused(&path, options(cancel.clone())).unwrap();
+        id = h.create_conversation(config()).unwrap();
+        assert!(
+            h.submit_and_run(id, None, "go".into(), &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(child.load(Ordering::SeqCst), 1);
+    }
+    let mut h = Harness::open(
+        &path,
+        options(CancellationToken::new()),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(
+        c.tool_results[0].diagnostics[0].message,
+        "nested checkpoint"
+    );
+    assert_eq!(parent.load(Ordering::SeqCst), 2);
+    assert_eq!(child.load(Ordering::SeqCst), 1);
+    let fork = h.fork(id).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().tool_results, c.tool_results);
+}
+
+struct Structured(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl KeyedTool for Structured {
+    fn spec(&self) -> ToolSpec {
+        spec("job")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&pi_rs_core::ExtensionState>,
+        host: KeyedHost,
+    ) -> pi_rs_core::ToolReply {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        host.diagnostic(diagnostic("raw diagnostic secret"))
+            .unwrap();
+        Outcome::Structured {
+            data: json!({"secret":"raw structured secret"}),
+            attachments: vec![],
+        }
+        .into()
+    }
+}
+struct Rewrite {
+    cancel: Option<CancellationToken>,
+    invalid: bool,
+}
+#[async_trait::async_trait]
+impl Hook for Rewrite {
+    async fn after_tool_result(
+        &self,
+        _: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        assert_eq!(
+            result.structured_output.as_ref().unwrap()["secret"],
+            "raw structured secret"
+        );
+        let mut result = result.clone();
+        result.output = "safe output".into();
+        result.structured_output = Some(if self.invalid {
+            json!({"safe":"wrong"})
+        } else {
+            json!({"safe":7})
+        });
+        result.details = Some(json!({"redacted":true}));
+        result.diagnostics = vec![diagnostic("safe diagnostic")];
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+        Ok(Some(result))
+    }
+}
+#[tokio::test]
+async fn explicit_result_rewrite_is_validated_and_survives_hook_interruption() {
+    for invalid in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let count = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let id;
+        let options = || Options {
+            model: Arc::new(FakeModel("job")),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(Structured(count.clone())))
+                    .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 3,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        {
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            h.install_extension(Extension {
+                name: "rewrite".into(),
+                hooks: vec![Arc::new(Rewrite {
+                    cancel: Some(cancel.clone()),
+                    invalid,
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+            id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["rewrite".into()]).unwrap();
+            h.set_tool_output_schema(id,"job".into(),Some(json!({"type":"object","properties":{"safe":{"type":"integer"}},"required":["safe"]}))).unwrap();
+            assert!(
+                h.submit_and_run(id, None, "go".into(), &cancel)
+                    .await
+                    .is_err()
+            );
+        }
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_extension(Extension {
+            name: "rewrite".into(),
+            hooks: vec![Arc::new(Rewrite {
+                cancel: None,
+                invalid,
+            })],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(h.conversation(id).unwrap().tool_results.is_empty());
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        let c = h.conversation(id).unwrap();
+        let result = &c.tool_results[0];
+        if invalid {
+            assert!(result.structured_output.is_none());
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_deref() == Some("invalid_structured_output"))
+            );
+        } else {
+            assert_eq!(result.structured_output.as_ref().unwrap()["safe"], 7);
+        }
+        assert_eq!(result.details.as_ref().unwrap()["redacted"], true);
+        assert_eq!(result.diagnostics[0].message, "safe diagnostic");
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| matches!(m,Message::Tool { content,.. } if content=="safe output"))
+        );
+        assert!(
+            !h.history(
+                id,
+                pi_rs_durable::observer::Cursor(0),
+                std::num::NonZeroUsize::new(1000).unwrap()
+            )
+            .unwrap()
+            .records
+            .iter()
+            .any(|r| r.value.to_string().contains("raw structured secret")
+                || r.value.to_string().contains("raw diagnostic secret"))
+        );
+        let fork = h.fork(id).unwrap();
+        assert_eq!(h.conversation(fork).unwrap().tool_results, c.tool_results);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+}

@@ -610,10 +610,16 @@ output produces a warning. Durable keyed tools can call `KeyedHost::diagnostic`
 while executing a top-level attempt; at most 32 diagnostics of at most 4 KiB
 each are accepted. Result metadata above 64 KiB is replaced by a truncation
 diagnostic, while the tool's model output is retained and the tool is not
-re-executed. Truncated metadata cannot be schema-validated. Records have no retention policy. Diagnostics emitted before a
-pending or unknown result, nested-tool diagnostics, historical records created
-before this feature, and synthetic skips without operation identities are not
-backfilled. Reconciliation accepts the existing terminal outcome types.
+re-executed. Truncated metadata cannot be schema-validated. Keyed diagnostics
+are privately checkpointed while the attempt is active and carried through
+pending, unknown, interruption and authoritative reconciliation. A keyed parent
+can use `call_keyed_with_diagnostics` to retrieve a child's committed diagnostics
+alongside its outcome; a reattached child keeps the same diagnostics. Diagnostics
+remain private until incorporated into a finalized result, so legacy output
+redaction can withhold them. Checkpoints and result records have no retention
+policy. Older records and synthetic skips without operation identities are not
+backfilled. Diagnostics recorded by a replayed attempt can be repeated.
+Reconciliation accepts the existing terminal outcome types.
 
 `Harness::set_tool_output_schema` and `Scheduler::set_tool_output_schema` set
 an optional JSON schema for a registered tool on a settled conversation. The
@@ -624,8 +630,11 @@ unchanged. For a nested call it becomes a failed outcome. Errors need not
 include a structured value. With a schema, structured data is not placed in
 model messages; schema-less tools keep their existing core serialization.
 These are conversation-scoped name-based schemas rather than upstream
-registration metadata. Hooks can replace text but cannot independently rewrite
-structured data; any text replacement conservatively withholds metadata.
+registration metadata. Legacy after-tool text replacements conservatively
+withhold metadata. An opt-in `Hook::after_tool_result` receives all result
+channels and can explicitly replace them; its chain runs after the legacy text
+hook chain, and the replacement is bounded and schema-validated before publication.
+Nested calls do not run this hook chain.
 Earlier history already published before this feature cannot be retroactively
 redacted, and previously streamed output cannot be retracted.
 

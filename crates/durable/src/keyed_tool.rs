@@ -18,12 +18,13 @@ struct Dispatch {
     ordinary: Arc<dyn ToolHost>,
     claimed: AtomicBool,
     control: Arc<Mutex<crate::reset::ToolControl>>,
-    diagnostics: Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
+    diagnostics: Option<Arc<dyn DiagnosticSink>>,
     stream: Option<Arc<dyn StreamSink>>,
 }
 tokio::task_local! { static CURRENT_HOST: Dispatch; }
 
 /// Execute within the runtime's invocation-scoped nested host.
+#[cfg(test)]
 pub(crate) async fn scope<F: std::future::Future>(
     nested: Arc<NestedHost>,
     tool: Arc<dyn Tool>,
@@ -43,10 +44,7 @@ pub(crate) async fn scope<F: std::future::Future>(
     .await
 }
 
-type OutputChannels = (
-    Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
-    Option<Arc<dyn StreamSink>>,
-);
+type OutputChannels = (Option<Arc<dyn DiagnosticSink>>, Option<Arc<dyn StreamSink>>);
 
 pub(crate) async fn scope_with_control<F: std::future::Future>(
     nested: Arc<NestedHost>,
@@ -111,10 +109,13 @@ pub struct KeyedHost {
     ordinary: Arc<dyn ToolHost>,
     nested: Arc<NestedHost>,
     stream: Option<Arc<dyn StreamSink>>,
-    diagnostics: Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
+    diagnostics: Option<Arc<dyn DiagnosticSink>>,
+}
+pub(crate) trait DiagnosticSink: Send + Sync {
+    fn record(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String>;
 }
 impl KeyedHost {
-    /// Record a bounded diagnostic for the completed top-level tool result.
+    /// Durably record a bounded diagnostic for this attempt.
     pub fn diagnostic(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String> {
         if diagnostic.message.len() > 4096
             || diagnostic
@@ -124,23 +125,27 @@ impl KeyedHost {
         {
             return Err("tool diagnostic exceeds size limit".into());
         }
-        let mut diagnostics = self
-            .diagnostics
+        self.diagnostics
             .as_ref()
-            .ok_or("nested tool diagnostics are not supported")?
-            .lock()
-            .map_err(|_| "tool diagnostic lock poisoned")?;
-        if diagnostics.len() >= 32 {
-            return Err("too many tool diagnostics".into());
-        }
-        diagnostics.push(diagnostic);
-        Ok(())
+            .ok_or("tool diagnostic checkpoint is unavailable")?
+            .record(diagnostic)
     }
     pub fn ordinary(&self) -> &Arc<dyn ToolHost> {
         &self.ordinary
     }
     pub async fn call_keyed(&self, key: &str, name: &str, arguments: Value) -> Outcome {
         self.nested.call_keyed(key, name, arguments).await
+    }
+    /// Invoke a keyed child and read its durable diagnostics with the outcome.
+    pub async fn call_keyed_with_diagnostics(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> crate::nested::KeyedResult {
+        self.nested
+            .call_keyed_with_diagnostics(key, name, arguments)
+            .await
     }
     /// Admit distinct keyed calls in order and poll accepted jobs concurrently.
     pub async fn call_keyed_batch(&self, calls: Vec<(String, String, Value)>) -> Vec<Outcome> {

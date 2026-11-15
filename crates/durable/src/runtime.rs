@@ -753,6 +753,8 @@ pub struct ToolResultMetadata {
     pub redacted: bool,
     #[serde(default)]
     pub metadata_truncated: bool,
+    #[serde(default)]
+    pub schema_validated: bool,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -841,6 +843,7 @@ fn record_tool_result(
         is_error: matches!(outcome, Outcome::Failed(_) | Outcome::Skipped(_)),
         redacted: false,
         metadata_truncated,
+        schema_validated: false,
         details,
         structured_output,
         attachments,
@@ -866,6 +869,10 @@ pub(crate) fn local_schema_references(value: &serde_json::Value) -> bool {
 }
 
 fn validate_tool_metadata(filters: &ToolFilters, metadata: &mut ToolResultMetadata) {
+    if metadata.schema_validated {
+        return;
+    }
+    metadata.schema_validated = true;
     if metadata.redacted || metadata.metadata_truncated {
         return;
     }
@@ -889,6 +896,24 @@ fn validate_tool_metadata(filters: &ToolFilters, metadata: &mut ToolResultMetada
             code: Some("invalid_structured_output".into()),
             message: "structured output missing or does not match the configured schema".into(),
         });
+        if serde_json::to_vec(&(
+            &metadata.details,
+            &metadata.structured_output,
+            &metadata.attachments,
+            &metadata.diagnostics,
+        ))
+        .map_or(true, |bytes| bytes.len() > 65_536)
+        {
+            metadata.details = None;
+            metadata.structured_output = None;
+            metadata.attachments.clear();
+            metadata.diagnostics = vec![ToolDiagnostic {
+                severity: DiagnosticSeverity::Warn,
+                code: Some("metadata_truncated".into()),
+                message: "tool result metadata exceeded 65536 bytes".into(),
+            }];
+            metadata.metadata_truncated = true;
+        }
     }
 }
 
@@ -1392,6 +1417,116 @@ struct RuntimeToolProgress {
     conversation: Uuid,
     attempt: ToolAttempt,
     storage_failed: Arc<AtomicBool>,
+}
+
+fn diagnostic_key(conversation: Uuid, operation: Uuid) -> Vec<u8> {
+    format!("runtime/tool-diagnostics/{conversation}/{operation}").into_bytes()
+}
+fn read_tool_diagnostics(
+    owner: &OwnedStore,
+    conversation: Uuid,
+    operation: Uuid,
+) -> Result<Vec<ToolDiagnostic>, Error> {
+    owner
+        .store()
+        .get(&diagnostic_key(conversation, operation))?
+        .map(|entry| serde_json::from_slice(&entry.value).map_err(Error::from))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+struct RuntimeDiagnostic {
+    owner: Arc<OwnedStore>,
+    conversation: Uuid,
+    attempt: ToolAttempt,
+    cancel: CancellationToken,
+    storage_failed: Arc<AtomicBool>,
+    closed: std::sync::Mutex<bool>,
+}
+impl RuntimeDiagnostic {
+    fn close(&self) {
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+}
+impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
+    fn record(&self, diagnostic: ToolDiagnostic) -> Result<(), String> {
+        let closed = self
+            .closed
+            .lock()
+            .map_err(|_| "tool diagnostic lock poisoned")?;
+        if *closed {
+            return Err("tool attempt is no longer active".into());
+        }
+        let store = self.owner.store();
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err("tool attempt cancelled".into());
+            }
+            let result = (|| -> Result<bool, Error> {
+                let key = Harness::key(self.conversation);
+                let entry = store.get(&key)?.ok_or(Error::NotFound)?;
+                let state: Conversation = serde_json::from_slice(&entry.value)?;
+                if state.abort_requested
+                    || state.tool_attempt() != Some(self.attempt)
+                    || !matches!(
+                        state.phase,
+                        Phase::ToolRunning {
+                            replay_ready: false,
+                            ..
+                        }
+                    )
+                {
+                    return Err(Error::Invalid("tool attempt is no longer active".into()));
+                }
+                let diag_key = diagnostic_key(self.conversation, self.attempt.operation_id);
+                let prior = store.get(&diag_key)?;
+                let mut diagnostics: Vec<ToolDiagnostic> = prior
+                    .as_ref()
+                    .map(|e| serde_json::from_slice(&e.value))
+                    .transpose()?
+                    .unwrap_or_default();
+                if diagnostics.len() >= 32 {
+                    return Err(Error::Invalid("too many tool diagnostics".into()));
+                }
+                diagnostics.push(diagnostic.clone());
+                let value = serde_json::to_vec(&diagnostics)?;
+                if value.len() > 65_536 {
+                    return Err(Error::Invalid("tool diagnostics exceed size limit".into()));
+                }
+                match store.commit(
+                    &[
+                        Check {
+                            key,
+                            expected: Expected::Version(entry.version),
+                        },
+                        Check {
+                            key: diag_key.clone(),
+                            expected: prior
+                                .as_ref()
+                                .map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                        },
+                    ],
+                    &[Mutation::Put {
+                        key: diag_key,
+                        value,
+                    }],
+                ) {
+                    Ok(()) => Ok(true),
+                    Err(durable_store::Error::Conflict { .. }) => Ok(false),
+                    Err(error) => Err(error.into()),
+                }
+            })();
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(error) => {
+                    if matches!(error, Error::Storage(_)) {
+                        self.storage_failed.store(true, Ordering::Release);
+                    }
+                    return Err(error.to_string());
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -8067,7 +8202,8 @@ impl Harness {
                             } else {
                                 "tool interrupted and may have partially run"
                             };
-                            record_tool_result(&mut c, &calls, index, operation_id, &Outcome::Failed(reason.into()), Vec::new())?;
+                            let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
+                            record_tool_result(&mut c, &calls, index, operation_id, &Outcome::Failed(reason.into()), reported)?;
                             c.phase = Phase::ToolFinished {
                                 turns,
                                 calls,
@@ -8363,7 +8499,8 @@ impl Harness {
                         arguments: Some(arguments),
                     };
                 } else {
-                    record_tool_result(&mut c, &calls, index, operation_id, &outcome, Vec::new())?;
+                    let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
+                    record_tool_result(&mut c, &calls, index, operation_id, &outcome, reported)?;
                     let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
                     append_tool(&mut c, &calls, index, content)?;
                     for i in index + 1..calls.len() {
@@ -10326,7 +10463,16 @@ impl Harness {
                     };
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
-                    let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let diagnostics = c.tool_attempt().map(|attempt| {
+                        Arc::new(RuntimeDiagnostic {
+                            owner: self.owner.clone(),
+                            conversation: id,
+                            attempt,
+                            cancel: cancel.clone(),
+                            storage_failed: self.storage_failed.clone(),
+                            closed: std::sync::Mutex::new(false),
+                        })
+                    });
                     let mut tool_panicked = false;
                     let mut nested_resume_candidate = false;
                     let task_adapter = tools
@@ -10412,7 +10558,7 @@ impl Harness {
                                                         progress_host.clone(),
                                                         control.clone(),
                                                         (
-                                                            Some(diagnostics.clone()),
+                                                            diagnostics.as_ref().map(|sink| sink.clone() as Arc<dyn crate::keyed_tool::DiagnosticSink>),
                                                             c.tool_attempt().map(|attempt| {
                                                                 Arc::new(RuntimeStreamOutput {
                                                             owner: Arc::downgrade(&self.owner),
@@ -10453,6 +10599,9 @@ impl Harness {
                                             cancel,
                                         )
                                         .await;
+                                        if let Some(sink) = &diagnostics {
+                                            sink.close();
+                                        }
                                         drop(scope);
                                         let reply = reply.map(|result| match result {
                                             Ok(reply) => Ok(reply),
@@ -10594,10 +10743,7 @@ impl Harness {
                             }
                         }
                         other => {
-                            let reported = diagnostics
-                                .lock()
-                                .expect("tool diagnostics mutex poisoned")
-                                .clone();
+                            let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
                             record_tool_result(
                                 &mut c,
                                 &calls,
@@ -10668,8 +10814,16 @@ impl Harness {
                     }
                     self.record_extension_reports(c.id, operation_id, "after_tool", reports)?;
                     let replaced = result.as_str().is_some_and(|value| value != content);
-                    let content = result.as_str().unwrap_or(&content).to_owned();
-                    if let Some(mut metadata) = c.pending_tool_result.take() {
+                    let mut content = result.as_str().unwrap_or(&content).to_owned();
+                    let pending = c.pending_tool_result.take();
+                    let is_pending = pending.is_some();
+                    let metadata = pending.or_else(|| {
+                        c.tool_results
+                            .iter()
+                            .find(|metadata| metadata.operation_id == operation_id)
+                            .cloned()
+                    });
+                    if let Some(mut metadata) = metadata {
                         if replaced {
                             redact_tool_metadata(
                                 &mut metadata,
@@ -10677,20 +10831,52 @@ impl Harness {
                                 "tool metadata withheld after output replacement",
                             );
                         }
-                        c.tool_results.push(metadata);
-                    } else if let Some(metadata) = c
-                        .tool_results
-                        .iter_mut()
-                        .find(|metadata| metadata.operation_id == operation_id)
-                    {
-                        if replaced {
-                            redact_tool_metadata(
-                                metadata,
-                                "output_redacted",
-                                "tool metadata withheld after output replacement",
-                            );
-                        } else {
-                            validate_tool_metadata(&c.tool_filters, metadata);
+                        let value = crate::extension::ToolResult {
+                            output: content.clone(),
+                            is_error: metadata.is_error,
+                            details: metadata.details.clone(),
+                            structured_output: metadata.structured_output.clone(),
+                            attachments: metadata.attachments.clone(),
+                            diagnostics: metadata.diagnostics.clone(),
+                        };
+                        let (value, explicitly_replaced, reports) = fenced_poll(
+                            selected.after_tool_result(&hook_call, value, &context),
+                            self.execution_gate.as_ref(),
+                            cancel,
+                        )
+                        .await
+                        .ok_or(Error::Interrupted)?;
+                        self.subagent_store()?;
+                        if cancel.is_cancelled() {
+                            self.failed = true;
+                            return Err(Error::Interrupted);
+                        }
+                        self.record_extension_reports(
+                            c.id,
+                            operation_id,
+                            "after_tool_result",
+                            reports,
+                        )?;
+                        if explicitly_replaced {
+                            content = value.output;
+                            metadata.is_error = value.is_error;
+                            metadata.details = value.details;
+                            metadata.structured_output = value.structured_output;
+                            metadata.attachments = value.attachments;
+                            metadata.diagnostics = value.diagnostics;
+                            metadata.redacted = false;
+                            metadata.metadata_truncated = false;
+                            metadata.schema_validated = false;
+                        }
+                        if is_pending {
+                            c.tool_results.push(metadata);
+                        } else if let Some(existing) = c
+                            .tool_results
+                            .iter_mut()
+                            .find(|item| item.operation_id == operation_id)
+                        {
+                            validate_tool_metadata(&c.tool_filters, &mut metadata);
+                            *existing = metadata;
                         }
                     }
                     append_tool(&mut c, &calls, index, content)?;
@@ -10725,13 +10911,14 @@ impl Harness {
                             arguments: Some(arguments),
                         }
                     } else {
+                        let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
                         record_tool_result(
                             &mut c,
                             &calls,
                             index,
                             operation_id,
                             &outcome,
-                            Vec::new(),
+                            reported,
                         )?;
                         let content = model_tool_content(&c.tool_filters, &calls, index, &outcome);
                         Phase::ToolFinished {
@@ -10800,13 +10987,14 @@ impl Harness {
                             };
                         }
                         crate::poll::PollResult::Outcome(outcome) => {
+                            let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
                             record_tool_result(
                                 &mut c,
                                 &calls,
                                 index,
                                 operation_id,
                                 &outcome,
-                                Vec::new(),
+                                reported,
                             )?;
                             let content =
                                 model_tool_content(&c.tool_filters, &calls, index, &outcome);
@@ -11004,7 +11192,8 @@ impl Harness {
             }
         }
         c.nested_resume = None;
-        record_tool_result(&mut c, &calls, index, operation_id, &outcome, Vec::new())?;
+        let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
+        record_tool_result(&mut c, &calls, index, operation_id, &outcome, reported)?;
         if c.abort_requested {
             if !self.conversation_tasks(c.id)?.is_empty() {
                 return Err(Error::Invalid("owned task cleanup is still pending".into()));
