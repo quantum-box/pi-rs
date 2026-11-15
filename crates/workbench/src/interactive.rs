@@ -7687,9 +7687,10 @@ mod tests {
         let mut args = Cli::parse_from(["pi"]);
         args.session = path;
         for enabled in [true, false] {
-            let mut view = View::default();
-            view.graphics =
-                Renderer::test_with_protocol(enabled.then_some(images::Protocol::Kitty));
+            let mut view = View {
+                graphics: Renderer::test_with_protocol(enabled.then_some(images::Protocol::Kitty)),
+                ..View::default()
+            };
             view.restore(&args).unwrap();
             let entry = view.lines.iter().find(|entry| matches!(entry, Entry::Tool { name, .. } if name.contains("unattributed"))).unwrap();
             let Entry::Tool {
