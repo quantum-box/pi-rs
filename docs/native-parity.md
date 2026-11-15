@@ -393,6 +393,10 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
+RPC startup ignores ordinary positional messages, as Pi does; it accepts
+prompts through stdin. Both reject `@file` arguments in RPC mode, with
+different diagnostic wording.
+
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
 frontends. The standalone crate is compile-checked for

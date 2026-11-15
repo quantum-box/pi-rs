@@ -12,9 +12,12 @@ pub(super) fn run(
     mut args: Cli,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    if args.command.is_some() || !args.prompt.is_empty() {
+    if args.command.is_some() {
         return Err(Error::Config("RPC accepts prompts through stdin".into()));
     }
+    // Pi prepares positional messages at startup but does not submit them in
+    // RPC mode. Keep stdin exclusively for RPC commands.
+    args.prompt.clear();
     if let Some(parent) = args
         .session
         .parent()
