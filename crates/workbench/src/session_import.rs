@@ -94,6 +94,7 @@ struct Branch {
     entry_start: u64,
     context_target: Option<u64>,
     calls: BTreeMap<String, Uuid>,
+    ambiguous_calls: std::collections::BTreeSet<String>,
     model: String,
     provider: Option<String>,
     thinking: Option<String>,
@@ -737,9 +738,11 @@ fn convert(
                                     "duplicate unfinished imported tool call {id}"
                                 )));
                             }
-                            // A reused ID belongs to this assistant response. The old
-                            // operation remains recorded and requires reconciliation.
-                            branch.calls.insert(id.clone(), operation_id);
+                            // A result with a reused unfinished ID cannot be attributed
+                            // safely. Preserve both operations for reconciliation.
+                            if branch.calls.insert(id.clone(), operation_id).is_some() {
+                                branch.ambiguous_calls.insert(id.clone());
+                            }
                             invocations.push(Invocation {
                                 operation_id,
                                 call: ToolCall {
@@ -829,6 +832,12 @@ fn convert(
                 "toolResult" => {
                     append_imported_usage(&mut events, &message["usage"]);
                     let id = required(message, "toolCallId")?;
+                    if branch.ambiguous_calls.contains(id) {
+                        // The SourceEntry retains the original result, but no operation
+                        // is resolved without reliable attribution.
+                        user_content(&message["content"])?;
+                        return Ok(events);
+                    }
                     let operation_id = branch.calls.remove(id).ok_or_else(|| {
                         Error::Session(format!("imported tool result has no call {id}"))
                     })?;
@@ -1727,8 +1736,10 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 2);
         assert_ne!(starts[0], starts[1]);
-        assert!(session.records().iter().any(|r| matches!(&r.event,
+        assert!(!session.records().iter().any(|r| matches!(&r.event,
             Event::ToolFinished { operation_id, .. } if *operation_id == starts[1])));
+        assert!(session.records().iter().any(|r| matches!(&r.event,
+            Event::SourceEntry { entry, .. } if entry["id"] == "r")));
         assert!(!session.records().iter().any(|r| matches!(&r.event,
             Event::ToolFinished { operation_id, .. } if *operation_id == starts[0])));
     }
@@ -1753,6 +1764,38 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn reused_unfinished_ids_leave_all_ambiguous_results_unresolved() {
+        for second_name in ["write", "read"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+                json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":second_name,"arguments":{}}]}}),
+                json!({"type":"message","id":"r1","parentId":"b","message":{"role":"toolResult","toolCallId":"x","toolName":"write","content":[{"type":"text","text":"first"}]}}),
+                json!({"type":"message","id":"r2","parentId":"r1","message":{"role":"toolResult","toolCallId":"x","toolName":second_name,"content":[{"type":"text","text":"second"}]}}),
+            ]).unwrap();
+            assert_eq!(
+                session
+                    .records()
+                    .iter()
+                    .filter(|r| matches!(r.event, Event::ToolStarted { .. }))
+                    .count(),
+                2
+            );
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+            );
+            for id in ["r1", "r2"] {
+                assert!(session.records().iter().any(
+                    |r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == id)
+                ));
+            }
+        }
     }
 
     #[test]
