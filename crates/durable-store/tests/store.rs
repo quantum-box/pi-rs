@@ -62,6 +62,37 @@ async fn commit_subscription_starts_from_current_cross_connection_state() {
         first.commit_sequence().unwrap()
     );
 }
+
+#[tokio::test]
+async fn commit_subscription_cannot_miss_a_concurrent_local_commit() {
+    use std::time::Duration;
+    let store = Arc::new(Store::memory().unwrap());
+    for n in 0_u32..32 {
+        let boundary = Arc::new(Barrier::new(2));
+        let worker_store = store.clone();
+        let worker_boundary = boundary.clone();
+        let worker = std::thread::spawn(move || {
+            worker_boundary.wait();
+            worker_store
+                .commit(&[], &[put(b"race", &n.to_le_bytes())])
+                .unwrap();
+        });
+        boundary.wait();
+        let mut updates = store.subscribe_commits().unwrap();
+        let observed = updates.current();
+        worker.join().unwrap();
+        let committed = store.commit_sequence().unwrap();
+        if observed != committed {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), updates.changed())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                committed
+            );
+        }
+    }
+}
 fn exercise(store: &Store) {
     store
         .commit(
