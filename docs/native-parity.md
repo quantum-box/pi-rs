@@ -101,9 +101,13 @@ without `defaultProvider` are still accepted.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt and explicit-directory context resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
+
+`pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
+servers, and `--description` for either transport. HTTP headers can be combined
+with `--bearer-token-env-var` unless an Authorization header is already present.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
@@ -837,6 +841,8 @@ while scanning a single long line. Directory listing runs off the async
 runtime and checks for cancellation during enumeration and metadata reads.
 It sorts lowercased filenames with Unicode collation, using the process
 locale for language-specific ordering before applying the entry limit.
+Local and injected `ls` select the locale in Node's environment order:
+`LC_ALL`, `LC_MESSAGES`, then `LANG`, including an explicitly empty value.
 
 `read` returns bounded PNG image content for PNG, JPEG, GIF, WebP, BMP and TIFF
 inputs. It preserves alpha, avoids upscaling and reduces large images before
@@ -1066,6 +1072,9 @@ Skill and prompt-template files decode malformed UTF-8 with replacement, as Pi
 does, so an invalid byte does not hide an otherwise usable resource. The native
 64 KiB resource limit and existing resource trust rules remain in force; source
 files are not rewritten. Tests cover discovery, invocation and the size limit.
+Skill invocation uses the same replacement decoding as discovery. Skill and
+prompt frontmatter each strip one leading BOM and use ECMAScript whitespace
+when trimming a delimited body, matching Pi.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -1190,8 +1199,10 @@ waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
-running. Reducing it does not interrupt existing workers; native retains its
-1,024-worker ceiling and uses the default of two for invalid values. Waiting counts toward the script deadline,
+running. Positive integer values accept Pi's numeric forms, including whitespace,
+decimal notation and radix prefixes. Reducing the limit does not interrupt
+existing workers; native retains its 1,024-worker ceiling and uses the default
+of two for invalid or larger values. Waiting counts toward the script deadline,
 and a cancelled waiter does not release another script's worker. In the Rust
 SDK, `Codemode.timeout` remains a `Duration`;
 its default `Duration::MAX` means no deadline, while other values set a limit.
@@ -1410,6 +1421,10 @@ rejected even when a later value is valid. Native session-option conflicts and
 session ID validation remain in force, and arguments after `--` remain prompt
 text. Parser regressions cover these cases; a CLI fixture verifies that only
 the last named session is created.
+
+Repeated `--tools` and `-t` selections use the last value. Each selection is
+checked for mixed names and modifiers or wildcard modifiers, including an
+invalid selection followed by a valid one.
 
 ### Regular-mode redraw checkpoint
 
@@ -3467,6 +3482,10 @@ origin. Radius sharing refreshes expiring credentials, serializes
 concurrent refreshes and saves rotated refresh tokens. A local OAuth
 fixture exercised both login methods, a rejected callback, cancellation,
 concurrent refresh, endpoint isolation, authenticated share and logout.
+Bearer-token export checks its requested minimum validity after refresh; a
+token that falls short is persisted before the command fails, preserving any
+rotated refresh token. Ordinary model, MCP and sharing requests accept a
+successfully refreshed token without imposing that export requirement.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
@@ -4149,6 +4168,16 @@ them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
 
+### Responses cache retention checkpoint
+
+For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
+24-hour retention, or the 30-minute explicit cache option when the model
+supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
+overrides can disable long retention. Summary requests remove configured cache
+fields and, for explicit-mode models, request explicit caching with no
+breakpoints. ChatGPT plan requests omit these API-specific options. The
+Responses adapter does not yet send Pi's session-derived prompt cache key.
+
 ### Native Messages cache control checkpoint
 
 The workbench marks the system prompt, last supported conversation block,
@@ -4666,3 +4695,10 @@ allows the blocking worker to stop at the image processing cancellation checks,
 matching Pi's aborted read behavior. The restricted no-profile image path also checks cancellation after decoding,
 thumbnailing and each PNG encoding attempt. Individual image operations remain
 synchronous and are interrupted at their checkpoints.
+
+SDK hosts can load ordered context-file snapshots from explicitly granted directories.
+Each directory uses Pi’s context filename precedence; repeated selected paths are
+loaded once. Hosts choose directories and
+when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
+follow symlinks, fail atomically on errors, and use the prompt resource size limit.
+Unlike Pi, unreadable higher-priority files fail rather than falling through.
