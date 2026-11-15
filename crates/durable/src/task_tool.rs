@@ -1,5 +1,6 @@
-//! Opt-in top-level tool whose work is a conversation-owned scheduler task.
-//! Nested and unscoped invocation are rejected before task admission.
+//! Opt-in tool whose work is a scheduler task. Model-issued invocation is
+//! conversation-owned; a task handler can stage another TaskTool as its owned
+//! keyed child. Ordinary nested Tool invocation remains unsupported.
 use pi_rs_core::{Outcome, Tool, ToolContext, ToolSpec};
 use serde_json::Value;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -50,6 +51,49 @@ impl TaskTool {
             tool,
             replay: crate::recovery::ReplayPolicy::Safe,
         }
+    }
+
+    /// Stage this adapter as a keyed direct child of the running task. The
+    /// handler must return a scheduler step; child admission and that step are
+    /// committed atomically. Reusing a key requires identical input and task
+    /// definition. The child handler must be registered in the task driver.
+    /// This is a synchronous task-handler API, not a `KeyedHost` invocation.
+    pub fn stage_child(
+        &self,
+        parent: &crate::task::Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+        key: &str,
+        input: Value,
+    ) -> Result<uuid::Uuid, String> {
+        let identity = self.identity().ok_or("invalid task tool identity")?;
+        let identity = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
+        if identity.len() > 65_536
+            || self.spec.name.is_empty()
+            || serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024
+            || !jsonschema::validator_for(&self.spec.parameters)
+                .is_ok_and(|validator| validator.is_valid(&input))
+        {
+            return Err("invalid task tool identity, schema, or input".into());
+        }
+        let child = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Task(parent.id()),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: input.clone(),
+            },
+            parent.restart_limit(),
+        )
+        .and_then(|child| {
+            child.registered_versioned(
+                self.kind.clone(),
+                self.replay_safe,
+                self.definition_version,
+                input.clone(),
+            )
+        })
+        .map_err(|error| format!("task creation: {error:?}"))?;
+        documents.stage_task_tool_child(key, &identity, &input, child, self.handler.clone())
     }
 }
 tokio::task_local! { static DISPATCH: (Arc<TaskTool>, uuid::Uuid); }

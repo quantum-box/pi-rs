@@ -858,9 +858,15 @@ impl Scheduler {
             return Ok(true);
         }
         let staged = std::mem::take(&mut documents.keyed_children);
-        for (_, child, _) in &staged {
+        for (key, child, _) in &staged {
             let reg = self.registered(child)?;
-            if reg.version != child.definition_version() || reg.replay_safe != child.replay_safe() {
+            if reg.version != child.definition_version()
+                || reg.replay_safe != child.replay_safe()
+                || documents
+                    .keyed_child_handlers
+                    .get(key)
+                    .is_some_and(|expected| !Arc::ptr_eq(expected, &reg.handler))
+            {
                 return Err(Error::Registration);
             }
         }

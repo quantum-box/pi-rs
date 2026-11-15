@@ -1474,6 +1474,8 @@ pub struct TaskDocuments<'a> {
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
+    pub(crate) keyed_child_handlers:
+        HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
 }
 impl<'a> TaskDocuments<'a> {
     pub(crate) fn belongs_to(&self, store: &Store, task: &crate::task::Task) -> bool {
@@ -1491,6 +1493,7 @@ impl<'a> TaskDocuments<'a> {
             signals: StagedSignals::new(),
             child_reads: HashMap::new(),
             keyed_children: Vec::new(),
+            keyed_child_handlers: HashMap::new(),
             revision: store.document_snapshot()?,
             reads: HashMap::new(),
             writes: HashMap::new(),
@@ -1526,6 +1529,19 @@ impl<'a> TaskDocuments<'a> {
                 .map_err(|e| e.to_string())?;
         let id = prepared.child;
         self.keyed_children.push((key.into(), child, prepared));
+        Ok(id)
+    }
+
+    pub(crate) fn stage_task_tool_child(
+        &mut self,
+        key: &str,
+        tool: &str,
+        arguments: &Value,
+        child: crate::task::Task,
+        handler: std::sync::Arc<dyn crate::task_scheduler::Handler>,
+    ) -> Result<uuid::Uuid, String> {
+        let id = self.stage_keyed_child(key, tool, arguments, child)?;
+        self.keyed_child_handlers.insert(key.to_owned(), handler);
         Ok(id)
     }
 

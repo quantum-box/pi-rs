@@ -359,6 +359,13 @@ so do omitted recorded calls in a replayed scope, unlike upstream. Calls are
 serialized, bounded in depth, and cannot update extension state. A safe replay
 still requires destination-level idempotency for external effects.
 
+Within a task-backed tool handler, `TaskTool::stage_child` stages another
+registered TaskTool under a stable key. Return a task wait step to commit the
+child and checkpoint together; on wake, `ended_children` and `get_owned_child`
+expose the frozen wake IDs and checked results. The driver verifies the child
+handler, version and replay policy before admission. This handler-only API does
+not add asynchronous child dispatch to `KeyedHost`.
+
 `KeyedTool::invoke_controlled` can return termination and handoff controls with its reply.
 The runtime persists it with the outcome and ends the run without another model
 request only when every result in the nonempty tool round requests termination.
