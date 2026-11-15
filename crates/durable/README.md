@@ -1469,6 +1469,18 @@ scheduler-owned nested task settlement: it does not replay intermediate callers,
 legacy blocked records, extension-selected or stateful parent calls, or arbitrary
 interrupted nested calls without a persisted pending reference.
 
+For task-backed tools, `TaskTool::start_child` stages a keyed child and returns a
+serializable `NestedTaskCall`. The handler can checkpoint the handle and return
+`Step::Wait` with `WaitFor::TasksAny` and the handle's task ID. After a wake,
+`Task::ended_children` identifies the ended children and `NestedTaskCall::result`
+reads a fenced, direct-child snapshot: it returns `None` while unfinished and
+preserves success, failure, and cancellation separately. Admission, the parent
+checkpoint and wait commit together, so a handle cannot read an uncommitted
+staged child. Reopening requires the same task registrations. This is a
+synchronous task-handler API for `TaskTool`, not general `executeTool` support;
+its child runs the registered task handler rather than the ordinary nested tool
+hook pipeline, and starting it does not dispatch until the handler commits.
+
 `KeyedHost::call_keyed_batch` is a bounded pi-rs extension for at most eight
 distinct keyed calls. It admits calls in input order, durably records each
 accepted pending reference, and then polls those jobs concurrently. Results

@@ -524,3 +524,22 @@ instead asks the host to call `fitImages` before submit; other pi-rs input
 paths remain unchanged.
 
 **Standalone wake callback delivery:** [`wake_delivery`](../crates/durable/src/wake_delivery.rs) provides a Tokio-scheduled, coalescing callback lane for host-supplied `{ active, at }` values. It suppresses only successful equal deliveries, retries failures on a later publication or kick, and permits callback reentry and nonblocking shutdown. A callback already claimed by the delivery task may start or finish after shutdown; the supplied runtime must remain running. The primitive is also usable independently. `RuntimeOwner::subscribe_wake` now connects it to the combined snapshot and scheduler hints, as described above; it does not connect built-in timers or upstream host reports. See [delivery tests](../crates/durable/tests/wake_delivery.rs).
+
+### Task-backed nested handles (upstream 04fd0897)
+
+`TaskTool::start_child` exposes a serializable keyed handle for the existing
+task-backed child admission path. A handler can checkpoint handles, wait on
+their task IDs, inspect `ended_children`, and retrieve fenced terminal results
+after wake or reopen. The child and the parent transition commit together.
+Unlike upstream `executeTool(..., { wait: false })`, this applies only to
+registered task-backed tools, starts them at transition commit, and does not
+run the ordinary nested tool pipeline or provide an asynchronous result wait.
+It does not change normal `KeyedHost` calls or introduce independent ordinary
+tool executors.
+
+Upstream §7.3 aborts live nested calls before parent settlement and waits for
+them. The generic TaskTool scheduler currently waits for live owned children
+to end naturally on successful parent settlement; a parked child may therefore
+hold settlement indefinitely. Explicit parent abort does drain them. TaskTool
+parking occurs inside the handler and does not dispatch ordinary nested-tool
+hooks, so hook parity for independently parked ordinary tools is still absent.

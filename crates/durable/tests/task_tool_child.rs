@@ -10,7 +10,7 @@ use pi_rs_durable::{
     task::{Checkpoint, Task, TaskState, WaitFor},
     task_scheduler::{Handler, Registry, Step},
     task_store::Signal,
-    task_tool::TaskTool,
+    task_tool::{NestedTaskCall, NestedTaskResult, TaskTool},
 };
 use serde_json::json;
 use std::{
@@ -58,6 +58,7 @@ struct Parent {
     wrong_handler: Arc<TaskTool>,
     slow: Arc<TaskTool>,
     ids: Arc<Mutex<Option<(Uuid, Uuid, Uuid)>>>,
+    finish_after_first: bool,
 }
 impl Handler for Parent {
     fn run(&self, _: &Task) -> Result<Step, String> {
@@ -78,11 +79,12 @@ impl Handler for Parent {
             }
             let a = self
                 .fast
-                .stage_child(task, docs, "fast", json!({"job":"fast"}))?;
+                .start_child(task, docs, "fast", json!({"job":"fast"}))?;
+            let a_id = a.task_id();
             if self
                 .fast
                 .stage_child(task, docs, "fast", json!({"job":"fast"}))?
-                != a
+                != a_id
             {
                 return Err("staged child identity changed".into());
             }
@@ -103,14 +105,15 @@ impl Handler for Parent {
             }
             let b = self
                 .slow
-                .stage_child(task, docs, "slow", json!({"job":"slow"}))?;
-            *self.ids.lock().unwrap() = Some((task.id(), a, b));
+                .start_child(task, docs, "slow", json!({"job":"slow"}))?;
+            let b_id = b.task_id();
+            *self.ids.lock().unwrap() = Some((task.id(), a_id, b_id));
             return Ok(Step::Wait {
                 checkpoint: Checkpoint {
                     phase: "first".into(),
                     data: json!({"a":a,"b":b,"checkpoint":"retained"}),
                 },
-                condition: WaitFor::TasksAny(vec![a, b]),
+                condition: WaitFor::TasksAny(vec![a_id, b_id]),
                 children: vec![],
             });
         }
@@ -118,8 +121,12 @@ impl Handler for Parent {
         if data["checkpoint"] != "retained" {
             return Err("checkpoint changed".into());
         }
-        let a: Uuid = serde_json::from_value(data["a"].clone()).map_err(|e| e.to_string())?;
-        let b: Uuid = serde_json::from_value(data["b"].clone()).map_err(|e| e.to_string())?;
+        let a: NestedTaskCall =
+            serde_json::from_value(data["a"].clone()).map_err(|e| e.to_string())?;
+        let b: NestedTaskCall =
+            serde_json::from_value(data["b"].clone()).map_err(|e| e.to_string())?;
+        let a_id = a.task_id();
+        let b_id = b.task_id();
         if task.checkpoint().phase == "first" {
             if self
                 .altered_fast
@@ -138,31 +145,42 @@ impl Handler for Parent {
             if self
                 .fast
                 .stage_child(task, docs, "fast", json!({"job":"fast"}))?
-                != a
+                != a_id
             {
                 return Err("child identity changed".into());
             }
-            if task.ended_children() != Some(&[a][..]) {
+            if task.ended_children() != Some(&[a_id][..]) {
                 return Err("wrong first wake".into());
             }
-            if !matches!(docs.get_owned_child(a)?.state(),TaskState::Succeeded(v) if v == &json!("fast-result"))
-            {
+            if b.result(task, docs)?.is_some() {
+                return Err("unfinished child reported a result".into());
+            }
+            let foreign: NestedTaskCall = serde_json::from_value(json!({
+                "parent": Uuid::new_v4(), "task_id": a_id
+            }))
+            .map_err(|e| e.to_string())?;
+            if foreign.result(task, docs).is_ok() {
+                return Err("foreign handle accepted".into());
+            }
+            if a.result(task, docs)? != Some(NestedTaskResult::Succeeded(json!("fast-result"))) {
                 return Err("wrong fast result".into());
+            }
+            if self.finish_after_first {
+                return Ok(Step::Succeed(json!("early result")));
             }
             return Ok(Step::Wait {
                 checkpoint: Checkpoint {
                     phase: "second".into(),
                     data: data.clone(),
                 },
-                condition: WaitFor::TasksAny(vec![b]),
+                condition: WaitFor::TasksAny(vec![b_id]),
                 children: vec![],
             });
         }
-        if task.ended_children() != Some(&[b][..]) {
+        if task.ended_children() != Some(&[b_id][..]) {
             return Err("wrong second wake".into());
         }
-        if !matches!(docs.get_owned_child(b)?.state(),TaskState::Succeeded(v) if v == &json!("slow-result"))
-        {
+        if b.result(task, docs)? != Some(NestedTaskResult::Succeeded(json!("slow-result"))) {
             return Err("wrong slow result".into());
         }
         Ok(Step::Succeed(json!("both results")))
@@ -191,9 +209,16 @@ struct Fixture {
     slow: Arc<dyn Handler>,
     adapter: Arc<TaskTool>,
     ids: Arc<Mutex<Option<(Uuid, Uuid, Uuid)>>>,
+    parent_replay_safe: bool,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_parent_policy(true)
+    }
+    fn with_parent_policy(parent_replay_safe: bool) -> Self {
+        Self::with_options(parent_replay_safe, false)
+    }
+    fn with_options(parent_replay_safe: bool, finish_after_first: bool) -> Self {
         let fast: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!("fast-result"))));
         let slow: Arc<dyn Handler> = Arc::new(Slow);
         let fast_tool = Arc::new(TaskTool::new(
@@ -227,11 +252,12 @@ impl Fixture {
             wrong_handler,
             slow: slow_tool,
             ids: ids.clone(),
+            finish_after_first,
         });
         let adapter = Arc::new(TaskTool::new(
             spec("parent"),
             "parent",
-            true,
+            parent_replay_safe,
             1,
             parent.clone(),
         ));
@@ -241,6 +267,7 @@ impl Fixture {
             slow,
             adapter,
             ids,
+            parent_replay_safe,
         }
     }
     fn options(&self) -> Options {
@@ -254,7 +281,7 @@ impl Fixture {
     }
     fn registry(&self) -> Registry {
         let mut r = Registry::default();
-        assert!(r.register_shared("parent", true, self.parent.clone()));
+        assert!(r.register_shared("parent", self.parent_replay_safe, self.parent.clone()));
         assert!(r.register_shared("fast", true, self.fast.clone()));
         assert!(r.register_shared("slow", true, self.slow.clone()));
         assert!(r.set_abort("parent", |_: &Task| Ok(Step::Succeed(json!(null)))));
@@ -431,12 +458,76 @@ async fn abort_drains_parked_task_tool_child_after_reopen() {
 }
 
 #[tokio::test]
+async fn settling_parent_waits_for_remaining_child_before_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = Fixture::with_options(false, true);
+    let mut scheduler = Scheduler::open(dir.path().join("db"), f.options()).unwrap();
+    let driver = scheduler.start_tasks(f.registry()).unwrap();
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "work".into()).unwrap();
+    until(|| {
+        f.ids
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(parent, _, slow)| {
+                driver
+                    .get(*parent)
+                    .unwrap()
+                    .is_some_and(|t| matches!(t.state(), TaskState::Completing(_)))
+                    && driver
+                        .get(*slow)
+                        .unwrap()
+                        .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
+            })
+    })
+    .await;
+    let (parent, _, slow) = f.ids.lock().unwrap().unwrap();
+    driver
+        .signal(&Signal::new(
+            Uuid::new_v4(),
+            slow,
+            "release".into(),
+            json!(null),
+        ))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        driver.get(parent).unwrap().unwrap().state(),
+        TaskState::Succeeded(_)
+    ));
+    assert!(matches!(
+        driver.get(slow).unwrap().unwrap().state(),
+        TaskState::Succeeded(_)
+    ));
+    assert!(
+        scheduler
+            .conversation(conversation)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "early result"))
+    );
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn task_tool_child_kill_worker() {
     let Some(root) = std::env::var_os("PI_TASK_TOOL_CHILD_KILL") else {
         return;
     };
     let root = std::path::PathBuf::from(root);
-    let f = Fixture::new();
+    let f = Fixture::with_parent_policy(false);
     let mut scheduler = Scheduler::open(root.join("db"), f.options()).unwrap();
     let driver = scheduler.start_tasks(f.registry()).unwrap();
     let conversation = scheduler
@@ -500,7 +591,7 @@ async fn killed_task_tool_parent_reopens_its_keyed_children_and_wakes() {
     let parent = ids.next().unwrap();
     let fast = ids.next().unwrap();
     let slow = ids.next().unwrap();
-    let f = Fixture::new();
+    let f = Fixture::with_parent_policy(false);
     let mut scheduler = Scheduler::open(root.join("db"), f.options()).unwrap();
     let driver = scheduler.start_tasks(f.registry()).unwrap();
     assert_eq!(

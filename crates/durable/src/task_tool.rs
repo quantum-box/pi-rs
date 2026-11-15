@@ -14,6 +14,50 @@ pub struct TaskTool {
     definition_version: u32,
     handler: Arc<dyn crate::task_scheduler::Handler>,
 }
+/// Handle for a keyed task-backed nested tool. It can be stored in a checkpoint
+/// and resolved after a child wake. The child is admitted only when the parent
+/// handler's transition commits successfully.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NestedTaskCall {
+    parent: uuid::Uuid,
+    task_id: uuid::Uuid,
+}
+
+/// The durable terminal state of a task-backed nested tool.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NestedTaskResult {
+    Succeeded(Value),
+    Failed(String),
+    Cancelled,
+}
+
+impl NestedTaskCall {
+    pub fn task_id(&self) -> uuid::Uuid {
+        self.task_id
+    }
+
+    /// Read the child in this invocation's snapshot. `None` means it has not
+    /// settled; a staged child cannot be read until its admission commits.
+    /// The read fences the parent transition against concurrent child changes.
+    pub fn result(
+        &self,
+        parent: &crate::task::Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+    ) -> Result<Option<NestedTaskResult>, String> {
+        if self.parent != parent.id() {
+            return Err("nested task handle belongs to a different parent".into());
+        }
+        let child = documents.get_owned_child(self.task_id)?;
+        use crate::task::TaskState;
+        Ok(match child.state() {
+            TaskState::Succeeded(value) => Some(NestedTaskResult::Succeeded(value.clone())),
+            TaskState::Failed(error) => Some(NestedTaskResult::Failed(error.clone())),
+            TaskState::Cancelled => Some(NestedTaskResult::Cancelled),
+            _ => None,
+        })
+    }
+}
+
 impl TaskTool {
     /// `definition_version` must be nonzero and must change whenever the
     /// handler's behavior or interpretation of its checkpoint changes. Register
@@ -51,6 +95,22 @@ impl TaskTool {
             tool,
             replay: crate::recovery::ReplayPolicy::Safe,
         }
+    }
+
+    /// Start or find a keyed nested task-backed tool and return its durable
+    /// handle. Return a `Step::Wait` naming the handle's task ID to release
+    /// the parent and receive `Task::ended_children()` on wake.
+    pub fn start_child(
+        &self,
+        parent: &crate::task::Task,
+        documents: &mut crate::document::TaskDocuments<'_>,
+        key: &str,
+        input: Value,
+    ) -> Result<NestedTaskCall, String> {
+        Ok(NestedTaskCall {
+            parent: parent.id(),
+            task_id: self.stage_child(parent, documents, key, input)?,
+        })
     }
 
     /// Stage this adapter as a keyed direct child of the running task. The
