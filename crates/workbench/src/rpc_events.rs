@@ -710,8 +710,10 @@ mod streaming_tool_tests {
                 "Model request cancelled",
             ),
         ] {
-            let mut stream = Stream::default();
-            stream.assistant = json!({"role":"assistant","content":[]});
+            let mut stream = Stream {
+                assistant: json!({"role":"assistant","content":[]}),
+                ..Stream::default()
+            };
             let mut events = Vec::new();
             stream.begin_turn(&mut events);
             stream.record(
