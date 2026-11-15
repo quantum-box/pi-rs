@@ -21,7 +21,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Signal(#[from] crate::task_store::Error),
-    #[error("self-delivery cannot be staged")]
+    /// Retained for compatibility with older signal composition errors.
+    #[error("signal composition is unsupported")]
     SignalComposition,
     #[error("invalid or unsupported document operations or stale base")]
     InvalidOperations,
@@ -993,11 +994,14 @@ pub struct Transaction {
     written: HashSet<Vec<u8>>,
 }
 
-// Independently prepared task observations can race. Compose their fences
-// before appending batches so disagreement becomes a normal commit conflict.
+// Independently prepared task and signal-revision observations can race.
+// Compose their fences before appending batches so disagreement becomes a
+// normal commit conflict.
 pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut OwnedBatch) {
     for other in &mut graph.checks {
-        if !other.key.starts_with(crate::task_store::PREFIX) {
+        if !other.key.starts_with(crate::task_store::PREFIX)
+            && !other.key.starts_with(b"durable/signal-revision/")
+        {
             continue;
         }
         if let Some(check) = documents.checks.iter_mut().find(|c| c.key == other.key) {
@@ -1345,7 +1349,7 @@ impl<'a> TaskDocuments<'a> {
     /// duplicate key validates the new payload and returns duplicate without
     /// staging another receipt; an invalid value may be retried. Repeated
     /// closed or missing outcomes retain their original fenced observation.
-    /// Self-delivery remains unsupported.
+    /// Self-delivery commits with the handler's task transition.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1358,9 +1362,6 @@ impl<'a> TaskDocuments<'a> {
             return Err(Error::ReadAfterWrite);
         }
         let identity = (task_id, token.name().to_owned(), key.to_owned());
-        if task_id == self.task.id() {
-            return Err(Error::SignalComposition);
-        }
         if let Some(previous) = self.signal_keys.get(&identity).copied() {
             match previous {
                 StagedSignalStatus::NotFound => {

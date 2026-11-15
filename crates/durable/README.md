@@ -466,7 +466,8 @@ Current limits and differences from upstream Pi Durable:
   to an expired key returns closed. `deliver_signal` uses wall time; deterministic
   hosts should use `deliver_signal_at` with the same clock as scheduler ticks.
 - Opt-in task handlers using `TaskDocuments::signal_at` can stage multiple distinct typed
-  signals to different existing or missing tasks, including distinct keys on one task before document/entry writes.
+  signals to existing or missing tasks, including the running task and distinct
+  keys on one task, before document/entry writes.
   Its status is provisional: the target task version and signal revision are
   checked with the handler's checkpoint and documents, and a conflict rolls
   back all of them. Replay-safe handlers are retried; other handlers require
@@ -478,10 +479,12 @@ Current limits and differences from upstream Pi Durable:
   value and returns duplicate without changing the staged receipt. An invalid
   value may be retried. Repeated missing or closed targets retain their fenced
   outcome; for an expired key, each new value is validated before closed is
-  returned. Self-delivery is excluded (upstream
-  permits it), and signal checks cannot overlap another batch
-  participant's checked keys (for example an entry's task ancestor or a newly
-  created child). It is not a general host transaction or upstream `tx.signal`.
+  returned. A self-delivery commits atomically with the handler's transition and
+  can satisfy a typed wait returned by that same invocation, including after
+  reopen. A committed value takes precedence when the wait is polled after its
+  deadline. Abort or failure discards uncommitted effects. Signal checks can
+  still conflict with other batch participants' checked keys (for example a
+  newly created child). It is not a general host transaction or upstream `tx.signal`.
   A running task driver continues scheduling after a successful step; external
   effects inside handlers remain the caller's idempotency responsibility.
   The older `send_signal` retains receipt idempotency semantics and reports
