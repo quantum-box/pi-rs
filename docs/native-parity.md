@@ -2847,9 +2847,11 @@ lookaround support. Invalid expressions produce no matches. Remaining JavaScript
 regular-expression edge compatibility has not been declared complete. In
 patterns without bracket expressions that the linear regex engine accepts,
 `\d`, `\D`, `\w`, `\W`, `\b`, and `\B` use JavaScript's ASCII classes
-and word boundaries. Patterns requiring lookaround or backreferences retain
-the existing bounded engine and Unicode class behavior; bracket expressions
-and other Unicode case folding differences remain open.
+and word boundaries. Patterns without brackets or word boundaries that require
+lookaround or backreferences use ASCII digit and word shorthand classes in the
+bounded engine. Advanced patterns with word boundaries retain the engine's
+previous Unicode classes and boundaries; bracket expressions and other Unicode
+case folding differences remain open.
 
 Name and working-directory fields support Pi's fuzzy alignment and letter/digit
 swap. Message text and IDs use literal matching. Relevance sorting uses the same
