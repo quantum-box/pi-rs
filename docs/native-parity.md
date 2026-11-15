@@ -4144,6 +4144,16 @@ them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
 
+### Responses cache retention checkpoint
+
+For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
+24-hour retention, or the 30-minute explicit cache option when the model
+supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
+overrides can disable long retention. Summary requests remove configured cache
+fields and, for explicit-mode models, request explicit caching with no
+breakpoints. ChatGPT plan requests omit these API-specific options. The
+Responses adapter does not yet send Pi's session-derived prompt cache key.
+
 ### Native Messages cache control checkpoint
 
 The workbench marks the system prompt, last supported conversation block,
