@@ -694,40 +694,39 @@ pub(crate) fn project_nonvision_request(
             pi_rs_core::Message::Tool { content, .. } => {
                 // Legacy tools can embed images in data.content, which core adapters extract.
                 // Replace only images core would otherwise extract; keep the JSON envelope.
-                if let Ok(mut value) = serde_json::from_str::<Value>(content) {
-                    if let Some(items) = value
+                if let Ok(mut value) = serde_json::from_str::<Value>(content)
+                    && let Some(items) = value
                         .get_mut("data")
                         .and_then(|v| v.get_mut("content"))
                         .and_then(Value::as_array_mut)
-                    {
-                        let mut previous = false;
-                        let mut changed = false;
-                        let mut out = Vec::with_capacity(items.len());
-                        for block in std::mem::take(items) {
-                            let extracted = block["type"] == "image"
-                                && block["data"]
-                                    .as_str()
-                                    .is_some_and(|s| s.len() <= 8 * 1024 * 1024)
-                                && matches!(
-                                    block["mimeType"].as_str(),
-                                    Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
-                                );
-                            if extracted {
-                                changed = true;
-                                if !previous {
-                                    out.push(json!({"type":"text", "text": TOOL_IMAGE_OMITTED}));
-                                }
-                                previous = true;
-                            } else {
-                                previous =
-                                    block["type"] == "text" && block["text"] == TOOL_IMAGE_OMITTED;
-                                out.push(block);
+                {
+                    let mut previous = false;
+                    let mut changed = false;
+                    let mut out = Vec::with_capacity(items.len());
+                    for block in std::mem::take(items) {
+                        let extracted = block["type"] == "image"
+                            && block["data"]
+                                .as_str()
+                                .is_some_and(|s| s.len() <= 8 * 1024 * 1024)
+                            && matches!(
+                                block["mimeType"].as_str(),
+                                Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+                            );
+                        if extracted {
+                            changed = true;
+                            if !previous {
+                                out.push(json!({"type":"text", "text": TOOL_IMAGE_OMITTED}));
                             }
+                            previous = true;
+                        } else {
+                            previous =
+                                block["type"] == "text" && block["text"] == TOOL_IMAGE_OMITTED;
+                            out.push(block);
                         }
-                        *items = out;
-                        if changed {
-                            *content = value.to_string();
-                        }
+                    }
+                    *items = out;
+                    if changed {
+                        *content = value.to_string();
                     }
                 }
             }
