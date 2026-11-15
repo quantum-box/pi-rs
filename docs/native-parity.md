@@ -3797,6 +3797,14 @@ uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
 APIs do not have a session owner; hosts that need message delivery use their
 session-owned counterparts.
+Discovery callbacks invoked through `Registry::discover_resources_in_session`
+can also use `ToolHost::append_entry` to persist branch-local custom entries.
+Both in-process and executable extensions receive this capability. The callback
+is acknowledged after the entry is committed; the entry does not enter model
+context. Other callbacks do not yet support this API.
+Discovery callbacks do not yet have a branch-entry read API for restoring
+previously stored custom data. An executable request already dispatched when
+its callback ends can still commit; queued requests are rejected after closure.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message
