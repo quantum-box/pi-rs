@@ -16,7 +16,7 @@ use winapi::um::{
 use super::windows_keys::{
     MouseButtonsPressed, handle_key_event, handle_mouse_event, handle_surrogate,
 };
-use super::{InputEvent, decoder::Decoder, escape_delay};
+use super::{InputEvent, decoder::Decoder};
 
 pub struct Reader {
     console: Console,
@@ -52,10 +52,10 @@ impl Reader {
                 return Ok(Some(event));
             }
             let mut remaining = timeout.saturating_sub(started.elapsed());
-            if self.decoder.waits_for_escape_timeout()
-                && let Some(started) = self.decoder.escape_started
+            if let (Some(started), Some(delay)) =
+                (self.decoder.escape_started, self.decoder.escape_timeout())
             {
-                remaining = remaining.min(escape_delay().saturating_sub(started.elapsed()));
+                remaining = remaining.min(delay.saturating_sub(started.elapsed()));
             }
             if wait_for_console(remaining)? {
                 self.read_record()?;

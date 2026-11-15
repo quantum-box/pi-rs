@@ -2339,8 +2339,8 @@ Workspace tests and all-target Clippy passed on Rust 1.89.
 Recognized OSC 10/11 color replies and OSC 4 replies with a complete palette
 header remain buffered across input timeouts, matching Pi's slow-terminal
 behavior. BEL or ST terminates the response; CAN, SUB or a new escape sequence
-abandons an incomplete response. Ambiguous Alt+] prefixes still time out as
-keyboard input. For bounded memory, pi-rs discards an OSC color payload over
+abandons an incomplete response. Ambiguous Alt+] prefixes recover as keyboard
+input after 50 ms without a new fragment, matching Pi's sequence timeout. For bounded memory, pi-rs discards an OSC color payload over
 256 bytes until its terminator or cancellation, an intentional native limit.
 An unterminated recognized reply can absorb ordinary text until it ends or is
 cancelled; timeout alone cannot distinguish a delayed reply from that text.

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{InputEvent, escape_delay, parse::parse_event};
 
@@ -183,14 +183,16 @@ impl Decoder {
     }
 
     pub(super) fn flush_escape(&mut self) {
-        // A recognized terminal response remains buffered until it ends,
-        // even over a slow connection. Its body must not become keystrokes.
-        if color_reply_header_complete(&self.buffer) || self.discarding_osc {
+        self.flush_escape_at(Instant::now());
+    }
+
+    fn flush_escape_at(&mut self, now: Instant) {
+        let Some(delay) = self.escape_timeout() else {
             return;
-        }
+        };
         if self
             .escape_started
-            .is_none_or(|start| start.elapsed() < escape_delay())
+            .is_none_or(|start| now.saturating_duration_since(start) < delay)
         {
             return;
         }
@@ -216,9 +218,15 @@ impl Decoder {
             self.push(&remaining);
         }
     }
-    pub(super) fn waits_for_escape_timeout(&self) -> bool {
-        self.buffer == b"\x1b"
-            || (self.buffer.starts_with(b"\x1b]") && !color_reply_header_complete(&self.buffer))
+    pub(super) fn escape_timeout(&self) -> Option<Duration> {
+        if self.buffer == b"\x1b" {
+            Some(escape_delay())
+        } else if self.buffer.starts_with(b"\x1b]") && !color_reply_header_complete(&self.buffer) {
+            // Pi waits 50ms for an ambiguous multi-byte reply header.
+            Some(Duration::from_millis(50))
+        } else {
+            None
+        }
     }
 
     pub(super) fn next(&mut self) -> Option<InputEvent> {
@@ -453,7 +461,7 @@ mod tests {
             matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('x'))
         );
         decoder.push(b"\x1b]");
-        decoder.escape_started = Some(Instant::now() - escape_delay());
+        decoder.escape_started = Some(Instant::now() - Duration::from_millis(50));
         decoder.flush_escape();
         assert!(
             matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT)
@@ -539,10 +547,31 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_palette_header_waits_fifty_milliseconds() {
+        let mut decoder = Decoder::default();
+        decoder.push(b"\x1b]4;1");
+        assert_eq!(decoder.escape_timeout(), Some(Duration::from_millis(50)));
+        let started = Instant::now();
+        decoder.escape_started = Some(started);
+        decoder.flush_escape_at(started + Duration::from_millis(30));
+        assert!(decoder.next().is_none());
+        decoder.push(b";rgb:ffff/0000/8080\x07");
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalPalette {
+                index: 1,
+                red: 255,
+                green: 0,
+                blue: 128
+            })
+        );
+    }
+
+    #[test]
     fn incomplete_palette_header_recovers_alt_input() {
         let mut decoder = Decoder::default();
         decoder.push(b"\x1b]4;12");
-        decoder.escape_started = Some(Instant::now() - escape_delay());
+        decoder.escape_started = Some(Instant::now() - Duration::from_millis(50));
         decoder.flush_escape();
         assert!(
             matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT)
@@ -721,11 +750,11 @@ mod tests {
     fn recognized_header_does_not_schedule_an_escape_timeout() {
         let mut decoder = Decoder::default();
         decoder.push(b"\x1b]4;12");
-        assert!(decoder.waits_for_escape_timeout());
+        assert!(decoder.escape_timeout().is_some());
         decoder.push(b";rgb:");
-        assert!(!decoder.waits_for_escape_timeout());
+        assert!(decoder.escape_timeout().is_none());
         decoder.push(b"\x1b");
-        assert!(!decoder.waits_for_escape_timeout());
+        assert!(decoder.escape_timeout().is_none());
         decoder.push(b"\\");
         assert_eq!(
             decoder.next(),
