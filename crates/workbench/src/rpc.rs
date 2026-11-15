@@ -678,7 +678,7 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
         image.validate()?;
     }
     let message = request["message"].as_str().unwrap_or_default();
-    if message.trim().is_empty() && images.is_empty() {
+    if request["message"].as_str().is_none() && images.is_empty() {
         return Err(Error::Config("message or images are required".into()));
     }
     let queue_kind = match name {

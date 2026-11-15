@@ -1732,6 +1732,257 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[cfg(unix)]
 #[test]
+fn rpc_input_hooks_receive_empty_and_whitespace_messages() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(Option<std::process::Child>);
+    impl std::ops::Deref for KillOnDrop {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl std::ops::DerefMut for KillOnDrop {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.0.as_mut().unwrap()
+        }
+    }
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("empty-input.py");
+    std::fs::write(
+        &extension,
+        r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'empty-input', 'dependencies':[], 'commands':[], 'tools':[], 'input_hook':True}
+elif request['type'] == 'input':
+    event = request['event']
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'input-events.jsonl'), 'a') as log:
+        log.write(json.dumps(event) + '\n')
+    if event['text'] in ('', ' '):
+        result = {'action':'handled'}
+    elif event['text'] in ('\t', '\n'):
+        result = {'action':'transform', 'text':'same input'}
+    else:
+        result = {'action':'continue'}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server_stop = StopOnDrop(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let (endpoint, server) = model_fixture_with_gate_timeout(
+        None,
+        "stop",
+        None,
+        Some(gate),
+        Duration::from_secs(150),
+        Some(server_stop.0.clone()),
+    );
+    let mut release = ReleaseOnDrop(Some(release));
+    let mut child = KillOnDrop(Some(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for request in [
+        json!({"type":"prompt","id":"missing"}),
+        json!({"type":"prompt","id":"null","message":null}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let response = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(response["id"], request["id"]);
+        assert_eq!(response["success"], false, "{response}");
+    }
+    for (id, text, disposition) in [
+        ("empty", "", Some("handled")),
+        ("space", " ", Some("handled")),
+        ("tab", "\t", Some("started")),
+        ("newline", "\n", Some("started")),
+        ("unhandled", "  ", None),
+    ] {
+        writeln!(input, "{}", json!({"type":"prompt","id":id,"message":text})).unwrap();
+        input.flush().unwrap();
+        let mut response = None;
+        let mut ended = None;
+        let mut observed = Vec::new();
+        let mut streaming_handled = 0;
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == id {
+                response = Some(event.clone());
+                if id == "tab" {
+                    for (command, request_id, behavior) in [
+                        ("steer", "stream-steer", None),
+                        ("follow_up", "stream-follow", None),
+                        ("prompt", "stream-prompt-steer", Some("steer")),
+                        ("prompt", "stream-prompt-follow", Some("followUp")),
+                    ] {
+                        let mut request = json!({"type":command,"id":request_id,"message":""});
+                        if let Some(behavior) = behavior {
+                            request["streamingBehavior"] = json!(behavior);
+                        }
+                        writeln!(input, "{request}").unwrap();
+                    }
+                    input.flush().unwrap();
+                }
+            }
+            if event["type"] == "response"
+                && event["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("stream-"))
+            {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                streaming_handled += 1;
+                if streaming_handled == 4 {
+                    release.0.take().unwrap().send(()).unwrap();
+                }
+            }
+            if event["type"] == "agent_end" {
+                ended = Some(event.clone());
+            }
+            observed.push(event.clone());
+            if event["type"] == "agent_settled" {
+                break;
+            }
+        }
+        let response = response.expect("prompt response");
+        if id == "tab" {
+            assert_eq!(streaming_handled, 4);
+        }
+        if let Some(disposition) = disposition {
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["data"]["disposition"], disposition, "{response}");
+            if disposition == "started" {
+                let ended = ended.expect("agent_end for transformed input");
+                assert_eq!(ended["success"], true, "{ended}; events: {observed:?}");
+            }
+        } else {
+            assert_eq!(response["success"], false, "{response}");
+        }
+    }
+    for command in ["steer", "follow_up"] {
+        writeln!(
+            input,
+            "{}",
+            json!({"type":command,"id":command,"message":""})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC queued input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == command {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "RPC did not exit after shutdown");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = child.0.take().unwrap().wait_with_output().unwrap();
+    reader.join().unwrap();
+    server.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let events: Vec<Value> = std::fs::read_to_string(root.path().join("input-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["", " ", "\t", "", "", "", "", "\n", "  ", "", ""]
+    );
+    assert!(events.iter().all(|event| event["source"] == "rpc"));
+}
+
+#[cfg(unix)]
+#[test]
 fn extension_command_can_trigger_model_in_print_and_json_modes() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -4659,7 +4910,25 @@ fn model_fixture_with_gate(
     effort: Option<&'static str>,
     finish: &'static str,
     expected_token: Option<&'static str>,
+    release_first: Option<std::sync::mpsc::Receiver<()>>,
+) -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_gate_timeout(
+        effort,
+        finish,
+        expected_token,
+        release_first,
+        Duration::from_secs(15),
+        None,
+    )
+}
+
+fn model_fixture_with_gate_timeout(
+    effort: Option<&'static str>,
+    finish: &'static str,
+    expected_token: Option<&'static str>,
     mut release_first: Option<std::sync::mpsc::Receiver<()>>,
+    gate_timeout: Duration,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
@@ -4671,6 +4940,12 @@ fn model_fixture_with_gate(
         let mut completed = 0;
         let deadline = Instant::now() + Duration::from_secs(180);
         while completed < 2 {
+            if stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return;
+            }
             let (mut socket, _) = match server.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4739,7 +5014,7 @@ fn model_fixture_with_gate(
             ).replace("\"finish_reason\":\"stop\"", &format!("\"finish_reason\":\"{finish}\""));
             if let Some(release) = release_first.take() {
                 release
-                    .recv_timeout(Duration::from_secs(15))
+                    .recv_timeout(gate_timeout)
                     .expect("release first response");
             }
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
