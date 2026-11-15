@@ -119,6 +119,15 @@ pub fn resolve(
                 continue;
             }
         }
+        if kind == Kind::Prompt && !path.exists() {
+            let pattern_path = path.strip_prefix(&workspace).unwrap_or(&path);
+            let patterned = pattern_path.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+            });
+            if !patterned {
+                continue;
+            }
+        }
         if !skill_file_is_markdown(kind, &path, warnings) {
             continue;
         }
