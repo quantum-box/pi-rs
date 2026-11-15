@@ -231,14 +231,22 @@ pub(crate) fn resolved_for_replay(
 }
 
 // A committed pre-dispatch gate proves that child invocation has not started.
-// Any other unresolved child is an independent uncertainty and blocks replay.
+// Accepted pending references and staged known results are safe to reattach;
+// records without a known outcome or durable gate remain reconciliation barriers.
 pub(crate) fn recoverable_gate_intent(
     store: &durable_store::Store,
     root: Uuid,
 ) -> Result<bool, crate::runtime::Error> {
     let mut gates = 0;
+    let mut pending = 0;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
+        if matches!(
+            &record.staged_outcome,
+            Some(Outcome::Pending { .. } | Outcome::Unknown(_))
+        ) {
+            return Ok(false);
+        }
         if record.before_pending
             && record
                 .before_gate
@@ -248,16 +256,22 @@ pub(crate) fn recoverable_gate_intent(
             && record.staged_outcome.is_none()
         {
             gates += 1;
-        } else if record.staged_outcome.is_some()
-            || matches!(
-                record.outcome,
-                None | Some(Outcome::Pending { .. }) | Some(Outcome::Unknown(_))
-            )
+            pending += 1;
+        } else if record.before_pending || record.before_gate.is_some() {
+            return Ok(false);
+        } else if matches!(record.outcome, Some(Outcome::Pending { .. }))
+            && record.staged_outcome.is_none()
+        {
+            pending += 1;
+        } else if matches!(
+            record.outcome,
+            Some(Outcome::Unknown(_) | Outcome::Pending { .. })
+        ) || (record.outcome.is_none() == record.staged_outcome.is_none())
         {
             return Ok(false);
         }
     }
-    Ok((1..=8).contains(&gates))
+    Ok(gates > 0 && pending <= 8)
 }
 
 pub(crate) fn has_staged_results(
@@ -2006,7 +2020,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
-    fn gate_recovery_rejects_other_unresolved_children() {
+    fn gate_recovery_accepts_pending_and_rejects_uncertain_children() {
         let store = durable_store::Store::memory().unwrap();
         let root = Uuid::new_v4();
         let key = format!("nested/{root}/{root}/gate").into_bytes();
@@ -2056,7 +2070,31 @@ mod tests {
                 }],
             )
             .unwrap();
+        assert!(recoverable_gate_intent(&store, root).unwrap());
+        record.outcome = Some(Outcome::Unknown("uncertain".into()));
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: other.clone(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
         assert!(!recoverable_gate_intent(&store, root).unwrap());
+        record.outcome = None;
+        record.staged_outcome = Some(Outcome::Succeeded("staged".into()));
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: other.clone(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(recoverable_gate_intent(&store, root).unwrap());
+        record.staged_outcome = None;
         record.outcome = Some(Outcome::Succeeded("done".into()));
         store
             .commit(
@@ -2068,6 +2106,8 @@ mod tests {
             )
             .unwrap();
         assert!(recoverable_gate_intent(&store, root).unwrap());
+        store.commit(&[], &[Mutation::Delete { key }]).unwrap();
+        assert!(!recoverable_gate_intent(&store, root).unwrap());
     }
 
     #[test]

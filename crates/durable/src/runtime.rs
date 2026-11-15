@@ -14455,58 +14455,57 @@ async fn poll_suspended_nested(
         Some(Err(error)) => return Err(error),
         None => return Ok(false),
     }
+    if crate::nested::has_staged_results(worker.owner.store(), *operation_id)? {
+        if state.extensions.is_empty() {
+            return Ok(false);
+        }
+        let host = crate::nested::NestedHost::new_with_schemas(
+            worker.owner.clone(),
+            *operation_id,
+            worker
+                .resolved_tools(&state)?
+                .into_iter()
+                .filter(|(name, reg)| {
+                    caller_allowed(&state, name, false) && !crate::tool_search::is_search(&reg.tool)
+                })
+                .map(|(_, reg)| reg)
+                .collect(),
+            cancel.child_token(),
+            Duration::from_secs(120),
+            8,
+            (
+                state.tool_filters.output_schemas.clone(),
+                Some(crate::nested::NestedHooks {
+                    selected: worker.selected_extensions(&state)?,
+                    snapshot: serde_json::to_value(&state)?,
+                    conversation: id,
+                    storage_failed: worker.storage_failed.clone(),
+                    conversation_fence: Some((Harness::key(id), version)),
+                }),
+            ),
+        )
+        .map_err(|error| Error::Invalid(format!("nested hook host: {error}")))?;
+        return match fenced_poll(
+            host.finish_staged_results(),
+            worker.execution_gate.as_ref(),
+            cancel,
+        )
+        .await
+        {
+            Some(Ok(())) => Ok(true),
+            None => Ok(false),
+            Some(Err(error)) => {
+                let (_, current) = worker.load(id)?;
+                if current != version {
+                    Ok(true)
+                } else {
+                    Err(Error::Invalid(error))
+                }
+            }
+        };
+    }
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
-        if crate::nested::has_staged_results(worker.owner.store(), *operation_id)? {
-            if state.extensions.is_empty() {
-                return Ok(false);
-            }
-            let host = crate::nested::NestedHost::new_with_schemas(
-                worker.owner.clone(),
-                *operation_id,
-                worker
-                    .resolved_tools(&state)?
-                    .into_iter()
-                    .filter(|(name, reg)| {
-                        caller_allowed(&state, name, false)
-                            && !crate::tool_search::is_search(&reg.tool)
-                    })
-                    .map(|(_, reg)| reg)
-                    .collect(),
-                cancel.child_token(),
-                Duration::from_secs(120),
-                8,
-                (
-                    state.tool_filters.output_schemas.clone(),
-                    Some(crate::nested::NestedHooks {
-                        selected: worker.selected_extensions(&state)?,
-                        snapshot: serde_json::to_value(&state)?,
-                        conversation: id,
-                        storage_failed: worker.storage_failed.clone(),
-                        conversation_fence: Some((Harness::key(id), version)),
-                    }),
-                ),
-            )
-            .map_err(|error| Error::Invalid(format!("nested hook host: {error}")))?;
-            return match fenced_poll(
-                host.finish_staged_results(),
-                worker.execution_gate.as_ref(),
-                cancel,
-            )
-            .await
-            {
-                Some(Ok(())) => Ok(true),
-                None => Ok(false),
-                Some(Err(error)) => {
-                    let (_, current) = worker.load(id)?;
-                    if current != version {
-                        Ok(true)
-                    } else {
-                        Err(Error::Invalid(error))
-                    }
-                }
-            };
-        }
         return worker.prepare_nested_resume(&mut state.clone());
     }
     let tools = worker.resolved_tools(&state)?;
@@ -14548,11 +14547,33 @@ async fn poll_suspended_nested(
             }
         });
     }
-    let mut retry = false;
-    for result in futures_util::future::join_all(polls).await {
-        retry |= result?;
+    let joined = futures_util::future::join_all(polls);
+    tokio::pin!(joined);
+    let mut gates_woken = false;
+    let mut gate_scan = true;
+    let mut gate_failure = None;
+    loop {
+        tokio::select! {
+            results = &mut joined => {
+                if let Some(error) = gate_failure { return Err(error); }
+                let mut retry = gates_woken;
+                for result in results { retry |= result?; }
+                return Ok(retry);
+            }
+            _ = cancel.cancelled() => return Ok(gates_woken),
+            _ = tokio::time::sleep(Duration::from_millis(100)), if gate_scan => {
+                match fenced_poll(async {
+                    crate::nested::wake_before_gates(worker.owner.store(), *operation_id, id, Harness::key(id), version, (worker.clock)())
+                }, worker.execution_gate.as_ref(), cancel).await {
+                    Some(Ok(true)) => gates_woken = true,
+                    Some(Ok(false)) => (),
+                    Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => { gates_woken = true; gate_scan = false; },
+                    Some(Err(error)) => { gate_failure = Some(error); gate_scan = false; },
+                    None => return Ok(gates_woken),
+                }
+            }
+        }
     }
-    Ok(retry)
 }
 
 // Serialize polling of effectful futures with the durable abort commit. Once

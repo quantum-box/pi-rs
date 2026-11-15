@@ -82,6 +82,336 @@ struct PreSuspendParent {
     root: std::path::PathBuf,
     stop: bool,
 }
+
+struct MultiGateCrashParent {
+    root: std::path::PathBuf,
+    stop: bool,
+}
+#[async_trait]
+impl KeyedTool for MultiGateCrashParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let a = host.call_keyed_unpolled("a", "gate_a", json!({})).await;
+        let b = host.call_keyed_unpolled("b", "gate_b", json!({})).await;
+        let remote = host.call_keyed_unpolled("r", "remote", json!({})).await;
+        if [&a, &b, &remote]
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Pending { .. }))
+        {
+            if self.stop {
+                std::fs::write(self.root.join("multi-before-suspend"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
+            host.suspend_pending().unwrap();
+            Outcome::Succeeded("discarded".into()).into()
+        } else if matches!(a, Outcome::Succeeded(_))
+            && matches!(b, Outcome::Succeeded(_))
+            && matches!(remote, Outcome::Succeeded(_))
+        {
+            Outcome::Succeeded("all complete".into()).into()
+        } else {
+            Outcome::Failed("unexpected nested result".into()).into()
+        }
+    }
+}
+struct MultiGateTool {
+    root: std::path::PathBuf,
+    name: &'static str,
+}
+#[async_trait]
+impl Tool for MultiGateTool {
+    fn spec(&self) -> ToolSpec {
+        spec(self.name)
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.root.join(format!("{}-invocations", self.name)))
+                .unwrap(),
+            "invoke"
+        )
+        .unwrap();
+        if self.name == "remote" {
+            Outcome::Pending {
+                reference: "remote-job".into(),
+            }
+        } else {
+            Outcome::Succeeded(self.name.into())
+        }
+    }
+    fn can_poll(&self) -> bool {
+        self.name == "remote"
+    }
+    async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+        if self.root.join("slow-poll").exists() {
+            std::fs::write(self.root.join("poll-entered"), b"ready").unwrap();
+            while !self.root.join("remote-ready").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        Some(if self.root.join("remote-ready").exists() {
+            Outcome::Succeeded("remote done".into())
+        } else {
+            Outcome::Pending {
+                reference: "remote-job".into(),
+            }
+        })
+    }
+}
+struct MultiGateHook(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for MultiGateHook {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        use pi_rs_durable::extension::{BeforeTool, Sleep};
+        if !call.name.starts_with("gate_") || ctx.snapshot.get("nested_before_tool_wake").is_some()
+        {
+            return Ok(BeforeTool::Pass);
+        }
+        Ok(BeforeTool::Sleep(Sleep {
+            signals: vec![call.name.clone()],
+            until_millis: None,
+        }))
+    }
+    async fn after_tool_result(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &pi_rs_durable::extension::ToolResult,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if call.name == "remote" {
+            std::fs::write(self.0.join("remote-hook"), b"done").unwrap();
+        }
+        Ok(None)
+    }
+}
+fn multigate_options(root: &std::path::Path, stop: bool, unsafe_parent: bool) -> Options {
+    let parent = Arc::new(KeyedToolAdapter::new(MultiGateCrashParent {
+        root: root.into(),
+        stop,
+    }));
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(if unsafe_parent {
+                ReplayPolicy::Unsafe
+            } else {
+                ReplayPolicy::Safe
+            }),
+            RegisteredTool {
+                tool: Arc::new(MultiGateTool {
+                    root: root.into(),
+                    name: "gate_a",
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: Arc::new(MultiGateTool {
+                    root: root.into(),
+                    name: "gate_b",
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+            RegisteredTool {
+                tool: Arc::new(MultiGateTool {
+                    root: root.into(),
+                    name: "remote",
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn multi_gate_pre_suspend_kill_worker() {
+    let Some(root) = std::env::var_os("PI_MULTIGATE_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        multigate_options(
+            &root,
+            true,
+            std::env::var_os("PI_MULTIGATE_UNSAFE").is_some(),
+        ),
+        hook_registry(Arc::new(MultiGateHook(root.clone()))),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_before_suspend_recovers_multiple_gates_and_pending_without_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for mode in [
+        "gates-first",
+        "remote-first",
+        "slow",
+        "abort",
+        "abort-slow",
+        "unsafe",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "multi_gate_pre_suspend_kill_worker"])
+            .env("PI_MULTIGATE_KILL_DIR", root);
+        if mode == "unsafe" {
+            command.env("PI_MULTIGATE_UNSAFE", "1");
+        }
+        let mut process = Kill(command.spawn().unwrap());
+        until(|| root.join("multi-before-suspend").exists()).await;
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("remote-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(!root.join("gate_a-invocations").exists());
+        assert!(!root.join("gate_b-invocations").exists());
+        let id = std::fs::read_to_string(root.join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        if mode == "remote-first" {
+            std::fs::write(root.join("remote-ready"), b"ready").unwrap();
+        }
+        if mode == "slow" || mode == "abort-slow" {
+            std::fs::write(root.join("slow-poll"), b"slow").unwrap();
+        }
+        let mut scheduler = Scheduler::open_with_extensions(
+            root.join("db"),
+            multigate_options(root, false, mode == "unsafe"),
+            hook_registry(Arc::new(MultiGateHook(root.into()))),
+        )
+        .unwrap();
+        if mode == "unsafe" {
+            assert!(scheduler.blocked(id).unwrap().is_some());
+            assert!(!scheduler.conversation(id).unwrap().nested_suspended());
+            scheduler.shutdown().await.unwrap();
+            continue;
+        }
+        until(|| scheduler.conversation(id).unwrap().nested_suspended()).await;
+        if mode == "remote-first" {
+            until(|| root.join("remote-hook").exists()).await;
+        }
+        if mode == "slow" || mode == "abort-slow" {
+            until(|| root.join("poll-entered").exists()).await;
+        }
+        let signal_id = uuid::Uuid::new_v4();
+        scheduler
+            .send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+                signal_id,
+                id,
+                "gate_b".into(),
+                json!(2),
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if mode == "slow" || mode == "abort-slow" {
+            let store = durable_store::Store::open(root.join("db")).unwrap();
+            until(|| {
+                pi_rs_durable::conversation_signal::Inbox::new(&store)
+                    .receipt(id, signal_id)
+                    .unwrap()
+                    .is_some_and(|receipt| receipt.is_consumed())
+            })
+            .await;
+        }
+        assert!(!root.join("gate_a-invocations").exists());
+        assert!(!root.join("gate_b-invocations").exists());
+        if mode == "abort" || mode == "abort-slow" {
+            scheduler.abort(id).unwrap();
+            scheduler.shutdown().await.unwrap();
+            let mut reopened = Scheduler::open_with_extensions(
+                root.join("db"),
+                multigate_options(root, false, false),
+                hook_registry(Arc::new(MultiGateHook(root.into()))),
+            )
+            .unwrap();
+            reopened.schedule(id);
+            wait(&mut reopened, id).await;
+            reopened.shutdown().await.unwrap();
+            assert!(!root.join("gate_a-invocations").exists());
+            assert!(!root.join("gate_b-invocations").exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join("remote-invocations"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            continue;
+        }
+        scheduler
+            .send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+                uuid::Uuid::new_v4(),
+                id,
+                "gate_a".into(),
+                json!(1),
+            ))
+            .unwrap();
+        if mode == "gates-first" || mode == "slow" {
+            std::fs::write(root.join("remote-ready"), b"ready").unwrap();
+        }
+        scheduler.schedule(id);
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none());
+        for name in ["remote", "gate_a", "gate_b"] {
+            assert_eq!(
+                std::fs::read_to_string(root.join(format!("{name}-invocations")))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{mode}: {name}"
+            );
+        }
+        assert!(scheduler.conversation(id).unwrap().messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "all complete")
+        ));
+        scheduler.shutdown().await.unwrap();
+    }
+}
 #[async_trait]
 impl KeyedTool for PreSuspendParent {
     fn spec(&self) -> ToolSpec {
