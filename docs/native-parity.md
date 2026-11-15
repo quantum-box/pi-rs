@@ -1061,6 +1061,9 @@ Skill and prompt-template files decode malformed UTF-8 with replacement, as Pi
 does, so an invalid byte does not hide an otherwise usable resource. The native
 64 KiB resource limit and existing resource trust rules remain in force; source
 files are not rewritten. Tests cover discovery, invocation and the size limit.
+Skill invocation uses the same replacement decoding as discovery. Skill and
+prompt frontmatter each strip one leading BOM and use ECMAScript whitespace
+when trimming a delimited body, matching Pi.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
