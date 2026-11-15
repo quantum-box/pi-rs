@@ -308,6 +308,8 @@ struct Cli {
     /// Read follow-up and cancellation messages as JSON lines on stdin.
     #[arg(long, global = true)]
     stdin_control: bool,
+    #[arg(long, global = true, hide = true)]
+    worker_settings_stdin: bool,
     /// Correlation key for retrying or explicitly resuming a host run.
     #[arg(long, global = true)]
     run_id: Option<Uuid>,
@@ -1388,7 +1390,21 @@ async fn run_cli() -> i32 {
         )?;
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
-        args.settings = config::Settings::load(&args.workspace, args.trusted)?;
+        args.settings = if matches!(args.command, Some(Command::Serve))
+            && args.stdin_control
+            && args.worker_settings_stdin
+        {
+            let mut settings = process::read_settings_bootstrap()?;
+            settings.validate_worker_snapshot(&args.workspace, args.trusted)?;
+            settings
+        } else {
+            config::Settings::load(&args.workspace, args.trusted)?
+        };
+        if !matches!(args.command, Some(Command::Serve)) || !args.worker_settings_stdin {
+            for warning in args.settings.diagnostics() {
+                eprintln!("{warning}");
+            }
+        }
         args.model_profiles = model_profiles::Profiles::load()?;
         args.model_keys = tokio::select! {
             result = model_auth::Keys::load_async() => result?,
@@ -1967,6 +1983,11 @@ async fn execute(
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
+        if !matches!(args.command, Some(Command::Serve)) || !args.worker_settings_stdin {
+            for warning in args.settings.diagnostics() {
+                eprintln!("{warning}");
+            }
+        }
     }
     if let Some(name) = &args.name {
         session.set_name(name)?;

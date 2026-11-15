@@ -32,12 +32,23 @@ pub(super) fn run(
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
     }
-    super::backend::initialize_queue_modes(&mut session, &args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, &mut args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
     drop(session);
+    let reported_settings = args.settings.diagnostics().to_vec();
     interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -2060,7 +2071,12 @@ fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
     }
     let mut session = Session::open(&args.session)?;
     session.set_working_directory(&args.workspace)?;
-    super::backend::initialize_queue_modes(&mut session, args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(parent) = parent {
         session.set_parent_session(parent)?;
     }
@@ -2084,6 +2100,9 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
     let mut next = args.clone();
     next.session = path.to_path_buf();
     interactive::restore_workspace(&mut next)?;
+    for warning in next.settings.diagnostics() {
+        eprintln!("{warning}");
+    }
     *args = next;
     Ok(())
 }

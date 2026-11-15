@@ -3762,7 +3762,13 @@ pub(super) async fn run(
     {
         std::fs::create_dir_all(parent)?;
     }
+    let reported_settings = args.settings.diagnostics().to_vec();
     args = prepare_initial_session_async(args).await?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -5458,8 +5464,10 @@ pub(super) async fn run(
                             view.dialogs.clear();
                             view.ui_status.clear();
                             view.widgets.clear();
-                            args.settings =
-                                crate::config::Settings::load(&args.workspace, args.trusted)?;
+                            args.settings = args.settings.reload(&args.workspace, args.trusted)?;
+                            for warning in args.settings.diagnostics() {
+                                view.append(warning);
+                            }
                             auth_reload =
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
@@ -6189,6 +6197,9 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
         });
     restore_workspace(args)?;
     view.restore(args)?;
+    for warning in args.settings.diagnostics() {
+        view.append(warning);
+    }
     if let Some(input) = input {
         view.editor.replace(input);
     }
@@ -7122,7 +7133,10 @@ fn select(
             crate::config::save_trust(&args.workspace, decision)?;
             args.trusted = decision;
             args.trust_pending = false;
-            args.settings = crate::config::Settings::load(&args.workspace, decision)?;
+            args.settings = args.settings.reload(&args.workspace, decision)?;
+            for warning in args.settings.diagnostics() {
+                view.append(warning);
+            }
             view.resources = super::resources::Resources::load(args)?;
             view.append(if decision {
                 "Project configuration trusted"
@@ -7240,6 +7254,9 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
         initialize_session(&mut next)?;
     }
     view.restore(&next)?;
+    for warning in next.settings.diagnostics() {
+        view.append(warning);
+    }
     view.resources = resources;
     *args = next;
     if args.trust_pending {
@@ -7336,7 +7353,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     )?;
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
-    args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.settings = args.settings.reload(&args.workspace, args.trusted)?;
     args.refresh_workspace_selection();
     args.restore_session_model(&session);
     drop(session);

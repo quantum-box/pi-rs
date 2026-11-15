@@ -969,7 +969,12 @@ async fn run_worker(
                 session.set_working_directory(&args.workspace)?;
             }
             args.record_automatic_model_selection(session)?;
-            initialize_queue_modes(session, &args)?;
+            if args.worker_settings_stdin {
+                initialize_queue_modes_from_settings(session, &args.settings)?;
+            } else {
+                let mut queue_args = args.clone();
+                let _ = initialize_queue_modes(session, &mut queue_args)?;
+            }
             {
                 let mut snapshot = snapshot.lock().expect("session snapshot");
                 snapshot.refresh(session);
@@ -1848,8 +1853,18 @@ pub(super) fn configured_queue_mode(args: &Cli, key: &str) -> Result<QueueMode> 
             .unwrap_or_else(|| json!("one-at-a-time")),
     )?)
 }
-pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Result<()> {
-    let settings = super::config::Settings::load(&args.workspace, args.trusted)?;
+pub(super) fn initialize_queue_modes(session: &mut Session, args: &mut Cli) -> Result<Vec<String>> {
+    let settings = args.settings.reload(&args.workspace, args.trusted)?;
+    initialize_queue_modes_from_settings(session, &settings)?;
+    let diagnostics = settings.diagnostics().to_vec();
+    args.settings.apply_queue_reload(&settings);
+    Ok(diagnostics)
+}
+
+fn initialize_queue_modes_from_settings(
+    session: &mut Session,
+    settings: &super::config::Settings,
+) -> Result<()> {
     for (kind, key) in [
         (InputKind::Steer, "steeringMode"),
         (InputKind::FollowUp, "followUpMode"),
@@ -1866,6 +1881,23 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
 mod share_context_tests {
     use super::*;
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn worker_queue_modes_use_its_settings_snapshot() {
+        let settings: super::super::config::Settings = serde_json::from_value(json!({
+            "value":{"steeringMode":"all","followUpMode":"one-at-a-time"},
+            "resource_layers":[], "diagnostics":["previous settings failed"],
+            "live_auto_retry":null, "live_auto_compaction":null
+        }))
+        .unwrap();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        super::initialize_queue_modes_from_settings(&mut session, &settings).unwrap();
+        assert_eq!(session.queue_mode(InputKind::Steer), QueueMode::All);
+        assert_eq!(
+            session.queue_mode(InputKind::FollowUp),
+            QueueMode::OneAtATime
+        );
+    }
 
     #[test]
     fn initial_snapshot_releases_new_journal_lock_for_worker() {

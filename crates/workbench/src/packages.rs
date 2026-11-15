@@ -1018,13 +1018,24 @@ fn configured_update_sources(args: &Cli) -> Result<Vec<String>> {
             args.workspace.join(".pi"),
         ));
     }
-    update_sources(&files)
+    update_sources_with_settings(&files, Some(&args.settings))
 }
 
+#[cfg(test)]
 fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
+    update_sources_with_settings(files, None)
+}
+
+fn update_sources_with_settings(
+    files: &[(PathBuf, PathBuf)],
+    settings: Option<&config::Settings>,
+) -> Result<Vec<String>> {
     let mut sources = Vec::new();
     for (file, base) in files {
-        let document = config::read_object(file)?;
+        let document = match settings.and_then(|settings| settings.stored_layer(base)) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(file)?,
+        };
         if let Some(packages) = document.get("packages") {
             for value in packages
                 .as_array()
@@ -1058,7 +1069,10 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
         ));
     }
     for (file, base, project) in files {
-        let document = config::read_object(&file)?;
+        let document = match args.settings.stored_layer(&base) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(&file)?,
+        };
         if let Some(packages) = document.get("packages") {
             for (position, value) in packages
                 .as_array()
@@ -2222,6 +2236,45 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_package_discovery_keeps_recovered_scope_after_disk_repair() {
+        use clap::Parser;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi/settings.json"),
+            json!({"packages":["git:https://example.com/new.git"]}).to_string(),
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.workspace = project.clone();
+        args.trusted = true;
+        for (worker, diagnostics) in [
+            (true, vec!["previous scope could not be read"]),
+            (false, vec![]),
+        ] {
+            args.worker_settings_stdin = worker;
+            args.settings = serde_json::from_value(json!({
+            "value":{},
+            "resource_layers":[[config::agent_dir(),{}],[project.join(".pi"),{"packages":["git:https://example.com/old.git"]}]],
+            "diagnostics":diagnostics,
+            "live_auto_retry":null,
+            "live_auto_compaction":null
+        })).unwrap();
+            let entries = declarations(&args).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(
+                entries[0].source.contains("old.git"),
+                "{}",
+                entries[0].source
+            );
+            let sources = configured_update_sources(&args).unwrap();
+            assert_eq!(sources.len(), 1);
+            assert!(sources[0].contains("old.git"), "{sources:?}");
+        }
+    }
 
     // A private test subprocess: the child owns a connection until it exits,
     // letting the test observe that exact process without relying on PID reuse.

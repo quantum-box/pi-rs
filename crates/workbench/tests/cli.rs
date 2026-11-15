@@ -857,6 +857,311 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
 }
 
 #[test]
+fn malformed_settings_warn_without_blocking_offline_model_listing() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    let user = home.join("settings.json");
+    let local = project.join(".pi/settings.json");
+    std::fs::write(&user, "{}").unwrap();
+    std::fs::write(&local, "{").unwrap();
+    let run = |trust: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args(trust)
+            .args(["--offline", "--no-mcp", "--list-models"])
+            .output()
+            .unwrap()
+    };
+    let result = run(&["--trust"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let warning = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        warning.contains("Invalid settings file") && warning.contains("settings.json"),
+        "{warning}"
+    );
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "{");
+    std::fs::write(&user, "{").unwrap();
+    std::fs::write(&local, "{}").unwrap();
+    let result = run(&[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Invalid settings file"));
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), "{");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(&project)
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(root.path().join("direct.jsonl"))
+        .args(["--no-trust", "--offline", "--no-mcp", "serve"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid settings file"));
+}
+
+#[test]
+fn malformed_settings_keep_other_scope_package_resources_in_rpc() {
+    for bad_global in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let package = root.path().join("package");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::create_dir_all(package.join("skills/example")).unwrap();
+        std::fs::write(
+            package.join("pi-package.json"),
+            r#"{"pi":{"skills":["skills"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("skills/example/SKILL.md"),
+            "---\nname: example\ndescription: Example skill\n---\nbody",
+        )
+        .unwrap();
+        let valid = json!({"packages":[package]}).to_string();
+        std::fs::write(
+            home.join("settings.json"),
+            if bad_global { "{" } else { &valid },
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".pi/settings.json"),
+            if bad_global { &valid } else { "{" },
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args([
+                "--trust",
+                "--offline",
+                "--no-mcp",
+                "--no-session",
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({"id":"commands","type":"get_commands"})
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr.matches("Invalid settings file").count(),
+            1,
+            "{stderr}"
+        );
+        let replies: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            replies.iter().all(|reply| reply["type"] != "error"
+                || !reply["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Invalid settings file")),
+            "{replies:?}"
+        );
+        let reply = replies
+            .iter()
+            .find(|reply| reply["id"] == "commands")
+            .unwrap();
+        assert!(
+            reply["data"]["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == "skill:example"),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
+fn new_rpc_session_recovers_queue_settings_per_scope() {
+    for bad_global in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        let user = home.join("settings.json");
+        let local = project.join(".pi/settings.json");
+        std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args([
+                "--trust",
+                "--offline",
+                "--no-mcp",
+                "--no-session",
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && sender.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let request = |input: &mut std::process::ChildStdin, id: &str, kind: &str| {
+            writeln!(input, "{}", json!({"id":id,"type":kind})).unwrap();
+            input.flush().unwrap();
+            loop {
+                let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+                if event["id"] == id {
+                    return event;
+                }
+            }
+        };
+        assert!(request(&mut input, "initial", "get_state")["success"] == true);
+        std::fs::write(&user, r#"{"steeringMode":"one-at-a-time"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"all"}"#).unwrap();
+        assert!(request(&mut input, "intermediate", "new_session")["success"] == true);
+        if bad_global {
+            std::fs::write(&user, "{").unwrap();
+            std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        } else {
+            std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+            std::fs::write(&local, "{").unwrap();
+        }
+        assert!(request(&mut input, "new", "new_session")["success"] == true);
+        let state = request(&mut input, "state", "get_state");
+        assert_eq!(
+            state["data"]["steeringMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        assert_eq!(
+            state["data"]["followUpMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        drop(input);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        reader.join().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("Invalid settings file"), "{stderr}");
+    }
+}
+
+#[test]
+fn switching_rpc_sessions_keeps_last_good_skill_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let skill = root.path().join("skill/SKILL.md");
+    let session = root.path().join("initial.jsonl");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: retained-fixture\ndescription: retained skill\n---\nbody",
+    )
+    .unwrap();
+    let settings = home.join("settings.json");
+    std::fs::write(&settings, json!({"skills":[skill]}).to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(&session)
+        .args(["--no-trust", "--offline", "--no-mcp", "--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line)
+                && sender.send(event).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let request = |input: &mut std::process::ChildStdin, value: Value| {
+        let id = value["id"].as_str().unwrap().to_owned();
+        writeln!(input, "{value}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+            if event["id"] == id {
+                return event;
+            }
+        }
+    };
+    assert!(request(&mut input, json!({"id":"before","type":"get_commands"}))["success"] == true);
+    std::fs::write(&settings, "{").unwrap();
+    assert!(request(&mut input, json!({"id":"new","type":"new_session"}))["success"] == true);
+    let switched = request(
+        &mut input,
+        json!({"id":"switch","type":"switch_session","sessionPath":session}),
+    );
+    assert!(switched["success"] == true, "{switched}");
+    let commands = request(&mut input, json!({"id":"after","type":"get_commands"}));
+    assert!(
+        commands["data"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "skill:retained-fixture"),
+        "{commands}"
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+}
+
+#[test]
 fn model_listing_searches_ids_with_pi_token_swaps() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(

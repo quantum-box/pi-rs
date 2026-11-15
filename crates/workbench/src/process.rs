@@ -12,6 +12,27 @@ pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+const MAX_SETTINGS_BOOTSTRAP: usize = 16 * 1024 * 1024;
+
+pub(super) fn read_settings_bootstrap() -> Result<super::config::Settings> {
+    read_settings_frame(&mut std::io::stdin().lock())
+}
+
+fn read_settings_frame(input: &mut impl std::io::Read) -> Result<super::config::Settings> {
+    let mut length = [0_u8; 8];
+    input.read_exact(&mut length)?;
+    let length = usize::try_from(u64::from_be_bytes(length))
+        .map_err(|_| Error::Config("invalid worker settings length".into()))?;
+    if length > MAX_SETTINGS_BOOTSTRAP {
+        return Err(Error::Config(
+            "worker settings snapshot is too large".into(),
+        ));
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Config("invalid worker settings snapshot".into()))
+}
 
 pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -162,6 +183,18 @@ impl Worker {
             command.env("PI_RS_MODEL_TOKEN", token);
         }
 
+        let bootstrap = if operation.first() == Some(&"serve") {
+            let bytes = serde_json::to_vec(&args.settings)?;
+            if bytes.len() > MAX_SETTINGS_BOOTSTRAP {
+                return Err(Error::Config(
+                    "worker settings snapshot is too large".into(),
+                ));
+            }
+            command.arg("--worker-settings-stdin");
+            Some(bytes)
+        } else {
+            None
+        };
         command
             .arg("--session")
             .arg(&args.session)
@@ -286,7 +319,18 @@ impl Worker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take();
+        if let Some(bytes) = bootstrap {
+            let input = stdin.as_mut().expect("piped stdin");
+            let sent = input
+                .write_all(&(bytes.len() as u64).to_be_bytes())
+                .and_then(|()| input.write_all(&bytes));
+            if let Err(error) = sent {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        }
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let (sender, events) = mpsc::channel();
@@ -787,6 +831,26 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_bootstrap_frame_preserves_following_input_and_rejects_invalid_lengths() {
+        use std::io::Read;
+        let settings = super::super::config::Settings::default();
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        let mut wire = (bytes.len() as u64).to_be_bytes().to_vec();
+        wire.extend_from_slice(&bytes);
+        wire.extend_from_slice(b"next-control-line\n");
+        let mut input = std::io::Cursor::new(wire);
+        super::read_settings_frame(&mut input).unwrap();
+        let mut rest = String::new();
+        input.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "next-control-line\n");
+        assert!(
+            super::read_settings_frame(&mut std::io::Cursor::new(u64::MAX.to_be_bytes())).is_err()
+        );
+        assert!(
+            super::read_settings_frame(&mut std::io::Cursor::new(100_u64.to_be_bytes())).is_err()
+        );
+    }
     use clap::Parser;
     #[cfg(unix)]
     #[test]

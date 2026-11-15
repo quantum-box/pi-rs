@@ -1897,8 +1897,11 @@ input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
-BOM when loaded or updated. Invalid JSON and invalid implemented settings remain
-errors; settings updates preserve unknown keys.
+BOM when loaded or updated. Malformed or unreadable user and trusted-project
+settings are reported and the other scope remains available. Settings updates
+do not overwrite malformed files. Invalid implemented setting values remain
+errors; updates preserve unknown keys. On reload, a failed scope retains its
+previous in-memory values while valid changes in the other scope take effect.
 
 `defaultTools` follows Pi's layered selection: project modifiers extend the
 user selection, while project plain-name lists replace it. Mixed plain names

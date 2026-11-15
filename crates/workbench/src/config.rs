@@ -8,10 +8,11 @@ pub fn agent_dir() -> PathBuf {
     pi_rs_workbench::agent_dir()
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     value: Value,
     resource_layers: Vec<(PathBuf, Value)>,
+    diagnostics: Vec<String>,
     // Live controls override merged settings only for this running session.
     live_auto_retry: Option<bool>,
     live_auto_compaction: Option<bool>,
@@ -62,8 +63,88 @@ impl Settings {
         let user_path = agent_dir().join("settings.json");
         Self::load_from_paths(workspace, trusted, &user_path)
     }
+    pub fn reload(&self, workspace: &Path, trusted: bool) -> Result<Self> {
+        let user_path = agent_dir().join("settings.json");
+        Self::load_from_paths_with_previous(workspace, trusted, &user_path, Some(self))
+    }
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+    pub(super) fn apply_queue_reload(&mut self, reloaded: &Self) {
+        for (base, layer) in &mut self.resource_layers {
+            let Some((_, incoming)) = reloaded
+                .resource_layers
+                .iter()
+                .find(|(path, _)| path == base)
+            else {
+                continue;
+            };
+            let Some(object) = layer.as_object_mut() else {
+                continue;
+            };
+            for key in ["steeringMode", "followUpMode"] {
+                if let Some(value) = incoming.get(key) {
+                    object.insert(key.into(), value.clone());
+                } else {
+                    object.remove(key);
+                }
+            }
+        }
+        self.diagnostics = reloaded.diagnostics.clone();
+        self.refresh_effective();
+    }
+    pub(super) fn validate_worker_snapshot(
+        &mut self,
+        workspace: &Path,
+        trusted: bool,
+    ) -> Result<()> {
+        let equal = |a: &Path, b: &Path| {
+            a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        };
+        let user = agent_dir();
+        if self.resource_layers.is_empty()
+            || self.resource_layers.len() > if trusted { 2 } else { 1 }
+            || !equal(&self.resource_layers[0].0, &user)
+            || self
+                .resource_layers
+                .get(1)
+                .is_some_and(|(base, _)| !equal(base, &workspace.join(".pi")))
+        {
+            return Err(Error::Config("invalid worker settings scope".into()));
+        }
+        for (base, value) in &self.resource_layers {
+            validate_settings(value, &base.join("settings.json"))?;
+        }
+        self.refresh_effective();
+        Ok(())
+    }
+    pub(super) fn stored_layer(&self, base: &Path) -> Option<&Value> {
+        self.resource_layers
+            .iter()
+            .find(|(path, _)| path == base)
+            .map(|(_, value)| value)
+    }
     fn load_from_paths(workspace: &Path, trusted: bool, user_path: &Path) -> Result<Self> {
-        let mut value = read_object(user_path)?;
+        Self::load_from_paths_with_previous(workspace, trusted, user_path, None)
+    }
+    fn load_from_paths_with_previous(
+        workspace: &Path,
+        trusted: bool,
+        user_path: &Path,
+        previous: Option<&Self>,
+    ) -> Result<Self> {
+        let mut diagnostics = Vec::new();
+        let old_layer = |base: &Path| {
+            previous.and_then(|settings| {
+                settings
+                    .resource_layers
+                    .iter()
+                    .find(|(path, _)| path == base)
+                    .map(|(_, value)| value)
+            })
+        };
+        let user_base = user_path.parent().unwrap_or(Path::new("."));
+        let mut value = read_settings_layer(user_path, old_layer(user_base), &mut diagnostics);
         migrate_legacy_settings(&mut value);
         validate_settings(&value, user_path)?;
         let mut resource_layers = vec![(
@@ -72,7 +153,11 @@ impl Settings {
         )];
         if trusted {
             let project_path = workspace.join(".pi/settings.json");
-            let mut project = read_object(&project_path)?;
+            let mut project = read_settings_layer(
+                &project_path,
+                old_layer(&workspace.join(".pi")),
+                &mut diagnostics,
+            );
             migrate_legacy_settings(&mut project);
             let user_only = project.as_object_mut().expect("object");
             user_only.remove("defaultProjectTrust");
@@ -84,7 +169,9 @@ impl Settings {
         Ok(Self {
             value,
             resource_layers,
-            ..Self::default()
+            diagnostics,
+            live_auto_retry: previous.and_then(|settings| settings.live_auto_retry),
+            live_auto_compaction: previous.and_then(|settings| settings.live_auto_compaction),
         })
     }
     pub fn string(&self, key: &str) -> Option<&str> {
@@ -381,6 +468,28 @@ impl Settings {
     }
 }
 
+// A broken settings file must not hide the other layer. Writes still read the
+// original file under lock and fail rather than replacing malformed contents.
+fn read_settings_layer(
+    path: &Path,
+    previous: Option<&Value>,
+    diagnostics: &mut Vec<String>,
+) -> Value {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    match read_object(&absolute) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(format!(
+                "Warning: Invalid settings file {}: {error}",
+                absolute.display()
+            ));
+            previous
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()))
+        }
+    }
+}
+
 /// Validate implemented settings while retaining extension-owned and future keys.
 pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
     static SCHEMA: std::sync::LazyLock<jsonschema::Validator> = std::sync::LazyLock::new(|| {
@@ -443,7 +552,10 @@ pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<
             return Ok(Some(decision));
         }
     }
-    let settings = read_object(&agent_dir().join("settings.json"))?;
+    // Settings::load reports a broken file. The trust gate must still choose
+    // the conservative default instead of failing before that diagnostic.
+    let settings = read_object(&agent_dir().join("settings.json"))
+        .unwrap_or_else(|_| Value::Object(Map::new()));
     match settings["defaultProjectTrust"].as_str() {
         Some("always") => Ok(Some(true)),
         Some("never") => Ok(Some(false)),
@@ -677,6 +789,10 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
+            // Pi treats an empty settings file as an empty settings scope.
+            if bytes.is_empty() && path.file_name().is_some_and(|name| name == "settings.json") {
+                return Ok(Value::Object(Map::new()));
+            }
             // Pi accepts a UTF-8 BOM in settings and MCP configuration when loading and editing them.
             let input = if path
                 .file_name()
@@ -1028,13 +1144,161 @@ mod tests {
         assert!(error.contains("settings.json/hideThinkingBlock"), "{error}");
         assert!(super::Settings::load_from_paths(&workspace, false, &user).is_ok());
         std::fs::write(&user, "\u{feff}{ broken").unwrap();
-        assert!(super::Settings::load_from_paths(&workspace, false, &user).is_err());
+        assert!(super::Settings::load_from_paths(&workspace, false, &user).is_ok());
         assert!(
             settings
                 .set_user_values_at(&user, &[("theme".into(), json!("dark"))])
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&user).unwrap(), "\u{feff}{ broken");
+    }
+
+    #[test]
+    fn broken_settings_leave_the_other_scope_usable_and_do_not_rewrite_files() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("agent/settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&user, r#"{"theme":"global"}"#).unwrap();
+        std::fs::write(&project, "{").unwrap();
+        let settings = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(settings.string("theme"), Some("global"));
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), "{");
+
+        std::fs::write(&user, "{").unwrap();
+        std::fs::write(&project, r#"{"theme":"project"}"#).unwrap();
+        let mut settings = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(settings.string("theme"), Some("project"));
+        assert!(
+            settings
+                .set_user_values_at(&user, &[("theme".into(), json!("dark"))])
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), "{");
+        let untrusted = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        assert_eq!(untrusted.string("theme"), None);
+        std::fs::write(&user, "").unwrap();
+        let empty = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        assert!(empty.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn reload_preserves_only_broken_layers_and_recovers_after_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("agent/settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&user, r#"{"theme":"global","quietStartup":false}"#).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"theme":"project","retry":{"enabled":true},"compaction":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let mut initial = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        initial.live_auto_retry = Some(false);
+        initial.live_auto_compaction = Some(false);
+        std::fs::write(&user, r#"{"theme":"new-global","quietStartup":true}"#).unwrap();
+        std::fs::write(&project, "{").unwrap();
+        let reloaded =
+            super::Settings::load_from_paths_with_previous(&workspace, true, &user, Some(&initial))
+                .unwrap();
+        assert_eq!(reloaded.string("theme"), Some("project"));
+        assert_eq!(reloaded.boolean("quietStartup"), Some(true));
+        assert!(!reloaded.retry_settings().enabled);
+        assert!(!reloaded.auto_compaction_enabled());
+        assert_eq!(reloaded.diagnostics().len(), 1);
+        std::fs::write(&user, "{").unwrap();
+        std::fs::write(&project, r#"{"theme":"new-project"}"#).unwrap();
+        let reloaded = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            true,
+            &user,
+            Some(&reloaded),
+        )
+        .unwrap();
+        assert_eq!(reloaded.string("theme"), Some("new-project"));
+        assert_eq!(reloaded.boolean("quietStartup"), Some(true));
+        assert!(!reloaded.retry_settings().enabled);
+        assert!(!reloaded.auto_compaction_enabled());
+        assert_eq!(reloaded.diagnostics().len(), 1);
+        std::fs::write(&user, r#"{"quietStartup":false}"#).unwrap();
+        let repaired = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            true,
+            &user,
+            Some(&reloaded),
+        )
+        .unwrap();
+        assert_eq!(repaired.boolean("quietStartup"), Some(false));
+        assert!(repaired.diagnostics().is_empty());
+        let untrusted = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            false,
+            &user,
+            Some(&repaired),
+        )
+        .unwrap();
+        assert_eq!(untrusted.string("theme"), None);
+    }
+
+    #[test]
+    fn worker_snapshot_rejects_untrusted_or_mismatched_project_layers() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let snapshot = json!({"value":{},"resource_layers":[[super::agent_dir(),{}],[project.join(".pi"),{"theme":"project"}]],"diagnostics":[],"live_auto_retry":null,"live_auto_compaction":null});
+        let mut settings: super::Settings = serde_json::from_value(snapshot.clone()).unwrap();
+        assert!(settings.validate_worker_snapshot(&project, false).is_err());
+        assert!(
+            settings
+                .validate_worker_snapshot(root.path(), true)
+                .is_err()
+        );
+        settings.validate_worker_snapshot(&project, true).unwrap();
+        assert_eq!(settings.string("theme"), Some("project"));
+    }
+
+    #[test]
+    fn queue_reload_updates_only_queue_values_and_keeps_model_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("agent/settings.json");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &user,
+            r#"{"defaultModel":"old","steeringMode":"one-at-a-time"}"#,
+        )
+        .unwrap();
+        let mut settings = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        std::fs::write(&user, r#"{"defaultModel":"new","steeringMode":"all"}"#).unwrap();
+        let reloaded = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            false,
+            &user,
+            Some(&settings),
+        )
+        .unwrap();
+        settings.apply_queue_reload(&reloaded);
+        assert_eq!(settings.string("defaultModel"), Some("old"));
+        assert_eq!(settings.string("steeringMode"), Some("all"));
+        std::fs::write(&user, "{").unwrap();
+        let reloaded = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            false,
+            &user,
+            Some(&settings),
+        )
+        .unwrap();
+        settings.apply_queue_reload(&reloaded);
+        assert_eq!(settings.string("defaultModel"), Some("old"));
+        assert_eq!(settings.string("steeringMode"), Some("all"));
+        assert_eq!(settings.diagnostics().len(), 1);
     }
     #[tokio::test]
     async fn auth_read_waits_asynchronously_until_lock_is_released() {
