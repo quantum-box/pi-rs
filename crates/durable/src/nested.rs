@@ -230,6 +230,36 @@ pub(crate) fn resolved_for_replay(
     Ok(resolved)
 }
 
+// A committed pre-dispatch gate proves that child invocation has not started.
+// Any other unresolved child is an independent uncertainty and blocks replay.
+pub(crate) fn recoverable_gate_intent(
+    store: &durable_store::Store,
+    root: Uuid,
+) -> Result<bool, crate::runtime::Error> {
+    let mut gates = 0;
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.before_pending
+            && record
+                .before_gate
+                .as_ref()
+                .is_some_and(|gate| gate.wake.is_none())
+            && record.outcome.is_none()
+            && record.staged_outcome.is_none()
+        {
+            gates += 1;
+        } else if record.staged_outcome.is_some()
+            || matches!(
+                record.outcome,
+                None | Some(Outcome::Pending { .. }) | Some(Outcome::Unknown(_))
+            )
+        {
+            return Ok(false);
+        }
+    }
+    Ok((1..=8).contains(&gates))
+}
+
 pub(crate) fn has_staged_results(
     store: &durable_store::Store,
     root: Uuid,
@@ -1397,6 +1427,40 @@ impl NestedHost {
                 reference: format!("nested-gate:{}", record.operation_id),
             });
         }
+        let invocation = Invocation {
+            operation_id: record.operation_id,
+            call: ToolCall {
+                id: call_id.into(),
+                name: record.name.clone(),
+                arguments: record.arguments.to_string(),
+            },
+        };
+        let preparation_error = if record
+            .before_gate
+            .as_ref()
+            .is_some_and(|gate| gate.wake.is_some())
+        {
+            match crate::tool::prepare(
+                reg.tool.as_ref(),
+                &invocation,
+                &self.shared.cancellation,
+                self.shared.timeout,
+                |schema, args| jsonschema::validator_for(schema).is_ok_and(|v| v.is_valid(args)),
+            )
+            .await
+            {
+                Ok(prepared) => {
+                    record.prepared = prepared.arguments().clone();
+                    None
+                }
+                Err(outcome) => Some(outcome.tool_content()),
+            }
+        } else {
+            None
+        };
+        if self.shared.cancellation.is_cancelled() {
+            return Err(self.fail("nested before-tool preparation cancelled"));
+        }
         let memo = crate::extension::DurableMemo::new(
             self.shared.owner.clone(),
             record.operation_id,
@@ -1419,7 +1483,11 @@ impl NestedHost {
             name: record.name.clone(),
             arguments: record.prepared.clone(),
         };
-        let (rewritten, decision, reports) = hooks.selected.before_tool(call, &context).await;
+        let (rewritten, decision, reports) = if preparation_error.is_some() {
+            (call, crate::extension::BeforeTool::Pass, Vec::new())
+        } else {
+            hooks.selected.before_tool(call, &context).await
+        };
         if let Err(error) =
             self.record_hook_reports(hooks, record.operation_id, "before_tool", reports)
         {
@@ -1495,15 +1563,11 @@ impl NestedHost {
             }
         }
         record.prepared = rewritten.arguments;
-        let invocation = Invocation {
-            operation_id: record.operation_id,
-            call: ToolCall {
-                id: call_id.into(),
-                name: record.name.clone(),
-                arguments: record.arguments.to_string(),
-            },
-        };
-        let rejection = match decision {
+        let rejection =
+            if let Some(error) = preparation_error {
+                Some(("invalid_arguments", error))
+            } else {
+                match decision {
             crate::extension::BeforeTool::Sleep(_) if invalid_gate => Some((
                 "invalid_park",
                 "Tool call cannot wait at its gates: invalid or consumed signal or deadline".into(),
@@ -1521,7 +1585,8 @@ impl NestedHost {
                 Err(outcome) => Some(("invalid_arguments", outcome.tool_content())),
             },
             _ => return Err(self.fail("invalid nested before-tool decision")),
-        };
+        }
+            };
         record.before_pending = false;
         record.before_gate = None;
         if let Some((code, message)) = rejection {
@@ -1939,6 +2004,71 @@ mod tests {
     use pi_rs_core::{Tool, ToolContext};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn gate_recovery_rejects_other_unresolved_children() {
+        let store = durable_store::Store::memory().unwrap();
+        let root = Uuid::new_v4();
+        let key = format!("nested/{root}/{root}/gate").into_bytes();
+        let other = format!("nested/{root}/{root}/other").into_bytes();
+        let mut record = Record {
+            name: "child".into(),
+            arguments: json!({}),
+            prepared: json!({}),
+            before_pending: true,
+            before_gate: Some(BeforeGate {
+                signals: vec!["gate".into()],
+                until_millis: None,
+                wake: None,
+            }),
+            policy: ReplayPolicy::Unsafe,
+            operation_id: Uuid::new_v4(),
+            outcome: None,
+            staged_outcome: None,
+            hooks_required: true,
+            hook_snapshot: None,
+            output_blocks: None,
+            diagnostics: Vec::new(),
+            diagnostic_keys: Default::default(),
+            resolution: None,
+        };
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(recoverable_gate_intent(&store, root).unwrap());
+        record.before_pending = false;
+        record.before_gate = None;
+        record.outcome = Some(Outcome::Pending {
+            reference: "remote".into(),
+        });
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: other.clone(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(!recoverable_gate_intent(&store, root).unwrap());
+        record.outcome = Some(Outcome::Succeeded("done".into()));
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: other,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(recoverable_gate_intent(&store, root).unwrap());
+    }
 
     #[test]
     fn stale_conversation_version_cannot_settle_nested_job() {

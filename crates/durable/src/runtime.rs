@@ -8304,6 +8304,33 @@ impl Harness {
                         "runtime/extension-report/{id}/{operation_id}/tool_execution_panic"
                     );
                     let panicked = self.owner.store().get(panic_key.as_bytes())?.is_some();
+                    if !c.abort_requested
+                        && !panicked
+                        && replay == ReplayPolicy::Safe
+                        && stored_identity == Some(DispatchIdentity::Other)
+                        && restarts.saturating_add(1) < self.options.restart_limit
+                        && crate::nested::recoverable_gate_intent(self.owner.store(), operation_id)?
+                    {
+                        c.nested_resume = Some(NestedResume {
+                            operation_id,
+                            restarts,
+                            dispatch_identity: DispatchIdentity::Other,
+                            explicit_suspend: true,
+                        });
+                        c.phase = Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason: "interrupted before nested gate suspension".into(),
+                            arguments: Some(arguments),
+                        };
+                        self.recovering = true;
+                        let result = self.save(&c, Expected::Version(version));
+                        self.recovering = false;
+                        return result;
+                    }
                     if !c.extensions.is_empty()
                         && !panicked
                         && replay == ReplayPolicy::Safe

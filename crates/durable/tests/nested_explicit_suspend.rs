@@ -77,6 +77,228 @@ impl KeyedTool for Parent {
 }
 struct Child(Arc<AtomicUsize>);
 struct GateChild(Arc<AtomicUsize>);
+
+struct PreSuspendParent {
+    root: std::path::PathBuf,
+    stop: bool,
+}
+#[async_trait]
+impl KeyedTool for PreSuspendParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        match host
+            .call_keyed_unpolled("child-key", "child", json!({}))
+            .await
+        {
+            Outcome::Pending { .. } => {
+                if self.stop {
+                    std::fs::write(self.root.join("before-suspend"), b"ready").unwrap();
+                    std::future::pending::<()>().await;
+                }
+                host.suspend_pending().unwrap();
+                Outcome::Succeeded("discarded".into()).into()
+            }
+            outcome => outcome.into(),
+        }
+    }
+}
+struct PreparedGateChild(std::path::PathBuf);
+#[async_trait]
+impl Tool for PreparedGateChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn prepare_arguments(&self, mut args: Value) -> pi_rs_core::ExtensionResult<Value> {
+        let path = self.0.join("preparations");
+        let n = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        std::fs::write(path, n.to_string()).unwrap();
+        if n > 1 && self.0.join("reject-prepare").exists() {
+            return Err("wake prepare rejected".into());
+        }
+        args["prepared"] = json!(n);
+        Ok(args)
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        std::fs::write(self.0.join("dispatched"), args.to_string()).unwrap();
+        Outcome::Succeeded("prepared child".into())
+    }
+}
+fn crash_gate_options(root: &std::path::Path, stop: bool, unsafe_parent: bool) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(PreSuspendParent {
+                root: root.into(),
+                stop,
+            }))
+            .register(if unsafe_parent {
+                ReplayPolicy::Unsafe
+            } else {
+                ReplayPolicy::Safe
+            }),
+            RegisteredTool {
+                tool: Arc::new(PreparedGateChild(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn before_suspend_gate_kill_worker() {
+    let Some(root) = std::env::var_os("PI_GATE_PRESUSPEND_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mode = if std::env::var_os("PI_GATE_DEADLINE").is_some() {
+        "time"
+    } else {
+        "signal"
+    };
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        crash_gate_options(&root, true, std::env::var_os("PI_GATE_UNSAFE").is_some()),
+        hook_registry(Arc::new(NestedGate {
+            mode,
+            seen: Arc::default(),
+        })),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_before_suspend_gate_recovers_and_reprepares_after_signal_or_deadline() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for mode in ["signal", "time", "abort", "unsafe", "invalid"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "before_suspend_gate_kill_worker"])
+            .env("PI_GATE_PRESUSPEND_DIR", root);
+        if mode == "time" {
+            command.env("PI_GATE_DEADLINE", "1");
+        }
+        if mode == "unsafe" {
+            command.env("PI_GATE_UNSAFE", "1");
+        }
+        let mut process = Kill(command.spawn().unwrap());
+        until(|| root.join("before-suspend").exists()).await;
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("preparations")).unwrap(),
+            "1"
+        );
+        let id = std::fs::read_to_string(root.join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        if mode == "invalid" {
+            std::fs::write(root.join("reject-prepare"), b"yes").unwrap();
+        }
+        let mut scheduler = Scheduler::open_with_extensions(
+            root.join("db"),
+            crash_gate_options(root, false, mode == "unsafe"),
+            hook_registry(Arc::new(NestedGate {
+                mode: if mode == "time" { "time" } else { "signal" },
+                seen: seen.clone(),
+            })),
+        )
+        .unwrap();
+        if mode == "abort" {
+            scheduler.abort(id).unwrap();
+            scheduler.shutdown().await.unwrap();
+            let mut reopened = Scheduler::open_with_extensions(
+                root.join("db"),
+                crash_gate_options(root, false, false),
+                hook_registry(Arc::new(NestedGate {
+                    mode: "signal",
+                    seen: Arc::default(),
+                })),
+            )
+            .unwrap();
+            reopened.schedule(id);
+            wait(&mut reopened, id).await;
+            reopened.shutdown().await.unwrap();
+            assert!(!root.join("dispatched").exists());
+            continue;
+        }
+        if mode == "unsafe" {
+            assert!(scheduler.blocked(id).unwrap().is_some());
+            assert!(!scheduler.conversation(id).unwrap().nested_suspended());
+            scheduler.shutdown().await.unwrap();
+            assert!(!root.join("dispatched").exists());
+            continue;
+        }
+        if mode == "signal" || mode == "invalid" {
+            scheduler
+                .send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+                    uuid::Uuid::new_v4(),
+                    id,
+                    "gate".into(),
+                    json!(42),
+                ))
+                .unwrap();
+        }
+        scheduler.schedule(id);
+        wait(&mut scheduler, id).await;
+        assert!(scheduler.blocked(id).unwrap().is_none(), "{mode}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("preparations")).unwrap(),
+            "2"
+        );
+        if mode == "invalid" {
+            assert!(!root.join("dispatched").exists());
+            assert!(seen.lock().unwrap().is_empty());
+            assert!(scheduler.conversation(id).unwrap().messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("wake prepare rejected"))));
+            scheduler.shutdown().await.unwrap();
+            continue;
+        }
+        let args: Value =
+            serde_json::from_slice(&std::fs::read(root.join("dispatched")).unwrap()).unwrap();
+        assert_eq!(args["prepared"], 2);
+        assert_eq!(
+            seen.lock().unwrap()[0]["reason"],
+            if mode == "time" { "time" } else { "signal" }
+        );
+        assert_eq!(seen.lock().unwrap()[0]["prepared"], 2);
+        scheduler.shutdown().await.unwrap();
+    }
+}
 #[async_trait]
 impl Tool for GateChild {
     fn spec(&self) -> ToolSpec {
@@ -102,11 +324,15 @@ impl pi_rs_durable::extension::Hook for NestedGate {
         if call.name != "child" {
             return Ok(BeforeTool::Pass);
         }
-        let wake = ctx
+        let mut wake = ctx
             .snapshot
             .get("nested_before_tool_wake")
             .cloned()
             .unwrap_or(Value::Null);
+        if let (Some(wake), Some(prepared)) = (wake.as_object_mut(), call.arguments.get("prepared"))
+        {
+            wake.insert("prepared".into(), prepared.clone());
+        }
         self.seen.lock().unwrap().push(wake.clone());
         if !wake.is_null() && self.mode != "repeat" {
             return Ok(BeforeTool::Pass);
