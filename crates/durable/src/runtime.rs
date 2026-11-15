@@ -10056,9 +10056,10 @@ impl Harness {
                                                         invocation.operation_id,
                                                         progress_host.clone(),
                                                         control.clone(),
-                                                        Some(diagnostics.clone()),
-                                                        c.tool_attempt().map(|attempt| {
-                                                            Arc::new(RuntimeStreamOutput {
+                                                        (
+                                                            Some(diagnostics.clone()),
+                                                            c.tool_attempt().map(|attempt| {
+                                                                Arc::new(RuntimeStreamOutput {
                                                             owner: Arc::downgrade(&self.owner),
                                                             source: self
                                                                 .merged_source
@@ -10074,7 +10075,8 @@ impl Harness {
                                                             as Arc<
                                                                 dyn crate::keyed_tool::StreamSink,
                                                             >
-                                                        }),
+                                                            }),
+                                                        ),
                                                         crate::task_tool::scope(
                                                             task_adapter.clone(),
                                                             operation_id,

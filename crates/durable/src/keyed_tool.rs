@@ -37,8 +37,7 @@ pub(crate) async fn scope<F: std::future::Future>(
         operation_id,
         ordinary,
         Arc::new(Mutex::new(Default::default())),
-        None,
-        None,
+        (None, None),
         future,
     )
     .await
@@ -50,8 +49,10 @@ pub(crate) async fn scope_with_control<F: std::future::Future>(
     operation_id: uuid::Uuid,
     ordinary: Arc<dyn ToolHost>,
     control: Arc<Mutex<crate::reset::ToolControl>>,
-    diagnostics: Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
-    stream: Option<Arc<dyn StreamSink>>,
+    (diagnostics, stream): (
+        Option<Arc<Mutex<Vec<crate::runtime::ToolDiagnostic>>>>,
+        Option<Arc<dyn StreamSink>>,
+    ),
     future: F,
 ) -> F::Output {
     let _invocation_scope = crate::nested::InvocationScope(nested.clone());
