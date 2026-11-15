@@ -32,6 +32,8 @@ enum Request {
         thinking: Option<String>,
         #[serde(default)]
         reported_thinking: bool,
+        #[serde(default)]
+        reported_reasoning: Option<bool>,
         session: PathBuf,
     },
     CacheWarmingChanged,
@@ -802,6 +804,7 @@ async fn run_worker(
             model,
             thinking,
             reported_thinking,
+            reported_reasoning,
             session,
         } = request
         {
@@ -823,6 +826,8 @@ async fn run_worker(
                 .await;
             }
             args.model = model;
+            args.thinking_profile = (reported_thinking || reported_reasoning.is_some())
+                .then(|| (args.model.clone(), Vec::new(), reported_reasoning));
             args.thinking = thinking;
             args.session = session;
             runtime.configure_model_options(&args, reported_thinking)?;

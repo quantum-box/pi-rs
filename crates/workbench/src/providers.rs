@@ -761,7 +761,7 @@ impl Client {
                     .chat_compatibility(&args.provider, configured.as_ref());
                 let client = client.with_chat_compatibility(
                     compatibility,
-                    configured.as_ref().and_then(|model| model.reasoning),
+                    super::thinking::adopted_reasoning(args),
                     thinking.is_some_and(|level| level != "off"),
                     configured
                         .as_ref()
@@ -770,7 +770,14 @@ impl Client {
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();
-                Self::Ollama(client.with_sampling(sampling)?)
+                Self::Ollama(
+                    client
+                        .with_thinking_budgets(
+                            thinking,
+                            args.settings.value().get("thinkingBudgets").cloned(),
+                        )
+                        .with_sampling(sampling)?,
+                )
             }
             Self::Anthropic(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
@@ -958,26 +965,31 @@ impl Client {
         })
     }
 
-    pub async fn thinking_levels(&self, model: &str) -> Option<(Vec<String>, Option<bool>)> {
+    pub async fn thinking_levels(
+        &self,
+        model: &str,
+    ) -> Option<(Option<Vec<String>>, Option<bool>)> {
         match self {
             Self::Ollama(client) => {
                 let details = client.model_details(&[model.into()]).await.remove(model)?;
-                Some((details.thinking_levels?, details.reasoning))
+                (details.thinking_levels.is_some() || details.reasoning.is_some())
+                    .then_some((details.thinking_levels, details.reasoning))
             }
             Self::Anthropic(client) => client
                 .model(model)
                 .await
                 .filter(|entry| entry.has_known_thinking())
-                .map(|entry| (entry.thinking_levels, entry.reasoning)),
+                .map(|entry| (Some(entry.thinking_levels), entry.reasoning)),
             Self::Google(client) => client
                 .model(model)
                 .await
-                .map(|entry| (entry.thinking_levels, Some(entry.reasoning))),
+                .map(|entry| (Some(entry.thinking_levels), Some(entry.reasoning))),
             Self::PiMessages(client) => {
                 let details = client.model_details(&[model.into()]).await.remove(model)?;
-                Some((details.thinking_levels?, details.reasoning))
+                (details.thinking_levels.is_some() || details.reasoning.is_some())
+                    .then_some((details.thinking_levels, details.reasoning))
             }
-            Self::OpenAi(_) => Some((pi_rs::openai::thinking_levels(model), None)),
+            Self::OpenAi(_) => Some((Some(pi_rs::openai::thinking_levels(model)), None)),
             Self::Bedrock(_) => None,
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await

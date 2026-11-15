@@ -32,6 +32,8 @@ pub struct Ollama {
     headers: HeaderMap,
     cache_retention: CacheRetention,
     reasoning_effort: Option<String>,
+    thinking_budget_level: Option<String>,
+    thinking_budgets: Option<Value>,
     compatibility: ChatCompatibility,
     supports_reasoning: Option<bool>,
     reasoning_enabled: bool,
@@ -115,6 +117,8 @@ impl Ollama {
             headers: HeaderMap::new(),
             cache_retention: CacheRetention::None,
             reasoning_effort: None,
+            thinking_budget_level: None,
+            thinking_budgets: None,
             compatibility: ChatCompatibility::default(),
             supports_reasoning: None,
             reasoning_enabled: false,
@@ -215,6 +219,13 @@ impl Ollama {
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         self.reasoning_effort = effort.map(str::to_owned);
+        self
+    }
+
+    /// Set the selected Pi thinking level and optional budget overrides.
+    pub fn with_thinking_budgets(mut self, level: Option<&str>, budgets: Option<Value>) -> Self {
+        self.thinking_budget_level = level.map(str::to_owned);
+        self.thinking_budgets = budgets;
         self
     }
 
@@ -659,6 +670,8 @@ impl Model for Ollama {
             self.reasoning_enabled,
             self.allow_reasoning_off,
             &self.reasoning_effort,
+            &self.thinking_budget_level,
+            &self.thinking_budgets,
             &self.sampling,
             self.cache_retention.anthropic_control(),
         ))
@@ -765,6 +778,13 @@ impl Model for Ollama {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        self.compatibility.thinking_budget_options(
+            &mut body,
+            self.thinking_budget_level.as_deref(),
+            self.thinking_budgets.as_ref(),
+            request.max_output_tokens,
+            self.supports_reasoning,
+        )?;
         self.compatibility.reasoning_options(
             &mut body,
             self.supports_reasoning,
@@ -1185,6 +1205,65 @@ struct CallDelta {
 
 #[cfg(test)]
 mod content_tests {
+    #[tokio::test]
+    async fn configured_thinking_budget_is_sent_on_wire() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            let (offset, length) = loop {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0 && bytes.len() + count < 65536);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..pos]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    break (pos + 4, length);
+                }
+            };
+            while bytes.len() - offset < length {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0 && bytes.len() + count < 65536);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
+            assert_eq!(body["thinking_budget_tokens"], 2500);
+            assert_eq!(body["reasoning_effort"], "high");
+            let reply = "data: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+        });
+        let compat =
+            serde_json::from_value(json!({"thinkingTokenBudgetField":"thinking_budget_tokens"}))
+                .unwrap();
+        let model = Ollama::new(&format!("http://{address}"), None)
+            .unwrap()
+            .with_chat_compatibility(compat, Some(true), true, true)
+            .with_mapped_reasoning_effort(Some("high"))
+            .with_thinking_budgets(Some("low"), Some(json!({"low":2500, "high":7000})));
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 4096,
+        };
+        let _stream = model.stream(request).await.unwrap();
+        worker.join().unwrap();
+    }
+
     #[tokio::test]
     async fn auth_header_error_literals_are_not_classified() {
         use std::io::{Read, Write};

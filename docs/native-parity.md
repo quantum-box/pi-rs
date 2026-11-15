@@ -3807,6 +3807,17 @@ override provider settings, model overrides apply afterward, and explicit
 `samplingParams.priority` takes final precedence. Focused loopback tests cover
 these configuration paths; no live vLLM server was used.
 
+For reasoning-enabled Chat Completions models, `compat.thinkingTokenBudgetField`
+selects `thinking_token_budget`, `thinking_budget`, or `thinking_budget_tokens`;
+`supportsThinkingTokenBudget: true` selects `thinking_token_budget` by default.
+Model compatibility overrides provider values. The selected thinking level uses
+Pi's default or configured `thinkingBudgets`, capped to leave 1,024 tokens for
+the answer within the host's output limit. Off and non-reasoning models omit the
+field. Discovered Ollama reasoning capability is carried through the RPC and
+interactive worker to the request, even when discovery omits explicit thinking
+levels. Chat-template `thinking.budget` variables remain unsupported. The request
+field is covered by loopback tests; no live compatible server was used.
+
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
