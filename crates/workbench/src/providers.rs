@@ -1216,6 +1216,12 @@ mod estimation_tests {
                 Some(false),
             ),
             (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":false}}}}),
+                None,
+            ),
+            (
                 "openrouter",
                 "~deepseek/deepseek-flash-latest",
                 serde_json::json!({}),
@@ -1224,20 +1230,32 @@ mod estimation_tests {
             (
                 "together",
                 "deepseek-ai/DeepSeek-V4-Pro-0813",
-                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":true}}}}),
+                serde_json::json!({}),
                 None,
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":true}}}}),
+                Some(false),
             ),
             (
                 "huggingface",
                 "deepseek-ai/DeepSeek-R1",
-                serde_json::json!({"providers":{"huggingface":{"modelOverrides":{"deepseek-ai/DeepSeek-R1":{"compat":{"supportsStrictMode":false}}}}}}),
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":true},"modelOverrides":{"deepseek-ai/DeepSeek-R1":{"compat":{"supportsStrictMode":false}}}}}}),
                 None,
             ),
             (
                 "huggingface",
                 "custom",
-                serde_json::json!({"providers":{"huggingface":{"models":[{"id":"custom"}]}}}),
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":true},"models":[{"id":"custom","compat":{"supportsStrictMode":false}}]}}}),
                 None,
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":false},"models":[{"id":"deepseek-ai/DeepSeek-V4-Pro-0813","compat":{"supportsStrictMode":true}}]}}}),
+                Some(false),
             ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

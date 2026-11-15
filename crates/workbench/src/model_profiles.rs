@@ -1238,9 +1238,16 @@ impl Profiles {
 
     pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
         let profile = self.entries.get(provider.id());
-        let model = self
+        let mut model = self
             .definition(provider, id)
             .map(|model| model.metadata.clone().with_model_defaults());
+        // Pi applies provider compatibility over bundled model defaults, while
+        // explicitly configured models and modelOverrides take precedence.
+        if let (Some(profile), Some(model)) = (profile, &mut model)
+            && !profile.models.iter().any(|configured| configured.id == id)
+        {
+            model.compat = model.compat.clone().overlay(profile.compat.clone());
+        }
         match profile.and_then(|profile| profile.overrides.get(id)) {
             Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
             None => model,
@@ -1723,6 +1730,37 @@ mod tests {
         assert_eq!(
             profiles.responses_cache_support(&openai, Some(&model)),
             (true, true)
+        );
+    }
+
+    #[test]
+    fn builtin_provider_compatibility_precedes_catalog_but_not_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+            "compat":{"supportsLongCacheRetention":false},
+            "modelOverrides":{"gpt-6-sol":{"compat":{"supportsLongCacheRetention":true}}},
+            "models":[{"id":"custom","compat":{"supportsLongCacheRetention":true}}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("openai").unwrap();
+        let builtin = profiles.model(&provider, "gpt-6-sol").unwrap();
+        assert!(
+            profiles
+                .responses_cache_support(&provider, Some(&builtin))
+                .0
+        );
+        let custom = profiles.model(&provider, "custom").unwrap();
+        assert!(profiles.responses_cache_support(&provider, Some(&custom)).0);
+
+        let without_override = Profiles::parse(&json!({"providers":{"openai":{
+            "compat":{"supportsLongCacheRetention":false}
+        }}}))
+        .unwrap();
+        let provider = without_override.provider("openai").unwrap();
+        let builtin = without_override.model(&provider, "gpt-6-sol").unwrap();
+        assert!(
+            !without_override
+                .responses_cache_support(&provider, Some(&builtin))
+                .0
         );
     }
 

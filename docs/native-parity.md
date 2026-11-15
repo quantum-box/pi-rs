@@ -3980,15 +3980,17 @@ is replayed only to the model and endpoint that produced it when the receiving
 adapter requires that field.
 
 For Chat Completions, `compat.vllmPriority` supplies the numeric top-level
-`priority` request field, including zero and negative values. Model settings
-override provider settings, model overrides apply afterward, and explicit
+`priority` request field, including zero and negative values. Custom model settings
+override provider settings; provider settings override bundled model defaults.
+Model overrides apply afterward, and explicit
 `samplingParams.priority` takes final precedence. Focused loopback tests cover
 these configuration paths; no live vLLM server was used.
 
 For reasoning-enabled Chat Completions models, `compat.thinkingTokenBudgetField`
 selects `thinking_token_budget`, `thinking_budget`, or `thinking_budget_tokens`;
 `supportsThinkingTokenBudget: true` selects `thinking_token_budget` by default.
-Model compatibility overrides provider values. The selected thinking level uses
+Custom model compatibility overrides provider values, while provider settings
+override bundled model defaults. The selected thinking level uses
 Pi's default or configured `thinkingBudgets`, capped to leave 1,024 tokens for
 the answer within the host's output limit. Off and non-reasoning models omit the
 field. Discovered Ollama reasoning capability is carried through the RPC and
@@ -4258,9 +4260,9 @@ sessions, and header overrides.
 The bundled Pi v1.5.0 Chat Completions entries retain their per-model
 `supportsStrictMode` flags. Models declaring support send `strict: false` on
 ordinary function tools; models declaring no support omit the field. Built-in
-model flags override provider defaults, while an explicit model override can
-replace the flag. User-defined models continue to use their configured or
-provider compatibility settings.
+model flags override built-in provider defaults. An explicit provider setting
+overrides bundled model flags, and a model override takes precedence over both.
+User-defined models use their own compatibility settings over provider settings.
 
 ### Chat catalog pricing checkpoint
 
