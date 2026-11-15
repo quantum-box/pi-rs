@@ -476,8 +476,9 @@ Current limits and differences from upstream Pi Durable:
   replay must sample a fresh timestamp. Clock jumps after staging are not observed.
   Repeating a key after a delivered or duplicate result validates the new
   value and returns duplicate without changing the staged receipt. An invalid
-  value may be retried; repeats after a closed or missing target remain
-  unsupported. Self-delivery is excluded (upstream
+  value may be retried. Repeated missing or closed targets retain their fenced
+  outcome; for an expired key, each new value is validated before closed is
+  returned. Self-delivery is excluded (upstream
   permits it), and signal checks cannot overlap another batch
   participant's checked keys (for example an entry's task ancestor or a newly
   created child). It is not a general host transaction or upstream `tx.signal`.

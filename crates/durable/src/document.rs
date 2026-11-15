@@ -21,7 +21,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Signal(#[from] crate::task_store::Error),
-    #[error("self-delivery or an unsupported repeated typed signal cannot be staged")]
+    #[error("self-delivery cannot be staged")]
     SignalComposition,
     #[error("invalid or unsupported document operations or stale base")]
     InvalidOperations,
@@ -1189,6 +1189,15 @@ type PendingEntries = (
     bool, // whether an entry was staged
 );
 
+#[derive(Clone, Copy)]
+enum StagedSignalStatus {
+    Invalid,
+    NotFound,
+    ClosedTarget,
+    ClosedKey,
+    Present,
+}
+
 /// Checked document operations at one invocation-wide immutable revision.
 /// Staged values are visible to later reads. A staged new document has version
 /// zero; existing staged documents retain their original version until commit.
@@ -1203,7 +1212,7 @@ pub struct TaskDocuments<'a> {
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
     signal: OwnedBatch,
-    signal_keys: HashMap<(uuid::Uuid, String, String), crate::task_store::SignalResult>,
+    signal_keys: HashMap<(uuid::Uuid, String, String), StagedSignalStatus>,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
 }
@@ -1334,8 +1343,9 @@ impl<'a> TaskDocuments<'a> {
     /// on replay; elapsed monotonic time is checked at the storage commit boundary.
     /// Clock jumps after staging are not observed. Repeating a delivered or
     /// duplicate key validates the new payload and returns duplicate without
-    /// staging another receipt; an invalid value may be retried. Repeats after
-    /// a closed or missing target and self-delivery remain unsupported.
+    /// staging another receipt; an invalid value may be retried. Repeated
+    /// closed or missing outcomes retain their original fenced observation.
+    /// Self-delivery remains unsupported.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1351,28 +1361,38 @@ impl<'a> TaskDocuments<'a> {
         if task_id == self.task.id() {
             return Err(Error::SignalComposition);
         }
-        if let Some(previous) = self.signal_keys.get(&identity) {
-            if matches!(
-                previous,
-                crate::task_store::SignalResult::Delivered
-                    | crate::task_store::SignalResult::Duplicate
-            ) {
-                return match crate::task_store::Signal::new_typed(
-                    uuid::Uuid::nil(),
-                    task_id,
-                    token,
-                    key,
-                    value,
-                ) {
-                    Ok(_) => Ok(crate::task_store::SignalResult::Duplicate),
-                    Err(crate::task_store::Error::InvalidSignalPayload) => {
-                        Ok(crate::task_store::SignalResult::Invalid)
-                    }
-                    Err(error) => Err(error.into()),
-                };
-            }
-            if *previous != crate::task_store::SignalResult::Invalid {
-                return Err(Error::SignalComposition);
+        if let Some(previous) = self.signal_keys.get(&identity).copied() {
+            match previous {
+                StagedSignalStatus::NotFound => {
+                    return Ok(crate::task_store::SignalResult::NotFound);
+                }
+                StagedSignalStatus::ClosedTarget => {
+                    return Ok(crate::task_store::SignalResult::Closed);
+                }
+                StagedSignalStatus::Present | StagedSignalStatus::ClosedKey => {
+                    return match crate::task_store::Signal::new_typed(
+                        uuid::Uuid::nil(),
+                        task_id,
+                        token,
+                        key,
+                        value,
+                    ) {
+                        Ok(_) => Ok(match previous {
+                            StagedSignalStatus::Present => {
+                                crate::task_store::SignalResult::Duplicate
+                            }
+                            StagedSignalStatus::ClosedKey => {
+                                crate::task_store::SignalResult::Closed
+                            }
+                            _ => unreachable!(),
+                        }),
+                        Err(crate::task_store::Error::InvalidSignalPayload) => {
+                            Ok(crate::task_store::SignalResult::Invalid)
+                        }
+                        Err(error) => Err(error.into()),
+                    };
+                }
+                StagedSignalStatus::Invalid => {}
             }
         }
         let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
@@ -1382,6 +1402,21 @@ impl<'a> TaskDocuments<'a> {
             value,
             || now_millis,
         )?;
+        let staged_status = match result {
+            crate::task_store::SignalResult::Invalid => StagedSignalStatus::Invalid,
+            crate::task_store::SignalResult::NotFound => StagedSignalStatus::NotFound,
+            crate::task_store::SignalResult::Delivered
+            | crate::task_store::SignalResult::Duplicate => StagedSignalStatus::Present,
+            crate::task_store::SignalResult::Closed
+                if batch
+                    .checks
+                    .iter()
+                    .any(|check| check.key == crate::task_store::signal_revision_key(task_id)) =>
+            {
+                StagedSignalStatus::ClosedKey
+            }
+            crate::task_store::SignalResult::Closed => StagedSignalStatus::ClosedTarget,
+        };
         // Only the target and its revision may be shared between deliveries.
         // Other overlaps remain errors when the complete transaction is composed.
         let shared = [
@@ -1424,7 +1459,7 @@ impl<'a> TaskDocuments<'a> {
             }
             self.signal.mutations.push(mutation);
         }
-        self.signal_keys.insert(identity, result);
+        self.signal_keys.insert(identity, staged_status);
         Ok(result)
     }
 

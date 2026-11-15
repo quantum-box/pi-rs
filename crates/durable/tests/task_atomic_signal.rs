@@ -398,10 +398,7 @@ impl Handler for MultiSend {
         ) {
             assert_eq!(repeated.unwrap(), SignalResult::Duplicate);
         } else {
-            assert!(matches!(
-                repeated,
-                Err(pi_rs_durable::document::Error::SignalComposition)
-            ));
+            assert_eq!(repeated.unwrap(), results[0]);
         }
         self.attempts.lock().unwrap().push(results);
         docs.get(&addr()).unwrap();
@@ -948,5 +945,225 @@ fn repeated_staged_signal_validates_each_value_and_commits_one_receipt() {
             .checkpoint()
             .phase,
         "done"
+    );
+}
+
+struct RepeatClosedOrMissing {
+    path: std::path::PathBuf,
+    mode: u8,
+    attempts: Arc<Mutex<Vec<Vec<SignalResult>>>>,
+}
+impl Handler for RepeatClosedOrMissing {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        current_task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if current_task.checkpoint().phase == "done" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        let token = SignalToken::with_schema("answer", 1, json!({"type":"integer"})).unwrap();
+        let target = Uuid::from_u128(if self.mode == 2 || self.mode == 3 {
+            4
+        } else {
+            2
+        });
+        let now = if self.mode == 0 || self.mode == 4 {
+            100
+        } else {
+            99
+        };
+        let first = docs.signal_at(target, &token, "a", json!(1), now).unwrap();
+        let attempt = self.attempts.lock().unwrap().len();
+        if self.mode == 3 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            let target = task(4, "receiver");
+            TaskStore::new(&db).save(&[Save::Create(&target)]).unwrap();
+        }
+        if self.mode == 4 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            assert_eq!(
+                TaskStore::new(&db)
+                    .deliver_signal_at(target, &token, "a", json!(7), 99)
+                    .unwrap(),
+                SignalResult::Delivered
+            );
+        }
+        let second = docs
+            .signal_at(target, &token, "a", json!("bad"), now)
+            .unwrap();
+        let third = docs.signal_at(target, &token, "a", json!(2), now).unwrap();
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(vec![first, second, third]);
+        docs.get(&addr()).unwrap();
+        docs.put(
+            &addr(),
+            json!({"committed":true}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        Ok(Step::Continue(cp("done")))
+    }
+}
+
+#[test]
+fn repeated_closed_and_missing_obey_validation_order_and_reopen() {
+    use pi_rs_durable::task_store::SignalState;
+    for mode in 0..=2 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        setup(&path, if mode == 0 { Some(100) } else { None });
+        if mode == 1 {
+            let db = Store::open(&path).unwrap();
+            let ts = TaskStore::new(&db);
+            let target = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
+            ts.update(&target, |task| task.cancel()).unwrap();
+        }
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry.register(
+            "sender",
+            true,
+            RepeatClosedOrMissing {
+                path: path.clone(),
+                mode,
+                attempts: attempts.clone(),
+            },
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        scheduler.submit(&task(1, "sender")).unwrap();
+        assert!(scheduler.tick(99).unwrap());
+        let expected = match mode {
+            0 => vec![
+                SignalResult::Closed,
+                SignalResult::Invalid,
+                SignalResult::Closed,
+            ],
+            1 => vec![SignalResult::Closed; 3],
+            _ => vec![SignalResult::NotFound; 3],
+        };
+        assert_eq!(*attempts.lock().unwrap(), vec![expected]);
+        drop(scheduler);
+        let db = Store::open(&path).unwrap();
+        assert_eq!(
+            Documents::new(&db).get(&addr()).unwrap().unwrap().value["committed"],
+            true
+        );
+        if mode == 0 {
+            let token = SignalToken::with_schema("answer", 1, json!({"type":"integer"})).unwrap();
+            assert_eq!(
+                TaskStore::new(&db)
+                    .read_typed_signal_state(Uuid::from_u128(2), &token, "a")
+                    .unwrap(),
+                Some(SignalState::Expired)
+            );
+        }
+    }
+}
+
+#[test]
+fn repeated_missing_is_fenced_against_concurrent_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry.register(
+        "sender",
+        true,
+        RepeatClosedOrMissing {
+            path: path.clone(),
+            mode: 3,
+            attempts: attempts.clone(),
+        },
+    );
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    scheduler.submit(&task(1, "sender")).unwrap();
+    assert!(scheduler.tick(99).unwrap());
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![vec![SignalResult::NotFound; 3]]
+    );
+    let db = Store::open(&path).unwrap();
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_none());
+    drop(db);
+    assert!(scheduler.tick(99).unwrap());
+    assert_eq!(
+        attempts.lock().unwrap()[1],
+        vec![
+            SignalResult::Delivered,
+            SignalResult::Invalid,
+            SignalResult::Duplicate
+        ]
+    );
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    let token = SignalToken::with_schema("answer", 1, json!({"type":"integer"})).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .read_typed_signal(Uuid::from_u128(4), &token, "a")
+            .unwrap(),
+        Some(json!(1))
+    );
+    assert_eq!(
+        Documents::new(&db).get(&addr()).unwrap().unwrap().value["committed"],
+        true
+    );
+}
+
+#[test]
+fn repeated_expired_is_fenced_against_concurrent_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    setup(&path, Some(100));
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry.register(
+        "sender",
+        true,
+        RepeatClosedOrMissing {
+            path: path.clone(),
+            mode: 4,
+            attempts: attempts.clone(),
+        },
+    );
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    scheduler.submit(&task(1, "sender")).unwrap();
+    assert!(scheduler.tick(99).unwrap());
+    assert_eq!(
+        attempts.lock().unwrap()[0],
+        vec![
+            SignalResult::Closed,
+            SignalResult::Invalid,
+            SignalResult::Closed
+        ]
+    );
+    let db = Store::open(&path).unwrap();
+    assert!(Documents::new(&db).get(&addr()).unwrap().is_none());
+    drop(db);
+    assert!(scheduler.tick(99).unwrap());
+    assert_eq!(
+        attempts.lock().unwrap()[1],
+        vec![
+            SignalResult::Duplicate,
+            SignalResult::Invalid,
+            SignalResult::Duplicate
+        ]
+    );
+    drop(scheduler);
+    let db = Store::open(&path).unwrap();
+    let token = SignalToken::with_schema("answer", 1, json!({"type":"integer"})).unwrap();
+    assert_eq!(
+        TaskStore::new(&db)
+            .read_typed_signal(Uuid::from_u128(2), &token, "a")
+            .unwrap(),
+        Some(json!(7))
+    );
+    assert_eq!(
+        Documents::new(&db).get(&addr()).unwrap().unwrap().value["committed"],
+        true
     );
 }
