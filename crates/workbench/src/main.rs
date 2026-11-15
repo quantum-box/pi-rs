@@ -1316,6 +1316,10 @@ async fn run_cli() -> i32 {
     });
     tokio::task::yield_now().await;
     let mut argv: Vec<_> = std::env::args_os().collect();
+    let export_plan = cli_compat::export_plan(&argv);
+    if let Some(plan) = &export_plan {
+        argv = plan.validation_args.clone();
+    }
     let mut literal_export = None;
     if let Some(metadata) = cli_compat::metadata(&argv) {
         for (error, message) in &metadata.diagnostics {
@@ -1324,7 +1328,7 @@ async fn run_cli() -> i32 {
         if metadata.diagnostics.iter().any(|(error, _)| *error) {
             return 1;
         }
-        if metadata.export && !metadata.version {
+        if (metadata.export || export_plan.is_some()) && !metadata.version {
             literal_export = metadata.literal_export;
             argv = metadata.args_without_help;
         } else {
@@ -1363,6 +1367,14 @@ async fn run_cli() -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        if let Some(plan) = export_plan {
+            if plan.input.as_os_str().is_empty() {
+                return Err(Error::Config("export input is required".into()));
+            }
+            let mut paths = vec![plan.input];
+            paths.extend(plan.output);
+            return export_from_file(&paths);
+        }
         if let Some(paths) = literal_export {
             return export_from_file(&paths);
         }

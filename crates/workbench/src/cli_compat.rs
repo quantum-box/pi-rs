@@ -500,6 +500,152 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
     Some(help)
 }
 
+/// Export paths are resolved independently of Clap's multi-value `--export`.
+/// Keeping them typed prevents a later input from becoming an output path.
+#[derive(Debug)]
+pub(super) struct ExportPlan {
+    pub input: std::path::PathBuf,
+    pub output: Option<std::path::PathBuf>,
+    pub validation_args: Vec<OsString>,
+}
+
+/// Project root export arguments onto native validation arguments while assigning
+/// each original token exactly once. Native subcommands retain their own parser.
+pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
+    let root = command();
+    let mut validation = vec![args.first()?.clone()];
+    let mut input = None;
+    let mut output = None;
+    let mut saw_export = false;
+    let mut saw_message = false;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        let bytes = arg.as_encoded_bytes();
+        if arg == "--" {
+            for value in &args[i + 1..] {
+                if !value.as_encoded_bytes().starts_with(b"@") && output.is_none() {
+                    output = Some(value.clone().into());
+                }
+            }
+            break;
+        }
+        if arg == "--export" {
+            saw_export = true;
+            i += 1;
+            if i == args.len() {
+                // Keep the incomplete option for Clap's normal diagnostic.
+                validation.push(arg.clone());
+                break;
+            }
+            input = Some(args[i].clone().into());
+            i += 1;
+            continue;
+        }
+        if let Some(value) = bytes.strip_prefix(b"--export=") {
+            saw_export = true;
+            // Removing an ASCII prefix preserves an OsStr encoding boundary.
+            let value = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(value) };
+            input = Some(value.into());
+            i += 1;
+            continue;
+        }
+        if !bytes.starts_with(b"-") || arg == "-" {
+            if !saw_export
+                && !saw_message
+                && !bytes.starts_with(b"@")
+                && root.find_subcommand(arg).is_some()
+            {
+                return None;
+            }
+            if !bytes.starts_with(b"@") {
+                saw_message = true;
+                if output.is_none() {
+                    output = Some(arg.clone().into());
+                }
+            }
+            i += 1;
+            continue;
+        }
+        let Some(text) = arg.to_str() else {
+            validation.push(arg.clone());
+            i += 1;
+            continue;
+        };
+        validation.push(arg.clone());
+        if text == "--print" || text == "-p" {
+            if let Some(next) = args.get(i + 1) {
+                let value = next.as_encoded_bytes();
+                if !value.starts_with(b"@")
+                    && (!value.starts_with(b"-") || value.starts_with(b"---"))
+                    && next != "extension"
+                {
+                    saw_message = true;
+                    if output.is_none() {
+                        output = Some(next.clone().into());
+                    }
+                    i += 1;
+                }
+            }
+        } else {
+            let canonical = match text {
+                "-nt" => "--no-tools",
+                "-nbt" => "--no-builtin-tools",
+                "-xt" => "--exclude-tools",
+                "-ne" => "--no-extensions",
+                "-ns" => "--no-skills",
+                "-np" => "--no-prompt-templates",
+                "-nc" => "--no-context-files",
+                "-na" => "--no-trust",
+                _ => text,
+            };
+            let (count, allow_hyphen) = option_values(&root, canonical);
+            let unknown_long = text.strip_prefix("--").is_some_and(|name| {
+                let name = name.split('=').next().unwrap_or(name);
+                long_arg(&root, name).is_none() && flag_name(name) && !text.contains('=')
+            });
+            let count = if unknown_long { 1 } else { count.min(1) };
+            for _ in 0..count {
+                let Some(next) = args.get(i + 1) else { break };
+                let next_bytes = next.as_encoded_bytes();
+                let unconditional = pi_unconditional_value(canonical);
+                if !unconditional
+                    && (next == "--"
+                        || (next_bytes.starts_with(b"-") && !allow_hyphen)
+                        || (unknown_long
+                            && (next_bytes.starts_with(b"@")
+                                || (!saw_message && root.find_subcommand(next).is_some()))))
+                {
+                    break;
+                }
+                // Attach dash-prefixed values so a second normalization does not
+                // mistake them for metadata, while retaining native validation.
+                if unconditional && next_bytes.starts_with(b"-") {
+                    let last = validation.last_mut().expect("option");
+                    if text.starts_with("--") {
+                        last.push("=");
+                    }
+                    last.push(next);
+                } else {
+                    validation.push(next.clone());
+                }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    if !saw_export {
+        return None;
+    }
+    // Empty input cannot be safely confused with an earlier export occurrence.
+    let input = input.unwrap_or_default();
+    Some(ExportPlan {
+        input,
+        output,
+        validation_args: validation,
+    })
+}
+
 /// Parse-time diagnostics that Pi emits before displaying root metadata.
 pub(super) struct Metadata {
     pub(super) version: bool,
@@ -757,6 +903,27 @@ fn option_values(command: &Command, option: &str) -> (usize, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn export_plan_preserves_non_utf8_input_and_output_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let input = OsString::from_vec(b"input-\xff".to_vec());
+        let output = OsString::from_vec(b"output-\xfe".to_vec());
+        let mut attached = OsString::from("--export=");
+        attached.push(&input);
+        let args = vec![
+            "pi".into(),
+            "--export".into(),
+            "old".into(),
+            attached,
+            "--help".into(),
+            output.clone(),
+        ];
+        let plan = export_plan(&args).unwrap();
+        assert_eq!(plan.input.as_os_str(), input);
+        assert_eq!(plan.output.unwrap().as_os_str(), output);
+    }
 
     #[test]
     fn metadata_respects_option_values_delimiters_and_native_commands() {

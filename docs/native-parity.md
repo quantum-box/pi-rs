@@ -1400,7 +1400,10 @@ reported before metadata; version takes precedence over help, and export takes
 precedence over help. Metadata scanning follows Pi's value ownership for its
 options, including values that begin with a dash. Native subcommands retain their
 own Clap parsing and help, while native-only attached values and short-option
-clusters continue to be accepted. Normal invocations without root metadata keep
+clusters continue to be accepted. For root `--export`, the last export input and first positional message select
+the input and HTML output, including when help is present; native option
+validation runs before writing. A missing or empty final export input is rejected
+rather than falling back to an earlier input. Other invocations without root metadata keep
 their existing native argument parsing.
 These selections propagate to persistent CLI workers. The settings editor,
 remaining CLI aliases still require parity work.
