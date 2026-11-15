@@ -1561,6 +1561,28 @@ impl View {
                         self.add_images(images);
                     }
                 }
+                pi_rs::Event::ImportedUnattributedToolResult {
+                    call_id,
+                    tool_name,
+                    content,
+                    is_error,
+                    details,
+                    ..
+                } => {
+                    let outcome = sessions::unattributed_outcome(content, *is_error, details);
+                    let id = format!("unattributed-{}", record.id);
+                    self.lines.push(Entry::Tool {
+                        id: id.clone(),
+                        name: format!("{tool_name} (unattributed, call {call_id})"),
+                        arguments: String::new(),
+                        output: String::new(),
+                        failed: false,
+                        finished: false,
+                        parts: Vec::new(),
+                        numbered_diff: false,
+                    });
+                    self.finish_tool(&id, &outcome);
+                }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
                         id: format!("shell-{}", record.id),
@@ -3639,7 +3661,9 @@ fn slash(
                         pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
                             TreeEntryKind::User
                         }
-                        pi_rs::Event::ToolFinished { .. } | pi_rs::Event::ToolReconciled { .. } => {
+                        pi_rs::Event::ToolFinished { .. }
+                        | pi_rs::Event::ToolReconciled { .. }
+                        | pi_rs::Event::ImportedUnattributedToolResult { .. } => {
                             TreeEntryKind::Tool
                         }
                         pi_rs::Event::Assistant { content, .. }
@@ -7876,6 +7900,102 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restored_unattributed_result_renders_image_parts_when_graphics_enabled() {
+        use super::*;
+        use base64::Engine;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = initial.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: pi_rs::Event::ImportedUnattributedToolResult {
+                call_id: "reused".into(),
+                tool_name: "read".into(),
+                is_error: false,
+                details: None,
+                content: pi_rs::ContextContent::Blocks(vec![
+                    pi_rs::ContentBlock::Text {
+                        text: "before".into(),
+                        text_signature: None,
+                    },
+                    pi_rs::ContentBlock::Image {
+                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        mime_type: "image/png".into(),
+                    },
+                    pi_rs::ContentBlock::Text {
+                        text: "after".into(),
+                        text_signature: None,
+                    },
+                ]),
+            },
+        });
+        Session::from_records(records)
+            .unwrap()
+            .export_jsonl(&path)
+            .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path;
+        for enabled in [true, false] {
+            let mut view = View {
+                graphics: Renderer::test_with_protocol(enabled.then_some(images::Protocol::Kitty)),
+                ..View::default()
+            };
+            view.restore(&args).unwrap();
+            let entry = view.lines.iter().find(|entry| matches!(entry, Entry::Tool { name, .. } if name.contains("unattributed"))).unwrap();
+            let Entry::Tool {
+                parts,
+                output,
+                finished,
+                ..
+            } = entry
+            else {
+                unreachable!()
+            };
+            assert!(*finished);
+            if enabled {
+                assert!(
+                    matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
+                );
+            } else {
+                assert!(parts.is_empty());
+                assert!(output.contains("[image · image/png]"));
+            }
+        }
+    }
+
+    #[test]
+    fn unattributed_text_block_result_displays_patch_details() {
+        let content = pi_rs::ContextContent::Blocks(vec![pi_rs::ContentBlock::Text {
+            text: "applied".into(),
+            text_signature: None,
+        }]);
+        let outcome = super::sessions::unattributed_outcome(
+            &content,
+            false,
+            &Some(serde_json::json!({"patch":"+new line"})),
+        );
+        assert_eq!(super::display_tool_result(&outcome), "applied\n+new line");
+    }
+
     #[test]
     fn indexed_delta_append_handles_interleaving_and_legacy_text() {
         let mut items = std::collections::BTreeMap::new();

@@ -1403,7 +1403,10 @@ modifying the source. It retains original entries alongside native events,
 including branch topology, completed tool results, reasoning, usage, names,
 labels, compaction boundaries and branch-local codemode store values. User and tool-result images reach the model
 adapter as image content. Previously completed tools remain recorded results;
-unfinished imported calls remain uncertain and require reconciliation.
+unfinished imported calls remain uncertain and require reconciliation. When a later assistant message reuses an unfinished call ID, ambiguous results
+are retained as separate, labeled historical content and neither operation is
+resolved automatically. This intentionally differs from Pi’s ID-only result
+pairing because it cannot establish which operation produced the result.
 A source entry with a missing parent is recovered as a separate native branch;
 its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;

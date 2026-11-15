@@ -795,6 +795,7 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
                 | Event::BranchSummary { .. }
                 | Event::CompactionSummaryMessage { .. }
                 | Event::ToolFinished { .. }
+                | Event::ImportedUnattributedToolResult { .. }
                 | Event::SystemCheckpoint { .. }
                 | Event::BashExecution { .. }
         ) | (

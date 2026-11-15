@@ -2739,6 +2739,11 @@ fn metadata(record: &pi_rs::Record) -> Value {
             json!({"event":"branch_summary", "from":from, "target":target, "usage":usage})
         }
         Event::UserImages { images } => json!({"event":"user_images","images":images.len()}),
+        Event::ImportedUnattributedToolResult {
+            call_id, tool_name, ..
+        } => {
+            json!({"event":"imported_unattributed_tool_result","call_id":call_id,"tool_name":tool_name})
+        }
         Event::SourceEntry { format, .. } => json!({"event":"source_entry","format":format}),
         Event::SystemCheckpoint {
             sections,
