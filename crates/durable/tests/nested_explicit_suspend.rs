@@ -76,6 +76,246 @@ impl KeyedTool for Parent {
     }
 }
 struct Child(Arc<AtomicUsize>);
+struct GateChild(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for GateChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Succeeded("gate child done".into())
+    }
+}
+struct NestedGate {
+    mode: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for NestedGate {
+    async fn before_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        ctx: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<pi_rs_durable::extension::BeforeTool, String> {
+        use pi_rs_durable::extension::{BeforeTool, Sleep};
+        if call.name != "child" {
+            return Ok(BeforeTool::Pass);
+        }
+        let wake = ctx
+            .snapshot
+            .get("nested_before_tool_wake")
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.seen.lock().unwrap().push(wake.clone());
+        if !wake.is_null() && self.mode != "repeat" {
+            return Ok(BeforeTool::Pass);
+        }
+        Ok(BeforeTool::Sleep(match self.mode {
+            "signal" | "repeat" => Sleep {
+                signals: vec!["gate".into()],
+                until_millis: None,
+            },
+            "time" => Sleep {
+                signals: vec![],
+                until_millis: Some(0),
+            },
+            _ => Sleep {
+                signals: vec![],
+                until_millis: None,
+            },
+        }))
+    }
+    async fn after_tool_result(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if call.name == "child" && (self.mode == "invalid" || self.mode == "repeat") {
+            assert!(result.is_error);
+            assert_eq!(result.diagnostics[0].code.as_deref(), Some("invalid_park"));
+        }
+        Ok(None)
+    }
+}
+fn gate_options(parent: Arc<KeyedToolAdapter<Parent>>, child: Arc<GateChild>) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: child,
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn nested_gate_signal_reopen_and_deadline_wake() {
+    for mode in ["signal", "time"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let pc = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parent = Arc::new(KeyedToolAdapter::new(Parent(pc.clone())));
+        let child = Arc::new(GateChild(cc.clone()));
+        let registry = || {
+            hook_registry(Arc::new(NestedGate {
+                mode,
+                seen: seen.clone(),
+            }))
+        };
+        let id;
+        {
+            let mut scheduler = Scheduler::open_with_extensions(
+                &path,
+                gate_options(parent.clone(), child.clone()),
+                registry(),
+            )
+            .unwrap();
+            id = scheduler
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 100,
+                })
+                .unwrap();
+            scheduler
+                .select_extensions(id, vec!["hooks".into()])
+                .unwrap();
+            scheduler.submit(id, None, "work".into()).unwrap();
+            until(|| !seen.lock().unwrap().is_empty()).await;
+            if mode == "signal" {
+                until(|| scheduler.conversation(id).unwrap().nested_suspended()).await;
+            }
+            scheduler.shutdown().await.unwrap();
+        }
+        let mut scheduler =
+            Scheduler::open_with_extensions(&path, gate_options(parent, child), registry())
+                .unwrap();
+        if mode == "signal" {
+            scheduler
+                .send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+                    uuid::Uuid::new_v4(),
+                    id,
+                    "gate".into(),
+                    json!(7),
+                ))
+                .unwrap();
+        }
+        scheduler.schedule(id);
+        wait(&mut scheduler, id).await;
+        assert_eq!(cc.load(Ordering::SeqCst), 1, "{mode}");
+        assert_eq!(pc.load(Ordering::SeqCst), 2, "{mode}");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{mode}");
+            assert_eq!(
+                seen[1]["reason"],
+                if mode == "signal" { "signal" } else { "time" }
+            );
+        }
+        scheduler.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn nested_invalid_gate_and_consumed_signal_settle_without_child_execution() {
+    for mode in ["invalid", "repeat"] {
+        let dir = tempfile::tempdir().unwrap();
+        let cc = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parent = Arc::new(KeyedToolAdapter::new(Parent(Arc::new(AtomicUsize::new(0)))));
+        let child = Arc::new(GateChild(cc.clone()));
+        let mut scheduler = Scheduler::open_with_extensions(
+            dir.path().join("db"),
+            gate_options(parent, child),
+            hook_registry(Arc::new(NestedGate {
+                mode,
+                seen: seen.clone(),
+            })),
+        )
+        .unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler
+            .select_extensions(id, vec!["hooks".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        if mode == "repeat" {
+            until(|| scheduler.conversation(id).unwrap().nested_suspended()).await;
+            scheduler
+                .send_signal(&pi_rs_durable::conversation_signal::Signal::new(
+                    uuid::Uuid::new_v4(),
+                    id,
+                    "gate".into(),
+                    json!(1),
+                ))
+                .unwrap();
+            scheduler.schedule(id);
+        }
+        wait(&mut scheduler, id).await;
+        assert_eq!(cc.load(Ordering::SeqCst), 0);
+        assert!(scheduler.blocked(id).unwrap().is_none());
+        assert!(scheduler.extension_reports().unwrap().is_empty());
+        assert!(scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content.contains("cannot wait"))
+        ));
+        scheduler.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn abort_nested_gate_fences_wake_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let pc = Arc::new(AtomicUsize::new(0));
+    let cc = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(pc.clone())));
+    let child = Arc::new(GateChild(cc.clone()));
+    let registry = || {
+        hook_registry(Arc::new(NestedGate {
+            mode: "signal",
+            seen: seen.clone(),
+        }))
+    };
+    let mut scheduler = Scheduler::open_with_extensions(
+        &path,
+        gate_options(parent.clone(), child.clone()),
+        registry(),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| scheduler.conversation(id).unwrap().nested_suspended()).await;
+    scheduler.abort(id).unwrap();
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler =
+        Scheduler::open_with_extensions(&path, gate_options(parent, child), registry()).unwrap();
+    scheduler.schedule(id);
+    wait(&mut scheduler, id).await;
+    assert_eq!(cc.load(Ordering::SeqCst), 0);
+    assert_eq!(pc.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+}
 #[async_trait]
 impl Tool for Child {
     fn spec(&self) -> ToolSpec {

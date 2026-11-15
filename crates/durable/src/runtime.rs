@@ -13995,6 +13995,29 @@ async fn poll_suspended_nested(
     let Phase::Blocked { operation_id, .. } = &state.phase else {
         return Ok(false);
     };
+    match fenced_poll(
+        async {
+            crate::nested::wake_before_gates(
+                worker.owner.store(),
+                *operation_id,
+                id,
+                Harness::key(id),
+                version,
+                (worker.clock)(),
+            )
+        },
+        worker.execution_gate.as_ref(),
+        cancel,
+    )
+    .await
+    {
+        Some(Ok(true)) | Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => {
+            return Ok(true);
+        }
+        Some(Ok(false)) => (),
+        Some(Err(error)) => return Err(error),
+        None => return Ok(false),
+    }
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
         if crate::nested::has_staged_results(worker.owner.store(), *operation_id)? {

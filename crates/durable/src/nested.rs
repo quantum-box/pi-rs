@@ -36,6 +36,8 @@ struct Record {
     prepared: Value,
     #[serde(default)]
     before_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    before_gate: Option<BeforeGate>,
     policy: ReplayPolicy,
     operation_id: Uuid,
     outcome: Option<Outcome>,
@@ -51,6 +53,12 @@ struct Record {
     diagnostic_keys: std::collections::BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolution: Option<Resolution>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct BeforeGate {
+    signals: Vec<String>,
+    until_millis: Option<i64>,
+    wake: Option<Value>,
 }
 
 /// A nested outcome with diagnostics committed for that keyed child.
@@ -197,6 +205,14 @@ pub(crate) fn resolved_for_replay(
     let mut resolved = false;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
+        if record
+            .before_gate
+            .as_ref()
+            .is_some_and(|gate| gate.wake.is_some())
+        {
+            resolved = true;
+            continue;
+        }
         if record.staged_outcome.is_none()
             && matches!(
                 record.outcome,
@@ -219,6 +235,60 @@ pub(crate) fn has_staged_results(
         if record.staged_outcome.is_some() {
             return Ok(true);
         }
+    }
+    Ok(false)
+}
+
+pub(crate) fn wake_before_gates(
+    store: &durable_store::Store,
+    root: Uuid,
+    conversation: Uuid,
+    conversation_key: Vec<u8>,
+    conversation_version: u64,
+    now: i64,
+) -> Result<bool, crate::runtime::Error> {
+    for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let mut record: Record = serde_json::from_slice(&entry.value)?;
+        let Some(gate) = record
+            .before_gate
+            .as_ref()
+            .filter(|gate| gate.wake.is_none())
+        else {
+            continue;
+        };
+        let Some(wake) = crate::conversation_signal::Inbox::new(store).prepare_wake(
+            conversation,
+            &gate.signals,
+            gate.until_millis,
+            now,
+        )?
+        else {
+            continue;
+        };
+        let reason = match &wake.signal {
+            Some(signal) => {
+                serde_json::json!({"reason":"signal", "name":signal.name, "id":signal.id, "payload":signal.payload})
+            }
+            None if gate.signals.is_empty() => serde_json::json!({"reason":"time"}),
+            None => serde_json::json!({"reason":"expired"}),
+        };
+        record.before_gate.as_mut().unwrap().wake = Some(reason);
+        let mut checks = wake.checks;
+        checks.push(Check {
+            key: conversation_key,
+            expected: Expected::Version(conversation_version),
+        });
+        checks.push(Check {
+            key: key.clone(),
+            expected: Expected::Version(entry.version),
+        });
+        let mut mutations = wake.mutations;
+        mutations.push(Mutation::Put {
+            key,
+            value: serde_json::to_vec(&record)?,
+        });
+        store.commit(&checks, &mutations)?;
+        return Ok(true);
     }
     Ok(false)
 }
@@ -606,6 +676,14 @@ impl NestedHost {
             .map_err(|e| e.to_string())?
         {
             let record: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if record
+                .before_gate
+                .as_ref()
+                .is_some_and(|gate| gate.wake.is_none())
+            {
+                pending += 1;
+                continue;
+            }
             match record.outcome {
                 Some(Outcome::Pending { .. }) => pending += 1,
                 None | Some(Outcome::Unknown(_)) => {
@@ -1012,6 +1090,7 @@ impl NestedHost {
                 arguments,
                 prepared: prepared.arguments().clone(),
                 before_pending: self.shared.hooks.is_some(),
+                before_gate: None,
                 policy: reg.replay,
                 operation_id: invocation.operation_id,
                 outcome: None,
@@ -1219,13 +1298,31 @@ impl NestedHost {
         let Some(hooks) = &self.shared.hooks else {
             return Err(self.fail("nested before-tool hooks unavailable"));
         };
+        if record
+            .before_gate
+            .as_ref()
+            .is_some_and(|gate| gate.wake.is_none())
+        {
+            return Err(Outcome::Pending {
+                reference: format!("nested-gate:{}", record.operation_id),
+            });
+        }
         let memo = crate::extension::DurableMemo::new(
             self.shared.owner.clone(),
             record.operation_id,
             hooks.storage_failed.clone(),
         );
+        let mut snapshot = hooks.snapshot.clone();
+        if let Some(wake) = record
+            .before_gate
+            .as_ref()
+            .and_then(|gate| gate.wake.as_ref())
+            && let Some(object) = snapshot.as_object_mut()
+        {
+            object.insert("nested_before_tool_wake".into(), wake.clone());
+        }
         let context = crate::extension::Context {
-            snapshot: &hooks.snapshot,
+            snapshot: &snapshot,
             memo: &memo,
         };
         let call = crate::extension::ToolCall {
@@ -1241,8 +1338,71 @@ impl NestedHost {
         if self.shared.cancellation.is_cancelled() {
             return Err(self.fail("nested before-tool hooks cancelled"));
         }
-        if matches!(decision, crate::extension::BeforeTool::Sleep(_)) {
-            return Err(self.fail("nested before-tool sleep is unsupported"));
+        let mut invalid_gate = false;
+        if let crate::extension::BeforeTool::Sleep(sleep) = &decision {
+            invalid_gate = (sleep.until_millis.is_none() && sleep.signals.is_empty())
+                || sleep.until_millis.is_some_and(|time| time < 0)
+                || sleep.signals.iter().any(String::is_empty);
+            if !invalid_gate {
+                let store = self.shared.owner.store();
+                loop {
+                    match crate::conversation_signal::Inbox::new(store)
+                        .prepare_wait(hooks.conversation, &sleep.signals)
+                    {
+                        Ok(wait) => {
+                            let entry = match store.get(key) {
+                                Ok(Some(entry)) => entry,
+                                _ => return Err(self.fail("nested gate intent missing")),
+                            };
+                            let current: Record = match serde_json::from_slice(&entry.value) {
+                                Ok(value) => value,
+                                Err(error) => return Err(self.fail(error.to_string())),
+                            };
+                            if current.operation_id != record.operation_id
+                                || !current.before_pending
+                                || current.outcome.is_some()
+                                || current.staged_outcome.is_some()
+                            {
+                                return Err(self.fail("nested gate intent changed"));
+                            }
+                            record.before_gate = Some(BeforeGate {
+                                signals: sleep.signals.clone(),
+                                until_millis: sleep.until_millis,
+                                wake: None,
+                            });
+                            let value = match serde_json::to_vec(&record) {
+                                Ok(value) => value,
+                                Err(error) => return Err(self.fail(error.to_string())),
+                            };
+                            let mut checks = wait.checks;
+                            checks.push(Check {
+                                key: key.to_vec(),
+                                expected: Expected::Version(entry.version),
+                            });
+                            let mut mutations = wait.mutations;
+                            mutations.push(Mutation::Put {
+                                key: key.to_vec(),
+                                value,
+                            });
+                            match store.commit(&checks, &mutations) {
+                                Ok(()) => (),
+                                Err(durable_store::Error::Conflict { .. }) => continue,
+                                Err(error) => {
+                                    return Err(self.fail(format!("nested gate commit: {error}")));
+                                }
+                            }
+                            return Err(Outcome::Pending {
+                                reference: format!("nested-gate:{}", record.operation_id),
+                            });
+                        }
+                        Err(crate::conversation_signal::Error::InvalidWait) => {
+                            invalid_gate = true;
+                            break;
+                        }
+                        Err(error) => return Err(self.fail(error.to_string())),
+                    }
+                }
+            }
         }
         record.prepared = rewritten.arguments;
         let invocation = Invocation {
@@ -1254,6 +1414,10 @@ impl NestedHost {
             },
         };
         let rejection = match decision {
+            crate::extension::BeforeTool::Sleep(_) if invalid_gate => Some((
+                "invalid_park",
+                "Tool call cannot wait at its gates: invalid or consumed signal or deadline".into(),
+            )),
             crate::extension::BeforeTool::Block(reason) => {
                 Some(("blocked", format!("Tool call blocked: {reason}")))
             }
@@ -1269,6 +1433,7 @@ impl NestedHost {
             _ => return Err(self.fail("invalid nested before-tool decision")),
         };
         record.before_pending = false;
+        record.before_gate = None;
         if let Some((code, message)) = rejection {
             record.diagnostics.push(crate::runtime::ToolDiagnostic {
                 severity: crate::runtime::DiagnosticSeverity::Error,
@@ -1629,6 +1794,7 @@ mod tests {
             arguments: serde_json::json!({}),
             prepared: serde_json::json!({}),
             before_pending: false,
+            before_gate: None,
             policy: ReplayPolicy::Unsafe,
             operation_id: operation,
             outcome: Some(Outcome::Pending {
