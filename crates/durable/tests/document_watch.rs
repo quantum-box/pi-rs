@@ -384,3 +384,62 @@ fn incremental_document_operations_apply_and_resume_across_reopen() {
     assert_eq!(recreated[0].ops[0][0], "r");
     assert_eq!(apply_chord(value, &recreated[0].ops), json!({"n":7}));
 }
+
+#[test]
+fn actual_operation_writes_are_atomic_under_competing_transactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("operation-race.db");
+    let store = Store::open(&path).unwrap();
+    put(&store, 0);
+    let version = Documents::new(&store)
+        .get(&address())
+        .unwrap()
+        .unwrap()
+        .version;
+    let barrier = Arc::new(Barrier::new(3));
+    let threads: Vec<_> = (1..=2)
+        .map(|n| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let store = Store::open(path).unwrap();
+                let mut tx = Transaction::new();
+                tx.apply_operations(&store, &address(), version, &[json!(["s", ["n"], n])])
+                    .unwrap();
+                barrier.wait();
+                tx.commit(&store).is_ok()
+            })
+        })
+        .collect();
+    barrier.wait();
+    assert_eq!(
+        threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count(),
+        1
+    );
+    let value = Documents::new(&store).get(&address()).unwrap().unwrap();
+    assert!(value.value["n"] == 1 || value.value["n"] == 2);
+    let mut invalid = Transaction::new();
+    assert!(
+        invalid
+            .apply_operations(
+                &store,
+                &address(),
+                value.version,
+                &[json!(["s", ["__proto__", "x"], 1])]
+            )
+            .is_err()
+    );
+    assert!(
+        invalid
+            .apply_operations(&store, &address(), version, &[json!(["s", ["n"], 4])])
+            .is_err()
+    );
+    assert_eq!(
+        Documents::new(&store).get(&address()).unwrap().unwrap(),
+        value
+    );
+}

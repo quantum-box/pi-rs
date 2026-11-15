@@ -276,7 +276,7 @@ so effects need idempotency. This pull-driven API has no background callback
 queue, upstream listener context or recoverable error frames; total page bytes remain subject to the merged stream's existing limits.
 
 `merged_progress_operations` and `MergedProgressWatch::next_operations` are
-opt-in derived-operation variants over the same cursor and atomic frames. They
+opt-in operation variants over the same cursor and atomic frames. They
 compare validated observation predecessors and tracked document predecessors,
 emitting top-level Chord `s`/`d` operations and append-only array `p` operations
 when smaller than a root replacement. Missing or unproven predecessors, unsafe
@@ -288,10 +288,23 @@ only to that state. Progress operations apply to the serialized entire progress
 change, including its request or attempt identity. A running predecessor must
 be uniquely identified in the immediately preceding tracked progress record;
 otherwise the change is a replacement. Nested paths and operation counts are
-bounded, and old overwritten progress is never reconstructed. These are derived
-state transitions, not original upstream operation batches; observation and
-record sizes remain subject to the existing merged-watch limits. Conversion
-errors do not advance the watch cursor.
+bounded, and old overwritten progress is never reconstructed. Observation and
+progress operations are derived state transitions, not original upstream batches.
+
+For existing documents, `Transaction::apply_operations` provides an opt-in
+forward-only boundary **per write**: it applies and atomically persists the exact
+caller batch alongside the version-checked update. Incremental merged watch
+returns it with `MergedDocumentOperations::actual == true` only after verifying
+its commit and result against the predecessor. Existing writes, creations,
+deletions, missing or invalid evidence use the prior derived/replacement or
+retirement behavior and report `actual == false`; no old batches are backfilled.
+This bounded subset accepts decoded `r`, `s`, `d`, `a`, and `p` operations on
+object paths, with at most 128 operations, eight path segments, 1 MiB of batch
+JSON, and a 2 MiB document. Array index paths, string truncation, permutation,
+and wire-compressed operations are unsupported. Operation evidence is retained
+as immutable store data; it is not garbage collected. Observation and record
+sizes remain subject to the existing merged-watch limits. Conversion errors do
+not advance the watch cursor.
 
 `progress_history_from_now` captures a versioned, conversation-scoped exclusive
 cursor. `progress_history` and `watch_progress_history` page committed generation

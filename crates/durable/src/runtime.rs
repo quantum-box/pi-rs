@@ -1531,6 +1531,8 @@ pub struct MergedDocumentOperations {
     pub previous: Option<crate::document::Document>,
     pub ops: Vec<serde_json::Value>,
     pub retired: bool,
+    /// True when this is the verified original batch from an opt-in write.
+    pub actual: bool,
 }
 /// A progress operation and its proven predecessor.
 #[derive(Clone, Debug, PartialEq)]
@@ -6351,20 +6353,36 @@ impl Harness {
                         }
                         _ => false,
                     };
-                    let ops = match (&previous, &change.document) {
-                        (Some(old), Some(new)) if proven => crate::chord_ops::diff(
-                            &serde_json::Value::Object(old.value.clone()),
-                            &serde_json::Value::Object(new.value.clone()),
-                        ),
-                        (_, Some(new)) => crate::chord_ops::replacement(
-                            &serde_json::Value::Object(new.value.clone()),
-                        ),
-                        (_, None) => Vec::new(),
+                    let actual_ops = match (&previous, &change.document) {
+                        (Some(old), Some(new)) => crate::document::committed_operations(
+                            store,
+                            &change.address,
+                            old,
+                            new,
+                            frame.commit_sequence,
+                        )?,
+                        _ => None,
+                    };
+                    let actual = actual_ops.is_some();
+                    let ops = if let Some(ops) = actual_ops {
+                        ops
+                    } else {
+                        match (&previous, &change.document) {
+                            (Some(old), Some(new)) if proven => crate::chord_ops::diff(
+                                &serde_json::Value::Object(old.value.clone()),
+                                &serde_json::Value::Object(new.value.clone()),
+                            ),
+                            (_, Some(new)) => crate::chord_ops::replacement(
+                                &serde_json::Value::Object(new.value.clone()),
+                            ),
+                            (_, None) => Vec::new(),
+                        }
                     };
                     documents.push(MergedDocumentOperations {
                         address: change.address.clone(),
-                        previous: if proven { previous } else { None },
+                        previous: if proven || actual { previous } else { None },
                         ops,
+                        actual,
                         retired: change.document.is_none(),
                     });
                 }

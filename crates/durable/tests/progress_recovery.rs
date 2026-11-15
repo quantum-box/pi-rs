@@ -2029,3 +2029,171 @@ async fn merged_incremental_watch_applies_atomic_frames_and_reopens() {
         }
     }
 }
+
+#[tokio::test]
+async fn merged_watch_retains_opt_in_document_batches_atomically_across_reopen() {
+    use pi_rs_durable::document::{Address, Documents, Transaction};
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("actual-ops.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let a = Address {
+        scope: id.to_string(),
+        name: "a".into(),
+        key: "".into(),
+    };
+    let b = Address {
+        scope: id.to_string(),
+        name: "b".into(),
+        key: "".into(),
+    };
+    let store = durable_store::Store::open(&path).unwrap();
+    let mut initial = Transaction::new();
+    for address in [&a, &b] {
+        initial
+            .put(
+                address,
+                durable_store::Expected::Missing,
+                serde_json::json!({"n":0,"text":"start","items":[1]})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    initial.commit(&store).unwrap();
+    let mut watch = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let cursor = watch.cursor().clone();
+    let first_ops = vec![
+        serde_json::json!(["s", ["n"], 1]),
+        serde_json::json!(["s", ["n"], 2]),
+        serde_json::json!(["a", ["text"], "🚀"]),
+        serde_json::json!(["p", ["items"], 1, 0, [2]]),
+    ];
+    let second_ops = vec![serde_json::json!(["s", ["n"], 3])];
+    let av = Documents::new(&store).get(&a).unwrap().unwrap().version;
+    let bv = Documents::new(&store).get(&b).unwrap().unwrap().version;
+    let mut winner = Transaction::new();
+    winner.apply_operations(&store, &a, av, &first_ops).unwrap();
+    winner
+        .apply_operations(&store, &b, bv, &second_ops)
+        .unwrap();
+    let mut loser = Transaction::new();
+    loser.apply_operations(&store, &a, av, &second_ops).unwrap();
+    winner.commit(&store).unwrap();
+    assert!(loser.commit(&store).is_err());
+    let page = watch.next_operations().await.unwrap().unwrap();
+    assert_eq!(page.frames.len(), 1);
+    let patches = &page.frames[0].documents;
+    assert_eq!(patches.len(), 2);
+    for (address, ops) in [(&a, &first_ops), (&b, &second_ops)] {
+        let patch = patches.iter().find(|p| &p.address == address).unwrap();
+        assert!(patch.actual);
+        assert_eq!(&patch.ops, ops);
+        let change = page.frames[0]
+            .frame
+            .documents
+            .iter()
+            .find(|d| &d.address == address)
+            .unwrap();
+        // Multiple writes to the same path prove the original batch was retained.
+        assert!(change.document.is_some() && patch.previous.is_some());
+        if address == &a {
+            assert_eq!(
+                serde_json::json!(change.document.as_ref().unwrap().value),
+                serde_json::json!({"n":2,"text":"start🚀","items":[1,2]})
+            );
+        }
+    }
+    let replay = h
+        .merged_progress_operations(&cursor, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(page, replay);
+    let saved = watch.cursor().clone();
+    watch.close();
+    drop(watch);
+    drop(store);
+    drop(h);
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut replay_watch = h
+        .watch_merged_progress_handle(
+            id,
+            Some(cursor.clone()),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    assert_eq!(replay_watch.next_operations().await.unwrap().unwrap(), page);
+    replay_watch.close();
+    // Evidence is immutable by contract; simulate a raw overwrite and ensure it
+    // cannot be mistaken for a batch from the original document commit.
+    let tamper_store = durable_store::Store::open(&path).unwrap();
+    let mut evidence_key = b"durable/document-operations/v1/".to_vec();
+    evidence_key.extend(serde_json::to_vec(&(&a.scope, &a.name, &a.key, av)).unwrap());
+    tamper_store
+        .commit(
+            &[],
+            &[durable_store::Mutation::Put {
+                key: evidence_key,
+                value: b"{}".to_vec(),
+            }],
+        )
+        .unwrap();
+    let fallback = h
+        .merged_progress_operations(&cursor, NonZeroUsize::MIN)
+        .unwrap();
+    assert!(
+        !fallback.frames[0]
+            .documents
+            .iter()
+            .find(|p| p.address == a)
+            .unwrap()
+            .actual
+    );
+    assert!(
+        fallback.frames[0]
+            .documents
+            .iter()
+            .find(|p| p.address == b)
+            .unwrap()
+            .actual
+    );
+    drop(tamper_store);
+    let mut resumed = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let version = Documents::new(&store).get(&a).unwrap().unwrap().version;
+    let mut legacy = Transaction::new();
+    legacy
+        .put(
+            &a,
+            durable_store::Expected::Version(version),
+            serde_json::json!({"n": 9}).as_object().unwrap(),
+        )
+        .unwrap();
+    legacy.commit(&store).unwrap();
+    let page = resumed.next_operations().await.unwrap().unwrap();
+    assert_eq!(page.frames[0].documents.len(), 1);
+    assert!(!page.frames[0].documents[0].actual);
+    assert_eq!(
+        page.frames[0].frame.documents[0]
+            .document
+            .as_ref()
+            .unwrap()
+            .value["n"],
+        9
+    );
+}

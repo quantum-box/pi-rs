@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 const PREFIX: &[u8] = b"durable/document/";
+const OPS_PREFIX: &[u8] = b"durable/document-operations/v1/";
 const POLICY_PREFIX: &[u8] = b"durable/document-policy/";
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +23,8 @@ pub enum Error {
     Signal(#[from] crate::task_store::Error),
     #[error("self-delivery or a repeated typed signal key cannot be staged")]
     SignalComposition,
+    #[error("invalid or unsupported document operations or stale base")]
+    InvalidOperations,
     #[error("stored document is not a JSON object")]
     InvalidDocument,
     #[error("a batch has duplicate checks or writes, or an unchecked write")]
@@ -68,6 +71,146 @@ impl Address {
 pub struct Document {
     pub value: Map<String, Value>,
     pub version: u64,
+}
+
+// Immutable, forward-only evidence keyed by the globally unique predecessor version.
+fn ops_key(address: &Address, version: u64) -> Result<Vec<u8>, Error> {
+    let mut key = OPS_PREFIX.to_vec();
+    key.extend(serde_json::to_vec(&(
+        &address.scope,
+        &address.name,
+        &address.key,
+        version,
+    ))?);
+    Ok(key)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredOperations {
+    version: u8,
+    ops: Vec<Value>,
+}
+
+// A deliberately bounded subset of decoded upstream Chord ops. Object-only
+// paths avoid JS array index and UTF-16 truncation ambiguities.
+fn apply_operations(base: &Map<String, Value>, ops: &[Value]) -> Result<Map<String, Value>, Error> {
+    if ops.is_empty()
+        || ops.len() > 128
+        || serde_json::to_vec(ops)?.len() > 1_048_576
+        || serde_json::to_vec(base)?.len() > 2_097_152
+    {
+        return Err(Error::InvalidOperations);
+    }
+    let mut root = Value::Object(base.clone());
+    for op in ops {
+        let tuple = op.as_array().ok_or(Error::InvalidOperations)?;
+        let verb = tuple
+            .first()
+            .and_then(Value::as_str)
+            .ok_or(Error::InvalidOperations)?;
+        if verb == "r" && tuple.len() == 2 {
+            if !tuple[1].is_object() {
+                return Err(Error::InvalidOperations);
+            }
+            root = tuple[1].clone();
+            continue;
+        }
+        let path = tuple
+            .get(1)
+            .and_then(Value::as_array)
+            .ok_or(Error::InvalidOperations)?;
+        if path.is_empty() || path.len() > 8 {
+            return Err(Error::InvalidOperations);
+        }
+        let mut parent = &mut root;
+        for segment in &path[..path.len() - 1] {
+            let key = segment
+                .as_str()
+                .filter(|s| !matches!(*s, "__proto__" | "constructor" | "prototype"))
+                .ok_or(Error::InvalidOperations)?;
+            parent = parent
+                .as_object_mut()
+                .and_then(|o| o.get_mut(key))
+                .ok_or(Error::InvalidOperations)?;
+        }
+        let key = path
+            .last()
+            .and_then(Value::as_str)
+            .filter(|s| !matches!(*s, "__proto__" | "constructor" | "prototype"))
+            .ok_or(Error::InvalidOperations)?;
+        let object = parent.as_object_mut().ok_or(Error::InvalidOperations)?;
+        match (verb, tuple.len()) {
+            ("s", 3) => {
+                object.insert(key.into(), tuple[2].clone());
+            }
+            ("d", 2) => {
+                object.remove(key);
+            }
+            ("a", 3) => {
+                let suffix = tuple[2].as_str().ok_or(Error::InvalidOperations)?;
+                let Value::String(text) = object.get_mut(key).ok_or(Error::InvalidOperations)?
+                else {
+                    return Err(Error::InvalidOperations);
+                };
+                text.push_str(suffix);
+            }
+            ("p", 5) => {
+                let start = tuple[2]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or(Error::InvalidOperations)?;
+                let count = tuple[3]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or(Error::InvalidOperations)?;
+                let items = tuple[4].as_array().ok_or(Error::InvalidOperations)?;
+                let array = object
+                    .get_mut(key)
+                    .and_then(Value::as_array_mut)
+                    .ok_or(Error::InvalidOperations)?;
+                let end = start
+                    .checked_add(count)
+                    .filter(|end| *end <= array.len())
+                    .ok_or(Error::InvalidOperations)?;
+                array.splice(start..end, items.iter().cloned());
+            }
+            _ => return Err(Error::InvalidOperations),
+        }
+    }
+    if serde_json::to_vec(&root)?.len() > 2_097_152 {
+        return Err(Error::InvalidOperations);
+    }
+    root.as_object().cloned().ok_or(Error::InvalidOperations)
+}
+
+/// Returns original operations only when their immutable evidence shares the
+/// document commit and applying them to the proven predecessor yields the result.
+pub(crate) fn committed_operations(
+    store: &Store,
+    address: &Address,
+    previous: &Document,
+    current: &Document,
+    sequence: u64,
+) -> Result<Option<Vec<Value>>, Error> {
+    let key = ops_key(address, previous.version)?;
+    let Some(entry) = store.get(&key)? else {
+        return Ok(None);
+    };
+    if store.commit_for_version(&key, entry.version)? != Some(sequence) {
+        return Ok(None);
+    }
+    if entry.value.len() > 1_100_000 {
+        return Ok(None);
+    }
+    let Ok(record) = serde_json::from_slice::<StoredOperations>(&entry.value) else {
+        return Ok(None);
+    };
+    if record.version != 1
+        || apply_operations(&previous.value, &record.ops).ok().as_ref() != Some(&current.value)
+    {
+        return Ok(None);
+    }
+    Ok(Some(record.ops))
 }
 
 /// Fork behavior for a document address. Missing policies retain legacy copy behavior.
@@ -562,6 +705,49 @@ impl Transaction {
                 key,
                 value: serde_json::to_vec(value)?,
             }],
+        })
+    }
+    /// Apply and retain a bounded decoded Chord batch against an existing version.
+    /// The operation record and document update commit atomically; stale bases fail.
+    pub fn apply_operations(
+        &mut self,
+        store: &Store,
+        address: &Address,
+        version: u64,
+        ops: &[Value],
+    ) -> Result<(), Error> {
+        let base = Documents::new(store)
+            .get(address)?
+            .filter(|d| d.version == version)
+            .ok_or(Error::InvalidOperations)?;
+        let value = apply_operations(&base.value, ops)?;
+        let key = address.storage_key()?;
+        let evidence = ops_key(address, version)?;
+        let record = serde_json::to_vec(&StoredOperations {
+            version: 1,
+            ops: ops.to_vec(),
+        })?;
+        self.append(OwnedBatch {
+            checks: vec![
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Version(version),
+                },
+                Check {
+                    key: evidence.clone(),
+                    expected: Expected::Missing,
+                },
+            ],
+            mutations: vec![
+                Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value)?,
+                },
+                Mutation::Put {
+                    key: evidence,
+                    value: record,
+                },
+            ],
         })
     }
     /// Set a policy using its own CAS version; can be composed atomically with document writes.
