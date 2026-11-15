@@ -6173,10 +6173,11 @@ mod tests {
             tool.shell(&json!({"command":command}), &cancellation),
         )
         .await
-        .expect("cancelled shell kept draining")
-        .unwrap();
+        .expect("cancelled shell kept draining");
         task.await.unwrap();
-        assert!(result.cancelled);
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("Command aborted"))
+        );
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             tool.shell(
@@ -6185,9 +6186,8 @@ mod tests {
             ),
         )
         .await
-        .expect("timed out shell kept draining")
-        .unwrap();
-        assert!(result.timed_out);
+        .expect("timed out shell kept draining");
+        assert!(matches!(result, Err(Error::Config(message)) if message.contains("timed out")));
     }
 
     #[tokio::test]
