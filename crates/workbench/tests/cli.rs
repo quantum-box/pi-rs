@@ -1592,19 +1592,28 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         writeln!(
             input,
             "{}",
-            json!({"id": id, "type": "prompt", "message": "/trigger"})
+            json!({"id": id, "type": "prompt", "message": "/trigger", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
         )
         .unwrap();
         input.flush().unwrap();
         let mut started = false;
         loop {
             let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_ne!(event["message"]["role"], "user", "{event}");
             if event["type"] == "response" && event["id"] == id {
                 assert_eq!(event["data"]["disposition"], "started", "{event}");
                 started = true;
             }
             if event["type"] == "agent_end" {
                 assert!(started, "turn ended before prompt was acknowledged");
+                assert!(
+                    event["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|message| message["role"] != "user"),
+                    "{event}"
+                );
                 break;
             }
         }
@@ -1686,7 +1695,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     writeln!(
         input,
         "{}",
-        json!({"id":"context", "type":"prompt", "message":"/context"})
+        json!({"id":"context", "type":"prompt", "message":"/context", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
     )
     .unwrap();
     input.flush().unwrap();

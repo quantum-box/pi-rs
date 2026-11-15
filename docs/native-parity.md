@@ -385,7 +385,12 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance follows input and command validation. A prompt
-that runs an extension command returns `handled`. A model turn returns
+that runs an extension command returns `handled`. Idle extension commands
+take precedence over valid attached images in RPC; the
+attachments are not sent to the model even when the command triggers a turn.
+RPC validates images before command dispatch. Unlike Pi, a command that
+triggers a model turn reports `started`, and commands submitted while a turn
+is active cannot yet execute immediately. A model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning

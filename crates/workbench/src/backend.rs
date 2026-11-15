@@ -1012,8 +1012,7 @@ async fn run_worker(
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
                     }
-                    if images.is_empty()
-                        && let Some(input) = content.as_deref()
+                    if let Some(input) = content.as_deref()
                         && let Some(trigger) = agent.try_extension_command_with_trigger(
                             session,
                             input,
@@ -1024,6 +1023,7 @@ async fn run_worker(
                             return Ok(());
                         }
                         content = None;
+                        images.clear();
                     }
                     if runtime.registry.has_input_hooks()
                         && (content.is_some() || !images.is_empty())
