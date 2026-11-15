@@ -1201,3 +1201,88 @@ async fn tool_block_compaction_rejects_hooks_without_block_opt_in() {
     assert_eq!(after.content_blocks, before.content_blocks);
     assert!(model.0.lock().unwrap().is_empty());
 }
+
+#[cfg(feature = "builtin-images")]
+#[tokio::test]
+async fn builtin_fitter_uses_conversation_model_limits_for_tool_output() {
+    use base64::Engine;
+    use image::{DynamicImage, ImageFormat, RgbaImage};
+    use pi_rs_durable::images::{BuiltinImageProcessor, ImageLimitsCatalog};
+    struct Picture(String);
+    #[async_trait]
+    impl Hook for Picture {
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            true
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            value: &ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            let mut result = value.clone();
+            result.output = vec![json!({"type":"image","data":self.0,"mimeType":"image/png"})];
+            Ok(Some(result))
+        }
+    }
+    let image =
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 6, image::Rgba([20, 40, 60, 255])));
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut encoded, ImageFormat::Png).unwrap();
+    let image = base64::engine::general_purpose::STANDARD.encode(encoded.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(Extension {
+        name: "picture".into(),
+        hooks: vec![Arc::new(Picture(image))],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut catalog = ImageLimitsCatalog::default();
+    catalog
+        .insert(
+            "fake",
+            &json!({"inputLimits":{"images":{"resize":{"maxWidth":4}}}}),
+        )
+        .unwrap();
+    h.install_extension(pi_rs_durable::images::create_fit_images_extension(
+        Arc::new(BuiltinImageProcessor),
+        catalog.resolver(),
+    ))
+    .unwrap();
+    let adapter = Arc::new(Adapter::default());
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "fake".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    h.select_extensions(id, vec!["picture".into(), "fit-images".into()])
+        .unwrap();
+    h.select_provider_adapter(id, true).unwrap();
+    h.submit_and_run(id, None, "show".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    let binding = c.content_blocks.values().next().unwrap();
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(binding.blocks[0]["data"].as_str().unwrap())
+        .unwrap();
+    let result = image::load_from_memory(&data).unwrap();
+    assert_eq!((result.width(), result.height()), (4, 3));
+    assert!(
+        c.tool_results
+            .iter()
+            .flat_map(|r| &r.diagnostics)
+            .any(|d| d.code.as_deref() == Some("image")
+                && d.message.contains("Resized from 8x6 to 4x3"))
+    );
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().content_blocks, c.content_blocks);
+    assert_eq!(adapter.0.lock().unwrap().len(), 2);
+}

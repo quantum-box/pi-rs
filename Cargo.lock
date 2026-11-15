@@ -2253,6 +2253,7 @@ dependencies = [
  "base64 0.22.1",
  "durable-store",
  "futures-util",
+ "image",
  "jsonschema",
  "pi-rs-core",
  "pi-rs-workbench",

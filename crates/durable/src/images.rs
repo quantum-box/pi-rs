@@ -1,6 +1,6 @@
 //! Opt-in preparation of host-supplied images before transcript admission.
 //!
-//! A host supplies the processor; this module does not decode or resize images.
+//! Hosts may supply a processor, or enable the `builtin-images` feature.
 use base64::{
     Engine, alphabet,
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
@@ -43,6 +43,65 @@ impl ImageLimitOverrides {
         }
     }
 }
+
+/// Per-model limits from host-supplied upstream-shaped model descriptors.
+/// Keys are exact conversation model names; missing models use the defaults.
+#[derive(Clone, Debug, Default)]
+pub struct ImageLimitsCatalog(std::collections::BTreeMap<String, ImageLimitOverrides>);
+
+impl ImageLimitsCatalog {
+    /// Read `inputLimits.images.resize`; absent fields inherit the defaults.
+    /// Invalid or zero dimensions/byte limits are rejected.
+    pub fn insert(&mut self, model: impl Into<String>, descriptor: &Value) -> Result<(), String> {
+        let model = model.into();
+        if model.is_empty() || !descriptor.is_object() {
+            return Err("invalid model descriptor".into());
+        }
+        let mut node = descriptor;
+        for key in ["inputLimits", "images", "resize"] {
+            match node.get(key) {
+                None | Some(Value::Null) => {
+                    self.0.insert(model, ImageLimitOverrides::default());
+                    return Ok(());
+                }
+                Some(value) if value.is_object() => node = value,
+                _ => return Err(format!("invalid {key} in model descriptor")),
+            }
+        }
+        fn field<T: TryFrom<u64>>(node: &Value, key: &str) -> Result<Option<T>, String> {
+            match node.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .and_then(|n| T::try_from(n).ok())
+                    .map(Some)
+                    .ok_or_else(|| format!("invalid {key} in model descriptor")),
+            }
+        }
+        let limits = ImageLimitOverrides {
+            max_width: field(node, "maxWidth")?,
+            max_height: field(node, "maxHeight")?,
+            max_bytes: field(node, "maxBytes")?,
+        };
+        self.0.insert(model, limits);
+        Ok(())
+    }
+    pub fn limits(&self, model: &str) -> ImageLimits {
+        self.0.get(model).copied().unwrap_or_default().resolve()
+    }
+    /// Resolver for `create_fit_images_extension`, using the persisted model name.
+    pub fn resolver(self) -> std::sync::Arc<ToolImageLimits> {
+        std::sync::Arc::new(move |snapshot| {
+            self.limits(snapshot["config"]["model"].as_str().unwrap_or(""))
+        })
+    }
+}
+
+#[cfg(feature = "builtin-images")]
+mod builtin;
+#[cfg(feature = "builtin-images")]
+pub use builtin::BuiltinImageProcessor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dimensions {
@@ -475,6 +534,40 @@ mod tests {
         };
         assert_eq!(content[0]["data"], "aGk=");
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn model_catalog_uses_exact_model_and_rejects_invalid_limits() {
+        let mut catalog = ImageLimitsCatalog::default();
+        catalog
+            .insert(
+                "vendor/model",
+                &json!({"inputLimits":{"images":{"resize":{"maxWidth":123,"maxBytes":456}}}}),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.limits("vendor/model"),
+            ImageLimits {
+                max_width: 123,
+                max_height: 2000,
+                max_bytes: 456
+            }
+        );
+        assert_eq!(catalog.limits("model"), ImageLimits::default());
+        assert!(
+            catalog
+                .insert(
+                    "vendor/model",
+                    &json!({"inputLimits":{"images":{"resize":{"maxWidth":0}}}})
+                )
+                .is_err()
+        );
+        assert_eq!(catalog.limits("vendor/model").max_width, 123);
+        let resolve = catalog.resolver();
+        assert_eq!(
+            resolve(&json!({"config":{"model":"vendor/model"}})).max_bytes,
+            456
+        );
     }
 
     #[test]

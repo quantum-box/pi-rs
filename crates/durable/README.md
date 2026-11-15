@@ -1450,7 +1450,23 @@ or another executor has joined, and it is not wired to live parking.
 
 ### Preparing host-supplied images
 
-The opt-in `images` module implements the host-input portion of upstream image fitting. Provide an `ImageProcessor` that decodes, orients and resizes/re-encodes images and call `fit_image` for bytes or `fit_images` for ordered text/image JSON blocks **before** passing them to `append_user_blocks`, `reset_with_blocks`, or a continuation. `ImageLimits::default()` is 2000 by 2000 pixels and 4.5 MiB of base64; `ImageLimitOverrides::resolve` applies per-field overrides supplied by the host. pi-rs does not currently expose upstream's model image-limit catalog, so hosts choose limits. The module has no built-in image codec: a processor is responsible for decoding and enforcing limits, and should return `None` for images it cannot prepare. Every image is passed to it, with the MIME type sniffed from bytes when recognized. Conversion and resizing notes include the coordinate scale. Errors, invalid base64 and unpreparable images are omitted with notes; hosts should include those notes in model-visible text if desired. Text and unchanged image blocks retain their metadata and order; a changed image is replaced by the processor's image block, as upstream does. Invalid block shapes return an error instead of partially transforming the input.
+The opt-in `images` module implements the host-input portion of upstream image fitting. Provide an `ImageProcessor` or enable the optional `builtin-images` feature and use `BuiltinImageProcessor`; call `fit_image` for bytes or `fit_images` for ordered text/image JSON blocks **before** passing them to `append_user_blocks`, `reset_with_blocks`, or a continuation. The built-in processor decodes PNG, JPEG, GIF, WebP and BMP; it preserves upright inline images that fit, applies JPEG/WebP EXIF orientation, scales with Lanczos3, and re-encodes as PNG or JPEG until the base64 fits. It uses image-rs rather than upstream Photon, so encoded bytes can differ. It rejects source files above 20 MiB or decoded RGBA dimensions above 128 MiB; processing runs on a Tokio blocking worker when available, and cancellation does not stop a worker already running. `ImageLimits::default()` is 2000 by 2000 pixels and 4.5 MiB of base64. `ImageLimitsCatalog` accepts host-supplied upstream-shaped model descriptors and resolves `inputLimits.images.resize` field by field, defaulting absent fields. It can supply a snapshot-based resolver to `create_fit_images_extension`; model names must match the conversation's configured model exactly. pi-rs does not automatically import upstream's model catalog. A custom processor remains responsible for decoding and enforcing its limits, and should return `None` for images it cannot prepare. Every image is passed to it, with the MIME type sniffed from bytes when recognized. Conversion and resizing notes include the coordinate scale. Errors, invalid base64 and unpreparable images are omitted with notes; hosts should include those notes in model-visible text if desired. Text and unchanged image blocks retain their metadata and order; a changed image is replaced by the processor's image block, as upstream does. Invalid block shapes return an error instead of partially transforming the input.
+
+For model-specific tool-result fitting with the optional feature enabled:
+
+```rust,ignore
+use std::sync::Arc;
+use pi_rs_durable::images::{BuiltinImageProcessor, ImageLimitsCatalog, create_fit_images_extension};
+
+let mut catalog = ImageLimitsCatalog::default();
+catalog.insert("provider/model", &serde_json::json!({
+    "inputLimits": {"images": {"resize": {"maxWidth": 1024}}}
+}))?;
+harness.install_extension(create_fit_images_extension(
+    Arc::new(BuiltinImageProcessor), catalog.resolver(),
+))?;
+// Select "fit-images" for the conversation, after hooks that produce image blocks.
+```
 
 For example, given an existing `processor`, `harness` and conversation `id`:
 
