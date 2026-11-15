@@ -57,6 +57,67 @@ impl PromptResourceFactory {
     }
 }
 
+/// Loads one Pi context file from each host-authorized directory, in order.
+/// Directories are explicit: no ancestors, global paths or packages are read
+/// implicitly. Symlinks are followed, so these grants are not a sandbox.
+#[derive(Clone, Debug, Default)]
+pub struct ContextReadGrants {
+    pub directories: Vec<PathBuf>,
+}
+
+/// An immutable, ordered snapshot of context files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextResources {
+    pub files: Vec<PromptResource>,
+}
+
+impl ContextReadGrants {
+    /// Resolve a fresh snapshot. Any read error rejects the entire snapshot;
+    /// a caller can retain its previous snapshot until it chooses to replace it.
+    pub fn load(&self) -> Result<ContextResources> {
+        let mut files = Vec::new();
+        for directory in &self.directories {
+            for name in [
+                "AGENTS.override.md",
+                "AGENTS.md",
+                "AGENTS.MD",
+                "CLAUDE.md",
+                "CLAUDE.MD",
+            ] {
+                let path = directory.join(name);
+                if let Some(text) = read_optional(&path)? {
+                    files.push(PromptResource {
+                        text,
+                        source: Some(path),
+                    });
+                    break;
+                }
+            }
+        }
+        Ok(ContextResources { files })
+    }
+}
+
+impl ContextResources {
+    /// Render Pi's project-context section for inclusion in a host-built prompt.
+    pub fn render(&self) -> String {
+        if self.files.is_empty() {
+            return String::new();
+        }
+        let mut result = String::from("Project-specific instructions and guidelines:");
+        for file in &self.files {
+            if let Some(path) = &file.source {
+                result.push_str(&format!(
+                    "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+                    path.display(),
+                    file.text
+                ));
+            }
+        }
+        result
+    }
+}
+
 impl PromptResources {
     /// Compose a caller-selected default with the resolved override and appendices.
     /// The caller owns the default prompt and any additional context formatting.

@@ -214,3 +214,56 @@ fn fifo_prompt_is_rejected_without_blocking() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn context_snapshots_use_granted_order_and_pi_filename_precedence() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let root = tempfile::tempdir().unwrap();
+    let global = root.path().join("global");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(global.join("CLAUDE.md"), "global").unwrap();
+    std::fs::write(project.join("AGENTS.md"), "normal").unwrap();
+    std::fs::write(project.join("AGENTS.override.md"), "\u{feff}override").unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![global.clone(), project.clone()],
+    };
+    let snapshot = grants.load().unwrap();
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|file| file.text.as_str())
+            .collect::<Vec<_>>(),
+        ["global", "override"]
+    );
+    assert!(snapshot.render().contains(&format!(
+        "<project_instructions path=\"{}\">\noverride\n</project_instructions>",
+        project.join("AGENTS.override.md").display()
+    )));
+    std::fs::remove_file(project.join("AGENTS.override.md")).unwrap();
+    assert_eq!(grants.load().unwrap().files[1].text, "normal");
+    assert_eq!(snapshot.files[1].text, "override");
+    assert!(
+        ContextReadGrants::default()
+            .load()
+            .unwrap()
+            .render()
+            .is_empty()
+    );
+}
+
+#[test]
+fn context_read_failure_does_not_return_partial_snapshot() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), [0xff]).unwrap();
+    assert!(
+        ContextReadGrants {
+            directories: vec![root.path().to_owned()]
+        }
+        .load()
+        .is_err()
+    );
+}
