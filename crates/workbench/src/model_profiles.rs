@@ -1126,7 +1126,11 @@ impl Profiles {
         endpoint: &str,
     ) -> &'static [&'static str] {
         let adapter = self.model_adapter(provider, model);
-        if !matches!(adapter, Adapter::Anthropic | Adapter::ChatCompletions) {
+        if !matches!(
+            adapter,
+            Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
+        ) || provider.id() == "openai-chatgpt"
+        {
             return &[];
         }
         let profile = self
@@ -1142,7 +1146,7 @@ impl Profiles {
         let send = model
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
-            .unwrap_or(openrouter);
+            .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
         if !send {
             return &[];
         }
@@ -1156,6 +1160,10 @@ impl Profiles {
             });
         match (adapter, format) {
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
+            (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
+                &["session_id", "x-client-request-id"]
+            }
+            (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) => &["x-client-request-id"],
             (Adapter::Anthropic, _) => &["x-session-affinity"],
             (_, AffinityFormat::Openai) => {
                 &["session_id", "x-client-request-id", "x-session-affinity"]
@@ -1604,6 +1612,46 @@ mod tests {
                 .levels(Adapter::ChatCompletions)
                 .unwrap()
                 .contains(&"off".into())
+        );
+    }
+
+    #[test]
+    fn responses_session_affinity_uses_api_specific_headers_and_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{
+            "custom":{"baseUrl":"https://example.test/v1", "api":"openai-responses", "models":[
+                {"id":"default"}, {"id":"router", "compat":{"sessionAffinityFormat":"openrouter"}},
+                {"id":"nosession", "compat":{"sessionAffinityFormat":"openai-nosession"}},
+                {"id":"disabled", "compat":{"sendSessionAffinityHeaders":false}}
+            ]}
+        }}))
+        .unwrap();
+        let provider = profiles.provider("custom").unwrap();
+        assert_eq!(
+            profiles.session_affinity(&provider, "default", "https://example.test"),
+            ["session_id", "x-client-request-id"]
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "router", "https://example.test"),
+            ["x-session-id"]
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "nosession", "https://example.test"),
+            ["x-client-request-id"]
+        );
+        assert!(
+            profiles
+                .session_affinity(&provider, "disabled", "https://example.test")
+                .is_empty()
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "default", "https://openrouter.ai/api/v1"),
+            ["x-session-id"]
+        );
+        let chatgpt = profiles.provider("openai-chatgpt").unwrap();
+        assert!(
+            profiles
+                .session_affinity(&chatgpt, "gpt", "https://example.test")
+                .is_empty()
         );
     }
 

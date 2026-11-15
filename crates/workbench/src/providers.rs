@@ -589,6 +589,11 @@ impl Client {
                 } else {
                     client.clone()
                 };
+                let client = if cache_disabled {
+                    client
+                } else {
+                    client.with_default_headers(defaults)
+                };
                 client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {

@@ -558,6 +558,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_session_headers_respect_explicit_values_and_summary_boundary() {
+        use std::io::{Read, Write};
+        for (summary, explicit) in [(false, false), (false, true), (true, false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut block = [0; 2048];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                String::from_utf8(bytes).unwrap().to_ascii_lowercase()
+            });
+            let mut headers = HeaderMap::new();
+            if explicit {
+                headers.insert("session_id", "explicit".parse().unwrap());
+            }
+            let model = WorkbenchModel {
+                client: Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(
+                        &format!("http://{address}/responses"),
+                        "fixture".into(),
+                    )
+                    .unwrap()
+                    .with_headers(headers),
+                ),
+                block_images: false,
+                supports_images: None,
+                session_affinity: &["session_id", "x-client-request-id"],
+                price: None,
+            };
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            };
+            if summary {
+                let _ = model
+                    .stream_for_summary(Uuid::new_v4(), Uuid::new_v4(), request)
+                    .await;
+            } else {
+                let _ = model
+                    .stream_in_session_with_identity(
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        "session-one",
+                        request,
+                    )
+                    .await;
+            }
+            let headers = server.join().unwrap();
+            assert_eq!(
+                headers.contains("x-client-request-id: session-one\r\n"),
+                !summary
+            );
+            assert_eq!(
+                headers.contains("session_id: session-one\r\n"),
+                !summary && !explicit
+            );
+            assert_eq!(headers.contains("session_id: explicit\r\n"), explicit);
+        }
+    }
+
+    #[tokio::test]
     async fn external_identity_is_used_for_affinity_header() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
