@@ -524,6 +524,10 @@ Current limits and differences from upstream Pi Durable:
   while a new ID is rejected for a terminal task. Existing stores with
   multiple typed records for one key are not consolidated; conflicting records
   reject new deliveries, and any consumed record closes the key.
+- Normal scheduler and driver typed waits apply the same signal-first deadline
+  ordering and atomically fence task and signal revisions. Consuming a receipt
+  advances the signal revision; mismatched record identities and ambiguous
+  duplicate typed receipts fail closed instead of selecting one arbitrarily.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.

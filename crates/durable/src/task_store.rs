@@ -1140,16 +1140,29 @@ impl<'a> TaskStore<'a> {
                 delivered = Some(signal);
             }
             WaitFor::TypedSignal(key) => {
+                let revision_key = signal_revision_key(snapshot.task.id());
+                let revision = self.store.get(&revision_key)?;
+                checks.push(Check {
+                    key: revision_key.clone(),
+                    expected: revision
+                        .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+                });
                 let mut found = None;
                 for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
+                    if signal.task_id != snapshot.task.id()
+                        || k != signal_key(snapshot.task.id(), signal.id)
+                    {
+                        return Err(Error::InvalidKey);
+                    }
                     if signal.typed_key() == Some(key) {
+                        if found.is_some() {
+                            return Err(Error::SignalKeyMismatch);
+                        }
                         if signal.consumed || signal.expired {
                             return Err(Error::SignalKeyConsumed);
                         }
-                        if found.is_none() {
-                            found = Some((k, entry.version, signal));
-                        }
+                        found = Some((k, entry.version, signal));
                     }
                 }
                 let Some((k, version, mut signal)) = found else {
@@ -1163,6 +1176,10 @@ impl<'a> TaskStore<'a> {
                 mutations.push(Mutation::Put {
                     key: k,
                     value: serde_json::to_vec(&signal)?,
+                });
+                mutations.push(Mutation::Put {
+                    key: revision_key,
+                    value: vec![],
                 });
                 delivered = Some(signal);
             }
@@ -1179,7 +1196,20 @@ impl<'a> TaskStore<'a> {
                 let mut records = Vec::new();
                 for (k, entry) in self.store.list(&signal_task_prefix(snapshot.task.id()))? {
                     let signal: Signal = serde_json::from_slice(&entry.value)?;
+                    if signal.task_id != snapshot.task.id()
+                        || k != signal_key(snapshot.task.id(), signal.id)
+                    {
+                        return Err(Error::InvalidKey);
+                    }
                     if signal.typed_key().is_some_and(|key| signals.contains(key)) {
+                        if records
+                            .iter()
+                            .any(|(_, _, previous): &(Vec<u8>, u64, Signal)| {
+                                previous.typed_key() == signal.typed_key()
+                            })
+                        {
+                            return Err(Error::SignalKeyMismatch);
+                        }
                         records.push((k, entry.version, signal));
                     }
                 }
@@ -1201,6 +1231,10 @@ impl<'a> TaskStore<'a> {
                     mutations.push(Mutation::Put {
                         key: k,
                         value: serde_json::to_vec(&signal)?,
+                    });
+                    mutations.push(Mutation::Put {
+                        key: revision_key.clone(),
+                        value: vec![],
                     });
                     delivered = Some(signal);
                 } else if until_millis.is_some_and(|deadline| now_millis >= deadline) {
