@@ -105,6 +105,20 @@ pub fn resolve(
     let mut paths = Vec::new();
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
+        if kind == Kind::Skill {
+            let normalized = normalize_skill_path(&path);
+            let pattern_path = normalized.strip_prefix(&workspace).unwrap_or(&normalized);
+            let patterned = pattern_path.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+            });
+            if !patterned && !normalized.exists() {
+                warnings.push(format!(
+                    "{}: skill path does not exist",
+                    normalized.display()
+                ));
+                continue;
+            }
+        }
         if !skill_file_is_markdown(kind, &path, warnings) {
             continue;
         }

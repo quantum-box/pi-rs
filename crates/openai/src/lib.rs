@@ -186,6 +186,16 @@ impl OpenAiResponses {
         self
     }
 
+    /// Add automatic headers without replacing explicitly configured values.
+    pub fn with_default_headers(mut self, headers: &reqwest::header::HeaderMap) -> Self {
+        for (name, value) in headers {
+            self.headers
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        self
+    }
+
     /// Set request body defaults from the selected model's sampling parameters.
     pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
         validate_sampling(&sampling)?;

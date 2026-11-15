@@ -1000,9 +1000,15 @@ impl View {
         self.widgets
             .iter()
             .filter(|(_, _, location)| *location == placement)
-            .flat_map(|(_, lines, _)| lines.iter())
+            .flat_map(|(_, lines, _)| {
+                lines
+                    .iter()
+                    .take(10)
+                    .map(String::as_str)
+                    .chain((lines.len() > 10).then_some("... (widget truncated)"))
+            })
             .flat_map(|text| {
-                Entry::Notice(text.clone()).render(
+                Entry::Notice(text.to_owned()).render(
                     theme,
                     width,
                     false,
@@ -9431,6 +9437,51 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn extension_widgets_truncate_each_string_array_after_ten_lines() {
+        let mut view = super::View::default();
+        let set = |view: &mut super::View, key: &str, count: usize, placement: &str| {
+            let lines: Vec<_> = (0..count).map(|index| format!("{key}-{index}")).collect();
+            assert!(
+                view.ui_request(&json!({
+                    "id": uuid::Uuid::new_v4(), "method":"setWidget", "widgetKey":key,
+                    "widgetLines":lines, "widgetPlacement":placement,
+                }))
+                .unwrap()
+                .is_none()
+            );
+        };
+        let theme =
+            super::Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let rendered = |view: &super::View, placement| {
+            view.widget_lines(&theme, 80, placement)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        set(&mut view, "ten", 10, "aboveEditor");
+        set(&mut view, "eleven", 11, "aboveEditor");
+        set(&mut view, "below", 11, "belowEditor");
+        let above = rendered(&view, pi_rs::WidgetPlacement::AboveEditor);
+        assert_eq!(above.len(), 21);
+        assert_eq!(above[9], "ten-9");
+        assert_eq!(above[10], "eleven-0");
+        assert_eq!(above[19], "eleven-9");
+        assert_eq!(above[20], "... (widget truncated)");
+        let below = rendered(&view, pi_rs::WidgetPlacement::BelowEditor);
+        assert_eq!(below.len(), 11);
+        assert_eq!(below[10], "... (widget truncated)");
+        set(&mut view, "eleven", 1, "aboveEditor");
+        let updated = rendered(&view, pi_rs::WidgetPlacement::AboveEditor);
+        assert_eq!(updated.len(), 11);
+        assert_eq!(updated[10], "eleven-0");
     }
 
     #[test]

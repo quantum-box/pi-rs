@@ -176,6 +176,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_provider_tracks_switch_and_branch_checkout() {
+        let mut builder = ModelCatalogBuilder::new();
+        let a: Arc<dyn Model> = Arc::new(NamedModel("a"));
+        let b: Arc<dyn Model> = Arc::new(NamedModel("b"));
+        builder.register("provider-a", "shared", a).unwrap();
+        builder.register("provider-b", "shared", b.clone()).unwrap();
+        let catalog = builder.build();
+        let mut session = catalog
+            .session_builder("provider-a", "shared")
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert_eq!(
+            (session.model_provider().unwrap(), session.model_name()),
+            (Some("provider-a"), "shared")
+        );
+        let before = session.journal().unwrap().head();
+        session
+            .set_provider_model(b, "provider-b", "shared")
+            .unwrap();
+        assert_eq!(
+            (session.model_provider().unwrap(), session.model_name()),
+            (Some("provider-b"), "shared")
+        );
+        session.checkout(before).unwrap();
+        assert_eq!(
+            (session.model_provider().unwrap(), session.model_name()),
+            (Some("provider-a"), "shared")
+        );
+        {
+            let mut journal = session.journal().unwrap();
+            journal
+                .select_provider_model(Some("provider-b"), "shared", None)
+                .unwrap();
+        }
+        assert!(session.model_provider().is_err());
+        session
+            .set_provider_model(
+                catalog.get("provider-b", "shared").unwrap(),
+                "provider-b",
+                "shared",
+            )
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("provider-b"));
+        session
+            .set_model(Arc::new(NamedModel("legacy")), "legacy")
+            .unwrap();
+        assert_eq!(
+            (session.model_provider().unwrap(), session.model_name()),
+            (None, "legacy")
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_provider_rejects_revoked_client() {
+        let registry = crate::Registry::default();
+        let mut session = SessionBuilder::new(Arc::new(NamedModel("a")), "shared")
+            .provider("provider-a")
+            .unwrap()
+            .registry(registry.clone())
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("provider-a"));
+        let id = session.journal().unwrap().session_id();
+        registry.remove_session_branch_models(id);
+        assert!(session.model_provider().is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_provider_rejects_unavailable_historical_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut original = ModelCatalogBuilder::new();
+        original
+            .register("provider-b", "shared", Arc::new(NamedModel("b")))
+            .unwrap();
+        let mut session = original
+            .build()
+            .session_builder("provider-b", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        session.close().await.unwrap();
+        drop(session);
+        let mut replacement = ModelCatalogBuilder::new();
+        replacement
+            .register("provider-a", "shared", Arc::new(NamedModel("a")))
+            .unwrap();
+        let mut session = replacement
+            .build()
+            .session_builder("provider-a", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert!(session.model_provider().is_err());
+        session
+            .set_provider_model(Arc::new(NamedModel("b")), "provider-b", "shared")
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("provider-b"));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn catalog_session_supports_repeated_prompts_and_reopen() {
         let mut builder = ModelCatalogBuilder::new();
         builder
