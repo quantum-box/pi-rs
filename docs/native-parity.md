@@ -732,6 +732,11 @@ against the current native registry. Earlier imports recover the snapshot
 from the preserved Pi entry when reopening the journal. RPC message snapshots
 include the active compaction's saved system message before the summary and
 retain later system updates in transcript order.
+Native compaction entries projected to Pi RPC and Radius share JSONL include
+their saved system message and tool declarations. Reimport preserves the
+effective section order, including sections removed and later re-added.
+Pi's JavaScript object enumeration can reorder integer-like section names;
+their relative order is not guaranteed when the JSONL is opened in Pi.
 HTML exports fold the initial recorded system prompt and subsequent updates,
 including changed sections and available, added, or removed tools. Tool
 parameters expand to show types, required flags, and descriptions.
