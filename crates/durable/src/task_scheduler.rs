@@ -1035,6 +1035,7 @@ impl Scheduler {
             .map_err(task_store::Error::from)?;
         let mut next = running.clone();
         let mut children = Vec::new();
+        let mut wait_graph_fence = false;
         match step {
             Step::Continue(checkpoint) => {
                 next.task.advance(checkpoint).map_err(Error::Transition)?;
@@ -1068,20 +1069,34 @@ impl Scheduler {
                 | WaitFor::TasksAny(ref waiting)
                 | WaitFor::TasksFailFast(ref waiting) = condition
                 {
+                    wait_graph_fence = true;
                     let mut seen = std::collections::HashSet::new();
                     for id in waiting {
-                        if !seen.insert(*id) {
+                        if *id == next.task.id() || !seen.insert(*id) {
                             return Err(Error::Ownership);
                         }
                         if !children.iter().any(|c| c.id() == *id)
                             && !staged.iter().any(|(_, _, p)| p.child == *id)
                         {
                             let child = self.ts().load(*id)?.ok_or(Error::Ownership)?;
-                            if child.task.owner() != &TaskOwner::Task(next.task.id()) {
+                            if matches!(condition, WaitFor::TasksFailFast(_))
+                                && child.task.owner() != &TaskOwner::Task(next.task.id())
+                            {
                                 return Err(Error::Ownership);
                             }
                         }
                     }
+                    let new_children: HashSet<_> = children
+                        .iter()
+                        .map(Task::id)
+                        .chain(
+                            staged
+                                .iter()
+                                .filter(|(_, _, p)| !p.mutations.is_empty())
+                                .map(|(_, _, p)| p.child),
+                        )
+                        .collect();
+                    validate_wait_graph(owner.store(), next.task.id(), waiting, &new_children)?;
                 }
                 next.task.wait(condition).map_err(Error::Transition)?;
             }
@@ -1161,7 +1176,7 @@ impl Scheduler {
             next.task.state(),
             TaskState::Succeeded(_) | TaskState::Completing(_)
         );
-        let committed = if success {
+        let committed = if success || wait_graph_fence {
             transaction.commit_task_graph(owner.store(), success_graph_version)
         } else {
             transaction.commit(owner.store())
@@ -1406,6 +1421,66 @@ impl Scheduler {
     }
 }
 
+// Follow durable waits and live foreground ownership from every target. The
+// caller fences graph puts between this scan and the waiting commit.
+fn validate_wait_graph(
+    store: &durable_store::Store,
+    waiter: Uuid,
+    targets: &[Uuid],
+    new_children: &HashSet<Uuid>,
+) -> Result<(), Error> {
+    let tasks = TaskStore::new(store).list()?;
+    let by_id: HashMap<_, _> = tasks
+        .iter()
+        .map(|item| (item.task.id(), &item.task))
+        .collect();
+    let edges = crate::ownership_edge::EdgeStore::new(store);
+    let mut pending = targets.to_vec();
+    let mut seen = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if id == waiter {
+            return Err(Error::Ownership);
+        }
+        if !seen.insert(id) || new_children.contains(&id) {
+            continue;
+        }
+        let task = by_id.get(&id).ok_or(Error::Ownership)?;
+        if task.is_terminal() {
+            continue;
+        }
+        if !task.abort_requested()
+            && let TaskState::Waiting(
+                WaitFor::Tasks(on) | WaitFor::TasksAny(on) | WaitFor::TasksFailFast(on),
+            ) = task.state()
+        {
+            pending.extend(on.iter().copied());
+        }
+        pending.extend(tasks.iter().filter_map(|child| {
+            (child.task.owner() == &TaskOwner::Task(id)
+                && !child.task.is_background()
+                && !child.task.is_terminal())
+            .then_some(child.task.id())
+        }));
+        for edge in edges
+            .children(id)
+            .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+        {
+            if edge.edge.task_owner != *task.owner() {
+                return Err(Error::Ownership);
+            }
+            if edge.edge.mode == crate::ownership_edge::Mode::Foreground {
+                pending.extend(tasks.iter().filter_map(|child| {
+                    (child.task.owner() == &TaskOwner::Conversation(edge.edge.child)
+                        && !child.task.is_background()
+                        && !child.task.is_terminal())
+                    .then_some(child.task.id())
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 // Walk through terminal tasks and owned conversations as well: work may be
 // admitted in an owned conversation after its original task has finished.
 fn has_live_owned(
@@ -1578,6 +1653,113 @@ mod tests {
         Task::new(Uuid::from_u128(id), owner, cp("start"), limit)
             .unwrap()
             .registered(kind.into(), safe)
+    }
+
+    #[test]
+    fn any_wait_on_unowned_task_survives_reopen_and_reports_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let mut registry = Registry::default();
+        registry.register("waiter", true, |task: &Task| {
+            if task.checkpoint().phase == "start" {
+                Ok(Step::Wait {
+                    checkpoint: cp("woken"),
+                    condition: WaitFor::TasksAny(vec![Uuid::from_u128(2)]),
+                    children: vec![],
+                })
+            } else {
+                assert_eq!(task.ended_children(), Some(&[Uuid::from_u128(2)][..]));
+                Ok(Step::Succeed(json!("done")))
+            }
+        });
+        registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!("other"))));
+        let mut scheduler = Scheduler::open(&path, registry.clone()).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "waiter", true, 3))
+            .unwrap();
+        scheduler.submit(&task(2, owner, "other", true, 3)).unwrap();
+        scheduler.tick(0).unwrap();
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        scheduler.tick(0).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+    }
+
+    #[test]
+    fn empty_any_wait_resumes_on_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("waiter", true, |task: &Task| {
+            if task.checkpoint().phase == "start" {
+                Ok(Step::Wait {
+                    checkpoint: cp("woken"),
+                    condition: WaitFor::TasksAny(vec![]),
+                    children: vec![],
+                })
+            } else {
+                assert_eq!(task.ended_children(), Some(&[][..]));
+                Ok(Step::Succeed(json!(null)))
+            }
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "waiter",
+                true,
+                3,
+            ))
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        assert!(scheduler.wake_snapshot(0).unwrap().active);
+        scheduler.tick(0).unwrap();
+        assert!(
+            scheduler
+                .get(Uuid::from_u128(1))
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+        );
+    }
+
+    #[test]
+    fn external_wait_rejects_wait_and_ownership_cycles() {
+        for owner_cycle in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            registry.register("waiter", true, |_: &Task| {
+                Ok(Step::Wait {
+                    checkpoint: cp("wait"),
+                    condition: WaitFor::TasksAny(vec![Uuid::from_u128(2)]),
+                    children: vec![],
+                })
+            });
+            registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let root_owner = TaskOwner::Conversation(Uuid::from_u128(9));
+            let waiter_owner = if owner_cycle {
+                TaskOwner::Task(Uuid::from_u128(2))
+            } else {
+                root_owner.clone()
+            };
+            let waiter = task(1, waiter_owner, "waiter", true, 3);
+            let mut other = task(2, root_owner, "other", true, 3);
+            if !owner_cycle {
+                other.start().unwrap();
+                other.wait(WaitFor::TasksAny(vec![waiter.id()])).unwrap();
+            }
+            scheduler
+                .ts()
+                .save(&[Save::Create(&waiter), Save::Create(&other)])
+                .unwrap();
+            assert!(matches!(scheduler.tick(0), Err(Error::Ownership)));
+        }
     }
     #[test]
     fn completing_survives_reopen_without_parent_definition_and_wakes_child() {

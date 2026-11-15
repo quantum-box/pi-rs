@@ -1342,11 +1342,13 @@ impl<'a> TaskStore<'a> {
                 let mut pending = false;
                 let mut ended = Vec::new();
                 for id in ids {
-                    if !seen.insert(*id) {
+                    if *id == snapshot.task.id() || !seen.insert(*id) {
                         return Err(Error::InvalidChild);
                     }
                     let child = self.load(*id)?.ok_or(Error::InvalidChild)?;
-                    if child.task.owner() != &TaskOwner::Task(snapshot.task.id()) {
+                    if matches!(condition, WaitFor::TasksFailFast(_))
+                        && child.task.owner() != &TaskOwner::Task(snapshot.task.id())
+                    {
                         return Err(Error::InvalidChild);
                     }
                     if !child.task.is_terminal() {
@@ -1360,7 +1362,7 @@ impl<'a> TaskStore<'a> {
                     });
                 }
                 if if matches!(condition, WaitFor::TasksAny(_)) {
-                    ended.is_empty()
+                    !ids.is_empty() && ended.is_empty()
                 } else {
                     pending
                 } {
@@ -1421,13 +1423,10 @@ impl<'a> TaskStore<'a> {
         let mut checks = Vec::with_capacity(ids.len());
         let mut ended = Vec::new();
         for id in ids {
-            if !seen.insert(id) {
+            if id == task.id() || !seen.insert(id) {
                 return Err(Error::InvalidChild);
             }
             let child = self.load(id)?.ok_or(Error::InvalidChild)?;
-            if child.task.owner() != &TaskOwner::Task(task.id()) {
-                return Err(Error::InvalidChild);
-            }
             if child.task.is_terminal() {
                 ended.push(id);
             }

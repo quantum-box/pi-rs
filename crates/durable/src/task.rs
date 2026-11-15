@@ -41,7 +41,7 @@ pub enum WaitFor {
         signals: Vec<String>,
     },
     Tasks(Vec<Uuid>),
-    /// Wake when any direct child ends; an empty set remains pending.
+    /// Wake when any named task ends. An empty set is immediately ready.
     TasksAny(Vec<Uuid>),
     /// Wait for all; a failed child cancels the other listed subtrees.
     TasksFailFast(Vec<Uuid>),
