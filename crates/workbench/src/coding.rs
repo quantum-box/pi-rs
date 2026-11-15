@@ -2127,7 +2127,8 @@ impl Tool for CodingTool {
             Err(Error::Config(message))
                 if self.unrestricted
                     && matches!(self.kind, Kind::Read { .. })
-                    && message.starts_with("ENOENT: no such file or directory, access '") =>
+                    && (message.starts_with("ENOENT: no such file or directory, access '")
+                        || message.starts_with("ENOTDIR: not a directory, access '")) =>
             {
                 Outcome::Failed(message)
             }
@@ -4475,8 +4476,11 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(result, Outcome::Failed(message)
-            if message == format!("ENOTDIR: not a directory, access '{}'", root.join("alias/child").display())));
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == &format!("ENOTDIR: not a directory, access '{}'", root.join("alias/child").display())),
+            "{result:?}"
+        );
     }
 
     #[cfg(unix)]
