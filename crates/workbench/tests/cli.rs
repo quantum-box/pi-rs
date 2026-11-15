@@ -6707,6 +6707,7 @@ fn sigint_interrupts_managed_model_discovery() {
         vec!["--mode", "rpc"],
         vec!["--models", "ollama/*", "serve"],
         vec!["--models", "ollama/*", "mcp", "login", "fixture"],
+        vec!["--list-models=ollama/*", "mcp", "login", "fixture"],
     ] {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

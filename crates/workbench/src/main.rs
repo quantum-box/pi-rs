@@ -1467,7 +1467,7 @@ async fn run_cli() -> i32 {
         let managed = args.list_models.is_none() && matches!(&args.command,
             None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
         );
-        let mcp_login = matches!(&args.command, Some(Command::Mcp { command: mcp_config::McpCommand::Login { .. } }));
+        let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command: mcp_config::McpCommand::Login { .. } }));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
         if managed {
