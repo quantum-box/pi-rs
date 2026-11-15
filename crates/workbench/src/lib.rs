@@ -31,6 +31,7 @@ mod mcp_provider_auth;
 pub mod mcp_refresh;
 #[doc(hidden)]
 pub mod oauth_callback;
+pub mod prompt_resources;
 mod shell_config;
 mod shell_output;
 mod text_edit;
