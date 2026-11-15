@@ -541,6 +541,9 @@ Current limits and differences from upstream Pi Durable:
   process-local and excludes direct harness drives and persisted waiting work.
   It is not an
   `onWake` or durable-idleness API.
+- `Driver::wake_snapshot(now)` reads task definitions and durable waits under
+  the task gate without waiting for the handler-held scheduler mutex. It does
+  not include conversation deadlines or provide `onWake` notifications.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff.
   There is no flow control.

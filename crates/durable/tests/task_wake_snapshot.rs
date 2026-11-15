@@ -143,3 +143,78 @@ fn inspecting_a_signalled_wait_does_not_consume_it() {
     assert!(!after.active);
     assert_eq!(after.at, Some(100));
 }
+
+#[test]
+fn driver_snapshot_reads_deadline_during_live_handler() {
+    use std::{
+        sync::{Mutex, mpsc},
+        time::Duration,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let mut registry = Registry::default();
+    registry.register("nap", true, |_: &Task| {
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "sleep".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::DeadlineMillis(i64::MAX - 1),
+            children: vec![],
+        })
+    });
+    registry.register("hold", true, move |_: &Task| {
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+        Ok(Step::Succeed(json!(null)))
+    });
+    let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+    scheduler.submit(&task(1, "nap")).unwrap();
+    assert!(scheduler.tick(0).unwrap());
+    scheduler.submit(&task(2, "hold")).unwrap();
+    let driver = Arc::new(Driver::start(scheduler));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let copy = driver.clone();
+    let (tx, rx) = mpsc::channel();
+    let observer = std::thread::spawn(move || {
+        tx.send(copy.wake_snapshot(0)).unwrap();
+    });
+    let snapshot = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("snapshot waited for handler")
+        .unwrap();
+    assert!(snapshot.active);
+    assert_eq!(snapshot.at, Some(i64::MAX - 1));
+    observer.join().unwrap();
+    release_tx.send(()).unwrap();
+    Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+}
+
+#[test]
+fn driver_wake_snapshot_rejects_panicked_worker() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    let wait = std::sync::Mutex::new(wait);
+    let mut registry = Registry::default();
+    registry.register("panic", true, move |_: &Task| -> Result<Step, String> {
+        wait.lock().unwrap().recv().unwrap();
+        panic!("expected handler panic")
+    });
+    let scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+    scheduler.submit(&task(7, "panic")).unwrap();
+    let driver = Driver::start(scheduler);
+    let rx = driver.subscribe_wake().unwrap().unwrap();
+    release.send(()).unwrap();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(()) => (),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(error) => panic!("worker did not stop: {error}"),
+        }
+    }
+    assert!(driver.wake_snapshot(0).is_err());
+    assert!(driver.shutdown().is_err());
+}

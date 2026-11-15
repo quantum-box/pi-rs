@@ -385,7 +385,7 @@ durable deadline without invoking handlers or migrations. The standalone task
 scheduler provides the same view. Unlike upstream
 [`onWake`](https://github.com/earendil-works/pi/blob/c1d4b0ac3e35dc4eb1c5d00d90bf54003cf517c0/packages/durable/src/harness/scheduler.ts#L566),
 notifications are hints rather than changes to `{active, at}`; polling continues,
-conversation scheduling is excluded, and inspection can wait for a handler.
+conversation scheduling is excluded. The driver snapshot uses a separately published definition view and the task gate, so it does not wait for a running handler; it still can wait for a task commit or migration under that gate.
 Scheduler and driver signal delivery is fenced with inspection; direct TaskStore
 writes are outside that protocol. Satisfied waits count as active even when their definition is blocked, and abort
 cleanup candidates may still depend on conversations. Fail-fast sibling cleanup

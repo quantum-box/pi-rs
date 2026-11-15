@@ -36,6 +36,7 @@ pub enum Error {
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
     activity: crate::worker_activity::WorkerActivity,
+    wake_reader: task_scheduler::WakeReader,
     owner: Arc<OwnedStore>,
     state: Mutex<State>,
     wake: Condvar,
@@ -89,6 +90,7 @@ impl Driver {
     ) -> Self {
         let owner = scheduler.owner();
         let activity = scheduler.worker_activity();
+        let wake_reader = scheduler.wake_reader();
         let policies = scheduler.policies();
         let definitions = scheduler.definitions();
         let (notify_tx, notify_rx) = mpsc::sync_channel(1);
@@ -97,6 +99,7 @@ impl Driver {
         let shared = Arc::new(Shared {
             scheduler: Mutex::new(scheduler),
             activity,
+            wake_reader,
             owner,
             state: Mutex::new(State {
                 policies,
@@ -115,6 +118,12 @@ impl Driver {
             struct CloseOnExit(Arc<Shared>);
             impl Drop for CloseOnExit {
                 fn drop(&mut self) {
+                    if std::thread::panicking()
+                        && let Ok(mut state) = self.0.state.lock()
+                    {
+                        state.stop = true;
+                        state.failure = Some("task worker panicked".into());
+                    }
                     self.0.close_notifications();
                 }
             }
@@ -272,11 +281,12 @@ impl Driver {
     }
 
     /// Inspect generic task wake state at a scheduling boundary using the supplied
-    /// Unix-millisecond clock. This may wait for an in-flight handler to finish.
+    /// Unix-millisecond clock. Does not acquire the handler's scheduler mutex.
     pub fn wake_snapshot(&self, now_millis: i64) -> Result<task_scheduler::WakeSnapshot, Error> {
-        let scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
-        let _state = self.check()?;
-        Ok(scheduler.wake_snapshot(now_millis)?)
+        drop(self.check()?);
+        let snapshot = self.shared.wake_reader.snapshot(now_millis)?;
+        drop(self.check()?);
+        Ok(snapshot)
     }
 
     /// Snapshot nonterminal tasks currently blocked by their definitions.
@@ -824,6 +834,7 @@ mod tests {
         let shared = Arc::new(Shared {
             owner: owner.clone(),
             state: Mutex::new(State::default()),
+            wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
@@ -980,6 +991,7 @@ mod tests {
             .unwrap();
         let shared = Shared {
             owner,
+            wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             state: Mutex::new(State::default()),
@@ -1075,6 +1087,7 @@ mod tests {
         let shared = Arc::new(Shared {
             owner: scheduler.owner(),
             state: Mutex::new(State::default()),
+            wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
@@ -1147,6 +1160,7 @@ mod tests {
                 definitions: scheduler.definitions(),
                 ..State::default()
             }),
+            wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
@@ -1427,6 +1441,7 @@ mod tests {
                 definitions: scheduler.definitions(),
                 ..State::default()
             }),
+            wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),

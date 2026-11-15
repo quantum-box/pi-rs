@@ -286,8 +286,127 @@ impl Drop for Attachment {
     }
 }
 
+#[derive(Clone)]
+struct WakeDefinitions {
+    registry: Registry,
+    failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
+}
+
+/// Task wake reader independent of the mutex held across handler execution.
+#[derive(Clone)]
+pub(crate) struct WakeReader {
+    owner: Arc<OwnedStore>,
+    definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
+}
+impl WakeReader {
+    pub(crate) fn snapshot(&self, now_millis: i64) -> Result<WakeSnapshot, Error> {
+        let _gate = self.owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        let definitions = self.definitions.read().map_err(|_| Error::Poisoned)?;
+        let ts = TaskStore::new(self.owner.store());
+        let tasks = ts.list()?;
+        let mut result = WakeSnapshot {
+            active: false,
+            at: None,
+            blocked: Vec::new(),
+        };
+        for item in &tasks {
+            let task = &item.task;
+            if task.is_terminal() {
+                continue;
+            }
+            let reason = definitions.blocked_reason(task);
+            if let Some(reason) = reason.clone() {
+                result.blocked.push(BlockedTask {
+                    id: task.id(),
+                    kind: task.kind().map(str::to_owned),
+                    owner: task.owner().clone(),
+                    reason,
+                });
+            }
+            match task.state() {
+                TaskState::Ready if task.abort_requested() => {
+                    if !tasks.iter().any(|child| {
+                        child.task.owner() == &TaskOwner::Task(task.id())
+                            && !child.task.is_terminal()
+                    }) {
+                        result.active = true;
+                    }
+                }
+                TaskState::Ready
+                    if reason.is_none() && definitions.ancestors_available(task, &tasks) =>
+                {
+                    result.active = true
+                }
+                TaskState::Running if reason.is_none() => result.active = true,
+                TaskState::Waiting(wait) => {
+                    let deadline = match wait {
+                        WaitFor::DeadlineMillis(at) => Some(*at),
+                        WaitFor::Sleep { until_millis, .. }
+                        | WaitFor::TypedSleep { until_millis, .. } => *until_millis,
+                        _ => None,
+                    };
+                    if ts.wait_ready(item, now_millis)? {
+                        result.active = true;
+                    } else if let Some(at) = deadline.filter(|at| *at > now_millis) {
+                        result.at = Some(result.at.map_or(at, |old| old.min(at)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+}
+impl WakeDefinitions {
+    fn blocked_reason(&self, task: &Task) -> Option<BlockedReason> {
+        let Some(reg) = task.kind().and_then(|kind| self.registry.entries.get(kind)) else {
+            return Some(BlockedReason::MissingTask);
+        };
+        if task.definition_version() > reg.version {
+            return Some(BlockedReason::TaskTooOld);
+        }
+        if task.definition_version() < reg.version {
+            if let Some((identity, error)) = self.failed_migrations.get(&task.id())
+                && Arc::ptr_eq(identity, &reg.identity)
+            {
+                return Some(BlockedReason::MigrationFailed(error.clone()));
+            }
+            if reg.migrate.is_none() {
+                return Some(BlockedReason::MigrationFailed("missing migration".into()));
+            }
+        }
+        None
+    }
+    fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
+        let mut owner = task.owner();
+        let mut visited = HashSet::new();
+        while let TaskOwner::Task(id) = owner {
+            if !visited.insert(*id) {
+                return false;
+            }
+            let Some(parent) = tasks.iter().find(|entry| entry.task.id() == *id) else {
+                return false;
+            };
+            if parent.task.abort_requested()
+                || parent.task.is_terminal()
+                || parent.task.state() == &TaskState::Running
+                || parent
+                    .task
+                    .kind()
+                    .and_then(|kind| self.registry.entries.get(kind))
+                    .is_none()
+            {
+                return false;
+            }
+            owner = parent.task.owner();
+        }
+        true
+    }
+}
+
 pub struct Scheduler {
     attachment: Attachment,
+    wake_reader: WakeReader,
     registry: Registry,
     validator: Option<crate::runtime::Harness>,
     poisoned: bool,
@@ -298,6 +417,19 @@ impl Scheduler {
     /// Observe live handler invocations without acquiring the scheduler lock.
     pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
         self.activity.clone()
+    }
+    pub(crate) fn wake_reader(&self) -> WakeReader {
+        self.wake_reader.clone()
+    }
+    fn publish_wake_definitions(&self) -> Result<(), Error> {
+        let mut view = self
+            .wake_reader
+            .definitions
+            .write()
+            .map_err(|_| Error::Poisoned)?;
+        view.registry = self.registry.clone();
+        view.failed_migrations.clone_from(&self.failed_migrations);
+        Ok(())
     }
     pub(crate) fn owner(&self) -> Arc<OwnedStore> {
         self.attachment.owner.clone()
@@ -333,8 +465,16 @@ impl Scheduler {
     /// all other task executors and direct TaskStore mutations themselves.
     /// Failed attachment or recovery releases the in-process guard.
     pub fn attach(owner: Arc<OwnedStore>, registry: Registry) -> Result<Self, Error> {
+        let wake_reader = WakeReader {
+            owner: owner.clone(),
+            definitions: Arc::new(std::sync::RwLock::new(WakeDefinitions {
+                registry: registry.clone(),
+                failed_migrations: HashMap::new(),
+            })),
+        };
         let mut scheduler = Self {
             attachment: Attachment::acquire(owner)?,
+            wake_reader,
             registry,
             validator: None,
             poisoned: false,
@@ -381,6 +521,7 @@ impl Scheduler {
                 .map_err(|_| Error::Registration)?;
         }
         self.registry = registry;
+        self.publish_wake_definitions()?;
         self.reconcile()
     }
     /// Inspect compatibility without executing migration code.
@@ -428,59 +569,7 @@ impl Scheduler {
     /// Inspect one task-store snapshot without polling waits or invoking user code.
     pub fn wake_snapshot(&self, now_millis: i64) -> Result<WakeSnapshot, Error> {
         self.check()?;
-        let owner = self.owner();
-        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
-        let tasks = self.ts().list()?;
-        let mut result = WakeSnapshot {
-            active: false,
-            at: None,
-            blocked: Vec::new(),
-        };
-        for item in &tasks {
-            let task = &item.task;
-            if task.is_terminal() {
-                continue;
-            }
-            let reason = self.blocked_reason(task);
-            if let Some(reason) = reason.clone() {
-                result.blocked.push(BlockedTask {
-                    id: task.id(),
-                    kind: task.kind().map(str::to_owned),
-                    owner: task.owner().clone(),
-                    reason,
-                });
-            }
-            match task.state() {
-                TaskState::Ready if task.abort_requested() => {
-                    // Cleanup may have additional foreground conversation dependencies.
-                    if !tasks.iter().any(|child| {
-                        child.task.owner() == &TaskOwner::Task(task.id())
-                            && !child.task.is_terminal()
-                    }) {
-                        result.active = true;
-                    }
-                }
-                TaskState::Ready if reason.is_none() && self.ancestors_available(task, &tasks) => {
-                    result.active = true
-                }
-                TaskState::Running if reason.is_none() => result.active = true,
-                TaskState::Waiting(wait) => {
-                    let deadline = match wait {
-                        WaitFor::DeadlineMillis(at) => Some(*at),
-                        WaitFor::Sleep { until_millis, .. }
-                        | WaitFor::TypedSleep { until_millis, .. } => *until_millis,
-                        _ => None,
-                    };
-                    if self.ts().wait_ready(item, now_millis)? {
-                        result.active = true;
-                    } else if let Some(at) = deadline.filter(|at| *at > now_millis) {
-                        result.at = Some(result.at.map_or(at, |old| old.min(at)));
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(result)
+        self.wake_reader.snapshot(now_millis)
     }
 
     // Compute migration on a detached record; persist it together with reservation.
@@ -507,6 +596,7 @@ impl Scheduler {
                 Err(error) => {
                     self.failed_migrations
                         .insert(snapshot.task.id(), (identity, error));
+                    self.publish_wake_definitions()?;
                     return Ok(false);
                 }
             }
