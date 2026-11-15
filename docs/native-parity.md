@@ -4307,6 +4307,10 @@ The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
 pi-rs does not automatically remove stale `auth.json.lock` directories.
+After a worker admits a protected OAuth refresh, pi-rs retains its worker
+refresh barrier until the auth lock is released, including on errors. A worker
+terminated while holding the auth lock but waiting to enter that barrier can
+still leave a stale directory, as can a crash or external termination.
 To recover one safely, stop **all** Pi and pi-rs processes that can access
 that credential store, including background or waiting processes on other
 hosts sharing the filesystem. Once they have exited, either remove the stale
