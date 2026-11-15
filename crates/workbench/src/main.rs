@@ -1315,7 +1315,38 @@ async fn run_cli() -> i32 {
         }
     });
     tokio::task::yield_now().await;
-    let argv: Vec<_> = std::env::args_os().collect();
+    let mut argv: Vec<_> = std::env::args_os().collect();
+    let mut literal_export = None;
+    if let Some(metadata) = cli_compat::metadata(&argv) {
+        for (error, message) in &metadata.diagnostics {
+            eprintln!("{}: {message}", if *error { "Error" } else { "Warning" });
+        }
+        if metadata.diagnostics.iter().any(|(error, _)| *error) {
+            return 1;
+        }
+        if metadata.export && !metadata.version {
+            literal_export = metadata.literal_export;
+            argv = metadata.args_without_help;
+        } else {
+            let flag = if metadata.version {
+                "--version"
+            } else if metadata.short_help {
+                "-h"
+            } else {
+                "--help"
+            };
+            if let Err(error) = cli_compat::parse([std::ffi::OsString::from("pi"), flag.into()]) {
+                let _ = error.print();
+            }
+            if !metadata.version
+                && let Some(help) =
+                    cli_compat::extension_help_from_args(&metadata.args_without_help)
+            {
+                print!("{help}");
+            }
+            return 0;
+        }
+    }
     let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
         Ok(parsed) => parsed,
         Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
@@ -1332,6 +1363,9 @@ async fn run_cli() -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        if let Some(paths) = literal_export {
+            return export_from_file(&paths);
+        }
         args.mcp_login_cancel = mcp_login_cancel;
         args.extension_flags = extension_flags;
         if let Some(paths) = &args.export_session {
