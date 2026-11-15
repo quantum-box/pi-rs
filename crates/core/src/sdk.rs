@@ -2444,8 +2444,17 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal);
         }
         let mut replaced = None;
-        if let Some((provider, name, level)) = journal.model_identity_at(journal.head()) {
-            if branch_client(&self.registry, self.session_id, provider.as_deref(), &name).is_some()
+        let selected = journal.model_identity_at(journal.head());
+        let missing_legacy = selected.is_none()
+            && self.model_provider.is_none()
+            && !branch_client(&self.registry, self.session_id, None, &self.model_name)
+                .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
+        let current =
+            selected.or_else(|| missing_legacy.then(|| (None, self.model_name.clone(), None)));
+        if let Some((provider, name, level)) = current {
+            if !missing_legacy
+                && branch_client(&self.registry, self.session_id, provider.as_deref(), &name)
+                    .is_some()
             {
                 self.restore_branch_model(provider.as_deref(), name)?;
             } else if let Some((model, replacement_provider, replacement)) = fallback {
@@ -2483,17 +2492,11 @@ impl AgentSession {
                 self.model_identity_resolved = true;
                 self.refresh_run_config();
                 replaced = Some((provider, name, level.unwrap_or_else(|| "off".into())));
-            } else {
+            } else if !missing_legacy {
                 self.restore_branch_model(provider.as_deref(), name)?;
-            }
-        }
-        if journal.model_identity_at(journal.head()).is_none() && self.model_provider.is_none() {
-            let valid = branch_client(&self.registry, self.session_id, None, &self.model_name)
-                .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
-            if !valid {
+            } else {
                 return Err(Error::Config(format!(
-                    "session branch requires registered model {}",
-                    self.model_name
+                    "session branch requires registered model {name}"
                 )));
             }
         }
@@ -4308,6 +4311,38 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_model_replaces_revoked_selection_free_legacy_client() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(NamedBranchModel("old")), "old")
+            .extension(Arc::new(ReplacementStartupHook(observed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .registry
+            .remove_session_branch_models(session.session_id);
+        session
+            .set_model_with_hooks(
+                Arc::new(NamedBranchModel("new")),
+                "new",
+                serde_json::json!({"id":"new", "provider":"fixture"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.journal().unwrap().model_provider(), Some("fixture"));
+        assert_eq!(session.prompt("next").await.unwrap(), "new");
+        assert!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, crate::LifecycleEvent::SessionStart { .. }))
+        );
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
