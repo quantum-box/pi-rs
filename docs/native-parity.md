@@ -22,6 +22,10 @@ Single-line extension input dialogs remove pasted line breaks and expand tabs
 to four spaces, while multiline editor dialogs normalize CRLF and CR to newlines.
 The native one MiB response limit applies after paste sanitization and expansion.
 
+Visible thinking blocks render Markdown with the thinking text style and
+preserve the Markdown theme's explicit colors. As in Pi, Mermaid fences in
+thinking remain code rather than being transformed into diagrams.
+
 OpenAI Responses streams both reasoning text and reasoning summary text as
 thinking deltas. Completed reasoning items retain their summary when present,
 otherwise their content or streamed text, in the completed turn metadata.
@@ -848,6 +852,11 @@ files follow the process umask and edits preserve existing permissions. File
 mutations run off the async runtime and check cancellation while holding the
 per-file lock, including immediately before committing the replacement.
 Lock acquisition also observes cancellation while another writer is active.
+The built-in local `write` uses atomic replacement. Unlike Pi's in-place write,
+it can replace a read-only file when the parent directory permits replacement,
+requires permission to create and replace entries in that directory, and leaves
+other hard links pointing at the old file. A permission preflight alone cannot
+bind the check to the file that a later pathname replacement will affect.
 RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
@@ -2618,6 +2627,10 @@ tail and truncation metadata are unchanged. A regression covers both cases
 with chunked multibyte output; other local-tool parity gaps remain open.
 
 ### Grep context and line-limit checkpoint
+
+Invalid regular expressions in unrestricted local `grep` include the `rg:`
+prefix used by Pi's ripgrep diagnostic. Unsupported look-around and
+backreferences include ripgrep's PCRE2 suggestion.
 
 Grep now emits a separate context block for each match, including repeated lines
 where adjacent matches overlap. The matching marker belongs to that block's
