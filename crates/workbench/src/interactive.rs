@@ -3945,12 +3945,11 @@ pub(super) async fn run(
         if worker
             .as_ref()
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
+            && let Some(mut old) = worker.take()
         {
-            if let Some(mut old) = worker.take() {
-                for warning in old.take_pending_warnings() {
-                    view.append(&warning);
-                    dirty = true;
-                }
+            for warning in old.take_pending_warnings() {
+                view.append(&warning);
+                dirty = true;
             }
         }
         if !is_busy(&worker)

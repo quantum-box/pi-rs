@@ -2471,10 +2471,7 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
             match master.read(&mut buffer) {
                 Ok(count) => output.extend_from_slice(&buffer[..count]),
                 Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
-                {
-                    ()
-                }
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
                 Err(error) => panic!("{label}: terminal read failed: {error}"),
             }
             let text = String::from_utf8_lossy(&output);
@@ -2503,10 +2500,7 @@ fn reload_preserves_broken_settings_in_restarted_worker() {
             match master.read(&mut buffer) {
                 Ok(count) => output.extend_from_slice(&buffer[..count]),
                 Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
-                {
-                    ()
-                }
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
                 Err(error) => panic!("{label}: terminal read failed: {error}"),
             }
             assert!(
