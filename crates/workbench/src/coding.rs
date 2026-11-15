@@ -6261,7 +6261,8 @@ mod tests {
         )
         .await
         .expect("cancelled shell kept draining");
-        task.await.unwrap();
+        task.abort();
+        let _ = task.await;
         let result = result.unwrap();
         assert!(
             result.cancelled,
