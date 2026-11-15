@@ -2323,11 +2323,9 @@ async fn execute(
         if let Some(record) = image_record {
             observer(Notification::Committed(record));
         }
-        drop(observer);
         let answer = agent.run_correlated_with_events(
             &mut session, run_id, input, &mut receiver, &cancel, &mut event_observer,
         ).await;
-        drop(event_observer);
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
             for event in stream.settle(aborted) {
