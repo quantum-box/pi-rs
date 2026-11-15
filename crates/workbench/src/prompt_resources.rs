@@ -50,7 +50,7 @@ impl PromptResourceFactory {
             None => discover(grants, "SYSTEM.md")?,
         };
         let append = match &self.append {
-            Some(values) => values.iter().map(literal).collect(),
+            Some(values) => values.iter().map(|value| literal(value)).collect(),
             None => discover(grants, "APPEND_SYSTEM.md")?.into_iter().collect(),
         };
         Ok(PromptResources { system, append })
@@ -61,7 +61,13 @@ impl PromptResources {
     /// Compose a caller-selected default with the resolved override and appendices.
     /// The caller owns the default prompt and any additional context formatting.
     pub fn compose(&self, default: &str) -> String {
-        let mut result = self.system.as_ref().map_or(default, |p| &p.text).to_owned();
+        let mut result = self
+            .system
+            .as_ref()
+            .map(|p| p.text.as_str())
+            .filter(|text| !text.is_empty())
+            .unwrap_or(default)
+            .to_owned();
         for prompt in &self.append {
             if !prompt.text.is_empty() {
                 result.push_str("\n\n");
@@ -77,9 +83,9 @@ impl PromptResources {
     }
 }
 
-fn literal(text: &String) -> PromptResource {
+fn literal(text: &str) -> PromptResource {
     PromptResource {
-        text: text.clone(),
+        text: text.to_owned(),
         source: None,
     }
 }
@@ -103,7 +109,16 @@ fn discover(grants: &PromptReadGrants, filename: &str) -> Result<Option<PromptRe
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
-    let file = match std::fs::File::open(path) {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Opening a FIFO for reading otherwise waits indefinitely for a writer.
+    // Validate the opened handle below, so replacement races cannot bypass it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),

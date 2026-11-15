@@ -146,3 +146,71 @@ async fn applied_snapshot_reaches_model_and_reload_is_host_controlled() {
     );
     session.close().await.unwrap();
 }
+
+#[test]
+fn empty_system_uses_default_without_falling_back_to_global() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let global = temp.path().join("global");
+    fs::create_dir_all(project.join(".pi")).unwrap();
+    fs::create_dir_all(&global).unwrap();
+    fs::write(project.join(".pi/SYSTEM.md"), "").unwrap();
+    fs::write(global.join("SYSTEM.md"), "global").unwrap();
+    let grants = PromptReadGrants {
+        project: Some(project),
+        global: Some(global),
+    };
+    let snapshot = PromptResourceFactory::default().load(&grants).unwrap();
+    assert_eq!(snapshot.system.as_ref().unwrap().text, "");
+    assert_eq!(snapshot.compose("default"), "default");
+    let explicit = PromptResourceFactory {
+        system: Some(String::new()),
+        append: Some(vec!["append".into()]),
+    };
+    assert_eq!(
+        explicit.load(&grants).unwrap().compose("default"),
+        "default\n\nappend"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_prompt_is_rejected_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CHILD: &str = "PI_RS_PROMPT_FIFO_TEST_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let grants = PromptReadGrants {
+            global: Some(directory.into()),
+            project: None,
+        };
+        let error = PromptResourceFactory::default().load(&grants).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("SYSTEM.md");
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fifo_prompt_is_rejected_without_blocking"])
+        .env(CHILD, temp.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "FIFO check subprocess failed: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("opening FIFO blocked");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

@@ -4615,7 +4615,8 @@ the corresponding global files. Nothing is read without a grant. As in the
 [pinned loader](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/src/core/resource-loader.ts),
 project files take precedence independently for each category, and explicit
 system or append values replace discovery. File values have a UTF-8 BOM removed
-and carry their source path. An explicit empty append list suppresses discovery.
+and carry their source path. An empty system prompt uses the host default; an
+explicit empty append list suppresses discovery.
 
 The host must obtain and reevaluate its own permissions and choose the paths;
 grants permit ordinary filesystem reads including symlink targets and are not a
@@ -4629,6 +4630,7 @@ This is a focused native API, not a complete Pi resource loader. It does not
 load skills, prompt templates, extensions, context files, themes, or settings;
 it does not interpret an explicit string as a filename. Unlike Pi's fallback
 for unreadable prompt files, invalid UTF-8, oversized files, and read failures
-are errors. The host supplies the default prompt and any Pi-specific context
+are errors. Unix file opens are nonblocking and validate the opened handle before
+reading, so a FIFO is rejected. The host supplies the default prompt and any Pi-specific context
 formatting; `compose` joins nonempty appendices with blank lines. Existing CLI
 loading remains independent.
