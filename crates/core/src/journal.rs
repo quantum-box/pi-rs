@@ -2079,6 +2079,59 @@ impl Session {
         timestamps
     }
 
+    /// Clone every branch only when the journal contains no executable or queued work.
+    /// Unsupported histories return `None` so callers may retain branch-only behavior.
+    pub fn fork_inert_full_history(&self) -> Result<Option<Self>> {
+        if self.host_binding().is_some()
+            || self.records.iter().any(|record| {
+                matches!(
+                    record.event,
+                    Event::HostBound { .. } | Event::HostRunBound { .. }
+                )
+            })
+        {
+            return Err(Error::Session(
+                "managed sessions must be forked by their host".into(),
+            ));
+        }
+        let inert = self.records.iter().all(|record| {
+            record.run_id.is_none()
+                && match &record.event {
+                    Event::Created { .. }
+                    | Event::SessionInfo { .. }
+                    | Event::ParentSession { .. }
+                    | Event::Checkout { .. }
+                    | Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::UserImages { .. }
+                    | Event::ModelSelected { .. }
+                    | Event::Label { .. }
+                    | Event::ContextEdited { .. }
+                    | Event::Compacted { .. }
+                    | Event::BranchSummary { .. }
+                    | Event::BashExecution { .. } => true,
+                    Event::SourceEntry { format, .. } => {
+                        matches!(format.as_str(), "pi" | "pi-rs:external-session-id")
+                    }
+                    Event::ModelFinished { reply, .. } => reply.is_none(),
+                    Event::Assistant { invocations, .. } => invocations.is_empty(),
+                    _ => false,
+                }
+        });
+        if !inert {
+            return Ok(None);
+        }
+        let mut records = self.records.clone();
+        if let Event::Created { session_id } = &mut records[0].event {
+            *session_id = Uuid::new_v4();
+            records[0].timestamp = Some(record_timestamp());
+        }
+        Ok(Some(Self::from_records_with_metadata(
+            records,
+            self.record_metadata.clone(),
+        )?))
+    }
+
     /// Export one settled branch with fresh session identity and remapped record references.
     /// Auxiliary record metadata is not representable in this legacy return type;
     /// use `fork_session` or `fork_to` when it must be preserved.
@@ -3964,6 +4017,120 @@ mod record_metadata_tests {
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn inert_full_history_preserves_branches_and_record_metadata() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "root".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let root = session.head();
+        session
+            .append_with_record_metadata(
+                Event::User {
+                    content: "sibling".into(),
+                    input_id: None,
+                },
+                serde_json::json!({"fixture":"retained"}),
+            )
+            .unwrap();
+        let sibling = session.head();
+        session.checkout(root).unwrap();
+        session
+            .append(Event::User {
+                content: "active".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let original_id = session.session_id();
+        let mut fork = session.fork_inert_full_history().unwrap().unwrap();
+        assert_ne!(fork.session_id(), original_id);
+        assert_eq!(
+            fork.record_metadata(sibling),
+            Some(&serde_json::json!({"fixture":"retained"}))
+        );
+        fork.checkout(sibling).unwrap();
+        assert!(
+            fork.current_messages()
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "sibling"))
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        fork.export_jsonl(&path).unwrap();
+        assert_eq!(
+            Session::open(&path).unwrap().record_metadata(sibling),
+            Some(&serde_json::json!({"fixture":"retained"}))
+        );
+    }
+
+    #[test]
+    fn inert_full_history_excludes_recoverable_and_queued_work() {
+        let message = crate::CustomMessage {
+            custom_type: "queue".into(),
+            content: crate::ContextContent::Text("text".into()),
+            display: false,
+            details: None,
+        };
+        let events = [
+            Event::Run {
+                state: RunState::Running,
+                initial: None,
+            },
+            Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message,
+                },
+            },
+            Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id: Uuid::new_v4(),
+                    call: crate::ToolCall {
+                        id: "x".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            },
+            Event::ModelFinished {
+                request_id: Uuid::new_v4(),
+                metadata: Default::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: "reply".into(),
+                    invocations: Vec::new(),
+                    advertised_tools: Vec::new(),
+                    max_output_tokens: 16,
+                }),
+            },
+        ];
+        for event in events {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session.append(event).unwrap();
+            assert!(session.fork_inert_full_history().unwrap().is_none());
+        }
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.set_run_id(Some(Uuid::new_v4()));
+        session
+            .append(Event::Assistant {
+                content: "partial".into(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        assert!(session.fork_inert_full_history().unwrap().is_none());
+    }
 
     #[test]
     fn fork_does_not_resurrect_tree_message_consumed_on_another_branch() {

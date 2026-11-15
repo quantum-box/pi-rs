@@ -278,6 +278,20 @@ pub fn fork(
     copy.export_jsonl(destination)
 }
 
+pub fn fork_full_history_when_inert(
+    session: &Session,
+    source: &Path,
+    destination: &Path,
+    workspace: &Path,
+) -> Result<()> {
+    let Some(mut copy) = session.fork_inert_full_history()? else {
+        return fork(session, source, session.head(), destination, workspace);
+    };
+    copy.set_parent_session(&source.to_string_lossy())?;
+    copy.set_working_directory(workspace)?;
+    copy.export_jsonl(destination)
+}
+
 pub fn import(source: &Path, destination: &Path) -> Result<()> {
     if !source.is_file() {
         return Err(Error::Config("session file not found".into()));
@@ -1178,6 +1192,67 @@ async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_fork_keeps_legacy_pending_tree_trigger_fallback() {
+        for sibling in [false, true] {
+            let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let mut records = initial.records().to_vec();
+            records.push(pi_rs::Record {
+                timestamp: None,
+                run_id: None,
+                version: records[0].version,
+                id: 2,
+                parent: Some(1),
+                event: Event::TreeMessageQueued {
+                    input: pi_rs::QueuedCustomMessage {
+                        id: uuid::Uuid::new_v4(),
+                        delivery: pi_rs::CustomMessageDelivery::TriggerTurn,
+                        message: pi_rs::CustomMessage {
+                            custom_type: "trigger".into(),
+                            content: pi_rs::ContextContent::Text("queued".into()),
+                            display: false,
+                            details: None,
+                        },
+                    },
+                },
+            });
+            if sibling {
+                records.push(pi_rs::Record {
+                    timestamp: None,
+                    run_id: None,
+                    version: records[0].version,
+                    id: 3,
+                    parent: Some(2),
+                    event: Event::Checkout { target: 1 },
+                });
+                records.push(pi_rs::Record {
+                    timestamp: None,
+                    run_id: None,
+                    version: records[0].version,
+                    id: 4,
+                    parent: Some(1),
+                    event: Event::User {
+                        content: "other".into(),
+                        input_id: None,
+                    },
+                });
+            }
+            let session = Session::from_records(records).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("fork.jsonl");
+            fork_full_history_when_inert(
+                &session,
+                Path::new("source"),
+                &destination,
+                directory.path(),
+            )
+            .unwrap();
+            let forked = Session::open(&destination).unwrap();
+            assert_eq!(forked.queued_custom_messages().len(), 1);
+            assert_eq!(session.queued_custom_messages().len(), 1);
+        }
+    }
 
     #[test]
     fn resume_resolves_external_and_native_ids_without_following_fork_metadata() {

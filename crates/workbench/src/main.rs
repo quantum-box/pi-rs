@@ -1825,10 +1825,9 @@ async fn execute(
     if let Some(source) = &args.fork_session {
         let source = sessions::resolve_reference(source, &directory)?;
         let source_session = session_import::read(&source)?;
-        sessions::fork(
+        sessions::fork_full_history_when_inert(
             &source_session,
             &source,
-            source_session.head(),
             &args.session,
             &args.workspace,
         )?;

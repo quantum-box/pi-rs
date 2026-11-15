@@ -130,6 +130,75 @@ fn mcp_add_saves_stdio_and_http_options() {
 }
 
 #[test]
+fn startup_fork_preserves_inert_sibling_history() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.jsonl");
+    let entries = [
+        json!({"type":"session","version":3,"id":"legacy"}),
+        json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"root"}}),
+        json!({"type":"message","id":"b","parentId":"a","message":{"role":"user","content":"sibling"}}),
+        json!({"type":"message","id":"c","parentId":"a","message":{"role":"user","content":"active"}}),
+    ];
+    let source_text = entries
+        .iter()
+        .map(|v| v.to_string() + "\n")
+        .collect::<String>();
+    std::fs::write(&source, &source_text).unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .arg("--fork")
+        .arg(&source)
+        .arg("--print")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_text);
+    let journals: Vec<_> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    assert_eq!(journals.len(), 1);
+    let destination = &journals[0];
+    let mut session = Session::open(destination).unwrap();
+    assert_ne!(session.external_session_id(), "legacy");
+    assert_eq!(session.parent_session(), Some(source.to_str().unwrap()));
+    assert!(
+        session
+            .current_messages()
+            .iter()
+            .any(|m| matches!(m, pi_rs::Message::User { content } if content == "active"))
+    );
+    let sibling = session
+        .records()
+        .iter()
+        .find(|record| {
+            matches!(&record.event,
+        pi_rs::Event::User { content, .. } if content == "sibling")
+        })
+        .unwrap()
+        .id;
+    session.checkout(sibling).unwrap();
+    assert!(
+        session
+            .current_messages()
+            .iter()
+            .any(|m| matches!(m, pi_rs::Message::User { content } if content == "sibling"))
+    );
+}
+
+#[test]
 fn repeated_session_id_selects_the_last_journal() {
     let root = tempfile::tempdir().unwrap();
     let sessions = root.path().join("sessions");
