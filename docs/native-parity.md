@@ -1402,7 +1402,10 @@ options, including values that begin with a dash. Native subcommands retain thei
 own Clap parsing and help, while native-only attached values and short-option
 clusters continue to be accepted. For root `--export`, the last export input and first positional message select
 the input and HTML output, including when help is present; native option
-validation runs before writing. A missing or empty final export input is rejected
+validation runs before writing. As a deliberate safety difference from Pi, an
+export destination cannot overwrite any explicitly supplied export input, even
+one replaced by a later option; aliases and symlinks are checked as well. A
+missing or empty final export input is rejected
 rather than falling back to an earlier input. Other invocations without root metadata keep
 their existing native argument parsing.
 These selections propagate to persistent CLI workers. The settings editor,

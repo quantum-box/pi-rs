@@ -1373,15 +1373,15 @@ async fn run_cli() -> i32 {
             }
             let mut paths = vec![plan.input];
             paths.extend(plan.output);
-            return export_from_file(&paths);
+            return export_from_file(&paths, &plan.inputs);
         }
         if let Some(paths) = literal_export {
-            return export_from_file(&paths);
+            return export_from_file(&paths, &paths[..1]);
         }
         args.mcp_login_cancel = mcp_login_cancel;
         args.extension_flags = extension_flags;
         if let Some(paths) = &args.export_session {
-            return export_from_file(paths);
+            return export_from_file(paths, &paths[..1]);
         }
         if let Some(flag) = args.extension_flags.keys().next()
             && !matches!(
@@ -1551,7 +1551,7 @@ async fn run_cli() -> i32 {
     cli_exit_code
 }
 
-fn export_from_file(paths: &[PathBuf]) -> Result<()> {
+fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<()> {
     let normalize = |path: &Path| {
         path.to_str()
             .map_or_else(|| Ok(path.to_path_buf()), pi_rs_workbench::normalize_path)
@@ -1570,6 +1570,29 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
             input.display()
         )));
     }
+    // `persist` replaces an existing destination. Protect every supplied input,
+    // including those superseded by a later --export, before writing anything.
+    let resolved_output = match output_path.canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(output) = resolved_output {
+        for path in protected_inputs {
+            let path = std::path::absolute(normalize(path)?)?;
+            match path.canonicalize() {
+                Ok(input) => {
+                    if same_export_file(&input, &output)? {
+                        return Err(Error::Config(
+                            "Cannot export HTML over an input session file".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     let session = session_import::read(&input)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
@@ -1583,6 +1606,21 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
         output_path.display()
     );
     Ok(())
+}
+
+fn same_export_file(input: &Path, output: &Path) -> std::io::Result<bool> {
+    if input == output {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let input = input.metadata()?;
+        let output = output.metadata()?;
+        Ok(input.dev() == output.dev() && input.ino() == output.ino())
+    }
+    #[cfg(not(unix))]
+    Ok(false)
 }
 
 async fn read_piped_stdin() -> Result<Vec<u8>> {

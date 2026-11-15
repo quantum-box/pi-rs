@@ -586,3 +586,72 @@ fn missing_or_empty_last_export_never_falls_back_to_earlier_input() {
         }
     }
 }
+
+#[test]
+fn repeated_export_destination_cannot_overwrite_any_earlier_input() {
+    for help in [false, true] {
+        for destination in [
+            "default",
+            "explicit",
+            "output-symlink",
+            "input-symlink",
+            "home-alias",
+            "hard-link",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let earlier = dir.path().join("pi-session-b.html");
+            let selected = dir.path().join("b.jsonl");
+            write_export_session(&earlier, "earlier sentinel");
+            write_export_session(&selected, "selected sentinel");
+            let earlier_before = std::fs::read(&earlier).unwrap();
+            let selected_before = std::fs::read(&selected).unwrap();
+            let alias = dir.path().join("alias");
+            #[cfg(unix)]
+            if matches!(destination, "output-symlink" | "input-symlink") {
+                std::os::unix::fs::symlink(&earlier, &alias).unwrap();
+            }
+            #[cfg(unix)]
+            if destination == "hard-link" {
+                std::fs::hard_link(&earlier, &alias).unwrap();
+            }
+            #[cfg(not(unix))]
+            if matches!(
+                destination,
+                "output-symlink" | "input-symlink" | "hard-link"
+            ) {
+                continue;
+            }
+            let home_alias = std::path::PathBuf::from("~/pi-session-b.html");
+            let previous = match destination {
+                "input-symlink" => &alias,
+                "home-alias" => &home_alias,
+                _ => &earlier,
+            };
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
+            cmd.current_dir(dir.path())
+                .env("PI_RS_HOME", dir.path())
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .arg("--export")
+                .arg(previous)
+                .arg("--export")
+                .arg(&selected);
+            if help {
+                cmd.arg("--help");
+            }
+            match destination {
+                "explicit" | "input-symlink" | "home-alias" => {
+                    cmd.arg("./pi-session-b.html");
+                }
+                "output-symlink" | "hard-link" => {
+                    cmd.arg(&alias);
+                }
+                _ => {}
+            }
+            let result = cmd.output().unwrap();
+            assert!(!result.status.success(), "{help} {destination}: {result:?}");
+            assert_eq!(std::fs::read(&earlier).unwrap(), earlier_before);
+            assert_eq!(std::fs::read(&selected).unwrap(), selected_before);
+        }
+    }
+}

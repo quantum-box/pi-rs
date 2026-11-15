@@ -505,6 +505,7 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
 #[derive(Debug)]
 pub(super) struct ExportPlan {
     pub input: std::path::PathBuf,
+    pub inputs: Vec<std::path::PathBuf>,
     pub output: Option<std::path::PathBuf>,
     pub validation_args: Vec<OsString>,
 }
@@ -515,6 +516,7 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
     let root = command();
     let mut validation = vec![args.first()?.clone()];
     let mut input = None;
+    let mut inputs = Vec::new();
     let mut output = None;
     let mut saw_export = false;
     let mut saw_message = false;
@@ -538,7 +540,9 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
                 validation.push(arg.clone());
                 break;
             }
-            input = Some(args[i].clone().into());
+            let path = std::path::PathBuf::from(&args[i]);
+            inputs.push(path.clone());
+            input = Some(path);
             i += 1;
             continue;
         }
@@ -546,7 +550,9 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
             saw_export = true;
             // Removing an ASCII prefix preserves an OsStr encoding boundary.
             let value = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(value) };
-            input = Some(value.into());
+            let path = std::path::PathBuf::from(value);
+            inputs.push(path.clone());
+            input = Some(path);
             i += 1;
             continue;
         }
@@ -641,6 +647,7 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
     let input = input.unwrap_or_default();
     Some(ExportPlan {
         input,
+        inputs,
         output,
         validation_args: validation,
     })
