@@ -1186,6 +1186,14 @@ policies, and preserve uncertainty after cancellation. Tests cover denied and
 invalid calls, concurrent reads and blocked replay after interruption. This is
 the execution boundary for the pending codemode sandbox.
 
+### Codemode OpenAI Decisions checkpoint
+
+Codemode supports OpenAI Decisions classifier models, including the pinned
+GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
+and the Decisions-specific 504 retry exclusion. Native image validation and
+endpoint-bound credentials continue to apply. Classifier usage identifies its
+calculated costs as estimates with `totalFromProvider: false`.
+
 ### Native codemode checkpoint
 
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
@@ -1230,12 +1238,6 @@ rejects unsupported or invalid fields and misplaced directives, and preserves
 script line numbers. The native JSON code argument differs from Pi's
 provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
-
-Codemode supports OpenAI Decisions classifier models, including the pinned
-GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
-and the Decisions-specific 504 retry exclusion. Native image validation and
-endpoint-bound credentials continue to apply. Classifier usage identifies its
-calculated costs as estimates with `totalFromProvider: false`.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
 `Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
