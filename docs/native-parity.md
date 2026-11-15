@@ -710,6 +710,12 @@ expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
 
+`pi mcp list --json` emits one JSON document with server state, source,
+transport, tool names, per-tool exposure overrides, and resource capability.
+Invalid entries are reported in `errors`; enabled connection failures cause a
+nonzero exit. An invalid trusted project override currently fails the merged
+configuration as a whole, preserving pi-rs's existing override validation.
+
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project
 override retains the global server's scope and does not satisfy `--local`.

@@ -10,7 +10,11 @@ use std::sync::Arc;
 
 #[derive(Clone, Subcommand)]
 pub enum McpCommand {
-    List,
+    List {
+        /// Print server reports as a single JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Sign in to an HTTP MCP server using OAuth and a browser.
     Login {
         name: String,
@@ -71,9 +75,9 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
 
 fn configurations_with_project_scope(
     args: &Cli,
-) -> Result<(BTreeMap<String, Value>, BTreeSet<String>)> {
+) -> Result<(BTreeMap<String, Value>, BTreeSet<String>, BTreeSet<String>)> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
-        return Ok((BTreeMap::new(), BTreeSet::new()));
+        return Ok((BTreeMap::new(), BTreeSet::new(), BTreeSet::new()));
     }
     let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
     let mut servers = user
@@ -82,6 +86,7 @@ fn configurations_with_project_scope(
         .cloned()
         .unwrap_or_default();
     let mut project_definitions = BTreeSet::new();
+    let mut project_overrides = BTreeSet::new();
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
@@ -95,10 +100,20 @@ fn configurations_with_project_scope(
                     })
                     .map(|_| name.clone())
             }));
+            project_overrides.extend(
+                entries
+                    .keys()
+                    .filter(|name| !project_definitions.contains(*name))
+                    .cloned(),
+            );
             merge_project_servers(&mut servers, entries)?;
         }
     }
-    Ok((servers.into_iter().collect(), project_definitions))
+    Ok((
+        servers.into_iter().collect(),
+        project_definitions,
+        project_overrides,
+    ))
 }
 
 fn merge_project_servers(
@@ -381,9 +396,159 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
     .await
 }
 
+fn report_exposure(value: &str) -> &str {
+    match value {
+        "codemode-deferred" => "codemode",
+        "off" => "hidden",
+        other => other,
+    }
+}
+
+async fn list_json(args: &Cli) -> Result<()> {
+    use std::io::Write;
+
+    let mut errors = Vec::new();
+    let (servers, project_definitions, project_overrides) =
+        match configurations_with_project_scope(args) {
+            Ok(configurations) => configurations,
+            Err(error) => {
+                errors.push(error.to_string());
+                (BTreeMap::new(), BTreeSet::new(), BTreeSet::new())
+            }
+        };
+    let global_path = config::agent_dir().join("mcp.json");
+    let project_path = args.workspace.join(".pi/mcp.json");
+    let mut normalized = BTreeSet::new();
+    let mut pending = Vec::new();
+    for (name, value) in servers {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        {
+            errors.push(format!("invalid MCP server name {name}"));
+            continue;
+        }
+        if !normalized.insert(name.replace('-', "_")) {
+            errors.push(format!("MCP server {name} collides after normalization"));
+            continue;
+        }
+        let config: ServerConfig = match serde_json::from_value(value) {
+            Ok(config) => config,
+            Err(error) => {
+                errors.push(format!("MCP server {name}: {error}"));
+                continue;
+            }
+        };
+        if config
+            .exposure
+            .iter()
+            .chain(config.tool_exposure.values())
+            .any(|value| !valid_exposure(&json!(value)))
+            || config.oauth_client().is_some_and(|client| {
+                pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).is_err()
+            })
+            || config.command.is_some()
+                && config
+                    .transport
+                    .as_deref()
+                    .is_some_and(|kind| kind != "stdio")
+            || config.command.is_none()
+                && config.url.is_some()
+                && config
+                    .transport
+                    .as_deref()
+                    .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
+        {
+            errors.push(format!("invalid MCP server configuration for {name}"));
+            continue;
+        }
+        let project = project_definitions.contains(&name);
+        let source = if project { &project_path } else { &global_path };
+        let transport = if let Some(command) = &config.command {
+            std::iter::once(command.as_str())
+                .chain(config.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else if let Some(url) = &config.url {
+            url.clone()
+        } else {
+            errors.push(format!("MCP server {name} requires a command or URL"));
+            continue;
+        };
+        let enabled = config.enabled != Some(false);
+        let base_exposure =
+            report_exposure(config.exposure.as_deref().unwrap_or("codemode")).to_owned();
+        let mut report = json!({"name":name,"scope":if project {"project"} else {"global"},"source":source.to_string_lossy(),"enabled":enabled,"exposure":base_exposure,"transport":transport,"state":"disabled","tools":[]});
+        if project_overrides.contains(&name) {
+            report["override"] = json!(project_path.to_string_lossy());
+        }
+        let args = args.clone();
+        pending.push(async move {
+            if !enabled {
+                return (report, false);
+            }
+            match connect(&args, &name, &config).await {
+                Ok(connection) => {
+                    let tools = connection.remote_tool_names();
+                    report["state"] = json!("connected");
+                    report["tools"] = json!(tools);
+                    let changes: serde_json::Map<String, Value> = tools
+                        .iter()
+                        .filter_map(|tool| {
+                            let exposure =
+                                report_exposure(pi_rs_workbench::mcp::tool_exposure(&config, tool));
+                            (exposure != base_exposure).then(|| (tool.clone(), json!(exposure)))
+                        })
+                        .collect();
+                    if !changes.is_empty() {
+                        report["toolExposure"] = Value::Object(changes);
+                    }
+                    if connection.offers_resources() {
+                        report["resources"] = json!(true);
+                    }
+                    connection.close().await;
+                    (report, false)
+                }
+                Err(error) => {
+                    report["state"] =
+                        json!(if matches!(&error, Error::AuthorizationRequired { .. }) {
+                            "needs-auth"
+                        } else {
+                            "failed"
+                        });
+                    report["error"] = json!(error.to_string());
+                    (report, true)
+                }
+            }
+        });
+    }
+    let reports = futures_util::future::join_all(pending).await;
+    let failed = !errors.is_empty() || reports.iter().any(|(_, failed)| *failed);
+    let mut result = json!({"servers":reports.into_iter().map(|(report, _)| report).collect::<Vec<_>>(),"errors":errors});
+    if !args.trusted && project_path.exists() {
+        result["note"] = json!(format!(
+            "{} is ignored because the project is not trusted.",
+            project_path.display()
+        ));
+    }
+    let mut stdout = std::io::stdout().lock();
+    let _ = serde_json::to_writer_pretty(&mut stdout, &result);
+    let _ = writeln!(stdout);
+    if failed {
+        return Err(Error::Config(
+            "one or more MCP servers failed to connect".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
     match command {
-        McpCommand::List => {
+        McpCommand::List { json: true } => {
+            return list_json(args).await;
+        }
+        McpCommand::List { json: false } => {
             let expected = configurations(args)?
                 .values()
                 .filter(|value| value["enabled"] != false)
@@ -639,7 +804,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             output(json!({"type":"mcp_logged_in","name":name}));
         }
         McpCommand::Logout { name, local } => {
-            let (servers, project_definitions) = configurations_with_project_scope(args)?;
+            let (servers, project_definitions, _) = configurations_with_project_scope(args)?;
             if local && !project_definitions.contains(&name) {
                 return Err(Error::Config(format!(
                     "MCP server {name} is not configured in the trusted project"

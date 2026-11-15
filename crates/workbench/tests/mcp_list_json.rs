@@ -1,0 +1,160 @@
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+#[tokio::test]
+async fn list_json_reports_servers_tools_sources_and_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                if socket.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if socket.read_line(&mut line).await.is_err()
+                        || line == "\r\n"
+                        || line.is_empty()
+                    {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length];
+                if socket.read_exact(&mut bytes).await.is_err() {
+                    return;
+                }
+                let request: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let result = match request["method"].as_str() {
+                    Some("initialize") => Some(
+                        json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                    ),
+                    Some("tools/list") => Some(
+                        json!({"tools":[{"name":"Public","inputSchema":{"type":"object"}},{"name":"Private","inputSchema":{"type":"object"}}]}),
+                    ),
+                    _ => None,
+                };
+                let (status, body) = match result {
+                    Some(result) => (
+                        "200 OK",
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
+                    ),
+                    None => ("202 Accepted", String::new()),
+                };
+                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+            });
+        }
+    });
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{
+            "fixture":{"url":format!("http://{address}/mcp"),"oauth":false},
+            "disabled":{"command":"ignored","enabled":false},
+            "failed":{"url":"http://127.0.0.1:1/mcp","timeout":1,"oauth":false}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{
+            "fixture":{"toolExposure":{"Private":"hidden"}},
+            "local":{"command":"ignored","enabled":false}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .args(["--trust", "mcp", "list", "--json"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    assert!(!output.status.success());
+    let data: Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be one JSON document");
+    assert_eq!(data["errors"], json!([]));
+    let reports = data["servers"].as_array().unwrap();
+    let find = |name: &str| {
+        reports
+            .iter()
+            .find(|server| server["name"] == name)
+            .unwrap()
+    };
+    let fixture = find("fixture");
+    assert_eq!(fixture["state"], "connected");
+    assert_eq!(fixture["scope"], "global");
+    assert_eq!(
+        fixture["source"],
+        home.join("mcp.json").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        fixture["override"],
+        project.join("mcp.json").to_string_lossy().as_ref()
+    );
+    assert_eq!(fixture["tools"], json!(["Public", "Private"]));
+    assert_eq!(fixture["toolExposure"], json!({"Private":"hidden"}));
+    assert_eq!(fixture["resources"], true);
+    assert_eq!(find("disabled")["state"], "disabled");
+    assert_eq!(find("local")["scope"], "project");
+    assert_eq!(find("failed")["state"], "failed");
+    assert!(find("failed")["error"].is_string());
+}
+
+#[test]
+fn list_json_reports_invalid_entries_and_untrusted_project() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{
+            "invalid":{"command":"ignored","enabled":"yes"},
+            "valid":{"command":"ignored","enabled":false}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"local":{"command":"ignored","enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--no-trust", "mcp", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["servers"].as_array().unwrap().len(), 1);
+    assert_eq!(data["servers"][0]["name"], "valid");
+    assert_eq!(data["errors"].as_array().unwrap().len(), 1);
+    assert!(data["note"].as_str().unwrap().contains("not trusted"));
+}
