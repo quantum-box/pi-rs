@@ -2124,21 +2124,20 @@ async fn execute(
     let mut runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
-    runtime
-        .session_lifecycle(
+    let result = async {
+    runtime.session_lifecycle_owned(
             &args,
-            &session,
+            &mut session,
             pi_rs::LifecycleEvent::SessionStart {
                 reason: pi_rs::SessionStartReason::Startup,
                 previous_session_file: None,
             },
         )
-        .await;
+        .await?;
     runtime
         .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
         .await?;
     run_pending_custom_trigger(&args, &runtime, &mut session).await?;
-    let result = async {
         if let Command::Extension { extension_id, command: extension_command, arguments } = &command {
             if let Some(run_id) = args.run_id
                 && session.records().iter().any(|record| record.run_id == Some(run_id))
@@ -2382,18 +2381,29 @@ async fn execute(
     }
     Ok(())
     }.await;
-    runtime
-        .session_lifecycle(
+    finish_session_run(
+        result,
+        runtime.session_lifecycle_owned(
             &args,
-            &session,
+            &mut session,
             pi_rs::LifecycleEvent::SessionShutdown {
                 reason: pi_rs::SessionShutdownReason::Quit,
                 target_session_file: None,
             },
-        )
-        .await;
-    let cleanup = runtime.close().await;
-    result.and(cleanup)
+        ),
+        runtime.close(),
+    )
+    .await
+}
+
+async fn finish_session_run(
+    result: Result<()>,
+    lifecycle: impl std::future::Future<Output = Result<()>>,
+    cleanup: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let lifecycle = lifecycle.await;
+    let cleanup = cleanup.await;
+    result.and(lifecycle).and(cleanup)
 }
 
 fn trace_tool_progress(
@@ -2792,6 +2802,106 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
 #[cfg(test)]
 mod cli_timeout_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_entry_failure_still_runs_shutdown_and_cleanup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct FailingStore(pi_rs::MemoryStore);
+        impl pi_rs::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<pi_rs::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &pi_rs::Record) -> Result<()> {
+                if matches!(record.event, pi_rs::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("startup write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        struct Hook(Arc<AtomicBool>, Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl pi_rs::Extension for Hook {
+            fn id(&self) -> &str {
+                "lifecycle-fixture"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &pi_rs::LifecycleEvent,
+                _: Option<&pi_rs::ExtensionState>,
+                host: Arc<dyn pi_rs::ToolHost>,
+            ) -> pi_rs::ExtensionResult<()> {
+                match event {
+                    pi_rs::LifecycleEvent::SessionStart { .. } => {
+                        host.append_entry(pi_rs::CustomEntry {
+                            custom_type: "failure".into(),
+                            data: None,
+                        })
+                        .await
+                    }
+                    pi_rs::LifecycleEvent::SessionShutdown { .. } => {
+                        self.0.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+            async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+                self.1.store(true, Ordering::SeqCst);
+                Err("cleanup failed".into())
+            }
+        }
+        let shutdown_seen = Arc::new(AtomicBool::new(false));
+        let cleanup_seen = Arc::new(AtomicBool::new(false));
+        let mut registry = pi_rs::Registry::default();
+        registry
+            .register(Arc::new(Hook(shutdown_seen.clone(), cleanup_seen.clone())))
+            .unwrap();
+        let mut session =
+            pi_rs::Session::with_store(FailingStore(pi_rs::MemoryStore::default())).unwrap();
+        let start = pi_rs::notify_extension_lifecycle_in_session(
+            &registry,
+            &mut session,
+            pi_rs::LifecycleEvent::SessionStart {
+                reason: pi_rs::SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await;
+        let shutdown = async {
+            pi_rs::notify_extension_lifecycle_in_session(
+                &registry,
+                &mut session,
+                pi_rs::LifecycleEvent::SessionShutdown {
+                    reason: pi_rs::SessionShutdownReason::Quit,
+                    target_session_file: None,
+                },
+                Duration::from_secs(2),
+                &mut |_| {},
+            )
+            .await?;
+            Err(Error::Session("shutdown failed".into()))
+        };
+        let result = finish_session_run(start, shutdown, registry.shutdown()).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("startup write failed")
+        );
+        assert!(shutdown_seen.load(Ordering::SeqCst));
+        assert!(cleanup_seen.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn session_names_reject_empty_input_and_trim_surrounding_whitespace() {
