@@ -3485,6 +3485,8 @@ Bearer-token export checks its requested minimum validity after refresh; a
 token that falls short is persisted before the command fails, preserving any
 rotated refresh token. Ordinary model, MCP and sharing requests accept a
 successfully refreshed token without imposing that export requirement.
+Normal Radius access refreshes credentials within five minutes of expiry,
+matching the upstream OAuth resolver's minimum refresh window.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
