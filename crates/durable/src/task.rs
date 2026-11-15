@@ -60,6 +60,7 @@ pub enum TaskState {
     Ready,
     Running,
     Waiting(WaitFor),
+    Completing(Value),
     Succeeded(Value),
     Failed(String),
     Cancelled,
@@ -433,6 +434,23 @@ impl Task {
         Ok(())
     }
 
+    pub(crate) fn hold_success(&mut self, result: Value) -> Result<(), TransitionError> {
+        self.succeed(result)?;
+        self.state = match std::mem::replace(&mut self.state, TaskState::Ready) {
+            TaskState::Succeeded(value) => TaskState::Completing(value),
+            _ => unreachable!(),
+        };
+        Ok(())
+    }
+
+    pub(crate) fn finalize_success(&mut self) -> Result<(), TransitionError> {
+        let TaskState::Completing(value) = &self.state else {
+            return Err(TransitionError::InvalidState);
+        };
+        self.state = TaskState::Succeeded(value.clone());
+        Ok(())
+    }
+
     pub fn fail(&mut self, reason: String) -> Result<(), TransitionError> {
         self.require_running()?;
         self.state = TaskState::Failed(reason);
@@ -458,7 +476,10 @@ impl Task {
     pub fn cancel(&mut self) -> Result<(), TransitionError> {
         if matches!(
             self.state,
-            TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Cancelled
+            TaskState::Completing(_)
+                | TaskState::Succeeded(_)
+                | TaskState::Failed(_)
+                | TaskState::Cancelled
         ) {
             return Err(TransitionError::InvalidState);
         }

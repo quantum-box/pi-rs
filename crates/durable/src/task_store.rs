@@ -452,6 +452,11 @@ impl<'a> TaskStore<'a> {
                         return Err(Error::InvalidOwnership);
                     }
                     if let Some(parent) = created.get(&id) {
+                        if matches!(task.owner(), TaskOwner::Task(owner) if *owner == id)
+                            && matches!(parent.state(), TaskState::Completing(_))
+                        {
+                            return Err(Error::InvalidOwnership);
+                        }
                         if parent.is_background() {
                             fence_scope = false;
                         }
@@ -466,6 +471,11 @@ impl<'a> TaskStore<'a> {
                         });
                         match parent {
                             Some(parent) => {
+                                if matches!(task.owner(), TaskOwner::Task(owner) if *owner == id)
+                                    && matches!(parent.task.state(), TaskState::Completing(_))
+                                {
+                                    return Err(Error::InvalidOwnership);
+                                }
                                 if parent.task.is_background() {
                                     fence_scope = false;
                                 }
@@ -617,7 +627,8 @@ impl<'a> TaskStore<'a> {
             let target = self
                 .load(signal.task_id)?
                 .ok_or(Error::SignalTargetNotFound)?;
-            if target.task.is_terminal() {
+            if target.task.is_terminal() || matches!(target.task.state(), TaskState::Completing(_))
+            {
                 return Err(Error::SignalTargetClosed);
             }
             // The revision fences the scan against all concurrent insertions,
@@ -780,7 +791,10 @@ impl<'a> TaskStore<'a> {
         let Some(target) = target else {
             return Ok((SignalResult::NotFound, batch));
         };
-        if target.task.is_terminal() || target.task.abort_requested() {
+        if target.task.is_terminal()
+            || target.task.abort_requested()
+            || matches!(target.task.state(), TaskState::Completing(_))
+        {
             return Ok((SignalResult::Closed, batch));
         }
         if key_text.is_empty() {

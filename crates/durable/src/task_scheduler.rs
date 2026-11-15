@@ -14,7 +14,7 @@
 //! background tasks, combined waits, or conversation integration.
 //! Cancellation changes durable state only and cannot undo external effects or
 //! interrupt a synchronous handler. Direct TaskStore writers must be fenced.
-//! Terminal success still requires all owned work to be finished.
+//! Success is retained while ordinary owned work finishes.
 
 use crate::task::{Checkpoint, Task, TaskOwner, TaskState, TransitionError, WaitFor};
 use crate::task_store::{self, Save, Signal, TaskStore, WakeResult};
@@ -324,6 +324,11 @@ impl WakeReader {
                 });
             }
             match task.state() {
+                TaskState::Completing(_)
+                    if !has_live_owned(self.owner.store(), task.id(), &tasks)? =>
+                {
+                    result.active = true
+                }
                 TaskState::Ready if task.abort_requested() => {
                     if !tasks.iter().any(|child| {
                         child.task.owner() == &TaskOwner::Task(task.id())
@@ -367,6 +372,9 @@ impl WakeReader {
 }
 impl WakeDefinitions {
     fn blocked_reason(&self, task: &Task) -> Option<BlockedReason> {
+        if matches!(task.state(), TaskState::Completing(_)) {
+            return None;
+        }
         let Some(reg) = task.kind().and_then(|kind| self.registry.entries.get(kind)) else {
             return Some(BlockedReason::MissingTask);
         };
@@ -531,6 +539,9 @@ impl Scheduler {
     }
     /// Inspect compatibility without executing migration code.
     pub fn blocked_reason(&self, task: &Task) -> Option<BlockedReason> {
+        if matches!(task.state(), TaskState::Completing(_)) {
+            return None;
+        }
         let Ok(reg) = self.registered(task) else {
             return Some(BlockedReason::MissingTask);
         };
@@ -759,6 +770,35 @@ impl Scheduler {
         let owner = self.owner();
         let gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         let mut progress = false;
+        // Finalization uses the same graph fence as admission, including work
+        // admitted through an already-owned conversation after the hold.
+        let graph_version = owner
+            .store()
+            .put_version()
+            .map_err(task_store::Error::from)?;
+        let held_tasks = self.ts().list()?;
+        for snapshot in &held_tasks {
+            if matches!(snapshot.task.state(), TaskState::Completing(_))
+                && !has_live_owned(owner.store(), snapshot.task.id(), &held_tasks)?
+            {
+                let mut next = snapshot.clone();
+                next.task.finalize_success().map_err(Error::Transition)?;
+                let batch = self.ts().prepare_save(&[Save::Update(&next)])?;
+                match owner.store().commit_with_prefix_put_fence(
+                    &batch.checks,
+                    &batch.mutations,
+                    &[
+                        task_store::PREFIX,
+                        crate::ownership_edge::PREFIX,
+                        b"runtime/conversation/",
+                    ],
+                    graph_version,
+                ) {
+                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => return Ok(true),
+                    Err(error) => return Err(task_store::Error::from(error).into()),
+                }
+            }
+        }
         for snapshot in self.ts().list()? {
             if !snapshot.task.abort_requested()
                 && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state()
@@ -969,6 +1009,10 @@ impl Scheduler {
                 return Err(Error::Registration);
             }
         }
+        let success_graph_version = owner
+            .store()
+            .put_version()
+            .map_err(task_store::Error::from)?;
         let mut next = running.clone();
         let mut children = Vec::new();
         match step {
@@ -1022,12 +1066,15 @@ impl Scheduler {
                 next.task.wait(condition).map_err(Error::Transition)?;
             }
             Step::Succeed(value) => {
-                // Newly staged children are live and cannot be hidden by a terminal parent.
-                if staged.iter().any(|(_, _, p)| !p.mutations.is_empty()) {
-                    return Err(Error::LiveChildren);
+                // Include children staged in this transaction, which are not
+                // present in the committed graph snapshot yet.
+                if staged.iter().any(|(_, _, p)| !p.mutations.is_empty())
+                    || has_live_owned(owner.store(), next.task.id(), &self.ts().list()?)?
+                {
+                    next.task.hold_success(value).map_err(Error::Transition)?;
+                } else {
+                    next.task.succeed(value).map_err(Error::Transition)?;
                 }
-                self.ensure_no_live_children(next.task.id())?;
-                next.task.succeed(value).map_err(Error::Transition)?;
             }
             Step::Fail(_) => unreachable!(),
         }
@@ -1090,7 +1137,16 @@ impl Scheduler {
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
-        match transaction.commit(owner.store()) {
+        let success = matches!(
+            next.task.state(),
+            TaskState::Succeeded(_) | TaskState::Completing(_)
+        );
+        let committed = if success {
+            transaction.commit_task_graph(owner.store(), success_graph_version)
+        } else {
+            transaction.commit(owner.store())
+        };
+        match committed {
             Ok(()) => {}
             Err(crate::document::Error::Store(durable_store::Error::Conflict { key })) => {
                 let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
@@ -1103,7 +1159,11 @@ impl Scheduler {
                         )
                         .into());
                     }
-                } else if document_keys.contains(&key) {
+                } else if document_keys.contains(&key)
+                    || key == task_store::PREFIX
+                    || key == crate::ownership_edge::PREFIX
+                    || key == b"runtime/conversation/"
+                {
                     // The checked batch definitely did not commit. Only registered
                     // replay-safe invocations may be run again after external effects.
                     if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
@@ -1200,6 +1260,14 @@ impl Scheduler {
                 break;
             }
         }
+        // The immediate-cancel API cannot safely settle a held outcome or
+        // its owner. Use request_abort to drain this subtree instead.
+        if records.iter().any(|record| {
+            ids.contains(&record.task.id())
+                && matches!(record.task.state(), TaskState::Completing(_))
+        }) {
+            return Err(Error::LiveChildren);
+        }
         if crate::ownership_edge::reject_foreground_children(
             self.attachment.owner.store(),
             records
@@ -1246,12 +1314,17 @@ impl Scheduler {
         reason: String,
         completed: bool,
     ) -> Result<(), Error> {
-        let records = self.ts().list()?;
-        let roots: Vec<_> = records
-            .iter()
-            .filter(|s| s.task.owner() == &TaskOwner::Task(parent.task.id()))
-            .map(|s| s.task.id())
-            .collect();
+        let store = self.ts();
+        let graph_version = store
+            .store()
+            .put_version()
+            .map_err(task_store::Error::from)?;
+        let records = store.list()?;
+        // Failure holding and its cancellation cascade are not implemented yet.
+        // Leave the running record intact instead of publishing a premature end.
+        if has_live_owned(store.store(), parent.task.id(), &records)? {
+            return Err(Error::LiveChildren);
+        }
         let mut next = parent.clone();
         next.task.fail(reason).map_err(Error::Transition)?;
         if completed {
@@ -1259,7 +1332,21 @@ impl Scheduler {
                 .record_completed_attempt(&parent.task)
                 .map_err(Error::Transition)?;
         }
-        self.cancel_roots(&records, &roots, Some(next))
+        let batch = store.prepare_save(&[Save::Update(&next)])?;
+        store
+            .store()
+            .commit_with_prefix_put_fence(
+                &batch.checks,
+                &batch.mutations,
+                &[
+                    task_store::PREFIX,
+                    crate::ownership_edge::PREFIX,
+                    b"runtime/conversation/",
+                ],
+                graph_version,
+            )
+            .map_err(task_store::Error::from)?;
+        Ok(())
     }
 
     fn cancel_failed_siblings(
@@ -1285,19 +1372,71 @@ impl Scheduler {
         }
         Ok(())
     }
+}
 
-    fn ensure_no_live_children(&self, id: Uuid) -> Result<(), Error> {
-        if self
-            .ts()
-            .list()?
+// Walk through terminal tasks and owned conversations as well: work may be
+// admitted in an owned conversation after its original task has finished.
+fn has_live_owned(
+    store: &durable_store::Store,
+    root: Uuid,
+    tasks: &[task_store::StoredTask],
+) -> Result<bool, Error> {
+    let edges = crate::ownership_edge::EdgeStore::new(store);
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        for child in tasks
             .iter()
-            .any(|s| s.task.owner() == &TaskOwner::Task(id) && !s.task.is_terminal())
+            .filter(|item| item.task.owner() == &TaskOwner::Task(id) && !item.task.is_background())
         {
-            Err(Error::LiveChildren)
-        } else {
-            Ok(())
+            if !child.task.is_terminal() {
+                return Ok(true);
+            }
+            pending.push(child.task.id());
+        }
+        for edge in edges
+            .children(id)
+            .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+        {
+            let parent = tasks
+                .iter()
+                .find(|item| item.task.id() == id)
+                .ok_or(Error::Ownership)?;
+            if edge.edge.task_owner != *parent.task.owner() {
+                return Err(Error::Ownership);
+            }
+            if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                continue;
+            }
+            // An aborting conversation is still being drained by the harness.
+            let key = format!("runtime/conversation/{}", edge.edge.child);
+            let record = store
+                .get(key.as_bytes())
+                .map_err(task_store::Error::from)?
+                .ok_or(Error::Ownership)?;
+            let conversation: crate::runtime::Conversation =
+                serde_json::from_slice(&record.value).map_err(task_store::Error::from)?;
+            if conversation.id != edge.edge.child {
+                return Err(Error::Ownership);
+            }
+            if conversation.abort_requested {
+                return Ok(true);
+            }
+            for child in tasks.iter().filter(|item| {
+                item.task.owner() == &TaskOwner::Conversation(edge.edge.child)
+                    && !item.task.is_background()
+            }) {
+                if !child.task.is_terminal() {
+                    return Ok(true);
+                }
+                pending.push(child.task.id());
+            }
         }
     }
+    Ok(false)
 }
 
 /// Mark the entire existing subtree atomically. Checking every live record also
@@ -1408,6 +1547,163 @@ mod tests {
             .unwrap()
             .registered(kind.into(), safe)
     }
+    #[test]
+    fn completing_survives_reopen_without_parent_definition_and_wakes_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        );
+        let child = task(2, TaskOwner::Task(root.id()), "child", true, 4);
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| {
+            Ok(Step::Succeed(json!({"result": 42})))
+        });
+        registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!("child"))));
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        scheduler
+            .ts()
+            .save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(json!({"result": 42}))
+        );
+        assert!(!scheduler.get(root.id()).unwrap().unwrap().is_terminal());
+        drop(scheduler);
+        let mut registry = Registry::default();
+        registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!("child"))));
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert!(scheduler.wake_snapshot(0).unwrap().active);
+        assert!(scheduler.blocked_tasks().unwrap().is_empty());
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("child"))
+        );
+        assert!(scheduler.wake_snapshot(0).unwrap().active);
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!({"result": 42}))
+        );
+    }
+
+    #[test]
+    fn abort_of_completing_parent_preserves_outcome_and_drains_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| Ok(Step::Succeed(json!(7))));
+        registry.register_with_abort(
+            "child",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(0))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(dir.path().join("tasks.db"), registry).unwrap();
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        );
+        let child = task(2, TaskOwner::Task(root.id()), "child", true, 4);
+        scheduler
+            .ts()
+            .save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        scheduler.request_abort(root.id()).unwrap();
+        let held = scheduler.get(root.id()).unwrap().unwrap();
+        assert_eq!(held.state(), &TaskState::Completing(json!(7)));
+        assert!(held.abort_requested());
+        assert!(
+            scheduler
+                .get(child.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        scheduler.tick(0).unwrap();
+        let finished = scheduler.get(root.id()).unwrap().unwrap();
+        assert_eq!(finished.state(), &TaskState::Succeeded(json!(7)));
+        assert!(finished.abort_requested());
+    }
+
+    #[test]
+    fn completing_includes_child_created_with_success() {
+        struct Parent;
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                parent: &Task,
+                docs: &mut crate::document::TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let child = task(2, TaskOwner::Task(parent.id()), "child", true, 4);
+                docs.stage_keyed_child("child", "tool", child.input(), child.clone())?;
+                Ok(Step::Succeed(json!("done")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("parent", true, Parent);
+        registry.register("child", true, |_: &Task| Ok(Step::Succeed(json!("child"))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        );
+        scheduler.submit(&root).unwrap();
+        let forbidden = task(3, TaskOwner::Task(root.id()), "child", true, 4);
+        let stale = scheduler
+            .ts()
+            .prepare_save(&[Save::Create(&forbidden)])
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(json!("done"))
+        );
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
+        assert!(matches!(
+            scheduler
+                .ts()
+                .store()
+                .commit(&stale.checks, &stale.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(matches!(
+            scheduler.ts().save(&[Save::Create(&forbidden)]),
+            Err(task_store::Error::InvalidOwnership)
+        ));
+        scheduler.tick(0).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+    }
+
     #[test]
     fn child_commit_after_scan_forces_standalone_abort_retry() {
         use std::sync::mpsc;
@@ -2434,17 +2730,29 @@ mod tests {
                 captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(Step::Succeed(json!("done")))
             });
+            if !safe {
+                assert!(matches!(
+                    Scheduler::open(&path, registry),
+                    Err(Error::LiveChildren)
+                ));
+                let db = durable_store::Store::open(&path).unwrap();
+                let tasks = TaskStore::new(&db);
+                assert_eq!(
+                    tasks.load(parent.id()).unwrap().unwrap().task.state(),
+                    &TaskState::Running
+                );
+                assert_eq!(
+                    tasks.load(child.id()).unwrap().unwrap().task.state(),
+                    &TaskState::Ready
+                );
+                continue;
+            }
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
             assert!(!scheduler.tick(0).unwrap());
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-            let child_state = scheduler.get(child.id()).unwrap().unwrap();
             assert_eq!(
-                child_state.state(),
-                if safe {
-                    &TaskState::Ready
-                } else {
-                    &TaskState::Cancelled
-                }
+                scheduler.get(child.id()).unwrap().unwrap().state(),
+                &TaskState::Ready
             );
         }
     }
@@ -2940,7 +3248,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_parent_cancels_running_child_without_replay() {
+    fn interrupted_parent_with_live_child_fails_closed_without_replay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tasks.db");
         let s = Scheduler::open(&path, Registry::default()).unwrap();
@@ -2961,14 +3269,19 @@ mod tests {
         let mut r = Registry::default();
         r.register("p", false, |_t: &Task| panic!("unsafe parent replayed"));
         r.register("c", true, |_t: &Task| panic!("cancelled child replayed"));
-        let s = Scheduler::open(&path, r).unwrap();
         assert!(matches!(
-            s.get(parent.id()).unwrap().unwrap().state(),
-            TaskState::Failed(_)
+            Scheduler::open(&path, r),
+            Err(Error::LiveChildren)
         ));
+        let db = durable_store::Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
         assert_eq!(
-            s.get(child.id()).unwrap().unwrap().state(),
-            &TaskState::Cancelled
+            tasks.load(parent.id()).unwrap().unwrap().task.state(),
+            &TaskState::Running
+        );
+        assert_eq!(
+            tasks.load(child.id()).unwrap().unwrap().task.state(),
+            &TaskState::Running
         );
     }
 
@@ -3177,21 +3490,33 @@ mod tests {
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
             scheduler.submit(&parent).unwrap();
             scheduler.tick(0).unwrap();
-            scheduler.tick(0).unwrap();
-            let state = scheduler.get(parent.id()).unwrap().unwrap();
+            let second = scheduler.tick(0);
             if replay_safe {
+                second.unwrap();
+                let state = scheduler.get(parent.id()).unwrap().unwrap();
                 assert_eq!(state.state(), &TaskState::Ready);
                 assert_eq!(state.checkpoint(), &cp("read"));
             } else {
-                assert!(
-                    matches!(state.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
-                );
-                assert!(
+                assert!(matches!(second, Err(Error::LiveChildren)));
+                assert_eq!(
                     scheduler
-                        .get(Uuid::from_u128(2))
+                        .ts()
+                        .load(parent.id())
                         .unwrap()
                         .unwrap()
-                        .is_terminal()
+                        .task
+                        .state(),
+                    &TaskState::Running
+                );
+                assert_eq!(
+                    scheduler
+                        .ts()
+                        .load(Uuid::from_u128(2))
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Running
                 );
             }
         }

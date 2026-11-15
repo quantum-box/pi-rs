@@ -387,6 +387,159 @@ mod tests {
         (task.id(), owner)
     }
     #[test]
+    fn completing_owner_tracks_work_added_to_owned_conversation() {
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let root = Task::new(
+            Uuid::from_u128(1),
+            owner.clone(),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("root".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&root)])
+            .unwrap();
+        let owned = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap();
+        let mut child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(owned.child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        child.start().unwrap();
+        child
+            .wait(crate::task::WaitFor::DeadlineMillis(10))
+            .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&child)])
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.register("root", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("root")))
+        });
+        registry.register("child", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("child")))
+        });
+        let mut scheduler = Scheduler::attach(h.owner.clone(), registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(serde_json::json!("root"))
+        );
+        let late = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Conversation(owned.child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&late)])
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(late.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(serde_json::json!("child"))
+        );
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(serde_json::json!("root"))
+        );
+        scheduler.tick(10).unwrap();
+        scheduler.tick(10).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(serde_json::json!("root"))
+        );
+    }
+
+    #[test]
+    fn abort_of_completing_owner_marks_owned_conversation_work() {
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Scheduler, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        };
+        let root = Task::new(Uuid::from_u128(1), owner.clone(), checkpoint.clone(), 3)
+            .unwrap()
+            .registered("root".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&root)])
+            .unwrap();
+        let owned = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap();
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Conversation(owned.child),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&child)])
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.register("root", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("root")))
+        });
+        registry.register_with_abort(
+            "child",
+            true,
+            |_: &Task| Ok(Step::Succeed(serde_json::Value::Null)),
+            |_: &Task| Ok(Step::Succeed(serde_json::Value::Null)),
+        );
+        let mut scheduler = Scheduler::attach(h.owner.clone(), registry).unwrap();
+        scheduler.tick(0).unwrap();
+        h.request_abort_task(root.id()).unwrap();
+        assert!(scheduler.get(root.id()).unwrap().unwrap().abort_requested());
+        assert!(
+            scheduler
+                .get(child.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        assert!(h.conversation(owned.child).unwrap().abort_requested);
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(serde_json::json!("root"))
+        );
+        assert!(!scheduler.tick(0).unwrap());
+    }
+
+    #[test]
     fn restricted_admission_binds_selection_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");

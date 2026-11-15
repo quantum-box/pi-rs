@@ -1173,6 +1173,19 @@ impl Transaction {
         store.commit(&self.checks, &self.mutations)?;
         Ok(())
     }
+    pub(crate) fn commit_task_graph(self, store: &Store, version: u64) -> Result<(), Error> {
+        store.commit_with_prefix_put_fence(
+            &self.checks,
+            &self.mutations,
+            &[
+                crate::task_store::PREFIX,
+                crate::ownership_edge::PREFIX,
+                b"runtime/conversation/",
+            ],
+            version,
+        )?;
+        Ok(())
+    }
 }
 
 /// A store-bound checked host transaction with provisional typed deliveries.
