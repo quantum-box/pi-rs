@@ -218,6 +218,22 @@ individual batches, and the retained initial snapshot are not byte-bounded.
 For an append-only cursor stream use `watch_history` instead; it covers only
 records explicitly included in that observation log.
 
+`progress_history_from_now` captures a versioned, conversation-scoped exclusive
+cursor. `progress_history` and `watch_progress_history` page committed generation
+and tool progress records after that boundary. Runtime checkpoints and terminal
+seals append their record atomically with the existing progress write, including
+when a conversation transition shares the transaction. Each record is capped at
+2 MiB plus 8 KiB and pages contain at most 256 records; backpressure is pull-based
+and callers persist `next` only after processing the entire page. Cursors are
+scoped to the same database and conversation. The boundary explicitly excludes
+previously overwritten progress: history is not backfilled on upgrade. Only
+runtime-owned progress writes participate; standalone progress-store writers,
+streamed output and uncommitted provider deltas are not covered. Records are
+whole replacement states, not upstream Chord diffs. Each frame includes its
+tracked database-local commit sequence; missing commit metadata fails closed. Retention and total page
+bytes are unbounded apart from per-record and page-count limits, and the reserved
+`durable/progress-history/` namespace must remain append-only.
+
 `Harness::watch_committed_view` and `Scheduler::watch_committed_view` add a
 separate pull stream of runtime conversation observations. Attachment captures
 the latest observation and returns it as `initial`; pass a saved

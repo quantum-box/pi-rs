@@ -117,6 +117,14 @@ impl<'a> Observer<'a> {
         }
     }
 
+    pub(crate) fn progress_history(store: &'a Store, conversation: Uuid) -> Self {
+        Self {
+            store,
+            stream: conversation,
+            prefix: b"durable/progress-history/",
+        }
+    }
+
     pub(crate) fn tool_attempts(store: &'a Store, conversation: Uuid) -> Self {
         Self {
             store,

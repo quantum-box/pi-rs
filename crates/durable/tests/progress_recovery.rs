@@ -506,3 +506,107 @@ async fn committed_view_rejects_snapshot_from_different_transaction() {
     );
     assert_eq!(watch.cursor(), &cursor);
 }
+
+#[tokio::test]
+async fn progress_history_has_atomic_forward_boundary_and_reopens() {
+    use pi_rs_durable::{
+        progress::State,
+        runtime::{ProgressHistoryChange, Scheduler},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+    });
+    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let start = scheduler.progress_history_from_now(id).unwrap();
+    assert_eq!(start.version, 1);
+    assert_eq!(start.position, 0);
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.watch_progress_history(&start, NonZeroUsize::MIN, Duration::from_millis(1)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.records.len(), 1);
+    let request = match &first.records[0].changes[..] {
+        [ProgressHistoryChange::Generation { request_id, state }] => {
+            assert!(
+                matches!(state.as_ref(), State::Running(partial) if partial.text == "uncommitted partial")
+            );
+            *request_id
+        }
+        other => panic!("unexpected progress {other:?}"),
+    };
+    let reader = durable_store::Store::open(&path).unwrap();
+    let snapshot_key = format!("durable/generation-progress/{request}");
+    let snapshot = reader.get(snapshot_key.as_bytes()).unwrap().unwrap();
+    let mut event_key = b"durable/progress-history/".to_vec();
+    event_key.extend_from_slice(id.as_bytes());
+    event_key.extend_from_slice(b"/r");
+    event_key.extend_from_slice(&first.next.position.to_be_bytes());
+    let event = reader.get(&event_key).unwrap().unwrap();
+    assert_eq!(
+        Some(first.records[0].commit_sequence),
+        reader
+            .commit_for_version(&event_key, event.version)
+            .unwrap()
+    );
+    assert_eq!(
+        reader
+            .commit_for_version(&event_key, event.version)
+            .unwrap(),
+        reader
+            .commit_for_version(snapshot_key.as_bytes(), snapshot.version)
+            .unwrap()
+    );
+    let saved = first.next.clone();
+    let encoded = serde_json::to_vec(&saved).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<pi_rs_durable::runtime::ProgressHistoryCursor>(&encoded).unwrap(),
+        saved
+    );
+    assert!(
+        scheduler
+            .progress_history(&start, NonZeroUsize::new(257).unwrap())
+            .is_err()
+    );
+    let other = scheduler
+        .progress_history(&start, NonZeroUsize::MIN)
+        .unwrap();
+    assert_eq!(other, first);
+    scheduler.abort_and_wait(id).await.unwrap();
+    scheduler.shutdown().await.unwrap();
+    drop(reader);
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let terminal = h.progress_history(&saved, NonZeroUsize::MIN).unwrap();
+    assert_eq!(terminal.records.len(), 1);
+    assert!(
+        matches!(&terminal.records[0].changes[..], [ProgressHistoryChange::Generation { request_id, state }] if *request_id == request && matches!(state.as_ref(), State::Aborted(partial) if partial.text == "uncommitted partial"))
+    );
+    assert!(
+        h.progress_history(&terminal.next, NonZeroUsize::MIN)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert_eq!(h.progress_history_from_now(id).unwrap(), terminal.next);
+    let mut invalid = saved.clone();
+    invalid.version = 2;
+    assert!(h.progress_history(&invalid, NonZeroUsize::MIN).is_err());
+}

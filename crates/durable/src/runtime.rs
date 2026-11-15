@@ -1188,6 +1188,20 @@ impl crate::tool_progress::Sink for RuntimeToolProgress {
                         }))?;
                 batch.checks.extend(event.checks);
                 batch.mutations.extend(event.mutations);
+                let history = prepare_progress_history(
+                    store,
+                    self.conversation,
+                    vec![ProgressHistoryChange::Tool {
+                        attempt: self.attempt,
+                        state: snapshot.state().clone(),
+                        partial_is_null: matches!(
+                            snapshot.state(),
+                            crate::tool_progress::State::Running(Some(serde_json::Value::Null))
+                        ),
+                    }],
+                )?;
+                batch.checks.extend(history.checks);
+                batch.mutations.extend(history.mutations);
                 match store.commit(&batch.checks, &batch.mutations) {
                     Ok(()) => Ok(true),
                     Err(durable_store::Error::Conflict { .. }) => Ok(false),
@@ -1204,6 +1218,67 @@ impl crate::tool_progress::Sink for RuntimeToolProgress {
             }
         }
     }
+}
+
+/// Versioned exclusive cursor; the boundary returned by `progress_history_from_now`
+/// deliberately excludes any overwritten progress before attachment.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgressHistoryCursor {
+    pub version: u32,
+    pub conversation: Uuid,
+    pub position: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProgressHistoryChange {
+    Generation {
+        request_id: Uuid,
+        state: Box<crate::progress::State>,
+    },
+    Tool {
+        attempt: ToolAttempt,
+        state: crate::tool_progress::State,
+        partial_is_null: bool,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct ProgressHistoryRecord {
+    version: u32,
+    conversation: Uuid,
+    changes: Vec<ProgressHistoryChange>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgressHistoryFrame {
+    pub cursor: ProgressHistoryCursor,
+    /// Database-local store commit containing this entire record.
+    pub commit_sequence: u64,
+    pub changes: Vec<ProgressHistoryChange>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgressHistoryPage {
+    pub records: Vec<ProgressHistoryFrame>,
+    pub next: ProgressHistoryCursor,
+    pub has_more: bool,
+}
+const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
+fn prepare_progress_history(
+    store: &durable_store::Store,
+    conversation: Uuid,
+    changes: Vec<ProgressHistoryChange>,
+) -> Result<crate::observer::Append, Error> {
+    let record = ProgressHistoryRecord {
+        version: 1,
+        conversation,
+        changes,
+    };
+    let value = serde_json::to_value(record)?;
+    if serde_json::to_vec(&value)?.len() > MAX_PROGRESS_HISTORY_BYTES {
+        return Err(Error::Invalid(
+            "progress history event exceeds size limit".into(),
+        ));
+    }
+    Ok(crate::observer::Observer::progress_history(store, conversation).prepare_append(&value)?)
 }
 
 /// Trusted cursor for a finite database-local unified history capture.
@@ -2981,6 +3056,7 @@ impl Harness {
             checks.extend(event.checks);
             mutations.extend(event.mutations);
         }
+        let mut progress_history = Vec::new();
         let terminal = if state.abort_requested {
             match &state.phase {
                 Phase::ModelRunning { request_id, .. }
@@ -3010,6 +3086,17 @@ impl Harness {
                 };
                 checks.extend(prepared.checks);
                 mutations.extend(prepared.mutations);
+                let terminal_state = if complete {
+                    crate::progress::State::Completed
+                } else if let crate::progress::State::Running(partial) = snapshot.state() {
+                    crate::progress::State::Aborted(partial.clone())
+                } else {
+                    unreachable!()
+                };
+                progress_history.push(ProgressHistoryChange::Generation {
+                    request_id,
+                    state: Box::new(terminal_state),
+                });
             }
         }
         // Seal the invocation in the same transaction that leaves its running
@@ -3072,8 +3159,21 @@ impl Harness {
                     }))?;
                     checks.extend(event.checks);
                     mutations.extend(event.mutations);
+                    progress_history.push(ProgressHistoryChange::Tool {
+                        attempt,
+                        state: terminal,
+                        partial_is_null: matches!(
+                            snapshot.state(),
+                            crate::tool_progress::State::Running(Some(serde_json::Value::Null))
+                        ),
+                    });
                 }
             }
+        }
+        if !progress_history.is_empty() {
+            let event = prepare_progress_history(self.owner.store(), state.id, progress_history)?;
+            checks.extend(event.checks);
+            mutations.extend(event.mutations);
         }
         if !children.is_empty() {
             let current = self.owner.store().get(&key)?.ok_or(Error::NotFound)?;
@@ -5107,6 +5207,115 @@ impl Harness {
             next,
             has_more,
         })
+    }
+
+    /// Capture an explicit forward-only boundary. Earlier overwritten progress
+    /// cannot be reconstructed, even when this cursor's position is zero.
+    pub fn progress_history_from_now(
+        &self,
+        conversation: Uuid,
+    ) -> Result<ProgressHistoryCursor, Error> {
+        self.load(conversation)?;
+        let position =
+            crate::observer::Observer::progress_history(self.owner.store(), conversation)
+                .head()?
+                .0;
+        Ok(ProgressHistoryCursor {
+            version: 1,
+            conversation,
+            position,
+        })
+    }
+    /// Read at most 256 atomic progress records after the supplied cursor.
+    pub fn progress_history(
+        &self,
+        cursor: &ProgressHistoryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ProgressHistoryPage, Error> {
+        if cursor.version != 1 || limit.get() > 256 {
+            return Err(Error::Invalid(
+                "unsupported progress cursor or page limit".into(),
+            ));
+        }
+        self.load(cursor.conversation)?;
+        let page =
+            crate::observer::Observer::progress_history(self.owner.store(), cursor.conversation)
+                .read(crate::observer::Cursor(cursor.position), limit)?;
+        let records = page
+            .records
+            .into_iter()
+            .map(|record| -> Result<_, Error> {
+                let mut key = b"durable/progress-history/".to_vec();
+                key.extend_from_slice(cursor.conversation.as_bytes());
+                key.extend_from_slice(b"/r");
+                key.extend_from_slice(&record.cursor.0.to_be_bytes());
+                let entry = self
+                    .owner
+                    .store()
+                    .get(&key)?
+                    .ok_or_else(|| Error::Invalid("missing progress history record".into()))?;
+                if entry.value.len() > MAX_PROGRESS_HISTORY_BYTES {
+                    return Err(Error::Invalid(
+                        "progress history event exceeds size limit".into(),
+                    ));
+                }
+                let persisted: serde_json::Value = serde_json::from_slice(&entry.value)?;
+                if persisted != record.value {
+                    return Err(Error::Invalid("changed progress history record".into()));
+                }
+                let commit_sequence = self
+                    .owner
+                    .store()
+                    .commit_for_version(&key, entry.version)?
+                    .ok_or_else(|| Error::Invalid("untracked progress history record".into()))?;
+                let event: ProgressHistoryRecord = serde_json::from_value(persisted)?;
+                if event.version != 1
+                    || event.conversation != cursor.conversation
+                    || event.changes.is_empty()
+                    || event.changes.len() > 2
+                {
+                    return Err(Error::Invalid("invalid progress history record".into()));
+                }
+                Ok(ProgressHistoryFrame {
+                    cursor: ProgressHistoryCursor {
+                        version: 1,
+                        conversation: cursor.conversation,
+                        position: record.cursor.0,
+                    },
+                    commit_sequence,
+                    changes: event.changes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ProgressHistoryPage {
+            records,
+            next: ProgressHistoryCursor {
+                version: 1,
+                conversation: cursor.conversation,
+                position: page.next.0,
+            },
+            has_more: page.has_more,
+        })
+    }
+    /// Poll for the next page; dropping the future does not consume a cursor.
+    pub async fn watch_progress_history(
+        &self,
+        cursor: &ProgressHistoryCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<ProgressHistoryPage, Error> {
+        if interval.is_zero() {
+            return Err(Error::Invalid(
+                "progress watch interval must be nonzero".into(),
+            ));
+        }
+        loop {
+            let page = self.progress_history(cursor, limit)?;
+            if !page.records.is_empty() {
+                return Ok(page);
+            }
+            tokio::time::sleep(interval).await;
+        }
     }
 
     /// Poll committed replacement and terminal events for one attempt. Cursors
@@ -7653,9 +7862,20 @@ impl Harness {
                                 return;
                             }
                             if (is_text && !text_flushed) || last_flush.is_none_or(|time| time.elapsed() >= Duration::from_millis(100)) {
-                                let committed = snapshot.prepare_checkpoint().and_then(|batch| {
-                                    store.commit(&batch.checks, &batch.mutations).map_err(crate::progress::Error::from)
-                                }).and_then(|_| crate::progress::Snapshot::load(store, request_id));
+                                let committed = (|| -> Result<crate::progress::Snapshot, Error> {
+                                    loop {
+                                        let mut batch = snapshot.prepare_checkpoint()?;
+                                        let history = prepare_progress_history(store, id, vec![ProgressHistoryChange::Generation { request_id, state: Box::new(snapshot.state().clone()) }])?;
+                                        let history_keys: Vec<_> = history.checks.iter().map(|check| check.key.clone()).collect();
+                                        batch.checks.extend(history.checks);
+                                        batch.mutations.extend(history.mutations);
+                                        match store.commit(&batch.checks, &batch.mutations) {
+                                            Ok(()) => return Ok(crate::progress::Snapshot::load(store, request_id)?),
+                                            Err(durable_store::Error::Conflict { key }) if history_keys.contains(&key) => continue,
+                                            Err(error) => return Err(error.into()),
+                                        }
+                                    }
+                                })();
                                 match committed {
                                     Ok(next) => { snapshot = next; last_flush = Some(Instant::now()); if is_text { text_flushed = true; } },
                                     Err(error) => { progress_failure = Some(error.to_string()); request_cancel.cancel(); }
@@ -10060,6 +10280,29 @@ impl Scheduler {
         registry: crate::task_scheduler::Registry,
     ) -> Result<crate::task_driver::Driver, Error> {
         self.harness.start_tasks(registry)
+    }
+    pub fn progress_history_from_now(
+        &self,
+        conversation: Uuid,
+    ) -> Result<ProgressHistoryCursor, Error> {
+        self.harness.progress_history_from_now(conversation)
+    }
+    pub fn progress_history(
+        &self,
+        cursor: &ProgressHistoryCursor,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ProgressHistoryPage, Error> {
+        self.harness.progress_history(cursor, limit)
+    }
+    pub async fn watch_progress_history(
+        &self,
+        cursor: &ProgressHistoryCursor,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<ProgressHistoryPage, Error> {
+        self.harness
+            .watch_progress_history(cursor, limit, interval)
+            .await
     }
     pub fn history(
         &self,

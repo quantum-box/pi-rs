@@ -1086,6 +1086,7 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
     let mut scheduler = Scheduler::open(&path, opts()).unwrap();
     let id = scheduler.create_conversation(config()).unwrap();
     let other = scheduler.create_conversation(config()).unwrap();
+    let history_start = scheduler.progress_history_from_now(id).unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
         .await
@@ -1143,6 +1144,27 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         second.records[0].value["state"],
         json!({"state":"running","partial":{"text":"later"}})
     );
+    let mut history_cursor = history_start.clone();
+    let mut history_records = Vec::new();
+    loop {
+        let page = scheduler
+            .progress_history(&history_cursor, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        assert!(page.records.len() <= 1);
+        history_cursor = page.next;
+        if page.records.is_empty() {
+            break;
+        }
+        history_records.extend(page.records);
+    }
+    assert!(history_records.iter().any(|frame| frame.changes.iter().any(|change| matches!(change,
+        pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. }
+        if *seen == attempt && *value == json!({"text":"working"})
+    ))));
+    assert!(history_records.iter().any(|frame| frame.changes.iter().any(|change| matches!(change,
+        pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. }
+        if *seen == attempt && *value == json!({"text":"later"})
+    ))));
     let error = scheduler.abort_and_wait(id).await.unwrap_err();
     assert!(error.to_string().contains("abort cleanup remains pending"));
     let host = tool.host.lock().unwrap().take().unwrap();
@@ -1167,6 +1189,13 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
             .value["attempt"],
         json!(attempt)
     );
+    let history_terminal = reopened
+        .progress_history(&history_cursor, std::num::NonZeroUsize::new(256).unwrap())
+        .unwrap();
+    assert!(history_terminal.records.iter().any(|frame| frame.changes.iter().any(|change| matches!(change,
+        pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Aborted(Some(value)), .. }
+        if *seen == attempt && *value == json!({"text":"later"})
+    ))));
     let terminal = reopened
         .tool_progress_events(attempt.attempt_id, second.next, limit)
         .unwrap();
