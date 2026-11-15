@@ -41,16 +41,26 @@ sharing, OpenRouter OAuth, and MCP HTTP connections honor `httpProxy`, the
 HTTP(S) proxy environment variables, and `no_proxy`/`NO_PROXY` domain, wildcard,
 and port exclusions. MCP OAuth discovery, explicit metadata, dynamic registration,
 authorization-code exchange, refresh, login, scope upgrades, and reconnects use
-the same settings. To prevent proxy DNS exemptions from bypassing address checks,
+the same settings. A loopback CLI test exercises the actual workbench `httpProxy`
+adapter and `no_proxy` for discovery, explicit metadata and dynamic registration.
+Client-level loopback tests also cover code exchange and refresh through a CONNECT
+proxy and through a supplied `NoProxy` exclusion; no browser or live credentials
+are used. To prevent proxy DNS exemptions from bypassing address checks,
 OAuth requests and redirects to a configured proxy hostname are rejected, even
 when `NO_PROXY` selects a direct connection. Embedders using the original
 `HttpOptions` without proxy hostname information apply DNS filtering to proxy
 hostnames too; `HttpOptionsWithProxyHosts` enables private DNS proxy hosts.
 Lowercase environment variables take precedence, and explicit
 environment values take precedence over the setting. Proxy URL credentials are
-not displayed in the settings list. Other network surfaces need integration;
-for plain HTTP origins reqwest uses forward-proxy requests, while upstream Pi
-uses CONNECT tunneling.
+not displayed in the settings list. Workbench-configured reqwest proxies use
+CONNECT for HTTP as well as HTTPS origins, matching Pi. Externally supplied
+authenticated forward-only proxies retain forward behavior. Proxy decisions are captured per request and route-specific connection pools prevent
+credentials from following a request onto another route. Caller-provided forward
+proxy authorization is bound to the first route across redirects. Caller-provided proxy
+authorization is removed for direct and local-socket requests, and passed only
+to the selected proxy for CONNECT. It overrides configured basic authentication;
+configured proxy-specific headers retain their existing precedence. HTTP/3 rejects matched proxy routes rather
+than bypassing them. Other network surfaces need integration.
 
 The `/settings` list remains open after a change, preserving its search and
 selected item so several values can be changed in succession. Enter activates
@@ -69,6 +79,9 @@ The per-model thinking submenu discovers models and their supported levels off
 the terminal thread, saves or clears individual overrides, and preserves other
 user and trusted-project settings. Changes for the active model update the
 session; when an agent run is in progress, they take effect after that run.
+While supported levels load, up to 1024 keyboard or paste events are retained
+for the level selector; the configured picker cancellation key cancels loading
+and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
@@ -94,7 +107,17 @@ without `defaultProvider` are still accepted.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
-those imports receive a new native UUID. Forks receive their own UUID.
+custom IDs are preserved across native export and reopen and used for
+model request and cache warming affinity. A separate internal UUID continues to
+identify sessions for existing SDKs and hosts; forks receive a fresh UUID and
+external ID. RPC state, session statistics, resume search, share headers and
+model-shell metadata project the external ID. Empty IDs omit affinity headers.
+Nonempty IDs use Fetch-compatible Latin-1
+header bytes and whitespace normalization. Unrepresentable or invalid values
+fail before dispatch when an affinity default is needed; explicit headers win
+without validating an unused default. An ID containing NUL is omitted from the
+child process environment. Internal UUIDs remain accepted for native session
+lookup.
 
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
@@ -116,11 +139,84 @@ the saved tool result retains the image for later use with a compatible model.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
-tool calls in a length-limited response are recorded as failed without executing
-their potentially incomplete arguments; the model receives those results and
-may request the tools again. Other incomplete reasons remain errors.
+tool calls in a length-limited response are never executed. When a recoverable
+length stop has an older prefix to compact, native omits the attempt and tries
+one compact-and-retry recovery; otherwise, it records failed tool results and
+the model may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
+For the Cerebras Chat Completions provider, a fully received, empty HTTP 400
+response is treated as context overflow, matching Pi's bodyless-error rule.
+Other providers and nonempty 400 bodies retain their normal classification;
+incomplete or timed-out bodies do not qualify as empty. Existing HTTP 413
+handling is unchanged.
+Native extensions can opt into a pre-summary compaction hook for manual,
+threshold, and supported overflow compaction. A supplied summary bypasses the summary model, carries
+optional details and usage into the journal, and emits the normal lifecycle
+notification; cancellation leaves the branch unchanged. Executable extensions
+negotiate this hook before receiving the new request. Existing post-summary
+compaction hooks continue to run. The detailed compaction lifecycle callback and
+negotiated executable protocol carry the `overflow` trigger; legacy lifecycle
+callbacks receive `threshold` so their closed Rust enum remains source compatible.
+An extension-provided summary does not consume
+a model request, so threshold compaction can use it even when only the turn's
+final model request remains. A declined optional hook preserves that request and
+does not emit a failed-compaction event. Unlike Pi, the native hook must retain at
+least the prepared recent context and uses native numeric journal IDs; cuts that
+split a user message from its legacy image records or a tool call from its
+result are rejected. Later legacy hook changes can retain more history, but
+cannot move an extension-provided boundary forward. Native summary size and
+timeout limits still apply. Custom `SessionStore` implementations that do not
+support atomic record metadata reject new pre-summary extension compactions
+rather than silently dropping their metadata. Legacy compaction hooks continue
+to work on those stores with their previous metadata-free behavior.
+An unsupported metadata append is rejected before any write, so the existing
+session remains usable. When a completed model summary is recovered, usage is
+settled with its original request ID and metadata before compaction is committed;
+the host must make settlement idempotent per request ID. A failed settlement
+leaves the summary available for retry instead of silently closing the run.
+SDK `resume()` also finds a recoverable summary on the latest branch run after
+reopening, and resumes that run instead of starting an unrelated one. It also
+recognizes interrupted compaction markers before a summary is complete, and
+recognizes a durable overflow or length stop before its marker is written. It
+restores the branch model before checking the interrupted request's identity;
+queued trigger turns do not overtake an unresolved compaction recovery.
+Queued steering and other deferred context are held until interrupted
+compaction is resolved; an unresolved request leaves them queued.
+SDK recovery defers session-start callbacks until recovery succeeds; when
+extensions are registered it settles known and unconfirmed recovery usage using
+the restored model, then requires reconciliation before invoking them. An
+interrupted hard-overflow summary request is settled as unconfirmed before that
+reconciliation; it is never automatically resent.
+Public startup and prompt paths also reject an unresolved recovery before
+callbacks or queued triggers run. For an ambiguous silent-overflow summary,
+resume retains the answer, settles any started summary request as unconfirmed
+when its outcome is unknown, and records a durable skip before accepting more
+work. Failed settlement leaves recovery pending for retry.
+The low-level agent similarly rejects a new run or direct queued-input
+delivery until the interrupted run has been resumed or reconciled.
+Ordinary silent-summary model or budget failures also record the skip before
+returning the answer. A saved summary's incurred usage is settled even when
+the restored run budget prevents further work.
+Saved summary usage is settled even when current request limits or the
+auto-compaction setting prevent replay. Cancellation during a silent summary
+returns cancellation and leaves the durable operation available for recovery.
+Explicit overflow recovery also settles durable failed, cancelled, truncated,
+empty, or oversized summary completions before deciding whether they can be
+reused; uncertain work still requires reconciliation rather than a resend.
+Saved silent-overflow recovery runs before checking the current auto-compaction
+setting or model window. A resumed run restores request and output limits from
+its journal; missing or unconfirmed usage reserves the request's full output
+allowance, while a replayed reply or summary is charged once.
+If cancellation arrives before silent recovery begins, it returns cancellation
+without delivering queued steering or marking the saved operation complete.
+Overflow recovery remains partial: when an
+interrupted operation may have invoked an extension hook or sent an unconfirmed
+summary request, native does not repeat the ambiguous operation. Retry-required
+recovery reports that reconciliation is needed; for a completed silent-overflow
+answer, native preserves the answer and skips the ambiguous compaction. An
+automatic reconciliation workflow, full Pi preparation payload and all
+provider overflow classifications remain gaps.
 
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed
@@ -206,9 +302,10 @@ uses its DeepSeek-style thinking switch. Subscription OAuth supports device
 login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
 remains open.
 
-Markdown links use the reference's non-hyperlink terminal fallback: link text
-is underlined and destinations appear in parentheses only when they differ from
-the visible URL or email address. OSC 8 hyperlink capability remains open.
+On terminals without OSC 8 support, Markdown links use the reference's text
+fallback: link text is underlined and destinations appear in parentheses only
+when they differ from the visible URL or email address. Supported terminals use
+OSC 8 hyperlinks, as described in the terminal capabilities checkpoint below.
 
 MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
 `MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled catalogs
@@ -243,8 +340,8 @@ form, including multiple keys and explicitly unbound actions.
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
 frontends. The standalone crate is compile-checked for
-`wasm32-unknown-unknown`; the agent SDK and browser runtime are not yet supported
-on that target. Preview behavior retains the existing native parser's documented
+`wasm32-unknown-unknown`; the experimental browser SDK supports the text-only
+sessions described above. Preview behavior retains the existing native parser's documented
 differences from Pi's streaming parser.
 
 RPC `extension_error` events include Pi's `extensionPath` and `error` fields
@@ -684,6 +781,29 @@ RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
 
+For text reads, Pi exposes the displayed page as both text content and a
+`structuredContent` string. Native agent tool-result events receive this string
+through operation-correlated transient metadata, including continuation and
+truncation notices. The journal, SDK observers, result hooks, direct calls and
+programmatic calls retain their existing `Outcome` variants, and the public
+`Notification` variants are unchanged. In-process partial patches preserve
+the structured value when they only update metadata, and discard it when they
+explicitly replace output, including with the same text. Custom host hooks may
+opt in to reporting output-field presence; native executable extensions negotiate
+that capability and forward the field-presence result across the process boundary.
+A duplex host remains available for nested calls even if it cannot send custom
+messages. Single-shot and duplex presence responses allow only the fixed wrapper
+overhead; the underlying outcome and nonterminal frames still obey their original
+limits. Older executables and opaque overrides remain conservative when field
+presence is unavailable. Image reads use the same transient event path to project
+Pi's image structured result with its MIME type, encoded data and displayed note;
+image omission results project the note as a string. Existing image and event
+size limits remain in force; attachment-reference results are not synthesized.
+Structured image outcomes accept metadata-only result patches without losing
+content or the transient structured value; explicit text replacement discards
+both. Changing the error status of a non-object structured payload remains
+unsupported.
+
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
 while scanning a single long line. Directory listing runs off the async
@@ -839,7 +959,15 @@ custom read operations because grep, find and ls still access the local filesyst
 To use all four tools on one remote workspace, `create_remote_read_only_tools`
 accepts one `Arc` whose backend implements read, grep, find, and ls operations.
 Its working directory and optional backend home are absolute paths in that
-backend's namespace. The backend enforces access controls and search semantics,
+backend's namespace. Local tools and injected `find`, `grep`, and `ls` share
+file URL validation: malformed UTF-8, percent escapes and encoded path separators
+are rejected before backend calls; query and fragment escapes are not path
+escapes. On Unix encoded backslashes remain literal filename characters. On
+Windows valid IDN UNC hostnames are decoded to Unicode before backend dispatch,
+matching Node's `fileURLToPath`. Simple ASCII UNC hosts with malformed punycode
+labels retain those labels literally, while valid labels are decoded. The URL
+parser remains stricter than Node for some other malformed punycode authorities,
+including percent-encoded host labels. Backends enforce access controls and search semantics,
 including matching, ignore rules, and ordering. A set is an `Extension` and can
 be registered directly with `Registry`; overlapping sets have duplicate tool names.
 
@@ -869,6 +997,11 @@ packages indexed by older versions gain their declared themes without a build.
 An explicit Pi `package.json` resource list contributes themes only and prevents
 previously cached native resources from being loaded. Unreadable local manifests
 are skipped instead of falling back to cached resources.
+When an in-progress package command is cancelled, the host requests termination
+of its process group (or Windows job) while the direct child is still owned. The
+host retains the child identity until inherited output pipes close, including when
+the parent has already exited. This does not impose a deadline on all share
+context preparation or cover processes that detach or close their inherited pipes.
 
 ### System prompt checkpoint
 
@@ -878,11 +1011,32 @@ only registered tools. Skill discovery is exposed to the model when a usable
 file-reading tool is registered; manual skill invocation remains available.
 Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
 Skill metadata is XML-escaped and relative-path guidance matches native skill
-loading. Declared `SKILL.md` files with missing descriptions report both the
+loading. Prompt templates accept Pi string `argument-hint` frontmatter; native multi-match
+completion displays the hint before the description and inserts only the command
+name. Built-in and skill candidates take precedence over same-named templates. Completion
+descriptions use Pi's single-line normalization, selected and muted theme roles,
+and narrow-width visibility. Native completion still opens on explicit Tab and
+inserts a sole match directly, rather than reproducing Pi's continuously displayed
+autocomplete.
+Prompt template parsing strips one leading BOM and applies ECMAScript trim to
+the body after frontmatter. When no explicit description is present, the first
+nonblank line uses ECMAScript whitespace rules and the first 60 UTF-16 code
+units, as in Pi.
+If the cutoff splits a surrogate pair, RPC `get_commands` preserves the unpaired
+UTF-16 unit as a `\ud83d`-style JSON escape, as Pi does. Native display uses
+U+FFFD for the unpaired unit because its strings contain valid UTF-8; actual
+U+FFFD characters remain distinct. Prompt bodies and explicit descriptions are
+not truncated.
+Declared `SKILL.md` files with missing descriptions report both the
 description problem and any invalid name diagnostics; unreadable skill files
 also report their source path. Empty-description checks use ECMAScript whitespace
 semantics, including U+FEFF and excluding U+0085. Tests cover these diagnostics,
 reader gating and custom-prompt precedence.
+
+Skill and prompt-template files decode malformed UTF-8 with replacement, as Pi
+does, so an invalid byte does not hide an otherwise usable resource. The native
+64 KiB resource limit and existing resource trust rules remain in force; source
+files are not rewritten. Tests cover discovery, invocation and the size limit.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
@@ -1132,8 +1286,8 @@ prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
 malformed UTF-8 in text attachments is decoded with replacement characters.
 For CLI attachments, image detection does not infer a format from the file
 extension. Malformed PNG headers and animated PNGs detected within the first
-4,100 bytes are treated as text, matching Pi's PNG sniffing; other format
-classification continues to use the native reader.
+4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection
+also follows Pi; unsupported image formats are treated as text.
 Images are referenced by a single-line file tag and sent as separate image
 content. The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
@@ -1218,6 +1372,15 @@ image-only data policy.
 model discovery and persistent CLI/RPC workers. The credential remains
 process-local. Regression tests verify the selected bearer header and check
 that session records and command output contain no key value.
+
+### Repeated CLI modes and session references
+
+Repeated `--mode`, `--tui-mode`, `--session`, `--session-id` and `--fork`
+options use their last value, as in Pi v1.5.0. Invalid mode values are still
+rejected even when a later value is valid. Native session-option conflicts and
+session ID validation remain in force, and arguments after `--` remain prompt
+text. Parser regressions cover these cases; a CLI fixture verifies that only
+the last named session is created.
 
 ### Regular-mode redraw checkpoint
 
@@ -1506,7 +1669,11 @@ File edits preserve UTF-8 BOMs and the file's LF/CRLF convention. Matching first
 uses exact text, then Pi-compatible Unicode normalization, quote/dash handling
 and trailing-space normalization. If fuzzy matching is needed, only touched
 line blocks are rewritten from the normalized view. Other line content retains
-its original characters and whitespace.
+its original characters and whitespace. Fuzzy trailing-space matching follows
+ECMAScript `trimEnd`: U+FEFF is trimmed, while U+0085 is retained. A missing
+U+0085 in an edit target therefore cannot cause a fuzzy match and file rewrite.
+Local and injected edit regressions verify that this mismatch leaves the file
+or backend untouched.
 
 Batch input accepts arrays, a single edit object or a JSON-encoded array/object.
 Legacy replacements can accompany a batch. All replacements match the same
@@ -1664,6 +1831,12 @@ bindings. Unix suspension remains available on WSL.
 Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
 Both use Ctrl+F for fullscreen transcript search and their prompt-jump
 defaults omit the redundant Ctrl+Shift variants, matching Pi.
+Transcript search normalizes ECMAScript whitespace in queries and rendered
+graphemes, including U+FEFF. U+0085 is retained in search-only input and
+rendered-text metadata, so it remains distinct from both whitespace and an
+absent character. Its zero-width matches can be navigated, although they have
+no visible cell to highlight. Terminal output still removes U+0085 and other
+unsafe control characters.
 
 A committed isolated-process-group PTY test covers resize input and suspension.
 A separate fixture covers both screen modes, SIGINT while suspended, resumed
@@ -1907,7 +2080,8 @@ clients, PKCE verification, rejection of an incorrect callback state,
 authenticated tool calls, token rotation, cross-process reuse, logout and login
 replacement. Store tests cover stale connections, locking, file permissions,
 failed oversized writes and recovery from a damaged store. These are fixture
-checks with an isolated browser launcher. Automatic interactive scope upgrades still require implementation.
+checks with an isolated browser launcher. Interactive scope upgrades for typed
+403 challenges are described in the MCP checkpoint above.
 
 ### Confidential MCP client checkpoint
 
@@ -1924,7 +2098,8 @@ rejected-token refresh, logout, re-login and concurrent configuration edits.
 Existing public-client fixtures also passed. Store tests preserve registration
 metadata across refresh and accept older files that have no registration field.
 The fixtures use a replacement browser launcher and a local authorization
-server. Interactive scope upgrades remain open.
+server. The MCP checkpoint above describes interactive upgrades for typed 403
+scope challenges.
 
 ### MCP client metadata registration checkpoint
 
@@ -2251,6 +2426,26 @@ zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
 Complete native prompt checkpointing remains open.
 
+### Tool argument token estimates
+
+Pi estimates assistant tool-call arguments using JavaScript `JSON.stringify`
+after parsing them. Native estimates now count JavaScript binary64 number
+rounding and exponent formatting as well as UTF-16 string units, including in
+imported assistant messages. To retain the correct binary64 value when imported
+JSON is first read, the shared `serde_json` parser enables `float_roundtrip`.
+This also changes decimal floating-point parsing throughout binaries that use the
+core crate, including model configuration, provider responses, tool arguments,
+and reserialized provider requests. Pi likewise parses JSON decimals as
+JavaScript numbers. Native integer values retain their existing exact integer
+representation, even above 2^53, and other native consumers may observe more
+accurate decimal rounding. Previously persisted rounded values cannot recover
+their original decimal representation. Regressions cover exponent cutoffs,
+integers beyond 2^53, negative zero, nested values and escaped Unicode against
+Node 24, as well as tool execution and an Anthropic loopback request. Inputs
+that Rust's JSON parser rejects, such as non-finite numeric overflow, retain the
+existing raw-input fallback, so complete JavaScript JSON parsing and
+token-estimator parity remain open.
+
 ### Directory listing limits checkpoint
 
 Directory listings now use the reference's combined notice when both the entry
@@ -2355,7 +2550,8 @@ existing tighter output bound.
 
 The file tools share Pi-style input normalization for leading `@`, home-directory
 paths, file URLs and Unicode space variants. Windows input also accepts drive
-paths written in Git Bash, Cygwin and WSL form. Dot segments resolve before file
+paths written in Git Bash, Cygwin and WSL form, with case-insensitive `mnt` and
+`cygdrive` prefixes as in Pi. Dot segments resolve before file
 lookup. Existing canonical-path checks and parent traversal restrictions remain
 in the workspace-scoped profile.
 
@@ -2557,7 +2753,8 @@ inherit the refresher. Refresh waits obey model timeouts and cancellation.
 
 Core tests cover same-run advertising and dispatch updates, removal between
 request and dispatch, fixed read-only profiles and cancellation. Interactive
-OAuth scope upgrades and push-notification optimization remain open.
+OAuth upgrades for typed 403 scope challenges are described above;
+push-notification optimization remains open.
 
 Loopback runs verify a direct tool replacement, a same-name schema change,
 explicit exclusion of an added tool, and deferred discovery of a replacement
@@ -2647,7 +2844,12 @@ user/assistant text across saved branches. Space-separated tokens must all
 match. Quoted phrases normalize whitespace. `re:` queries use a case-insensitive
 native regular-expression engine with a bounded backtracking limit, including
 lookaround support. Invalid expressions produce no matches. Remaining JavaScript
-regular-expression edge compatibility has not been declared complete.
+regular-expression edge compatibility has not been declared complete. In
+patterns without bracket expressions that the linear regex engine accepts,
+`\d`, `\D`, `\w`, `\W`, `\b`, and `\B` use JavaScript's ASCII classes
+and word boundaries. Patterns requiring lookaround or backreferences retain
+the existing bounded engine and Unicode class behavior; bracket expressions
+and other Unicode case folding differences remain open.
 
 Name and working-directory fields support Pi's fuzzy alignment and letter/digit
 swap. Message text and IDs use literal matching. Relevance sorting uses the same
@@ -3439,8 +3641,10 @@ Async `session_compact` and
 Manual preparation failures also emit `session_compact_failed`; its error
 message identifies manual versus automatic threshold compaction, and aborted
 events omit the error message. Native compaction retains its existing
-preflight, error types, and extension replacement behavior; overflow recovery
-and Pi's pre-summary extension-provided compaction remain separate gaps.
+preflight, error types, and extension replacement behavior. Manual and threshold
+compaction accept extension-provided summaries before model generation.
+Supported overflow recovery also invokes the hook; ambiguous interrupted
+requests or hooks are not automatically repeated.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
@@ -3481,9 +3685,14 @@ both display modes, as well as the correlated RPC responses.
 
 ### Radius share presentation metadata
 
-Terminal `/share` appends Pi's `pi.share` entry with the active system prompt
-and tool schemas to Radius uploads. Idle shares use the worker's current
-runtime and branch; shares during a model request use the actual request context.
+Terminal `/share` appends Pi's `pi.share` entry with the session's system prompt
+and active tool schemas to Radius uploads. Idle and in-flight shares use the
+worker's session state; request-only `context_with_system` transformations do
+not replace the shared prompt, matching Pi's `session.state` export. Pi v1.5.0
+exposes interactive `/share`; the standalone `pi share` command is a pi-rs
+extension. Standalone share keeps the journal lock without implicitly repairing
+or creating the journal. An incomplete journal or pending handoff recovery is
+reported before upload; an explicit `--name` still updates the session name.
 The snapshot is matched to the session and head before upload, and a changed
 session requires a retry. Idle refreshes accept a disk snapshot only when it
 extends the worker's retained journal, preventing a delayed read from rewinding
@@ -4213,6 +4422,16 @@ model discovery, and workbench proxy/idle-timeout settings. Custom model endpoin
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
 
+### External editor result
+
+The external-editor command follows Pi's configured, `VISUAL`, `EDITOR`, then
+platform-default precedence, ignoring blank configured values and empty
+environment values. On successful return it decodes UTF-8 with replacement,
+strips one leading BOM and removes exactly one final LF. Failed editors leave
+the draft unchanged. As in Pi, the temporary draft is closed before the editor
+launches, allowing editors that require exclusive file access. Native shell-style
+command splitting remains supported.
+
 ### Editor kill ring checkpoint
 
 Typing now follows Pi's undo grouping: consecutive non-whitespace characters
@@ -4226,7 +4445,12 @@ Consecutive editor kill commands now combine their removed text in deletion
 order, including newline joins. Cursor movement or another editing action
 starts a separate kill. Yank-pop rotates the ring and is undoable, matching
 Pi's editor behavior. Focused editor tests cover both directions, multiline
-text, interrupted kills and yank cycling; other editor parity gaps remain open.
+text, interrupted kills and yank cycling; other editor parity gaps remain open. Word navigation and word deletion use ICU word
+boundaries and Pi’s ASCII punctuation rules, and move across a newline one
+line at a time. As intentional fixes to pinned Pi, backward word operations
+advance past a trailing Hebrew apostrophe and preserve combining marks on
+punctuation graphemes. Native editing retains literal pasted text rather than Pi’s
+atomic paste markers.
 
 ### Session tree branch navigation checkpoint
 
@@ -4244,15 +4468,16 @@ empty blocks while retained source entries preserve whether content was missing
 or null. Tests cover export and reopen, branch-local edits, metadata and invalid
 non-null content. Other specialized message variants remain open.
 
-### RPC truncated JSON diagnostics
+### RPC JSON diagnostics
 
 Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
-(including lone surrogate escapes), and
-missing values. Offsets and columns count UTF-16 units; CR, LF and CRLF are
-counted as line breaks. Other malformed JSON, including incomplete escapes,
-retains the native parser's diagnostics; full malformed-input parity remains
-open.
+(including lone surrogate escapes), dangling backslashes, incomplete Unicode
+escapes, invalid escape characters or Unicode digits, and missing values. Offsets
+and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+Escapes following lone surrogate
+escapes and other malformed JSON retain the native parser's diagnostics; full
+malformed-input parity remains open.
 
 ### Shell execution transcript checkpoint
 
@@ -4284,6 +4509,21 @@ matching, including the ASCII letter/number swap (for example `p2` matches
 `nova-2p`). Display names alone do not match. The native JSON listing remains
 available; model scope and picker selection retain their existing behavior.
 
+### Messages quota retry classification
+
+Anthropic-compatible Messages requests inspect bounded retryable HTTP error
+responses and stream error fields for Pi's account, quota and billing markers.
+Structured JSON classification uses error message, code and type fields, excluding
+request identifiers and other metadata. Those failures
+stop agent retries; transient rate limits remain retryable. Response bodies are
+not surfaced or logged. Classification falls back to the existing retry behavior
+when the marker lies beyond 64 KiB or the response cannot be read within two seconds.
+Complete error fields preceding a truncated later JSON field remain classifiable;
+unrelated metadata, incomplete numeric values and undelimited numbers are ignored.
+Known credentials and configured header values are redacted before error fields
+are classified, including for stream errors.
+Other provider adapters still need equivalent quota classification.
+
 ### Bedrock quota retry classification
 
 Bedrock service and stream exceptions stop agent retries when their redacted
@@ -4299,3 +4539,26 @@ the agent remain governed by the configured SDK policy.
 Pi's non-chat System One provider-level policy retries transient HTTP status
 codes including 429 without classifying the response body; native keeps that
 separate policy.
+
+### Provider quota retry classification
+
+Google Gemini, OpenAI-compatible chat, OpenAI Responses and Pi Messages requests
+recognize permanent account, billing and quota exhaustion in structured error
+message, code and type fields for retryable HTTP statuses and stream errors.
+Recognized transient stream errors, including Gemini errors without a numeric
+code, remain retryable after permanent-limit checks. OpenAI response codes are
+classified only after known credentials are masked.
+JSON metadata such as request IDs does not affect classification. Known request
+credentials, Bearer tokens and conventional authentication-header values are
+masked before classification, even when they equal quota or transient terms.
+Other configured header values are masked
+when distinguishable from those terms; ambiguous header values remain
+classifiable because an echo cannot be distinguished from a provider error.
+Diagnostics remain fixed and do not include provider bodies. Transient stream
+matching follows the pinned Pi patterns. OpenAI subscription
+codes retain their explicit error precedence. Plain-text errors are also supported. HTTP body inspection is limited to 64 KiB and two
+seconds. Complete error fields preceding a truncated later JSON field remain
+classifiable; incomplete values and unrelated metadata are ignored. Failed or
+timed-out inspection falls back to the existing transient classification. Provider error bodies are not logged or
+returned. Bedrock typed SDK errors and non-chat operations retain their separate
+policies.

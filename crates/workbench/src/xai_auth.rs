@@ -503,8 +503,33 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // Consume the complete request before closing the connection. A
+            // single read can leave its body unread and reset the response.
+            let mut request = Vec::new();
             let mut bytes = [0; 2048];
-            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            loop {
+                let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut bytes))
+                    .await
+                    .expect("refresh request did not complete")
+                    .unwrap();
+                assert!(count > 0, "request closed before its body arrived");
+                request.extend_from_slice(&bytes[..count]);
+                assert!(request.len() <= 16 * 1024, "unexpectedly large request");
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("refresh request content length");
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
             started_tx.send(()).unwrap();
             reply_rx.await.unwrap();
             let body =
@@ -532,21 +557,27 @@ mod tests {
                 .unwrap(),
         };
         let task = tokio::spawn(access_at(path.clone(), service, None, false));
-        started_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("refresh request did not arrive")
+            .unwrap();
         task.abort();
         reply_tx.send(()).unwrap();
         server.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                if saved["xai"]["refresh"] == "new-refresh" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        // The detached refresh holds the auth lock until it finishes saving.
+        // Reacquiring it lets the assertion distinguish a completed failure
+        // from a worker that is still in flight.
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::auth_lock::acquire_async(&path),
+        )
         .await
-        .unwrap();
+        .expect("refresh did not release the auth lock")
+        .expect("could not acquire the auth lock");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        guard.check().unwrap();
+        assert_eq!(saved["xai"]["access"], "new-access");
+        assert_eq!(saved["xai"]["refresh"], "new-refresh");
     }
 
     #[tokio::test]

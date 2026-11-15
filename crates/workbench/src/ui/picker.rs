@@ -20,6 +20,7 @@ pub enum Selection {
     Completion {
         range: std::ops::Range<usize>,
         text: String,
+        description: Option<String>,
     },
     LoginProvider(super::super::Provider),
     BedrockBearer,
@@ -208,17 +209,18 @@ impl Picker {
         }
     }
     pub fn completion(
-        candidates: Vec<String>,
+        candidates: Vec<(String, Option<String>)>,
         range: std::ops::Range<usize>,
         limit: usize,
     ) -> Self {
         let items = candidates
             .into_iter()
-            .map(|text| Item {
+            .map(|(text, description)| Item {
                 label: text.clone(),
                 selection: Selection::Completion {
                     range: range.clone(),
                     text,
+                    description,
                 },
             })
             .collect();
@@ -229,8 +231,20 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
-        self.query
-            .extend(text.chars().filter(|character| !character.is_control()));
+        if self.title == "Settings" {
+            // Pi's single-line input removes CR/LF, expands tabs, and keeps
+            // other characters for filtering. Rendering sanitizes controls.
+            for character in text.chars() {
+                match character {
+                    '\r' | '\n' => {}
+                    '\t' => self.query.push_str("    "),
+                    character => self.query.push(character),
+                }
+            }
+        } else {
+            self.query
+                .extend(text.chars().filter(|character| !character.is_control()));
+        }
         self.selected = 0;
         self.unfold_tree_for_search();
     }
@@ -609,12 +623,13 @@ impl Picker {
                 {
                     return session_query.score(document).is_some();
                 }
-                let label = item.label.to_lowercase();
+                let label = match &item.selection {
+                    Selection::Completion { text, .. } => text.to_lowercase(),
+                    _ => item.label.to_lowercase(),
+                };
                 if self.title == "Settings" {
-                    crate::model_selection::fuzzy(
-                        &query,
-                        label.split(" · ").next().unwrap_or(&label),
-                    )
+                    settings_match_score(&query, label.split(" · ").next().unwrap_or(&label))
+                        .is_some()
                 } else if self.active_session.is_some()
                     || self.model_scope.is_some()
                     || self.title == "Thinking: select model"
@@ -636,7 +651,14 @@ impl Picker {
                 {
                     return (session_query.score(document).unwrap_or(i64::MAX), 0);
                 }
-                let label = item.label.to_lowercase();
+                let label = match &item.selection {
+                    Selection::Completion { text, .. } => text.to_lowercase(),
+                    _ => item.label.to_lowercase(),
+                };
+                if self.title == "Settings" {
+                    let name = label.split(" · ").next().unwrap_or(&label);
+                    return (settings_match_score(&query, name).unwrap_or(i64::MAX), 0);
+                }
                 (
                     label
                         .find(&query)
@@ -1152,6 +1174,12 @@ impl Picker {
         } else {
             0
         };
+        let completion_column = items
+            .iter()
+            .map(|item| item.label.width() + 2)
+            .max()
+            .unwrap_or(12)
+            .clamp(12, 32);
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
             if let (Some(tree), Some(layout), Selection::Checkout(id)) =
                 (&self.tree, &tree_layout, &item.selection)
@@ -1214,6 +1242,48 @@ impl Picker {
                     theme,
                     width,
                 ));
+                continue;
+            }
+            if let Selection::Completion {
+                text, description, ..
+            } = &item.selection
+            {
+                let selected = index == self.selected;
+                let role = if selected { "accent" } else { "text" };
+                let prefix = if selected { "› " } else { "  " };
+                let mut spans = vec![super::render::Span::themed(prefix, theme, role)];
+                let normalized = description.as_deref().map(normalize_completion_description);
+                let column = completion_column.min(width.saturating_sub(6)).max(1);
+                let primary = clip_completion(text, column.saturating_sub(2).max(1));
+                let spacing = column.saturating_sub(primary.width()).max(1);
+                let remaining = width.saturating_sub(2 + primary.width() + spacing + 2);
+                if width > 40
+                    && remaining > 10
+                    && normalized.as_ref().is_some_and(|s| !s.is_empty())
+                {
+                    spans.push(super::render::Span::themed(primary, theme, role));
+                    let desc = format!(
+                        "{}{}",
+                        " ".repeat(spacing),
+                        clip_completion(normalized.as_deref().unwrap_or_default(), remaining)
+                    );
+                    spans.push(super::render::Span::themed(
+                        desc,
+                        theme,
+                        if selected { "accent" } else { "muted" },
+                    ));
+                } else {
+                    spans.push(super::render::Span::themed(
+                        clip_completion(text, width.saturating_sub(4)),
+                        theme,
+                        role,
+                    ));
+                }
+                lines.push(Line {
+                    spans,
+                    background: selected.then(|| theme.color("selectedBg")),
+                    image: None,
+                });
                 continue;
             }
             let mut line = Line::themed(
@@ -1774,6 +1844,48 @@ fn short_path(path: &std::path::Path) -> String {
     }
     path.display().to_string()
 }
+fn settings_match_score(query: &str, label: &str) -> Option<i64> {
+    query
+        .split(|ch| ch == '/' || super::session_search::is_whitespace(ch))
+        .filter(|token| !token.is_empty())
+        .try_fold(0_i64, |sum, token| {
+            super::session_search::fuzzy_score(token, label).map(|score| sum.saturating_add(score))
+        })
+}
+
+fn normalize_completion_description(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_newline = false;
+    for ch in text.chars() {
+        if matches!(ch, '\r' | '\n') {
+            if !in_newline {
+                result.push(' ');
+            }
+            in_newline = true;
+        } else {
+            result.push(ch);
+            in_newline = false;
+        }
+    }
+    result
+        .trim_matches(|ch: char| (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}')
+        .to_owned()
+}
+
+fn clip_completion(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let next = grapheme.width();
+        if used + next > width {
+            break;
+        }
+        result.push_str(grapheme);
+        used += next;
+    }
+    result
+}
+
 fn truncate(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.into();
@@ -1794,6 +1906,82 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_description_follows_pi_width_and_theme_rules() {
+        let picker = Picker::completion(
+            vec![
+                ("/audit".into(), Some("  <file>\r\n\n[focus]  ".into())),
+                (
+                    "/author".into(),
+                    Some("second description that is long enough".into()),
+                ),
+            ],
+            0..3,
+            10,
+        );
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let wide = picker.render(&theme, 80, 10, &keys);
+        let selected = &wide[1];
+        assert!(selected.spans.iter().any(
+            |span| span.text.contains("<file> [focus]") && span.color == theme.color("accent")
+        ));
+        let other = &wide[2];
+        assert!(
+            other
+                .spans
+                .iter()
+                .any(|span| span.text.contains("second description")
+                    && span.color == theme.color("muted"))
+        );
+        assert!(
+            selected
+                .spans
+                .iter()
+                .all(|span| !span.text.contains(['\r', '\n']))
+        );
+        let narrow = picker.render(&theme, 40, 10, &keys);
+        for line in &narrow[1..3] {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert!(!text.contains("file") && !text.contains("description"));
+            assert!(text.width() <= 40);
+        }
+        let clipped = picker.render(&theme, 43, 10, &keys);
+        assert!(
+            clipped[2]
+                .spans
+                .iter()
+                .map(|span| span.text.width())
+                .sum::<usize>()
+                <= 43
+        );
+        assert_eq!(
+            normalize_completion_description("\u{feff}a\r\n\nb\u{feff}"),
+            "a b"
+        );
+    }
+
+    #[test]
+    fn completion_search_matches_inserted_text_not_description() {
+        let mut picker = Picker::completion(
+            vec![
+                ("/audit".into(), Some("<path> — Inspect changes".into())),
+                ("/author".into(), None),
+            ],
+            0..3,
+            10,
+        );
+        picker.paste("changes");
+        assert!(picker.matches().is_empty());
+        picker.query.clear();
+        picker.paste("audit");
+        assert_eq!(picker.matches().len(), 1);
+    }
 
     #[test]
     fn search_deletes_words_at_unicode_and_punctuation_boundaries() {
@@ -1949,6 +2137,72 @@ mod tests {
             matches!(&picker.matches()[picker.selected].selection, Selection::Setting(name, value) if name == "HTTP timeout" && *value == 30)
         );
         assert_eq!(picker.query, "ht to");
+    }
+
+    #[test]
+    fn settings_search_uses_pi_token_order_and_scores() {
+        let item = |name: &str| Item {
+            label: format!("{name} · value"),
+            selection: Selection::Setting(name.into(), serde_json::json!(true)),
+        };
+        let mut picker = Picker::new(
+            "Settings",
+            [
+                "HTTP timeout",
+                "Timeout HTTP",
+                "HTTP response timeout",
+                "Unrelated",
+            ]
+            .into_iter()
+            .map(item)
+            .collect(),
+        );
+        for query in ["timeout/http", "timeout http", "ht\u{feff}time"] {
+            picker.query = query.into();
+            let matches = picker.matches();
+            let names: Vec<_> = matches.iter().map(|item| item.label.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "Timeout HTTP · value",
+                    "HTTP timeout · value",
+                    "HTTP response timeout · value"
+                ],
+                "{query:?}"
+            );
+        }
+        picker.query = "http\u{85}timeout".into();
+        assert!(picker.matches().is_empty());
+        picker.query = "//".into();
+        assert_eq!(picker.matches().len(), 4);
+    }
+
+    #[test]
+    fn settings_paste_preserves_filter_semantics_and_sanitizes_display() {
+        let mut picker = Picker::new(
+            "Settings",
+            vec![Item {
+                label: "HTTP timeout · 30".into(),
+                selection: Selection::Setting("HTTP timeout".into(), serde_json::json!(30)),
+            }],
+        );
+        picker.paste("time\r\nout\thttp");
+        assert_eq!(picker.query, "timeout    http");
+        assert_eq!(picker.matches().len(), 1);
+
+        picker.query.clear();
+        picker.paste("http\u{85}timeout");
+        assert_eq!(picker.query, "http\u{85}timeout");
+        assert!(picker.matches().is_empty());
+
+        picker.paste("\u{1b}]8;;https://example.invalid\u{7}");
+        let lines = picker.render(&Theme::system(), 80, 8, &Keys::default());
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| { span.text.chars().all(|character| !character.is_control()) })
+        );
     }
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {

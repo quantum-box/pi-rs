@@ -2824,6 +2824,8 @@ dependencies = [
  "jsonschema",
  "libc",
  "pi-rs-tool-arguments",
+ "regex",
+ "ryu-js",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2854,6 +2856,14 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "pi-rs-file-url"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "url",
 ]
 
 [[package]]
@@ -2936,6 +2946,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "pi-rs",
+ "pi-rs-file-url",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2950,6 +2961,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "pi-rs",
+ "pi-rs-file-url",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2966,6 +2978,7 @@ dependencies = [
  "icu_collator",
  "icu_locale_core",
  "pi-rs",
+ "pi-rs-file-url",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3026,6 +3039,7 @@ dependencies = [
  "palette",
  "pi-rs",
  "pi-rs-extensions",
+ "pi-rs-file-url",
  "pi-rs-fixture-tools",
  "pi-rs-plan-mode",
  "pi-rs-remote-find",
@@ -3051,6 +3065,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
@@ -3425,8 +3440,6 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3466,8 +3479,6 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3724,6 +3735,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "same-file"

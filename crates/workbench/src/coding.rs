@@ -455,7 +455,7 @@ impl CodingTools {
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
         let path = tool.path(name)?;
-        let image = if lossy && png_attachment_is_text(&path)? {
+        let image = if lossy && !crate::cli_attachment_sniff::is_image_file(&path)? {
             Ok(None)
         } else if lossy {
             tool.read_image_inner(&path, false)
@@ -485,47 +485,6 @@ impl CodingTools {
             Ok(String::from_utf8_lossy(&bytes).into_owned())
         })
     }
-}
-
-// Pi sniffs the first 4100 bytes and treats malformed or animated PNG as text.
-// Other formats retain the native reader's existing classification.
-fn png_attachment_is_text(path: &Path) -> Result<bool> {
-    if !path.is_file() {
-        return Err(Error::Config("expected a regular file".into()));
-    }
-    let mut prefix = Vec::new();
-    std::fs::File::open(path)?
-        .take(4100)
-        .read_to_end(&mut prefix)?;
-    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-    if !prefix.starts_with(PNG) {
-        return Ok(false);
-    }
-    if prefix.len() < 16 || prefix[8..12] != [0, 0, 0, 13] || &prefix[12..16] != b"IHDR" {
-        return Ok(true);
-    }
-    let mut offset = 8usize;
-    while offset + 8 <= prefix.len() {
-        let length = u32::from_be_bytes(prefix[offset..offset + 4].try_into().unwrap()) as usize;
-        let kind = &prefix[offset + 4..offset + 8];
-        if kind == b"acTL" {
-            return Ok(true);
-        }
-        if kind == b"IDAT" {
-            return Ok(false);
-        }
-        let Some(next) = offset
-            .checked_add(length)
-            .and_then(|end| end.checked_add(12))
-        else {
-            break;
-        };
-        if next > prefix.len() {
-            break;
-        }
-        offset = next;
-    }
-    Ok(false)
 }
 
 fn finish_attachment(
@@ -821,6 +780,42 @@ struct CancellableReader<R> {
     inner: R,
     cancellation: pi_rs::CancellationToken,
 }
+fn read_event_content(outcome: &Outcome) -> Option<Value> {
+    match outcome {
+        Outcome::Succeeded(output)
+        | Outcome::SucceededWithDetails { output, .. }
+        | Outcome::TextResult { output, .. } => Some(json!(output)),
+        Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } if attachments.is_empty() => {
+            let blocks = data.get("content")?.as_array()?;
+            let note = blocks
+                .iter()
+                .find_map(|block| {
+                    (block.get("type")?.as_str()? == "text")
+                        .then(|| block.get("text")?.as_str())
+                        .flatten()
+                })
+                .unwrap_or("");
+            if let Some(image) = blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            {
+                let data = image.get("data")?.as_str()?;
+                let mime_type = image.get("mimeType")?.as_str()?;
+                if data.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+                Some(json!({"type":"image", "data":data, "mimeType":mime_type, "note":note}))
+            } else {
+                Some(json!(note))
+            }
+        }
+        _ => None,
+    }
+}
+
 impl<R> CancellableReader<R> {
     fn check(&self) -> std::io::Result<()> {
         if self.cancellation.is_cancelled() {
@@ -848,6 +843,9 @@ impl<R: Seek> Seek for CancellableReader<R> {
 impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
         self.tool.spec()
+    }
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        read_event_content(outcome)
     }
     fn execution(&self) -> ToolExecution {
         self.tool.execution()
@@ -2050,6 +2048,13 @@ impl Tool for CodingTool {
         }
     }
 
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        if matches!(self.kind, Kind::Read { .. }) {
+            read_event_content(outcome)
+        } else {
+            None
+        }
+    }
     fn execution(&self) -> ToolExecution {
         match self.kind {
             Kind::Read { .. } | Kind::Grep | Kind::Find | Kind::List => ToolExecution::ParallelRead,
@@ -3519,6 +3524,52 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn image_read_structured_projection_uses_first_text_and_image() {
+        use pi_rs::{AttachmentRef, Outcome};
+        use serde_json::json;
+        let image = Outcome::Structured {
+            data: json!({"content":[
+                {"type":"text", "text":"read note"},
+                {"type":"image", "mimeType":"image/png", "data":"aW1hZ2U="},
+                {"type":"text", "text":"other"}
+            ]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&image),
+            Some(
+                json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"read note"})
+            )
+        );
+        let omitted = Outcome::Structured {
+            data: json!({"content":[{"type":"text", "text":"image omitted"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&omitted),
+            Some(json!("image omitted"))
+        );
+        let malformed = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "data":"x"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&malformed), None);
+        let external = Outcome::Structured {
+            data: json!({"content":[]}),
+            attachments: vec![AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+        };
+        assert_eq!(super::read_event_content(&external), None);
+        let oversized = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "mimeType":"image/png", "data":"x".repeat(8 * 1024 * 1024 + 1)}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&oversized), None);
+    }
+
+    #[test]
     fn attachment_image_io_invalid_data_does_not_fall_back_to_text() {
         let image_error = std::io::Error::new(std::io::ErrorKind::InvalidData, "image read failed");
         let result = super::finish_attachment(Err(image_error.into()), || {
@@ -3943,6 +3994,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output.script, "unset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_shell_receives_external_session_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ShellConfig::default();
+        config.set_context_with_external_id(
+            ShellContext {
+                id: uuid::Uuid::new_v4(),
+                path: None,
+                provider: "fixture".into(),
+                model: "model".into(),
+                reasoning_level: None,
+            },
+            "legacy 日本語".into(),
+        );
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config,
+            kind: Kind::Bash,
+        };
+        let result = tool
+            .shell(
+                &json!({"command":"printf '%s' \"$PI_SESSION_ID\""}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.script, "legacy 日本語");
     }
 
     #[cfg(unix)]
@@ -5046,6 +5128,71 @@ mod tests {
     }
 
     #[test]
+    fn local_edit_does_not_remove_u0085_via_fuzzy_match() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.txt");
+        let original = "alpha\u{0085}\nbeta\n";
+        std::fs::write(&path, original).unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let error = tool
+            .edit(&json!({"path":"example.txt","oldText":"alpha\nbeta","newText":"changed"}))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Config(message) if message.starts_with("Could not find the exact text"))
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn injected_edit_does_not_write_for_u0085_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Backend(AtomicUsize);
+        #[async_trait::async_trait]
+        impl EditOperations for Backend {
+            async fn access(&self, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+                Ok("alpha\u{0085}\nbeta\n".as_bytes().to_vec())
+            }
+            async fn write_file(&self, _: &Path, _: &str) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn write_if_unchanged(
+                &self,
+                _: &Path,
+                _: &[u8],
+                _: &str,
+            ) -> Result<ConditionalEdit> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ConditionalEdit::Applied)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(Backend(AtomicUsize::new(0)));
+        let tool = create_edit_tool(&root.path().canonicalize().unwrap(), backend.clone()).unwrap();
+        let result = tool
+            .invoke(
+                json!({"path":"example.txt","oldText":"alpha\nbeta","newText":"changed"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(ref message) if message.starts_with("Could not find the exact text"))
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn directory_output_sorts_case_insensitively_and_reports_limits() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
@@ -5670,6 +5817,52 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shell_timeout_can_advance_after_process_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let mut task = tokio::spawn(async move {
+            tool.shell(
+                &json!({"command":"printf ready > ready; sleep 300", "timeout":120}),
+                &cancellation,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::select! {
+                    result = &mut task => panic!("shell ended before readiness: {}", match result {
+                        Ok(Ok(_)) => "unexpected success".into(),
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                    }),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+        })
+        .await
+        .expect("shell readiness timed out");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .expect("shell did not finish after advancing the clock")
+            .expect("shell task panicked");
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("timed out after 120 seconds"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn shell_does_not_wait_for_inherited_background_pipes() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
@@ -5780,40 +5973,117 @@ mod tests {
             .await
             .unwrap();
         assert!(output.output.script.contains("日本語"));
-        let ready = root
-            .path()
-            .join("ready.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
-        let leaked = root
-            .path()
-            .join("leaked.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
+        use base64::Engine as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        struct ProcessHandle(HANDLE);
+        impl Drop for ProcessHandle {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns a successful OpenProcess handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+        let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+        let ready = root.path().join("ready.txt");
+        let pid_file = root.path().join("child.pid");
+        let leaked = root.path().join("leaked.txt");
+        let child_stderr = root.path().join("child-stderr.txt");
+        let parent_stage = root.path().join("parent-stage.txt");
         let script = format!(
-            "Set-Content -LiteralPath '{ready}' -Value ready; Start-Sleep -Seconds 10; Set-Content -LiteralPath '{leaked}' -Value leaked"
+            "[IO.File]::WriteAllText('{}',[string]$PID); [IO.File]::WriteAllText('{}','ready'); Start-Sleep -Seconds 300; [IO.File]::WriteAllText('{}','leaked')",
+            quote(&pid_file),
+            quote(&ready),
+            quote(&leaked),
         );
+        let utf16 = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
         let command = format!(
-            "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command',\"{script}\"; Start-Sleep -Seconds 20"
+            "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText('{}','starting child'); Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' -RedirectStandardError '{}' | Out-Null; [IO.File]::WriteAllText('{}','child started'); Start-Sleep -Seconds 300",
+            quote(&parent_stage),
+            quote(&child_stderr),
+            quote(&parent_stage),
         );
-        assert!(
-            tool.shell(
-                &json!({"command":command,"timeout":5}),
-                &pi_rs::CancellationToken::new()
-            )
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let task_cancel = cancellation.clone();
+        let mut shell = tokio::spawn(async move {
+            tool.shell(&json!({"command":command,"timeout":120}), &task_cancel)
+                .await
+        });
+        let readiness = async {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
             .await
-            .is_err()
-        );
+        };
+        tokio::select! {
+            result = &mut shell => panic!("shell ended before child readiness: {}", match result {
+                Ok(Ok(_)) => "unexpected success".into(),
+                Ok(Err(error)) => error.to_string(),
+                Err(error) => error.to_string(),
+            }),
+            result = readiness => if result.is_err() {
+                panic!("child did not report readiness before deadline; parent stage: {:?}; child stderr: {:?}; child pid: {:?}",
+                    std::fs::read_to_string(&parent_stage), std::fs::read_to_string(&child_stderr), std::fs::read_to_string(&pid_file));
+            },
+        }
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: requesting a synchronization-only handle for the reported child PID.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         assert!(
-            root.path().join("ready.txt").exists(),
-            "child process must have started"
+            !raw.is_null(),
+            "cannot open child process: {}",
+            std::io::Error::last_os_error()
         );
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        let child = ProcessHandle(raw);
+        // SAFETY: the guard holds a live process handle. A zero timeout only observes its state.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 0) },
+            WAIT_TIMEOUT,
+            "child must be running before timeout"
+        );
+        // Expire the running timeout only after observing the live descendant.
+        // Advancing Tokio's clock avoids waiting two minutes or racing
+        // PowerShell startup on a loaded Windows runner.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::time::resume();
+        let result = match tokio::time::timeout(Duration::from_secs(35), &mut shell).await {
+            Ok(result) => result.expect("shell task panicked"),
+            Err(_) => {
+                cancellation.cancel();
+                let stopped = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                if stopped.is_err() {
+                    shell.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                }
+                panic!("shell did not finish within the outer deadline after child readiness");
+            }
+        };
         assert!(
-            !root.path().join("leaked.txt").exists(),
-            "timed-out descendants must be terminated"
+            matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 120 seconds")),
+            "expected the configured timeout"
         );
+        // SAFETY: the process handle remains owned by the guard during the wait.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 5000) },
+            WAIT_OBJECT_0,
+            "timed-out descendant must terminate"
+        );
+        assert!(!leaked.exists(), "timed-out descendant must not continue");
     }
 }

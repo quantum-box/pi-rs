@@ -823,10 +823,100 @@ mod jsonl_framing_tests {
     }
 
     #[test]
-    fn unfinished_escapes_keep_native_diagnostic() {
-        for input in ["\"a\\", "\"a\\u12"] {
+    fn unfinished_escapes_report_v8_diagnostic() {
+        for (input, expected) in [
+            ("\"a\\", "Unexpected end of JSON input"),
+            (
+                "\"a\\u",
+                "Bad Unicode escape in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "\"a\\u1",
+                "Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                "\"a\\u12",
+                "Bad Unicode escape in JSON at position 6 (line 1 column 7)",
+            ),
+            (
+                "\"a\\u123",
+                "Bad Unicode escape in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "{\"x\":\"😺\\u1",
+                "Bad Unicode escape in JSON at position 11 (line 1 column 12)",
+            ),
+            (
+                "[\r\n\"x\\u12",
+                "Bad Unicode escape in JSON at position 9 (line 2 column 7)",
+            ),
+            ("[\"a\\\\u12\\", "Unexpected end of JSON input"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
+        for input in ["[false,] \"x\\u1", "\"x\n\\u1"] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-            assert_eq!(super::rpc_json_error(input, &error), error.to_string());
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_escapes_report_v8_diagnostics() {
+        for (input, expected) in [
+            (
+                "\"\\x\"",
+                "Bad escaped character in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "\"\\q\"",
+                "Bad escaped character in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "\"\\u12x4\"",
+                "Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                "\"\\u1\"",
+                "Bad Unicode escape in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "{\"x\":\"😺\\x\"}",
+                "Bad escaped character in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                "[\r\n\"\\u12z4\"]",
+                "Bad Unicode escape in JSON at position 8 (line 2 column 6)",
+            ),
+            (
+                "\"x\\q\\u1",
+                "Bad escaped character in JSON at position 3 (line 1 column 4)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+        for input in ["[false,] \"x\\q\"", "\"x\n\\q\"", "\"\\uDC00\\x\""] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
         }
     }
 
@@ -866,6 +956,48 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
+    if (message.starts_with("invalid escape")
+        || error.is_eof() && message.starts_with("EOF while parsing a string"))
+        && let Some((reason, offset)) = invalid_json_escape(line)
+    {
+        let prefix = &line[..offset];
+        let position = prefix.encode_utf16().count();
+        let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
+            + prefix.bytes().filter(|byte| *byte == b'\n').count()
+            - prefix.matches("\r\n").count()
+            + 1;
+        let column = prefix
+            .rsplit(['\r', '\n'])
+            .next()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count()
+            + 1;
+        return format!("{reason} at position {position} (line {row} column {column})");
+    }
+    if error.is_eof() && message.starts_with("EOF while parsing a string") {
+        match unfinished_json_escape(line) {
+            Some(false) => return "Unexpected end of JSON input".into(),
+            Some(true) => {
+                let position = line.encode_utf16().count();
+                let row = line.bytes().filter(|byte| *byte == b'\r').count()
+                    + line.bytes().filter(|byte| *byte == b'\n').count()
+                    - line.matches("\r\n").count()
+                    + 1;
+                let column = line
+                    .rsplit(['\r', '\n'])
+                    .next()
+                    .unwrap_or_default()
+                    .encode_utf16()
+                    .count()
+                    + 1;
+                return format!(
+                    "Bad Unicode escape in JSON at position {position} (line {row} column {column})"
+                );
+            }
+            None => {}
+        }
+    }
     let surrogate_eof = (message.starts_with("lone leading surrogate in hex escape")
         || message.starts_with("unexpected end of hex escape"))
         && unterminated_surrogate_string(line, error);
@@ -873,8 +1005,8 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         return error.to_string();
     }
     let tail = line.trim_end_matches([' ', '\t', '\n', '\r']);
-    // Only map complete escapes: a dangling backslash or partial Unicode escape
-    // has a different V8 diagnostic and is left to serde for now.
+    // The remaining unterminated-string case has complete escapes; incomplete
+    // escapes above use different V8 diagnostics.
     let reason = if surrogate_eof
         || message.starts_with("EOF while parsing a string") && complete_json_escapes(line)
     {
@@ -917,6 +1049,67 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+// Locate the first malformed escape without interpreting subsequent text.
+// The caller only uses this after serde reports an invalid escape or an
+// unfinished string, so preceding structural errors retain their diagnostics.
+fn invalid_json_escape(line: &str) -> Option<(&'static str, usize)> {
+    let mut chars = line.char_indices();
+    let mut in_string = false;
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => match chars.next() {
+                Some((_, 'u')) => {
+                    for _ in 0..4 {
+                        match chars.next() {
+                            Some((_, hex)) if hex.is_ascii_hexdigit() => {}
+                            Some((offset, _)) => {
+                                return Some(("Bad Unicode escape in JSON", offset));
+                            }
+                            None => return None,
+                        }
+                    }
+                }
+                Some((_, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')) => {}
+                Some((offset, _)) => return Some(("Bad escaped character in JSON", offset)),
+                None => return None,
+            },
+            ch if in_string && ch < ' ' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+// Identify only an incomplete escape inside an open string. Earlier invalid
+// escapes and control characters must retain their own diagnostics.
+fn unfinished_json_escape(line: &str) -> Option<bool> {
+    let mut chars = line.chars();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => match chars.next() {
+                None => return Some(false),
+                Some('u') => {
+                    for _ in 0..4 {
+                        match chars.next() {
+                            None => return Some(true),
+                            Some(hex) if hex.is_ascii_hexdigit() => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {}
+                Some(_) => return None,
+            },
+            ch if in_string && ch < ' ' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 // serde rejects lone surrogate escapes that V8 permits in JSON strings. Only
@@ -1375,7 +1568,7 @@ pub(super) fn snapshot_response(
             let pending = pending_request();
             state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
             state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
-            state["sessionId"] = json!(session.session_id());
+            state["sessionId"] = json!(session.external_session_id());
             if let Some(name) = session.name() {
                 state["sessionName"] = json!(name);
             }
@@ -1437,6 +1630,7 @@ pub(super) fn snapshot_response(
             native.tokens.total = native.tokens.total.saturating_add(operations.total_tokens);
             native.cost = native.cost.map(|cost| cost + operations.cost.total);
             let mut stats = serde_json::to_value(native)?;
+            stats["sessionId"] = json!(session.external_session_id());
             if operations.measured() {
                 stats["operationUsage"] = serde_json::to_value(operations)?;
             }
@@ -1910,6 +2104,7 @@ fn forward_event(
 ) -> Result<()> {
     let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
+        Some("response") if event["command"] == "get_commands" => emit_command_catalog(event),
         Some("response")
             if matches!(
                 event["command"].as_str(),
@@ -2021,7 +2216,12 @@ fn forward_event(
             }
             if matches!(
                 event["type"].as_str(),
-                Some("text_delta" | "tool_call_delta" | "summary_request_start")
+                Some(
+                    "text_delta"
+                        | "tool_call_delta"
+                        | "summary_request_start"
+                        | "internal_tool_result_metadata"
+                )
             ) {
                 return Ok(());
             }
@@ -2047,6 +2247,99 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
     emit(value)
 }
 
+// The worker sends split UTF-16 units separately because JSON Value and Rust
+// String cannot carry an unpaired surrogate. Only this RPC response uses that
+// trusted sidecar; normal text and literal U+FFFD never act as sentinels.
+fn command_catalog_json(mut event: Value) -> Result<Vec<u8>> {
+    let Some(data) = event.get_mut("data").and_then(Value::as_object_mut) else {
+        return Ok(serde_json::to_vec(&event)?);
+    };
+    let sidecar = data.remove("_pi_rs_prompt_surrogates");
+    let Some(entries) = sidecar.as_ref().and_then(Value::as_array) else {
+        return Ok(serde_json::to_vec(&event)?);
+    };
+    let mut units = std::collections::BTreeMap::new();
+    for entry in entries {
+        if let (Some(index), Some(unit)) = (entry[0].as_u64(), entry[1].as_u64())
+            && (0xd800..=0xdbff).contains(&unit)
+            && let Ok(index) = usize::try_from(index)
+        {
+            units.insert(index, unit as u16);
+        }
+    }
+    fn object<W: Write>(
+        out: &mut W,
+        map: &serde_json::Map<String, Value>,
+        mut special: impl FnMut(&mut W, &str, &Value) -> Result<bool>,
+    ) -> Result<()> {
+        write!(out, "{{")?;
+        for (index, (key, value)) in map.iter().enumerate() {
+            if index > 0 {
+                write!(out, ",")?;
+            }
+            serde_json::to_writer(&mut *out, key)?;
+            write!(out, ":")?;
+            if !special(out, key, value)? {
+                serde_json::to_writer(&mut *out, value)?;
+            }
+        }
+        write!(out, "}}")?;
+        Ok(())
+    }
+    let mut output = Vec::new();
+    if let Some(root) = event.as_object() {
+        object(&mut output, root, |out, key, value| {
+            let Some(data) = (key == "data").then(|| value.as_object()).flatten() else {
+                return Ok(false);
+            };
+            object(out, data, |out, key, value| {
+                let Some(commands) = (key == "commands").then(|| value.as_array()).flatten() else {
+                    return Ok(false);
+                };
+                write!(out, "[")?;
+                for (index, command) in commands.iter().enumerate() {
+                    if index > 0 {
+                        write!(out, ",")?;
+                    }
+                    let unit = units.get(&index).filter(|_| command["source"] == "prompt");
+                    if let (Some(unit), Some(map)) = (unit, command.as_object()) {
+                        object(out, map, |out, key, value| {
+                            let Some(prefix) = (key == "description")
+                                .then(|| value.as_str())
+                                .flatten()
+                                .and_then(|s| s.strip_suffix("�..."))
+                            else {
+                                return Ok(false);
+                            };
+                            let mut quoted = serde_json::to_string(prefix)?;
+                            quoted.pop();
+                            write!(out, "{quoted}\\u{unit:04x}...\"")?;
+                            Ok(true)
+                        })?;
+                    } else {
+                        serde_json::to_writer(&mut *out, command)?;
+                    }
+                }
+                write!(out, "]")?;
+                Ok(true)
+            })?;
+            Ok(true)
+        })?;
+    } else {
+        output = serde_json::to_vec(&event)?;
+    }
+    Ok(output)
+}
+
+fn emit_command_catalog(event: Value) -> Result<()> {
+    let encoded = command_catalog_json(event)?;
+    let mut output = std::io::stdout().lock();
+    output.write_all(&encoded)?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
+}
+
 fn emit(value: Value) -> Result<()> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{value}")?;
@@ -2058,6 +2351,76 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn command_catalog_encodes_only_recorded_surrogates() {
+        let event = json!({"type":"response", "command":"get_commands", "id":"�\\ud83d", "data":{
+            "commands":[
+                {"source":"prompt", "description":"literal �..."},
+                {"source":"prompt", "description":"quote\"\\�prefix�..."},
+                {"source":"prompt", "description":"second �..."},
+                {"source":"extension", "description":"extension �..."}
+            ],
+            "_pi_rs_prompt_surrogates":[[1, 0xd83d], [2, 0xd840], [3, 0xd83d]]
+        }});
+        let output = String::from_utf8(command_catalog_json(event).unwrap()).unwrap();
+        assert!(output.contains(r#""description":"literal �...""#));
+        assert!(output.contains(r#""description":"quote\"\\�prefix\ud83d...""#));
+        assert!(output.contains(r#""description":"second \ud840...""#));
+        assert!(output.contains(r#""description":"extension �...""#));
+        assert!(output.contains(r#""id":"�\\ud83d""#));
+        assert!(!output.contains("_pi_rs_prompt_surrogates"));
+    }
+
+    #[test]
+    fn rpc_session_identity_survives_import_export_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.jsonl");
+        for identity in ["legacy-id", "ID / 日本語", "bad\r\nid"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({"type":"session", "version":3, "id":identity})
+                ),
+            )
+            .unwrap();
+            let imported = super::super::session_import::read(&path).unwrap();
+            let check = |session: &Session, expected: &str| {
+                for command in ["get_state", "get_session_stats"] {
+                    for native in [false, true] {
+                        let result = snapshot_response(
+                            &json!({"type":command,"includeNative":native}),
+                            session,
+                            &path,
+                            None,
+                            json!({}),
+                        )
+                        .unwrap();
+                        assert_eq!(result["sessionId"], expected, "{command}");
+                    }
+                }
+            };
+            check(&imported, identity);
+            assert_eq!(imported.statistics().session_id, imported.session_id());
+            let export = directory.path().join("export.jsonl");
+            imported.export_jsonl(&export).unwrap();
+            let reopened = super::super::session_import::read(&export).unwrap();
+            check(&reopened, identity);
+            let fork =
+                Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+            assert_ne!(fork.session_id(), reopened.session_id());
+            check(&fork, &fork.session_id().to_string());
+            std::fs::remove_file(export).unwrap();
+        }
+        let native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for command in ["get_state", "get_session_stats"] {
+            let result =
+                snapshot_response(&json!({"type":command}), &native, &path, None, json!({}))
+                    .unwrap();
+            assert_eq!(result["sessionId"], native.session_id().to_string());
+        }
+    }
 
     #[cfg(unix)]
     #[test]

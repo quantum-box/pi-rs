@@ -78,7 +78,13 @@ fn fuzzy(text: &str) -> String {
     text.nfkc()
         .collect::<String>()
         .split('\n')
-        .map(|line| line.trim_end_matches(|c: char| c.is_whitespace() || c == '\u{feff}'))
+        // JavaScript trimEnd includes U+FEFF but not U+0085, unlike Rust's
+        // Unicode whitespace predicate. This affects which edits may match.
+        .map(|line| {
+            line.trim_end_matches(|c: char| {
+                (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}'
+            })
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .chars()
@@ -304,6 +310,29 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fuzzy_edits_use_ecmascript_trailing_whitespace() {
+        let arguments = json!({"path":"example","oldText":"alpha\nbeta","newText":"changed"});
+        for text in ["alpha\u{0085}\nbeta", "alpha\u{0085} \nbeta"] {
+            let error = apply(text, &arguments).unwrap_err();
+            assert!(
+                matches!(error, Error::Config(message) if message.starts_with("Could not find the exact text"))
+            );
+        }
+        for whitespace in ["\u{feff}", "\u{00a0}", "\t"] {
+            let input = format!("alpha{whitespace}\nbeta");
+            assert_eq!(apply(&input, &arguments).unwrap().0, "changed");
+        }
+        assert_eq!(
+            apply(
+                "alpha\u{0085}\nbeta",
+                &json!({"oldText":"alpha\u{0085}\nbeta","newText":"changed"})
+            )
+            .unwrap()
+            .0,
+            "changed"
+        );
+    }
     #[test]
     fn multiline_fuzzy_ranges_preserve_repeated_untouched_lines() {
         let source = "keep  \nleft “one”\nmiddle – two  \nright  \nkeep\t\n";

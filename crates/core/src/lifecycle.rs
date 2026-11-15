@@ -334,7 +334,7 @@ pub async fn notify(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) {
-    notify_inner(registry, event, states, timeout, observer, None).await;
+    notify_inner(registry, event, states, timeout, observer, None, None).await;
 }
 
 pub(crate) async fn notify_with_host(
@@ -345,7 +345,7 @@ pub(crate) async fn notify_with_host(
     observer: &mut Observer<'_>,
     host: std::sync::Arc<dyn crate::ToolHost>,
 ) {
-    notify_inner(registry, event, states, timeout, observer, Some(host)).await;
+    notify_inner(registry, event, states, timeout, observer, Some(host), None).await;
 }
 
 pub(crate) async fn notify_idle_with_host(
@@ -366,6 +366,19 @@ pub(crate) async fn notify_session_with_host(
     observer: &mut Observer<'_>,
     idle: bool,
 ) -> crate::Result<()> {
+    notify_session_compaction_with_host(registry, session, event, timeout, observer, idle, None)
+        .await
+}
+
+pub(crate) async fn notify_session_compaction_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    idle: bool,
+    compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
+) -> crate::Result<()> {
     let states = session.extension_states();
     let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
     let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle });
@@ -382,7 +395,15 @@ pub(crate) async fn notify_session_with_host(
         }
     };
     {
-        let future = notify_with_host(registry, event, &states, timeout, &mut collect, host);
+        let future = notify_inner(
+            registry,
+            event,
+            &states,
+            timeout,
+            &mut collect,
+            Some(host),
+            compaction,
+        );
         tokio::pin!(future);
         loop {
             tokio::select! {
@@ -425,6 +446,7 @@ async fn notify_inner(
     timeout: Duration,
     observer: &mut Observer<'_>,
     host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+    compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
     let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
     for extension in registry.extensions.iter().filter(|extension| {
@@ -459,16 +481,25 @@ async fn notify_inner(
                 async {
                     match &host {
                         Some(host) => {
-                            extension
-                                .lifecycle_with_host(
-                                    &event,
-                                    states.get(extension.id()),
-                                    crate::sdk::scope_callback_host(
-                                        host.for_extension(extension.id())
-                                            .unwrap_or_else(|| host.clone()),
-                                    ),
-                                )
-                                .await
+                            let scoped = crate::sdk::scope_callback_host(
+                                host.for_extension(extension.id())
+                                    .unwrap_or_else(|| host.clone()),
+                            );
+                            if let Some((trigger, metadata)) = &compaction {
+                                extension
+                                    .compaction_lifecycle_with_host(
+                                        &event,
+                                        *trigger,
+                                        metadata.as_ref(),
+                                        states.get(extension.id()),
+                                        scoped,
+                                    )
+                                    .await
+                            } else {
+                                extension
+                                    .lifecycle_with_host(&event, states.get(extension.id()), scoped)
+                                    .await
+                            }
                         }
                         None => {
                             extension
@@ -497,6 +528,75 @@ async fn notify_inner(
 mod wire_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn detailed_compaction_callback_receives_trigger_and_committed_metadata() {
+        use std::sync::{Arc, Mutex};
+        struct Hook(Arc<Mutex<Option<serde_json::Value>>>);
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "detailed-compaction"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn compaction_lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                trigger: crate::CompactionTrigger,
+                metadata: Option<&serde_json::Value>,
+                _: Option<&crate::ExtensionState>,
+                _: Arc<dyn crate::ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                *self.0.lock().unwrap() = Some(json!({"trigger":trigger,"metadata":metadata}));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Hook(seen.clone()))).unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let metadata = json!({"details":{"source":"hook"}});
+        let record = session
+            .append_with_record_metadata(
+                crate::Event::Compacted {
+                    summary: "summary".into(),
+                    system_prompt: None,
+                    retain_from: None,
+                    tokens_before: None,
+                    states: Default::default(),
+                    usage: None,
+                    usage_metadata: None,
+                },
+                metadata.clone(),
+            )
+            .unwrap()
+            .clone();
+        notify_session_compaction_with_host(
+            &registry,
+            &mut session,
+            LifecycleEvent::SessionCompact {
+                compaction_entry: Box::new(record),
+                from_extension: true,
+                reason: CompactionReason::Threshold,
+                will_retry: true,
+            },
+            Duration::from_secs(1),
+            &mut |_| {},
+            true,
+            Some((crate::CompactionTrigger::Overflow, Some(metadata.clone()))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(json!({"trigger":"overflow","metadata":metadata}))
+        );
+    }
 
     #[test]
     fn transition_and_lifecycle_fields_use_pi_names() {

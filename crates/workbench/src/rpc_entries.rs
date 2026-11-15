@@ -10,7 +10,7 @@ const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
 pub(super) fn session_header(session: &Session, cwd: &std::path::Path) -> Value {
     json!({
-        "type":"session", "version":3, "id":session.session_id(),
+        "type":"session", "version":3, "id":session.external_session_id(),
         "timestamp":session.records().first().and_then(|record| record.timestamp.as_deref()).unwrap_or(UNKNOWN_TIMESTAMP),
         "cwd":session.working_directory().map_or_else(|| cwd.to_string_lossy().into_owned(), str::to_owned)
     })
@@ -140,7 +140,7 @@ impl Entries {
         let values = session
             .records()
             .iter()
-            .flat_map(|record| cursor.append(session.records(), record, Some(session)))
+            .flat_map(|record| cursor.append(session.records(), record, Some(session), None))
             .collect();
         Self {
             values,
@@ -403,11 +403,11 @@ impl Default for Cursor {
 impl Cursor {
     pub(super) fn advance(&mut self, records: &[Record]) {
         for record in records.iter().skip(self.positions.len() - 1) {
-            self.append(records, record, None);
+            self.append(records, record, None, None);
         }
     }
 
-    pub(super) fn appended(&mut self, records: &[Record]) -> Vec<Value> {
+    pub(super) fn appended(&mut self, records: &[Record], metadata: Option<&Value>) -> Vec<Value> {
         let Some((record, prefix)) = records.split_last() else {
             return Vec::new();
         };
@@ -415,7 +415,7 @@ impl Cursor {
         if record.id as usize != self.positions.len() {
             return Vec::new();
         }
-        self.append(records, record, None)
+        self.append(records, record, None, metadata)
     }
 
     fn append(
@@ -423,6 +423,7 @@ impl Cursor {
         records: &[Record],
         record: &Record,
         session: Option<&Session>,
+        live_metadata: Option<&Value>,
     ) -> Vec<Value> {
         let mut entries = Vec::new();
         self.messages.record(record);
@@ -654,6 +655,16 @@ impl Cursor {
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
                     "tokensBefore":compaction_tokens(records, record, session)
                 });
+                if let Some(metadata) = live_metadata
+                    .or_else(|| session.and_then(|session| session.record_metadata(record.id)))
+                {
+                    if let Some(details) = metadata.get("details") {
+                        entry["details"] = details.clone();
+                    }
+                    if metadata["fromExtension"] == true {
+                        entry["fromHook"] = json!(true);
+                    }
+                }
                 add_summary_usage(&mut entry, records, record);
                 Some(entry)
             }
@@ -844,7 +855,7 @@ pub(super) fn changes(session: &Session, previous: usize) -> Vec<Value> {
     cursor.advance(prefix);
     appended
         .iter()
-        .flat_map(|record| cursor.append(records, record, Some(session)))
+        .flat_map(|record| cursor.append(records, record, Some(session), None))
         .collect()
 }
 
@@ -880,6 +891,75 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_compaction_entry_projects_supplied_metadata() {
+        use super::*;
+        let session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = session.records().to_vec();
+        let id = records.len() as u64 + 1;
+        records.push(Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id,
+            parent: Some(id - 1),
+            event: Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: Some(42),
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        });
+        let mut cursor = Cursor::default();
+        let entries = cursor.appended(
+            &records,
+            Some(&json!({"fromExtension":true,"details":{"origin":"hook"}})),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["fromHook"], true);
+        assert_eq!(entries[0]["details"]["origin"], "hook");
+        for metadata in [
+            json!({"fromExtension":true}),
+            json!({"fromExtension":true,"details":null}),
+        ] {
+            let entries = Cursor::default().appended(&records, Some(&metadata));
+            assert_eq!(entries[0].get("details"), metadata.get("details"));
+        }
+    }
+
+    #[test]
+    fn share_header_preserves_imported_external_id_and_fork_identity() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let identity = "ID / 日本語\r\nlegacy";
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"session", "version":3, "id":identity})
+            ),
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let body = Entries::new(&session)
+            .write_share_branch(&session, dir.path())
+            .unwrap();
+        let first = body.split(|byte| *byte == b'\n').next().unwrap();
+        let header: Value = serde_json::from_slice(first).unwrap();
+        assert_eq!(header["id"], identity);
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        let body = Entries::new(&fork)
+            .write_share_branch(&fork, dir.path())
+            .unwrap();
+        let header: Value =
+            serde_json::from_slice(body.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(header["id"], fork.session_id().to_string());
+    }
+
     #[test]
     fn branch_fallback_projects_selection_and_summary() {
         use super::*;

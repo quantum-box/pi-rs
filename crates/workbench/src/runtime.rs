@@ -257,7 +257,11 @@ impl Runtime {
             }
             commands.push(entry);
         }
+        let mut prompt_surrogates = Vec::new();
         for (name, prompt) in &self.resources.prompts {
+            if let Some(unit) = prompt.fallback_surrogate {
+                prompt_surrogates.push(json!([commands.len(), unit]));
+            }
             commands.push(json!({
                 "name": name,
                 "description": prompt.description,
@@ -273,7 +277,11 @@ impl Runtime {
                 "sourceInfo": ResourceOrigin::source_info(&skill.path, &self.resource_origins.skills).unwrap_or_else(|| source_info(&skill.path, &self.resources.packages.skills)),
             }));
         }
-        json!({"commands":commands})
+        let mut catalog = json!({"commands":commands});
+        if !prompt_surrogates.is_empty() {
+            catalog["_pi_rs_prompt_surrogates"] = json!(prompt_surrogates);
+        }
+        catalog
     }
 
     pub fn agent<'a>(&'a self, args: &'a Cli, session: &Session) -> Agent<'a> {
@@ -325,14 +333,17 @@ impl Runtime {
                 );
             }
         }
-        self.shell.set_context(ShellContext {
-            id: session_id,
-            path: (!args.no_session && !args.ephemeral_worker_session)
-                .then(|| args.session.clone()),
-            provider: args.provider.id().into(),
-            model: args.model.clone(),
-            reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
-        });
+        self.shell.set_context_with_external_id(
+            ShellContext {
+                id: session_id,
+                path: (!args.no_session && !args.ephemeral_worker_session)
+                    .then(|| args.session.clone()),
+                provider: args.provider.id().into(),
+                model: args.model.clone(),
+                reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+            },
+            session.external_session_id(),
+        );
         self.auto_compaction.set_token_settings(
             args.settings
                 .compaction_tokens(args.provider.id(), &args.model),

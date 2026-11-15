@@ -10,6 +10,34 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn repeated_session_id_selects_the_last_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .args([
+            "--session-id",
+            "first",
+            "--session-id",
+            "last",
+            "name",
+            "selected",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sessions.join("first.jsonl").exists());
+    assert!(sessions.join("last.jsonl").is_file());
+}
+
+#[test]
 fn jsonl_session_id_can_be_opened_by_session_and_resume() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -156,6 +184,36 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     std::fs::create_dir_all(prompts.join("nested")).unwrap();
     std::fs::write(prompts.join("nested/deep.md"), "Nested").unwrap();
     std::fs::write(prompts.join("top.md"), "Top level").unwrap();
+    std::fs::write(
+        prompts.join("unicode-space.md"),
+        "---\nother: value\n---\n\u{0085}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-bom.md"),
+        "---\nother: value\n---\n\u{feff}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-cut.md"),
+        format!("{}😀tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-cut.md"),
+        format!("{}�tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-before-cut.md"),
+        format!("{}�😀tail", "x".repeat(58)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("two-boms.md"),
+        "\u{feff}\u{feff}---\ndescription: not frontmatter\n---\nbody",
+    )
+    .unwrap();
     std::fs::write(prompts.join(".hidden.md"), "Hidden").unwrap();
     std::fs::write(prompts.join("ignored.md"), "Ignored").unwrap();
     std::fs::write(prompts.join(".gitignore"), "ignored.md\n").unwrap();
@@ -183,8 +241,11 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
+            // serde_json rejects unpaired surrogate escapes; preserve the raw
+            // wire line for exact assertions and normalize only for inspection.
+            let normalized = line.replace("\\ud83d", "\\ufffd");
             if sender
-                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .send((line, serde_json::from_str::<Value>(&normalized).unwrap()))
                 .is_err()
             {
                 break;
@@ -193,15 +254,31 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     });
     writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
     input.flush().unwrap();
-    let response = loop {
-        let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    let (wire, response) = loop {
+        let (wire, event) = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
         if event["id"] == "commands" {
-            break event;
+            break (wire, event);
         }
     };
+    assert!(wire.contains(&format!("{}\\ud83d...", "x".repeat(59))));
+    assert!(wire.contains(&format!("{}�\\ud83d...", "x".repeat(58))));
+    assert!(wire.contains(&format!("{}�...", "x".repeat(59))));
+    assert!(!wire.contains("_pi_rs_prompt_surrogates"));
     let commands = response["data"]["commands"]
         .as_array()
         .expect("command list");
+    for (name, expected) in [
+        ("unicode-space", "\u{0085}".to_owned()),
+        ("unicode-bom", "visible".to_owned()),
+        ("unicode-cut", format!("{}�...", "x".repeat(59))),
+        ("two-boms", "\u{feff}---".to_owned()),
+    ] {
+        let command = commands
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap();
+        assert_eq!(command["description"], expected, "{name}");
+    }
     let builtin = commands
         .iter()
         .find(|command| command["sourceInfo"]["path"] == "builtin:plan-mode")
@@ -4818,6 +4895,22 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     }
                     headers.push_str(&line.to_ascii_lowercase());
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut origin_headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    origin_headers.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(!origin_headers.contains("proxy-authorization:"));
                 if first.starts_with("GET ") {
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
@@ -4885,10 +4978,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     String::from_utf8_lossy(&stderr)
                 )
             });
-        assert!(
-            request.starts_with("POST http://127.0.0.1:1/"),
-            "{provider}: {request}"
-        );
+        assert!(request.starts_with("POST /"), "{provider}: {request}");
         assert!(
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"
@@ -5001,6 +5091,19 @@ fn model_listing_uses_proxy_before_a_model_request() {
     .unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -5037,12 +5140,7 @@ fn model_listing_uses_proxy_before_a_model_request() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        server
-            .join()
-            .unwrap()
-            .starts_with("GET http://127.0.0.1:1/v1/models ")
-    );
+    assert!(server.join().unwrap().starts_with("GET /v1/models "));
 }
 
 #[test]
@@ -5058,6 +5156,19 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -5096,7 +5207,7 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new-token");
     let (request, body) = server.join().unwrap();
-    assert!(request.starts_with("POST http://127.0.0.1:1/v1/oauth/token "));
+    assert!(request.starts_with("POST /v1/oauth/token "));
     assert!(
         String::from_utf8(body)
             .unwrap()
@@ -5117,6 +5228,19 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut headers = String::new();
         loop {
             let mut line = String::new();
@@ -5153,10 +5277,7 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
             String::from_utf8_lossy(&output.stderr)
         )
     });
-    assert!(
-        request.starts_with("POST http://127.0.0.1:1/mcp "),
-        "{request}"
-    );
+    assert!(request.starts_with("POST /mcp "), "{request}");
     assert!(
         headers.contains("authorization: bearer fixture-token"),
         "{headers}"
@@ -7139,4 +7260,182 @@ fn bedrock_uses_configured_provider_and_model_headers() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("route-secret"));
+}
+
+#[tokio::test]
+async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as AsyncListener;
+    use tokio::process::Command as AsyncCommand;
+
+    async fn headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: tokio::time::Instant,
+    ) -> (String, usize) {
+        tokio::time::timeout_at(deadline, async {
+            let mut first = String::new();
+            assert_ne!(
+                reader.read_line(&mut first).await.unwrap(),
+                0,
+                "missing request line"
+            );
+            let mut total = first.len();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader.read_line(&mut line).await.unwrap(),
+                    0,
+                    "incomplete request headers"
+                );
+                total += line.len();
+                assert!(total <= 64 * 1024, "headers too large");
+                if line == "\r\n" {
+                    break;
+                }
+                assert!(
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                );
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(length <= 64 * 1024, "body too large");
+            (first, length)
+        })
+        .await
+        .expect("fixture header deadline")
+    }
+
+    for (bypass, explicit_metadata) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let base = format!("http://{origin_addr}");
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpProxy":format!("http://localhost:{proxy_port}")}).to_string(),
+        )
+        .unwrap();
+        let mut oauth = json!({"clientRegistration":"dcr"});
+        if explicit_metadata {
+            oauth["authServerMetadataUrl"] = json!(format!("{base}/metadata"));
+        }
+        std::fs::write(
+            root.path().join("mcp.json"),
+            json!({"mcpServers":{"fixture":{"url":format!("{base}/mcp"),"oauth":oauth}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (selected, unused) = if bypass {
+            (origin, proxy)
+        } else {
+            (proxy, origin)
+        };
+        let server_base = base.clone();
+        // Share one deadline with the subprocess, including startup and discovery.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let Ok(Ok((socket, _))) =
+                    tokio::time::timeout_at(deadline, selected.accept()).await
+                else {
+                    break;
+                };
+                let mut socket = tokio::io::BufReader::new(socket);
+                let (mut first, mut length) = headers(&mut socket, deadline).await;
+                if !bypass {
+                    assert_eq!(first, format!("CONNECT {origin_addr} HTTP/1.1\r\n"));
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    (first, length) = headers(&mut socket, deadline).await;
+                }
+                let mut body = vec![0; length];
+                tokio::time::timeout_at(
+                    deadline,
+                    tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body),
+                )
+                .await
+                .expect("fixture body deadline")
+                .unwrap();
+                let registration = first.starts_with("POST /register ");
+                let metadata = first.starts_with("GET /metadata ")
+                    || first.contains("/.well-known/oauth-authorization-server")
+                    || first.contains("/.well-known/openid-configuration");
+                let issuer = if first.contains("oauth-authorization-server/mcp") {
+                    format!("{server_base}/mcp")
+                } else {
+                    server_base.clone()
+                };
+                requests.push(first);
+                let (status, body) = if metadata {
+                    ("200 OK", json!({"issuer":issuer,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if registration {
+                    ("400 Bad Request", "{}".to_owned())
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                if registration {
+                    break;
+                }
+            }
+            requests
+        });
+        let mut command = AsyncCommand::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("NO_PROXY")
+            .env("no_proxy", if bypass { "127.0.0.1" } else { "" })
+            .args(["mcp", "login", "fixture"])
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout_at(deadline, command.output())
+            .await
+            .expect("login exceeded fixture deadline")
+            .unwrap();
+        assert!(!output.status.success(), "fixture rejects registration");
+        let requests = tokio::time::timeout_at(deadline + Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests.iter().any(|line| if explicit_metadata {
+                line.starts_with("GET /metadata ")
+            } else {
+                line.starts_with("GET /.well-known/")
+            }),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            requests
+                .last()
+                .is_some_and(|line| line.starts_with("POST /register ")),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unused.accept())
+                .await
+                .is_err(),
+            "unexpected route"
+        );
+    }
 }

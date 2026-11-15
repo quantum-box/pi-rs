@@ -160,6 +160,56 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_signatures_and_malformed_bmp_are_cli_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut invalid_bmp = vec![0; 30];
+        invalid_bmp[..2].copy_from_slice(b"BM");
+        invalid_bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        invalid_bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        invalid_bmp[26..28].copy_from_slice(&2u16.to_le_bytes());
+        invalid_bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for (name, bytes) in [
+            ("jpeg-ls.jpg", b"\xff\xd8\xff\xf7binary".as_slice()),
+            ("tiff.tif", b"II*\0not-supported".as_slice()),
+            ("broken.bmp", invalid_bmp.as_slice()),
+        ] {
+            std::fs::write(directory.path().join(name), bytes).unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{name}: {text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
+    fn supported_signatures_are_processed_without_filename_hints() {
+        let directory = tempfile::tempdir().unwrap();
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+            image::ImageFormat::Bmp,
+        ] {
+            let path = directory.path().join(format!("{format:?}.data"));
+            image::RgbImage::from_pixel(2, 2, image::Rgb([200, 100, 20]))
+                .save_with_format(&path, format)
+                .unwrap();
+            let (text, images) = expand(
+                &[format!("@{}", path.display())],
+                directory.path(),
+                true,
+                None,
+            )
+            .unwrap();
+            assert_eq!(images.len(), 1, "{format:?}: {text}");
+        }
+    }
+
+    #[test]
     fn malformed_text_still_obeys_aggregate_input_limit() {
         let directory = tempfile::tempdir().unwrap();
         let mut bytes = vec![b'a'; 8 * 1024 * 1024];

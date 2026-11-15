@@ -65,55 +65,14 @@ fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Re
         });
     }
     if value.starts_with("file://") {
-        let url = reqwest::Url::parse(value).map_err(|error| Error::Config(error.to_string()))?;
-        validate_file_url_path(url.path(), cfg!(windows))?;
-        return url
-            .to_file_path()
-            .map_err(|_| Error::Config("invalid file URL".into()));
+        return pi_rs_file_url::to_file_path(value).map_err(Error::Config);
     }
     Ok(PathBuf::from(value))
 }
 
-// Node's fileURLToPath rejects encoded separators before decoding, and its
-// decodeURIComponent rejects malformed escapes and invalid UTF-8. Checking the
-// URL path rather than the whole URL leaves query and fragment semantics intact.
+#[cfg(test)]
 fn validate_file_url_path(path: &str, windows: bool) -> Result<()> {
-    let input = path.as_bytes();
-    let escape = |index: usize| -> Option<u8> {
-        let digit = |byte: u8| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        };
-        Some(digit(*input.get(index + 1)?)? * 16 + digit(*input.get(index + 2)?)?)
-    };
-    for (index, &character) in input.iter().enumerate() {
-        if character == b'%'
-            && let Some(byte) = escape(index)
-            && (byte == b'/' || (windows && byte == b'\\'))
-        {
-            let message = if windows {
-                "File URL path must not include encoded \\ or / characters"
-            } else {
-                "File URL path must not include encoded / characters"
-            };
-            return Err(Error::Config(message.into()));
-        }
-    }
-    let mut decoded = Vec::with_capacity(input.len());
-    let mut index = 0;
-    while index < input.len() {
-        if input[index] == b'%' {
-            decoded.push(escape(index).ok_or_else(|| Error::Config("URI malformed".into()))?);
-            index += 3;
-        } else {
-            decoded.push(input[index]);
-            index += 1;
-        }
-    }
-    std::str::from_utf8(&decoded).map_err(|_| Error::Config("URI malformed".into()))?;
-    Ok(())
+    pi_rs_file_url::validate_path(path, windows).map_err(Error::Config)
 }
 
 pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
@@ -177,13 +136,21 @@ pub(super) fn read_variant(path: PathBuf) -> PathBuf {
 
 #[cfg(any(windows, test))]
 fn windows_shell_path(value: &str) -> String {
-    if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
+    if !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains(['\\', '\n', '\r', '\u{2028}', '\u{2029}'])
+    {
         return value.into();
     }
-    let drive = value
-        .strip_prefix("/mnt/")
-        .or_else(|| value.strip_prefix("/cygdrive/"))
-        .unwrap_or(&value[1..]);
+    let path = &value[1..];
+    let drive = ["mnt/", "cygdrive/"]
+        .into_iter()
+        .find_map(|prefix| {
+            path.get(..prefix.len())
+                .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                .map(|_| &path[prefix.len()..])
+        })
+        .unwrap_or(path);
     let bytes = drive.as_bytes();
     if bytes.first().is_some_and(u8::is_ascii_alphabetic)
         && (bytes.len() == 1 || bytes.get(1) == Some(&b'/'))
@@ -227,6 +194,19 @@ mod tests {
         }
         assert!(validate_file_url_path("/tmp/a%20b/%E6%97%A5", false).is_ok());
         assert!(validate_file_url_path("/tmp/a%252Fb", false).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_url_decodes_idn_unc_host() {
+        assert_eq!(
+            input("file://xn--n3h/share/a%20b", None).unwrap(),
+            PathBuf::from(r"\\☃\share\a b")
+        );
+        assert_eq!(
+            input("file:///C:/hello", None).unwrap(),
+            PathBuf::from(r"C:\hello")
+        );
     }
 
     #[test]
@@ -291,14 +271,37 @@ mod tests {
         for (input, expected) in [
             ("/c/Users/name", "C:\\Users\\name"),
             ("/mnt/d/file", "D:\\file"),
+            ("/MNT/c/Work/a", "C:\\Work\\a"),
+            ("/MNT/z", "Z:\\"),
             ("/cygdrive/e/folder/file", "E:\\folder\\file"),
+            ("/CyGdRiVe/d/file", "D:\\file"),
             ("/c", "C:\\"),
             ("//host/share", "//host/share"),
             ("/usr/share", "/usr/share"),
+            ("/mnt/case/foo", "/mnt/case/foo"),
+            ("/MNT/c/a\\b", "/MNT/c/a\\b"),
+            ("/MNT/c/a\nb", "/MNT/c/a\nb"),
+            ("/MNT/c/a\rb", "/MNT/c/a\rb"),
+            ("/CyGdRiVe/d/a\u{2028}b", "/CyGdRiVe/d/a\u{2028}b"),
+            ("/CyGdRiVe/d/a\u{2029}b", "/CyGdRiVe/d/a\u{2029}b"),
+            ("/é/c", "/é/c"),
             ("/c/mixed\\path", "/c/mixed\\path"),
         ] {
             assert_eq!(windows_shell_path(input), expected);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_tool_input_normalizes_mixed_case_shell_prefixes() {
+        assert_eq!(
+            input("@/MnT/c/notes\u{202f}file.txt", None).unwrap(),
+            Path::new("C:\\notes file.txt")
+        );
+        assert_eq!(
+            input("/CYGDRIVE/d/notes.txt", None).unwrap(),
+            Path::new("D:\\notes.txt")
+        );
     }
 
     #[test]

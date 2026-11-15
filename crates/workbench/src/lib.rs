@@ -15,6 +15,7 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: u64 = 64 * 1024;
 const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
+mod cli_attachment_sniff;
 pub mod coding;
 pub mod coding_factories;
 mod coding_paths;

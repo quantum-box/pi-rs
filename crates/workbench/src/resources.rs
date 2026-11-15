@@ -16,6 +16,8 @@ pub struct Prompt {
     pub path: PathBuf,
     pub body: String,
     pub description: String,
+    pub argument_hint: Option<String>,
+    pub(super) fallback_surrogate: Option<u16>,
 }
 #[derive(Clone, Default)]
 pub struct Resources {
@@ -47,6 +49,7 @@ struct ResourceCollision {
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
+    argument_hint: Option<String>,
     manual: bool,
 }
 impl Resources {
@@ -563,7 +566,7 @@ fn validate_skill(name: &str, skill: &Skill, warnings: &mut Vec<String>) {
 }
 
 fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String, Skill)>> {
-    let text = match read(path) {
+    let text = match read_resource(path) {
         Ok(text) => text,
         Err(error) => {
             warnings.push(format!("{}: {error}", path.display()));
@@ -596,18 +599,27 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 }
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
-    let (metadata, body) = frontmatter(&read(path)?)?;
+    let (metadata, body) = frontmatter_with_trim(&read_resource(path)?, true)?;
+    let mut fallback_surrogate = None;
     let description = metadata
         .description
         .filter(|description| !description.is_empty())
         .unwrap_or_else(|| {
             let first = body
                 .lines()
-                .find(|line| !line.trim().is_empty())
+                .find(|line| !line.trim_matches(is_prompt_space).is_empty())
                 .unwrap_or_default();
-            let mut characters = first.chars();
-            let mut description: String = characters.by_ref().take(60).collect();
-            if characters.next().is_some() {
+            // Pi's String.slice and length count UTF-16 code units. A slice
+            // through a surrogate pair is encoded as a replacement character
+            // when displayed as UTF-8.
+            let mut units = first.encode_utf16();
+            let prefix: Vec<_> = units.by_ref().take(60).collect();
+            let mut description = String::from_utf16_lossy(&prefix);
+            if units.next().is_some() {
+                fallback_surrogate = prefix
+                    .last()
+                    .copied()
+                    .filter(|unit| (0xd800..=0xdbff).contains(unit));
                 description.push_str("...");
             }
             description
@@ -615,15 +627,23 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
     Ok(Prompt {
         path: path.to_owned(),
         description,
+        fallback_surrogate,
+        argument_hint: metadata.argument_hint.filter(|hint| !hint.is_empty()),
         body,
     })
 }
 
 fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
-    let normalized = text
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    frontmatter_with_trim(text, false)
+}
+
+fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, String)> {
+    let text = if prompt {
+        text.strip_prefix('\u{feff}').unwrap_or(text)
+    } else {
+        text.trim_start_matches('\u{feff}')
+    };
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let Some(end) = normalized
         .strip_prefix("---")
         .and_then(|rest| rest.find("\n---"))
@@ -643,12 +663,25 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
             .get("description")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
+        argument_hint: value
+            .get("argument-hint")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         manual: value
             .get("disable-model-invocation")
             .and_then(|v| v.as_bool())
             == Some(true),
     };
-    Ok((metadata, normalized[end + 4..].trim().into()))
+    let body = &normalized[end + 4..];
+    Ok((
+        metadata,
+        if prompt {
+            body.trim_matches(is_prompt_space)
+        } else {
+            body.trim()
+        }
+        .into(),
+    ))
 }
 fn context_file(
     directory: &Path,
@@ -718,6 +751,11 @@ fn read_without_bom(path: &Path) -> Result<String> {
     let bytes = read_bytes(path)?;
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+// Pi reads skill and prompt files as UTF-8 text, replacing malformed byte
+// sequences. Keep the BOM for the frontmatter parser to handle exactly once.
+fn read_resource(path: &Path) -> Result<String> {
+    Ok(String::from_utf8_lossy(&read_bytes(path)?).into_owned())
 }
 fn read(path: &Path) -> Result<String> {
     String::from_utf8(read_bytes(path)?)
@@ -1482,6 +1520,63 @@ mod tests {
     }
 
     #[test]
+    fn skill_and_prompt_resources_decode_malformed_utf8_without_changing_files() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let skill_path = directory.path().join("skills/fixture/SKILL.md");
+        let prompt_path = directory.path().join("review.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        let skill_bytes =
+            b"---\nname: fixture\ndescription: Skill \xff\n---\nSkill body \xe2\x82\n";
+        let prompt_bytes = b"---\ndescription: Review \xff\n---\nPrompt body \xe2\x82 $1\n";
+        std::fs::write(&skill_path, skill_bytes).unwrap();
+        std::fs::write(&prompt_path, prompt_bytes).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--skill",
+            skill_path.to_str().unwrap(),
+            "--prompt-template",
+            prompt_path.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["fixture"].description, "Skill �");
+        assert_eq!(resources.prompts["review"].description, "Review �");
+        assert_eq!(
+            resources.expand("/review test").as_deref(),
+            Some("Prompt body � test")
+        );
+        assert!(
+            resources
+                .expand("/skill:fixture")
+                .unwrap()
+                .contains("Skill body �")
+        );
+        assert_eq!(std::fs::read(&skill_path).unwrap(), skill_bytes);
+        assert_eq!(std::fs::read(&prompt_path).unwrap(), prompt_bytes);
+    }
+
+    #[test]
+    fn malformed_utf8_resources_still_obey_the_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_path = directory.path().join("SKILL.md");
+        let prompt_path = directory.path().join("review.md");
+        let bytes = vec![0xff; 64 * 1024 + 1];
+        std::fs::write(&skill_path, &bytes).unwrap();
+        std::fs::write(&prompt_path, &bytes).unwrap();
+        assert!(parse_prompt(&prompt_path).is_err());
+        let mut warnings = Vec::new();
+        assert!(parse_skill(&skill_path, &mut warnings).unwrap().is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("exceeds resource size limit"))
+        );
+    }
+
+    #[test]
     fn disabled_discovery_keeps_explicit_resource_paths() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
@@ -1580,6 +1675,68 @@ mod tests {
         );
     }
     #[test]
+    fn prompt_argument_hint_uses_nonempty_string_frontmatter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (yaml, expected) in [
+            ("argument-hint: '<path> [focus]'", Some("<path> [focus]")),
+            ("argument-hint: ''", None),
+            ("argument-hint: 42", None),
+            ("other: value", None),
+        ] {
+            std::fs::write(&path, format!("---\n{yaml}\n---\nReview $1")).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.argument_hint.as_deref(), expected);
+            assert_eq!(prompt.body, "Review $1");
+        }
+    }
+
+    #[test]
+    fn prompt_fallback_description_matches_ecmascript_whitespace_and_utf16() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (body, expected) in [
+            (" \u{feff}\nvisible", "visible".to_owned()),
+            ("\u{0085}\nvisible", "\u{0085}".to_owned()),
+            (
+                "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀x",
+                format!("{}...", "😀".repeat(30)),
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.description, expected);
+            assert_eq!(prompt.body, body);
+        }
+        let body = format!("{}😀tail", "x".repeat(59));
+        std::fs::write(&path, &body).unwrap();
+        let prompt = parse_prompt(&path).unwrap();
+        assert_eq!(prompt.description, format!("{}�...", "x".repeat(59)));
+        assert_eq!(prompt.body, body);
+        std::fs::write(&path, format!("---\ndescription: explicit\n---\n{body}")).unwrap();
+        assert_eq!(parse_prompt(&path).unwrap().description, "explicit");
+    }
+
+    #[test]
+    fn prompt_fallback_preserves_only_actually_split_surrogates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (body, expected) in [
+            (format!("{}😀tail", "x".repeat(59)), Some(0xd83d)),
+            (format!("{}𠀀tail", "x".repeat(59)), Some(0xd840)),
+            (format!("{}�tail", "x".repeat(59)), None),
+            (format!("{}tail", "😀".repeat(30)), None),
+            (
+                format!("---\ndescription: explicit �...\n---\n{}😀", "x".repeat(59)),
+                None,
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(parse_prompt(&path).unwrap().fallback_surrogate, expected);
+        }
+    }
+
+    #[test]
     fn frontmatter_reads_multiline_yaml_without_exposing_it_as_prompt() {
         let (metadata, body) = frontmatter(
             "---\nname: test\ndescription: >\n  first line\n  second line\n---\nInstructions",
@@ -1590,6 +1747,61 @@ mod tests {
             Some("first line second line\n")
         );
         assert_eq!(body, "Instructions");
+    }
+
+    #[test]
+    fn prompt_frontmatter_body_uses_ecmascript_trim_without_changing_skill_trim() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (input, body, description) in [
+            (
+                "---\nother: value\n---\n\u{0085}\nvisible\n\u{0085}",
+                "\u{0085}\nvisible\n\u{0085}",
+                "\u{0085}",
+            ),
+            (
+                "---\nother: value\n---\n\u{feff}\nvisible\n\u{feff}",
+                "visible",
+                "visible",
+            ),
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.body, body);
+            assert_eq!(prompt.description, description);
+        }
+        assert_eq!(
+            frontmatter("---\nother: value\n---\n\u{0085}body\u{0085}")
+                .unwrap()
+                .1,
+            "body"
+        );
+    }
+
+    #[test]
+    fn prompt_frontmatter_strips_only_one_leading_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.md");
+        for (input, body, description) in [
+            ("\u{feff}\u{feff}", "\u{feff}", ""),
+            (
+                "\u{feff}---\ndescription: explicit\n---\nbody",
+                "body",
+                "explicit",
+            ),
+            (
+                "\u{feff}\u{feff}---\ndescription: explicit\n---\nbody",
+                "\u{feff}---\ndescription: explicit\n---\nbody",
+                "\u{feff}---",
+            ),
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let prompt = parse_prompt(&path).unwrap();
+            assert_eq!(prompt.body, body);
+            assert_eq!(prompt.description, description);
+        }
+        // Keep existing non-prompt callers' BOM behavior.
+        assert_eq!(frontmatter("\u{feff}\u{feff}body").unwrap().1, "body");
     }
 
     #[test]

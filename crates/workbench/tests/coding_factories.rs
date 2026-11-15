@@ -140,6 +140,12 @@ async fn failed_image_preparation_returns_an_omission_note() {
         let outcome = tool.invoke(json!({"path":"broken.gif"}), context()).await;
         assert!(matches!(outcome, Outcome::Structured { ref data, .. }
             if data["content"] == json!([{"type":"text", "text":"Read image file [image/gif]\n[Image omitted: could not be resized below the inline image size limit.]"}])));
+        assert_eq!(
+            tool.event_structured_content(&outcome),
+            Some(json!(
+                "Read image file [image/gif]\n[Image omitted: could not be resized below the inline image size limit.]"
+            ))
+        );
         let result = tool
             .invoke_programmatic(
                 json!({"path":"broken.gif"}),
@@ -758,4 +764,775 @@ async fn factory_registers_with_owned_sdk_session() {
     assert_eq!(requests[0].tools.len(), 4);
     assert!(requests[0].tools.iter().all(|spec| spec.name != "write"));
     assert!(requests[1].messages.iter().any(|message| matches!(message, pi_rs::Message::Tool { content, is_error: false, .. } if content.contains("sdk fixture"))));
+}
+
+#[derive(Default)]
+struct ObserveReadOutcome(Mutex<Vec<Outcome>>);
+
+#[async_trait::async_trait]
+impl Extension for ObserveReadOutcome {
+    fn id(&self) -> &str {
+        "read-outcome-observer"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        if call.name == "read" {
+            self.0.lock().unwrap().push(outcome.clone());
+        }
+        Ok(None)
+    }
+    fn after_tool(
+        &self,
+        name: &str,
+        outcome: &Outcome,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ExtensionState>> {
+        if name == "read" {
+            self.0.lock().unwrap().push(outcome.clone());
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn sdk_read_outcomes_remain_compatible_in_hooks_and_observers() {
+    for truncated in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let text = if truncated {
+            "x".repeat(51_201)
+        } else {
+            "sdk fixture".into()
+        };
+        std::fs::write(directory.path().join("note.txt"), text).unwrap();
+        let hook = Arc::new(ObserveReadOutcome::default());
+        let mut session = pi_rs::SessionBuilder::new(Arc::new(Script::default()), "fixture")
+            .extension(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+            .unwrap()
+            .extension(hook.clone())
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let mut events = session.subscribe();
+        assert_eq!(session.prompt("read it").await.unwrap(), "done");
+        let values = hook.0.lock().unwrap().clone();
+        assert_eq!(values.len(), 2);
+        if truncated {
+            assert!(
+                matches!(&values[0], Outcome::SucceededWithDetails { output, details } if output.contains("exceeds 50.0KB") && details["truncation"]["firstLineExceedsLimit"] == true)
+            );
+        } else {
+            assert_eq!(values[0], Outcome::Succeeded("sdk fixture".into()));
+        }
+        assert_eq!(values[0], values[1]);
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let pi_rs::SessionEvent::Record(record) = event
+                && let pi_rs::Event::ToolFinished { outcome, .. } = &record.event
+            {
+                outcomes.push(outcome.clone());
+            }
+        }
+        assert_eq!(outcomes, vec![values[0].clone()]);
+    }
+}
+
+struct ReplaceReadOutcome(bool);
+#[async_trait::async_trait]
+impl Extension for ReplaceReadOutcome {
+    fn id(&self) -> &str {
+        "replace-read-outcome"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        if call.name == "read" {
+            assert!(matches!(outcome, Outcome::Succeeded(text) if text == "sdk fixture"));
+            return Ok(Some(Outcome::Succeeded(
+                if self.0 { "sdk fixture" } else { "replacement" }.into(),
+            )));
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn read_event_metadata_tracks_outcome_without_leaking_stale_content() {
+    for replace in [None, Some(false), Some(true)] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "sdk fixture").unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+            .unwrap();
+        if let Some(same) = replace {
+            registry
+                .register(Arc::new(ReplaceReadOutcome(same)))
+                .unwrap();
+        } else {
+            registry
+                .register(Arc::new(ObserveReadOutcome::default()))
+                .unwrap();
+        }
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut metadata = Vec::new();
+        let mut committed = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        if let Some(value) = pi_rs::tool_result_event_metadata(*operation_id) {
+                            metadata.push((*operation_id, value));
+                        }
+                        committed.push((*operation_id, outcome.clone()));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let expected = if replace == Some(false) {
+            "replacement"
+        } else {
+            "sdk fixture"
+        };
+        assert_eq!(committed.len(), 1);
+        assert!(pi_rs::tool_result_event_metadata(committed[0].0).is_none());
+        assert_eq!(committed[0].1, Outcome::Succeeded(expected.into()));
+        if replace.is_some() {
+            assert!(metadata.is_empty());
+        } else {
+            assert_eq!(metadata, vec![(committed[0].0, json!("sdk fixture"))]);
+        }
+    }
+}
+
+struct ReadPartialPatch {
+    output: bool,
+    mark_error: bool,
+}
+#[async_trait::async_trait]
+impl Extension for ReadPartialPatch {
+    fn id(&self) -> &str {
+        "read-partial-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        if call.name != "read" {
+            return Ok(None);
+        }
+        tokio::task::yield_now().await;
+        assert!(matches!(outcome, Outcome::Succeeded(text) if text == "sdk fixture"));
+        Ok(Some(pi_rs::ToolResultPatchV2 {
+            output: self.output.then(|| "sdk fixture".into()),
+            details: Some(json!({"patched":true})),
+            is_error: self.mark_error.then_some(true),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn metadata_only_read_patch_preserves_structured_value() {
+    for (replaces_output, mark_error) in [(false, false), (true, false), (false, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "sdk fixture").unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+            .unwrap();
+        registry
+            .register(Arc::new(ReadPartialPatch {
+                output: replaces_output,
+                mark_error,
+            }))
+            .unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut metadata = Vec::new();
+        let mut outcomes = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        metadata.push(pi_rs::tool_result_event_metadata(*operation_id));
+                        outcomes.push(outcome.clone());
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        if mark_error {
+            assert!(
+                matches!(&outcomes[0], Outcome::TextResult { output, details: Some(details), is_error: true } if output == "sdk fixture" && details["patched"] == true)
+            );
+        } else {
+            assert!(
+                matches!(&outcomes[0], Outcome::SucceededWithDetails { output, details } if output == "sdk fixture" && details["patched"] == true)
+            );
+        }
+        assert_eq!(
+            metadata,
+            vec![if replaces_output {
+                None
+            } else {
+                Some(json!("sdk fixture"))
+            }]
+        );
+    }
+}
+
+struct WrappedReadPatch;
+#[async_trait::async_trait]
+impl Extension for WrappedReadPatch {
+    fn id(&self) -> &str {
+        "wrapped-read-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        _: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        Ok((call.name == "read").then(|| pi_rs::ToolResultPatchV2 {
+            output: None,
+            details: Some(json!({"patched":true})),
+            is_error: None,
+        }))
+    }
+    async fn tool_result_update_with_host(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        _: Arc<dyn pi_rs::ToolHost>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        let _ = self
+            .tool_result_update(call, outcome, context, state)
+            .await?;
+        Ok((call.name == "read").then(|| Outcome::Succeeded("sdk fixture".into())))
+    }
+}
+
+#[tokio::test]
+async fn opaque_host_override_does_not_reuse_patch_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("note.txt"), "sdk fixture").unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(create_read_only_tools(directory.path()).unwrap()))
+        .unwrap();
+    registry.register(Arc::new(WrappedReadPatch)).unwrap();
+    let model = Script::default();
+    let agent = pi_rs::Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: pi_rs::Limits::default(),
+    };
+    let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut metadata = Vec::new();
+    agent
+        .run(
+            &mut session,
+            Some("read".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if let pi_rs::Notification::Committed(record) = event
+                    && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
+                {
+                    metadata.push(pi_rs::tool_result_event_metadata(*operation_id));
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata, vec![None]);
+}
+
+struct PresenceAwareReadHook {
+    replaced: bool,
+    changed: bool,
+}
+#[async_trait::async_trait]
+impl Extension for PresenceAwareReadHook {
+    fn id(&self) -> &str {
+        "presence-aware-read-hook"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_update_with_presence(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        host: Option<Arc<dyn pi_rs::ToolHost>>,
+    ) -> pi_rs::ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        assert!(host.is_some());
+        if call.name != "read" {
+            return Ok((None, None));
+        }
+        assert!(matches!(outcome, Outcome::Succeeded(text) if text == "sdk fixture"));
+        Ok((
+            Some(Outcome::SucceededWithDetails {
+                output: if self.changed {
+                    "changed"
+                } else {
+                    "sdk fixture"
+                }
+                .into(),
+                details: json!({"patched": true}),
+            }),
+            Some(!self.replaced),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn host_hook_with_explicit_output_presence_preserves_or_clears_metadata() {
+    for (replaced, changed) in [(false, false), (true, false), (false, true)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "sdk fixture").unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+            .unwrap();
+        registry
+            .register(Arc::new(PresenceAwareReadHook { replaced, changed }))
+            .unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut metadata = Vec::new();
+        agent.run(&mut session, Some("read".into()), &mut inputs, &CancellationToken::new(), &mut |event| {
+            if let pi_rs::Notification::Committed(record) = event
+                && let pi_rs::Event::ToolFinished { operation_id, outcome, .. } = &record.event {
+                assert!(matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["patched"] == true));
+                metadata.push(pi_rs::tool_result_event_metadata(*operation_id));
+            }
+        }).await.unwrap();
+        assert_eq!(
+            metadata,
+            vec![if replaced || changed {
+                None
+            } else {
+                Some(json!("sdk fixture"))
+            }]
+        );
+    }
+}
+
+#[tokio::test]
+async fn image_read_structured_metadata_preserves_original_outcome_and_note() {
+    let root = tempfile::tempdir().unwrap();
+    let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+    image
+        .save_with_format(root.path().join("note.txt"), image::ImageFormat::Png)
+        .unwrap();
+    for scoped in [false, true] {
+        let tools = if scoped {
+            CodingTools::new(root.path()).unwrap()
+        } else {
+            CodingTools::local(root.path()).unwrap()
+        };
+        let mut registry = Registry::default();
+        registry.register(Arc::new(tools)).unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut recorded = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read image".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        recorded.push((
+                            outcome.clone(),
+                            pi_rs::tool_result_event_metadata(*operation_id),
+                        ));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let [(Outcome::Structured { data, attachments }, Some(structured))] = recorded.as_slice()
+        else {
+            panic!("expected native image outcome with transient structured metadata")
+        };
+        assert!(attachments.is_empty());
+        let content = data["content"].as_array().unwrap();
+        assert_eq!(structured["type"], "image");
+        assert_eq!(structured["data"], content[1]["data"]);
+        assert_eq!(structured["mimeType"], content[1]["mimeType"]);
+        assert_eq!(structured["note"], content[0]["text"]);
+        assert!(structured["note"].as_str().unwrap().contains("image"));
+    }
+}
+
+struct RedactImageRead;
+#[async_trait::async_trait]
+impl Extension for RedactImageRead {
+    fn id(&self) -> &str {
+        "redact-image-read"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<Outcome>> {
+        if call.name == "read" {
+            assert!(matches!(outcome, Outcome::Structured { .. }));
+            Ok(Some(Outcome::Succeeded("redacted".into())))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn replaced_image_read_never_emits_stale_image_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+        .save_with_format(root.path().join("note.txt"), image::ImageFormat::Png)
+        .unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+        .unwrap();
+    registry.register(Arc::new(RedactImageRead)).unwrap();
+    let model = Script::default();
+    let agent = pi_rs::Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: pi_rs::Limits::default(),
+    };
+    let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut outcomes = Vec::new();
+    agent
+        .run(
+            &mut session,
+            Some("read image".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if let pi_rs::Notification::Committed(record) = event
+                    && let pi_rs::Event::ToolFinished {
+                        operation_id,
+                        outcome,
+                        ..
+                    } = &record.event
+                {
+                    outcomes.push((
+                        outcome.clone(),
+                        pi_rs::tool_result_event_metadata(*operation_id),
+                    ));
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcomes,
+        vec![(Outcome::Succeeded("redacted".into()), None)]
+    );
+}
+
+struct ImageMetadataPatch(u8);
+#[async_trait::async_trait]
+impl Extension for ImageMetadataPatch {
+    fn id(&self) -> &str {
+        "image-metadata-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        if call.name != "read" {
+            return Ok(None);
+        }
+        assert!(
+            matches!(outcome, Outcome::Structured { data, .. } if data["content"][1]["type"] == "image")
+        );
+        Ok(Some(pi_rs::ToolResultPatchV2 {
+            output: match self.0 {
+                2 => Some("replacement".into()),
+                3 => match outcome {
+                    Outcome::Structured { data, .. } => {
+                        data["content"][0]["text"].as_str().map(str::to_owned)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            details: Some(json!({"patched":true})),
+            is_error: (self.0 == 1).then_some(true),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn image_read_metadata_only_patches_preserve_content_and_structured_value() {
+    for mode in 0..4 {
+        let root = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(root.path().join("note.txt"), image::ImageFormat::Png)
+            .unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+            .unwrap();
+        registry
+            .register(Arc::new(ImageMetadataPatch(mode)))
+            .unwrap();
+        let model = Script::default();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut recorded = Vec::new();
+        agent
+            .run(
+                &mut session,
+                Some("read image".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs::Notification::Committed(record) = event
+                        && let pi_rs::Event::ToolFinished {
+                            operation_id,
+                            outcome,
+                            ..
+                        } = &record.event
+                    {
+                        recorded.push((
+                            outcome.clone(),
+                            pi_rs::tool_result_event_metadata(*operation_id),
+                        ));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded.len(), 1);
+        if mode >= 2 {
+            assert!(
+                matches!(&recorded[0], (Outcome::TextResult { output, details: Some(details), is_error: false }, None) if (if mode == 2 { output == "replacement" } else { output.contains("image") }) && details["patched"] == true)
+            );
+        } else {
+            let (
+                Outcome::StructuredWithDetails {
+                    data,
+                    attachments,
+                    details,
+                },
+                Some(structured),
+            ) = &recorded[0]
+            else {
+                panic!("structured outcome or metadata lost")
+            };
+            assert!(attachments.is_empty());
+            assert_eq!(details["patched"], true);
+            assert_eq!(data["content"][1]["type"], "image");
+            assert_eq!(structured["data"], data["content"][1]["data"]);
+            assert_eq!(structured["mimeType"], data["content"][1]["mimeType"]);
+            assert_eq!(structured["note"], data["content"][0]["text"]);
+            assert_eq!(recorded[0].0.is_error(), mode == 1);
+        }
+    }
+}
+
+struct ImageErrorPatch;
+#[async_trait::async_trait]
+impl Extension for ImageErrorPatch {
+    fn id(&self) -> &str {
+        "image-error-patch"
+    }
+    fn handles_tool_result(&self) -> bool {
+        true
+    }
+    async fn tool_result_patch_v2(
+        &self,
+        call: &pi_rs::ToolCall,
+        outcome: &Outcome,
+        _: &ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<Option<pi_rs::ToolResultPatchV2>> {
+        if call.name != "read" {
+            return Ok(None);
+        }
+        assert!(
+            matches!(outcome, Outcome::StructuredWithDetails { data, details, .. } if data["content"][1]["type"] == "image" && details["patched"] == true)
+        );
+        Ok(Some(pi_rs::ToolResultPatchV2 {
+            output: None,
+            details: None,
+            is_error: Some(true),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn chained_image_metadata_and_error_patches_keep_the_original_image() {
+    let root = tempfile::tempdir().unwrap();
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+        .save_with_format(root.path().join("note.txt"), image::ImageFormat::Png)
+        .unwrap();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(create_read_only_tools(root.path()).unwrap()))
+        .unwrap();
+    registry.register(Arc::new(ImageMetadataPatch(0))).unwrap();
+    registry.register(Arc::new(ImageErrorPatch)).unwrap();
+    let model = Script::default();
+    let agent = pi_rs::Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: pi_rs::Limits::default(),
+    };
+    let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut observed = Vec::new();
+    agent
+        .run(
+            &mut session,
+            Some("read image".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if let pi_rs::Notification::Committed(record) = event
+                    && let pi_rs::Event::ToolFinished {
+                        operation_id,
+                        outcome,
+                        ..
+                    } = &record.event
+                {
+                    observed.push((
+                        outcome.clone(),
+                        pi_rs::tool_result_event_metadata(*operation_id),
+                    ));
+                }
+            },
+        )
+        .await
+        .unwrap();
+    let [(Outcome::StructuredWithDetails { data, details, .. }, Some(structured))] =
+        observed.as_slice()
+    else {
+        panic!("structured result lost")
+    };
+    assert_eq!(data["isError"], true);
+    assert_eq!(details["patched"], true);
+    assert_eq!(structured["data"], data["content"][1]["data"]);
+    assert_eq!(structured["note"], data["content"][0]["text"]);
 }

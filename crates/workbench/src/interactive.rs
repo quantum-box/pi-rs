@@ -1101,7 +1101,15 @@ impl View {
         true
     }
     fn append(&mut self, text: &str) {
-        self.lines.push(Entry::Notice(clean(text)));
+        // Keep U+0085 for transcript search only. Span rendering strips it
+        // before terminal output, as it does for other control characters.
+        let text = text
+            .chars()
+            .filter(|character| {
+                !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
+            })
+            .collect();
+        self.lines.push(Entry::Notice(text));
         if self.lines.len() > 4000 {
             let removed = self.lines.len() - 4000;
             self.lines.drain(..removed);
@@ -3263,9 +3271,8 @@ fn slash(
                         let local = std::path::Path::new(cwd)
                             .canonicalize()
                             .is_ok_and(|cwd| cwd == workspace);
-                        let mut document = super::ui::session_search::Document::new(
-                            session.name().unwrap_or_default().into(),
-                            session.session_id().to_string(),
+                        let mut document = super::ui::session_search::Document::from_session(
+                            &session,
                             cwd.into(),
                             messages,
                             local,
@@ -3745,6 +3752,7 @@ pub(super) async fn run(
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     let mut deferred_input = VecDeque::new();
+    let mut thinking_level_input = VecDeque::new();
     let mut interrupted = false;
     'interactive: loop {
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3997,6 +4005,7 @@ pub(super) async fn run(
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     state.levels = None;
+                    thinking_level_input.clear();
                     let mut picker = state.model_picker.take().expect("model picker");
                     picker.show_feedback(Err("Thinking level discovery stopped".into()));
                     view.picker = Some(picker);
@@ -4279,7 +4288,20 @@ pub(super) async fn run(
         } else {
             Duration::from_millis(40)
         };
-        let next_input = if let Some(event) = deferred_input.pop_front() {
+        let picker_title = view.picker.as_ref().map(|picker| picker.title.as_str());
+        let loading = picker_title == Some("Loading thinking levels");
+        let ready = picker_title.is_some_and(|title| title.starts_with("Thinking level · "));
+        let blocked =
+            view.dialog().is_some() || view.local_editor.is_some() || view.share_blocks_input();
+        let pending = if view.pending_transition.is_some() {
+            thinking_level_input.clear();
+            None
+        } else {
+            next_thinking_level_input(&mut thinking_level_input, loading, ready, blocked)
+        };
+        let next_input = if let Some(event) = pending {
+            Some(crate::ui::input::InputEvent::Event(event))
+        } else if let Some(event) = deferred_input.pop_front() {
             Some(event)
         } else {
             input.next(input_wait)?
@@ -4395,6 +4417,22 @@ pub(super) async fn run(
             }
             _ => continue,
         };
+        if view
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.title == "Loading thinking levels")
+            && view.dialog().is_none()
+            && view.local_editor.is_none()
+            && !view.share_blocks_input()
+            && view.pending_transition.is_none()
+            && buffer_thinking_level_input(
+                &mut thinking_level_input,
+                &event,
+                matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && keys.matches("tui.select.cancel", *key)),
+            )
+        {
+            continue;
+        }
         if view.pending_transition.is_some() {
             match &event {
                 Event::Key(key) if key.code == KeyCode::Esc => {
@@ -6812,7 +6850,7 @@ fn select(
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;
         }
-        Selection::Completion { range, text } => insert_completion(view, range, &text),
+        Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
@@ -7027,6 +7065,40 @@ fn select(
     Ok(())
 }
 
+// Keep typeahead in order until model-level discovery finishes. A configured
+// picker cancellation discards input intended for the abandoned picker.
+fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event, cancel: bool) -> bool {
+    match event {
+        Event::Key(_) if cancel => {
+            pending.clear();
+            false
+        }
+        Event::Key(_) | Event::Paste(_) => {
+            if pending.len() < 1024 {
+                pending.push_back(event.clone());
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn next_thinking_level_input(
+    pending: &mut VecDeque<Event>,
+    loading: bool,
+    ready: bool,
+    blocked: bool,
+) -> Option<Event> {
+    if !loading && !ready {
+        pending.clear();
+    }
+    if ready && !blocked {
+        pending.pop_front()
+    } else {
+        None
+    }
+}
+
 // A bare Escape may need the input decoder's 25 ms disambiguation window.
 // Give already-arrived input priority over committing a prepared session.
 fn queued_transition_cancel(
@@ -7187,28 +7259,44 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
 }
 
 fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
-    let command = args
-        .settings
-        .string("externalEditor")
-        .map(str::to_owned)
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "nano".into()
-            }
-        });
-    let parts = shell_words::split(&command).map_err(|error| Error::Config(error.to_string()))?;
+    let command = external_editor_command(
+        args.settings.string("externalEditor"),
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
+    run_external_editor(&command, editor)
+}
+
+fn external_editor_command(
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> String {
+    configured
+        .filter(|command| {
+            !command
+                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}')
+                .is_empty()
+        })
+        .or_else(|| visual.filter(|command| !command.is_empty()))
+        .or_else(|| editor.filter(|command| !command.is_empty()))
+        .unwrap_or(if cfg!(windows) { "notepad" } else { "nano" })
+        .to_owned()
+}
+
+fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
+    let parts = shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
     let Some((program, arguments)) = parts.split_first() else {
         return Err(Error::Config("external editor is empty".into()));
     };
-    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-    file.write_all(editor.text.as_bytes())?;
+    // Keep the directory, rather than an open file handle, alive while the
+    // editor runs. Editors on Windows may require exclusive access to the file.
+    let directory = external_editor_directory()?;
+    let path = directory.path().join("prompt.md");
+    std::fs::write(&path, editor.text.as_bytes())?;
     if !std::process::Command::new(program)
         .args(arguments)
-        .arg(file.path())
+        .arg(&path)
         .status()?
         .success()
     {
@@ -7216,11 +7304,36 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
             "external editor exited unsuccessfully".into(),
         ));
     }
-    editor.replace(std::fs::read_to_string(file.path())?);
+    let bytes = std::fs::read(&path)?;
+    editor.replace(external_editor_text(&bytes));
     Ok(())
 }
 
+fn external_editor_directory() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("pi-editor-");
+    // Match mkdtemp's private directory on Unix: the draft can contain secrets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
+fn external_editor_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    text.strip_suffix('\n').unwrap_or(text).to_owned()
+}
+
 fn complete_input(args: &Cli, view: &mut View) {
+    enum CompletionSource {
+        Builtin,
+        Skill,
+        Prompt(Option<String>),
+        Other,
+    }
     let prefix = &view.editor.text[..view.editor.cursor];
     let start = prefix
         .char_indices()
@@ -7256,7 +7369,7 @@ fn complete_input(args: &Cli, view: &mut View) {
         ]
         .into_iter()
         .filter(|name| name.starts_with(word))
-        .map(str::to_owned)
+        .map(|name| (name.to_owned(), CompletionSource::Builtin))
         .collect::<Vec<_>>()
     } else {
         let file_word = word.strip_prefix('@').unwrap_or(word);
@@ -7287,40 +7400,71 @@ fn complete_input(args: &Cli, view: &mut View) {
                 } else {
                     ""
                 };
-                Some(format!(
-                    "{}{}{suffix}",
-                    if word.starts_with('@') { "@" } else { "" },
-                    parent.join(file_name).display()
+                Some((
+                    format!(
+                        "{}{}{suffix}",
+                        if word.starts_with('@') { "@" } else { "" },
+                        parent.join(file_name).display()
+                    ),
+                    CompletionSource::Other,
                 ))
             })
             .take(100)
             .collect::<Vec<_>>()
     };
     if start == 0 && word.starts_with('/') {
-        candidates.extend(
-            view.resources
-                .prompts
-                .keys()
-                .map(|name| format!("/{name}"))
-                .filter(|name| name.starts_with(word)),
-        );
+        for (name, prompt) in &view.resources.prompts {
+            let text = format!("/{name}");
+            if text.starts_with(word) && !candidates.iter().any(|(candidate, _)| candidate == &text)
+            {
+                if name
+                    .strip_prefix("skill:")
+                    .is_some_and(|skill| view.resources.skills.contains_key(skill))
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                    continue;
+                }
+                let description = match (&prompt.argument_hint, prompt.description.is_empty()) {
+                    (Some(hint), false) => format!("{hint} — {}", prompt.description),
+                    (Some(hint), true) => hint.clone(),
+                    (None, _) => prompt.description.clone(),
+                };
+                candidates.push((
+                    text,
+                    CompletionSource::Prompt((!description.is_empty()).then_some(description)),
+                ));
+            }
+        }
         if args.settings.enable_skill_commands() {
-            candidates.extend(
-                view.resources
-                    .skills
-                    .keys()
-                    .map(|name| format!("/skill:{name}"))
-                    .filter(|name| name.starts_with(word)),
-            );
+            for name in view.resources.skills.keys() {
+                let text = format!("/skill:{name}");
+                if text.starts_with(word)
+                    && !candidates.iter().any(|(candidate, _)| candidate == &text)
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                }
+            }
         }
     }
-    candidates.sort();
-    candidates.dedup();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.dedup_by(|a, b| a.0 == b.0);
     let range = start..view.editor.cursor;
     match candidates.as_slice() {
-        [candidate] => insert_completion(view, range, candidate),
+        [(candidate, _)] => insert_completion(view, range, candidate),
         [] => {}
         _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|(text, source)| {
+                    let description = match source {
+                        CompletionSource::Prompt(description) => description,
+                        CompletionSource::Builtin
+                        | CompletionSource::Skill
+                        | CompletionSource::Other => None,
+                    };
+                    (text, description)
+                })
+                .collect();
             view.picker = Some(Picker::completion(
                 candidates,
                 range,
@@ -7384,6 +7528,130 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_editor_selects_first_nonempty_command() {
+        assert_eq!(
+            super::external_editor_command(
+                Some("  \u{feff}"),
+                Some("visual --wait"),
+                Some("editor")
+            ),
+            "visual --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(
+                Some("configured --wait"),
+                Some("visual"),
+                Some("editor")
+            ),
+            "configured --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("editor")),
+            "editor"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("")),
+            if cfg!(windows) { "notepad" } else { "nano" }
+        );
+        assert_eq!(
+            super::external_editor_command(Some("\u{0085}"), None, None),
+            "\u{0085}"
+        );
+    }
+
+    #[test]
+    fn external_editor_strips_one_bom_and_one_final_lf() {
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbfprompt\n\n"),
+            "prompt\n"
+        );
+        assert_eq!(super::external_editor_text(b"prompt\r\n"), "prompt\r");
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbf\xef\xbb\xbftext"),
+            "\u{feff}text"
+        );
+        assert_eq!(super::external_editor_text(b"bad\xff\n"), "bad\u{fffd}");
+        assert_eq!(super::external_editor_text(b""), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = super::external_editor_directory().unwrap();
+        let mode = std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_updates_only_after_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277edited\\n\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        super::run_external_editor(program.to_str().unwrap(), &mut editor).unwrap();
+        assert_eq!(editor.text, "edited\n");
+        assert_eq!(editor.cursor, editor.text.len());
+        std::fs::write(&program, "#!/bin/sh\nprintf corrupted > \"$1\"\nexit 1\n").unwrap();
+        assert!(super::run_external_editor(program.to_str().unwrap(), &mut editor).is_err());
+        assert_eq!(editor.text, "edited\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_editor_allows_exclusive_open_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("editor test.ps1");
+        let marker = dir.path().join("draft-path.txt");
+        let command = format!(
+            "powershell.exe -NoProfile -NonInteractive -File \"{}\" \"{}\"",
+            script.display(),
+            marker.display()
+        );
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        for (exit, replacement) in [(0, "edited"), (1, "corrupted")] {
+            std::fs::write(
+                &script,
+                format!(
+                    r#"param([string]$marker, [string]$draft)
+$ErrorActionPreference = 'Stop'
+[System.IO.File]::WriteAllText($marker, $draft)
+$file = [System.IO.File]::Open($draft, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {{
+    $file.SetLength(0)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("{replacement}`n")
+    $file.Write($bytes, 0, $bytes.Length)
+}} finally {{ $file.Dispose() }}
+exit {exit}
+"#
+                ),
+            )
+            .unwrap();
+            let result = super::run_external_editor(&command, &mut editor);
+            assert_eq!(result.is_ok(), exit == 0);
+            assert_eq!(editor.text, "edited");
+            let path = std::path::PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+            assert!(!path.exists(), "temporary draft survived editor exit");
+            assert!(
+                !path.parent().unwrap().exists(),
+                "temporary directory survived editor exit"
+            );
+        }
+    }
+
     #[test]
     fn live_frame_flushes_text_before_console_side_effects() {
         use std::io::Write;
@@ -7895,6 +8163,99 @@ mod tests {
     }
 
     #[test]
+    fn thinking_level_typeahead_waits_for_discovery_and_escape_discards_it() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let mut pending = VecDeque::new();
+        let typed = [
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)),
+            Event::Paste("lear".into()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        for event in &typed {
+            assert!(super::buffer_thinking_level_input(
+                &mut pending,
+                event,
+                false
+            ));
+        }
+        assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), typed);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, true, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, true),
+            None
+        );
+        for event in &typed {
+            assert_eq!(
+                super::next_thinking_level_input(&mut pending, false, true, false),
+                Some(event.clone())
+            );
+        }
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &escape,
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(super::Keys::default().matches("tui.select.cancel", ctrl_c));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Key(ctrl_c),
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Resize(80, 24),
+            false
+        ));
+    }
+
+    #[test]
+    fn thinking_typeahead_does_not_escape_an_abandoned_picker() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let extra = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut pending = VecDeque::from([enter.clone(), extra.clone()]);
+        // Enter selects a level and closes the level picker.
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            Some(enter)
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert!(pending.is_empty());
+        // A new picker must never receive input left by a cancelled discovery.
+        pending.push_back(extra);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            None
+        );
+    }
+
+    #[test]
     fn queued_escape_wins_over_ready_new_session() {
         use clap::Parser;
         use std::collections::VecDeque;
@@ -8180,6 +8541,163 @@ mod tests {
         assert_eq!(args.model, "initial");
         assert_eq!(args.thinking.as_deref(), Some("high"));
     }
+    #[test]
+    fn prompt_completion_displays_argument_hint_without_inserting_it() {
+        use super::*;
+        use clap::Parser;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("audit.md"),
+            "---\ndescription: Inspect changes\nargument-hint: |-\n  <path>\n  [focus]\n---\nReview $1",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("author.md"), "Write text").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/au".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().expect("multiple matching commands");
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(
+            rendered.contains("<path> [focus] — Inspect changes"),
+            "{rendered}"
+        );
+        let input = picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, .. }) if text == "/audit")
+        );
+    }
+
+    #[test]
+    fn builtin_completion_never_uses_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("model.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nText",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("models.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/mo".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/model"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/model")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_completion_wins_over_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        let skill = directory.path().join("skills/review");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review\ndescription: Review skill\n---\nSkill body",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("skill:review.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nWrong body",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("skill:reviewer.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--no-skills",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+            "--skill",
+            skill.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        assert!(
+            view.resources
+                .expand("/skill:review")
+                .unwrap()
+                .contains("Skill body")
+        );
+        view.editor.replace("/skill:rev".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/skill:review"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
+        );
+    }
+
     #[test]
     fn patched_results_render_status_and_details_from_record_events() {
         use super::*;

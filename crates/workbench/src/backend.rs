@@ -181,11 +181,11 @@ struct ControlState {
 
 struct SessionSnapshot {
     records: Vec<pi_rs::Record>,
+    record_metadata: std::collections::BTreeMap<u64, serde_json::Value>,
     share_records: Vec<Arc<pi_rs::Record>>,
     revision: u64,
     entries: Option<super::rpc_entries::Cursor>,
     share_base: Option<Arc<super::sessions::ShareContext>>,
-    share_active: Option<Arc<super::sessions::ShareContext>>,
     share_pending: bool,
 }
 
@@ -198,13 +198,27 @@ impl SessionSnapshot {
         let share_records = records.iter().cloned().map(Arc::new).collect();
         Self {
             records,
+            record_metadata: Default::default(),
             share_records,
             revision: 0,
             entries,
             share_base: None,
-            share_active: None,
             share_pending: false,
         }
+    }
+
+    fn from_session(session: &Session, emit_entries: bool) -> Self {
+        let mut snapshot = Self::new(session.records().to_vec(), emit_entries);
+        snapshot.record_metadata = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .map(|metadata| (record.id, metadata.clone()))
+            })
+            .collect();
+        snapshot
     }
 
     #[cfg(test)]
@@ -214,20 +228,19 @@ impl SessionSnapshot {
                 "Model request context is changing; try sharing again".into(),
             ));
         }
-        let session = Session::from_records(self.records.clone())?;
+        let session = Session::from_records_with_metadata(
+            self.records.clone(),
+            self.record_metadata.clone(),
+        )?;
         let base = self
             .share_base
             .as_ref()
             .ok_or_else(|| Error::Config("share context is not ready".into()))?;
-        let context = if let Some(active) = &self.share_active {
-            active.as_ref().clone()
-        } else {
-            let (system_prompt, tools) =
-                session.effective_system_context(&base.system_prompt, base.tools.clone());
-            super::sessions::ShareContext {
-                system_prompt,
-                tools,
-            }
+        let (system_prompt, _) =
+            session.effective_system_context(&base.system_prompt, base.tools.clone());
+        let context = super::sessions::ShareContext {
+            system_prompt,
+            tools: base.tools.clone(),
         };
         Ok(super::sessions::ShareSnapshot {
             session_id: session.session_id(),
@@ -255,23 +268,9 @@ impl SessionSnapshot {
                 self.revision = self.revision.wrapping_add(1);
                 self.share_pending = true;
             }
-            pi_rs::Notification::Request(request) => {
+            pi_rs::Notification::Request(_) => {
                 self.revision = self.revision.wrapping_add(1);
-                if !*summary {
-                    let system_prompt = request
-                        .messages
-                        .iter()
-                        .filter_map(|message| match message {
-                            pi_rs::Message::System { content } => Some(content.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    self.share_active = Some(Arc::new(super::sessions::ShareContext {
-                        system_prompt,
-                        tools: request.tools.clone(),
-                    }));
-                }
+                // Pi shares agent state, not request-only context transforms.
                 self.share_pending = false;
                 *summary = false;
             }
@@ -281,13 +280,21 @@ impl SessionSnapshot {
 
     fn settle_share_context(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        self.share_active = None;
         self.share_pending = false;
     }
 
     fn refresh(&mut self, session: &Session) {
         self.revision = self.revision.wrapping_add(1);
         self.records = session.records().to_vec();
+        self.record_metadata = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .map(|metadata| (record.id, metadata.clone()))
+            })
+            .collect();
         self.share_records = self.records.iter().cloned().map(Arc::new).collect();
         if let Some(cursor) = &mut self.entries {
             cursor.advance(&self.records);
@@ -312,6 +319,10 @@ impl SessionSnapshot {
 
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
         self.revision = self.revision.wrapping_add(1);
+        let metadata = pi_rs::record_event_metadata(record.id);
+        if let Some(metadata) = &metadata {
+            self.record_metadata.insert(record.id, metadata.clone());
+        }
         if let Some(existing) = self.records.get_mut(record.id.saturating_sub(1) as usize) {
             *existing = record.clone();
             self.share_records[record.id.saturating_sub(1) as usize] = Arc::new(record.clone());
@@ -319,10 +330,22 @@ impl SessionSnapshot {
         }
         self.records.push(record.clone());
         self.share_records.push(Arc::new(record.clone()));
-        self.entries
-            .as_mut()
-            .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
+        self.entries.as_mut().map_or_else(Vec::new, |cursor| {
+            cursor.appended(&self.records, metadata.as_ref())
+        })
     }
+}
+
+fn open_initial_snapshot(path: &std::path::Path, emit_entries: bool) -> Result<SessionSnapshot> {
+    let session = match Session::snapshot(path) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Session::open(path)?
+        }
+        result => result?,
+    };
+    // Any exclusive lock acquired while creating the journal ends when this
+    // function returns, before the worker opens the session for a run.
+    Ok(SessionSnapshot::from_session(&session, emit_entries))
 }
 
 fn snapshot_for_share(
@@ -340,17 +363,17 @@ fn snapshot_for_share_with_hook(
     hook: impl FnOnce(),
 ) -> Result<super::sessions::ShareSnapshot> {
     let changed = || Error::Config("Share context changed; try sharing again".into());
-    let (revision, count, base, selected, pending, emit_entries, idle) = {
+    let (revision, count, base, pending, emit_entries, idle, record_metadata) = {
         let state = active.lock().expect("worker control");
         let snapshot = snapshot.lock().expect("session snapshot");
         (
             snapshot.revision,
             snapshot.share_records.len(),
             snapshot.share_base.clone(),
-            snapshot.share_active.clone(),
             snapshot.share_pending,
             snapshot.entries.is_some(),
             state.token.is_none() && state.queued == 0,
+            snapshot.record_metadata.clone(),
         )
     };
     if pending {
@@ -375,8 +398,8 @@ fn snapshot_for_share_with_hook(
             })
     });
     let prepared = if extends {
-        Some(SessionSnapshot::new(
-            current.as_ref().expect("checked").records().to_vec(),
+        Some(SessionSnapshot::from_session(
+            current.as_ref().expect("checked"),
             emit_entries,
         ))
     } else {
@@ -385,24 +408,21 @@ fn snapshot_for_share_with_hook(
     let session = if extends {
         current.expect("checked")
     } else {
-        Session::from_records(
+        Session::from_records_with_metadata(
             records
                 .iter()
                 .map(|record| record.as_ref().clone())
                 .collect(),
+            record_metadata,
         )?
     };
     let base = base.ok_or_else(|| Error::Config("share context is not ready".into()))?;
-    let context = selected
-        .map(|selected| selected.as_ref().clone())
-        .unwrap_or_else(|| {
-            let (system_prompt, tools) =
-                session.effective_system_context(&base.system_prompt, base.tools.clone());
-            super::sessions::ShareContext {
-                system_prompt,
-                tools,
-            }
-        });
+    let (system_prompt, _) =
+        session.effective_system_context(&base.system_prompt, base.tools.clone());
+    let context = super::sessions::ShareContext {
+        system_prompt,
+        tools: base.tools.clone(),
+    };
     let result = super::sessions::ShareSnapshot {
         session_id: session.session_id(),
         head: session.head(),
@@ -417,6 +437,7 @@ fn snapshot_for_share_with_hook(
         snapshot.revision = snapshot.revision.wrapping_add(1);
         (
             std::mem::replace(&mut snapshot.records, prepared.records),
+            std::mem::replace(&mut snapshot.record_metadata, prepared.record_metadata),
             std::mem::replace(&mut snapshot.share_records, prepared.share_records),
             std::mem::replace(&mut snapshot.entries, prepared.entries),
         )
@@ -535,18 +556,10 @@ async fn run_worker(
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
-    let initial_records = match Session::snapshot(&args.session) {
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Session::open(&args.session)?
-        }
-        result => result?,
-    }
-    .records()
-    .to_vec();
-    let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
-        initial_records,
+    let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
+        &args.session,
         args.mode == Some(super::OutputMode::Rpc),
-    )));
+    )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
@@ -851,7 +864,6 @@ async fn run_worker(
             {
                 let mut snapshot = snapshot.lock().expect("session snapshot");
                 snapshot.share_base = Some(Arc::new(runtime.share_base()));
-                snapshot.share_active = None;
                 snapshot.revision = snapshot.revision.wrapping_add(1);
             }
             share_ready.send_replace(true);
@@ -957,7 +969,6 @@ async fn run_worker(
                 let mut snapshot = snapshot.lock().expect("session snapshot");
                 snapshot.refresh(session);
                 snapshot.share_base = Some(Arc::new(runtime.share_base()));
-                snapshot.share_active = None;
             }
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
@@ -1471,6 +1482,14 @@ fn observe_snapshot(
     trace: bool,
     snapshot: &Mutex<SessionSnapshot>,
 ) {
+    if let pi_rs::Notification::Committed(record) = &event
+        && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
+        && let Some(structured_content) = pi_rs::tool_result_event_metadata(*operation_id)
+    {
+        output(
+            json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured_content}),
+        );
+    }
     let name = match &event {
         pi_rs::Notification::Committed(record) => match &record.event {
             pi_rs::Event::SessionInfo {
@@ -1554,16 +1573,21 @@ fn read_requests(
                     context_window,
                     state,
                 } => {
-                    let records = snapshot.lock().expect("session snapshot").records.clone();
-                    let result = Session::from_records(records).and_then(|session| {
-                        super::rpc::snapshot_response(
-                            &request,
-                            &session,
-                            &path,
-                            context_window,
-                            state,
-                        )
-                    });
+                    let (records, metadata) = {
+                        let snapshot = snapshot.lock().expect("session snapshot");
+                        (snapshot.records.clone(), snapshot.record_metadata.clone())
+                    };
+                    let result = Session::from_records_with_metadata(records, metadata).and_then(
+                        |session| {
+                            super::rpc::snapshot_response(
+                                &request,
+                                &session,
+                                &path,
+                                context_window,
+                                state,
+                            )
+                        },
+                    );
                     control_response(
                         request["type"].as_str().unwrap_or_default(),
                         request.get("id").cloned(),
@@ -1821,6 +1845,53 @@ mod share_context_tests {
     use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
 
     #[test]
+    fn initial_snapshot_releases_new_journal_lock_for_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new-session.jsonl");
+        let snapshot = open_initial_snapshot(&path, true).unwrap();
+        let worker_session = Session::open(&path).unwrap();
+        assert_eq!(snapshot.records[0].id, worker_session.records()[0].id);
+    }
+
+    #[test]
+    fn live_session_snapshot_preserves_compaction_metadata_for_rpc_reads() {
+        let base = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = base.records().to_vec();
+        let id = records.len() as u64 + 1;
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id,
+            parent: Some(id - 1),
+            event: Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        });
+        let metadata = json!({"fromExtension":true,"details":{"origin":"hook"}});
+        let session = Session::from_records_with_metadata(
+            records,
+            [(id, metadata.clone())].into_iter().collect(),
+        )
+        .unwrap();
+        let mut snapshot = SessionSnapshot::from_session(&session, true);
+        let restored = Session::from_records_with_metadata(
+            snapshot.records.clone(),
+            snapshot.record_metadata.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.record_metadata(id), Some(&metadata));
+        snapshot.refresh(&session);
+        assert_eq!(snapshot.record_metadata.get(&id), Some(&metadata));
+    }
+
+    #[test]
     fn stalled_share_reader_does_not_delay_runtime_shutdown() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1925,7 +1996,6 @@ mod share_context_tests {
         });
         let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
         initial.share_base = Some(context.clone());
-        initial.share_active = Some(context.clone());
         let snapshot = Arc::new(Mutex::new(initial));
         let active = Arc::new(Mutex::new(ControlState {
             token: Some(CancellationToken::new()),
@@ -1949,7 +2019,7 @@ mod share_context_tests {
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap();
         assert!(
-            Arc::strong_count(&context) >= 5,
+            Arc::strong_count(&context) >= 3,
             "share capture must retain references, not clone the context"
         );
         let _state = active
@@ -2180,12 +2250,66 @@ mod share_context_tests {
         snapshot.track_share_event(&Notification::Request(&request), &mut summary);
         assert_eq!(
             snapshot.share_snapshot().unwrap().context.system_prompt,
-            "request-specific prompt"
+            "refreshed prompt"
         );
         snapshot.settle_share_context();
         let context = snapshot.share_snapshot().unwrap().context;
         assert_eq!(context.system_prompt, "refreshed prompt");
         assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn live_share_uses_current_tools_not_transcript_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::SystemCheckpoint {
+                content: "session prompt".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "fallback",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "transformed request".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot_for_share(
+            &Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            }),
+            &Mutex::new(snapshot),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "session prompt");
+        assert!(result.context.tools.iter().any(|tool| tool.name == "read"));
     }
 
     #[tokio::test]
@@ -2278,10 +2402,6 @@ mod share_context_tests {
             system_prompt: "base".into(),
             tools: vec![],
         }));
-        snapshot.share_active = Some(Arc::new(super::super::sessions::ShareContext {
-            system_prompt: "previous".into(),
-            tools: vec![],
-        }));
         let record = pi_rs::Record {
             timestamp: None,
             run_id: None,
@@ -2321,7 +2441,7 @@ mod share_context_tests {
         snapshot.track_share_event(&Notification::Request(&request), &mut summary);
         let result = snapshot.share_snapshot().unwrap();
         assert_eq!(result.head, 2);
-        assert_eq!(result.context.system_prompt, "new");
+        assert_eq!(result.context.system_prompt, "base");
     }
 }
 
