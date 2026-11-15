@@ -780,7 +780,7 @@ struct View {
     tree_navigation: Option<(u64, bool)>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
-    widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
+    widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
@@ -929,13 +929,15 @@ impl View {
                 lines,
                 placement,
             } => {
-                if lines.is_some() && !self.widgets.contains_key(&key) && self.widgets.len() >= 64 {
+                if lines.is_some()
+                    && !self.widgets.iter().any(|(existing, _, _)| existing == &key)
+                    && self.widgets.len() >= 64
+                {
                     return Err(Error::Config("too many extension widgets".into()));
                 }
+                self.widgets.retain(|(existing, _, _)| existing != &key);
                 if let Some(lines) = lines {
-                    self.widgets.insert(key, (lines, placement));
-                } else {
-                    self.widgets.remove(&key);
+                    self.widgets.push((key, lines, placement));
                 }
             }
             pi_rs::UiRequest::SetTitle { title } => execute!(
@@ -969,9 +971,9 @@ impl View {
         placement: pi_rs::WidgetPlacement,
     ) -> Vec<Line> {
         self.widgets
-            .values()
-            .filter(|(_, location)| *location == placement)
-            .flat_map(|(lines, _)| lines.iter())
+            .iter()
+            .filter(|(_, _, location)| *location == placement)
+            .flat_map(|(_, lines, _)| lines.iter())
             .flat_map(|text| {
                 Entry::Notice(text.clone()).render(
                     theme,
@@ -9127,6 +9129,80 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn extension_widgets_follow_registration_and_replacement_order() {
+        let mut view = super::View::default();
+        let set = |view: &mut super::View, key: &str, lines: Option<Vec<&str>>, placement: &str| {
+            assert!(
+                view.ui_request(&json!({
+                    "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": key,
+                    "widgetLines": lines, "widgetPlacement": placement,
+                }))
+                .unwrap()
+                .is_none()
+            );
+        };
+        let theme =
+            super::Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let rendered = |view: &super::View, placement| {
+            view.widget_lines(&theme, 80, placement)
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+                .collect::<String>()
+        };
+        set(&mut view, "z", Some(vec!["first"]), "aboveEditor");
+        set(&mut view, "a", Some(vec!["second"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "firstsecond"
+        );
+        set(&mut view, "z", Some(vec!["updated"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "secondupdated"
+        );
+        set(&mut view, "a", Some(vec!["moved"]), "belowEditor");
+        set(&mut view, "z", Some(vec!["later"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "movedlater"
+        );
+        set(&mut view, "a", None, "aboveEditor");
+        set(&mut view, "a", Some(vec!["readded"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "laterreadded"
+        );
+        assert!(rendered(&view, pi_rs::WidgetPlacement::AboveEditor).is_empty());
+
+        let mut full = super::View::default();
+        for index in 0..64 {
+            set(
+                &mut full,
+                &format!("widget-{index}"),
+                Some(vec!["x"]),
+                "aboveEditor",
+            );
+        }
+        let rejected = full.ui_request(&json!({
+            "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": "overflow",
+            "widgetLines": ["x"], "widgetPlacement": "aboveEditor",
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.first().unwrap().0, "widget-0");
+        set(
+            &mut full,
+            "widget-0",
+            Some(vec!["replacement"]),
+            "belowEditor",
+        );
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.last().unwrap().0, "widget-0");
+        set(&mut full, "widget-0", None, "aboveEditor");
+        assert_eq!(full.widgets.len(), 63);
     }
 
     #[test]

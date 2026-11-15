@@ -1754,6 +1754,10 @@ interface. Embedded applications supply an `ExtensionUi` through the registry
 or `SessionBuilder::ui`. Native executable extensions use the same correlated
 host protocol for select, confirm, input and multiline editor dialogs, notices,
 status entries, above/below-editor widgets, window titles and editor text.
+Widgets appear in registration order within each position; replacing or moving
+a widget places it last at its destination, as in Pi.
+Native widgets retain the existing 64-widget and 128-line limits, and do not
+yet match Pi's ten-line truncation, text styling, or fixed fullscreen placement.
 `interactive_review` is a runnable Rust example.
 
 The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
