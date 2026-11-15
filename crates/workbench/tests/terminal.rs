@@ -1178,6 +1178,12 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
     );
     let mut master = unsafe { File::from_raw_fd(master_fd) };
     let mut slave = unsafe { File::from_raw_fd(slave_fd) };
+    let mut initial_termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave_fd, initial_termios.as_mut_ptr()) },
+        0
+    );
+    let initial_termios = unsafe { initial_termios.assume_init() };
     let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
     assert_eq!(
         unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
@@ -1226,6 +1232,26 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
     // Queue input for the next terminal owner in the same write as selection.
     master.write_all(b"\rnext shell command\n").unwrap();
     output_until(&mut master, |text| text.contains("\x1b[?1049l"));
+    // The alternate-screen exit is emitted before raw mode is restored.
+    // Wait for terminal handoff before reading as the next owner.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut current = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave_fd, current.as_mut_ptr()) },
+            0
+        );
+        let current = unsafe { current.assume_init() };
+        if current.c_lflag == initial_termios.c_lflag
+            && current.c_iflag == initial_termios.c_iflag
+            && current.c_oflag == initial_termios.c_oflag
+            && current.c_cc == initial_termios.c_cc
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "terminal was not restored");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
     assert_eq!(
         unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },

@@ -164,14 +164,20 @@ struct ColorQueries {
 }
 
 impl Terminal {
-    fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
+    fn enter(
+        mode: Option<TuiMode>,
+        images: Cleanup,
+        #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
+    ) -> Result<Self> {
         terminal::enable_raw_mode()?;
+        #[cfg(any(unix, windows))]
+        let initial_colors = previous_colors.is_none();
         let mut guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
             progress: None,
             #[cfg(any(unix, windows))]
-            colors: ColorQueries::default(),
+            colors: previous_colors.unwrap_or_default(),
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -188,7 +194,9 @@ impl Terminal {
         execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u"))?;
         #[cfg(any(unix, windows))]
         {
-            crate::ui::theme::reset_terminal_background();
+            if initial_colors {
+                crate::ui::theme::reset_terminal_background();
+            }
             execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
             guard.colors.query_terminal_colors(&mut std::io::stdout())?;
         }
@@ -264,6 +272,9 @@ impl Terminal {
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        let colors = guard
+            .as_mut()
+            .map(|terminal| std::mem::take(&mut terminal.colors));
         drop(guard.take());
         // The foreground job owns this process group, including its frontend worker.
         let result = unsafe {
@@ -287,7 +298,7 @@ impl Terminal {
                 }
             }
         };
-        *guard = Some(Self::enter(mode, images)?);
+        *guard = Some(Self::enter(mode, images, colors)?);
         result.map_err(Error::Io)
     }
 }
@@ -3765,7 +3776,12 @@ pub(super) async fn run(
         slash("/resume", &mut args, &mut view, None)?;
     }
     let mut keys = Keys::load()?;
-    let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+    let mut _terminal = Some(Terminal::enter(
+        args.tui_mode,
+        view.graphics.cleanup(),
+        #[cfg(any(unix, windows))]
+        None,
+    )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     install_terminal_signal(terminal_signal.clone())?;
@@ -4365,7 +4381,9 @@ pub(super) async fn run(
                     terminal
                         .colors
                         .receive_color_marker(&mut std::io::stdout())?;
-                    dirty |= finish_initial_terminal_colors(&mut theme);
+                    if !terminal.colors.color_requery && terminal.colors.color_queries.is_empty() {
+                        dirty |= finish_initial_terminal_colors(&mut theme);
+                    }
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
@@ -5291,9 +5309,18 @@ pub(super) async fn run(
                         if args.tui_mode == Some(TuiMode::Regular) {
                             view.finish_regular()?;
                         }
+                        #[cfg(any(unix, windows))]
+                        let colors = _terminal
+                            .as_mut()
+                            .map(|terminal| std::mem::take(&mut terminal.colors));
                         drop(_terminal.take());
                         let result = external_editor(&args, &mut view.editor);
-                        _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+                        _terminal = Some(Terminal::enter(
+                            args.tui_mode,
+                            view.graphics.cleanup(),
+                            #[cfg(any(unix, windows))]
+                            colors,
+                        )?);
                         if view.graphics.enabled() {
                             images::query_cell_size()?;
                         }
