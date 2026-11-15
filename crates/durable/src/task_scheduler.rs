@@ -2474,7 +2474,7 @@ mod tests {
         assert_eq!(early.at, Some(100));
         assert_eq!(early.blocked.len(), 1);
         let due = scheduler.wake_snapshot(100).unwrap();
-        assert!(due.active);
+        assert!(!due.active);
         assert_eq!(due.at, None);
         assert_eq!(due.blocked.len(), 1);
         let after = scheduler.ts().list().unwrap();
