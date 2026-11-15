@@ -6703,7 +6703,11 @@ fn sigint_cancels_package_install_waiting_for_package_lock() {
 #[cfg(unix)]
 #[test]
 fn sigint_interrupts_managed_model_discovery() {
-    for mode in [vec!["--mode", "rpc"], vec!["--models", "ollama/*", "serve"]] {
+    for mode in [
+        vec!["--mode", "rpc"],
+        vec!["--models", "ollama/*", "serve"],
+        vec!["--models", "ollama/*", "mcp", "login", "fixture"],
+    ] {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(

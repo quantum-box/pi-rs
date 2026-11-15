@@ -1602,7 +1602,19 @@ async fn execute(
         );
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
-        model_selection::catalogs(&args, true).await?
+        if matches!(
+            &args.command,
+            Some(Command::Mcp {
+                command: mcp_config::McpCommand::Login { .. }
+            })
+        ) {
+            tokio::select! {
+                result = model_selection::catalogs(&args, true) => result?,
+                _ = args.mcp_login_cancel.cancelled() => return Err(Error::Cancelled),
+            }
+        } else {
+            model_selection::catalogs(&args, true).await?
+        }
     } else if needs_default_model {
         vec![
             model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
