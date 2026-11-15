@@ -125,6 +125,11 @@ with `--bearer-token-env-var` unless an Authorization header is already present.
 `--env` is restricted to stdio and requires nonempty names; bearer-token
 environment variables apply to HTTP servers.
 
+Local package sources expand `~` using a nonempty `HOME` or the platform
+home-directory fallback, including `~\` on Windows. On Unix an explicitly
+empty `HOME` remains empty. Relative home values resolve from the source
+settings scope, matching Pi.
+
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 For remote packages with a single settings scope, an invalid file URL in a
