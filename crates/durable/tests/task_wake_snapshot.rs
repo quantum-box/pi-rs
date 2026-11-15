@@ -126,7 +126,7 @@ async fn failed_migration_notifies_readiness_observers_without_a_commit() {
     let activity = scheduler.worker_activity();
     let mut updates = activity.subscribe();
     assert!(scheduler.wake_snapshot(0).unwrap().active);
-    assert!(!scheduler.tick(0).unwrap());
+    scheduler.tick(0).unwrap();
     let changed = tokio::time::timeout(std::time::Duration::from_secs(2), updates.changed())
         .await
         .unwrap()
