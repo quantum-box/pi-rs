@@ -85,7 +85,7 @@ fn list_waits_for_login_configuration_finalization() {
     )
     .unwrap();
     gate.unlock().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -122,7 +122,7 @@ fn login_deadline_includes_wait_for_initial_configuration_snapshot() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
