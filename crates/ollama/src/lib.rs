@@ -820,9 +820,10 @@ impl Model for Ollama {
                 return Err(Error::Model("413 request too large".into()));
             }
             if matches!(status.as_u16(), 400 | 422) {
-                let overflow = pi_rs_core::provider_context_overflow_stream(
+                let overflow = pi_rs_core::provider_context_overflow_stream_or_empty(
                     response.bytes_stream(),
                     &error_secrets,
+                    self.provider == "cerebras" && status.as_u16() == 400,
                 )
                 .await;
                 return Err(Error::Model(if overflow {
@@ -1434,6 +1435,188 @@ mod content_tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn cerebras_bodyless_400_is_overflow_without_reclassifying_other_errors() {
+        use std::io::{Read, Write};
+        for (provider, status, body, overflow) in [
+            ("cerebras", 400, "", true),
+            ("other", 400, "", false),
+            ("cerebras", 422, "", false),
+            ("cerebras", 400, "{}", false),
+            ("cerebras", 400, "private-error-body", false),
+            (
+                "cerebras",
+                400,
+                r#"{"error":{"message":"prompt is too long"}}"#,
+                true,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 1024];
+                let header_end = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 32 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .unwrap();
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 64 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let model = Ollama::new(&format!("http://{address}/v1/chat/completions"), None)
+                .unwrap()
+                .with_provider(provider);
+            let error = match model
+                .stream(ModelRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("expected HTTP error"),
+            };
+            assert_eq!(
+                error.to_string().contains("context window exceeded"),
+                overflow,
+                "{provider} {status} {body:?}"
+            );
+            assert!(!error.to_string().contains("private-error-body"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cerebras_bodyless_overflow_compacts_and_retries_the_turn() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 2048];
+                let header_end = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 64 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let length = String::from_utf8_lossy(&bytes[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .unwrap();
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0 && bytes.len() + count <= 128 * 1024);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                if index == 1 {
+                    write!(
+                        socket,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let text = if index == 2 {
+                    "saved summary"
+                } else {
+                    "answer"
+                };
+                let chunk = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}});
+                let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let model = Ollama::new(&format!("http://{address}/v1/chat/completions"), None)
+            .unwrap()
+            .with_provider("cerebras");
+        let registry = pi_rs_core::Registry::default();
+        let agent = pi_rs_core::Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs_core::Limits {
+                context_window: Some(10000),
+                output_tokens_per_request: 16,
+                model_requests: 3,
+                compaction_tokens: Some(pi_rs_core::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Default::default()
+            },
+        };
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let cancel = pi_rs_core::CancellationToken::new();
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    Some("old".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert!(session.records().iter().any(|record| matches!(&record.event, pi_rs_core::Event::Compacted { summary, .. } if summary == "saved summary")));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn capacity_estimate_matches_image_and_replay_serialization() {

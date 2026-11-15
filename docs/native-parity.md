@@ -145,6 +145,11 @@ one compact-and-retry recovery; otherwise, it records failed tool results and
 the model may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
+For the Cerebras Chat Completions provider, a fully received, empty HTTP 400
+response is treated as context overflow, matching Pi's bodyless-error rule.
+Other providers and nonempty 400 bodies retain their normal classification;
+incomplete or timed-out bodies do not qualify as empty. Existing HTTP 413
+handling is unchanged.
 Native extensions can opt into a pre-summary compaction hook for manual,
 threshold, and supported overflow compaction. A supplied summary bypasses the summary model, carries
 optional details and usage into the journal, and emits the normal lifecycle
@@ -959,9 +964,10 @@ file URL validation: malformed UTF-8, percent escapes and encoded path separator
 are rejected before backend calls; query and fragment escapes are not path
 escapes. On Unix encoded backslashes remain literal filename characters. On
 Windows valid IDN UNC hostnames are decoded to Unicode before backend dispatch,
-matching Node's `fileURLToPath`. The URL parser still rejects some malformed
-punycode hosts that Node accepts; this stricter existing behavior remains a
-compatibility difference. Backends enforce access controls and search semantics,
+matching Node's `fileURLToPath`. Simple ASCII UNC hosts with malformed punycode
+labels retain those labels literally, while valid labels are decoded. The URL
+parser remains stricter than Node for some other malformed punycode authorities,
+including percent-encoded host labels. Backends enforce access controls and search semantics,
 including matching, ignore rules, and ordering. A set is an `Extension` and can
 be registered directly with `Registry`; overlapping sets have duplicate tool names.
 
@@ -1826,8 +1832,11 @@ Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
 Both use Ctrl+F for fullscreen transcript search and their prompt-jump
 defaults omit the redundant Ctrl+Shift variants, matching Pi.
 Transcript search normalizes ECMAScript whitespace in queries and rendered
-graphemes, including U+FEFF. Native terminal sanitization removes control
-characters such as U+0085 before they reach the search input or rendered text.
+graphemes, including U+FEFF. U+0085 is retained in search-only input and
+rendered-text metadata, so it remains distinct from both whitespace and an
+absent character. Its zero-width matches can be navigated, although they have
+no visible cell to highlight. Terminal output still removes U+0085 and other
+unsafe control characters.
 
 A committed isolated-process-group PTY test covers resize input and suspension.
 A separate fixture covers both screen modes, SIGINT while suspended, resumed
@@ -2840,12 +2849,14 @@ patterns without bracket expressions that the linear regex engine accepts,
 `\d`, `\D`, `\w`, `\W`, `\b`, and `\B` use JavaScript's ASCII classes
 and word boundaries. Single-shorthand bracket expressions such as `[\d]`,
 `[^\w]`, and `[\D]` also use those ASCII classes, including their negations;
-shorthands outside complex brackets are translated independently. Patterns
-requiring lookaround or backreferences retain the existing bounded engine and
-Unicode class behavior; mixed bracket expressions and other Unicode case
-folding differences remain open. The native engine matches Unicode scalar
-values rather than JavaScript's non-Unicode UTF-16 code units: for example,
-`^[\D]$` matches an emoji natively but not in Pi.
+shorthands outside complex brackets are translated independently by the linear
+engine. Patterns without brackets or word boundaries that require
+lookaround or backreferences use ASCII digit and word shorthand classes in the
+bounded engine. Advanced patterns with brackets or word boundaries retain the
+engine's previous Unicode classes and boundaries. Mixed bracket expressions and
+other Unicode case folding differences remain open. The native engine matches
+Unicode scalar values rather than JavaScript's non-Unicode UTF-16 code units:
+for example, `^[\D]$` matches an emoji natively but not in Pi.
 
 Name and working-directory fields support Pi's fuzzy alignment and letter/digit
 swap. Message text and IDs use literal matching. Relevance sorting uses the same
