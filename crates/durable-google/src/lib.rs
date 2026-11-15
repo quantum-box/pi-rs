@@ -21,6 +21,7 @@ pub struct GoogleAdapter {
     client: Client,
     endpoint: Url,
     key: HeaderValue,
+    ordered_tool_blocks: bool,
 }
 impl GoogleAdapter {
     pub fn new(endpoint: &str, key: &str) -> Result<Self> {
@@ -55,7 +56,15 @@ impl GoogleAdapter {
             client,
             endpoint,
             key,
+            ordered_tool_blocks: false,
         })
+    }
+    /// Use ordered JSON references for tool blocks instead of upstream's
+    /// text-and-images projection. This mode has a distinct persisted adapter ID.
+    pub fn new_ordered_tool_blocks(endpoint: &str, key: &str) -> Result<Self> {
+        let mut adapter = Self::new(endpoint, key)?;
+        adapter.ordered_tool_blocks = true;
+        Ok(adapter)
     }
 }
 fn model_id(model: &str) -> &str {
@@ -102,7 +111,8 @@ fn family(id: &str) -> Option<ThinkingFamily> {
 }
 
 fn gemini_major(id: &str) -> Option<u32> {
-    let version = id.strip_prefix("gemini-")?;
+    let normalized = id.to_ascii_lowercase();
+    let version = normalized.strip_prefix("gemini-")?;
     let version = version.strip_prefix("live-").unwrap_or(version);
     version.split(['.', '-']).next()?.parse().ok()
 }
@@ -191,6 +201,14 @@ fn check_status(response: Response) -> Result<Response> {
     }
 }
 
+// JavaScript String.trim uses ECMAScript WhiteSpace and LineTerminator, which
+// includes BOM and excludes U+0085 even though Rust classifies it as whitespace.
+fn upstream_has_text(text: &str) -> bool {
+    !text
+        .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}')
+        .is_empty()
+}
+
 fn identity(provider: &str, model: &str) -> ResolvedModelIdentity {
     ResolvedModelIdentity {
         provider: provider.into(),
@@ -225,7 +243,7 @@ fn wire_request(
     thinking: Option<&str>,
     replay_scope: &str,
 ) -> Result<Value> {
-    wire_request_with_blocks(request, thinking, replay_scope, None, None)
+    wire_request_with_blocks(request, thinking, replay_scope, None, None, false)
 }
 
 fn wire_request_with_blocks(
@@ -234,6 +252,7 @@ fn wire_request_with_blocks(
     replay_scope: &str,
     durable: Option<&DurableRequest>,
     tools: Option<&DurableToolRequest>,
+    ordered_tool_blocks: bool,
 ) -> Result<Value> {
     if let Some(durable) = durable {
         let mut ids = BTreeSet::new();
@@ -251,16 +270,7 @@ fn wire_request_with_blocks(
     let mut contents = Vec::new();
     let mut system = Vec::new();
     let mut calls = BTreeMap::new();
-    let mut tool_images = Vec::new();
     for (index, message) in request.messages.iter().enumerate() {
-        if !matches!(message, Message::Tool { .. }) && !tool_images.is_empty() {
-            push_content(
-                &mut contents,
-                "user",
-                std::mem::take(&mut tool_images),
-                false,
-            );
-        }
         if let Some(binding) = durable.and_then(|d| d.blocks.get(&index)) {
             if !matches!(message, Message::User { content } if content.is_empty()) {
                 return Err(Error::Config("durable block placeholder mismatch".into()));
@@ -375,26 +385,26 @@ fn wire_request_with_blocks(
                         "Google tool result has no preceding call".into(),
                     ));
                 };
-                let (text, images) = if let Some(binding) =
-                    tools.and_then(|t| t.tool_blocks.get(&index))
-                {
-                    if request.messages.iter().filter(|m| matches!(m, Message::Tool { call_id: other, .. } if other == call_id)).count() != 1 {
-                        return Err(Error::Config("ambiguous tool result call ID".into()));
-                    }
-                    let mut text = String::new();
+                let binding = tools.and_then(|t| t.tool_blocks.get(&index));
+                if binding.is_some() && request.messages.iter().filter(|m| matches!(m, Message::Tool { call_id: other, .. } if other == call_id)).count() != 1 {
+                    return Err(Error::Config("ambiguous tool result call ID".into()));
+                }
+                let (texts, images) = if let Some(binding) = binding {
+                    let mut texts = Vec::new();
                     let mut images = Vec::new();
-                    let mut seen_text = false;
-                    for block in &binding.blocks {
+                    let mut ordered = Vec::new();
+                    let mut image_parts = Vec::new();
+                    for (position, block) in binding.blocks.iter().enumerate() {
                         let obj = block
                             .as_object()
                             .ok_or_else(|| Error::Config("invalid tool block".into()))?;
                         match block["type"].as_str() {
-                            Some("text") if obj.len() == 2 && !seen_text && images.is_empty() => {
-                                text = block["text"]
+                            Some("text") if obj.len() == 2 => {
+                                let text = block["text"]
                                     .as_str()
-                                    .ok_or_else(|| Error::Config("invalid text".into()))?
-                                    .to_string();
-                                seen_text = true;
+                                    .ok_or_else(|| Error::Config("invalid tool text".into()))?;
+                                texts.push(text.to_string());
+                                ordered.push(json!(text));
                             }
                             Some("image")
                                 if obj.len() == 3
@@ -413,36 +423,79 @@ fn wire_request_with_blocks(
                                         .into(),
                                 };
                                 image.validate()?;
+                                if ordered_tool_blocks {
+                                    if !gemini_v3 {
+                                        return Err(Error::Config("ordered Google tool images require a recognized Gemini 3 or later model".into()));
+                                    }
+                                    if !matches!(
+                                        image.mime_type.as_str(),
+                                        "image/png" | "image/jpeg" | "image/webp"
+                                    ) {
+                                        return Err(Error::Config(
+                                            "unsupported Google function response image type"
+                                                .into(),
+                                        ));
+                                    }
+                                    let reference = format!("pi-{}-{position}", binding.message_id);
+                                    ordered.push(json!({"$ref":reference}));
+                                    image_parts.push(json!({"inlineData":{"mimeType":image.mime_type,"data":image.data,"displayName":reference}}));
+                                }
                                 images.push(image);
                             }
                             _ => {
                                 return Err(Error::Config(
-                                    "Google cannot preserve this tool block order or metadata"
-                                        .into(),
+                                    "unsupported tool block metadata".into(),
                                 ));
                             }
                         }
                     }
-                    if binding.blocks.is_empty() || (!images.is_empty() && !gemini_v3) {
-                        return Err(Error::Config(
-                            "Google cannot preserve these tool blocks for this model".into(),
-                        ));
+                    if ordered_tool_blocks && binding.blocks.is_empty() {
+                        return Err(Error::Config("empty Google tool blocks".into()));
                     }
-                    (text, images)
+                    if ordered_tool_blocks {
+                        let output = if ordered.len() == 1 && ordered[0].is_string() {
+                            ordered.remove(0)
+                        } else {
+                            json!(ordered)
+                        };
+                        let mut response = json!({"name":name,"response":{"output":output}});
+                        if let Some(id) = id {
+                            response["id"] = json!(id);
+                        }
+                        if !image_parts.is_empty() {
+                            response["parts"] = json!(image_parts);
+                        }
+                        push_content(
+                            &mut contents,
+                            "user",
+                            vec![json!({"functionResponse":response})],
+                            true,
+                        );
+                        continue;
+                    }
+                    (texts, images)
                 } else {
-                    extract_tool_images(content.clone())
+                    let (text, images) = extract_tool_images(content.clone());
+                    (vec![text], images)
                 };
-                let mut response = json!({"name":name,"response":{"output":text}});
+                // Match upstream's text filtering/joining and image-only fallback.
+                let text = texts.join("\n");
+                let output = if upstream_has_text(&text) {
+                    text.as_str()
+                } else if !images.is_empty() {
+                    "(see attached image)"
+                } else {
+                    ""
+                };
+                let mut response = json!({"name":name,"response":{"output":output}});
                 if let Some(id) = id {
                     response["id"] = json!(id);
                 }
-                if gemini_v3 {
-                    if !images.is_empty() {
-                        response["parts"] = json!(images.iter().map(|image| json!({"inlineData":{"mimeType":image.mime_type,"data":image.data}})).collect::<Vec<_>>());
-                    }
-                } else if !images.is_empty() {
-                    tool_images.push(json!({"text":"Tool result image:"}));
-                    tool_images.extend(images.iter().map(|image| json!({"inlineData":{"mimeType":image.mime_type,"data":image.data}})));
+                // Upstream treats unknown model IDs as supporting multimodal responses.
+                let native_images = gemini_major(&identity.model).is_none_or(|major| major >= 3);
+                let parts: Vec<_> = images.iter().map(|image| json!({"inlineData":{"mimeType":image.mime_type,"data":image.data}})).collect();
+                if native_images && !parts.is_empty() {
+                    response["parts"] = json!(parts);
                 }
                 push_content(
                     &mut contents,
@@ -450,10 +503,14 @@ fn wire_request_with_blocks(
                     vec![json!({"functionResponse":response})],
                     true,
                 );
+                if !native_images && !parts.is_empty() {
+                    let mut attached = vec![json!({"text":"Tool result image:"})];
+                    attached.extend(parts);
+                    push_content(&mut contents, "user", attached, false);
+                }
             }
         }
     }
-    push_content(&mut contents, "user", tool_images, false);
     let mut body = json!({"contents":contents,"generationConfig":{"maxOutputTokens":request.max_output_tokens,"candidateCount":1}});
     if !system.is_empty() {
         body["systemInstruction"] = json!({"parts":[{"text":system.join("\n\n")}]});
@@ -547,6 +604,7 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(&request.request),
             Some(request),
+            self.ordered_tool_blocks,
         )
     }
     fn validate_with_tool_blocks(
@@ -563,6 +621,7 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(&request.request),
             Some(request),
+            self.ordered_tool_blocks,
         )?;
         if body.get("contents") != expected.get("contents") {
             return Err(Error::Config("provider hook changed durable input".into()));
@@ -580,7 +639,7 @@ impl ProviderAdapter for GoogleAdapter {
         if !valid_model_id(model_id(&request.request.model)) {
             return Err(Error::Config("invalid Google model ID".into()));
         }
-        wire_request_with_blocks(&request.request, None, "google", Some(request), None)
+        wire_request_with_blocks(&request.request, None, "google", Some(request), None, false)
     }
     fn validate_durable(
         &self,
@@ -591,15 +650,26 @@ impl ProviderAdapter for GoogleAdapter {
         self.validate(attempt, &request.request, body)?;
         if !request.blocks.is_empty()
             && body.get("contents")
-                != wire_request_with_blocks(&request.request, None, "google", Some(request), None)?
-                    .get("contents")
+                != wire_request_with_blocks(
+                    &request.request,
+                    None,
+                    "google",
+                    Some(request),
+                    None,
+                    false,
+                )?
+                .get("contents")
         {
             return Err(Error::Config("provider hook changed durable input".into()));
         }
         Ok(())
     }
     fn id(&self) -> &str {
-        "google-generative-ai/v1"
+        if self.ordered_tool_blocks {
+            "google-generative-ai-ordered-tool-blocks/v1"
+        } else {
+            "google-generative-ai/v1"
+        }
     }
     async fn prepare(&self, _: &ProviderAttempt, request: &ModelRequest) -> Result<Value> {
         if !valid_model_id(model_id(&request.model)) {

@@ -9,3 +9,23 @@ Hooks may replace conversation contents and system instructions. Validation chec
 The API key stays in a sensitive HTTP header and is absent from prepared bodies and error messages. Base URLs must use HTTPS or numeric loopback HTTP and cannot contain credentials, query, or fragment. The host must trust its configured HTTPS endpoint. Redirects and proxies are disabled, responses are bounded to 4 MiB, and connect and read idle timeouts apply. Cancellation drops the request or stream; remote execution may already have occurred.
 
 Unlike the full provider, this adapter does not support catalog lookup, model limit discovery, custom provider identities, custom headers, proxies, progress observers, or a thinking configuration API. Hook-supplied sampling, thinking, safety settings and other extra generation options are rejected. It supports only streaming GenerateContent with API-key authentication, not OAuth, Vertex AI, Live API, hosted tools or other Gemini APIs. Usage is limited to the counters handled by the existing provider. Independent copied protocol code may drift from pi-rs and upstream pi.
+
+By default, durable tool-result blocks follow upstream pi's
+[Google conversion at c3cc916](https://github.com/earendil-works/pi/blob/c3cc91632d0a1950fb122605b190233f2aa0006e/packages/ai/src/api/google-shared.ts):
+text blocks are joined with newlines, and images are attached to the function
+response for Gemini 3+ or unrecognized model IDs, or placed in an immediately
+following user message for older Gemini models. Whitespace-only text becomes
+`(see attached image)` when images exist, otherwise empty text. This loses
+text/image interleaving only in the provider request; persisted blocks remain
+unchanged. This adapter has no model input catalog, so it assumes image support,
+where upstream drops images for text-only models. The durable core request has
+no tool-result error flag, so the upstream `error` key is not reproduced.
+
+For explicit order preservation, construct
+`GoogleAdapter::new_ordered_tool_blocks(base_url, api_key)` and select its
+`google-generative-ai-ordered-tool-blocks/v1` identity. Its ordered array uses
+[Google image references](https://ai.google.dev/gemini-api/docs/generate-content/function-calling#multimodal)
+instead of the upstream representation. It requires recognized Gemini 3+
+models for images, supports PNG, JPEG and WebP, and rejects empty result arrays.
+The separate identity prevents silently changing the mode on reopen. Fake HTTP
+tests verify the body but not real provider acceptance or model interpretation.

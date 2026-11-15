@@ -419,23 +419,70 @@ fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
     }
 }
 
+// Expected wire cases transcribed from pi's google-shared.ts at c3cc91632d0a.
 #[tokio::test]
-async fn google_tool_blocks_reject_unrepresentable_order_and_tampering() {
+async fn upstream_tool_result_fixtures_and_hook_validation() {
     let adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
     let a = attempt();
-    let mut req = ordered_tool_request();
-    assert!(adapter.prepare_with_tool_blocks(&a, &req).await.is_err());
-    req.tool_blocks.get_mut(&2).unwrap().blocks.pop();
+    assert_eq!(adapter.id(), "google-generative-ai/v1");
+    let cases: Value =
+        serde_json::from_str(include_str!("fixtures/upstream_tool_results.json")).unwrap();
+    for case in cases.as_array().unwrap() {
+        let mut req = ordered_tool_request();
+        req.request.request.model = case["model"].as_str().unwrap().into();
+        req.tool_blocks.get_mut(&2).unwrap().blocks = case["blocks"].as_array().unwrap().clone();
+        let before = req.tool_blocks[&2].blocks.clone();
+        let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+        assert_eq!(
+            json!(&body["contents"].as_array().unwrap()[2..]),
+            case["expected"],
+            "{}",
+            case["name"]
+        );
+        assert_eq!(req.tool_blocks[&2].blocks, before);
+        adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+        let mut changed = body.clone();
+        changed["contents"][2]["parts"][0]["functionResponse"]["response"]["output"] =
+            json!("tampered");
+        assert!(
+            adapter
+                .validate_with_tool_blocks(&a, &req, &changed)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordered_mode_is_explicit_and_fenced_by_adapter_identity() {
+    let adapter = GoogleAdapter::new_ordered_tool_blocks("http://127.0.0.1:1", "key").unwrap();
+    let a = attempt();
+    let req = ordered_tool_request();
+    assert_eq!(adapter.id(), "google-generative-ai-ordered-tool-blocks/v1");
     let mut body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
-    let response = &body["contents"][2]["parts"][0]["functionResponse"];
-    assert_eq!(response["response"]["output"], "first");
-    assert_eq!(response["parts"][0]["inlineData"]["data"], "aGk=");
+    let name = format!("pi-{}-1", req.tool_blocks[&2].message_id);
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+        json!(["first",{"$ref":name},"last"])
+    );
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["displayName"],
+        name
+    );
     adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
-    body["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"] =
-        json!("YQ==");
+    body["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["displayName"] =
+        json!("changed");
     assert!(adapter.validate_with_tool_blocks(&a, &req, &body).is_err());
-    req.request.request.model = "gemini-2.5-flash".into();
-    assert!(adapter.prepare_with_tool_blocks(&a, &req).await.is_err());
+    let mut old = req.clone();
+    old.request.request.model = "gemini-2.5-flash".into();
+    assert!(adapter.prepare_with_tool_blocks(&a, &old).await.is_err());
+    let mut invalid = req;
+    invalid.tool_blocks.get_mut(&2).unwrap().blocks[1]["mimeType"] = json!("image/gif");
+    assert!(
+        adapter
+            .prepare_with_tool_blocks(&a, &invalid)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -447,8 +494,7 @@ async fn google_tool_result_reaches_fake_http() {
     let (url, server) = server(response, false).await;
     let adapter = GoogleAdapter::new(&url, "secret-key").unwrap();
     let a = attempt();
-    let mut req = ordered_tool_request();
-    req.tool_blocks.get_mut(&2).unwrap().blocks.pop();
+    let req = ordered_tool_request();
     let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
     adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
     collect_generation(
@@ -466,4 +512,148 @@ async fn google_tool_result_reaches_fake_http() {
         sent["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"],
         "aGk="
     );
+    assert_eq!(
+        sent["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+        "first\nlast"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_tool_results_follow_upstream_image_placement() {
+    let adapter = GoogleAdapter::new("http://127.0.0.1:1", "key").unwrap();
+    let a = attempt();
+    for model in ["gemini-3-flash", "gemini-2.5-flash"] {
+        let mut req = ordered_tool_request();
+        req.request.request.model = model.into();
+        if let Message::Assistant { calls, .. } = &mut req.request.request.messages[1] {
+            calls.push(pi_rs_core::ToolCall {
+                id: "c2".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            });
+        }
+        req.request.request.messages.push(Message::Tool {
+            call_id: "c2".into(),
+            content: String::new(),
+        });
+        req.tool_blocks.insert(
+            3,
+            pi_rs_durable::transcript::MessageContentBlocks {
+                message_id: Uuid::new_v4(),
+                blocks: vec![
+                    json!({"type":"text","text":"second"}),
+                    json!({"type":"image","data":"aGk=","mimeType":"image/png"}),
+                ],
+            },
+        );
+        let body = adapter.prepare_with_tool_blocks(&a, &req).await.unwrap();
+        let contents = body["contents"].as_array().unwrap();
+        if model == "gemini-3-flash" {
+            assert_eq!(contents.len(), 3);
+            let results = contents[2]["parts"].as_array().unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(
+                results[0]["functionResponse"]["response"]["output"],
+                "first\nlast"
+            );
+            assert_eq!(
+                results[1]["functionResponse"]["response"]["output"],
+                "second"
+            );
+        } else {
+            assert_eq!(contents.len(), 6);
+            assert_eq!(
+                contents[2]["parts"][0]["functionResponse"]["response"]["output"],
+                "first\nlast"
+            );
+            assert_eq!(contents[3]["parts"][0]["text"], "Tool result image:");
+            assert_eq!(
+                contents[4]["parts"][0]["functionResponse"]["response"]["output"],
+                "second"
+            );
+            assert_eq!(contents[5]["parts"][0]["text"], "Tool result image:");
+        }
+        adapter.validate_with_tool_blocks(&a, &req, &body).unwrap();
+    }
+}
+
+struct UnusedModelForMode;
+#[async_trait::async_trait]
+impl pi_rs_core::Model for UnusedModelForMode {
+    async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+        panic!("configured provider must handle requests")
+    }
+}
+
+#[tokio::test]
+async fn reopen_cannot_silently_switch_tool_result_mode() {
+    use pi_rs_durable::{
+        recovery::UncertainPolicy,
+        runtime::{Config, Harness, Options},
+    };
+    use std::sync::Arc;
+    let path = std::env::temp_dir().join(format!("pi-google-mode-{}", Uuid::new_v4()));
+    let options = || Options {
+        model: Arc::new(UnusedModelForMode),
+        tools: vec![],
+        restart_limit: 3,
+        max_turns: 3,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let id;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(Arc::new(
+            GoogleAdapter::new_ordered_tool_blocks("http://127.0.0.1:1", "key").unwrap(),
+        ))
+        .unwrap();
+        id = h
+            .create_conversation(Config {
+                model: "gemini-3-flash".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.submit(id, None, "hello".into()).unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(Arc::new(GoogleAdapter::new(&endpoint, "key").unwrap()))
+            .unwrap();
+        let err = h
+            .resume(&CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("selected provider adapter unavailable"),
+            "{err}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    drop(listener);
+    let response = Box::leak(
+        sse(r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#)
+            .into_boxed_str(),
+    );
+    let (endpoint, server) = server(response, false).await;
+    {
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(Arc::new(
+            GoogleAdapter::new_ordered_tool_blocks(&endpoint, "key").unwrap(),
+        ))
+        .unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+    }
+    server.await.unwrap();
+    for suffix in ["", "-wal", "-shm", ".owner"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

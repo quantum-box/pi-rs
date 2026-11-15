@@ -1,0 +1,343 @@
+[
+  {
+    "name": "mixed-gemini3",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": "first"
+      },
+      {
+        "type": "image",
+        "data": "aGk=",
+        "mimeType": "image/png"
+      },
+      {
+        "type": "text",
+        "text": "last"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": "first\nlast"
+              },
+              "parts": [
+                {
+                  "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "aGk="
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "mixed-gemini25",
+    "model": "gemini-2.5-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": "first"
+      },
+      {
+        "type": "image",
+        "data": "aGk=",
+        "mimeType": "image/png"
+      },
+      {
+        "type": "text",
+        "text": "last"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "response": {
+                "output": "first\nlast"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Tool result image:"
+          },
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "aGk="
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "image-only",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "image",
+        "data": "aGk=",
+        "mimeType": "image/png"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": "(see attached image)"
+              },
+              "parts": [
+                {
+                  "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "aGk="
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "whitespace-image",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": " \t"
+      },
+      {
+        "type": "image",
+        "data": "aGk=",
+        "mimeType": "image/png"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": "(see attached image)"
+              },
+              "parts": [
+                {
+                  "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "aGk="
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "whitespace-only",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": "  "
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": ""
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "empty",
+    "model": "gemini-3-flash",
+    "blocks": [],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": ""
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "two-texts",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": "a"
+      },
+      {
+        "type": "text",
+        "text": "b"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": "a\nb"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "unknown-model",
+    "model": "custom-model",
+    "blocks": [
+      {
+        "type": "image",
+        "data": "aGk=",
+        "mimeType": "image/png"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "response": {
+                "output": "(see attached image)"
+              },
+              "parts": [
+                {
+                  "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "aGk="
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "js-bom-whitespace",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": "﻿"
+      },
+      {
+        "type": "image",
+        "data": "aGk=",
+        "mimeType": "image/png"
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": "(see attached image)"
+              },
+              "parts": [
+                {
+                  "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "aGk="
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "js-next-line-is-text",
+    "model": "gemini-3-flash",
+    "blocks": [
+      {
+        "type": "text",
+        "text": ""
+      }
+    ],
+    "expected": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "id": "c1",
+              "response": {
+                "output": ""
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+]

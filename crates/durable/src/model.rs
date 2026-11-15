@@ -119,7 +119,9 @@ pub trait ProviderAdapter: Send + Sync {
         }
         self.validate(attempt, &request.request, body)
     }
-    /// Explicitly opt in to encoding ordered tool result blocks without loss.
+    /// Explicitly opt in to consuming durable tool result blocks. An adapter must
+    /// document any provider-specific projection that combines or reorders them;
+    /// the durable transcript itself remains unchanged.
     fn supports_durable_tool_blocks(&self) -> bool {
         false
     }
@@ -138,7 +140,8 @@ pub trait ProviderAdapter: Send + Sync {
         self.prepare_durable(attempt, &request.request).await
     }
     /// Validate the exact body after provider hooks; tool-block adapters must
-    /// enforce preservation of every ordered block and associated call ID.
+    /// enforce the exact documented projection of each bound result and call ID,
+    /// including any intentionally lossy upstream-compatible projection.
     fn validate_with_tool_blocks(
         &self,
         attempt: &ProviderAttempt,
