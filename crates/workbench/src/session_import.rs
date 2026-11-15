@@ -188,7 +188,7 @@ pub(super) fn branch_selection(
                 if let Some(change) = change && let (Some(provider), Some(model)) = (change["provider"].as_str(), change["modelId"].as_str()) && catalog(provider, model) == Some(true) {
                     return selected(&change["provider"], &change["modelId"], thinking);
                 }
-                if let Some(message) = projection.raw_message(session.records(), record) {
+                if let Some(message) = projection.raw_message(session.records(), record, None) {
                     return selected(&message["provider"], &message["model"], thinking);
                 }
             }
@@ -1273,7 +1273,7 @@ mod tests {
         let mut cursor = super::super::rpc_entries::Cursor::default();
         cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
         cursor.advance(&session.records()[..(native - 1) as usize]);
-        let live = cursor.appended(session.records(), None);
+        let live = cursor.appended(session.records(), None, &Default::default());
         assert_eq!(changes, live);
         session.set_label(source, Some("source".into())).unwrap();
         session.set_label(native, Some("native".into())).unwrap();

@@ -1,6 +1,6 @@
 //! Project the native session transcript into the Pi RPC message format.
 mod anthropic;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pi_rs::{
     Event, Invocation, Message, ModelMetadata, ModelRequest, Record, Session, Usage, UsageReport,
@@ -9,6 +9,21 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::Provider;
+
+#[derive(Clone, Copy)]
+pub(super) enum MetadataSource<'a> {
+    Session(&'a Session),
+    Snapshot(&'a BTreeMap<u64, Value>),
+}
+
+impl<'a> MetadataSource<'a> {
+    fn get(self, id: u64) -> Option<&'a Value> {
+        match self {
+            Self::Session(session) => session.record_metadata(id),
+            Self::Snapshot(metadata) => metadata.get(&id),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ModelIdentity<'a> {
@@ -20,6 +35,8 @@ struct ModelIdentity<'a> {
 struct Finished<'a> {
     metadata: &'a ModelMetadata,
     usage: Option<Usage>,
+    successful: bool,
+    record_id: u64,
 }
 
 pub(super) fn pending_request(session: &Session) -> Option<Uuid> {
@@ -264,7 +281,13 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
             json!({"role":"compactionSummary","summary":summary,"tokensBefore":compaction_tokens(session, record),"timestamp":timestamp})
         } else {
-            projection.message(session.records(), record, &message, edited.contains(&id))
+            projection.message(
+                session.records(),
+                record,
+                &message,
+                edited.contains(&id),
+                Some(MetadataSource::Session(session)),
+            )
         };
         let value = imported_entries
             .get(&id)
@@ -458,7 +481,10 @@ impl Projection {
     fn finished<'a>(&self, records: &'a [Record], id: Uuid) -> Option<Finished<'a>> {
         let request = self.finished.get(&id)?;
         let Event::ModelFinished {
-            metadata, usage, ..
+            metadata,
+            usage,
+            failure,
+            ..
         } = &records[*request as usize - 1].event
         else {
             return None;
@@ -467,7 +493,12 @@ impl Projection {
             UsageReport::Measured { usage } => Some(*usage),
             _ => None,
         };
-        Some(Finished { metadata, usage })
+        Some(Finished {
+            metadata,
+            usage,
+            successful: failure.is_none(),
+            record_id: *request,
+        })
     }
 
     fn invocation<'a>(&self, records: &'a [Record], id: &Uuid) -> Option<&'a Invocation> {
@@ -502,12 +533,17 @@ impl Projection {
             calls: Vec::new(),
             replay: None,
         };
-        let mut value = self.message(records, &assistant_record, &message, false);
+        let mut value = self.message(records, &assistant_record, &message, false, None);
         value["stopReason"] = json!("aborted");
         Some(value)
     }
 
-    pub(super) fn raw_message(&self, records: &[Record], record: &Record) -> Option<Value> {
+    pub(super) fn raw_message(
+        &self,
+        records: &[Record],
+        record: &Record,
+        metadata: Option<MetadataSource<'_>>,
+    ) -> Option<Value> {
         let message = match &record.event {
             Event::User { content, .. } => Message::User {
                 content: content.clone(),
@@ -553,7 +589,7 @@ impl Projection {
             },
             _ => return None,
         };
-        Some(self.message(records, record, &message, false))
+        Some(self.message(records, record, &message, false, metadata))
     }
 
     fn message(
@@ -562,6 +598,7 @@ impl Projection {
         record: &Record,
         message: &Message,
         edited: bool,
+        metadata: Option<MetadataSource<'_>>,
     ) -> Value {
         let timestamp = record.timestamp_millis().unwrap_or_default();
         if let Event::CustomMessage { message: custom }
@@ -720,6 +757,17 @@ impl Projection {
                             calls,
                         )
                     })
+                {
+                    blocks = projected;
+                }
+                if !edited
+                    && api == "anthropic-messages"
+                    && let Some(projected) = finalized
+                        .filter(|entry| entry.successful)
+                        .and_then(|entry| {
+                            metadata.and_then(|metadata| metadata.get(entry.record_id))
+                        })
+                        .and_then(|metadata| anthropic::display_blocks(metadata, content, calls))
                 {
                     blocks = projected;
                 }
@@ -1060,8 +1108,13 @@ mod tests {
             is_error: false,
             is_structured: Some(true),
         };
-        let value =
-            Projection::default().message(std::slice::from_ref(&record), &record, &message, false);
+        let value = Projection::default().message(
+            std::slice::from_ref(&record),
+            &record,
+            &message,
+            false,
+            None,
+        );
         assert_eq!(value["content"], blocks);
         assert_eq!(value["nativeData"]["duration"], 3);
         assert_eq!(value["structuredContent"], json!({"answer":42}));

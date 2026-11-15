@@ -512,8 +512,10 @@ strings. The fullscreen and regular terminals also show the prepared tool and
 its partial path, command or pattern while the model streams it. Completed
 calls are still validated before execution. `get_messages` returns
 Pi message roles and blocks, with a correlated partial assistant message
-during streaming. Set `includeNative: true` to include the native model
-projection in `nativeMessages`. The `steer` and `follow_up` commands
+during streaming. Completed unsigned Anthropic responses retain bounded text
+and tool-call block order across session reopen when the stored layout matches
+the current message; provider continuation still uses its existing representation.
+Set `includeNative: true` to include the native model projection in `nativeMessages`. The `steer` and `follow_up` commands
 can queue input before the next prompt without starting the model. The same
 queue accepts prompts with `streamingBehavior` during a turn, expands prompt
 templates and skills, and emits `queue_update` as inputs are saved or consumed.
