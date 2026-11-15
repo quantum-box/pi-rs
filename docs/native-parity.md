@@ -2990,8 +2990,10 @@ Full workspace tests and all-target Clippy pass.
 
 An unrestricted local `read` of a missing path now reports the resolved path
 in Pi's `ENOENT: no such file or directory, access '…'` diagnostic. This also
-identifies the requested file when a parent directory is missing. Other I/O
-errors and restricted workspace path checks retain their existing behavior.
+identifies the requested file when a parent directory is missing. On Unix, a
+non-directory parent reports Pi's `ENOTDIR` access diagnostic with the requested
+path. Other I/O errors and restricted workspace path checks retain their existing
+behavior.
 
 ### Write and edit result checkpoint
 
