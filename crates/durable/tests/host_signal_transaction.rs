@@ -503,3 +503,367 @@ fn host_multi_signal_races_external_delivery_without_partial_commit() {
         assert!(document.is_none());
     }
 }
+
+fn setup_single(store: &Store, deadline: Option<i64>) -> Uuid {
+    let ts = TaskStore::new(store);
+    let task = Task::new(
+        Uuid::from_u128(11),
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("host-wake".into(), true);
+    ts.save(&[Save::Create(&task)]).unwrap();
+    ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+    ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+        task.wait(WaitFor::TypedSleep {
+            until_millis: deadline,
+            signals: vec![token().key("a").unwrap()],
+        })
+    })
+    .unwrap();
+    task.id()
+}
+
+#[test]
+fn host_staged_signal_atomically_wakes_single_key_and_reopens() {
+    use pi_rs_durable::task::{TaskState, TypedWake};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let id = setup_single(&store, Some(60_000));
+    let mut tx = HostTransaction::new(&store);
+    put(&mut tx, 1);
+    assert_eq!(
+        tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.wake_with_staged_signal(id).unwrap();
+    assert!(matches!(
+        tx.signal_at(id, &token(), "a", json!(2), 0),
+        Err(Error::SignalComposition)
+    ));
+    tx.commit().unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let task = ts.load(id).unwrap().unwrap().task;
+    assert_eq!(task.state(), &TaskState::Ready);
+    assert_eq!(
+        task.typed_wake(),
+        Some(&TypedWake::Signal(token().key("a").unwrap()))
+    );
+    let receipt = ts
+        .signal(id, task.delivered_signal().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(receipt.is_consumed());
+    assert_eq!(
+        ts.read_typed_signal(id, &token(), "a").unwrap(),
+        Some(json!(1))
+    );
+    assert_eq!(
+        Documents::new(&store)
+            .get(&address())
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        1
+    );
+    drop(store);
+    let mut registry = pi_rs_durable::task::scheduler::Registry::default();
+    registry.register("host-wake", true, |task: &Task| {
+        assert_eq!(
+            task.typed_wake(),
+            Some(&TypedWake::Signal(token().key("a").unwrap()))
+        );
+        Ok(pi_rs_durable::task::scheduler::Step::Succeed(json!(
+            "resumed"
+        )))
+    });
+    let mut scheduler = pi_rs_durable::task::scheduler::Scheduler::open(&path, registry).unwrap();
+    assert!(scheduler.tick(60_001).unwrap());
+    assert!(
+        matches!(scheduler.get(id).unwrap().unwrap().state(), TaskState::Succeeded(value) if *value == json!("resumed"))
+    );
+}
+
+#[test]
+fn host_staged_wake_rejects_unsupported_waits_and_preserves_delivery() {
+    let store = Store::memory().unwrap();
+    let id = setup(&store, None); // two-key wait
+    let mut tx = HostTransaction::new(&store);
+    assert!(matches!(
+        tx.wake_with_staged_signal(id),
+        Err(Error::SignalComposition)
+    ));
+    assert_eq!(
+        tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    assert!(tx.wake_with_staged_signal(id).is_err());
+    tx.commit().unwrap();
+    let ts = TaskStore::new(&store);
+    assert!(matches!(
+        ts.load(id).unwrap().unwrap().task.state(),
+        pi_rs_durable::task::TaskState::Waiting(_)
+    ));
+    assert_eq!(
+        ts.read_typed_signal(id, &token(), "a").unwrap(),
+        Some(json!(1))
+    );
+    // A committed duplicate is not a newly staged receipt and cannot be used.
+    let mut tx = HostTransaction::new(&store);
+    assert_eq!(
+        tx.signal_at(id, &token(), "a", json!(2), 0).unwrap(),
+        SignalResult::Duplicate
+    );
+    assert!(tx.wake_with_staged_signal(id).is_err());
+
+    let store = Store::memory().unwrap();
+    let single = setup_single(&store, None);
+    let ts = TaskStore::new(&store);
+    assert_eq!(
+        ts.deliver_signal_at(single, &token(), "a", json!(4), 0)
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    let mut tx = HostTransaction::new(&store);
+    assert_eq!(
+        tx.signal_at(single, &token(), "a", json!(5), 0).unwrap(),
+        SignalResult::Duplicate
+    );
+    assert!(tx.wake_with_staged_signal(single).is_err());
+    tx.commit().unwrap();
+    assert!(matches!(
+        ts.load(single).unwrap().unwrap().task.state(),
+        pi_rs_durable::task::TaskState::Waiting(_)
+    ));
+    assert_eq!(
+        ts.read_typed_signal(single, &token(), "a").unwrap(),
+        Some(json!(4))
+    );
+}
+
+#[test]
+fn host_staged_wake_conflicts_on_abort_or_competing_delivery() {
+    for mode in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let id = setup_single(&store, None);
+        let mut tx = HostTransaction::new(&store);
+        put(&mut tx, 1);
+        assert_eq!(
+            tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+            SignalResult::Delivered
+        );
+        tx.wake_with_staged_signal(id).unwrap();
+        let other = Store::open(&path).unwrap();
+        let ts = TaskStore::new(&other);
+        if mode == 0 {
+            let task = ts.load(id).unwrap().unwrap();
+            ts.update(&task, |task| task.cancel()).unwrap();
+        } else {
+            assert_eq!(
+                ts.deliver_signal_at(id, &token(), "a", json!(7), 0)
+                    .unwrap(),
+                SignalResult::Delivered
+            );
+        }
+        assert!(matches!(
+            tx.commit(),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        drop(other);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        assert_eq!(
+            TaskStore::new(&store)
+                .read_typed_signal(id, &token(), "a")
+                .unwrap(),
+            if mode == 0 { None } else { Some(json!(7)) }
+        );
+    }
+}
+
+#[test]
+fn host_staged_wake_cannot_cross_deadline() {
+    let store = Store::memory().unwrap();
+    let id = setup_single(&store, Some(20));
+    let mut tx = HostTransaction::new(&store);
+    put(&mut tx, 1);
+    assert_eq!(
+        tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.wake_with_staged_signal(id).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(matches!(
+        tx.commit(),
+        Err(Error::Store(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    assert_eq!(
+        TaskStore::new(&store)
+            .read_typed_signal(id, &token(), "a")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn host_staged_signal_wakes_single_typed_signal_wait() {
+    let store = Store::memory().unwrap();
+    let ts = TaskStore::new(&store);
+    let task = Task::new(
+        Uuid::from_u128(12),
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    ts.save(&[Save::Create(&task)]).unwrap();
+    ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+    ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+        task.wait(WaitFor::TypedSignal(token().key("a").unwrap()))
+    })
+    .unwrap();
+    let mut tx = HostTransaction::new(&store);
+    assert_eq!(
+        tx.signal_at(task.id(), &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.wake_with_staged_signal(task.id()).unwrap();
+    tx.commit().unwrap();
+    let task = ts.load(task.id()).unwrap().unwrap().task;
+    assert_eq!(task.state(), &pi_rs_durable::task::TaskState::Ready);
+    assert_eq!(task.typed_wake(), None);
+    assert!(
+        ts.signal(task.id(), task.delivered_signal().unwrap())
+            .unwrap()
+            .unwrap()
+            .is_consumed()
+    );
+}
+
+#[test]
+fn host_staged_wake_races_external_delivery_atomically() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let store = Store::open(&path).unwrap();
+    let id = setup_single(&store, None);
+    drop(store);
+    let barrier = Arc::new(Barrier::new(3));
+    let host_path = path.clone();
+    let host_barrier = barrier.clone();
+    let host = std::thread::spawn(move || {
+        let store = Store::open(host_path).unwrap();
+        let mut tx = HostTransaction::new(&store);
+        put(&mut tx, 1);
+        assert_eq!(
+            tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+            SignalResult::Delivered
+        );
+        tx.wake_with_staged_signal(id).unwrap();
+        host_barrier.wait();
+        tx.commit()
+    });
+    let other_path = path.clone();
+    let other_barrier = barrier.clone();
+    let other = std::thread::spawn(move || {
+        let store = Store::open(other_path).unwrap();
+        other_barrier.wait();
+        TaskStore::new(&store)
+            .deliver_signal_at(id, &token(), "a", json!(7), 0)
+            .unwrap()
+    });
+    barrier.wait();
+    let result = host.join().unwrap();
+    let other = other.join().unwrap();
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let task = ts.load(id).unwrap().unwrap().task;
+    let signal = ts.read_typed_signal(id, &token(), "a").unwrap();
+    let doc = Documents::new(&store).get(&address()).unwrap();
+    if result.is_ok() {
+        assert_eq!(other, SignalResult::Duplicate);
+        assert_eq!(signal, Some(json!(1)));
+        assert_eq!(task.state(), &pi_rs_durable::task::TaskState::Ready);
+        assert!(
+            ts.signal(id, task.delivered_signal().unwrap())
+                .unwrap()
+                .unwrap()
+                .is_consumed()
+        );
+        assert!(doc.is_some());
+    } else {
+        assert!(matches!(
+            result,
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(other, SignalResult::Delivered);
+        assert_eq!(signal, Some(json!(7)));
+        assert!(matches!(
+            task.state(),
+            pi_rs_durable::task::TaskState::Waiting(_)
+        ));
+        assert!(doc.is_none());
+    }
+}
+
+#[test]
+fn host_staged_wake_reconciles_prior_stale_task_read() {
+    let store = Store::memory().unwrap();
+    let id = setup_single(&store, None);
+    let mut key = b"durable/task/".to_vec();
+    key.extend_from_slice(id.as_bytes());
+    let entry = store.get(&key).unwrap().unwrap();
+    let mut tx = HostTransaction::new(&store);
+    put(&mut tx, 1);
+    tx.append(pi_rs_durable::task_store::OwnedBatch {
+        checks: vec![durable_store::Check {
+            key: key.clone(),
+            expected: Expected::Version(entry.version),
+        }],
+        mutations: vec![],
+    })
+    .unwrap();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        tx.signal_at(id, &token(), "a", json!(1), 0).unwrap(),
+        SignalResult::Delivered
+    );
+    tx.wake_with_staged_signal(id).unwrap();
+    assert!(matches!(
+        tx.commit(),
+        Err(Error::Store(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    let ts = TaskStore::new(&store);
+    assert!(matches!(
+        ts.load(id).unwrap().unwrap().task.state(),
+        pi_rs_durable::task::TaskState::Waiting(_)
+    ));
+    assert_eq!(ts.read_typed_signal(id, &token(), "a").unwrap(), None);
+}

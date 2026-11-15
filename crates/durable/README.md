@@ -497,10 +497,16 @@ Current limits and differences from upstream Pi Durable:
   multiple keys and repeated calls per target; repeated keys validate the new
   value and preserve the first accepted receipt. Calls remain provisional until
   commit, and the earliest deadline and all target/revision fences are enforced.
-  Target task writes in either order and raw signal-namespace writes are rejected.
-  Callers retry the entire transaction with a fresh clock after conflicts. Unlike
-  upstream `Tx`, sequential signal calls remain allowed after a staged delivery;
-  this API does not create or transition a signalled task in that commit.
+  `wake_with_staged_signal` can consume a newly staged delivery and wake its
+  target in the same commit, but only for a single-key `TypedSignal` or
+  `TypedSleep` wait. The receipt, wake reason, task and document writes commit
+  atomically; an abort, competing delivery or deadline conflict rolls all back.
+  Existing deliveries, multi-key waits, arbitrary task writes and raw
+  signal-namespace writes are excluded. After staging the wake, further signals
+  to that target are rejected. Callers retry the entire transaction with a fresh
+  clock after conflicts. Unlike upstream `Tx`, sequential signal calls remain
+  allowed after a staged delivery; the explicit atomic wake is a pi-rs API, not
+  a general upstream task-record replacement.
   Storage errors can have uncertain outcomes. Same-ID retries remain successful
   after task termination,
   while a new ID is rejected for a terminal task. Existing stores with

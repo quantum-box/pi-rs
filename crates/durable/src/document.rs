@@ -1176,8 +1176,8 @@ impl Transaction {
 }
 
 /// A store-bound checked host transaction with provisional typed deliveries.
-/// It supports multiple typed deliveries and rejects task writes for their
-/// targets, regardless of staging order.
+/// It supports multiple typed deliveries and an explicit single-key wake;
+/// arbitrary task writes for delivery targets remain excluded.
 pub struct HostTransaction<'a> {
     store: &'a Store,
     transaction: Transaction,
@@ -1220,7 +1220,8 @@ impl<'a> HostTransaction<'a> {
         self.transaction.append(batch)
     }
     /// Stage typed deliveries. Results remain provisional until commit.
-    /// Target task writes cannot be composed in either order.
+    /// Raw target task writes cannot be composed in either order; the
+    /// supported transition is `wake_with_staged_signal`.
     pub fn signal_at(
         &mut self,
         task_id: uuid::Uuid,
@@ -1238,6 +1239,41 @@ impl<'a> HostTransaction<'a> {
             .signal_at(self.store, task_id, token, key, value, now_millis)?;
         self.signal_targets.insert(target);
         Ok(result)
+    }
+    /// Atomically consume a newly staged delivery and wake its waiting task.
+    /// Only a single-key typed wait is supported. Further signal or raw task
+    /// writes to that target are rejected after staging this transition.
+    pub fn wake_with_staged_signal(&mut self, task_id: uuid::Uuid) -> Result<(), Error> {
+        let target = crate::task_store::key(task_id);
+        if !self.signal_targets.contains(&target) || self.transaction.written.contains(&target) {
+            return Err(Error::SignalComposition);
+        }
+        // Prepare in private copies so a failed validation cannot alter a
+        // previously staged delivery or any checked document writes.
+        let mut signals = OwnedBatch {
+            checks: self.signals.batch.checks.clone(),
+            mutations: self.signals.batch.mutations.clone(),
+        };
+        let mut graph = crate::task_store::TaskStore::new(self.store)
+            .prepare_staged_signal_wake(task_id, &mut signals)?;
+        let mut transaction = Transaction {
+            checks: self.transaction.checks.clone(),
+            mutations: self.transaction.mutations.clone(),
+            checked: self.transaction.checked.clone(),
+            written: self.transaction.written.clone(),
+        };
+        let mut existing = OwnedBatch {
+            checks: std::mem::take(&mut transaction.checks),
+            mutations: Vec::new(),
+        };
+        reconcile_task_checks(&mut signals, &mut graph);
+        reconcile_task_checks(&mut signals, &mut existing);
+        reconcile_task_checks(&mut graph, &mut existing);
+        transaction.checks = existing.checks;
+        transaction.append(graph)?;
+        self.signals.batch = signals;
+        self.transaction = transaction;
+        Ok(())
     }
     pub fn commit(mut self) -> Result<(), Error> {
         let mut existing = OwnedBatch {

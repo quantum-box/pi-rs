@@ -840,6 +840,63 @@ impl<'a> TaskStore<'a> {
         ))
     }
 
+    /// Prepare a wake from a newly staged delivery for a single-key typed wait.
+    /// The caller must commit the modified signal batch and returned task batch
+    /// together, reconciling their task and signal-revision fences.
+    pub(crate) fn prepare_staged_signal_wake(
+        &self,
+        task_id: Uuid,
+        signals: &mut OwnedBatch,
+    ) -> Result<OwnedBatch, Error> {
+        let snapshot = self.load(task_id)?.ok_or(Error::SignalTargetNotFound)?;
+        if snapshot.task.abort_requested() || snapshot.task.is_terminal() {
+            return Err(Error::SignalTargetClosed);
+        }
+        let (key, typed_sleep) = match snapshot.task.state() {
+            TaskState::Waiting(WaitFor::TypedSignal(key)) => (key, false),
+            TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) if signals.len() == 1 => {
+                (&signals[0], true)
+            }
+            _ => return Err(Error::InvalidOwnedBatch),
+        };
+        let prefix = signal_task_prefix(task_id);
+        let mut found: Option<(usize, Signal)> = None;
+        for (index, mutation) in signals.mutations.iter().enumerate() {
+            if let Mutation::Put {
+                key: stored_key,
+                value,
+            } = mutation
+                && stored_key.starts_with(&prefix)
+            {
+                let signal: Signal = serde_json::from_slice(value)?;
+                if signal.task_id != task_id {
+                    return Err(Error::InvalidOwnedBatch);
+                }
+                if signal.typed_key() == Some(key) {
+                    if signal.consumed || signal.expired || found.is_some() {
+                        return Err(Error::InvalidOwnedBatch);
+                    }
+                    found = Some((index, signal));
+                }
+            }
+        }
+        let (index, mut signal) = found.ok_or(Error::InvalidOwnedBatch)?;
+        let mut next = snapshot.clone();
+        next.task
+            .wake_with_signal(signal.id)
+            .map_err(Error::Transition)?;
+        if typed_sleep {
+            next.task
+                .set_typed_wake(crate::task::TypedWake::Signal(key.clone()));
+        }
+        let batch = self.prepare_save(&[Save::Update(&next)])?;
+        signal.consumed = true;
+        if let Mutation::Put { value, .. } = &mut signals.mutations[index] {
+            *value = serde_json::to_vec(&signal)?;
+        }
+        Ok(batch)
+    }
+
     /// Read a signal receipt, including whether it has been consumed.
     pub fn signal(&self, task_id: Uuid, id: Uuid) -> Result<Option<Signal>, Error> {
         self.store
