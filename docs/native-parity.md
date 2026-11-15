@@ -1406,6 +1406,10 @@ session ID validation remain in force, and arguments after `--` remain prompt
 text. Parser regressions cover these cases; a CLI fixture verifies that only
 the last named session is created.
 
+Repeated `--tools` and `-t` selections use the last value. Each selection is
+checked for mixed names and modifiers or wildcard modifiers, including an
+invalid selection followed by a valid one.
+
 ### Regular-mode redraw checkpoint
 
 Regular mode replays committed entries when visibility settings, theme colors
