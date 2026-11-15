@@ -1387,20 +1387,32 @@ fn command_cancellable(
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" => {
-            let provider_id = request.get("provider").map_or(args.provider.id(), |value| {
-                value.as_str().unwrap_or("undefined")
-            });
-            let model = request["modelId"].as_str().unwrap_or("undefined");
+            let provider_value = request.get("provider");
+            let model_field = request.get("modelId");
+            let (Some(provider_id), Some(model)) = (
+                provider_value.map_or(Some(args.provider.id()), Value::as_str),
+                model_field.and_then(Value::as_str),
+            ) else {
+                let display = |value: Option<&Value>| match value {
+                    Some(value) => js_command_string(value),
+                    None => Ok("undefined".into()),
+                };
+                return Err(Error::Config(format!(
+                    "Model not found: {}/{}",
+                    match provider_value {
+                        Some(value) => display(Some(value))?,
+                        None => args.provider.id().to_owned(),
+                    },
+                    display(model_field)?
+                )));
+            };
             let not_found = || Error::Config(format!("Model not found: {provider_id}/{model}"));
             let provider = args
                 .model_profiles
                 .provider(provider_id)
                 .filter(|provider| provider.id() == provider_id)
                 .ok_or_else(not_found)?;
-            if request["modelId"]
-                .as_str()
-                .is_none_or(|model| model.is_empty())
-            {
+            if model.is_empty() {
                 return Err(not_found());
             }
             let value = if args
@@ -2920,6 +2932,28 @@ mod tests {
         .unwrap();
         args.provider = args.model_profiles.provider("ollama").unwrap();
         args.model = "vision".into();
+        for (request, expected) in [
+            (
+                json!({"type":"set_model", "provider":"ollama"}),
+                "Model not found: ollama/undefined",
+            ),
+            (
+                json!({"type":"set_model", "provider":null, "modelId":"text"}),
+                "Model not found: null/text",
+            ),
+            (
+                json!({"type":"set_model", "provider":{}, "modelId":"text"}),
+                "Model not found: [object Object]/text",
+            ),
+            (
+                json!({"type":"set_model", "provider":"ollama", "modelId":[1,null,2]}),
+                "Model not found: ollama/1,,2",
+            ),
+        ] {
+            let error = command(&request, &mut args, &mut None).unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message == expected));
+            assert_eq!(args.model, "vision");
+        }
         let selected = command(
             &json!({"type":"set_model", "provider":"ollama", "modelId":"text"}),
             &mut args,
@@ -2933,6 +2967,14 @@ mod tests {
             .unwrap();
         assert_eq!(state["model"]["id"], "text");
         assert_eq!(state["model"]["input"], json!(["text"]));
+        let selected = command(
+            &json!({"type":"set_model", "modelId":"vision"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["id"], "vision");
     }
 
     #[test]
