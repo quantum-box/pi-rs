@@ -279,9 +279,7 @@ fn wire_request(
         replay_scope,
         None,
         None,
-        false,
-        None,
-        true,
+        (false, None, true),
     )
 }
 
@@ -291,10 +289,9 @@ fn wire_request_with_blocks(
     replay_scope: &str,
     durable: Option<&DurableRequest>,
     tools: Option<&DurableToolRequest>,
-    ordered_tool_blocks: bool,
-    tool_errors: Option<&BTreeMap<usize, bool>>,
-    image_input: bool,
+    options: (bool, Option<&BTreeMap<usize, bool>>, bool),
 ) -> Result<Value> {
+    let (ordered_tool_blocks, tool_errors, image_input) = options;
     if let Some(durable) = durable {
         let mut ids = BTreeSet::new();
         if durable.blocks.iter().any(|(index, binding)| {
@@ -676,9 +673,11 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(&inner.request),
             Some(inner),
-            self.ordered_tool_blocks,
-            Some(&request.tool_errors),
-            self.accepts_tool_images(&inner.request.request.model),
+            (
+                self.ordered_tool_blocks,
+                Some(&request.tool_errors),
+                self.accepts_tool_images(&inner.request.request.model),
+            ),
         )
     }
     fn validate_with_result_metadata(
@@ -696,9 +695,11 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(&inner.request),
             Some(inner),
-            self.ordered_tool_blocks,
-            Some(&request.tool_errors),
-            self.accepts_tool_images(&inner.request.request.model),
+            (
+                self.ordered_tool_blocks,
+                Some(&request.tool_errors),
+                self.accepts_tool_images(&inner.request.request.model),
+            ),
         )?;
         if body.get("contents") != expected.get("contents") {
             return Err(Error::Config(
@@ -725,9 +726,11 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(&request.request),
             Some(request),
-            self.ordered_tool_blocks,
-            None,
-            self.accepts_tool_images(&request.request.request.model),
+            (
+                self.ordered_tool_blocks,
+                None,
+                self.accepts_tool_images(&request.request.request.model),
+            ),
         )
     }
     fn validate_with_tool_blocks(
@@ -744,9 +747,11 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(&request.request),
             Some(request),
-            self.ordered_tool_blocks,
-            None,
-            self.accepts_tool_images(&request.request.request.model),
+            (
+                self.ordered_tool_blocks,
+                None,
+                self.accepts_tool_images(&request.request.request.model),
+            ),
         )?;
         if body.get("contents") != expected.get("contents") {
             return Err(Error::Config("provider hook changed durable input".into()));
@@ -770,9 +775,11 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             Some(request),
             None,
-            false,
-            None,
-            self.accepts_tool_images(&request.request.model),
+            (
+                false,
+                None,
+                self.accepts_tool_images(&request.request.model),
+            ),
         )
     }
     fn validate_durable(
@@ -790,9 +797,11 @@ impl ProviderAdapter for GoogleAdapter {
                     "google",
                     Some(request),
                     None,
-                    false,
-                    None,
-                    self.accepts_tool_images(&request.request.model),
+                    (
+                        false,
+                        None,
+                        self.accepts_tool_images(&request.request.model),
+                    ),
                 )?
                 .get("contents")
         {
@@ -817,9 +826,7 @@ impl ProviderAdapter for GoogleAdapter {
             "google",
             None,
             None,
-            false,
-            None,
-            self.accepts_tool_images(&request.model),
+            (false, None, self.accepts_tool_images(&request.model)),
         )
     }
     fn validate(&self, _: &ProviderAttempt, request: &ModelRequest, body: &Value) -> Result<()> {
