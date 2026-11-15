@@ -1676,7 +1676,7 @@ impl BashOperations for LocalBashOperations {
             }
         };
         tokio::pin!(deadline);
-        while status.is_none() || stdout_open || stderr_open {
+        'drain: while status.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
@@ -1692,12 +1692,22 @@ impl BashOperations for LocalBashOperations {
                     let count = count?; stdout_open = count != 0;
                     if count != 0 {
                         if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                            _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                            _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
-                            result = output.send(stdout_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                                result = process.wait(), if status.is_none() => {
+                                    status = Some(result?);
+                                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                                },
+                                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break 'drain,
+                                result = output.send(stdout_buffer[..count].to_vec()) => {
+                                    if result.is_err() { return Err(Error::Cancelled); }
+                                    break;
+                                },
+                            }
                         }
                     }
                 },
@@ -1705,12 +1715,22 @@ impl BashOperations for LocalBashOperations {
                     let count = count?; stderr_open = count != 0;
                     if count != 0 {
                         if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                            _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                            _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
-                            result = output.send(stderr_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                                result = process.wait(), if status.is_none() => {
+                                    status = Some(result?);
+                                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                                },
+                                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break 'drain,
+                                result = output.send(stderr_buffer[..count].to_vec()) => {
+                                    if result.is_err() { return Err(Error::Cancelled); }
+                                    break;
+                                },
+                            }
                         }
                     }
                 },
