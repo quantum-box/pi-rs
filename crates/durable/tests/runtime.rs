@@ -1844,7 +1844,7 @@ async fn streamed_tool_replay_is_fenced_by_attempt_and_reopened_result() {
 }
 
 #[tokio::test]
-async fn interrupted_unsafe_stream_is_not_promoted_or_replayed() {
+async fn interrupted_unsafe_stream_is_preserved_without_replay() {
     use pi_rs_durable::runtime::Scheduler;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
@@ -1876,7 +1876,7 @@ async fn interrupted_unsafe_stream_is_not_promoted_or_replayed() {
             .unwrap()
             .messages
             .iter()
-            .any(|m| matches!(m, Message::Tool { content, .. } if !content.contains("first")))
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("first")))
     );
     scheduler.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();

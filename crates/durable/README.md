@@ -162,8 +162,10 @@ conversation version and attempt identity. A safe replay gets a fresh record,
 not the previous attempt's text. `streamed_output::load` reads committed text
 by attempt UUID after reopen, but the record is not a terminal result and records
 are not automatically deleted. The final result and extension state use the
-existing atomic conversation transition. Reopening an interrupted unsafe call
-does not promote the record into an error result. Nested calls cannot use this
+existing atomic conversation transition. When recovery produces an interruption
+or restart-limit error result, it includes the last committed text from the
+same attempt before the error message. The explicit reconciliation policy still
+blocks for host resolution and does not publish an error result. Nested calls cannot use this
 adapter because they do not have this runtime's model-issued attempt fence.
 Legacy running calls without an attempt identity also fail closed. There is no
 line limit, tail retention, truncation diagnostic, streamed details fallback, or
