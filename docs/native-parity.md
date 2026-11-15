@@ -1096,6 +1096,9 @@ files are not rewritten. Tests cover discovery, invocation and the size limit.
 Skill invocation uses the same replacement decoding as discovery. Skill and
 prompt frontmatter each strip one leading BOM and use ECMAScript whitespace
 when trimming a delimited body, matching Pi.
+Skill discovery keeps the selected symlink path for the skill name, displayed
+location and relative references. Canonical paths are still used to deduplicate
+aliases to the same file.
 
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
