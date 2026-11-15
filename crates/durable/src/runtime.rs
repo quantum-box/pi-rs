@@ -13551,6 +13551,26 @@ pub(crate) async fn drive_scheduled<'a>(
             };
         }
         let state = worker.conversation(id)?;
+        if state.nested_suspended() && !state.abort_requested {
+            // No parent dispatch remains alive after the suspension commit.
+            // Never wait for the nested poll lock while holding the worker:
+            // another driver may be finishing a poll and need this lock.
+            drop(guard.take());
+            let retry = poll_suspended_nested(worker, id, cancel).await?;
+            if !retry || cancel.is_cancelled() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => (),
+            }
+            *guard = Some(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                guard = lock.lock() => guard,
+            });
+            continue;
+        }
         let should_poll = if state.abort_requested && !matches!(state.phase, Phase::Blocked { .. })
         {
             true
@@ -13620,6 +13640,77 @@ pub(crate) async fn drive_scheduled<'a>(
             errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         }
     }
+}
+
+/// Poll accepted nested jobs without holding the conversation worker mutex.
+/// The per-conversation poll mutex avoids overlapping poll rounds; the abort
+/// gate fences every poll and every version-checked result commit.
+async fn poll_suspended_nested(
+    worker: &Harness,
+    id: Uuid,
+    cancel: &CancellationToken,
+) -> Result<bool, Error> {
+    let control = worker.owner.conversation_controls().get(id);
+    let _poll = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(false),
+        guard = control.nested_poll.lock() => guard,
+    };
+    let (state, version) = worker.load(id)?;
+    if state.abort_requested || !state.nested_suspended() {
+        return Ok(false);
+    }
+    let Phase::Blocked { operation_id, .. } = &state.phase else {
+        return Ok(false);
+    };
+    let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
+    if jobs.is_empty() {
+        return worker.prepare_nested_resume(&mut state.clone());
+    }
+    let tools = worker.resolved_tools(&state)?;
+    let mut polls = Vec::new();
+    for job in jobs {
+        let Some(reg) = tools.get(job.name()) else {
+            continue;
+        };
+        if !caller_allowed(&state, job.name(), false)
+            || reg.replay != job.policy()
+            || !reg.tool.can_poll()
+        {
+            continue;
+        }
+        let tool = reg.tool.clone();
+        let gate = worker.execution_gate.as_ref();
+        let schemas = &state.tool_filters.output_schemas;
+        let owner = &worker.owner;
+        polls.push(async move {
+            let polled = fenced_poll(
+                std::panic::AssertUnwindSafe(crate::poll::poll_once(
+                    tool.as_ref(), job.operation(), job.reference(), cancel, Duration::from_secs(120),
+                )).catch_unwind(),
+                gate,
+                cancel,
+            ).await;
+            let outcome = match polled {
+                Some(Ok(crate::poll::PollResult::Outcome(Outcome::Unknown(_)))) => return Ok(false),
+                Some(Ok(crate::poll::PollResult::Outcome(outcome))) => outcome,
+                Some(Err(panic)) => { crate::extension::discard_panic_payload(panic); return Ok(false); },
+                _ => return Ok(false),
+            };
+            match fenced_poll(async move {
+                job.commit(owner.store(), Harness::key(id), version, outcome, schemas)
+            }, gate, cancel).await {
+                Some(Ok(())) | Some(Err(Error::Storage(durable_store::Error::Conflict { .. }))) => Ok(true),
+                Some(Err(error)) => Err(error),
+                None => Ok(false),
+            }
+        });
+    }
+    let mut retry = false;
+    for result in futures_util::future::join_all(polls).await {
+        retry |= result?;
+    }
+    Ok(retry)
 }
 
 // Serialize polling of effectful futures with the durable abort commit. Once
@@ -18569,6 +18660,94 @@ mod scheduler_tests {
             })])
             .boxed())
         }
+    }
+    #[tokio::test]
+    async fn suspended_nested_poll_releases_actual_conversation_worker_lock() {
+        struct Parent;
+        #[async_trait::async_trait]
+        impl crate::keyed_tool::KeyedTool for Parent {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "barrier".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                _: pi_rs_core::ToolContext,
+                _: Option<&pi_rs_core::ExtensionState>,
+                host: crate::keyed_tool::KeyedHost,
+            ) -> pi_rs_core::ToolReply {
+                assert!(matches!(
+                    host.call_keyed_unpolled("child", "child", serde_json::json!({}))
+                        .await,
+                    Outcome::Pending { .. }
+                ));
+                host.suspend_pending().unwrap();
+                Outcome::Succeeded("ignored".into()).into()
+            }
+        }
+        struct Child(Arc<Semaphore>);
+        #[async_trait::async_trait]
+        impl Tool for Child {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "child".into(),
+                    description: "".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn invoke(&self, _: serde_json::Value, _: pi_rs_core::ToolContext) -> Outcome {
+                Outcome::Pending {
+                    reference: "job".into(),
+                }
+            }
+            fn can_poll(&self) -> bool {
+                true
+            }
+            async fn poll(&self, _: &str, _: pi_rs_core::ToolContext) -> Option<Outcome> {
+                self.0.add_permits(1);
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(Semaphore::new(0));
+        let parent = Arc::new(crate::keyed_tool::KeyedToolAdapter::new(Parent));
+        let opts = Options {
+            model: Arc::new(ToolModel),
+            tools: vec![
+                parent.register(ReplayPolicy::Safe),
+                RegisteredTool {
+                    tool: Arc::new(Child(entered.clone())),
+                    replay: ReplayPolicy::Unsafe,
+                },
+            ],
+            restart_limit: 5,
+            max_turns: 5,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut scheduler = Scheduler::open(dir.path().join("db"), opts).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let control = scheduler.harness.owner.conversation_controls().get(id);
+        let guard = control
+            .worker
+            .try_lock()
+            .expect("poll held conversation worker");
+        drop(guard);
+        scheduler.abort(id).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
     }
     struct BarrierTool {
         started: Arc<Semaphore>,

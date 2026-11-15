@@ -388,16 +388,24 @@ An opt-in keyed parent can instead call `call_keyed_unpolled` and then
 `suspend_pending`. Once its invocation has returned and the nested host has
 sealed and joined local calls, the existing blocked-operation transition
 persists an explicit suspension marker and releases the conversation worker.
-For a replay-safe parent without selected extensions, an authoritative host
-can resolve all pending references and the scheduler replays the parent using
-the existing keyed journal. Reopen leaves the parent parked until resolution;
-abort fences replay and retains unresolved references for reconciliation.
+For a replay-safe parent without selected extensions, the scheduler polls
+pending children whose registered tools opt in to polling, commits their results
+with conversation and child version checks, and automatically replays the
+parent after all children have terminal results. Polling releases the parent
+conversation worker; process-local poll rounds are serialized, while children
+in a round are polled concurrently. Reopen resumes polling without redispatching
+the accepted jobs. Abort fences polling and replay and retains unresolved
+references for reconciliation. Selected extensions still prevent creating an
+automatic replay candidate, including after reopening or a manually confirmed
+child result; extension hooks do not yet have a replay fence for this path.
 This is a restricted external-pending-job bridge: it does not start an
-independent task, automatically poll or cancel a remote job, store a tool
-checkpoint, implement wait-any, or connect the private `nested_suspension`
-protocol to `TaskTool`. Abort can remain blocked until a host confirms child
-outcomes and reconciles the parent. A crash before the blocked transition is
-an interrupted tool attempt, subject to the normal replay policy. See
+independent task, cancel a remote job, store a tool checkpoint, implement
+wait-any, or connect the private `nested_suspension` protocol to `TaskTool`.
+Tools without polling support and unavailable, timed-out, panicking or uncertain
+polls remain blocked for a later retry or host reconciliation. Abort can remain
+blocked until a host confirms child outcomes and reconciles the parent. A crash
+before the blocked transition is an interrupted tool attempt, subject to the
+normal replay policy. See
 [suspension tests](../crates/durable/tests/nested_explicit_suspend.rs).
 
 A private versioned nested-suspension record now persists a bounded immutable

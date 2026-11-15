@@ -17,6 +17,8 @@ use uuid::Uuid;
 pub struct Control {
     pub gate: Arc<Mutex<()>>,
     pub worker: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes autonomous nested polling without holding the conversation worker.
+    pub nested_poll: Arc<tokio::sync::Mutex<()>>,
     /// Next periodic drive, shared by all owners of this conversation.
     /// Read or update only while holding `worker`.
     pub next_poll: Arc<Mutex<Option<Instant>>>,
@@ -56,6 +58,7 @@ impl ConversationControls {
             .or_insert_with(|| Control {
                 gate: Arc::new(Mutex::new(())),
                 worker: Arc::new(tokio::sync::Mutex::new(())),
+                nested_poll: Arc::new(tokio::sync::Mutex::new(())),
                 next_poll: Arc::new(Mutex::new(None)),
                 cancel: self.root.child_token(),
                 cleanup_cancel: CancellationToken::new(),
@@ -159,11 +162,13 @@ mod tests {
             .unwrap();
         assert!(first.cancel.is_cancelled());
         assert!(first.cleanup_cancel.is_cancelled());
-        assert!(!attached
-            .conversation_controls()
-            .get(id)
-            .cleanup_cancel
-            .is_cancelled());
+        assert!(
+            !attached
+                .conversation_controls()
+                .get(id)
+                .cleanup_cancel
+                .is_cancelled()
+        );
         attached.conversation_controls().root().cancel();
         let cleanup = attached.conversation_controls().get(id);
         assert!(cleanup.cancel.is_cancelled());
@@ -172,12 +177,14 @@ mod tests {
         drop(owner);
         let reopened = OwnedStore::open(&path).unwrap();
         let fresh = reopened.conversation_controls().get(id);
-        assert!(reopened
-            .conversation_controls()
-            .worker_errors()
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(
+            reopened
+                .conversation_controls()
+                .worker_errors()
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         assert!(!fresh.cancel.is_cancelled());
         assert!(!Arc::ptr_eq(&first.gate, &fresh.gate));
     }

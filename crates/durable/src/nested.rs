@@ -69,6 +69,93 @@ pub struct PendingJob {
     pub reference: String,
 }
 
+/// A versioned observation used by the autonomous poller. The reference is
+/// opaque, and both the conversation and record versions fence its result.
+pub(crate) struct PendingPoll {
+    key: Vec<u8>,
+    version: u64,
+    record: Record,
+}
+
+impl PendingPoll {
+    pub(crate) fn name(&self) -> &str {
+        &self.record.name
+    }
+    pub(crate) fn policy(&self) -> ReplayPolicy {
+        self.record.policy
+    }
+    pub(crate) fn operation(&self) -> Uuid {
+        self.record.operation_id
+    }
+    pub(crate) fn reference(&self) -> &str {
+        match self.record.outcome.as_ref() {
+            Some(Outcome::Pending { reference }) => reference,
+            _ => unreachable!("pending snapshot"),
+        }
+    }
+
+    pub(crate) fn commit(
+        self,
+        store: &durable_store::Store,
+        conversation_key: Vec<u8>,
+        conversation_version: u64,
+        outcome: Outcome,
+        schemas: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<(), crate::runtime::Error> {
+        if matches!(outcome, Outcome::Unknown(_)) {
+            return Err(crate::runtime::Error::Invalid(
+                "uncertain nested poll".into(),
+            ));
+        }
+        let reference = self.reference().to_owned();
+        let outcome = validate_nested_output(schemas, &self.record.name, outcome);
+        let mut record = self.record;
+        record.outcome = Some(outcome.clone());
+        if !matches!(outcome, Outcome::Pending { .. }) {
+            record.resolution = Some(Resolution {
+                reference,
+                outcome,
+                cancelled: false,
+            });
+        }
+        store.commit(
+            &[
+                Check {
+                    key: conversation_key,
+                    expected: Expected::Version(conversation_version),
+                },
+                Check {
+                    key: self.key.clone(),
+                    expected: Expected::Version(self.version),
+                },
+            ],
+            &[Mutation::Put {
+                key: self.key,
+                value: serde_json::to_vec(&record)?,
+            }],
+        )?;
+        Ok(())
+    }
+}
+
+pub(crate) fn pending_polls(
+    store: &durable_store::Store,
+    root: Uuid,
+) -> Result<Vec<PendingPoll>, crate::runtime::Error> {
+    let mut jobs = Vec::new();
+    for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if matches!(record.outcome, Some(Outcome::Pending { .. })) {
+            jobs.push(PendingPoll {
+                key,
+                version: entry.version,
+                record,
+            });
+        }
+    }
+    Ok(jobs)
+}
+
 pub(crate) fn pending_jobs(
     store: &durable_store::Store,
     root: Uuid,
