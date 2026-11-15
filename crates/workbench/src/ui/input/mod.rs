@@ -61,6 +61,9 @@ impl Reader {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self)
     }
+    pub fn new_for_handoff() -> std::io::Result<Self> {
+        Self::new()
+    }
     pub fn drain(&mut self, max: Duration, idle: Duration) -> std::io::Result<()> {
         drain_until_idle(max, idle, |timeout| {
             self.next(timeout).map(|event| event.is_some())

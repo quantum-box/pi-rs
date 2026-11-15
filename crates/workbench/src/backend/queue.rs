@@ -276,7 +276,7 @@ impl Processor {
                 })
                 .await
                 .map_err(|error| Error::Config(error.to_string()))??;
-                Ok(json!({"mode":mode}))
+                Ok(Value::Null)
             }
             .await;
             control_response(mode_command(kind), id, result);

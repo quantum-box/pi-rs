@@ -324,10 +324,30 @@ impl Ollama {
                 .requires_reasoning_content_on_assistant_messages
                 == Some(true)
         {
-            first["reasoning_content"] = json!(reasoning.unwrap_or_default());
+            first["reasoning_content"] = json!(if self.compatibility.requires_thinking_as_text
+                == Some(true)
+            {
+                ""
+            } else {
+                reasoning.as_deref().unwrap_or_default()
+            });
         }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
+        }
+        if edited_reasoning.is_empty()
+            && self.supports_reasoning != Some(false)
+            && self.compatibility.requires_thinking_as_text == Some(true)
+            && let Some(text) = reasoning.as_deref().filter(|text| !text.trim().is_empty())
+        {
+            let mut parts = vec![json!({"type":"text","text":text})];
+            if let Some(content) = first["content"]
+                .as_str()
+                .filter(|content| !content.is_empty())
+            {
+                parts.push(json!({"type":"text","text":content}));
+            }
+            first["content"] = json!(parts);
         }
         if !edited_reasoning.is_empty() && self.supports_reasoning != Some(false) {
             let text = edited_reasoning
@@ -698,7 +718,9 @@ impl Model for Ollama {
                     )))
                 })
             });
-            let visible_extra = if self.compatibility.requires_thinking_as_text == Some(true) {
+            let visible_extra = if self.supports_reasoning != Some(false)
+                && self.compatibility.requires_thinking_as_text == Some(true)
+            {
                 if let Message::Assistant {
                     replay: Some(replay),
                     ..
@@ -707,16 +729,33 @@ impl Model for Ollama {
                     if replay.identity == self.replay_identity(&request.model)
                         && replay.supports_api(ModelApi::OpenaiCompletions)
                     {
-                        replay
+                        if replay
                             .blocks
                             .iter()
-                            .filter(|b| b["type"] == "context_edit_reasoning")
-                            .filter_map(|b| b["text"].as_str())
-                            .fold(0u64, |sum, text| {
-                                sum.saturating_add(pi_rs_core::estimate_replay_tokens(&[json!(
-                                    text
-                                )]))
-                            })
+                            .any(|b| b["type"] == "context_edit_reasoning")
+                        {
+                            replay
+                                .blocks
+                                .iter()
+                                .filter(|b| b["type"] == "context_edit_reasoning")
+                                .filter_map(|b| b["text"].as_str())
+                                .fold(0u64, |sum, text| {
+                                    sum.saturating_add(pi_rs_core::estimate_replay_tokens(&[
+                                        json!(text),
+                                    ]))
+                                })
+                        } else {
+                            replay
+                                .blocks
+                                .iter()
+                                .rev()
+                                .find(|b| b["type"] == "reasoning_content")
+                                .and_then(|b| b["text"].as_str())
+                                .filter(|text| !text.trim().is_empty())
+                                .map_or(0, |text| {
+                                    pi_rs_core::estimate_replay_tokens(&[json!(text)])
+                                })
+                        }
                     } else {
                         0
                     }
@@ -746,10 +785,11 @@ impl Model for Ollama {
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
         let preserve_details = self.compatibility.preserves_reasoning_details();
         let preserve_reasoning = self.supports_reasoning != Some(false)
-            && self
+            && (self
                 .compatibility
                 .requires_reasoning_content_on_assistant_messages
-                == Some(true);
+                == Some(true)
+                || self.compatibility.requires_thinking_as_text == Some(true));
         let mut last_progress = None;
         report_progress(
             &self.progress,
@@ -1205,6 +1245,101 @@ struct CallDelta {
 
 #[cfg(test)]
 mod content_tests {
+    #[tokio::test]
+    async fn thinking_as_text_replays_streamed_reasoning() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}]}),
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model = Ollama::new(&format!("http://{address}"), None)
+            .unwrap()
+            .with_chat_compatibility(
+                serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+                Some(true),
+                true,
+                true,
+            );
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let events = model
+            .stream(request.clone())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let replay = events
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.unwrap() {
+                ModelEvent::Metadata(metadata) => metadata.replay,
+                _ => None,
+            })
+            .expect("reasoning replay");
+        let message = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: Some(replay.clone()),
+        };
+        let encoded = model.compatible_message(message, &model.replay_identity("m"));
+        assert_eq!(
+            encoded[0]["content"],
+            json!([{"type":"text","text":"internal"},{"type":"text","text":"answer"}])
+        );
+        assert_eq!(encoded[0]["tool_calls"][0]["id"], "call");
+        let thinking_only = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: Some(replay),
+        };
+        assert_eq!(
+            model.compatible_message(thinking_only.clone(), &model.replay_identity("m"))[0]["content"],
+            json!([{"type":"text","text":"internal"}])
+        );
+        let mut long = thinking_only.clone();
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut long
+        {
+            replay.blocks[0]["text"] = json!("x".repeat(5000));
+        }
+        assert!(model.estimate_message_tokens(&request, &long) > 1000);
+        let no_reasoning = model.clone().with_chat_compatibility(
+            serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+            Some(false),
+            true,
+            true,
+        );
+        assert_eq!(
+            no_reasoning.estimate_message_tokens(&request, &long),
+            pi_rs_core::estimate_message_tokens(&long)
+        );
+        assert!(
+            model
+                .compatible_message(thinking_only, &model.replay_identity("other"))
+                .is_empty()
+        );
+        worker.join().unwrap();
+    }
+
     #[tokio::test]
     async fn configured_thinking_budget_is_sent_on_wire() {
         use std::io::{Read, Write};

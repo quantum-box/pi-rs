@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod anthropic_auth;
 mod attachments;
 mod auth_cli;
 mod auth_lock;
@@ -128,6 +129,8 @@ struct Cli {
     selection_events: Vec<pi_rs::LifecycleEvent>,
     #[arg(skip)]
     trusted: bool,
+    #[arg(skip)]
+    mcp_login_cancel: CancellationToken,
     #[arg(skip)]
     trust_pending: bool,
     /// Load this project's executable configuration.
@@ -1133,7 +1136,7 @@ enum Command {
     Package(packages::PackageCommand),
     Mcp {
         #[command(subcommand)]
-        command: mcp_config::McpCommand,
+        command: Box<mcp_config::McpCommand>,
     },
     /// Check or print a configured provider credential.
     Auth {
@@ -1303,8 +1306,11 @@ fn main() {
 async fn run_cli() -> i32 {
     // Register before parsing or starting any operation, including auth commands.
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
+    let mcp_login_cancel = CancellationToken::new();
+    let signal_cancel = mcp_login_cancel.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
             let _ = signal_tx.send(());
         }
     });
@@ -1326,6 +1332,7 @@ async fn run_cli() -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.mcp_login_cancel = mcp_login_cancel;
         args.extension_flags = extension_flags;
         if let Some(paths) = &args.export_session {
             return export_from_file(paths);
@@ -1461,6 +1468,7 @@ async fn run_cli() -> i32 {
         let managed = args.list_models.is_none() && matches!(&args.command,
             None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
         );
+        let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
         if managed {
@@ -1470,6 +1478,10 @@ async fn run_cli() -> i32 {
                 result = &mut execution => result,
                 _ = ready_rx => execution.await,
             }
+        } else if mcp_login {
+            // Login handles cancellation itself so an in-progress credential
+            // commit can finish and its result can be reported.
+            execution.await
         } else {
             tokio::select! {
                 result = &mut execution => result,
@@ -1591,7 +1603,15 @@ async fn execute(
         );
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
-        model_selection::catalogs(&args, true).await?
+        if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
+        {
+            tokio::select! {
+                result = model_selection::catalogs(&args, true) => result?,
+                _ = args.mcp_login_cancel.cancelled() => return Err(Error::Cancelled),
+            }
+        } else {
+            model_selection::catalogs(&args, true).await?
+        }
     } else if needs_default_model {
         vec![
             model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
@@ -1693,7 +1713,7 @@ async fn execute(
         return backend::run(args, ready).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
-        return mcp_config::command(&args, command.clone()).await;
+        return mcp_config::command(&args, command.as_ref().clone()).await;
     }
     match args.command.as_ref() {
         Some(Command::Login {
@@ -2715,6 +2735,11 @@ fn metadata(record: &pi_rs::Record) -> Value {
             json!({"event":"branch_summary", "from":from, "target":target, "usage":usage})
         }
         Event::UserImages { images } => json!({"event":"user_images","images":images.len()}),
+        Event::ImportedUnattributedToolResult {
+            call_id, tool_name, ..
+        } => {
+            json!({"event":"imported_unattributed_tool_result","call_id":call_id,"tool_name":tool_name})
+        }
         Event::SourceEntry { format, .. } => json!({"event":"source_entry","format":format}),
         Event::SystemCheckpoint {
             sections,

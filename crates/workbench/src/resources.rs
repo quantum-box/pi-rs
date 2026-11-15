@@ -1,6 +1,7 @@
 //! Context files, discoverable skills, and non-executable prompt templates.
 use super::Cli;
 use pi_rs::{Error, Result};
+use pi_rs_workbench::prompt_template_arguments::expand_arguments;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -790,80 +791,6 @@ fn is_prompt_space(character: char) -> bool {
     (character.is_whitespace() && character != '\u{0085}') || character == '\u{feff}'
 }
 
-fn parse_arguments(arguments: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut has_token = false;
-    let mut quote = None;
-    for character in arguments.chars() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            } else {
-                current.push(character);
-            }
-        } else if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            has_token = true;
-        } else if is_prompt_space(character) {
-            if std::mem::take(&mut has_token) {
-                args.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(character);
-            has_token = true;
-        }
-    }
-    if has_token {
-        args.push(current);
-    }
-    args
-}
-
-fn expand_arguments(body: &str, arguments: &str) -> String {
-    static PLACEHOLDER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let expression = PLACEHOLDER.get_or_init(|| {
-        regex::Regex::new(r"\$\{([0-9]+|ARGUMENTS|@):-([^}]*)\}|\$\{@:([0-9]+)(?::([0-9]+))?\}|\$(ARGUMENTS|@|[0-9]+)")
-            .expect("Pi argument placeholders")
-    });
-    let args = parse_arguments(arguments);
-    let all = args.join(" ");
-    let value = |key: &str| match key {
-        "@" | "ARGUMENTS" => all.as_str(),
-        _ => key
-            .parse::<usize>()
-            .ok()
-            .and_then(|index| index.checked_sub(1))
-            .and_then(|index| args.get(index))
-            .map_or("", String::as_str),
-    };
-    expression
-        .replace_all(body, |captures: &regex::Captures<'_>| {
-            if let Some(target) = captures.get(1) {
-                let found = value(target.as_str());
-                return if found.is_empty() {
-                    captures[2].to_owned()
-                } else {
-                    found.to_owned()
-                };
-            }
-            if let Some(start) = captures.get(3) {
-                let start = start
-                    .as_str()
-                    .parse::<usize>()
-                    .unwrap_or(usize::MAX)
-                    .saturating_sub(1)
-                    .min(args.len());
-                let length = captures
-                    .get(4)
-                    .and_then(|length| length.as_str().parse::<usize>().ok())
-                    .unwrap_or(usize::MAX);
-                return args[start..start.saturating_add(length).min(args.len())].join(" ");
-            }
-            value(&captures[5]).to_owned()
-        })
-        .into_owned()
-}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -916,12 +843,11 @@ mod tests {
                 .contains("Existing prompt: world")
         );
         assert!(resources.themes.contains(&theme.canonicalize().unwrap()));
-        assert!(
-            resources
-                .warnings
-                .iter()
-                .any(|warning| warning.contains(&missing.display().to_string()))
-        );
+        assert!(resources.warnings.iter().any(|warning| {
+            warning
+                .replace('\\', "/")
+                .contains(&missing.to_string_lossy().replace('\\', "/"))
+        }));
     }
     use super::*;
     #[test]
@@ -1077,8 +1003,8 @@ mod tests {
                 || warning.contains(&format!("using {}", prompt_b.display()))
         }));
 
-        // A missing path triggers individual-load recovery; both later files
-        // must still report the winner from the original resource set.
+        // A missing path is diagnosed while the later files still report the
+        // winner from the original resource set.
         let mut recovered = discovered.clone();
         recovered.skill_paths.push(root.join("missing/SKILL.md"));
         let resources = Resources::load_with_discovered(&args, &recovered).unwrap();
@@ -1281,6 +1207,74 @@ mod tests {
             warning.contains("skill path is not a markdown file")
                 && warning.contains("instruction.txt")
         }));
+    }
+
+    #[test]
+    fn missing_explicit_skill_warns_and_preserves_other_resources() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
+        let valid = directory.path().join("valid.md");
+        std::fs::write(
+            &valid,
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().to_owned();
+        args.skill = vec![
+            missing.to_string_lossy().into(),
+            valid.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing.md")
+                    && warning.contains("skill path does not exist"))
+        );
+        args.skill = vec![directory.path().join("none-*.md").to_string_lossy().into()];
+        assert!(Resources::load(&args).is_err());
+    }
+
+    #[test]
+    fn missing_skill_under_workspace_with_glob_characters_is_not_a_glob() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace[1]");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("valid.md"),
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.skill = vec!["missing/file.md".into(), "valid.md".into()];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skill path does not exist"))
+        );
     }
 
     #[cfg(unix)]

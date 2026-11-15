@@ -9,6 +9,239 @@ use pi_rs::{
 };
 use serde_json::{Value, json};
 
+#[tokio::test]
+async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let config = json!({"mcpServers":{"fixture":{"url":server}}}).to_string();
+    std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let directory = root.path().join("mcp-auth");
+    std::fs::create_dir_all(&directory).unwrap();
+    let digest = Sha256::digest(serde_json::to_vec(&("fixture", &server)).unwrap());
+    let credential = directory.join(format!("{digest:x}.json"));
+    std::fs::write(&credential, "existing credentials").unwrap();
+    let run = |timeout: &str| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .stderr(Stdio::piped())
+            .args(["mcp", "login", "fixture", "--timeout", timeout]);
+        command
+    };
+    for invalid in ["0", "-1", "NaN", "inf"] {
+        let output = run(invalid).output().await.unwrap();
+        assert!(!output.status.success(), "accepted {invalid}");
+    }
+    let child = run("2").kill_on_drop(true).spawn().unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP login timed out"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read_to_string(credential).unwrap(),
+        "existing credentials"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_login_sigint_cancels_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = json!({"mcpServers":{"fixture":{"url":format!("http://{}/mcp", listener.local_addr().unwrap())}}}).to_string();
+    std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["mcp", "login", "fixture", "--timeout", "60"])
+        .kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
+        config
+    );
+    assert!(!root.path().join("mcp-auth").exists());
+}
+
+#[test]
+fn mcp_add_persists_oauth_client_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "https://example.com/mcp",
+        "--oauth-client-id",
+        "client",
+        "--oauth-client-secret",
+        "${CLIENT_SECRET}",
+        "--oauth-callback-port",
+        "12345",
+        "--oauth-client-name",
+        "client name",
+        "--oauth-client-registration",
+        "dcr",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = root.path().join("mcp.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["remote"]["oauth"],
+        json!({"clientId":"client","clientSecret":"${CLIENT_SECRET}","callbackPort":12345,"clientName":"client name","clientRegistration":"dcr"})
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--oauth-client-id",
+            "client",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-secret",
+            "secret",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-registration",
+            "cimd",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-callback-port",
+            "0",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--header",
+            "authorization=Bearer token",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
+fn mcp_added_oauth_secret_reference_is_resolved_for_login() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |args: &[&str], secret: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_TEST_MCP_SECRET")
+            .args(args);
+        if let Some(secret) = secret {
+            command.env("PI_RS_TEST_MCP_SECRET", secret);
+        }
+        command.output().unwrap()
+    };
+    let added = command(
+        &[
+            "mcp",
+            "add",
+            "fixture",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-secret",
+            "${PI_RS_TEST_MCP_SECRET}",
+        ],
+        None,
+    );
+    assert!(added.status.success());
+    let path = root.path().join("mcp.json");
+    let before = std::fs::read(&path).unwrap();
+    let missing = command(&["mcp", "login", "fixture"], None);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("missing environment variable PI_RS_TEST_MCP_SECRET")
+    );
+    let resolved = command(&["mcp", "login", "fixture"], Some("private-fixture-secret"));
+    assert!(!resolved.status.success());
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("missing environment variable"));
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("private-fixture-secret"));
+    assert!(!String::from_utf8_lossy(&resolved.stdout).contains("private-fixture-secret"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!String::from_utf8_lossy(&before).contains("private-fixture-secret"));
+}
+
 #[test]
 fn mcp_logout_local_targets_trusted_project_credentials() {
     use sha2::{Digest, Sha256};
@@ -1649,6 +1882,257 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         assert_eq!(event["text"], "hello");
         assert!(event.get("streamingBehavior").is_none());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_input_hooks_receive_empty_and_whitespace_messages() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(Option<std::process::Child>);
+    impl std::ops::Deref for KillOnDrop {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl std::ops::DerefMut for KillOnDrop {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.0.as_mut().unwrap()
+        }
+    }
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("empty-input.py");
+    std::fs::write(
+        &extension,
+        r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'empty-input', 'dependencies':[], 'commands':[], 'tools':[], 'input_hook':True}
+elif request['type'] == 'input':
+    event = request['event']
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'input-events.jsonl'), 'a') as log:
+        log.write(json.dumps(event) + '\n')
+    if event['text'] in ('', ' '):
+        result = {'action':'handled'}
+    elif event['text'] in ('\t', '\n'):
+        result = {'action':'transform', 'text':'same input'}
+    else:
+        result = {'action':'continue'}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server_stop = StopOnDrop(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let (endpoint, server) = model_fixture_with_gate_timeout(
+        None,
+        "stop",
+        None,
+        Some(gate),
+        Duration::from_secs(150),
+        Some(server_stop.0.clone()),
+    );
+    let mut release = ReleaseOnDrop(Some(release));
+    let mut child = KillOnDrop(Some(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for request in [
+        json!({"type":"prompt","id":"missing"}),
+        json!({"type":"prompt","id":"null","message":null}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let response = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(response["id"], request["id"]);
+        assert_eq!(response["success"], false, "{response}");
+    }
+    for (id, text, disposition) in [
+        ("empty", "", Some("handled")),
+        ("space", " ", Some("handled")),
+        ("tab", "\t", Some("started")),
+        ("newline", "\n", Some("started")),
+        ("unhandled", "  ", None),
+    ] {
+        writeln!(input, "{}", json!({"type":"prompt","id":id,"message":text})).unwrap();
+        input.flush().unwrap();
+        let mut response = None;
+        let mut ended = None;
+        let mut observed = Vec::new();
+        let mut streaming_handled = 0;
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == id {
+                response = Some(event.clone());
+                if id == "tab" {
+                    for (command, request_id, behavior) in [
+                        ("steer", "stream-steer", None),
+                        ("follow_up", "stream-follow", None),
+                        ("prompt", "stream-prompt-steer", Some("steer")),
+                        ("prompt", "stream-prompt-follow", Some("followUp")),
+                    ] {
+                        let mut request = json!({"type":command,"id":request_id,"message":""});
+                        if let Some(behavior) = behavior {
+                            request["streamingBehavior"] = json!(behavior);
+                        }
+                        writeln!(input, "{request}").unwrap();
+                    }
+                    input.flush().unwrap();
+                }
+            }
+            if event["type"] == "response"
+                && event["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("stream-"))
+            {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                streaming_handled += 1;
+                if streaming_handled == 4 {
+                    release.0.take().unwrap().send(()).unwrap();
+                }
+            }
+            if event["type"] == "agent_end" {
+                ended = Some(event.clone());
+            }
+            observed.push(event.clone());
+            if event["type"] == "agent_settled" {
+                break;
+            }
+        }
+        let response = response.expect("prompt response");
+        if id == "tab" {
+            assert_eq!(streaming_handled, 4);
+        }
+        if let Some(disposition) = disposition {
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["data"]["disposition"], disposition, "{response}");
+            if disposition == "started" {
+                let ended = ended.expect("agent_end for transformed input");
+                assert_eq!(ended["success"], true, "{ended}; events: {observed:?}");
+            }
+        } else {
+            assert_eq!(response["success"], false, "{response}");
+        }
+    }
+    for command in ["steer", "follow_up"] {
+        writeln!(
+            input,
+            "{}",
+            json!({"type":command,"id":command,"message":""})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC queued input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == command {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "RPC did not exit after shutdown");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = child.0.take().unwrap().wait_with_output().unwrap();
+    reader.join().unwrap();
+    server.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let events: Vec<Value> = std::fs::read_to_string(root.path().join("input-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["", " ", "\t", "", "", "", "", "\n", "  ", "", ""]
+    );
+    assert!(events.iter().all(|event| event["source"] == "rpc"));
 }
 
 #[cfg(unix)]
@@ -4580,7 +5064,25 @@ fn model_fixture_with_gate(
     effort: Option<&'static str>,
     finish: &'static str,
     expected_token: Option<&'static str>,
+    release_first: Option<std::sync::mpsc::Receiver<()>>,
+) -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_gate_timeout(
+        effort,
+        finish,
+        expected_token,
+        release_first,
+        Duration::from_secs(15),
+        None,
+    )
+}
+
+fn model_fixture_with_gate_timeout(
+    effort: Option<&'static str>,
+    finish: &'static str,
+    expected_token: Option<&'static str>,
     mut release_first: Option<std::sync::mpsc::Receiver<()>>,
+    gate_timeout: Duration,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
@@ -4592,6 +5094,12 @@ fn model_fixture_with_gate(
         let mut completed = 0;
         let deadline = Instant::now() + Duration::from_secs(180);
         while completed < 2 {
+            if stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return;
+            }
             let (mut socket, _) = match server.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4660,7 +5168,7 @@ fn model_fixture_with_gate(
             ).replace("\"finish_reason\":\"stop\"", &format!("\"finish_reason\":\"{finish}\""));
             if let Some(release) = release_first.take() {
                 release
-                    .recv_timeout(Duration::from_secs(15))
+                    .recv_timeout(gate_timeout)
                     .expect("release first response");
             }
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
@@ -5125,6 +5633,14 @@ fn rpc_controls_apply_while_idle_and_streaming() {
             }
         }
     };
+    for command in ["set_steering_mode", "set_follow_up_mode"] {
+        for (id, mode) in [("idle-first", "all"), ("idle-last", "one-at-a-time")] {
+            send(json!({"type":command,"id":id,"mode":mode}));
+            let response = until(&|event| event["type"] == "response" && event["id"] == id);
+            assert_eq!(response["success"], true, "{response}");
+            assert!(response.get("data").is_none(), "{response}");
+        }
+    }
     send(serde_json::json!({"type":"steer","id":"idle-steer","message":"queued while idle"}));
     let updated = until(&|event| event["type"] == "queue_update" || event["id"] == "idle-steer");
     assert_eq!(
@@ -5145,6 +5661,19 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     );
     send(serde_json::json!({"type":"prompt","message":"same input"}));
     until(&|event| event["record"]["event"]["type"] == "model_requested");
+    for command in ["set_steering_mode", "set_follow_up_mode"] {
+        for (id, mode) in [("active-first", "all"), ("active-last", "one-at-a-time")] {
+            send(json!({"type":command,"id":id,"mode":mode}));
+            let response = until(&|event| event["type"] == "response" && event["id"] == id);
+            assert_eq!(response["success"], true, "{response}");
+            assert!(response.get("data").is_none(), "{response}");
+        }
+    }
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["steeringMode"], "one-at-a-time");
+    assert_eq!(settings["followUpMode"], "one-at-a-time");
     send(serde_json::json!({"type":"set_session_name","id":"rename","name":"  Active name  "}));
     let renamed = until(&|event| event["type"] == "session_info_changed");
     assert_eq!(renamed["name"], "Active name");
@@ -6935,7 +7464,12 @@ fn sigint_cancels_package_install_waiting_for_package_lock() {
 #[cfg(unix)]
 #[test]
 fn sigint_interrupts_managed_model_discovery() {
-    for mode in [vec!["--mode", "rpc"], vec!["--models", "ollama/*", "serve"]] {
+    for mode in [
+        vec!["--mode", "rpc"],
+        vec!["--models", "ollama/*", "serve"],
+        vec!["--models", "ollama/*", "mcp", "login", "fixture"],
+        vec!["--list-models=ollama/*", "mcp", "login", "fixture"],
+    ] {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(
