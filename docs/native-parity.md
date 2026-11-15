@@ -164,15 +164,14 @@ settings scope, matching Pi.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
-For remote packages with a single settings scope, an invalid file URL in a
-package settings filter reports an error when evaluated. For a local package
-with one settings scope and native manifest (or no manifest), an error reached
-against a native resource candidate stops that package at the current resource
-type, preserving earlier resources and continuing with later packages. Startup
-theme discovery uses cached candidates when available. Layered package settings,
-upstream Pi package manifests, and other resource filter paths still treat
-invalid URLs as non-matches. Diagnostic candidates for unsupported upstream Pi
-package resources remain incomplete. Package resources are evaluated in
+An invalid file URL in a package settings filter reports an error when
+reached against an available native resource candidate. For a local directory
+package it stops the current declaration at that resource type, retaining
+earlier resources and processing later declarations. Remote errors propagate.
+Startup theme discovery uses cached candidates when available. Single-file
+sources and other resource filter paths still treat invalid URLs as non-matches.
+Diagnostic candidates for unsupported upstream Pi package resources remain
+incomplete. Package resources are evaluated in
 settings order, with project sources first.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
@@ -2086,11 +2085,17 @@ Regular-mode active-region images and iTerm2 partial-image behavior remain open.
 
 ### Package autoload checkpoint
 
-A native package declaration with `autoload: false` starts with no resources
-and applies only its explicit patterns. Project declarations in this mode apply
-ordered additions/removals over a matching user package declaration. Missing or
-empty per-resource arrays leave the inherited selection intact. An ordinary
-project declaration still replaces the matching user selection.
+A native package declaration with `autoload: false` writes only paths matched
+by its ordered patterns. A project delta is evaluated before each matching user
+declaration, and its explicit enabled or disabled paths take precedence.
+Unmatched paths can be supplied by the user declarations. The delta resolves
+against the first usable cached user source, falling back to the first declared
+source when none is cached. This native fallback can apply a project delta to a
+later revision after an earlier revision fails to install.
+An ordinary project declaration replaces the matching user selections. Native Git and
+Cargo caches remain per source revision; for layered declarations, matching
+relative resource paths share first-writer precedence across those caches.
+Resources present only in another cached revision can therefore remain visible.
 
 Unit and CLI fixtures cover standalone explicit selection, exclusions, ordered
 re-inclusion, inherited user filters and an ordinary empty-array replacement.
