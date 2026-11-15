@@ -3989,12 +3989,13 @@ uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
 APIs do not have a session owner; hosts that need message delivery use their
 session-owned counterparts.
-Discovery callbacks invoked through `Registry::discover_resources_in_session`
+Discovery callbacks invoked through `Registry::discover_resources_in_session`,
+and transition callbacks invoked through `session_transition_cancelled_in_session`,
 can also use `ToolHost::append_entry` to persist branch-local custom entries.
 Both in-process and executable extensions receive this capability. The callback
 is acknowledged after the entry is committed; the entry does not enter model
 context. Other callbacks do not yet support this API.
-The same callbacks can read active-branch custom entries, optionally filtered
+These callbacks can read active-branch custom entries, optionally filtered
 by type, including entries appended earlier in the callback. Responses over
 8 MiB are rejected; other callbacks do not yet expose this lookup. An executable
 request already dispatched when its callback ends can still commit; queued
