@@ -205,7 +205,7 @@ pub fn transient_resources(args: &Cli) -> Result<PackageResources> {
 fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     let installed = index()?;
     let mut result = PackageResources::default();
-    'declarations: for declaration in declarations(args)?
+    for declaration in declarations(args)?
         .into_iter()
         .filter(|entry| entry.transient == transient)
     {
@@ -232,6 +232,17 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 .as_ref()
                 .map(|value| ResourceFilter::new(value, name))
                 .transpose()?;
+            if !remote(&declaration.source) || inherited.is_some() {
+                for path in paths {
+                    let base = inherited
+                        .as_ref()
+                        .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
+                    if filter.includes_legacy(path, &package.root, base) && !target.contains(path) {
+                        target.push(path.clone());
+                    }
+                }
+                continue;
+            }
             let evaluate = || -> Result<Vec<bool>> {
                 let base = match &inherited {
                     Some(filter) => {
@@ -241,11 +252,7 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 };
                 filter.apply(paths, &package.root, &base)
             };
-            let enabled = match evaluate() {
-                Ok(enabled) => enabled,
-                Err(_) if !remote(&declaration.source) => continue 'declarations,
-                Err(error) => return Err(error),
-            };
+            let enabled = evaluate()?;
             for (path, enabled) in paths.iter().zip(enabled) {
                 if enabled && !target.contains(path) {
                     target.push(path.clone());
@@ -342,6 +349,17 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             .map(|value| ResourceFilter::new(value, "themes"))
             .transpose()?;
         let paths = &package.resources.themes;
+        if !remote(&declaration.source) || inherited.is_some() {
+            for path in paths {
+                let base = inherited
+                    .as_ref()
+                    .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
+                if filter.includes_legacy(path, &package.root, base) && !themes.contains(path) {
+                    themes.push(path.clone());
+                }
+            }
+            continue;
+        }
         let evaluate = || -> Result<Vec<bool>> {
             let base = match &inherited {
                 Some(filter) => filter.apply(paths, &package.root, &vec![false; paths.len()])?,
@@ -349,11 +367,7 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             };
             filter.apply(paths, &package.root, &base)
         };
-        let enabled = match evaluate() {
-            Ok(enabled) => enabled,
-            Err(_) if !remote(&declaration.source) => continue,
-            Err(error) => return Err(error),
-        };
+        let enabled = evaluate()?;
         for (path, enabled) in paths.iter().zip(enabled) {
             if enabled && !themes.contains(path) {
                 themes.push(path.clone());
@@ -616,6 +630,33 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
+    // Local and layered packages retain the previous behavior until their
+    // separately caught errors and evaluation order can be reproduced.
+    fn includes_legacy(&self, path: &Path, root: &Path, inherited: bool) -> bool {
+        if self.autoload {
+            return self
+                .patterns
+                .as_ref()
+                .is_none_or(|patterns| selected(path, root, patterns));
+        }
+        self.patterns
+            .iter()
+            .flatten()
+            .fold(inherited, |enabled, pattern| {
+                let prefix = pattern.chars().next();
+                let target = if matches!(prefix, Some('+' | '-' | '!')) {
+                    &pattern[1..]
+                } else {
+                    pattern.as_str()
+                };
+                if resource_matches(path, root, target, matches!(prefix, Some('+' | '-')), false) {
+                    !matches!(prefix, Some('-' | '!'))
+                } else {
+                    enabled
+                }
+            })
+    }
+
     #[cfg(test)]
     fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
         Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])

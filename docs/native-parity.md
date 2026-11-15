@@ -107,9 +107,11 @@ without `defaultProvider` are still accepted.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
-For remote packages, an invalid file URL in a package settings filter reports
-an error when evaluated. Local package filter errors stop processing that package,
-as in Pi. Invalid URLs in other resource filter paths still behave as non-matches.
+For remote packages with a single settings scope, an invalid file URL in a
+package settings filter reports an error when evaluated. Layered package
+settings, local packages, and other resource filter paths still treat invalid
+URLs as non-matches. Pi evaluates the scopes separately and stops processing
+a local package when an error is reached.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;

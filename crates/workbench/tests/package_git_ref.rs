@@ -215,3 +215,52 @@ fn configured_git_userinfo_is_not_exposed_in_logs_or_list() {
     assert!(stderr.contains("[redacted]@example.invalid"), "{stderr}");
     assert!(!stderr.contains("ssh://git@"), "{stderr}");
 }
+
+#[test]
+fn malformed_remote_package_filter_is_reported_during_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::create_dir(repo.join("prompts")).unwrap();
+    std::fs::write(repo.join("prompts/review.md"), "review").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "fixture"]);
+    let home = directory.path().join("agent");
+    let url = reqwest::Url::from_directory_path(&repo).unwrap();
+    let source = format!("git:{}", url.as_str().trim_end_matches('/'));
+    let install = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("PI_OFFLINE")
+        .args(["--no-trust", "install", &source])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({
+            "packages": [{"source": source, "prompts": ["file:///bad%2Fpath"]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("PI_OFFLINE", "1")
+        .args(["--no-trust", "--no-mcp", "--print", "hello"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("encoded"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
