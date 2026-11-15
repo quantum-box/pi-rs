@@ -116,6 +116,13 @@ impl Resources {
         };
         for additional in additions {
             for (name, skill) in additional.skills {
+                if resources
+                    .skills
+                    .values()
+                    .any(|existing| same_resource_file(&existing.path, &skill.path))
+                {
+                    continue;
+                }
                 match resources.skills.entry(name.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(skill);
@@ -590,7 +597,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
         .or_else(|| path.parent()?.file_name()?.to_str().map(str::to_owned))
         .ok_or_else(|| Error::Config("skill name is required".into()))?;
     let skill = Skill {
-        path: path.canonicalize()?,
+        path: path.to_owned(),
         description: description.clone().unwrap_or_default(),
         automatic: !metadata.manual,
     };
@@ -958,9 +965,9 @@ mod tests {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let skill_a = root.join("first/SKILL.md");
-        let skill_b = root.join("second/SKILL.md");
-        let skill_c = root.join("third/SKILL.md");
+        let skill_a = root.join("first").join("SKILL.md");
+        let skill_b = root.join("second").join("SKILL.md");
+        let skill_c = root.join("third").join("SKILL.md");
         let prompt_a = root.join("first/greet.md");
         let prompt_b = root.join("second/greet.md");
         let prompt_c = root.join("third/greet.md");
@@ -1002,9 +1009,6 @@ mod tests {
         ];
         args.prompt_template = vec![prompt_a.clone(), prompt_b.clone()];
         let resources = Resources::load(&args).unwrap();
-        let skill_a = skill_a.canonicalize().unwrap();
-        let skill_b = skill_b.canonicalize().unwrap();
-        let skill_c = skill_c.canonicalize().unwrap();
         let skill_warning = format!(
             "Duplicate skill shared at {}; using {}",
             skill_b.display(),
@@ -1123,6 +1127,102 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn skill_symlink_keeps_its_location_and_deduplicates_the_target() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let root = dunce::simplified(&canonical).to_owned();
+        let target = root.join("target/SKILL.md");
+        let alias = root.join("alias/SKILL.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            "---\ndescription: example\n---\nRead reference.txt",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        args.skill = vec![
+            alias.to_string_lossy().into(),
+            target.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills.len(), 1);
+        assert_eq!(resources.skills["alias"].path, alias);
+        let expanded = resources.expand("/skill:alias").unwrap();
+        assert!(expanded.contains(&format!("location=\"{}\"", alias.display())));
+        assert!(expanded.contains(&format!(
+            "References are relative to {}.",
+            alias.parent().unwrap().display()
+        )));
+        assert!(
+            !resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate skill"))
+        );
+        let discovered = pi_rs::DiscoveredResources {
+            skill_paths: vec![target],
+            ..Default::default()
+        };
+        let resources = Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert_eq!(resources.skills.len(), 1);
+        assert_eq!(resources.skills["alias"].path, alias);
+    }
+
+    #[test]
+    fn skill_path_normalizes_dot_components_without_resolving_symlinks() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let root = canonical.clone();
+        let path = root.join("example/SKILL.md");
+        std::fs::create_dir_all(root.join("example/child")).unwrap();
+        std::fs::write(&path, "---\ndescription: example\n---\nbody").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        #[cfg(not(windows))]
+        let explicit = path
+            .parent()
+            .unwrap()
+            .join("child/../SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let explicit = format!(r"{}\example\child\..\SKILL.md", canonical.display());
+        args.skill = vec![explicit];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["example"].path, path);
+        #[cfg(not(windows))]
+        let pattern = canonical
+            .join("example/child/../*")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let pattern = format!(r"{}\example\child\..\*", canonical.display());
+        args.skill = vec![pattern];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["example"].path, path);
+    }
+
     #[test]
     fn skill_metadata_warnings_preserve_loadable_skills() {
         let directory = tempfile::tempdir().unwrap();
@@ -1143,6 +1243,180 @@ mod tests {
                 .any(|message| message.contains("exceeds 1024"))
         );
         assert!(warnings.iter().all(|message| message.contains("SKILL.md")));
+    }
+
+    #[test]
+    fn explicit_skill_paths_reject_non_markdown_files_without_hiding_valid_skills() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let invalid = directory.path().join("instruction.txt");
+        let valid = directory.path().join("valid.md");
+        std::fs::write(
+            &invalid,
+            "---\nname: rejected\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            &valid,
+            "---\nname: accepted\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = directory.path().to_owned();
+        args.skill = vec![
+            invalid.to_string_lossy().into(),
+            valid.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(!resources.skills.contains_key("rejected"));
+        assert!(resources.skills.contains_key("accepted"));
+        assert!(resources.warnings.iter().any(|warning| {
+            warning.contains("skill path is not a markdown file")
+                && warning.contains("instruction.txt")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_skill_suffix_is_checked_before_following_symlinks() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let non_markdown = root.join("target.txt");
+        let markdown = root.join("target.md");
+        let accepted = root.join("accepted.md");
+        let rejected = root.join("rejected.txt");
+        std::fs::write(
+            &non_markdown,
+            "---\nname: shared\ndescription: from alias\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            &markdown,
+            "---\nname: shared\ndescription: later\n---\nbody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&non_markdown, &accepted).unwrap();
+        std::os::unix::fs::symlink(&markdown, &rejected).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root.to_owned();
+        args.skill = vec![
+            rejected.to_string_lossy().into(),
+            accepted.to_string_lossy().into(),
+            markdown.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["shared"].description, "from alias");
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("rejected.txt")
+                    && warning.contains("skill path is not a markdown file"))
+        );
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate skill shared"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_skill_alias_uses_its_name_and_declared_file_status() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let source = root.join("source.txt");
+        let alias = root.join("alias/entry.md");
+        let declared = root.join("declared/SKILL.md");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(declared.parent().unwrap()).unwrap();
+        std::fs::write(&source, "---\ndescription: example\n---\nbody").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        std::os::unix::fs::symlink(&source, &declared).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        args.skill = vec![alias.to_string_lossy().into()];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["alias"].path, alias);
+        std::fs::write(&source, "---\nname: invalid--name\n---\nbody").unwrap();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.warnings.is_empty());
+        args.skill = vec![declared.to_string_lossy().into()];
+        let resources = Resources::load(&args).unwrap();
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("description is required"))
+        );
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("consecutive hyphens"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_skill_suffix_checks_lexically_normalized_path() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let target = root.join("other/deep");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        std::fs::write(
+            root.join("instruction.txt"),
+            "---\nname: rejected\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root.clone();
+        args.skill = vec![
+            root.join("link/../instruction.txt")
+                .to_string_lossy()
+                .into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.skills.is_empty());
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skill path is not a markdown file"))
+        );
     }
 
     #[test]

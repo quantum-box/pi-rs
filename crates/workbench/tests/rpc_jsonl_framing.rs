@@ -37,8 +37,9 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         .write_all("{\"type\":\"get_state\",\"id\":\"a\u{2028}b\"}\n".as_bytes())
         .unwrap();
     input
-        .write_all(b"{\"type\":\"get_state\",\"id\":\"last\"}\r")
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"last\"}\r\n")
         .unwrap();
+    input.write_all(b"{\"id\":\"object\",\"type\":{\"x\":1}}\n{\"id\":\"array\",\"type\":[1,null,[true,2],{}]}\n{\"id\":\"number\",\"type\":1.0}\n{\"id\":\"shadow\",\"type\":{\"toString\":0}}\n{\"id\":\"missing\"}\r").unwrap();
     drop(input);
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
@@ -62,7 +63,7 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 4, "{responses:?}");
+    assert_eq!(responses.len(), 9, "{responses:?}");
     assert_eq!(responses[0]["id"], "bad�id");
     assert_eq!(responses[0]["success"], true);
     assert_eq!(responses[1]["command"], "parse");
@@ -71,4 +72,28 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
     assert_eq!(responses[2]["success"], true);
     assert_eq!(responses[3]["id"], "last");
     assert_eq!(responses[3]["success"], true);
+    for (response, id, error) in [
+        (&responses[4], "object", "Unknown command: [object Object]"),
+        (
+            &responses[5],
+            "array",
+            "Unknown command: 1,,true,2,[object Object]",
+        ),
+        (&responses[6], "number", "Unknown command: 1"),
+        (
+            &responses[7],
+            "shadow",
+            "Cannot convert object to primitive value",
+        ),
+        (&responses[8], "missing", "Unknown command: undefined"),
+    ] {
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"], error);
+        assert_eq!(response["success"], false);
+    }
+    assert_eq!(responses[4]["command"], serde_json::json!({"x":1}));
+    assert_eq!(
+        responses[5]["command"],
+        serde_json::json!([1, null, [true, 2], {}])
+    );
 }

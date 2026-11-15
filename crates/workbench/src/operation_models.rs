@@ -14,6 +14,7 @@ use super::{
     model_auth::{Credential, Keys},
 };
 
+mod decisions;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -36,6 +37,8 @@ enum Kind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum Api {
+    #[serde(rename = "openai-decisions")]
+    OpenAiDecisions,
     #[serde(rename = "typesafe-system-one")]
     SystemOne,
     #[serde(rename = "cloudflare-workers-ai-system-one")]
@@ -47,13 +50,14 @@ enum Api {
 impl Api {
     fn kind(self) -> Kind {
         match self {
-            Self::SystemOne | Self::WorkersAiSystemOne => Kind::Classifier,
+            Self::SystemOne | Self::WorkersAiSystemOne | Self::OpenAiDecisions => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
     }
 
     fn route(self) -> &'static str {
         match self {
+            Self::OpenAiDecisions => "decisions",
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
@@ -227,6 +231,9 @@ async fn send_model_request(
                 }
             }
         }
+        if matches!(api, Api::OpenAiDecisions) && response.status().as_u16() == 504 {
+            return Err(Error::Model("OpenAI Decisions error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.".into()));
+        }
         if attempt == retries || !retryable_classifier_response(&response) {
             return Err(Error::Model(format!(
                 "model operation returned HTTP {}",
@@ -259,6 +266,18 @@ struct Compat {
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Cost {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tiers: Vec<CostTier>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CostTier {
+    input_tokens_above: u64,
     input: f64,
     output: f64,
     cache_read: f64,
@@ -394,6 +413,7 @@ impl Catalogue {
                     .or_else(|| serde_json::from_value(provider["api"].clone()).ok())
                     .or(match (name.as_str(), kind) {
                         ("typesafe" | "openrouter", Kind::Classifier) => Some(Api::SystemOne),
+                        ("openai", Kind::Classifier) => Some(Api::OpenAiDecisions),
                         ("openrouter", Kind::Image) => Some(Api::OpenRouterImages),
                         _ => None,
                     })
@@ -422,6 +442,11 @@ impl Catalogue {
                 ]
                 .iter()
                 .any(|cost| !cost.is_finite() || *cost < 0.0 || *cost > 1_000_000.0)
+                    || configured.cost.tiers.iter().any(|tier| {
+                        [tier.input, tier.output, tier.cache_read, tier.cache_write]
+                            .iter()
+                            .any(|cost| !cost.is_finite() || *cost < 0.0 || *cost > 1_000_000.0)
+                    })
                 {
                     return Err(Error::Config(format!(
                         "invalid operation model cost for {name}/{}",
@@ -595,6 +620,7 @@ fn unambiguous_model_base(provider: &Value) -> Option<String> {
 
 pub(super) fn official_base(provider: &str) -> Option<&'static str> {
     match provider {
+        "openai" => Some("https://api.openai.com/v1"),
         "typesafe" => Some("https://api.typesafe.ai/v1"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "vercel-ai-gateway" => Some("https://ai-gateway.vercel.sh/typesafe/v1"),
@@ -765,6 +791,7 @@ impl Entry {
         {
             let key = match (self.provider.as_str(), official) {
                 ("typesafe", true) => "TYPESAFE_API_KEY",
+                ("openai", true) => "OPENAI_API_KEY",
                 ("openrouter", true) => "OPENROUTER_API_KEY",
                 ("vercel-ai-gateway", true) => "AI_GATEWAY_API_KEY",
                 ("cloudflare-workers-ai", true) => "CLOUDFLARE_API_KEY",
@@ -992,7 +1019,7 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
-        initialize_image_result(model, &mut data);
+        initialize_result(model, &mut data);
         let result = if has_images && self.args.settings.block_model_images() {
             Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
         } else {
@@ -1018,8 +1045,8 @@ impl Tool for Operations {
     }
 }
 
-fn initialize_image_result(entry: &Entry, data: &mut Value) {
-    if matches!(entry.api, Api::OpenRouterImages) && data.get("timestamp").is_none() {
+fn initialize_result(entry: &Entry, data: &mut Value) {
+    if data.get("timestamp").is_none() {
         data["api"] = json!(entry.api);
         data["timestamp"] = json!(
             std::time::SystemTime::now()
@@ -1092,9 +1119,10 @@ impl Operations {
     ) -> Result<()> {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
-        initialize_image_result(entry, data);
+        initialize_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
+            Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
         let credential = entry
@@ -1142,15 +1170,6 @@ impl Operations {
         let body = send_model_request(&self.client, request, entry.api).await?;
         let body: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
-        if !matches!(entry.api, Api::OpenRouterImages) {
-            data["api"] = json!(entry.api);
-            data["timestamp"] = json!(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            );
-        }
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -1163,6 +1182,10 @@ impl Operations {
             Api::SystemOne | Api::WorkersAiSystemOne => {
                 data["answers"] =
                     classifier_answers(&context["questions"], &result_body["answers"])?
+            }
+            Api::OpenAiDecisions => {
+                data["answers"] =
+                    decisions::answers(&context["questions"], &result_body["answers"])?;
             }
             Api::OpenRouterImages => {
                 if let Some(id) = body["id"].as_str() {
@@ -2050,6 +2073,52 @@ mod tests {
         assert_eq!(data["output"], json!([]));
     }
 
+    #[tokio::test]
+    async fn classifier_early_failure_and_cancellation_keep_result_identity() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one", "input":["text"]
+        }]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let entry = operation
+            .args
+            .model_profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let mut data = json!({"answers":{}});
+        assert!(operation.perform(entry, &json!({"state":{},"questions":{"q":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}}), &Keys::parse(&json!({})), &mut data).await.is_err());
+        assert_eq!(data["api"], "typesafe-system-one");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["answers"], json!({}));
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = operation
+            .invoke(
+                json!({"action":"classify","provider":"relay","id":"fixture","context":{}}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation,
+                },
+            )
+            .await;
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("expected structured result")
+        };
+        assert_eq!(data["stopReason"], "aborted");
+        assert_eq!(data["api"], "typesafe-system-one");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["answers"], json!({}));
+    }
+
     #[test]
     fn openrouter_image_choices_validate_nonempty_responses() {
         let mut output = Vec::new();
@@ -2551,6 +2620,18 @@ mod tests {
     async fn classifier_retries_transient_http_failures_with_server_controls() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         for (api, responses, expected_success, expected_error) in [
+            (
+                Api::OpenAiDecisions,
+                vec![(504, "x-should-retry: true\r\nretry-after-ms: 0\r\n")],
+                false,
+                "OpenAI Decisions error (504)",
+            ),
+            (
+                Api::OpenAiDecisions,
+                vec![(503, "retry-after-ms: 0\r\n"), (200, "")],
+                true,
+                "",
+            ),
             (
                 Api::SystemOne,
                 vec![(429, "retry-after-ms: 0\r\n"), (200, "")],
