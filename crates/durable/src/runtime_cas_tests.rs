@@ -114,6 +114,45 @@ fn abort_returns_queued_inputs_across_foreground_and_background_boundaries() {
         );
     }
 }
+
+#[test]
+fn abort_result_retries_when_an_input_arrives_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "running".into()).unwrap();
+    h.submit(id, None, "before".into()).unwrap();
+    let mut other = h.worker();
+    let mut injected = false;
+    let (_, _, result) = h
+        .abort_owned_graph_impl_with(Some(id), None, None, false, || {
+            if !injected {
+                injected = true;
+                other.submit(id, None, "raced".into()).unwrap();
+            }
+        })
+        .unwrap();
+    assert!(injected);
+    assert_eq!(
+        result
+            .withdrawn
+            .iter()
+            .map(|item| item.submission.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["before", "raced"]
+    );
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions[1..].iter().all(|item| item.status
+        == Status::Unanswered {
+            reason: "aborted".into()
+        }));
+}
 #[test]
 fn cas_merges_admission_and_boundary_retries_instead_of_losing_steer() {
     let dir = tempfile::tempdir().unwrap();
