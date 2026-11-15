@@ -27,6 +27,7 @@ async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
         command
             .current_dir(root.path())
             .env("PI_RS_HOME", root.path())
+            .stderr(Stdio::piped())
             .args(["mcp", "login", "fixture", "--timeout", timeout]);
         command
     };
