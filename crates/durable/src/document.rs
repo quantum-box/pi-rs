@@ -1506,6 +1506,7 @@ impl StagedSignals {
             canonical_self_version: None,
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn signal_at(
         &mut self,
         store: &Store,
