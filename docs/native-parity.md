@@ -122,6 +122,8 @@ live refresh acceptance remain open.
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
 with `--bearer-token-env-var` unless an Authorization header is already present.
+`--env` is restricted to stdio and requires nonempty names; bearer-token
+environment variables apply to HTTP servers.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.

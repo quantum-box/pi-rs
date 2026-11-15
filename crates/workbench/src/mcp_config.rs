@@ -475,6 +475,11 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 value["exposure"] = json!(exposure);
             }
             if let Some(variable) = bearer_token_env_var {
+                if value.get("url").is_none() {
+                    return Err(Error::Config(
+                        "--bearer-token-env-var requires an HTTP server".into(),
+                    ));
+                }
                 if !variable
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -503,11 +508,15 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 );
             }
             if !environment.is_empty() {
+                if value.get("command").is_none() {
+                    return Err(Error::Config("--env requires a stdio server".into()));
+                }
                 let mut env = serde_json::Map::new();
                 for item in environment {
-                    let (name, value) = item
-                        .split_once('=')
-                        .ok_or_else(|| Error::Config("--env expects NAME=VALUE".into()))?;
+                    let (name, value) =
+                        item.split_once('=')
+                            .filter(|(name, _)| !name.is_empty())
+                            .ok_or_else(|| Error::Config("--env expects NAME=VALUE".into()))?;
                     env.insert(name.into(), json!(value));
                 }
                 value["env"] = Value::Object(env);

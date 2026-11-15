@@ -196,6 +196,10 @@ fn mcp_add_saves_stdio_and_http_options() {
             "subdir",
             "--description",
             "Local tools",
+            "--env",
+            "FIRST=one=two",
+            "--env",
+            "EMPTY=",
             "--",
             "server",
             "--flag",
@@ -229,7 +233,7 @@ fn mcp_add_saves_stdio_and_http_options() {
         serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
     assert_eq!(
         config["mcpServers"]["local"],
-        json!({"command":"server", "args":["--flag"], "cwd":"subdir", "description":"Local tools"})
+        json!({"command":"server", "args":["--flag"], "cwd":"subdir", "description":"Local tools", "env":{"FIRST":"one=two", "EMPTY":""}})
     );
     assert_eq!(
         config["mcpServers"]["remote"]["headers"],
@@ -250,6 +254,25 @@ fn mcp_add_saves_stdio_and_http_options() {
             "dir",
         ],
         vec!["mcp", "add", "bad", "--header", "X=1", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--env",
+            "VAR=value",
+        ],
+        vec!["mcp", "add", "local", "--env", "=value", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--",
+            "server",
+        ],
         vec![
             "mcp",
             "add",
