@@ -474,6 +474,31 @@ mod tests {
         let dynamic =
             json!({"type":"object","properties":{"x":{"type":"string","$dynamicRef":"#node"}}});
         assert!(normalize_strict_tool_arguments(&dynamic, &json!({"x":null})).is_err());
+        for keyword in ["$dynamicRef", "$recursiveRef"] {
+            let mut reference = json!({"type":"object","properties":{"x":{"type":"string"}}});
+            reference["properties"]["x"][keyword] = json!("#node");
+            assert_eq!(
+                resolve_strict_tool_schema(
+                    "x",
+                    &reference,
+                    StrictToolPolicy::Prefer,
+                    true,
+                    |_, _| false
+                )
+                .unwrap(),
+                None
+            );
+            assert!(
+                resolve_strict_tool_schema(
+                    "x",
+                    &reference,
+                    StrictToolPolicy::Require,
+                    true,
+                    |_, _| false
+                )
+                .is_err()
+            );
+        }
         let mixed = json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{
             "x":{"$id":"https://example.test/nested","$schema":"http://json-schema.org/draft-04/schema#","type":["string","null"],"const":"x"}
         }});
