@@ -5061,6 +5061,12 @@ loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.
+Hosts that have verified a nested linked worktree can opt into Pi's matching-name
+shadowing by supplying both explicitly granted roots. The selected main-root
+entry is suppressed when the nested worktree has the same selected filename;
+separate directory aliases remain available for global context. Hosts identify
+the global role explicitly when it shares the main-root path. The host verifies
+the repository relationship, and no Git metadata or additional paths are read.
 
 The SDK model catalog can enumerate its host-registered provider/model identities
 in deterministic order for host model pickers. This lists the immutable catalog
