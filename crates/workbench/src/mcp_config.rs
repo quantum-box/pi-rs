@@ -66,8 +66,14 @@ pub enum McpCommand {
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    Ok(configurations_with_project_scope(args)?.0)
+}
+
+fn configurations_with_project_scope(
+    args: &Cli,
+) -> Result<(BTreeMap<String, Value>, BTreeSet<String>)> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeSet::new()));
     }
     let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
     let mut servers = user
@@ -75,13 +81,24 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let mut project_definitions = BTreeSet::new();
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
+            project_definitions.extend(entries.iter().filter_map(|(name, entry)| {
+                entry
+                    .as_object()
+                    .filter(|entry| {
+                        ["command", "url", "type"]
+                            .iter()
+                            .any(|key| entry.contains_key(*key))
+                    })
+                    .map(|_| name.clone())
+            }));
             merge_project_servers(&mut servers, entries)?;
         }
     }
-    Ok(servers.into_iter().collect())
+    Ok((servers.into_iter().collect(), project_definitions))
 }
 
 fn merge_project_servers(
@@ -610,27 +627,11 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             output(json!({"type":"mcp_logged_in","name":name}));
         }
         McpCommand::Logout { name, local } => {
-            let servers = configurations(args)?;
-            if local {
-                let project = if args.trusted {
-                    config::read_object(&path(args, true))?
-                } else {
-                    Default::default()
-                };
-                if project
-                    .get("mcpServers")
-                    .and_then(|entries| entries.get(&name))
-                    .and_then(Value::as_object)
-                    .is_none_or(|entry| {
-                        !["command", "url", "type"]
-                            .iter()
-                            .any(|key| entry.contains_key(*key))
-                    })
-                {
-                    return Err(Error::Config(format!(
-                        "MCP server {name} is not configured in the trusted project"
-                    )));
-                }
+            let (servers, project_definitions) = configurations_with_project_scope(args)?;
+            if local && !project_definitions.contains(&name) {
+                return Err(Error::Config(format!(
+                    "MCP server {name} is not configured in the trusted project"
+                )));
             }
             let server: ServerConfig = serde_json::from_value(
                 servers
@@ -652,6 +653,14 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 return Err(Error::Config(
                     "MCP OAuth cannot be combined with an Authorization header".into(),
                 ));
+            }
+            if server.command.is_some()
+                || server
+                    .transport
+                    .as_deref()
+                    .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
+            {
+                return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
             }
             let url = server
                 .url

@@ -83,6 +83,17 @@ fn mcp_logout_local_targets_trusted_project_credentials() {
     let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
     assert!(!output.status.success());
     assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"type":"sse","url":global_url}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
     std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"headers":{"authorization":"Bearer static"}}}}).to_string()).unwrap();
     assert!(
         !run(&["--no-trust", "mcp", "logout", "service"])
