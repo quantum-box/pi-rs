@@ -145,6 +145,24 @@ one compact-and-retry recovery; otherwise, it records failed tool results and
 the model may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
+Model-generated compaction summaries include Pi-style `read-files` and
+`modified-files` sections for projected `read`, `write`, and `edit` calls in
+the summarized prefix, including native nested calls attached to a visible
+tool result. Modified files are excluded from the read-only list; paths are
+deduplicated and sorted using JavaScript string order. The generated file lists
+are retained as compaction `details` on metadata-capable stores and carried
+forward from earlier model-generated compactions. Extension-provided summaries
+and their details are preserved as supplied. Imported nested-call metadata not
+represented as native operations is not yet included.
+If appending the complete file listing would exceed the native 64 KiB summary
+limit, native omits the listing from the summary but retains it in `details`
+on metadata-capable stores. Generated file details are bounded to at most 4 MiB
+of encoded JSON, using the actual encoded record envelope to honor the active
+store's record limit; modified files are retained first. If entries do not fit, the native metadata carries
+`nativeFileDetailsTruncated: true` across reopen and later compactions. Pi's
+projected `details` contains only the retained paths. A legacy hook that edits a generated summary retains
+the native file history across journal reopen; Pi exports still expose it as a
+hook-originated compaction.
 For the Cerebras Chat Completions provider, a fully received, empty HTTP 400
 response is treated as context overflow, matching Pi's bodyless-error rule.
 Other providers and nonempty 400 bodies retain their normal classification;

@@ -485,6 +485,12 @@ pub trait SessionStore: Send {
         false
     }
 
+    /// Maximum encoded record size, including its terminating newline, when
+    /// this store uses the native JSONL record format.
+    fn encoded_record_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Load auxiliary data committed atomically with records. Legacy stores
     /// need not implement this until they support metadata-bearing records.
     fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, serde_json::Value>> {
@@ -557,6 +563,45 @@ pub struct Session {
 impl Session {
     pub fn supports_record_metadata(&self) -> bool {
         self.store.supports_record_metadata()
+    }
+    pub(crate) fn compaction_details_budget(
+        &self,
+        event: &Event,
+        from_extension: bool,
+        truncated: bool,
+    ) -> Result<usize> {
+        let Some(limit) = self.store.encoded_record_limit() else {
+            return Ok(4 * 1024 * 1024);
+        };
+        let mut metadata = serde_json::json!({"details":null});
+        if truncated {
+            metadata["nativeFileDetailsTruncated"] = true.into();
+        }
+        if from_extension {
+            metadata["fromExtension"] = true.into();
+            metadata["nativeGeneratedFileDetails"] = true.into();
+        }
+        let record = Record {
+            timestamp: Some(record_timestamp()),
+            run_id: self.run_id,
+            version: self
+                .records
+                .last()
+                .map_or(TURN_END_JOURNAL_VERSION, |record| {
+                    record.version.max(TURN_END_JOURNAL_VERSION)
+                }),
+            id: self.records.len() as u64 + 1,
+            parent: (self.head != 0).then_some(self.head),
+            event: event.clone(),
+        };
+        let envelope = encode_record(&record, Some(&metadata))?
+            .len()
+            .saturating_add(1);
+        // `null` in the template occupies four bytes; replace it with details.
+        Ok(limit
+            .saturating_sub(envelope)
+            .saturating_add(4)
+            .min(4 * 1024 * 1024))
     }
     pub fn retry_control(&self) -> crate::RetryControl {
         self.retry.clone()
@@ -2461,6 +2506,17 @@ impl Session {
             parent,
             event,
         };
+        // Reject an oversized metadata record before a store write is attempted;
+        // this is a deterministic validation failure, not an ambiguous I/O error.
+        if metadata.is_some()
+            && let Some(limit) = self.store.encoded_record_limit()
+            && encode_record(&record, metadata.as_ref())?
+                .len()
+                .saturating_add(1)
+                > limit
+        {
+            return Err(Error::Session("journal record exceeds size limit".into()));
+        }
         if let Err(err) = self.store.append_with_metadata(&record, metadata.as_ref()) {
             self.poisoned = true;
             return Err(err);
@@ -2868,6 +2924,9 @@ fn read_complete_records(reader: impl Read) -> Result<CompleteRecords> {
 struct ShareFileStore(FileStore);
 
 impl SessionStore for ShareFileStore {
+    fn encoded_record_limit(&self) -> Option<usize> {
+        Some(MAX_RECORD_BYTES)
+    }
     fn supports_record_metadata(&self) -> bool {
         true
     }
@@ -2900,6 +2959,9 @@ impl SessionStore for ShareFileStore {
 }
 
 impl SessionStore for FileStore {
+    fn encoded_record_limit(&self) -> Option<usize> {
+        Some(MAX_RECORD_BYTES)
+    }
     fn supports_record_metadata(&self) -> bool {
         true
     }
@@ -3870,6 +3932,32 @@ mod record_metadata_tests {
             .unwrap();
         assert_eq!(record.id, length as u64 + 1);
         assert_eq!(session.records().len(), length + 1);
+    }
+
+    #[test]
+    fn oversized_metadata_rejection_does_not_poison_file_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-metadata.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let length = session.records().len();
+        let result = session.append_with_record_metadata(
+            Event::SessionInfo {
+                name: None,
+                cwd: None,
+            },
+            serde_json::json!({"value": "x".repeat(MAX_RECORD_BYTES)}),
+        );
+        assert!(result.is_err());
+        assert_eq!(session.records().len(), length);
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert!(reopened.records().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "still writable")));
     }
 }
 

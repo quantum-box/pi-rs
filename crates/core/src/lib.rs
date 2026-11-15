@@ -1,5 +1,6 @@
 //! Model, session, and tool execution primitives for an embeddable agent.
 mod agent;
+mod compaction_files;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod context;
 mod context_fingerprint;
