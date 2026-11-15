@@ -3071,7 +3071,7 @@ impl CodingTool {
         let mut drain_max = None;
         let mut cancelled = false;
         let mut timed_out = false;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let mut drain_reason = "pipes closed";
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
@@ -3150,7 +3150,7 @@ impl CodingTool {
                         None => std::future::pending().await,
                     }
                 } => {
-                    #[cfg(test)] { drain_reason = "idle deadline"; }
+                    #[cfg(all(test, unix))] { drain_reason = "idle deadline"; }
                     break;
                 },
                 _ = async {
@@ -3159,7 +3159,7 @@ impl CodingTool {
                         None => std::future::pending().await,
                     }
                 } => {
-                    #[cfg(test)] { drain_reason = "maximum deadline"; }
+                    #[cfg(all(test, unix))] { drain_reason = "maximum deadline"; }
                     break;
                 },
             }
@@ -3194,7 +3194,7 @@ impl CodingTool {
             output: output.finish()?,
             status: status.expect("shell status observed"),
             elapsed: started.elapsed().as_secs_f64(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             drain_reason,
         })
     }
@@ -3329,7 +3329,7 @@ struct ShellResult {
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     drain_reason: &'static str,
 }
 
