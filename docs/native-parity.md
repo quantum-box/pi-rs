@@ -1832,8 +1832,11 @@ Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
 Both use Ctrl+F for fullscreen transcript search and their prompt-jump
 defaults omit the redundant Ctrl+Shift variants, matching Pi.
 Transcript search normalizes ECMAScript whitespace in queries and rendered
-graphemes, including U+FEFF. Native terminal sanitization removes control
-characters such as U+0085 before they reach the search input or rendered text.
+graphemes, including U+FEFF. U+0085 is retained in search-only input and
+rendered-text metadata, so it remains distinct from both whitespace and an
+absent character. Its zero-width matches can be navigated, although they have
+no visible cell to highlight. Terminal output still removes U+0085 and other
+unsafe control characters.
 
 A committed isolated-process-group PTY test covers resize input and suspension.
 A separate fixture covers both screen modes, SIGINT while suspended, resumed

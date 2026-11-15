@@ -23,6 +23,8 @@ use super::theme::Theme;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub text: String,
+    // Search-only text may retain U+0085; `text` is always terminal-safe.
+    search_text: Option<String>,
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
@@ -35,8 +37,11 @@ pub struct Span {
 }
 impl Span {
     pub(super) fn new(text: impl Into<String>, color: Color) -> Self {
+        let text = text.into();
+        let search_text = text.contains('\u{85}').then(|| clean_for_search(&text));
         Self {
-            text: clean(&text.into()),
+            text: clean(&text),
+            search_text,
             color,
             background: None,
             bold: false,
@@ -47,6 +52,33 @@ impl Span {
             strikethrough: false,
             hyperlink: None,
         }
+    }
+    pub(super) fn searchable(&self) -> &str {
+        self.search_text.as_deref().unwrap_or(&self.text)
+    }
+    fn set_source(&mut self, text: &str) {
+        self.text = clean(text);
+        self.search_text = text.contains('\u{85}').then(|| clean_for_search(text));
+    }
+    fn search_slice(&self, range: Range<usize>) -> Option<String> {
+        let raw = self.search_text.as_ref()?;
+        let boundary = |target: usize| {
+            if target == self.text.len() {
+                return raw.len();
+            }
+            let mut visible = 0;
+            for (offset, character) in raw.char_indices() {
+                if visible == target {
+                    return offset;
+                }
+                if character != '\u{85}' {
+                    visible += character.len_utf8();
+                }
+            }
+            raw.len()
+        };
+        let result = &raw[boundary(range.start)..boundary(range.end)];
+        result.contains('\u{85}').then(|| result.to_owned())
     }
     pub(super) fn themed(text: impl Into<String>, theme: &Theme, role: &str) -> Self {
         let mut span = Self::new(text, theme.color(role));
@@ -94,7 +126,8 @@ impl Line {
                 ] {
                     if !range.is_empty() {
                         let mut piece = Span {
-                            text: span.text[range].into(),
+                            text: span.text[range.clone()].into(),
+                            search_text: span.search_slice(range),
                             ..span.clone()
                         };
                         if matched {
@@ -526,6 +559,46 @@ pub fn clean(text: &str) -> String {
         .replace('\t', "    ")
 }
 
+fn clean_for_search(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t' | '\u{85}'))
+        .collect::<String>()
+        .replace('\t', "    ")
+}
+
+// Segment after sanitizing: removing a control can join a ZWJ emoji into one
+// displayed grapheme. Return the corresponding byte range in the raw source.
+pub(super) fn search_graphemes(text: &str, mut visit: impl FnMut(Range<usize>, &str)) {
+    if !text.contains('\u{85}') {
+        for (start, grapheme) in text.grapheme_indices(true) {
+            visit(start..start + grapheme.len(), grapheme);
+        }
+        return;
+    }
+    let display = clean(text);
+    let mut raw = text.char_indices();
+    let mut raw_start = 0;
+    for (start, grapheme) in display.grapheme_indices(true) {
+        let mut visible = 0;
+        let mut raw_end = raw_start;
+        while visible < grapheme.len() {
+            let (offset, character) = raw.next().expect("sanitized grapheme has source");
+            raw_end = offset + character.len_utf8();
+            if character != '\u{85}' {
+                visible += character.len_utf8();
+            }
+        }
+        if start + grapheme.len() == display.len() {
+            raw_end = text.len();
+        }
+        visit(raw_start..raw_end, grapheme);
+        raw_start = raw_end;
+    }
+    if display.is_empty() {
+        visit(0..text.len(), "");
+    }
+}
+
 pub(crate) fn strip_shell_ansi(text: &str) -> String {
     let mut chars = text.chars().peekable();
     let mut result = String::with_capacity(text.len());
@@ -584,22 +657,41 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     for span in spans {
         let mut fragment = span.clone();
         fragment.text.clear();
-        for grapheme in span.text.graphemes(true) {
+        fragment.search_text = span.search_text.as_ref().map(|_| String::new());
+        search_graphemes(span.searchable(), |range, grapheme| {
             let size = UnicodeWidthStr::width(grapheme);
+            let source = &span.searchable()[range];
+            let (before_newline, after_newline) = if grapheme == "\n" {
+                source.split_once('\n').unwrap_or(("", ""))
+            } else {
+                ("", "")
+            };
+            if let Some(raw) = &mut fragment.search_text {
+                raw.push_str(before_newline);
+            }
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
                 fragment.text.clear();
+                if let Some(raw) = &mut fragment.search_text {
+                    raw.clear();
+                }
                 lines.push(Line::default());
                 used = 0;
                 if grapheme == "\n" {
-                    continue;
+                    if let Some(raw) = &mut fragment.search_text {
+                        raw.push_str(after_newline);
+                    }
+                    return;
                 }
             }
             if size <= width {
                 fragment.text.push_str(grapheme);
+                if let Some(raw) = &mut fragment.search_text {
+                    raw.push_str(source);
+                }
                 used += size;
             }
-        }
+        });
         lines.last_mut().unwrap().spans.push(fragment);
     }
     lines
@@ -1727,7 +1819,7 @@ fn markdown_at_depth(
                         for (link_range, url) in bare_links(displayed) {
                             let Some(mut url) = url else {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..link_range.end]);
+                                plain.set_source(&displayed[cursor..link_range.end]);
                                 spans.push(plain);
                                 cursor = link_range.end;
                                 continue;
@@ -1743,7 +1835,7 @@ fn markdown_at_depth(
                             }
                             if cursor < link_range.start {
                                 let mut plain = span.clone();
-                                plain.text = clean(&displayed[cursor..link_range.start]);
+                                plain.set_source(&displayed[cursor..link_range.start]);
                                 spans.push(plain);
                             }
                             let raw_label = &displayed[link_range.clone()];
@@ -1754,7 +1846,7 @@ fn markdown_at_depth(
                                 raw_label.to_owned()
                             };
                             let mut link = span.clone();
-                            link.text = clean(&label);
+                            link.set_source(&label);
                             link.color = theme.color("mdLink");
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
@@ -1770,7 +1862,7 @@ fn markdown_at_depth(
                             cursor = link_range.end;
                         }
                         if cursor < displayed.len() {
-                            span.text = clean(&displayed[cursor..]);
+                            span.set_source(&displayed[cursor..]);
                             spans.push(span);
                         }
                     } else {
