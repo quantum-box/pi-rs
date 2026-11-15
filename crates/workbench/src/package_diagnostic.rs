@@ -264,17 +264,17 @@ impl Scanner {
             }
         }
         let mut entries = collected;
-        if kind == Kind::Skill {
-            if let Some(entry) = entries.iter().find(|entry| entry.file_name() == "SKILL.md") {
-                let path = entry.path();
-                if path.is_file()
-                    && !matcher
-                        .matched_path_or_any_parents(&path, false)
-                        .is_ignore()
-                {
-                    output.push(path);
-                    return self.tick();
-                }
+        if kind == Kind::Skill
+            && let Some(entry) = entries.iter().find(|entry| entry.file_name() == "SKILL.md")
+        {
+            let path = entry.path();
+            if path.is_file()
+                && !matcher
+                    .matched_path_or_any_parents(&path, false)
+                    .is_ignore()
+            {
+                output.push(path);
+                return self.tick();
             }
         }
         for entry in entries.drain(..) {
