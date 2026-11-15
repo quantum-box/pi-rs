@@ -91,9 +91,23 @@ async fn abort_only_one_conversation_and_withdraw_existing_queue() {
         2
     );
     s.submit(b, None, "other".into()).unwrap();
-    s.abort(a).unwrap();
-    let view = s.view(a, std::num::NonZeroUsize::new(50).unwrap()).unwrap();
-    assert!(view.state.abort_requested);
+    let result = tokio::time::timeout(Duration::from_secs(5), s.abort_and_wait_withdrawn(a))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.withdrawn.len(), 2);
+    assert_eq!(result.withdrawn[0].conversation_id, a);
+    assert_eq!(result.withdrawn[0].mode, InputMode::Steer);
+    assert_eq!(result.withdrawn[0].submission.content, "steer");
+    assert_eq!(result.withdrawn[1].mode, InputMode::FollowUp);
+    assert_eq!(result.withdrawn[1].submission.content, "follow");
+    assert!(
+        s.abort_and_wait_withdrawn(a)
+            .await
+            .unwrap()
+            .withdrawn
+            .is_empty()
+    );
     tokio::time::timeout(Duration::from_secs(5), s.wait(a))
         .await
         .unwrap()

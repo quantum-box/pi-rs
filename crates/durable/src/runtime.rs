@@ -188,6 +188,20 @@ pub enum SubmissionKind {
     Continue,
 }
 
+/// An input withdrawn by an atomic conversation abort, in its conversation's queue order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WithdrawnInput {
+    pub conversation_id: Uuid,
+    pub mode: InputMode,
+    pub submission: Submission,
+}
+
+/// Inputs withdrawn by a conversation abort.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConversationAbortResult {
+    pub withdrawn: Vec<WithdrawnInput>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Submission {
     #[serde(default)]
@@ -8599,7 +8613,7 @@ impl Harness {
         receipt: Option<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Vec<Uuid>, Error> {
         self.abort_owned_graph_impl(conversation, task, receipt, false)
-            .map(|(conversations, _)| conversations)
+            .map(|(conversations, _, _)| conversations)
     }
 
     fn abort_owned_graph_impl(
@@ -8608,7 +8622,7 @@ impl Harness {
         task: Option<Uuid>,
         receipt: Option<(Vec<u8>, Vec<u8>)>,
         background: bool,
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
         self.abort_owned_graph_impl_with(conversation, task, receipt, background, || {})
     }
 
@@ -8619,7 +8633,7 @@ impl Harness {
         receipt: Option<(Vec<u8>, Vec<u8>)>,
         background: bool,
         mut before_commit: impl FnMut(),
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -8633,7 +8647,7 @@ impl Harness {
             if let Some((key, _)) = &receipt
                 && store.get(key)?.is_some()
             {
-                return Ok((Vec::new(), Vec::new()));
+                return Ok((Vec::new(), Vec::new(), ConversationAbortResult::default()));
             }
             let records = crate::task_store::TaskStore::new(store)
                 .list()
@@ -8726,9 +8740,19 @@ impl Harness {
                     generation_updates.push((state.id, next));
                 }
             }
+            let mut withdrawn = Vec::new();
             for (state, _) in &mut states {
                 for submission in &mut state.submissions {
                     if submission.status == Status::Queued {
+                        withdrawn.push(WithdrawnInput {
+                            conversation_id: state.id,
+                            mode: state
+                                .input_modes
+                                .get(&submission.id)
+                                .copied()
+                                .unwrap_or(InputMode::FollowUp),
+                            submission: submission.clone(),
+                        });
                         submission.status = Status::Unanswered {
                             reason: "aborted".into(),
                         };
@@ -8819,6 +8843,7 @@ impl Harness {
                     return Ok((
                         conversations.into_iter().collect(),
                         tasks.into_iter().collect(),
+                        ConversationAbortResult { withdrawn },
                     ));
                 }
                 Err(Error::Storage(durable_store::Error::Conflict { .. })) => continue,
@@ -13943,16 +13968,21 @@ impl Scheduler {
         self.abort_background_graph(id).map(|_| ())
     }
 
-    fn abort_background_graph(&mut self, id: Uuid) -> Result<(Vec<Uuid>, Vec<Uuid>), Error> {
+    fn abort_background_graph(
+        &mut self,
+        id: Uuid,
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>, ConversationAbortResult), Error> {
         let owner = self.harness.owner.clone();
         let mut tasks = Vec::new();
+        let mut result = ConversationAbortResult::default();
         let affected = owner
             .conversation_controls()
             .fence(|| {
-                let (conversations, reached) =
+                let (conversations, reached, withdrawn) =
                     self.harness
                         .abort_owned_graph_impl(Some(id), None, None, true)?;
                 tasks = reached;
+                result = withdrawn;
                 Ok(conversations)
             })
             .map_err(|error| match error {
@@ -13962,7 +13992,7 @@ impl Scheduler {
         for conversation in &affected {
             self.schedule(*conversation);
         }
-        Ok((affected, tasks))
+        Ok((affected, tasks, result))
     }
 
     /// Abort a task and its foreground owned conversations.
@@ -13975,13 +14005,29 @@ impl Scheduler {
         conversation: Option<Uuid>,
         task: Option<Uuid>,
     ) -> Result<Vec<Uuid>, Error> {
+        self.abort_graph_with_result(conversation, task)
+            .map(|(affected, _)| affected)
+    }
+
+    fn abort_graph_with_result(
+        &mut self,
+        conversation: Option<Uuid>,
+        task: Option<Uuid>,
+    ) -> Result<(Vec<Uuid>, ConversationAbortResult), Error> {
         // Prevent controls from being created and fence every existing poll while
         // discovering and committing the graph. A child may be admitted right up
         // to the transaction, so fencing a previously read graph is insufficient.
         let owner = self.harness.owner.clone();
+        let mut result = ConversationAbortResult::default();
         let affected = owner
             .conversation_controls()
-            .fence(|| self.harness.abort_owned_graph(conversation, task))
+            .fence(|| {
+                let (affected, _, withdrawn) =
+                    self.harness
+                        .abort_owned_graph_impl(conversation, task, None, false)?;
+                result = withdrawn;
+                Ok(affected)
+            })
             .map_err(|error| match error {
                 durable_store::controls::FenceError::Poisoned => Error::Failed,
                 durable_store::controls::FenceError::Commit(error) => error,
@@ -13989,11 +14035,18 @@ impl Scheduler {
         for id in &affected {
             self.schedule(*id);
         }
-        Ok(affected)
+        Ok((affected, result))
     }
     /// Request abort and join workers for every affected foreground conversation.
     pub async fn abort_and_wait(&mut self, id: Uuid) -> Result<(), Error> {
-        let affected = self.abort_graph(Some(id), None)?;
+        self.abort_and_wait_withdrawn(id).await.map(|_| ())
+    }
+    /// Abort and wait, returning the queued inputs withdrawn in the committed transaction.
+    pub async fn abort_and_wait_withdrawn(
+        &mut self,
+        id: Uuid,
+    ) -> Result<ConversationAbortResult, Error> {
+        let (affected, result) = self.abort_graph_with_result(Some(id), None)?;
         let mut first_error = None;
         for child in &affected {
             if let Err(error) = self.wait(*child).await {
@@ -14010,12 +14063,21 @@ impl Scheduler {
                 )));
             }
         }
-        Ok(())
+        Ok(result)
     }
     /// Abort across background boundaries and wait for the reached work to settle.
     /// A task driver must be running for any nonterminal generic tasks.
     pub async fn abort_and_wait_with_background(&mut self, id: Uuid) -> Result<(), Error> {
-        let (conversations, tasks) = self.abort_background_graph(id)?;
+        self.abort_and_wait_with_background_withdrawn(id)
+            .await
+            .map(|_| ())
+    }
+    /// Abort across background boundaries and return the withdrawn inputs after cleanup.
+    pub async fn abort_and_wait_with_background_withdrawn(
+        &mut self,
+        id: Uuid,
+    ) -> Result<ConversationAbortResult, Error> {
+        let (conversations, tasks, result) = self.abort_background_graph(id)?;
         let mut first_error = None;
         for conversation in &conversations {
             loop {
@@ -14045,7 +14107,7 @@ impl Scheduler {
         }
         loop {
             if !self.check_abort_task_progress(&tasks)? {
-                return Ok(());
+                return Ok(result);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
