@@ -1014,6 +1014,8 @@ struct NestedResume {
     operation_id: Uuid,
     restarts: u32,
     dispatch_identity: DispatchIdentity,
+    #[serde(default)]
+    explicit_suspend: bool,
 }
 
 /// Identity of one execution of a durable tool operation.
@@ -1041,6 +1043,14 @@ fn terminate_tool_round(c: &mut Conversation) -> Result<Phase, Error> {
 }
 
 impl Conversation {
+    /// Whether a replay-safe keyed tool explicitly suspended on pending
+    /// nested jobs. An abort keeps the suspension visible until reconciled.
+    pub fn nested_suspended(&self) -> bool {
+        self.nested_resume
+            .as_ref()
+            .is_some_and(|resume| resume.explicit_suspend)
+            && matches!(self.phase, Phase::Blocked { .. })
+    }
     pub(crate) fn active_tool_attempt(&self) -> Option<ToolAttempt> {
         if self.abort_requested
             || !matches!(
@@ -10476,6 +10486,7 @@ impl Harness {
                     });
                     let mut tool_panicked = false;
                     let mut nested_resume_candidate = false;
+                    let mut explicitly_suspended = false;
                     let task_adapter = tools
                         .get(&call.name)
                         .and_then(|reg| crate::task_tool::lookup(&reg.tool));
@@ -10622,6 +10633,7 @@ impl Harness {
                                         // Even a failed report write must seal the nested host.
                                         let inspection = host.seal_and_wait().await;
                                         panic_report?;
+                                        explicitly_suspended = host.explicitly_suspended();
                                         nested_resume_candidate = inspection.is_err()
                                             && host.only_pending_failure()
                                             && !tool_panicked
@@ -10719,6 +10731,7 @@ impl Harness {
                                     operation_id,
                                     restarts,
                                     dispatch_identity: DispatchIdentity::Other,
+                                    explicit_suspend: explicitly_suspended,
                                 })
                             } else {
                                 None

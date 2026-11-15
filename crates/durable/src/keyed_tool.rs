@@ -136,6 +136,17 @@ impl KeyedHost {
     pub async fn call_keyed(&self, key: &str, name: &str, arguments: Value) -> Outcome {
         self.nested.call_keyed(key, name, arguments).await
     }
+    /// Dispatch a keyed child without polling its pending result.
+    pub async fn call_keyed_unpolled(&self, key: &str, name: &str, arguments: Value) -> Outcome {
+        self.nested.call_keyed_unpolled(key, name, arguments).await
+    }
+
+    /// End this invocation at a pending-child boundary. The parent must be
+    /// registered replay-safe and return normally without state or controls.
+    /// The host must resolve every pending child before the parent can replay.
+    pub fn suspend_pending(&self) -> Result<(), String> {
+        self.nested.suspend_pending()
+    }
     /// Invoke a keyed child and read its durable diagnostics with the outcome.
     pub async fn call_keyed_with_diagnostics(
         &self,

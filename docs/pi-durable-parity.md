@@ -384,6 +384,22 @@ persisted pending jobs concurrently, preserving key and operation identity over
 reopen. It is not upstream's independent task admission or parked parent: the
 conversation worker remains active and abort requires local polling to stop.
 
+An opt-in keyed parent can instead call `call_keyed_unpolled` and then
+`suspend_pending`. Once its invocation has returned and the nested host has
+sealed and joined local calls, the existing blocked-operation transition
+persists an explicit suspension marker and releases the conversation worker.
+For a replay-safe parent without selected extensions, an authoritative host
+can resolve all pending references and the scheduler replays the parent using
+the existing keyed journal. Reopen leaves the parent parked until resolution;
+abort fences replay and retains unresolved references for reconciliation.
+This is a restricted external-pending-job bridge: it does not start an
+independent task, automatically poll or cancel a remote job, store a tool
+checkpoint, implement wait-any, or connect the private `nested_suspension`
+protocol to `TaskTool`. Abort can remain blocked until a host confirms child
+outcomes and reconciles the parent. A crash before the blocked transition is
+an interrupted tool attempt, subject to the normal replay policy. See
+[suspension tests](../crates/durable/tests/nested_explicit_suspend.rs).
+
 A private versioned nested-suspension record now persists a bounded immutable
 snapshot of pending job identities and opaque references with a checkpoint,
 abort marker, and executor state. Conditional retirement, claim, and abort

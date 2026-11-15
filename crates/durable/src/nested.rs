@@ -211,6 +211,7 @@ struct Shared {
     lifecycle: Mutex<Lifecycle>,
     failed: AtomicBool,
     non_pending_failure: AtomicBool,
+    explicit_suspend: AtomicBool,
     idle: tokio::sync::Notify,
 }
 struct NestedDiagnostic {
@@ -399,6 +400,7 @@ impl NestedHost {
                 lifecycle: Mutex::new(lifecycle),
                 failed: AtomicBool::new(false),
                 non_pending_failure: AtomicBool::new(false),
+                explicit_suspend: AtomicBool::new(false),
                 idle: tokio::sync::Notify::new(),
             }),
             parent,
@@ -425,6 +427,62 @@ impl NestedHost {
         }
         self.call_inner(Some(key), name, arguments, false, true)
             .await
+    }
+    /// Dispatch or reattach without polling a pending result. This is a
+    /// building block for an explicitly suspended, replay-safe parent.
+    pub(crate) async fn call_keyed_unpolled(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Outcome {
+        if !valid_key(key) {
+            return self.fail("invalid nested call key");
+        }
+        self.call_inner(Some(key), name, arguments, false, false)
+            .await
+    }
+
+    /// Request a durable wait after all local nested invocations have returned.
+    /// An unresolved or uncertain non-pending operation remains a barrier.
+    pub(crate) fn suspend_pending(&self) -> Result<(), String> {
+        if self.parent != self.shared.root || self.shared.failed.load(Ordering::Acquire) {
+            return Err("nested suspension requires a healthy root invocation".into());
+        }
+        let lifecycle = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| "nested lifecycle lock poisoned")?;
+        if lifecycle.sealed || lifecycle.active != 0 {
+            return Err("nested invocations remain active".into());
+        }
+        let mut pending = 0;
+        for (_, entry) in self
+            .shared
+            .owner
+            .store()
+            .list(&self.prefix())
+            .map_err(|e| e.to_string())?
+        {
+            let record: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            match record.outcome {
+                Some(Outcome::Pending { .. }) => pending += 1,
+                None | Some(Outcome::Unknown(_)) => {
+                    return Err("nested operation is uncertain".into());
+                }
+                _ => (),
+            }
+        }
+        if pending == 0 || pending > 8 {
+            return Err("nested suspension requires one to eight pending jobs".into());
+        }
+        // Seal future admissions before asking the runtime to discard this
+        // invocation's reply. The runtime waits for all calls before persisting.
+        self.shared.explicit_suspend.store(true, Ordering::Release);
+        self.pending_failure("explicit nested suspension");
+        drop(lifecycle);
+        Ok(())
     }
     pub async fn call_keyed_with_diagnostics(
         &self,
@@ -589,6 +647,9 @@ impl NestedHost {
     pub(crate) fn only_pending_failure(&self) -> bool {
         self.shared.failed.load(Ordering::Acquire)
             && !self.shared.non_pending_failure.load(Ordering::Acquire)
+    }
+    pub(crate) fn explicitly_suspended(&self) -> bool {
+        self.shared.explicit_suspend.load(Ordering::Acquire)
     }
     fn enter(&self) -> Result<Active, Outcome> {
         let mut l = self
