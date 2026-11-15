@@ -130,6 +130,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_session_supports_repeated_prompts_and_reopen() {
+        let mut builder = ModelCatalogBuilder::new();
+        builder
+            .register("a", "shared", Arc::new(NamedModel("first")))
+            .unwrap();
+        builder
+            .register("b", "shared", Arc::new(NamedModel("second")))
+            .unwrap();
+        let catalog = builder.build();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = catalog
+            .session_builder("a", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(session.prompt("one").await.unwrap(), "first");
+        assert_eq!(session.prompt("two").await.unwrap(), "first");
+        session.close().await.unwrap();
+        drop(session);
+
+        let mut reopened = catalog
+            .session_builder("b", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("three").await.unwrap(), "first");
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn builder_restores_exact_provider_client_from_journal() {
         let mut builder = ModelCatalogBuilder::new();
         builder

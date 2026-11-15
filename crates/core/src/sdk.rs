@@ -1350,6 +1350,10 @@ impl SessionBuilder {
         let guarded = resolved
             .as_ref()
             .map(|(provider, name, client)| (provider.as_str(), name.as_str(), client));
+        // A request-only journal does not carry a provider. Record the initial
+        // qualified choice before its first request, while leaving existing
+        // historical selections (including unqualified ones) untouched.
+        let initial_selection = session.model_identity_at(session.head()).is_none();
         let (_, _revoked) = self.registry.commit_session_model_bindings(
             session.session_id(),
             bindings,
@@ -1357,6 +1361,8 @@ impl SessionBuilder {
             || {
                 if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
                     session.select_provider_model_atomic(provider, name)?;
+                } else if initial_selection && let Some(provider) = &self.model_provider {
+                    session.select_provider_model(Some(provider), &self.model_name, None)?;
                 }
                 Ok(())
             },
