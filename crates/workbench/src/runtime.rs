@@ -1168,46 +1168,51 @@ mod standalone_share_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn standalone_share_keeps_active_tools_after_imported_system_checkpoint() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.jsonl");
-        let entries = [
-            serde_json::json!({"type":"session","version":3}),
+        for checkpoint in [
             serde_json::json!({"type":"message","id":"s","parentId":null,"message":{"role":"system","content":[{"type":"text","text":"checkpoint prompt"}]}}),
-        ];
-        std::fs::write(
-            &path,
-            entries
-                .iter()
-                .map(|entry| entry.to_string() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        let original = std::fs::read(&path).unwrap();
-        let source = super::super::session_import::read(&path).unwrap();
-        let mut args = Cli::try_parse_from([
-            "pi",
-            "--offline",
-            "--no-trust",
-            "--no-mcp",
-            "--no-extensions",
-            "--no-skills",
-            "--no-context-files",
-            "--endpoint",
-            "http://127.0.0.1:1/v1/chat/completions",
-        ])
-        .unwrap();
-        args.workspace = directory.path().to_owned();
-        args.session = path.clone();
-        let runtime = configure(&args, false).await.unwrap();
-        let expected = runtime.share_base().tools;
-        assert!(!expected.is_empty());
-        let session = Session::from_records(source.records().to_vec()).unwrap();
-        let snapshot = standalone_share_snapshot_with_runtime(&args, &source, session, runtime)
-            .await
+            serde_json::json!({"type":"compaction","id":"c","parentId":null,"firstKeptEntryId":"c","summary":"prior","systemMessage":{"role":"system","content":[{"type":"text","text":"checkpoint prompt"}]}}),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.jsonl");
+            let entries = [
+                serde_json::json!({"type":"session","version":3}),
+                checkpoint,
+            ];
+            std::fs::write(
+                &path,
+                entries
+                    .iter()
+                    .map(|entry| entry.to_string() + "\n")
+                    .collect::<String>(),
+            )
             .unwrap();
-        assert_eq!(snapshot.context.system_prompt, "checkpoint prompt");
-        assert_eq!(snapshot.context.tools, expected);
-        assert_eq!(std::fs::read(path).unwrap(), original);
+            let original = std::fs::read(&path).unwrap();
+            let source = super::super::session_import::read(&path).unwrap();
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+            ])
+            .unwrap();
+            args.workspace = directory.path().to_owned();
+            args.session = path.clone();
+            let runtime = configure(&args, false).await.unwrap();
+            let expected = runtime.share_base().tools;
+            assert!(!expected.is_empty());
+            let session = Session::from_records(source.records().to_vec()).unwrap();
+            let snapshot = standalone_share_snapshot_with_runtime(&args, &source, session, runtime)
+                .await
+                .unwrap();
+            assert_eq!(snapshot.context.system_prompt, "checkpoint prompt");
+            assert_eq!(snapshot.context.tools, expected);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
