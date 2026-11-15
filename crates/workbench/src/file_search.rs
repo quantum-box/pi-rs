@@ -29,8 +29,20 @@ impl Grep {
         };
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(args["ignoreCase"] == true)
+            // Pi invokes ripgrep without multiline mode. The matcher must
+            // reject a required newline rather than silently finding nothing.
+            .line_terminator(Some(b'\n'))
             .build(&pattern)
-            .map_err(|error| Error::Config(error.to_string()))?;
+            .map_err(|error| {
+                let message = error.to_string();
+                if message == "the literal \"\\n\" is not allowed in a regex" {
+                    Error::Config(format!(
+                        "rg: {message}\n\nConsider enabling multiline mode with the --multiline flag (or -U for short).\nWhen multiline mode is enabled, new line characters can be matched."
+                    ))
+                } else {
+                    Error::Config(message)
+                }
+            })?;
         let context = args["context"]
             .as_u64()
             .unwrap_or_else(|| args["context"].as_f64().unwrap_or(0.0).max(0.0) as u64);
@@ -495,6 +507,34 @@ fn render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_line_patterns_follow_ripgrep_newline_rules() {
+        let expected = "rg: the literal \"\\n\" is not allowed in a regex\n\nConsider enabling multiline mode with the --multiline flag (or -U for short).\nWhen multiline mode is enabled, new line characters can be matched.";
+        for args in [
+            json!({"pattern":"foo\nbar"}),
+            json!({"pattern":"foo\nbar", "literal":true}),
+            json!({"pattern":r"foo\nbar"}),
+            json!({"pattern":r"[\n]"}),
+            json!({"pattern":r"\x0a"}),
+        ] {
+            match Grep::new(&args, 100) {
+                Err(Error::Config(message)) => assert_eq!(message, expected, "{args}"),
+                _ => panic!("expected newline rejection for {args}"),
+            }
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "alpha\nBETA\n").unwrap();
+        for pattern in [r"[a-z\n]", r"(?s:.)", r"[^x]"] {
+            let mut grep = Grep::new(&json!({"pattern":pattern}), 100).unwrap();
+            grep.search(file.path(), "fixture", &CancellationToken::new())
+                .unwrap();
+            assert!(
+                grep.finish().tool_content().contains("fixture:1: alpha"),
+                "{pattern}"
+            );
+        }
+    }
 
     #[test]
     fn explicit_binary_file_uses_ripgrep_nul_line_boundaries() {
