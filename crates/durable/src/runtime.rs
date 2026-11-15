@@ -752,6 +752,8 @@ pub struct Conversation {
     active: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_attempt: Option<ToolAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_wait_attempt: Option<ToolAttempt>,
     #[serde(default)]
     pub abort_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4949,6 +4951,7 @@ impl Harness {
             compaction_return_turns: None,
             active: None,
             tool_attempt: None,
+            identity_wait_attempt: None,
             abort_requested: false,
             nested_resume: None,
             phase: Phase::Idle,
@@ -5266,6 +5269,7 @@ impl Harness {
             compaction_return_turns: None,
             active: None,
             tool_attempt: None,
+            identity_wait_attempt: None,
             abort_requested: false,
             nested_resume: None,
             phase: Phase::Idle,
@@ -9069,6 +9073,16 @@ impl Harness {
                     replay_ready,
                     dispatch_identity: stored_identity,
                 } => {
+                    if replay == ReplayPolicy::Unsafe
+                        && !replay_ready
+                        && c.identity_wait_attempt.is_some_and(|attempt| {
+                            attempt.operation_id == operation_id && !attempt.attempt_id.is_nil()
+                        })
+                        && c.identity_wait_attempt == c.tool_attempt()
+                        && c.nested_resume.is_none()
+                    {
+                        return Ok(());
+                    }
                     // An explicit suspended replay retains its marker until the
                     // parent finishes. Registry installation happens after open,
                     // so park it again and validate the selected tools on drive.
@@ -9913,6 +9927,15 @@ impl Harness {
     }
 
     async fn drive(&mut self, id: Uuid, cancel: &CancellationToken) -> Result<(), Error> {
+        self.drive_until_wait(id, cancel, &mut false).await
+    }
+
+    async fn drive_until_wait(
+        &mut self,
+        id: Uuid,
+        cancel: &CancellationToken,
+        identity_busy: &mut bool,
+    ) -> Result<(), Error> {
         // Held from before the durable unsafe claim until the checked result
         // commit. Process death drops these and recovery treats the claim as
         // uncertain, never as the old park.
@@ -9925,7 +9948,7 @@ impl Harness {
                 self.failed = true;
                 return Err(Error::Interrupted);
             }
-            let (mut c, version) = self.load(id)?;
+            let (mut c, mut version) = self.load(id)?;
             if unsafe_resume_leases
                 .as_ref()
                 .is_some_and(|(attempt, _)| c.active_tool_attempt() != Some(*attempt))
@@ -11727,42 +11750,51 @@ impl Harness {
                                 .and_then(|r| r.unsafe_park.as_ref())
                                 .expect("checked unsafe proof");
                             let parent = calls.get(index).and_then(|call| tools.get(&call.name));
-                            let acquired = if let Some(parent) =
-                                parent.filter(|reg| reg.replay == ReplayPolicy::Unsafe)
-                            {
-                                if let Some(parent_lease) = crate::nested_identity::lease(
-                                    &parent.tool,
-                                    &proof.identity.identity,
-                                ) {
-                                    if crate::keyed_tool::unsafe_park_identity(&parent.tool)
-                                        .as_ref()
-                                        == Some(&proof.identity)
-                                    {
-                                        crate::nested::lease_children(
-                                            self.owner.store(),
-                                            operation_id,
-                                            &tools,
-                                        )?
-                                        .map(
-                                            |mut children| {
-                                                children.push(parent_lease);
-                                                children
-                                            },
-                                        )
-                                    } else {
-                                        None
+                            let acquired =
+                                if let Some(parent) =
+                                    parent.filter(|reg| reg.replay == ReplayPolicy::Unsafe)
+                                {
+                                    match crate::nested_identity::checked_lease(
+                                        &parent.tool,
+                                        &proof.identity.identity,
+                                    ) {
+                                        Ok(parent_lease) => {
+                                            if crate::keyed_tool::unsafe_park_identity(&parent.tool)
+                                                .as_ref()
+                                                == Some(&proof.identity)
+                                            {
+                                                crate::nested::lease_children(
+                                                    self.owner.store(),
+                                                    operation_id,
+                                                    &tools,
+                                                )?
+                                                .map(|mut children| {
+                                                    children.push(parent_lease);
+                                                    children
+                                                })
+                                            } else {
+                                                Err(crate::nested_identity::LeaseFailure::Mismatch)
+                                            }
+                                        }
+                                        Err(error) => Err(error),
                                     }
                                 } else {
-                                    None
+                                    Err(crate::nested_identity::LeaseFailure::Mismatch)
+                                };
+                            let leases = match acquired {
+                                Ok(leases) => leases,
+                                Err(crate::nested_identity::LeaseFailure::Busy) => {
+                                    #[cfg(test)]
+                                    unsafe_park_boundary_tests::checkpoint(id, "lease-busy").await;
+                                    *identity_busy = true;
+                                    return Ok(());
                                 }
-                            } else {
-                                None
-                            };
-                            let Some(leases) = acquired else {
-                                #[cfg(test)]
-                                unsafe_park_boundary_tests::checkpoint(id, "lease-busy").await;
-                                tokio::select! { _ = cancel.cancelled() => return Err(Error::Interrupted), _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
-                                continue;
+                                Err(crate::nested_identity::LeaseFailure::Mismatch) => {
+                                    c.nested_resume = None;
+                                    c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "unsafe park parent or child identity changed; reconciliation required".into(), arguments: Some(arguments) };
+                                    self.save(&c, Expected::Version(version))?;
+                                    continue;
+                                }
                             };
                             Some(leases)
                         } else {
@@ -11832,12 +11864,21 @@ impl Harness {
                         if let Some(reg) = tools.get(&call.name) {
                             match crate::nested_identity::execution_lease(&reg.tool) {
                                 Ok(Some(lease)) if lease.is_some() => Some(lease),
-                                Ok(None) => None,
+                                Ok(None) if c.identity_wait_attempt.is_none() => None,
                                 Err(()) => {
-                                    tokio::select! { _ = cancel.cancelled() => return Err(Error::Interrupted), _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
-                                    continue;
+                                    if c.nested_resume.is_some() {
+                                        return Err(Error::Invalid(
+                                            "claimed unsafe resume lost identity lease".into(),
+                                        ));
+                                    }
+                                    if c.identity_wait_attempt != c.tool_attempt() {
+                                        c.identity_wait_attempt = c.tool_attempt();
+                                        self.save(&c, Expected::Version(version))?;
+                                    }
+                                    *identity_busy = true;
+                                    return Ok(());
                                 }
-                                Ok(Some(_)) => {
+                                Ok(Some(_)) | Ok(None) => {
                                     c.phase = Phase::Blocked { tool_panicked: false, turns, calls, index, operation_id, reason: "registered unsafe parent identity unavailable; reconciliation required".into(), arguments: Some(arguments) };
                                     self.save(&c, Expected::Version(version))?;
                                     continue;
@@ -11849,6 +11890,13 @@ impl Harness {
                     } else {
                         None
                     };
+                    if c.identity_wait_attempt.is_some() {
+                        c.identity_wait_attempt = None;
+                        self.save(&c, Expected::Version(version))?;
+                        let (fresh, fresh_version) = self.load(id)?;
+                        c = fresh;
+                        version = fresh_version;
+                    }
                     let started_unsafe_identity = (replay == ReplayPolicy::Unsafe)
                         .then(|| {
                             tools
@@ -15581,13 +15629,38 @@ pub(crate) async fn drive_scheduled<'a>(
     if let Some(errors) = errors {
         errors.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
+    let mut identity_retry = false;
     loop {
         if cancel.is_cancelled() {
             return Ok(());
         }
         // Another owner may have failed while this worker was parked. Apply
         // the same recovery policy as a newly scheduled worker before driving.
-        if let Err(error) = worker.recover_conversation(id) {
+        let safe_identity_retry = if identity_retry {
+            let state = worker.conversation(id)?;
+            !state.abort_requested
+                && match &state.phase {
+                    Phase::ToolRunning {
+                        replay: ReplayPolicy::Unsafe,
+                        replay_ready: true,
+                        ..
+                    } => true,
+                    Phase::ToolRunning {
+                        replay: ReplayPolicy::Unsafe,
+                        replay_ready: false,
+                        ..
+                    } => {
+                        state.identity_wait_attempt.is_some()
+                            && state.identity_wait_attempt == state.tool_attempt()
+                            && state.nested_resume.is_none()
+                    }
+                    _ => false,
+                }
+        } else {
+            false
+        };
+        identity_retry = false;
+        if !safe_identity_retry && let Err(error) = worker.recover_conversation(id) {
             let _gate = worker
                 .execution_gate
                 .as_ref()
@@ -15600,7 +15673,11 @@ pub(crate) async fn drive_scheduled<'a>(
                 Err(error)
             };
         }
-        if let Err(error) = worker.drive(id, cancel).await {
+        let mut identity_busy = false;
+        if let Err(error) = worker
+            .drive_until_wait(id, cancel, &mut identity_busy)
+            .await
+        {
             let _gate = worker
                 .execution_gate
                 .as_ref()
@@ -15612,6 +15689,22 @@ pub(crate) async fn drive_scheduled<'a>(
             } else {
                 Err(error)
             };
+        }
+        if identity_busy {
+            drop(guard.take());
+            activity.set(crate::worker_activity::WorkerPhase::Waiting);
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => (),
+            }
+            *guard = Some(tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                guard = lock.lock() => guard,
+            });
+            activity.set(crate::worker_activity::WorkerPhase::Running);
+            identity_retry = true;
+            continue;
         }
         let state = worker.conversation(id)?;
         if state.nested_suspended() && !state.abort_requested {
@@ -20066,6 +20159,7 @@ mod scheduler_tests {
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,
+            identity_wait_attempt: None,
             phase: Phase::Idle,
         };
         let mut latest = base.clone();

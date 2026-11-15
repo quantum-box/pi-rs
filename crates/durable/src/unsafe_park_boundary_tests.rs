@@ -41,10 +41,10 @@ struct BoundaryModel;
 #[async_trait::async_trait]
 impl pi_rs_core::Model for BoundaryModel {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
-        let done = request
-            .messages
-            .iter()
-            .any(|m| matches!(m, Message::Tool { .. }));
+        let done = request.messages.iter().any(|m| {
+            matches!(m, Message::Tool { .. })
+                || matches!(m, Message::User { content } if content == "other")
+        });
         Ok(stream::iter(vec![
             Ok(ModelEvent::Text(if done { "done" } else { "" }.into())),
             Ok(ModelEvent::Complete {
@@ -314,6 +314,323 @@ async fn busy_identity_does_not_claim_and_leases_survive_until_commit() {
         assert!(scheduler.blocked(id).unwrap().is_none());
         scheduler.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn permanent_parent_or_child_mismatch_blocks_without_claim() {
+    for change_parent in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (opts, parent, child) = options_with_handles(root, 1, false, ReplayPolicy::Unsafe);
+        let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        until(|| {
+            scheduler
+                .conversation(id)
+                .is_ok_and(|c| c.nested_suspended())
+                && root.join("poll-entered").exists()
+        })
+        .await;
+        let before_claim = install(id, "before-claim");
+        std::fs::write(root.join("release"), b"ready").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), before_claim.reached.notified())
+            .await
+            .unwrap();
+        let old = scheduler.conversation(id).unwrap().tool_attempt();
+        let target = if change_parent { parent } else { child };
+        target
+            .update(Some("different-backend".into()), || {})
+            .await
+            .unwrap();
+        before_claim.release.notify_one();
+        until(|| scheduler.blocked(id).unwrap().is_some()).await;
+        let reason = scheduler.blocked(id).unwrap().unwrap().1;
+        assert!(reason.contains("identity changed"), "{reason}");
+        assert_eq!(scheduler.conversation(id).unwrap().tool_attempt(), old);
+        assert_eq!(count(root, "wake-effects"), 0);
+        wait(&mut scheduler, id).await;
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn busy_wait_releases_worker_and_allows_abort_and_other_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (opts, _, child) = options_with_handles(root, 1, false, ReplayPolicy::Unsafe);
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 100,
+    };
+    let id = scheduler.create_conversation(config.clone()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| {
+        scheduler
+            .conversation(id)
+            .is_ok_and(|c| c.nested_suspended())
+            && root.join("poll-entered").exists()
+    })
+    .await;
+    let before_claim = install(id, "before-claim");
+    let busy = install(id, "lease-busy");
+    std::fs::write(root.join("release"), b"ready").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), before_claim.reached.notified())
+        .await
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(child.update(Some("test-backend:child:v1".into()), || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    before_claim.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(20), busy.reached.notified())
+        .await
+        .unwrap();
+    let next_try = install(id, "before-claim");
+    busy.release.notify_one();
+    let lock = scheduler
+        .harness
+        .owner
+        .conversation_controls()
+        .get(id)
+        .worker;
+    let guard = tokio::time::timeout(Duration::from_secs(2), lock.lock())
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), next_try.reached.notified())
+            .await
+            .is_err(),
+        "busy loop retried before bounded timer"
+    );
+    CHECKPOINTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&(id, "before-claim"));
+    let other = scheduler.create_conversation(config).unwrap();
+    scheduler.submit(other, None, "other".into()).unwrap();
+    wait(&mut scheduler, other).await;
+    assert!(
+        scheduler
+            .conversation(other)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { .. }))
+    );
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count(root, "wake-effects"), 0);
+    tokio::time::timeout(Duration::from_secs(2), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    release_tx.send(()).unwrap();
+    assert!(writer.join().unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn initial_busy_wait_persists_unstarted_attempt_and_abort_does_not_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (opts, parent, _) = options_with_handles(root, 1, false, ReplayPolicy::Unsafe);
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(parent.update(Some("test-parent/tenant-a".into()), || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| {
+        scheduler
+            .conversation(id)
+            .is_ok_and(|c| c.identity_wait_attempt.is_some())
+    })
+    .await;
+    let state = scheduler.conversation(id).unwrap();
+    assert_eq!(state.identity_wait_attempt, state.tool_attempt());
+    assert_eq!(count(root, "initial-effects"), 0);
+    let lock = scheduler
+        .harness
+        .owner
+        .conversation_controls()
+        .get(id)
+        .worker;
+    let guard = tokio::time::timeout(Duration::from_secs(2), lock.lock())
+        .await
+        .unwrap();
+    drop(guard);
+    scheduler.abort(id).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count(root, "initial-effects"), 0);
+    tokio::time::timeout(Duration::from_secs(2), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    release_tx.send(()).unwrap();
+    assert!(writer.join().unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn shutdown_during_initial_busy_wait_reopens_unstarted_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (opts, parent, _) = options_with_handles(root, 1, false, ReplayPolicy::Unsafe);
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(parent.update(Some("test-parent/tenant-a".into()), || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| {
+        scheduler
+            .conversation(id)
+            .is_ok_and(|c| c.identity_wait_attempt.is_some())
+    })
+    .await;
+    let attempt = scheduler.conversation(id).unwrap().tool_attempt();
+    tokio::time::timeout(Duration::from_secs(2), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count(root, "initial-effects"), 0);
+    release_tx.send(()).unwrap();
+    assert!(writer.join().unwrap().is_ok());
+    let opts = options(root, 1, false, ReplayPolicy::Unsafe);
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    assert_eq!(scheduler.conversation(id).unwrap().tool_attempt(), attempt);
+    std::fs::write(root.join("release"), b"ready").unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(count(root, "initial-effects"), 1);
+    assert_eq!(count(root, "wake-effects"), 1);
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn initial_busy_wait_reopen_requires_parent_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (opts, parent, _) = options_with_handles(root, 1, false, ReplayPolicy::Unsafe);
+    let mut scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(parent.update(Some("test-parent/tenant-a".into()), || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }))
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| {
+        scheduler
+            .conversation(id)
+            .is_ok_and(|c| c.identity_wait_attempt.is_some())
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    release_tx.send(()).unwrap();
+    assert!(writer.join().unwrap().is_ok());
+    let parent = Arc::new(KeyedToolAdapter::new(BoundaryParent {
+        root: root.into(),
+        version: 1,
+        changed_spec: false,
+    }))
+    .register(ReplayPolicy::Unsafe);
+    let child: Arc<dyn Tool> = Arc::new(BoundaryChild(root.into()));
+    crate::nested_identity::register(&child, Some("test-backend:child:v1".into())).unwrap();
+    let opts = Options {
+        model: Arc::new(BoundaryModel),
+        tools: vec![
+            parent,
+            RegisteredTool {
+                tool: child,
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let scheduler = Scheduler::open(root.join("db"), opts).unwrap();
+    until(|| scheduler.blocked(id).unwrap().is_some()).await;
+    assert!(
+        scheduler
+            .blocked(id)
+            .unwrap()
+            .unwrap()
+            .1
+            .contains("identity unavailable")
+    );
+    assert_eq!(count(root, "initial-effects"), 0);
+    scheduler.shutdown().await.unwrap();
 }
 struct Kill(std::process::Child);
 impl Drop for Kill {

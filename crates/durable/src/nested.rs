@@ -335,25 +335,36 @@ pub(crate) fn lease_children(
     store: &durable_store::Store,
     root: Uuid,
     tools: &std::collections::HashMap<String, RegisteredTool>,
-) -> Result<Option<Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>>, crate::runtime::Error> {
+) -> Result<
+    Result<
+        Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>,
+        crate::nested_identity::LeaseFailure,
+    >,
+    crate::runtime::Error,
+> {
     let mut leases = Vec::new();
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
         let Some(identity) = record.durable_identity.as_deref() else {
-            return Ok(None);
+            return Ok(Err(crate::nested_identity::LeaseFailure::Mismatch));
         };
         let Some(reg) = tools.get(&record.name) else {
-            return Ok(None);
+            return Ok(Err(crate::nested_identity::LeaseFailure::Mismatch));
         };
         if record.policy != reg.replay {
-            return Ok(None);
+            return Ok(Err(crate::nested_identity::LeaseFailure::Mismatch));
         }
-        let Some(lease) = crate::nested_identity::lease(&reg.tool, identity) else {
-            return Ok(None);
+        let lease = match crate::nested_identity::checked_lease(&reg.tool, identity) {
+            Ok(lease) => lease,
+            Err(error) => return Ok(Err(error)),
         };
         leases.push(lease);
     }
-    Ok((!leases.is_empty()).then_some(leases))
+    if leases.is_empty() {
+        Ok(Err(crate::nested_identity::LeaseFailure::Mismatch))
+    } else {
+        Ok(Ok(leases))
+    }
 }
 
 // Automatic replay is restricted to a root with only terminal records and at

@@ -427,6 +427,13 @@ Experimental older unsafe park proofs without a parent identity cannot be
 recovered by binding children: authoritative parent reconciliation is required.
 Before claiming a resumed unsafe attempt, the runtime leases the parent and all
 child identities through handler execution and the checked result commit.
+An identity mismatch at claim blocks for reconciliation. A temporarily busy
+identity releases the conversation worker lock and retries on a bounded timer;
+abort and shutdown can proceed while it waits. For an initially busy unsafe
+invocation the persisted attempt records that its handler has not started; the
+marker is cleared before dispatch, after which a crash remains uncertain.
+The standalone `Harness` does not run a background timer; its caller must
+drive it again after an identity becomes available.
 The committed checkpoint and original attempt identity fence the park; a new
 attempt is claimed before resumption. Process death after that claim is an
 interrupted unsafe invocation and requires reconciliation (or follows the

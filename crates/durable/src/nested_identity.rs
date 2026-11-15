@@ -84,6 +84,23 @@ pub(crate) fn lease(
     let guard = binding(tool)?.try_read_owned().ok()?;
     (guard.as_deref() == Some(expected)).then_some(guard)
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseFailure {
+    Busy,
+    Mismatch,
+}
+pub(crate) fn checked_lease(
+    tool: &Arc<dyn Tool>,
+    expected: &str,
+) -> Result<OwnedRwLockReadGuard<Option<String>>, LeaseFailure> {
+    let binding = binding(tool).ok_or(LeaseFailure::Mismatch)?;
+    let guard = binding.try_read_owned().map_err(|_| LeaseFailure::Busy)?;
+    if guard.as_deref() == Some(expected) {
+        Ok(guard)
+    } else {
+        Err(LeaseFailure::Mismatch)
+    }
+}
 
 #[cfg(test)]
 mod tests {
