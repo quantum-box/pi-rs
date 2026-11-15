@@ -106,6 +106,10 @@ async fn shared_activity_tracks_concurrent_workers_abort_and_shutdown() {
         && w.id == conversation
         && w.phase == WorkerPhase::Running));
     assert_eq!(driver.worker_activity().snapshot(), snapshot);
+    scheduler.schedule(conversation);
+    assert!(activity.snapshot().iter().any(|w| w.id == conversation
+        && w.kind == WorkerKind::Conversation
+        && w.phase == WorkerPhase::Queued));
     scheduler.abort(conversation).unwrap();
     assert!(activity.snapshot().iter().any(|w| w.id == task_id));
     release_tx.send(()).unwrap();
@@ -290,5 +294,39 @@ fn driver_shutdown_keeps_running_attempt_visible_until_joined() {
     );
     release_tx.send(()).unwrap();
     thread.join().unwrap().unwrap();
+    assert!(activity.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_removes_queued_lock_contenders() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(HoldingModel {
+        entered: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "hold".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), model.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let activity = scheduler.worker_activity();
+    for _ in 0..3 {
+        scheduler.schedule(id);
+    }
+    assert_eq!(
+        activity
+            .snapshot()
+            .iter()
+            .filter(|w| w.id == id && w.phase == WorkerPhase::Queued)
+            .count(),
+        3
+    );
+    tokio::time::timeout(Duration::from_secs(5), scheduler.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(activity.snapshot().is_empty());
 }

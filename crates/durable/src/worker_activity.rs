@@ -13,9 +13,10 @@ pub enum WorkerKind {
     /// An independent compaction worker, identified by its operation ID.
     Summary,
 }
-/// Whether an executor is driving work or is parked between polls.
+/// Whether an executor is queued, driving work or parked between polls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerPhase {
+    Queued,
     Running,
     Waiting,
 }
@@ -45,15 +46,14 @@ impl WorkerActivity {
         workers
     }
     pub(crate) fn enter(&self, kind: WorkerKind, id: Uuid) -> Guard {
+        self.enter_at(kind, id, WorkerPhase::Running)
+    }
+    pub(crate) fn enter_at(&self, kind: WorkerKind, id: Uuid, phase: WorkerPhase) -> Guard {
         let mut workers = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let token = loop {
             let token = Uuid::new_v4();
             if let std::collections::hash_map::Entry::Vacant(slot) = workers.entry(token) {
-                slot.insert(Worker {
-                    kind,
-                    id,
-                    phase: WorkerPhase::Running,
-                });
+                slot.insert(Worker { kind, id, phase });
                 break token;
             }
         };

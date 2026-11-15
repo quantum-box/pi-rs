@@ -2724,6 +2724,11 @@ impl Harness {
         id: Uuid,
         stop: &CancellationToken,
     ) -> Result<(), Error> {
+        let activity = self.activity.enter_at(
+            crate::worker_activity::WorkerKind::Conversation,
+            id,
+            crate::worker_activity::WorkerPhase::Queued,
+        );
         let lock = self.owner.conversation_controls().get(id).worker;
         let guard = tokio::select! {
             biased;
@@ -2737,7 +2742,7 @@ impl Harness {
         let result = tokio::select! {
             biased;
             _ = stop.cancelled() => return Ok(()),
-            result = std::panic::AssertUnwindSafe(drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard, Some(&errors))).catch_unwind() => result,
+            result = std::panic::AssertUnwindSafe(drive_scheduled(self, id, &control.cleanup_cancel, &lock, &mut guard, Some(&errors), activity)).catch_unwind() => result,
         };
         let failure = match &result {
             Ok(Err(error)) => Some(error.to_string()),
@@ -13584,6 +13589,11 @@ impl Scheduler {
         let mut worker = self.harness.worker();
         worker.execution_gate = Some(control.gate);
         let errors = self.worker_errors.clone();
+        let activity = self.harness.activity.enter_at(
+            crate::worker_activity::WorkerKind::Conversation,
+            id,
+            crate::worker_activity::WorkerPhase::Queued,
+        );
         let task = tokio::spawn(async move {
             // A queued worker must not delay shutdown behind another owner.
             let mut guard = Some(tokio::select! {
@@ -13602,6 +13612,7 @@ impl Scheduler {
                 &lock,
                 &mut guard,
                 Some(&errors),
+                activity,
             ))
             .catch_unwind()
             .await;
@@ -14015,6 +14026,11 @@ impl Scheduler {
                                     let Some(child) = worker.reporter_child(&reporter)? else {
                                         return Ok(());
                                     };
+                                    let activity = worker.activity.enter_at(
+                                        crate::worker_activity::WorkerKind::Conversation,
+                                        child,
+                                        crate::worker_activity::WorkerPhase::Queued,
+                                    );
                                     let lock =
                                         worker.owner.conversation_controls().get(child).worker;
                                     {
@@ -14033,12 +14049,18 @@ impl Scheduler {
                                             &lock,
                                             &mut guard,
                                             Some(&worker_errors),
+                                            activity,
                                         )
                                         .await?;
                                     }
                                     if let Some(parent) =
                                         worker.deliver_report(&task_key, &reporter)?
                                     {
+                                        let activity = worker.activity.enter_at(
+                                            crate::worker_activity::WorkerKind::Conversation,
+                                            parent,
+                                            crate::worker_activity::WorkerPhase::Queued,
+                                        );
                                         let lock =
                                             worker.owner.conversation_controls().get(parent).worker;
                                         let mut guard = Some(tokio::select! {
@@ -14056,6 +14078,7 @@ impl Scheduler {
                                             &lock,
                                             &mut guard,
                                             Some(&worker_errors),
+                                            activity,
                                         )
                                         .await?;
                                     }
@@ -14291,10 +14314,9 @@ pub(crate) async fn drive_scheduled<'a>(
     lock: &'a tokio::sync::Mutex<()>,
     guard: &mut Option<tokio::sync::MutexGuard<'a, ()>>,
     errors: Option<&std::sync::Mutex<HashMap<Uuid, String>>>,
+    activity: crate::worker_activity::Guard,
 ) -> Result<(), Error> {
-    let activity = worker
-        .activity
-        .enter(crate::worker_activity::WorkerKind::Conversation, id);
+    activity.set(crate::worker_activity::WorkerPhase::Running);
     let next_poll = worker.owner.conversation_controls().get(id).next_poll;
     if cancel.is_cancelled() {
         return Ok(());
@@ -16357,7 +16379,10 @@ mod scheduler_tests {
                 worker.execution_gate = Some(control.gate);
                 let lock = control.worker;
                 let mut guard = Some(lock.lock().await);
-                drive_scheduled(&mut worker, id, &cancel, &lock, &mut guard, None).await
+                let activity = worker
+                    .activity
+                    .enter(crate::worker_activity::WorkerKind::Conversation, id);
+                drive_scheduled(&mut worker, id, &cancel, &lock, &mut guard, None, activity).await
             })
         };
         let first_cancel = CancellationToken::new();
