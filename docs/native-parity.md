@@ -655,8 +655,8 @@ expanding a quoted prompt argument before the model request.
 ### Local MCP checkpoint
 
 `pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
-default is 300 seconds. The callback wait also retains pi-rs's existing
-10-minute ceiling when a longer timeout is requested.
+default is 300 seconds. Once credential persistence starts, it is allowed to
+finish even if the deadline passes, so its outcome can be reported reliably.
 
 `pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
 `mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for

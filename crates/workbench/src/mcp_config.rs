@@ -520,6 +520,9 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 .ok_or_else(|| {
                     Error::Config("--timeout must be a positive number of seconds".into())
                 })?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| Error::Config("--timeout is too large".into()))?;
             let path = path(args, local);
             let document = config::read_object(&path)?;
             let value = document.get("mcpServers").and_then(|servers| servers.get(&name))
@@ -556,44 +559,45 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 |url: &str| output(json!({"type":"mcp_authorization","name":name,"url":url}));
             let server_oauth = server.oauth.clone();
             let http_options = super::http_proxy::configured_mcp(&args.settings)?;
-            tokio::time::timeout(timeout, async {
-                if let Some(metadata_url) = client_metadata_url {
-                    pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options(
-                        &name,
-                        url,
-                        &metadata_url,
-                        &scopes,
-                        Some(&http_options),
-                        announce,
-                    )
-                    .await?;
-                } else if client_id.is_none() && server.oauth_client().is_some() {
-                    pi_rs_workbench::mcp_auth::login_configured_with_http_options(
-                        &name,
-                        url,
-                        server.oauth_client(),
-                        None,
-                        &scopes,
-                        Some(&http_options),
-                        announce,
-                    )
-                    .await?;
-                } else {
-                    pi_rs_workbench::mcp_auth::login_with_secret_with_http_options(
-                        &name,
-                        url,
-                        client_id.as_deref(),
-                        client_secret.as_deref(),
-                        &scopes,
-                        Some(&http_options),
-                        announce,
-                    )
-                    .await?;
-                }
-                Ok::<(), Error>(())
-            })
-            .await
-            .map_err(|_| Error::Config("MCP login timed out".into()))??;
+            if let Some(metadata_url) = client_metadata_url {
+                pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options_and_deadline(
+                    &name,
+                    url,
+                    &metadata_url,
+                    &scopes,
+                    Some(&http_options),
+                    deadline,
+                    &args.mcp_login_cancel,
+                    announce,
+                )
+                .await?;
+            } else if client_id.is_none() && server.oauth_client().is_some() {
+                pi_rs_workbench::mcp_auth::login_configured_with_http_options_and_deadline(
+                    &name,
+                    url,
+                    server.oauth_client(),
+                    None,
+                    &scopes,
+                    Some(&http_options),
+                    deadline,
+                    &args.mcp_login_cancel,
+                    announce,
+                )
+                .await?;
+            } else {
+                pi_rs_workbench::mcp_auth::login_with_secret_with_http_options_and_deadline(
+                    &name,
+                    url,
+                    client_id.as_deref(),
+                    client_secret.as_deref(),
+                    &scopes,
+                    Some(&http_options),
+                    deadline,
+                    &args.mcp_login_cancel,
+                    announce,
+                )
+                .await?;
+            }
             config::update_object(&path, |document| {
                 let server = document
                     .get_mut("mcpServers")

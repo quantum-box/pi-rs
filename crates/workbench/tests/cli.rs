@@ -11,11 +11,17 @@ use serde_json::{Value, json};
 
 #[tokio::test]
 async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
+    use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = format!("http://{}/mcp", listener.local_addr().unwrap());
     let config = json!({"mcpServers":{"fixture":{"url":server}}}).to_string();
     std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let directory = root.path().join("mcp-auth");
+    std::fs::create_dir_all(&directory).unwrap();
+    let digest = Sha256::digest(serde_json::to_vec(&("fixture", &server)).unwrap());
+    let credential = directory.join(format!("{digest:x}.json"));
+    std::fs::write(&credential, "existing credentials").unwrap();
     let run = |timeout: &str| {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
         command
@@ -28,7 +34,7 @@ async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
         let output = run(invalid).output().await.unwrap();
         assert!(!output.status.success(), "accepted {invalid}");
     }
-    let child = run("0.5").kill_on_drop(true).spawn().unwrap();
+    let child = run("2").kill_on_drop(true).spawn().unwrap();
     let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
         .await
         .unwrap()
@@ -39,6 +45,41 @@ async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("MCP login timed out"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read_to_string(credential).unwrap(),
+        "existing credentials"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_login_sigint_cancels_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = json!({"mcpServers":{"fixture":{"url":format!("http://{}/mcp", listener.local_addr().unwrap())}}}).to_string();
+    std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["mcp", "login", "fixture", "--timeout", "60"])
+        .kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success());
     assert_eq!(
         std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
         config

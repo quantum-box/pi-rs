@@ -537,6 +537,116 @@ impl CredentialStore for FileCredentials {
     }
 }
 
+// Keep authorization results in memory until the caller has crossed the
+// cancellation boundary. No credential file is touched during preparation.
+#[derive(Clone)]
+struct StagedCredentials {
+    store: FileCredentials,
+    staged: Staging,
+}
+
+#[async_trait::async_trait]
+impl CredentialStore for StagedCredentials {
+    async fn load(&self) -> std::result::Result<Option<StoredCredentials>, AuthError> {
+        self.store.load().await
+    }
+    async fn save(&self, credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
+        *self
+            .staged
+            .credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((self.store.clone(), credentials));
+        Ok(())
+    }
+    async fn clear(&self) -> std::result::Result<(), AuthError> {
+        *self
+            .staged
+            .credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+    async fn acquire_refresh_guard(
+        &self,
+    ) -> std::result::Result<Option<CredentialRefreshGuard>, AuthError> {
+        self.store.acquire_refresh_guard().await
+    }
+}
+
+#[derive(Default)]
+struct StagingState {
+    credentials: Mutex<Option<(FileCredentials, StoredCredentials)>>,
+    callback: Mutex<Option<crate::oauth_callback::Callback>>,
+    guard: Mutex<Option<CredentialRefreshGuard>>,
+}
+type Staging = Arc<StagingState>;
+
+async fn reply_staged(staged: &Staging, success: bool) {
+    let callback = staged
+        .callback
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(callback) = callback {
+        // The browser must not hold the login open indefinitely after the result.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), callback.reply(success)).await;
+    }
+}
+
+async fn deadline_login<F>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    // Acquiring the lock is preparation too: expiry must never leave a queued
+    // writer that can replace credentials later.
+    let ready = async {
+        prepare.await?;
+        let (store, credentials) = staged
+            .credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| Error::Config("MCP OAuth produced no credentials".into()))?;
+        let guard = staged
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
+        Ok::<_, Error>((store, credentials, guard))
+    };
+    let ready = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = tokio::time::timeout_at(deadline, ready) =>
+            result.map_err(|_| Error::Config("MCP login timed out".into())).and_then(|result| result),
+    };
+    let result = match ready {
+        Ok((store, credentials, _guard)) if tokio::time::Instant::now() < deadline => {
+            // The blocking write retains the lease even if the caller is dropped.
+            store.save(credentials).await.map_err(auth_error)
+        }
+        Ok(_) => Err(Error::Config("MCP login timed out".into())),
+        Err(error) => Err(error),
+    };
+    // A failed or cancelled preparation can leave the guard in staging.
+    drop(
+        staged
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(),
+    );
+    reply_staged(&staged, result.is_ok()).await;
+    result
+}
+
 /// Restore a previously authorized client. Each connection is bound to one login generation.
 pub async fn client(
     name: &str,
@@ -647,6 +757,7 @@ pub async fn login_with_secret_with_http_options(
         scopes,
         options,
         announce,
+        None,
     )
     .await
     .map(|_| ())
@@ -682,6 +793,7 @@ pub async fn login_with_metadata_with_http_options(
         scopes,
         options,
         announce,
+        None,
     )
     .await
     .map(|_| ())
@@ -706,6 +818,22 @@ pub async fn login_configured_with_http_options(
     scopes: &[String],
     options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
+) -> Result<()> {
+    login_configured_inner(
+        name, url, settings, challenge, scopes, options, announce, None,
+    )
+    .await
+}
+
+async fn login_configured_inner(
+    name: &str,
+    url: &str,
+    settings: Option<&OAuthClientSettings>,
+    challenge: Option<&str>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    announce: impl Fn(&str),
+    staging: Option<Staging>,
 ) -> Result<()> {
     let default = OAuthClientSettings::default();
     let settings = settings.unwrap_or(&default);
@@ -744,9 +872,106 @@ pub async fn login_configured_with_http_options(
         scopes,
         options,
         announce,
+        staging,
     )
     .await
     .map(|_| ())
+}
+
+/// CLI login with an absolute deadline covering all preparation. Once the
+/// credential commit begins it runs to completion, even after the deadline.
+pub async fn login_with_secret_with_http_options_and_deadline(
+    name: &str,
+    url: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let staged = Staging::default();
+    deadline_login(deadline, staged.clone(), cancellation, async {
+        authorize(
+            name,
+            url,
+            Registration::New(ClientOptions {
+                client_id,
+                client_secret,
+                ..ClientOptions::default()
+            }),
+            scopes,
+            options,
+            announce,
+            Some(staged.clone()),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await
+}
+
+/// Deadline-aware CLI login using a hosted client metadata document.
+pub async fn login_with_metadata_with_http_options_and_deadline(
+    name: &str,
+    url: &str,
+    client_metadata_url: &str,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let staged = Staging::default();
+    deadline_login(deadline, staged.clone(), cancellation, async {
+        authorize(
+            name,
+            url,
+            Registration::New(ClientOptions {
+                metadata_url: Some(client_metadata_url),
+                ..ClientOptions::default()
+            }),
+            scopes,
+            options,
+            announce,
+            Some(staged.clone()),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await
+}
+
+/// Deadline-aware CLI login using configured client settings.
+pub async fn login_configured_with_http_options_and_deadline(
+    name: &str,
+    url: &str,
+    settings: Option<&OAuthClientSettings>,
+    challenge: Option<&str>,
+    scopes: &[String],
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+    deadline: tokio::time::Instant,
+    cancellation: &pi_rs::CancellationToken,
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let staged = Staging::default();
+    deadline_login(
+        deadline,
+        staged.clone(),
+        cancellation,
+        login_configured_inner(
+            name,
+            url,
+            settings,
+            challenge,
+            scopes,
+            options,
+            announce,
+            Some(staged.clone()),
+        ),
+    )
+    .await
 }
 
 pub(crate) async fn upgrade(
@@ -787,6 +1012,7 @@ pub(crate) async fn upgrade(
         &scopes,
         options,
         announce,
+        None,
     )
     .await
 }
@@ -1060,6 +1286,7 @@ async fn authorize(
     scopes: &[String],
     http_options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
+    staging: Option<Staging>,
 ) -> Result<Uuid> {
     use rmcp::transport::auth::{AuthorizationRequest, AuthorizationSession};
     use std::time::Duration;
@@ -1131,7 +1358,14 @@ async fn authorize(
         }));
     }
     let mut manager = oauth_manager(url, http_options).await?;
-    manager.set_credential_store(store.clone());
+    if let Some(staged) = staging.as_ref() {
+        manager.set_credential_store(StagedCredentials {
+            store: store.clone(),
+            staged: staged.clone(),
+        });
+    } else {
+        manager.set_credential_store(store.clone());
+    }
     let metadata = if let Some(metadata_url) = options.auth_server_metadata_url {
         configured_metadata(metadata_url, url, http_options).await?
     } else {
@@ -1246,15 +1480,35 @@ async fn authorize(
             incoming.reply(false).await;
             return Err(Error::Config("MCP OAuth authorization was declined".into()));
         }
-        let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
-        let result = session.handle_callback_url(incoming.url.as_str()).await;
-        incoming.reply(result.is_ok()).await;
-        result.map(|_| ()).map_err(auth_error)
+        if let Some(staged) = &staging {
+            let callback_url = incoming.url.to_string();
+            *staged.callback.lock().unwrap_or_else(|e| e.into_inner()) = Some(incoming);
+            let guard = store
+                .acquire_refresh_guard()
+                .await
+                .map_err(auth_error)?
+                .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
+            session
+                .handle_callback_url(&callback_url)
+                .await
+                .map_err(auth_error)?;
+            *staged.guard.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+            Ok(())
+        } else {
+            let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
+            let result = session.handle_callback_url(incoming.url.as_str()).await;
+            incoming.reply(result.is_ok()).await;
+            result.map(|_| ()).map_err(auth_error)
+        }
     };
-    tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(600), receive) => result.map_err(|_| Error::Config("MCP login timed out".into()))?,
-        _ = tokio::signal::ctrl_c() => Err(Error::Cancelled),
-    }?;
+    if staging.is_some() {
+        receive.await?;
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(600), receive) => result.map_err(|_| Error::Config("MCP login timed out".into()))?,
+            _ = tokio::signal::ctrl_c() => Err(Error::Cancelled),
+        }?;
+    }
     Ok(generation)
 }
 
@@ -1295,6 +1549,266 @@ pub(crate) async fn test_oauth_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn staged_fixture(path: PathBuf) -> (StagedCredentials, Staging) {
+        let staged = Staging::default();
+        let store = FileCredentials {
+            path,
+            generation: Some(Uuid::new_v4()),
+            new_login: true,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        (
+            StagedCredentials {
+                store,
+                staged: staged.clone(),
+            },
+            staged,
+        )
+    }
+
+    fn fixture_credentials() -> StoredCredentials {
+        serde_json::from_value(serde_json::json!({
+            "client_id":"fixture", "token_response":{"access_token":"new", "token_type":"Bearer"}
+        }))
+        .unwrap()
+    }
+
+    async fn stage_fixture(store: &StagedCredentials) -> Result<()> {
+        let guard = store
+            .store
+            .acquire_refresh_guard()
+            .await
+            .map_err(auth_error)?
+            .expect("fixture credential guard");
+        store
+            .save(fixture_credentials())
+            .await
+            .map_err(auth_error)?;
+        *store.staged.guard.lock().unwrap() = Some(guard);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_login_stages_then_commits_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async {
+                stage_fixture(&store).await?;
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let saved: Envelope = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.credentials.client_id, "fixture");
+    }
+
+    #[tokio::test]
+    async fn deadline_login_timeout_never_commits_staged_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(30),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async {
+                stage_fixture(&store).await?;
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn deadline_login_bounds_waiting_for_commit_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        let guard = store.store.acquire_refresh_guard().await.unwrap();
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(30),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async { stage_fixture(&store).await },
+        )
+        .await;
+        assert!(result.is_err());
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn staged_exchange_holds_guard_until_commit_before_logout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let competitor = FileCredentials {
+            lease: Arc::default(),
+            ..store.store.clone()
+        };
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let login = tokio::spawn(async move {
+            deadline_login(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move {
+                    stage_fixture(&store).await?;
+                    staged_tx.send(()).unwrap();
+                    continue_rx.await.unwrap();
+                    Ok(())
+                },
+            )
+            .await
+        });
+        staged_rx.await.unwrap();
+        // Inspect the same OS lock that login, logout, and refresh use.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert!(matches!(
+            lock.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+        let logout = tokio::spawn(async move {
+            attempt_tx.send(()).unwrap();
+            let _guard = competitor.acquire_refresh_guard().await.unwrap();
+            // Logout may proceed only after the login has made its write visible.
+            assert!(competitor.read().unwrap().is_some());
+            competitor.clear().await.unwrap();
+        });
+        attempt_rx.await.unwrap();
+        continue_tx.send(()).unwrap();
+        login.await.unwrap().unwrap();
+        logout.await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_aborts_preparation_and_releases_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let cancellation = pi_rs::CancellationToken::new();
+        let trigger = cancellation.clone();
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            staged,
+            &cancellation,
+            async move {
+                stage_fixture(&store).await?;
+                trigger.cancel();
+                std::future::pending::<Result<()>>().await
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(!path.exists());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert!(lock.try_lock().is_ok());
+    }
+
+    async fn fixture_callback() -> (crate::oauth_callback::Callback, tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest_mcp::Url::parse(&format!(
+            "http://{}/callback",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let mut browser = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        browser
+            .write_all(
+                b"GET /callback?code=fixture&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let callback = crate::oauth_callback::receive(&listener, &url, "expected")
+            .await
+            .unwrap();
+        (callback, browser)
+    }
+
+    #[tokio::test]
+    async fn staged_callback_reports_actual_commit_result() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let (store, staged) = staged_fixture(path.clone());
+        let guard = store.store.acquire_refresh_guard().await.unwrap();
+        let (callback, mut browser) = fixture_callback().await;
+        *staged.callback.lock().unwrap() = Some(callback);
+        let run = tokio::spawn(async move {
+            deadline_login(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move { stage_fixture(&store).await },
+            )
+            .await
+        });
+        let mut byte = [0; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                browser.read(&mut byte)
+            )
+            .await
+            .is_err()
+        );
+        assert!(!path.exists());
+        drop(guard);
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        run.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(path.is_file());
+
+        // Persisting over a directory fails after staging succeeds.
+        let bad_path = dir.path().join("directory");
+        std::fs::create_dir(&bad_path).unwrap();
+        let (store, staged) = staged_fixture(bad_path);
+        let (callback, mut browser) = fixture_callback().await;
+        *staged.callback.lock().unwrap() = Some(callback);
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async move { stage_fixture(&store).await },
+        )
+        .await;
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(result.is_err());
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    }
 
     // Drain the complete HTTP request before replying. Closing a socket with
     // unread request bytes can reset the connection and discard the response.
