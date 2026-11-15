@@ -13657,7 +13657,7 @@ async fn poll_suspended_nested(
         guard = control.nested_poll.lock() => guard,
     };
     let (state, version) = worker.load(id)?;
-    if state.abort_requested || !state.nested_suspended() {
+    if state.abort_requested || !state.nested_suspended() || !state.extensions.is_empty() {
         return Ok(false);
     }
     let Phase::Blocked { operation_id, .. } = &state.phase else {
@@ -13676,6 +13676,7 @@ async fn poll_suspended_nested(
         if !caller_allowed(&state, job.name(), false)
             || reg.replay != job.policy()
             || !reg.tool.can_poll()
+            || job.requires_hooks()
         {
             continue;
         }

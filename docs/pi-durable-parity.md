@@ -398,6 +398,12 @@ the accepted jobs. Abort fences polling and replay and retains unresolved
 references for reconciliation. Selected extensions still prevent creating an
 automatic replay candidate, including after reopening or a manually confirmed
 child result; extension hooks do not yet have a replay fence for this path.
+Automatic polling also rejects records that require result hooks. A process-kill
+test reopens a suspended poll and verifies automatic parent wake without
+redispatching the accepted child.
+As with existing nested reattachment, the host must preserve tool registration
+semantics across reopen; the journal checks the name and replay policy, not a
+versioned implementation identity.
 This is a restricted external-pending-job bridge: it does not start an
 independent task, cancel a remote job, store a tool checkpoint, implement
 wait-any, or connect the private `nested_suspension` protocol to `TaskTool`.

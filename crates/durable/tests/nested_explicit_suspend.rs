@@ -485,3 +485,120 @@ async fn selected_extension_prevents_automatic_poll_and_replay_across_reopen() {
     assert_eq!(started.load(Ordering::SeqCst), 0);
     s.shutdown().await.unwrap();
 }
+
+struct FileChild(std::path::PathBuf);
+#[async_trait]
+impl Tool for FileChild {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("dispatches"))
+                .unwrap(),
+            "dispatch"
+        )
+        .unwrap();
+        Outcome::Pending {
+            reference: "persisted-reference".into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        assert_eq!(reference, "persisted-reference");
+        if self.0.join("finish").exists() {
+            return Some(Outcome::Succeeded("after-kill".into()));
+        }
+        std::fs::write(self.0.join("poll-entered"), b"ready").unwrap();
+        std::future::pending().await
+    }
+}
+fn file_options(parent: Arc<KeyedToolAdapter<Parent>>, root: &std::path::Path) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(FileChild(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn nested_auto_poll_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_AUTO_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(Arc::new(AtomicUsize::new(0)))));
+    let mut scheduler = Scheduler::open(root.join("db"), file_options(parent, &root)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_suspended_poller_reopens_and_wakes_without_child_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_auto_poll_kill_worker"])
+            .env("PI_NESTED_AUTO_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("poll-entered").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("finish"), b"done").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(calls.clone())));
+    let mut scheduler = Scheduler::open(root.join("db"), file_options(parent, root)).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "after-kill"))
+    );
+    scheduler.shutdown().await.unwrap();
+}

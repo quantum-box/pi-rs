@@ -84,6 +84,9 @@ impl PendingPoll {
     pub(crate) fn policy(&self) -> ReplayPolicy {
         self.record.policy
     }
+    pub(crate) fn requires_hooks(&self) -> bool {
+        self.record.hooks_required
+    }
     pub(crate) fn operation(&self) -> Uuid {
         self.record.operation_id
     }
@@ -102,6 +105,11 @@ impl PendingPoll {
         outcome: Outcome,
         schemas: &std::collections::BTreeMap<String, Value>,
     ) -> Result<(), crate::runtime::Error> {
+        if self.record.hooks_required {
+            return Err(crate::runtime::Error::Invalid(
+                "nested result hooks require reconciliation".into(),
+            ));
+        }
         if matches!(outcome, Outcome::Unknown(_)) {
             return Err(crate::runtime::Error::Invalid(
                 "uncertain nested poll".into(),
