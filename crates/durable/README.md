@@ -1685,8 +1685,15 @@ document was already absent, it ends after the available changes are drained.
 This does not implement upstream document definitions, incarnation semantics,
 observer lifecycle, or automatic wakeups. Raw writes to ownership metadata are
 stored in a dedicated SQLite table; ordinary store byte keys are not reserved.
-Direct SQLite writes bypass this protocol. Each store commit currently scans
-ownership metadata, so large deployments should account for its cost.
+Direct SQLite writes bypass this protocol. The store validates owned task
+records with the same persisted schema used by `TaskStore`. It validates only
+owners affected by a commit, so a malformed owner does not block unrelated
+writes; mutations involving that owner fail closed, including attempts to
+replace its malformed task record. Persisted task declarations live in
+`crates/durable-task-schema`, so schema changes must be made there for both
+runtime and store. Previously corrupted records or already
+retired documents are not automatically repaired. Each store commit currently scans ownership metadata,
+so large deployments should account for its cost.
 
 Databases used with the earlier experimental byte-key ownership implementation
 must be migrated explicitly before writes resume. Stop all old writers, identify

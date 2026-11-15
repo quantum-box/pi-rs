@@ -93,12 +93,7 @@ impl PartialEq for SignalToken {
 }
 impl Eq for SignalToken {}
 
-/// Upstream-shaped signal kind and wait key; versions do not affect matching.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignalKey {
-    signal: String,
-    key: String,
-}
+durable_task_schema::declare_signal_key!();
 
 impl SignalToken {
     pub fn new(name: impl Into<String>, version: u32) -> Result<Self, Error> {

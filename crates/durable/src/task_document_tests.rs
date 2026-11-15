@@ -826,3 +826,344 @@ fn task_watch_does_not_end_before_queued_recreation_and_retirement() {
     assert!(last[0].retired);
     assert!(watch.ended());
 }
+
+#[test]
+fn malformed_terminal_candidate_rolls_back_task_document_and_watch() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::{Expected, Mutation, Store};
+    let db = Store::memory().unwrap();
+    let ts = TaskStore::new(&db);
+    let root = task(
+        201,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    ts.save(&[Save::Create(&root)]).unwrap();
+    let address = Address {
+        scope: "malformed".into(),
+        name: "owned".into(),
+        key: "".into(),
+    };
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&address, root.id()).unwrap();
+    tx.put(
+        &address,
+        Expected::Missing,
+        json!({"v": 1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let (initial, mut watch) = Documents::new(&db).watch_task_document(&address).unwrap();
+    let before = db.commit_sequence().unwrap();
+    let task_key = crate::task_store::key(root.id());
+    for invalid in [
+        json!({"id": root.id(), "state": {"Succeeded": null}}),
+        {
+            let mut task = serde_json::to_value(&root).unwrap();
+            task["restart_limit"] = json!("bad");
+            task["state"] = json!({"Succeeded": null});
+            task
+        },
+        {
+            let mut task = serde_json::to_value(&root).unwrap();
+            task["state"] = json!({"Waiting": {"TypedSignal": {"signal": 7, "key": "x"}}});
+            task
+        },
+    ] {
+        let result = db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: b"must-rollback".to_vec(),
+                    value: vec![1],
+                },
+                Mutation::Put {
+                    key: task_key.clone(),
+                    value: serde_json::to_vec(&invalid).unwrap(),
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert!(db.get(b"must-rollback").unwrap().is_none());
+        assert_eq!(db.commit_sequence().unwrap(), before);
+        assert_eq!(ts.load(root.id()).unwrap().unwrap().task, root);
+        assert_eq!(Documents::new(&db).get(&address).unwrap(), initial.document);
+        assert!(watch.poll(1).unwrap().is_empty());
+        assert!(!watch.ended());
+        assert_eq!(watch.cursor(), initial.revision);
+    }
+    let stored = ts.load(root.id()).unwrap().unwrap();
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.succeed(json!(0))
+    })
+    .unwrap();
+    assert!(watch.poll(1).unwrap()[0].retired);
+    assert!(watch.ended());
+}
+
+#[test]
+fn legacy_migration_rejects_malformed_task_without_claiming_document() {
+    use crate::document::{Address, Documents};
+    use durable_store::{Mutation, Store, TaskDocumentAcquisition};
+    let db = Store::memory().unwrap();
+    let root = task(
+        202,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    let address = Address {
+        scope: "legacy".into(),
+        name: "owned".into(),
+        key: "".into(),
+    };
+    let key = address.storage_key().unwrap();
+    let mut marker = b"durable/task-document-owner/".to_vec();
+    marker.extend_from_slice(&key);
+    let task_key = crate::task_store::key(root.id());
+    let invalid = json!({"id": root.id(), "state": "Ready"});
+    db.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&invalid).unwrap(),
+            },
+            Mutation::Put {
+                key: marker.clone(),
+                value: root.id().as_bytes().to_vec(),
+            },
+            Mutation::Put {
+                key: key.clone(),
+                value: br#"{"v":1}"#.to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    let item = TaskDocumentAcquisition {
+        document_key: key.clone(),
+        owner: root.id(),
+    };
+    let before = db.commit_sequence().unwrap();
+    assert!(
+        db.migrate_legacy_task_documents(std::slice::from_ref(&item))
+            .is_err()
+    );
+    assert_eq!(db.commit_sequence().unwrap(), before);
+    assert_eq!(db.task_document_owner(&key).unwrap(), None);
+    assert_eq!(
+        Documents::new(&db).get(&address).unwrap().unwrap().value["v"],
+        1
+    );
+    assert_eq!(
+        db.get(&marker).unwrap().unwrap().value,
+        root.id().as_bytes()
+    );
+    db.commit(
+        &[],
+        &[Mutation::Put {
+            key: task_key,
+            value: serde_json::to_vec(&root).unwrap(),
+        }],
+    )
+    .unwrap();
+    db.migrate_legacy_task_documents(&[item]).unwrap();
+    let (_, mut watch) = Documents::new(&db).watch_task_document(&address).unwrap();
+    let ts = TaskStore::new(&db);
+    let stored = ts.load(root.id()).unwrap().unwrap();
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.succeed(json!(0))
+    })
+    .unwrap();
+    assert!(watch.poll(1).unwrap()[0].retired);
+    assert!(watch.ended());
+}
+
+#[test]
+fn legacy_migration_rejects_malformed_terminal_task_with_absent_document() {
+    use crate::document::Address;
+    use durable_store::{Mutation, Store, TaskDocumentAcquisition};
+    let db = Store::memory().unwrap();
+    let root = task(
+        203,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    let address = Address {
+        scope: "legacy".into(),
+        name: "absent".into(),
+        key: "".into(),
+    };
+    let key = address.storage_key().unwrap();
+    let mut marker = b"durable/task-document-owner/".to_vec();
+    marker.extend_from_slice(&key);
+    db.commit(
+        &[],
+        &[
+            Mutation::Put {
+                key: crate::task_store::key(root.id()),
+                value: serde_json::to_vec(&json!({"id": root.id(), "state": {"Succeeded": null}}))
+                    .unwrap(),
+            },
+            Mutation::Put {
+                key: marker,
+                value: root.id().as_bytes().to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    let before = db.commit_sequence().unwrap();
+    assert!(
+        db.migrate_legacy_task_documents(&[TaskDocumentAcquisition {
+            document_key: key.clone(),
+            owner: root.id()
+        }])
+        .is_err()
+    );
+    assert_eq!(db.commit_sequence().unwrap(), before);
+    assert_eq!(db.task_document_owner(&key).unwrap(), None);
+}
+
+#[test]
+fn corrupt_legacy_owner_only_blocks_its_own_mutations() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::{Expected, Mutation, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-owner.db");
+    let bad = task(
+        301,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    let good = task(
+        302,
+        TaskOwner::Conversation(Uuid::from_u128(9)),
+        "job",
+        true,
+        4,
+    );
+    let bad_address = Address {
+        scope: "isolated".into(),
+        name: "bad".into(),
+        key: "".into(),
+    };
+    let good_address = Address {
+        scope: "isolated".into(),
+        name: "good".into(),
+        key: "".into(),
+    };
+    let bad_cursor = {
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db)
+            .save(&[Save::Create(&bad), Save::Create(&good)])
+            .unwrap();
+        let mut tx = Transaction::new();
+        tx.acquire_task_document(&bad_address, bad.id()).unwrap();
+        tx.put(
+            &bad_address,
+            Expected::Missing,
+            json!({"v": "bad"}).as_object().unwrap(),
+        )
+        .unwrap();
+        tx.commit(&db).unwrap();
+        let docs = Documents::new(&db);
+        let (initial, watch) = docs.watch_task_document(&bad_address).unwrap();
+        let cursor = watch.cursor();
+        drop(watch);
+        let mut tx = Transaction::new();
+        tx.put(
+            &bad_address,
+            Expected::Version(initial.document.unwrap().version),
+            json!({"v":"bad-new"}).as_object().unwrap(),
+        )
+        .unwrap();
+        tx.commit(&db).unwrap();
+        cursor
+    };
+    // Model data committed by the earlier partial-schema implementation.
+    let invalid =
+        serde_json::to_vec(&json!({"id": bad.id(), "state": {"Succeeded": null}})).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE durable_store_entries SET value=?1 WHERE key=?2",
+            rusqlite::params![invalid, crate::task_store::key(bad.id())],
+        )
+        .unwrap();
+    }
+    let db = Store::open(&path).unwrap();
+    db.commit(
+        &[],
+        &[Mutation::Put {
+            key: b"unrelated".to_vec(),
+            value: b"ok".to_vec(),
+        }],
+    )
+    .unwrap();
+    let mut tx = Transaction::new();
+    tx.acquire_task_document(&good_address, good.id()).unwrap();
+    tx.put(
+        &good_address,
+        Expected::Missing,
+        json!({"v": "good"}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let docs = Documents::new(&db);
+    let mut bad_watch = docs
+        .resume_task_document_watch(&bad_address, bad_cursor)
+        .unwrap();
+    assert!(bad_watch.poll(1).is_err());
+    assert_eq!(bad_watch.cursor(), bad_cursor);
+    assert!(bad_watch.poll(1).is_err());
+    assert_eq!(bad_watch.cursor(), bad_cursor);
+    let bad_key = bad_address.storage_key().unwrap();
+    assert!(
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: bad_key,
+                value: br#"{}"#.to_vec()
+            }]
+        )
+        .is_err()
+    );
+    let mut repaired = bad.clone();
+    repaired.start().unwrap();
+    repaired.succeed(json!(0)).unwrap();
+    assert!(
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: crate::task_store::key(bad.id()),
+                value: serde_json::to_vec(&repaired).unwrap()
+            }]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        docs.get(&bad_address).unwrap().unwrap().value["v"],
+        "bad-new"
+    );
+    let (_, mut good_watch) = docs.watch_task_document(&good_address).unwrap();
+    let ts = TaskStore::new(&db);
+    let stored = ts.load(good.id()).unwrap().unwrap();
+    ts.update(&stored, |task| {
+        task.start()?;
+        task.succeed(json!(0))
+    })
+    .unwrap();
+    assert!(good_watch.poll(1).unwrap()[0].retired);
+    assert!(good_watch.ended());
+    assert!(docs.get(&good_address).unwrap().is_none());
+    assert_eq!(db.get(b"unrelated").unwrap().unwrap().value, b"ok");
+}

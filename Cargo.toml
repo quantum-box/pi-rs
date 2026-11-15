@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/durable", "crates/durable-store", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/extensions", "crates/workbench"]
+exclude = ["crates/durable-task-schema"]
 resolver = "3"
 
 [package]

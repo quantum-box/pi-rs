@@ -96,36 +96,24 @@ pub struct TaskDocumentAcquisition {
     pub owner: uuid::Uuid,
 }
 
-fn task_terminal(value: &[u8]) -> Option<bool> {
-    let value: serde_json::Value = serde_json::from_slice(value).ok()?;
-    let state = value.get("state")?;
-    if let Some(name) = state.as_str() {
-        return match name {
-            "Cancelled" => Some(true),
-            "Ready" | "Running" => Some(false),
-            _ => None,
-        };
-    }
-    let state = state.as_object()?;
-    if state.len() != 1 {
-        return None;
-    }
-    let (name, payload) = state.iter().next()?;
-    match name.as_str() {
-        "Succeeded" => Some(true),
-        "Failed" if payload.is_string() => Some(true),
-        "Waiting" | "Completing" => Some(false),
-        "CompletingFailed" if payload.is_string() => Some(false),
-        _ => None,
-    }
-}
+// The same persisted declarations are expanded in `pi-rs-durable::task`.
+// Keep schema validation independent of the runtime crate and its executors.
+#[allow(dead_code)]
+mod task_record {
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use uuid::Uuid;
 
-fn task_id_matches(value: &[u8], owner: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(value)
-        .ok()
-        .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
-        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
-        .is_some_and(|id| id.as_bytes().as_slice() == owner)
+    durable_task_schema::declare_signal_key!();
+    durable_task_schema::declare_task_schema!(SignalKey);
+
+    pub(super) fn terminal(value: &[u8], owner: &[u8]) -> Option<bool> {
+        let task: Task = serde_json::from_slice(value).ok()?;
+        if task.id.as_bytes().as_slice() != owner {
+            return None;
+        }
+        Some(task.state.is_terminal_state())
+    }
 }
 
 /// A single connection, safe to share between threads. Different instances
@@ -285,8 +273,7 @@ impl Store {
                 .optional()?;
             let state = task
                 .as_deref()
-                .filter(|v| task_id_matches(v, item.owner.as_bytes()))
-                .and_then(task_terminal)
+                .and_then(|v| task_record::terminal(v, item.owner.as_bytes()))
                 .ok_or_else(|| Error::Conflict {
                     key: task_key.clone(),
                 })?;
@@ -1192,11 +1179,33 @@ impl Store {
                 }
             }
         }
-        let mut states = std::collections::HashMap::<Vec<u8>, bool>::new();
-        for owner in owners.values() {
-            if states.contains_key(owner) {
-                continue;
+        // Only touched owners can affect this commit. A corrupt, unrelated
+        // legacy task must not prevent independent store operations.
+        let mut affected = std::collections::HashSet::<Vec<u8>>::new();
+        affected.extend(
+            acquisitions
+                .iter()
+                .map(|item| item.owner.as_bytes().to_vec()),
+        );
+        affected.extend(task_candidates.keys().cloned());
+        for mutation in mutations {
+            let key = match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+            };
+            let policy_document = key.strip_prefix(b"durable/document-policy/").map(|suffix| {
+                let mut document = b"durable/document/".to_vec();
+                document.extend_from_slice(suffix);
+                document
+            });
+            if let Some(owner) = owners
+                .get(key)
+                .or_else(|| policy_document.as_ref().and_then(|doc| owners.get(doc)))
+            {
+                affected.insert(owner.clone());
             }
+        }
+        let mut states = std::collections::HashMap::<Vec<u8>, bool>::new();
+        for owner in &affected {
             let mut key = b"durable/task/".to_vec();
             key.extend_from_slice(owner);
             let value = match task_candidates.get(owner) {
@@ -1211,8 +1220,7 @@ impl Store {
             };
             let state = value
                 .as_deref()
-                .filter(|value| task_id_matches(value, owner))
-                .and_then(task_terminal)
+                .and_then(|value| task_record::terminal(value, owner))
                 .ok_or_else(|| Error::Conflict { key: key.clone() })?;
             states.insert(owner.clone(), state);
         }
@@ -1229,14 +1237,28 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let previous_terminal = previous.as_deref().and_then(task_terminal);
-            if candidate.as_deref().and_then(task_terminal) == Some(true)
+            let previous_terminal =
+                match previous.as_deref() {
+                    Some(value) => Some(task_record::terminal(value, owner).ok_or_else(|| {
+                        Error::Conflict {
+                            key: task_key.clone(),
+                        }
+                    })?),
+                    None => None,
+                };
+            if candidate
+                .as_deref()
+                .and_then(|value| task_record::terminal(value, owner))
+                == Some(true)
                 && (previous.is_none() || previous_terminal == Some(false))
             {
                 settling.insert(owner.clone());
             }
             if previous_terminal == Some(true)
-                && candidate.as_deref().and_then(task_terminal) != Some(true)
+                && candidate
+                    .as_deref()
+                    .and_then(|value| task_record::terminal(value, owner))
+                    != Some(true)
             {
                 return Err(Error::Conflict { key: task_key });
             }
@@ -1272,7 +1294,7 @@ impl Store {
             effective.push(mutation.clone());
         }
         for (doc, owner) in &owners {
-            if states[owner] && task_candidates.contains_key(owner) {
+            if task_candidates.contains_key(owner) && states.get(owner) == Some(&true) {
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
                     [doc],

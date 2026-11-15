@@ -720,13 +720,19 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "durable-store"
 version = "0.1.0"
 dependencies = [
+ "durable-task-schema",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "uuid",
 ]
+
+[[package]]
+name = "durable-task-schema"
+version = "0.1.0"
 
 [[package]]
 name = "email_address"
@@ -2253,6 +2259,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "durable-store",
+ "durable-task-schema",
  "futures-util",
  "image",
  "jsonschema",

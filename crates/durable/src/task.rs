@@ -9,110 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Ownership is an immutable identity edge, not an executor lease.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskOwner {
-    Conversation(Uuid),
-    Task(Uuid),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Checkpoint {
-    pub phase: String,
-    pub data: Value,
-}
-
-/// Conditions persisted with the task. Deadlines are absolute Unix milliseconds;
-/// `Tasks` waits for all listed tasks to reach any terminal state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WaitFor {
-    DeadlineMillis(i64),
-    Signal(String),
-    /// Wait for one namespaced signal key, independent of its value version.
-    TypedSignal(crate::task_store::SignalKey),
-    /// Typed keys to wake on, optionally bounded by an absolute deadline.
-    TypedSleep {
-        until_millis: Option<i64>,
-        signals: Vec<crate::task_store::SignalKey>,
-    },
-    /// Wake on the first matching signal or when the absolute deadline passes.
-    Sleep {
-        until_millis: Option<i64>,
-        signals: Vec<String>,
-    },
-    /// Wake when all named tasks are terminal, including unowned tasks.
-    Tasks(Vec<Uuid>),
-    /// Wake when any named task ends. An empty set is immediately ready.
-    TasksAny(Vec<Uuid>),
-    /// Wait for all direct children; a failure cancels the other listed subtrees.
-    TasksFailFast(Vec<Uuid>),
-}
-
-/// Durable wake reason for a typed sleep.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TypedWake {
-    Signal(crate::task_store::SignalKey),
-    Expired,
-    Time,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskState {
-    Ready,
-    Running,
-    Waiting(WaitFor),
-    Completing(Value),
-    CompletingFailed(String),
-    Succeeded(Value),
-    Failed(String),
-    Cancelled,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Task {
-    id: Uuid,
-    owner: TaskOwner,
-    checkpoint: Checkpoint,
-    #[serde(default = "initial_version")]
-    definition_version: u32,
-    #[serde(default)]
-    input: Value,
-    state: TaskState,
-    /// Identity of the current scheduler reservation; legacy and standalone
-    /// task records may have none. This is not by itself an executor lease.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attempt_id: Option<Uuid>,
-    /// Last scheduler attempt whose handler returned and whose transition committed.
-    /// This is storage evidence only, not proof that detached work has stopped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retired_attempt_id: Option<Uuid>,
-    /// Consecutive recoveries since the last changed checkpoint.
-    restarts: u32,
-    restart_limit: u32,
-    #[serde(default)]
-    delivered_signal: Option<Uuid>,
-    #[serde(default)]
-    typed_wake: Option<TypedWake>,
-    /// Terminal direct children observed by the most recent child wait. Kept
-    /// across reservation and replay until the next progress or settlement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ended_children: Option<Vec<Uuid>>,
-    /// Children named by the wait, retained to refresh ended IDs at reservation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    wake_children: Option<Vec<Uuid>>,
-    /// Registration identity; absent on records created by the standalone API.
-    #[serde(default)]
-    kind: Option<String>,
-    /// Only explicitly replay-safe tasks may run again after an interrupted invocation.
-    #[serde(default)]
-    replay_safe: bool,
-    /// Durable cancellation intent; retained on terminal records.
-    #[serde(default)]
-    abort_requested: bool,
-    /// Conversation-owned background tasks form an ordinary abort boundary.
-    #[serde(default)]
-    background: bool,
-}
+durable_task_schema::declare_task_schema!(crate::task_store::SignalKey);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionError {
@@ -122,10 +19,6 @@ pub enum TransitionError {
     SelfOwned,
     InvalidWait,
     BackgroundChild,
-}
-
-fn initial_version() -> u32 {
-    1
 }
 
 impl Task {
@@ -514,10 +407,7 @@ impl Task {
 
     /// Terminal children satisfy a task wait regardless of their outcome.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.state,
-            TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Cancelled
-        )
+        self.state.is_terminal_state()
     }
 
     fn require_running(&self) -> Result<(), TransitionError> {
