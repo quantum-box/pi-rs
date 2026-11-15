@@ -194,13 +194,13 @@ impl OpenAiResponses {
     }
 
     fn apply_cache(&self, body: &mut Value) {
-        if self.cache_retention != CacheRetention::None {
-            if let Some(key) = &self.session_cache_key {
-                body.as_object_mut()
-                    .expect("Responses request object")
-                    .entry("prompt_cache_key")
-                    .or_insert_with(|| json!(key));
-            }
+        if self.cache_retention != CacheRetention::None
+            && let Some(key) = &self.session_cache_key
+        {
+            body.as_object_mut()
+                .expect("Responses request object")
+                .entry("prompt_cache_key")
+                .or_insert_with(|| json!(key));
         }
         if self.provider == "openai-chatgpt" {
             let object = body.as_object_mut().expect("Responses request object");

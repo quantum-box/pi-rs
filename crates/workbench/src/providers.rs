@@ -580,15 +580,15 @@ impl Client {
                     .stream(request)
                     .await
             }
-            Self::OpenAi(client) if cache_disabled => {
-                client.clone().without_cache().stream(request).await
-            }
-            Self::OpenAi(client) if session_cache_key.is_some() => {
-                client
-                    .clone()
-                    .with_session_cache_key(session_cache_key.unwrap())
-                    .stream(request)
-                    .await
+            Self::OpenAi(client) => {
+                let client = if cache_disabled {
+                    client.clone().without_cache()
+                } else if let Some(key) = session_cache_key {
+                    client.clone().with_session_cache_key(key)
+                } else {
+                    client.clone()
+                };
+                client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {
                 client.clone().without_cache().stream(request).await
