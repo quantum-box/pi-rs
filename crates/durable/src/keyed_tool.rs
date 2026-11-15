@@ -165,12 +165,39 @@ impl KeyedHost {
         self.nested.call_keyed_unpolled(key, name, arguments).await
     }
 
+    /// Dispatch or reattach without polling and return the persisted operation ID.
+    /// The initial child invocation is awaited; this is not upstream `wait: false`.
+    pub async fn call_keyed_unpolled_with_id(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<crate::nested::UnpolledCall, String> {
+        self.nested
+            .call_keyed_unpolled_with_id(key, name, arguments)
+            .await
+    }
+
     /// End this invocation at a pending-child boundary. The parent must be
     /// registered replay-safe and return normally without state or controls.
     /// The host must resolve every pending child before the parent can replay.
     pub fn suspend_pending(&self) -> Result<(), String> {
         self.nested.suspend_pending()
     }
+    /// Park this replay-safe root until all accepted pending nested jobs settle,
+    /// recording a checkpoint in the same conversation transition. The
+    /// invocation must return normally without state or controls.
+    pub fn suspend_pending_with_checkpoint(&self, checkpoint: Value) -> Result<(), String> {
+        self.nested
+            .suspend_pending_with_checkpoint(Some(checkpoint))
+    }
+
+    /// Checkpoint and ended nested operation IDs from the preceding park.
+    /// This is an all-pending wake, not an upstream task `any` wake.
+    pub fn pending_wake(&self) -> Option<crate::nested::PendingWake> {
+        self.nested.resumed_checkpoint()
+    }
+
     /// Invoke a keyed child and read its durable diagnostics with the outcome.
     /// Fails closed when ordered output would be lost; use `call_keyed_with_blocks`
     /// to consume changed block output.

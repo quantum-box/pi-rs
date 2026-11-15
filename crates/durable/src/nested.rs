@@ -63,6 +63,21 @@ struct BeforeGate {
     wake: Option<Value>,
 }
 
+/// Checkpoint and IDs of pending nested operations that settled before replay.
+/// These IDs identify nested journal operations, not scheduler task IDs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingWake {
+    pub checkpoint: Value,
+    pub ended: Vec<Uuid>,
+}
+
+/// A keyed nested journal operation and its current outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpolledCall {
+    pub operation_id: Uuid,
+    pub outcome: Outcome,
+}
+
 /// A nested outcome with diagnostics committed for that keyed child.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyedResult {
@@ -457,6 +472,8 @@ struct Shared {
     failed: AtomicBool,
     non_pending_failure: AtomicBool,
     explicit_suspend: AtomicBool,
+    parked_checkpoint: Mutex<Option<PendingWake>>,
+    resumed_checkpoint: Mutex<Option<PendingWake>>,
     idle: tokio::sync::Notify,
 }
 pub(crate) struct NestedHooks {
@@ -659,6 +676,8 @@ impl NestedHost {
                 failed: AtomicBool::new(false),
                 non_pending_failure: AtomicBool::new(false),
                 explicit_suspend: AtomicBool::new(false),
+                parked_checkpoint: Mutex::new(None),
+                resumed_checkpoint: Mutex::new(None),
                 idle: tokio::sync::Notify::new(),
             }),
             parent,
@@ -701,9 +720,59 @@ impl NestedHost {
             .await
     }
 
+    pub(crate) async fn call_keyed_unpolled_with_id(
+        &self,
+        key: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<UnpolledCall, String> {
+        let outcome = self.call_keyed_unpolled(key, name, arguments.clone()).await;
+        let lifecycle = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| "nested lifecycle lock poisoned")?;
+        if lifecycle.sealed || lifecycle.closed.contains(&self.parent) {
+            return Err("nested host sealed".into());
+        }
+        if !valid_key(key) {
+            return Err("invalid nested call key".into());
+        }
+        let entry = self
+            .shared
+            .owner
+            .store()
+            .get(&self.explicit_key(self.parent, key))
+            .map_err(|e| e.to_string())?
+            .ok_or("nested call was not admitted")?;
+        let record: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+        if record.name != name
+            || record.arguments != arguments
+            || record.outcome.as_ref() != Some(&outcome)
+        {
+            return Err("nested call is uncertain or its result is not available".into());
+        }
+        Ok(UnpolledCall {
+            operation_id: record.operation_id,
+            outcome,
+        })
+    }
+
     /// Request a durable wait after all local nested invocations have returned.
     /// An unresolved or uncertain non-pending operation remains a barrier.
     pub(crate) fn suspend_pending(&self) -> Result<(), String> {
+        self.suspend_pending_with_checkpoint(None)
+    }
+
+    pub(crate) fn suspend_pending_with_checkpoint(
+        &self,
+        checkpoint: Option<Value>,
+    ) -> Result<(), String> {
+        if checkpoint.as_ref().is_some_and(|value| {
+            !serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
+        }) {
+            return Err("nested checkpoint exceeds 64 KiB".into());
+        }
         if self.parent != self.shared.root || self.shared.failed.load(Ordering::Acquire) {
             return Err("nested suspension requires a healthy root invocation".into());
         }
@@ -715,7 +784,7 @@ impl NestedHost {
         if lifecycle.sealed || lifecycle.active != 0 {
             return Err("nested invocations remain active".into());
         }
-        let mut pending = 0;
+        let mut pending = Vec::new();
         for (_, entry) in self
             .shared
             .owner
@@ -729,20 +798,34 @@ impl NestedHost {
                 .as_ref()
                 .is_some_and(|gate| gate.wake.is_none())
             {
-                pending += 1;
+                if checkpoint.is_some() {
+                    return Err(
+                        "checkpointed suspension does not support nested before-tool gates".into(),
+                    );
+                }
+                pending.push(record.operation_id);
                 continue;
             }
             match record.outcome {
-                Some(Outcome::Pending { .. }) => pending += 1,
+                Some(Outcome::Pending { .. }) => pending.push(record.operation_id),
                 None | Some(Outcome::Unknown(_)) => {
                     return Err("nested operation is uncertain".into());
                 }
                 _ => (),
             }
         }
-        if pending == 0 || pending > 8 {
+        if pending.is_empty() || pending.len() > 8 {
             return Err("nested suspension requires one to eight pending jobs".into());
         }
+        let mut parked = self
+            .shared
+            .parked_checkpoint
+            .lock()
+            .map_err(|_| "nested checkpoint lock poisoned")?;
+        *parked = checkpoint.map(|checkpoint| PendingWake {
+            checkpoint,
+            ended: pending,
+        });
         // Seal future admissions before asking the runtime to discard this
         // invocation's reply. The runtime waits for all calls before persisting.
         self.shared.explicit_suspend.store(true, Ordering::Release);
@@ -963,6 +1046,31 @@ impl NestedHost {
     pub(crate) fn only_pending_failure(&self) -> bool {
         self.shared.failed.load(Ordering::Acquire)
             && !self.shared.non_pending_failure.load(Ordering::Acquire)
+    }
+    pub(crate) fn parked_checkpoint(&self) -> Result<Option<PendingWake>, String> {
+        self.shared
+            .parked_checkpoint
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| "nested checkpoint lock poisoned".into())
+    }
+    pub(crate) fn set_resumed_checkpoint(&self, wake: Option<PendingWake>) -> Result<(), String> {
+        *self
+            .shared
+            .resumed_checkpoint
+            .lock()
+            .map_err(|_| "nested checkpoint lock poisoned")? = wake;
+        Ok(())
+    }
+    pub(crate) fn resumed_checkpoint(&self) -> Option<PendingWake> {
+        if self.parent != self.shared.root {
+            return None;
+        }
+        let lifecycle = self.shared.lifecycle.lock().ok()?;
+        if lifecycle.sealed || lifecycle.closed.contains(&self.parent) {
+            return None;
+        }
+        self.shared.resumed_checkpoint.lock().ok()?.clone()
     }
     pub(crate) fn explicitly_suspended(&self) -> bool {
         self.shared.explicit_suspend.load(Ordering::Acquire)
@@ -2239,6 +2347,43 @@ mod tests {
         )
         .unwrap()
     }
+    #[tokio::test]
+    async fn checkpoint_is_bounded_and_wake_is_root_scoped_and_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let tool = Arc::new(Polling {
+            invoked: AtomicUsize::new(0),
+            mode: AtomicUsize::new(0),
+            ids: Mutex::new(vec![]),
+        });
+        let host = polling_host(&dir.path().join("db"), root, tool, CancellationToken::new());
+        let call = host
+            .call_keyed_unpolled_with_id("key", "polling", json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(call.outcome, Outcome::Pending { .. }));
+        assert!(
+            host.suspend_pending_with_checkpoint(Some(json!("x".repeat(65_537))))
+                .is_err()
+        );
+        assert!(!host.explicitly_suspended());
+        host.suspend_pending_with_checkpoint(Some(json!({"saved":true})))
+            .unwrap();
+        let saved = host.parked_checkpoint().unwrap().unwrap();
+        assert_eq!(saved.ended, vec![call.operation_id]);
+        host.set_resumed_checkpoint(Some(saved.clone())).unwrap();
+        assert_eq!(host.resumed_checkpoint(), Some(saved));
+        let child = NestedHost {
+            shared: host.shared.clone(),
+            parent: Uuid::new_v4(),
+            depth: 1,
+            serial: tokio::sync::Mutex::new(()),
+        };
+        assert!(child.resumed_checkpoint().is_none());
+        drop(InvocationScope(host.clone()));
+        assert!(host.resumed_checkpoint().is_none());
+    }
+
     #[tokio::test]
     async fn keyed_pending_survives_interruption_failure_and_abort_without_redispatch() {
         let dir = tempfile::tempdir().unwrap();

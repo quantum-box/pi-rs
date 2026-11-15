@@ -373,6 +373,23 @@ The runtime persists it with the outcome and ends the run without another model
 request only when every result in the nonempty tool round requests termination.
 The last defined handoff in model call order (including empty text) appends a reset after after-tools tasks and before queued boundary items. It starts a new model context while preserving history. Controls are persisted with tool outcomes and survive reopen; nested calls do not control their caller’s round.
 
+A replay-safe root `KeyedTool` can additionally use
+`call_keyed_unpolled_with_id` to retrieve a nested journal operation ID and
+`suspend_pending_with_checkpoint` to persist up to 64 KiB of JSON alongside
+an explicit suspension. On replay `pending_wake()` returns that checkpoint
+and the IDs of the pending operations captured at suspension. It is present
+only on the resumed root, including a replay after process death; a completed
+parent clears it. The call still waits for the child's initial invocation, and
+the parent resumes only after **all** captured pending jobs settle. IDs are
+journal operation IDs, not task handles. Checkpointed suspension rejects
+before-tool gates; use the existing gate suspension API for those. A crash
+before the suspension commit cannot recover the proposed checkpoint. The
+parent must be replay-safe, return normally without state or controls, and
+make its own effects replay-safe. Conversation abort fences polling and replay
+but does not cancel an accepted external job, which remains available for
+explicit reconciliation. This is not upstream's `wait: false`, `ToolPark`,
+`any` wake, or independently executing child task.
+
 Selected extensions may provide tools and before/after-tool hooks. Nested calls with a resolved, valid tool run before-tool hooks before dispatch; pass, rewrites and blocks are durably recorded, rewritten arguments are revalidated, and rejected calls pass through after-tool hooks. A nested before-tool sleep returns a pending gate; a replay-safe keyed parent must explicitly call `suspend_pending` and return normally, and a Scheduler resumes it when the deadline or named conversation signal fires. On wake the child is resolved and its original arguments are prepared and validated again before the before-tool chain runs, with `Context.snapshot["nested_before_tool_wake"]` containing the wake reason and, for a signal, its name, ID and payload. Invalid gates settle through after-tool with an `invalid_park` diagnostic. Gate and signal consumption survive reopening, and abort fences the wake. The parent may run again and must make its own effects replay-safe; the existing restart limit also bounds these resumes. A parent that does not explicitly suspend fails closed during normal execution. On reopen, a committed pre-dispatch gate can recover an interrupted replay-safe parent if every other child is terminal, has an accepted pending reference, has a staged result, or has a committed gate, and the parent registration still satisfies the existing identity and replay-policy checks; the host must restore the same tool and extension implementations. A crash before gate persistence, an unsafe parent, or another uncertain child still requires reconciliation. Harness alone does not drive parked gates. Gate waits are not listed by the external-job `nested_pending_jobs` API. The explicit parent suspension waits for all admitted children: gate wake receipts can commit while another child poll is running, but gate hooks and child execution resume when the parent replays after all pending work settles, in the parent’s call order. This differs from upstream independently running nested tasks; abort fences local polling and replay but does not guarantee cancellation of an already accepted external job. Preparation failures and unavailable nested tools still require reconciliation rather than entering the result-hook path. Interrupted hooks may replay and must make effects idempotent.
 The runtime
 commits terminal tool output and state before invoking after-tool hooks; a crash

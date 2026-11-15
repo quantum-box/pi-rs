@@ -564,3 +564,26 @@ held outcome. Ordinary nested-tool hooks, autonomous ordinary Tool dispatch,
 and cancellation of a running synchronous handler remain unsupported.
 
 **Shared task schema integration:** The persisted TaskTool marker is part of the schema shared by the runtime and store. True survives task updates and document retirement; explicit false and missing legacy fields both decode as false, and false is omitted on serialization to retain the previous JSON shape. Legacy records without the marker cannot safely be identified as TaskTools.
+
+### Checkpointed nested pending-job suspension
+
+`KeyedHost::call_keyed_unpolled_with_id` exposes the existing keyed journal
+operation ID and `suspend_pending_with_checkpoint` persists a bounded JSON
+checkpoint with the parent suspension. Once all captured pending jobs settle,
+`pending_wake()` supplies the checkpoint and ended operation IDs to the replayed
+root invocation. The same wake survives a process death during that replay;
+the parent must be replay-safe. Process-kill and abort tests cover the ordinary
+`KeyedTool` / nested `Tool` execution path without re-dispatching the child.
+
+This is a bounded extension of the existing external-pending path, not upstream
+`executeTool(..., {wait: false})` or `ToolPark`: initial child execution is
+awaited, operation IDs are not independently scheduled task handles, wake is
+all-pending rather than `any`, and checkpointed before-tool gates, unsafe
+parents, tool sleep and independent synchronous children are unsupported.
+Abort fences local replay but does not abort an accepted remote job. TaskTool
+handles cannot safely be reused here: their owner is a durable scheduler task,
+whereas a `NestedHost` call is an operation journal entry owned by a live tool
+invocation. A complete integration still needs an atomic parent tool-task
+handoff, executor fencing, task-owned keyed admission, wake/park transitions,
+and ordinary nested hook and cancellation semantics; it cannot be achieved by
+relabeling an operation UUID as a task ID.

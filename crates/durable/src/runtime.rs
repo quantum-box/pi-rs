@@ -1082,6 +1082,8 @@ struct NestedResume {
     dispatch_identity: DispatchIdentity,
     #[serde(default)]
     explicit_suspend: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_wake: Option<crate::nested::PendingWake>,
 }
 
 /// Identity of one execution of a durable tool operation.
@@ -9049,6 +9051,7 @@ impl Harness {
                             restarts,
                             dispatch_identity: DispatchIdentity::Other,
                             explicit_suspend: true,
+                            pending_wake: None,
                         });
                         c.phase = Phase::Blocked {
                             tool_panicked: false,
@@ -9658,7 +9661,7 @@ impl Harness {
         {
             return Ok(false);
         }
-        if resume.explicit_suspend && !c.extensions.is_empty() {
+        if resume.explicit_suspend && (!c.extensions.is_empty() || resume.pending_wake.is_some()) {
             c.nested_resume.as_mut().unwrap().restarts = resume.restarts.saturating_add(1);
         } else {
             c.nested_resume = None;
@@ -11614,6 +11617,7 @@ impl Harness {
                     let mut tool_panicked = false;
                     let mut nested_resume_candidate = false;
                     let mut explicitly_suspended = false;
+                    let mut parked_checkpoint = None;
                     let task_adapter = tools
                         .get(&call.name)
                         .and_then(|reg| crate::task_tool::lookup(&reg.tool));
@@ -11679,6 +11683,13 @@ impl Harness {
                                     ),
                                 ) {
                                     Ok(host) => {
+                                        let resumed = c
+                                            .nested_resume
+                                            .as_ref()
+                                            .filter(|resume| resume.operation_id == operation_id)
+                                            .and_then(|resume| resume.pending_wake.clone());
+                                        host.set_resumed_checkpoint(resumed)
+                                            .map_err(Error::Invalid)?;
                                         let scope = c.tool_attempt().map(|attempt| {
                                             crate::tool_progress::scoped_host(
                                                 host.clone(),
@@ -11774,6 +11785,8 @@ impl Harness {
                                         let inspection = host.seal_and_wait().await;
                                         panic_report?;
                                         explicitly_suspended = host.explicitly_suspended();
+                                        parked_checkpoint =
+                                            host.parked_checkpoint().map_err(Error::Invalid)?;
                                         nested_resume_candidate = inspection.is_err()
                                             && host.only_pending_failure()
                                             && !tool_panicked
@@ -11875,6 +11888,7 @@ impl Harness {
                                     restarts,
                                     dispatch_identity: DispatchIdentity::Other,
                                     explicit_suspend: explicitly_suspended,
+                                    pending_wake: parked_checkpoint,
                                 })
                             } else {
                                 None

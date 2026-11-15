@@ -1067,7 +1067,10 @@ impl Tool for AutoChild {
         })
     }
 }
-fn multi_options(parent: Arc<KeyedToolAdapter<MultiParent>>, child: Arc<AutoChild>) -> Options {
+fn multi_options<T: KeyedTool + 'static>(
+    parent: Arc<KeyedToolAdapter<T>>,
+    child: Arc<AutoChild>,
+) -> Options {
     Options {
         model: Arc::new(ModelStub),
         tools: vec![
@@ -2450,6 +2453,341 @@ async fn nested_result_hook_chain_runs_once_in_order_before_parent() {
             .messages
             .iter()
             .any(|m| matches!(m,Message::Tool {content,..} if content == "received ordered image"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct CheckpointParent;
+#[async_trait]
+impl KeyedTool for CheckpointParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let wake = host.pending_wake();
+        let call = match host
+            .call_keyed_unpolled_with_id("child-key", "child", json!({}))
+            .await
+        {
+            Ok(call) => call,
+            Err(error) => return Outcome::Failed(error).into(),
+        };
+        match call.outcome {
+            Outcome::Pending { .. } if wake.is_none() => {
+                host.suspend_pending_with_checkpoint(
+                    json!({"operation": call.operation_id, "value": 42}),
+                )
+                .unwrap();
+                Outcome::Succeeded("discarded".into()).into()
+            }
+            Outcome::Succeeded(value) => {
+                let Some(wake) = wake else {
+                    return Outcome::Failed("missing checkpoint wake".into()).into();
+                };
+                if wake.checkpoint != json!({"operation": call.operation_id, "value": 42})
+                    || wake.ended != vec![call.operation_id]
+                {
+                    return Outcome::Failed("checkpoint or ended operation changed".into()).into();
+                }
+                Outcome::Succeeded(format!("checkpoint:{value}")).into()
+            }
+            other => Outcome::Failed(format!("unexpected child: {other:?}")).into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkpointed_nested_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_CHECKPOINT_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let parent = Arc::new(KeyedToolAdapter::new(CheckpointParent));
+    let mut scheduler = Scheduler::open(root.join("db"), file_options(parent, &root)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(root.join("checkpoint-conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn checkpointed_nested_operation_survives_kill_and_wakes_parent() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpointed_nested_kill_worker"])
+            .env("PI_NESTED_CHECKPOINT_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("poll-entered").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("checkpoint-conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("finish"), b"done").unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(CheckpointParent));
+    let mut scheduler = Scheduler::open(root.join("db"), file_options(parent, root)).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool {content, ..} if content == "checkpoint:after-kill")
+        )
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_checkpointed_nested_poll_does_not_resume_parent_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let parent = Arc::new(KeyedToolAdapter::new(CheckpointParent));
+    let mut scheduler =
+        Scheduler::open(root.join("db"), file_options(parent.clone(), root)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| root.join("poll-entered").exists()).await;
+    let operation = scheduler.blocked(id).unwrap().unwrap().0;
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        scheduler.nested_pending_jobs(id, operation).unwrap().len(),
+        1
+    );
+    scheduler.shutdown().await.unwrap();
+    std::fs::write(root.join("finish"), b"done").unwrap();
+    let mut scheduler = Scheduler::open(root.join("db"), file_options(parent, root)).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().abort_requested);
+    assert!(
+        !scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool {content, ..} if content == "checkpoint:after-kill")
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct WakeCrashParent(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for WakeCrashParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if host.pending_wake().is_some() {
+            std::fs::write(self.0.join("wake-entered"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        CheckpointParent
+            .invoke(arguments, context, state, host)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn checkpointed_nested_wake_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_WAKE_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let parent = Arc::new(KeyedToolAdapter::new(WakeCrashParent(root.clone())));
+    let _scheduler = Scheduler::open(root.join("db"), file_options(parent, &root)).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn checkpoint_wake_survives_process_death_during_parent_replay() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut first = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpointed_nested_kill_worker"])
+            .env("PI_NESTED_CHECKPOINT_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("poll-entered").exists()).await;
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("checkpoint-conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("finish"), b"done").unwrap();
+    let mut second = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpointed_nested_wake_kill_worker"])
+            .env("PI_NESTED_WAKE_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("wake-entered").exists()).await;
+    second.0.kill().unwrap();
+    second.0.wait().unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(CheckpointParent));
+    let mut scheduler = Scheduler::open(root.join("db"), file_options(parent, root)).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool {content, ..} if content == "checkpoint:after-kill")
+        )
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct MultiCheckpointParent(Arc<AtomicUsize>);
+#[async_trait]
+impl KeyedTool for MultiCheckpointParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let wake = host.pending_wake();
+        let a = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        let b = host
+            .call_keyed_unpolled_with_id("b", "child", json!({"job":"b"}))
+            .await
+            .unwrap();
+        if matches!(a.outcome, Outcome::Pending { .. })
+            || matches!(b.outcome, Outcome::Pending { .. })
+        {
+            assert!(wake.is_none());
+            host.suspend_pending_with_checkpoint(json!({"a":a.operation_id,"b":b.operation_id}))
+                .unwrap();
+            Outcome::Succeeded("park".into()).into()
+        } else {
+            let wake = wake.expect("checkpoint wake");
+            assert_eq!(
+                wake.checkpoint,
+                json!({"a":a.operation_id,"b":b.operation_id})
+            );
+            assert_eq!(wake.ended, vec![a.operation_id, b.operation_id]);
+            Outcome::Succeeded("both-ended".into()).into()
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_wake_lists_all_original_pending_operations() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let a = Arc::new(AtomicBool::new(false));
+    let b = Arc::new(AtomicBool::new(false));
+    let parent = Arc::new(KeyedToolAdapter::new(MultiCheckpointParent(calls.clone())));
+    let child = Arc::new(AutoChild {
+        invoked: invoked.clone(),
+        polls: polls.clone(),
+        ready_a: a.clone(),
+        ready_b: b.clone(),
+    });
+    let mut scheduler =
+        Scheduler::open(dir.path().join("db"), multi_options(parent, child)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| polls.load(Ordering::SeqCst) >= 2).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    a.store(true, Ordering::SeqCst);
+    until(|| {
+        scheduler
+            .nested_pending_jobs(id, root)
+            .is_ok_and(|jobs| jobs.len() == 1)
+    })
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    b.store(true, Ordering::SeqCst);
+    wait(&mut scheduler, id).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(invoked.load(Ordering::SeqCst), 2);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "both-ended"))
     );
     scheduler.shutdown().await.unwrap();
 }
