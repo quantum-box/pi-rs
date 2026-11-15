@@ -4774,6 +4774,13 @@ Native SDK hosts can inspect the configured base system prompt with
 does not run extension hooks and is not Pi's effective `systemPrompt`; hooks may
 modify individual requests after the configured prompt is read.
 
+SDK hosts can read a session's selected provider with `model_provider()`
+alongside `model_name()`, including after model switches and branch checkout.
+Provider-less legacy selections return `None`; an unavailable historical model
+returns an error rather than the builder default. A busy journal or an
+unreconciled direct journal selection or revoked client binding also returns an
+error. This is a point-in-time check, not a guarantee of later availability.
+
 ### Native SDK prompt resource factory
 
 `pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
