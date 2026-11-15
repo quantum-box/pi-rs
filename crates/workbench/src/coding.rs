@@ -1349,6 +1349,19 @@ fn unix_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
         Some(libc::ELOOP) => "ELOOP",
         Some(libc::EROFS) => "EROFS",
         Some(libc::EPERM) => "EPERM",
+        Some(libc::ENAMETOOLONG) => "ENAMETOOLONG",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
+#[cfg(windows)]
+fn windows_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
         _ => return error.into(),
     };
     Error::Config(format!(
@@ -2654,6 +2667,8 @@ impl CodingTool {
         let path = self.path(display_path).map_err(|error| match error {
             #[cfg(unix)]
             Error::Io(cause) if self.unrestricted => unix_edit_access_error(cause, display_path),
+            #[cfg(windows)]
+            Error::Io(cause) if self.unrestricted => windows_edit_access_error(cause, display_path),
             Error::Io(ref cause)
                 if self.unrestricted && cause.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -2671,10 +2686,14 @@ impl CodingTool {
                 .map_err(|error| unix_edit_access_error(error, display_path))?;
         }
         #[cfg(windows)]
-        if self.unrestricted && std::fs::metadata(&path)?.permissions().readonly() {
-            return Err(Error::Config(format!(
-                "Could not edit file: {display_path}. Error code: EACCES."
-            )));
+        if self.unrestricted {
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| windows_edit_access_error(error, display_path))?;
+            if metadata.permissions().readonly() {
+                return Err(Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: EPERM."
+                )));
+            }
         }
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
@@ -4561,12 +4580,38 @@ mod tests {
             (libc::EROFS, "EROFS"),
             (libc::ENOTDIR, "ENOTDIR"),
             (libc::ELOOP, "ELOOP"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
         ] {
             assert!(
                 matches!(unix_edit_access_error(std::io::Error::from_raw_os_error(errno), "name"),
                 Error::Config(message) if message == format!("Could not edit file: name. Error code: {code}."))
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_oversized_path_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = "a".repeat(4096);
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":name,"edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == format!("Could not edit file: {name}. Error code: ENAMETOOLONG."))
+        );
     }
 
     #[cfg(windows)]
@@ -4598,7 +4643,7 @@ mod tests {
         permissions.set_readonly(false);
         std::fs::set_permissions(&path, permissions).unwrap();
         assert!(
-            matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
+            matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EPERM.")
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
     }
