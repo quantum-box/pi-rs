@@ -15,6 +15,11 @@
 //! Cancellation changes durable state only and cannot undo external effects or
 //! interrupt a synchronous handler. Direct TaskStore writers must be fenced.
 //! Success is retained while ordinary owned work finishes.
+//!
+//! `reserve_tick` and `settle_invocation` expose a lower-level invocation split;
+//! callers must serialize scheduler operations and manage the detached leases.
+//! This does not make the existing task driver concurrent or supply a coordinator
+//! for blocked settlement, failure publication, or bounded worker admission.
 
 use crate::task::{Checkpoint, Task, TaskOwner, TaskState, TransitionError, WaitFor};
 use crate::task_store::{self, Save, Signal, TaskStore, WakeResult};
@@ -253,6 +258,8 @@ pub enum Error {
     Handler(String),
     #[error("a task scheduler is already attached to this owner")]
     AlreadyAttached,
+    #[error("scheduler has active detached invocations")]
+    Busy,
     #[error("scheduler must be reopened after an invocation or commit failure")]
     Poisoned,
 }
@@ -285,6 +292,105 @@ impl Drop for Attachment {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
+    }
+}
+
+#[derive(Default)]
+struct InvocationState {
+    attempts: HashSet<Uuid>,
+    poisoned: bool,
+}
+
+// Retain the attachment and activity until settlement or abandonment. Dropping
+// an unretired invocation forces recovery rather than guessing its outcome.
+struct InvocationLease {
+    attachment: Arc<Attachment>,
+    state: Arc<Mutex<InvocationState>>,
+    id: Uuid,
+    retired: bool,
+    _activity: crate::worker_activity::Guard,
+}
+impl Drop for InvocationLease {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.attempts.remove(&self.id);
+        if !self.retired {
+            state.poisoned = true;
+        }
+    }
+}
+
+/// A scheduling pass either did maintenance or reserved a detached invocation.
+pub enum TickReservation {
+    Progress(bool),
+    Invocation(Box<DetachedInvocation>),
+}
+
+/// An exclusive in-process reservation. Dropping it without settlement poisons
+/// the scheduler; its attachment remains held until the invocation is dropped.
+pub struct DetachedInvocation {
+    running: task_store::StoredTask,
+    handler: Arc<dyn Handler>,
+    abort: bool,
+    lease: InvocationLease,
+}
+
+enum InvocationResult {
+    Handler(
+        Result<Step, String>,
+        Box<crate::document::DetachedTaskDocuments>,
+    ),
+    Abort(Option<String>),
+}
+
+/// Completed handler output, still fenced by its exclusive reservation.
+pub struct CompletedInvocation {
+    running: task_store::StoredTask,
+    result: InvocationResult,
+    lease: InvocationLease,
+}
+
+impl DetachedInvocation {
+    pub fn task_id(&self) -> Uuid {
+        self.running.task.id()
+    }
+
+    /// Run without holding the scheduler mutex. A panic abandons the attempt
+    /// and poisons the scheduler; abort handler panics retain existing semantics.
+    pub fn execute(self) -> Result<CompletedInvocation, Error> {
+        let Self {
+            running,
+            handler,
+            abort,
+            lease,
+        } = self;
+        let result = if abort {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.run(&running.task)
+            }));
+            let outcome = match result {
+                Ok(Ok(Step::Succeed(_))) => None,
+                Ok(Ok(Step::Fail(reason))) => Some(reason),
+                Ok(Ok(_)) => Some("abort handler must return Succeed or Fail".into()),
+                Ok(Err(reason)) => Some(format!("abort handler failed: {reason}")),
+                Err(payload) => {
+                    crate::extension::discard_panic_payload(payload);
+                    Some("abort handler panicked".into())
+                }
+            };
+            InvocationResult::Abort(outcome)
+        } else {
+            let owner = &lease.attachment.owner;
+            let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
+            let result = handler.run_with_documents(&running.task, &mut documents);
+            let documents = documents.detach(owner.clone(), &running)?;
+            InvocationResult::Handler(result, Box::new(documents))
+        };
+        Ok(CompletedInvocation {
+            running,
+            result,
+            lease,
+        })
     }
 }
 
@@ -458,7 +564,8 @@ impl WakeDefinitions {
 type CommitHook = Arc<dyn Fn(usize, &durable_store::Store) + Send + Sync>;
 
 pub struct Scheduler {
-    attachment: Attachment,
+    attachment: Arc<Attachment>,
+    live_invocations: Arc<Mutex<InvocationState>>,
     wake_reader: WakeReader,
     registry: Registry,
     validator: Option<crate::runtime::Harness>,
@@ -475,6 +582,66 @@ pub struct Scheduler {
     activity: crate::worker_activity::WorkerActivity,
 }
 impl Scheduler {
+    fn make_invocation(
+        &self,
+        running: task_store::StoredTask,
+        handler: Arc<dyn Handler>,
+        abort: bool,
+    ) -> Result<DetachedInvocation, Error> {
+        let id = running.task.id();
+        let mut state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
+        if state.poisoned || !state.attempts.insert(id) {
+            return Err(Error::Poisoned);
+        }
+        drop(state);
+        Ok(DetachedInvocation {
+            running,
+            handler,
+            abort,
+            lease: InvocationLease {
+                attachment: self.attachment.clone(),
+                state: self.live_invocations.clone(),
+                id,
+                retired: false,
+                _activity: self
+                    .activity
+                    .enter(crate::worker_activity::WorkerKind::Task, id),
+            },
+        })
+    }
+
+    /// Settle a completed invocation against its original scheduler and attempt.
+    /// The caller must serialize this operation with other scheduler operations.
+    pub fn settle_invocation(&mut self, completed: CompletedInvocation) -> Result<bool, Error> {
+        self.check()?;
+        if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state) {
+            return Err(Error::Ownership);
+        }
+        let CompletedInvocation {
+            running,
+            result,
+            mut lease,
+        } = completed;
+        let result = match result {
+            InvocationResult::Handler(result, documents) => {
+                self.settle_handler_result(running, result, *documents)
+            }
+            InvocationResult::Abort(outcome) => {
+                let owner = self.owner();
+                let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+                match outcome {
+                    None => self.ts().update(&running, |task| task.cancel())?,
+                    Some(reason) => self.ts().update(&running, |task| task.fail(reason))?,
+                }
+                Ok(true)
+            }
+        };
+        if result.is_ok() {
+            lease.retired = true;
+        }
+        result
+    }
+
     /// Observe live handler invocations without acquiring the scheduler lock.
     pub fn worker_activity(&self) -> crate::worker_activity::WorkerActivity {
         self.activity.clone()
@@ -534,7 +701,8 @@ impl Scheduler {
             })),
         };
         let mut scheduler = Self {
-            attachment: Attachment::acquire(owner)?,
+            attachment: Arc::new(Attachment::acquire(owner)?),
+            live_invocations: Arc::new(Mutex::new(InvocationState::default())),
             wake_reader,
             registry,
             validator: None,
@@ -556,7 +724,13 @@ impl Scheduler {
         TaskStore::new(self.attachment.owner.store())
     }
     pub(crate) fn check(&self) -> Result<(), Error> {
-        if self.poisoned {
+        if self.poisoned
+            || self
+                .live_invocations
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .poisoned
+        {
             Err(Error::Poisoned)
         } else {
             Ok(())
@@ -602,8 +776,18 @@ impl Scheduler {
         Ok(entry)
     }
     /// Replace registrations after a clean scheduling boundary. Failed migrations
-    /// are retried only when their task definition changes.
+    /// are retried only when their task definition changes. Returns `Busy`
+    /// while any detached invocation or completed result retains its lease.
     pub fn replace_registry(&mut self, registry: Registry) -> Result<(), Error> {
+        if !self
+            .live_invocations
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .attempts
+            .is_empty()
+        {
+            return Err(Error::Busy);
+        }
         let owner = self.owner();
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
         self.replace_registry_locked(registry)
@@ -614,6 +798,15 @@ impl Scheduler {
     }
     pub(crate) fn replace_registry_locked(&mut self, registry: Registry) -> Result<(), Error> {
         self.check()?;
+        if !self
+            .live_invocations
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .attempts
+            .is_empty()
+        {
+            return Err(Error::Busy);
+        }
         if let Some(harness) = &self.validator {
             harness
                 .validate_task_tool_registry(&registry)
@@ -727,6 +920,12 @@ impl Scheduler {
         Ok(true)
     }
     fn reconcile(&mut self) -> Result<(), Error> {
+        let live = self
+            .live_invocations
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .attempts
+            .clone();
         'scan: loop {
             let records = self.ts().list()?;
             // The harness is bound only after attach. Defer interrupted work in
@@ -801,6 +1000,7 @@ impl Scheduler {
                 self.deferred_recovery
                     .extend(records.iter().filter_map(|item| {
                         (item.task.state() == &TaskState::Running
+                            && !live.contains(&item.task.id())
                             && task_ids.contains(&item.task.id()))
                         .then_some(item.task.id())
                     }));
@@ -811,6 +1011,9 @@ impl Scheduler {
                 std::mem::take(&mut self.deferred_recovery)
             };
             for listed in records {
+                if live.contains(&listed.task.id()) {
+                    continue;
+                }
                 if pending && self.deferred_recovery.contains(&listed.task.id()) {
                     continue;
                 }
@@ -949,6 +1152,16 @@ impl Scheduler {
     /// Errors after reservation poison this instance, including handler errors.
     /// Checked-document conflicts are recovered without returning an error.
     pub fn tick(&mut self, now_millis: i64) -> Result<bool, Error> {
+        match self.reserve_tick(now_millis)? {
+            TickReservation::Progress(progress) => Ok(progress),
+            TickReservation::Invocation(invocation) => {
+                self.settle_invocation(invocation.execute()?)
+            }
+        }
+    }
+
+    /// Reserve at most one invocation; run it outside the scheduler mutex.
+    pub fn reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
         self.check()?;
         let owner = self.owner();
         let gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
@@ -976,7 +1189,7 @@ impl Scheduler {
                 } else {
                     request_abort_nested_tools(&self.ts(), snapshot.task.id())?;
                 }
-                return Ok(true);
+                return Ok(TickReservation::Progress(true));
             }
             if live
                 && !snapshot.task.is_task_tool()
@@ -994,7 +1207,7 @@ impl Scheduler {
                 } else {
                     request_abort_subtree(&self.ts(), snapshot.task.id())?;
                 }
-                return Ok(true);
+                return Ok(TickReservation::Progress(true));
             }
             if !live {
                 let mut next = snapshot.clone();
@@ -1010,7 +1223,9 @@ impl Scheduler {
                     ],
                     graph_version,
                 ) {
-                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => return Ok(true),
+                    Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                        return Ok(TickReservation::Progress(true));
+                    }
                     Err(error) => return Err(task_store::Error::from(error).into()),
                 }
             }
@@ -1036,12 +1251,12 @@ impl Scheduler {
                 } else {
                     request_abort_subtree(&self.ts(), id)?;
                 }
-                return Ok(true);
+                return Ok(TickReservation::Progress(true));
             }
         }
         if !self.deferred_recovery.is_empty() {
             self.reconcile()?;
-            return Ok(true);
+            return Ok(TickReservation::Progress(true));
         }
         for snapshot in self.ts().list()? {
             if !snapshot.task.abort_requested()
@@ -1135,7 +1350,7 @@ impl Scheduler {
                 self.ts()
                     .update(snapshot, |task| task.fail_abort_restart())?;
                 self.poisoned = false;
-                return Ok(true);
+                return Ok(TickReservation::Progress(true));
             }
             if let Some(reason) = self.blocked_reason(&snapshot.task) {
                 let diagnostic = orphan_diagnostic(&reason);
@@ -1144,7 +1359,7 @@ impl Scheduler {
                     t.fail(diagnostic)
                 })?;
                 self.poisoned = false;
-                return Ok(true);
+                return Ok(TickReservation::Progress(true));
             }
             let abort = self
                 .registered(&snapshot.task)
@@ -1161,34 +1376,16 @@ impl Scheduler {
                         t.fail(diagnostic)
                     })?;
                     self.poisoned = false;
-                    return Ok(true);
+                    return Ok(TickReservation::Progress(true));
                 }
-                let _activity = self
-                    .activity
-                    .enter(crate::worker_activity::WorkerKind::Task, snapshot.task.id());
                 let running = self
                     .ts()
                     .load(snapshot.task.id())?
                     .ok_or(Error::Ownership)?;
+                let invocation = self.make_invocation(running, abort, true)?;
+                self.poisoned = false;
                 drop(gate);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    abort.run(&running.task)
-                }));
-                let outcome = match result {
-                    Ok(Ok(Step::Succeed(_))) => None,
-                    Ok(Ok(Step::Fail(reason))) => Some(reason),
-                    Ok(Ok(_)) => Some("abort handler must return Succeed or Fail".into()),
-                    Ok(Err(reason)) => Some(format!("abort handler failed: {reason}")),
-                    Err(payload) => {
-                        crate::extension::discard_panic_payload(payload);
-                        Some("abort handler panicked".into())
-                    }
-                };
-                let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
-                match outcome {
-                    None => self.ts().update(&running, |t| t.cancel())?,
-                    Some(reason) => self.ts().update(&running, |t| t.fail(reason))?,
-                }
+                return Ok(TickReservation::Invocation(Box::new(invocation)));
             } else {
                 self.ts().update(snapshot, |t| {
                     t.start()?;
@@ -1196,7 +1393,7 @@ impl Scheduler {
                 })?;
             }
             self.poisoned = false;
-            return Ok(true);
+            return Ok(TickReservation::Progress(true));
         }
         let Some(snapshot) = tasks
             .iter()
@@ -1208,24 +1405,20 @@ impl Scheduler {
             })
             .cloned()
         else {
-            return Ok(progress);
+            return Ok(TickReservation::Progress(progress));
         };
         let handler = self.registered(&snapshot.task)?.handler.clone();
         if !self.reserve_resolved(&snapshot)? {
-            return Ok(true);
+            return Ok(TickReservation::Progress(true));
         }
-        let _activity = self
-            .activity
-            .enter(crate::worker_activity::WorkerKind::Task, snapshot.task.id());
         let running = self
             .ts()
             .load(snapshot.task.id())?
             .ok_or(Error::Ownership)?;
+        let invocation = self.make_invocation(running, handler, false)?;
+        self.poisoned = false;
         drop(gate);
-        let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
-        let result = handler.run_with_documents(&running.task, &mut documents);
-        let documents = documents.detach(owner.clone(), &running)?;
-        self.settle_handler_result(running, result, documents)
+        Ok(TickReservation::Invocation(Box::new(invocation)))
     }
 
     fn settle_handler_result(
@@ -1691,8 +1884,19 @@ impl Scheduler {
 
     /// Cancel a task and all of its owned descendants in one transaction.
     /// This requires exclusive scheduler ownership and cannot interrupt `tick`.
+    /// Returns `Busy` while any detached invocation retains its lease; use
+    /// `request_abort` to mark a running attempt for bottom-up cleanup.
     pub fn cancel(&mut self, id: Uuid) -> Result<(), Error> {
         self.check()?;
+        if !self
+            .live_invocations
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .attempts
+            .is_empty()
+        {
+            return Err(Error::Busy);
+        }
         let records = self.ts().list()?;
         let root = records
             .iter()
@@ -2340,6 +2544,204 @@ mod tests {
         Task::new(Uuid::from_u128(id), owner, cp("start"), limit)
             .unwrap()
             .registered(kind.into(), safe)
+    }
+
+    #[test]
+    fn detached_handler_allows_another_reservation_without_recovery() {
+        use std::{sync::mpsc, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = Registry::default();
+        registry.register("slow", true, move |_: &Task| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(json!("slow")))
+        });
+        registry.register("quick", true, |_: &Task| Ok(Step::Succeed(json!("quick"))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "slow", true, 3))
+            .unwrap();
+        scheduler.submit(&task(2, owner, "quick", true, 3)).unwrap();
+        let TickReservation::Invocation(slow) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("slow reservation")
+        };
+        assert_eq!(slow.task_id(), Uuid::from_u128(1));
+        let thread = std::thread::spawn(move || slow.execute().unwrap());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            scheduler.replace_registry(registry),
+            Err(Error::Busy)
+        ));
+        scheduler.reconcile().unwrap();
+        let slow_record = scheduler.get(Uuid::from_u128(1)).unwrap().unwrap();
+        assert_eq!(slow_record.state(), &TaskState::Running);
+        assert_eq!(slow_record.restarts(), 0);
+        let TickReservation::Invocation(quick) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("quick reservation")
+        };
+        assert_eq!(quick.task_id(), Uuid::from_u128(2));
+        scheduler
+            .settle_invocation(quick.execute().unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("quick"))
+        );
+        assert!(matches!(
+            scheduler.reserve_tick(0).unwrap(),
+            TickReservation::Progress(false)
+        ));
+        release_tx.send(()).unwrap();
+        scheduler.settle_invocation(thread.join().unwrap()).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("slow"))
+        );
+    }
+
+    #[test]
+    fn detached_abort_handler_preserves_catch_and_drains_after_concurrent_work() {
+        use std::{sync::mpsc, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = Registry::default();
+        registry.register_with_abort(
+            "aborted",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            move |_: &Task| {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                panic!("abort panic")
+            },
+        );
+        registry.register("other", true, |_: &Task| Ok(Step::Succeed(json!("other"))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+        scheduler
+            .submit(&task(1, owner.clone(), "aborted", true, 3))
+            .unwrap();
+        scheduler.submit(&task(2, owner, "other", true, 3)).unwrap();
+        scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+        let TickReservation::Invocation(abort) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("abort reservation")
+        };
+        let thread = std::thread::spawn(move || abort.execute().unwrap());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        scheduler.reconcile().unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        let TickReservation::Invocation(other) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("other reservation")
+        };
+        scheduler
+            .settle_invocation(other.execute().unwrap())
+            .unwrap();
+        release_tx.send(()).unwrap();
+        scheduler.settle_invocation(thread.join().unwrap()).unwrap();
+        assert!(
+            matches!(scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(), TaskState::Failed(reason) if reason == "abort handler panicked")
+        );
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("other"))
+        );
+    }
+
+    #[test]
+    fn detached_lease_fences_reattachment_and_abandonment() {
+        use std::{sync::mpsc, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = Registry::default();
+        registry.register("job", true, move |_: &Task| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(json!(null)))
+        });
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "job",
+                true,
+                3,
+            ))
+            .unwrap();
+        let owner = scheduler.owner();
+        let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("reservation")
+        };
+        let worker = std::thread::spawn(move || invocation.execute().unwrap());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(scheduler);
+        assert!(matches!(
+            Scheduler::attach(owner.clone(), registry.clone()),
+            Err(Error::AlreadyAttached)
+        ));
+        release_tx.send(()).unwrap();
+        let completed = worker.join().unwrap();
+        assert!(matches!(
+            Scheduler::attach(owner.clone(), registry.clone()),
+            Err(Error::AlreadyAttached)
+        ));
+        drop(completed);
+        let recovered = Scheduler::attach(owner, registry).unwrap();
+        let task = recovered.get(Uuid::from_u128(1)).unwrap().unwrap();
+        assert_eq!(task.state(), &TaskState::Ready);
+        assert_eq!(task.restarts(), 1);
+    }
+
+    #[test]
+    fn abort_of_detached_running_attempt_discards_result_before_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register_with_abort(
+            "job",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!("discarded"))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "job",
+                true,
+                3,
+            ))
+            .unwrap();
+        let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("reservation")
+        };
+        scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        scheduler
+            .settle_invocation(invocation.execute().unwrap())
+            .unwrap();
+        let pending = scheduler.get(Uuid::from_u128(1)).unwrap().unwrap();
+        assert_eq!(pending.state(), &TaskState::Ready);
+        assert!(pending.abort_requested());
+        assert!(scheduler.tick(0).unwrap());
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
     }
 
     #[test]
