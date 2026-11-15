@@ -1087,8 +1087,10 @@ The reported appearance is used when no background is known.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. With a known background,
 the system theme generates Pi's OKHSL color families and contrast-solved roles,
-using a complete terminal palette when available. Native applies terminal color
-replies incrementally; Pi initially renders in grayscale until its query finishes.
+using a complete terminal palette when available. At interactive startup the
+system theme stays grayscale until the color query's device-attributes marker
+or its 100 ms initial timeout, then uses the available colors. Late replies are
+applied incrementally; query aggregation still differs from Pi.
 Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.

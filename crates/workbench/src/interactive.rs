@@ -376,7 +376,10 @@ impl Drop for Terminal {
         #[cfg(unix)]
         self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
-        let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        {
+            crate::ui::theme::finish_terminal_colors_pending();
+            let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
             let _ = execute!(
@@ -3557,6 +3560,25 @@ fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     (changed, redraw_system)
 }
 
+#[cfg(any(unix, windows))]
+fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+        *theme = Theme::system();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn expire_initial_terminal_colors(terminal: &Terminal, theme: &mut Theme) -> bool {
+    terminal
+        .color_queries
+        .front()
+        .is_some_and(|query| query.started.elapsed() >= Duration::from_millis(100))
+        && finish_initial_terminal_colors(theme)
+}
+
 // Like Pi's startup UI, do not install missing packages or let an absent or
 // malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
@@ -3695,6 +3717,8 @@ pub(super) async fn run(
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
+    #[cfg(any(unix, windows))]
+    crate::ui::theme::mark_terminal_colors_pending();
     let mut deferred_theme_error = None;
     let mut theme = match load_resolved_theme(
         args.use_theme.as_deref().unwrap_or("system"),
@@ -4289,6 +4313,7 @@ pub(super) async fn run(
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
             terminal.poll_color_timeout()?;
+            dirty |= expire_initial_terminal_colors(terminal, &mut theme);
         }
         let input_wait = if dirty {
             frame_interval.saturating_sub(last_frame.elapsed())
@@ -4326,6 +4351,7 @@ pub(super) async fn run(
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
                     terminal.receive_color_marker()?;
+                    dirty |= finish_initial_terminal_colors(&mut theme);
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
@@ -10141,6 +10167,59 @@ exit {exit}
         view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
         view.settle();
         assert!(view.streaming_tools.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn initial_theme_query_settles_on_timeout_or_marker() {
+        const CHILD: &str = "PI_RS_INITIAL_THEME_QUERY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::initial_theme_query_settles_on_timeout_or_marker",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: 0,
+                quarantined: false,
+            }]),
+            color_requery: false,
+            completed_color_markers: 0,
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Disabled,
+        });
+        assert!(!super::expire_initial_terminal_colors(
+            &terminal, &mut theme
+        ));
+        assert_eq!(theme.color("accent"), Color::Reset);
+        terminal.color_queries.front_mut().unwrap().started -=
+            std::time::Duration::from_millis(101);
+        assert!(super::expire_initial_terminal_colors(&terminal, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        assert!(super::finish_initial_terminal_colors(&mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::finish_initial_terminal_colors(&mut theme));
     }
 
     #[cfg(any(unix, windows))]
