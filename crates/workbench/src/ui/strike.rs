@@ -284,9 +284,12 @@ fn repair_split_mail(tokens: &[Value], source: &str, refs: &RefDefs<'_>) -> Opti
         let raw = source.get(range.clone())?;
         replacement.push(json!({"type":"link", "raw":raw, "text":raw, "href":href,
             "tokens":[{"type":"text", "raw":raw, "text":raw}]}));
-        if range.end < end {
-            let raw = source.get(range.end..end)?;
-            if tokens[last].get("type").and_then(Value::as_str) == Some("latex") {
+        let math_overlap = tokens[last].get("type").and_then(Value::as_str) == Some("latex");
+        let splice_end = if math_overlap { tokens.len() - 1 } else { last };
+        let suffix_end = if math_overlap { source.len() } else { end };
+        if range.end < suffix_end {
+            let raw = source.get(range.end..suffix_end)?;
+            if math_overlap {
                 let suffix = LEXER.with(|lexer| {
                     lexer
                         .borrow()
@@ -298,7 +301,7 @@ fn repair_split_mail(tokens: &[Value], source: &str, refs: &RefDefs<'_>) -> Opti
                 replacement.push(json!({"type":"text", "raw":raw, "text":raw}));
             }
         }
-        tokens.splice(first..=last, replacement);
+        tokens.splice(first..=splice_end, replacement);
     }
     Some(tokens)
 }

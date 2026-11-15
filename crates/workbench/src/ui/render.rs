@@ -1532,8 +1532,7 @@ fn markdown_at_depth(
         || text.len().saturating_mul(blocks.len() + 1) > 1024 * 1024
     {
         return markdown_plain_at_depth(
-            text,
-            text,
+            (text, text),
             theme,
             width,
             depth,
@@ -1558,8 +1557,7 @@ fn markdown_at_depth(
     for block in &blocks {
         let segment = masked_math_segment(text, start..block.source.start, &definitions);
         let before = markdown_plain_at_depth(
-            text,
-            &segment,
+            (text, &segment),
             theme,
             width,
             depth,
@@ -1587,8 +1585,7 @@ fn markdown_at_depth(
     }
     let segment = masked_math_segment(text, start..text.len(), &definitions);
     let after = markdown_plain_at_depth(
-        text,
-        &segment,
+        (text, &segment),
         theme,
         width,
         depth,
@@ -1728,8 +1725,7 @@ fn insert_list_math(
 }
 
 fn markdown_plain_at_depth(
-    text: &str,
-    parsed: &str,
+    (text, parsed): (&str, &str),
     theme: &Theme,
     width: usize,
     depth: usize,
@@ -2471,6 +2467,20 @@ mod tests {
                 "{spans:?}"
             );
         }
+        let lines = markdown("a$foo_bar@example.com and$x^2$", &theme, 120);
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "a$foo_bar@example.com andx²"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "a$foo_bar@example.com" && span.underline)
+        );
     }
 
     #[test]
