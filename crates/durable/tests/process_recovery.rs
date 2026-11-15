@@ -389,3 +389,153 @@ fn repeated_process_deaths_exhaust_restart_limit_without_losing_checkpoint() {
     assert!(matches!(task.state(), TaskState::Failed(reason) if reason.contains("restart limit")));
     assert!(!reopened.tick(0).unwrap());
 }
+
+// The failure is committed while a non-replay-safe sibling is still executing.
+// Killing here leaves no fail-fast mark, exactly the recovery ordering boundary.
+#[test]
+fn fail_fast_kill_child() {
+    let Ok(path) = std::env::var("PI_FAIL_FAST_KILL_DB") else {
+        return;
+    };
+    use durable_store::owner::OwnedStore;
+    use pi_rs_durable::task_store::{Save, TaskStore};
+    use std::sync::Arc;
+    let owner = Arc::new(OwnedStore::open(path).unwrap());
+    let mut parent = Task::new(TASK, TaskOwner::Conversation(OWNER), checkpoint("first"), 4)
+        .unwrap()
+        .registered("parent".into(), false);
+    parent.start().unwrap();
+    parent
+        .wait(WaitFor::TasksFailFast(vec![FAST_CHILD, SLOW_CHILD]))
+        .unwrap();
+    let running = Task::new(FAST_CHILD, TaskOwner::Task(TASK), checkpoint("first"), 4)
+        .unwrap()
+        .registered("running".into(), false);
+    let failing = Task::new(SLOW_CHILD, TaskOwner::Task(TASK), checkpoint("first"), 4)
+        .unwrap()
+        .registered("failing".into(), false);
+    TaskStore::new(owner.store())
+        .save(&[
+            Save::Create(&parent),
+            Save::Create(&running),
+            Save::Create(&failing),
+        ])
+        .unwrap();
+    let address = pi_rs_durable::document::Address {
+        scope: "fail-fast".into(),
+        name: "owned".into(),
+        key: "running".into(),
+    };
+    let mut tx = pi_rs_durable::document::Transaction::new();
+    tx.acquire_task_document(&address, FAST_CHILD).unwrap();
+    tx.put(
+        &address,
+        durable_store::Expected::Missing,
+        json!({"live": true}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(owner.store()).unwrap();
+    let store_owner = owner.clone();
+    let mut registry = Registry::default();
+    registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+    registry.register("running", false, move |_: &Task| {
+        let store = TaskStore::new(store_owner.store());
+        let sibling = store.load(SLOW_CHILD).unwrap().unwrap();
+        store
+            .update(&sibling, |task| {
+                task.start()?;
+                task.fail("failed".into())
+            })
+            .unwrap();
+        println!("FAIL_FAST_RUNNING_AND_FAILED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    });
+    let mut scheduler = Scheduler::attach(owner, registry).unwrap();
+    scheduler.tick(0).unwrap();
+}
+
+#[test]
+fn fail_fast_kill_before_mark_recovers_without_replaying_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.db");
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fail_fast_kill_child", "--nocapture"])
+            .env("PI_FAIL_FAST_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line.unwrap().contains("FAIL_FAST_RUNNING_AND_FAILED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("handler did not reach failure boundary");
+    let address = pi_rs_durable::document::Address {
+        scope: "fail-fast".into(),
+        name: "owned".into(),
+        key: "running".into(),
+    };
+    let db = durable_store::Store::open(&path).unwrap();
+    assert!(
+        pi_rs_durable::document::Documents::new(&db)
+            .get(&address)
+            .unwrap()
+            .is_some()
+    );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut registry = Registry::default();
+    registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!("done"))));
+    registry.register_with_abort(
+        "running",
+        false,
+        |_: &Task| panic!("non-replay-safe handler replayed"),
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+    );
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    let before = scheduler.get(FAST_CHILD).unwrap().unwrap();
+    assert_eq!(before.state(), &TaskState::Running);
+    assert!(!before.abort_requested());
+    scheduler.tick(0).unwrap();
+    let marked = scheduler.get(FAST_CHILD).unwrap().unwrap();
+    assert_eq!(marked.state(), &TaskState::Running);
+    assert!(marked.abort_requested());
+    assert!(
+        pi_rs_durable::document::Documents::new(&db)
+            .get(&address)
+            .unwrap()
+            .is_some()
+    );
+    for _ in 0..8 {
+        scheduler.tick(0).unwrap();
+        if scheduler.get(TASK).unwrap().unwrap().is_terminal() {
+            break;
+        }
+    }
+    assert_eq!(
+        scheduler.get(FAST_CHILD).unwrap().unwrap().state(),
+        &TaskState::Cancelled
+    );
+    assert_eq!(
+        scheduler.get(TASK).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!("done"))
+    );
+    assert!(
+        pi_rs_durable::document::Documents::new(&db)
+            .get(&address)
+            .unwrap()
+            .is_none()
+    );
+}

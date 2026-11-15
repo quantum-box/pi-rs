@@ -1538,6 +1538,217 @@ mod tests {
     }
 
     #[test]
+    fn fail_fast_concurrent_handler_discards_documents_before_retirement() {
+        use crate::document::{Address, Documents, TaskDocuments, Transaction};
+        use durable_store::Expected;
+        struct BlockingHandler {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            owned: Address,
+            staged: Address,
+        }
+        impl task_scheduler::Handler for BlockingHandler {
+            fn run(&self, _: &Task) -> Result<task_scheduler::Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<task_scheduler::Step, String> {
+                docs.acquire_owned(&self.owned).map_err(|e| e.to_string())?;
+                docs.put(
+                    &self.owned,
+                    json!({"value":"uncommitted"}).as_object().unwrap().clone(),
+                )
+                .map_err(|e| e.to_string())?;
+                docs.get(&self.staged).map_err(|e| e.to_string())?;
+                docs.put(
+                    &self.staged,
+                    json!({"value":"uncommitted"}).as_object().unwrap().clone(),
+                )
+                .map_err(|e| e.to_string())?;
+                self.entered.send(()).map_err(|e| e.to_string())?;
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(|e| e.to_string())?;
+                Ok(task_scheduler::Step::Succeed(json!("normal result")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let parent_id = Uuid::from_u128(1);
+        let running_id = Uuid::from_u128(2);
+        let failed_id = Uuid::from_u128(3);
+        let owned = Address {
+            scope: "race".into(),
+            name: "owned".into(),
+            key: "".into(),
+        };
+        let staged = Address {
+            scope: "race".into(),
+            name: "staged".into(),
+            key: "".into(),
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let finish_rx = Mutex::new(finish_rx);
+        let (parent_tx, parent_rx) = mpsc::channel();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("parent", false, move |_: &Task| {
+            parent_tx.send(()).unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("parent")))
+        });
+        registry.register_with_abort(
+            "running",
+            false,
+            BlockingHandler {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                owned: owned.clone(),
+                staged: staged.clone(),
+            },
+            move |_: &Task| {
+                cleanup_tx.send(()).unwrap();
+                finish_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+                Ok(task_scheduler::Step::Succeed(json!(null)))
+            },
+        );
+        let scheduler = task_scheduler::Scheduler::open(&path, registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        };
+        let mut parent = Task::new(
+            parent_id,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![running_id, failed_id]))
+            .unwrap();
+        let running = Task::new(
+            running_id,
+            TaskOwner::Task(parent_id),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("running".into(), false);
+        let failed = Task::new(failed_id, TaskOwner::Task(parent_id), checkpoint, 3)
+            .unwrap()
+            .registered("failed".into(), false);
+        let tasks = TaskStore::new(owner.store());
+        tasks
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&running),
+                Save::Create(&failed),
+            ])
+            .unwrap();
+        let mut tx = Transaction::new();
+        tx.acquire_task_document(&owned, running_id).unwrap();
+        tx.put(
+            &owned,
+            Expected::Missing,
+            json!({"value":"original"}).as_object().unwrap(),
+        )
+        .unwrap();
+        tx.commit(owner.store()).unwrap();
+        let docs = Documents::new(owner.store());
+        let (_, mut watch) = docs.watch_task_document(&owned).unwrap();
+        let driver = Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The driver owns the scheduler lock while invoking the handler. Use the
+        // same fail-fast selection and abort transaction as tick, under its gate.
+        let marking_owner = owner.clone();
+        thread::spawn(move || {
+            let _gate = marking_owner.task_gate().lock().unwrap();
+            let tasks = TaskStore::new(marking_owner.store());
+            let failed = tasks.load(failed_id).unwrap().unwrap();
+            tasks
+                .update(&failed, |task| {
+                    task.start()?;
+                    task.fail("failure".into())
+                })
+                .unwrap();
+            let parent = tasks.load(parent_id).unwrap().unwrap();
+            let selected =
+                task_scheduler::failed_sibling_to_abort(&tasks, &parent, &[running_id, failed_id])
+                    .unwrap();
+            assert_eq!(selected, Some(running_id));
+            task_scheduler::request_abort_subtree(&tasks, running_id).unwrap();
+        })
+        .join()
+        .unwrap();
+        let marked = driver.get(running_id).unwrap().unwrap();
+        assert_eq!(marked.state(), &TaskState::Running);
+        assert!(marked.abort_requested());
+        assert!(matches!(
+            driver.get(parent_id).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        assert_eq!(
+            docs.get(&owned).unwrap().unwrap().value["value"],
+            "original"
+        );
+        assert!(docs.get(&staged).unwrap().is_none());
+        assert!(watch.poll(10).unwrap().is_empty());
+        assert!(parent_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        cleanup_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            driver.get(running_id).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert!(matches!(
+            driver.get(parent_id).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        assert_eq!(
+            docs.get(&owned).unwrap().unwrap().value["value"],
+            "original"
+        );
+        assert!(docs.get(&staged).unwrap().is_none());
+        assert!(watch.poll(10).unwrap().is_empty());
+        assert!(parent_rx.try_recv().is_err());
+        finish_tx.send(()).unwrap();
+        parent_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !driver.get(parent_id).unwrap().unwrap().is_terminal() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            driver.get(running_id).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(docs.get(&owned).unwrap().is_none());
+        assert!(docs.get(&staged).unwrap().is_none());
+        let frames = watch.poll(10).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].retired);
+        assert_eq!(
+            frames[0].document.as_ref().unwrap().value["value"],
+            "original"
+        );
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
     fn abort_during_handler_fences_children_and_drains() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tasks.db");

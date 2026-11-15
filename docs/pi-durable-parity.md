@@ -598,3 +598,17 @@ invocation. A complete integration still needs an atomic parent tool-task
 handoff, executor fencing, task-owned keyed admission, wake/park transitions,
 and ordinary nested hook and cancellation semantics; it cannot be achieved by
 relabeling an operation UUID as a task ID.
+
+### Fail-fast sibling cancellation
+
+Upstream pi 04fd0897 marks the other live children after a non-completed
+outcome, then waits for all children to settle before resuming their parent.
+pi-rs marks sibling ownership graphs in separate scheduling passes; failed and
+cancelled outcomes trigger the cascade. Recovery holds interrupted invocations under pending
+fail-fast graphs until their marks have been persisted. A completing TaskTool
+similarly defers interrupted nested TaskTool roots until its nested abort mark;
+direct generic children are not included in that normal settlement cascade. A
+running synchronous handler is allowed to return before its abort cleanup and
+terminal transition. The attached runtime also drains foreground child-owned
+conversations; standalone scheduling rejects those graphs. Legacy explicit
+`cancel` retains its immediate-cancellation semantics.

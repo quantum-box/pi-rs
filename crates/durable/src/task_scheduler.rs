@@ -352,7 +352,33 @@ impl WakeReader {
                 {
                     result.active = true
                 }
-                TaskState::Running if reason.is_none() => result.active = true,
+                TaskState::Running if task.abort_requested() || reason.is_none() => {
+                    result.active = true
+                }
+                TaskState::Waiting(WaitFor::TasksFailFast(ids))
+                    if !task.abort_requested()
+                        && ids.iter().any(|id| {
+                            tasks.iter().any(|child| {
+                                child.task.id() == *id
+                                    && matches!(
+                                        child.task.state(),
+                                        TaskState::Failed(_)
+                                            | TaskState::CompletingFailed(_)
+                                            | TaskState::Cancelled
+                                    )
+                            })
+                        })
+                        && ids.iter().any(|id| {
+                            tasks.iter().any(|child| {
+                                child.task.id() == *id
+                                    && !child.task.is_terminal()
+                                    && !child.task.abort_requested()
+                                    && !matches!(child.task.state(), TaskState::CompletingFailed(_))
+                            })
+                        }) =>
+                {
+                    result.active = true;
+                }
                 TaskState::Waiting(wait) => {
                     let deadline = match wait {
                         WaitFor::DeadlineMillis(at) => Some(*at),
@@ -433,6 +459,8 @@ pub struct Scheduler {
     validator: Option<crate::runtime::Harness>,
     poisoned: bool,
     failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
+    // Interrupted invocations held until pending fail-fast marks have landed.
+    deferred_recovery: HashSet<Uuid>,
     activity: crate::worker_activity::WorkerActivity,
 }
 impl Scheduler {
@@ -501,6 +529,7 @@ impl Scheduler {
             validator: None,
             poisoned: false,
             failed_migrations: HashMap::new(),
+            deferred_recovery: HashSet::new(),
             activity: Default::default(),
         };
         scheduler.reconcile()?;
@@ -650,44 +679,140 @@ impl Scheduler {
         Ok(true)
     }
     fn reconcile(&mut self) -> Result<(), Error> {
-        for listed in self.ts().list()? {
-            let Some(item) = self.ts().load(listed.task.id())? else {
-                continue;
-            };
-            if item.task.state() != &TaskState::Running {
-                continue;
-            }
-            if item.task.abort_requested() {
-                // Defer even restart-limit failure until owned cleanup settles.
-                self.ts().update(&item, |task| task.recover())?;
-                continue;
-            }
-            if !item.task.replay_safe() {
-                self.finish_failed(
-                    &item,
-                    "interrupted: execution outcome requires reconciliation".into(),
-                )?;
-                continue;
-            }
-            let Ok(reg) = self.registered(&item.task) else {
-                // Leave a task blocked until its definition is restored.
-                continue;
-            };
-            if item.task.replay_safe() && reg.replay_safe {
-                let exhausted = item.task.restarts().saturating_add(1) >= item.task.restart_limit();
-                if exhausted {
-                    self.finish_failed(&item, "restart limit".into())?;
-                } else {
-                    self.ts().update(&item, |task| task.recover())?;
+        'scan: loop {
+            let records = self.ts().list()?;
+            // The harness is bound only after attach. Defer interrupted work in
+            // pending fail-fast ownership graphs, including conversation descendants,
+            // until the normal graph-abort path has persisted the complete mark.
+            let mut pending_roots = Vec::new();
+            for parent in &records {
+                if !parent.task.abort_requested()
+                    && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = parent.task.state()
+                    && failed_sibling_to_abort(&self.ts(), parent, ids)?.is_some()
+                {
+                    pending_roots.extend(ids.iter().copied());
                 }
-            } else {
-                self.finish_failed(
-                    &item,
-                    "interrupted: execution outcome requires reconciliation".into(),
-                )?;
             }
+            // A settled TaskTool aborts only its nested TaskTool roots, not
+            // generic siblings. Defer those roots and their ownership graphs until
+            // the normal nested-abort transaction has marked them.
+            for parent in &records {
+                if parent.task.is_task_tool()
+                    && parent.task.is_completing()
+                    && has_unmarked_nested(parent.task.id(), &records)
+                {
+                    pending_roots.extend(records.iter().filter_map(|child| {
+                        (child.task.owner() == &TaskOwner::Task(parent.task.id())
+                            && child.task.is_task_tool()
+                            && !child.task.is_terminal()
+                            && !child.task.abort_requested())
+                        .then_some(child.task.id())
+                    }));
+                }
+            }
+            // A held failure is itself cancellation intent; its descendants must
+            // not be recovered before that graph is marked either.
+            for record in &records {
+                if matches!(record.task.state(), TaskState::CompletingFailed(_))
+                    && !record.task.is_task_tool()
+                    && !record.task.abort_requested()
+                    && has_live_owned(self.owner().store(), record.task.id(), &records)?
+                {
+                    pending_roots.push(record.task.id());
+                }
+            }
+            let pending = !pending_roots.is_empty();
+            if pending {
+                let mut task_ids = HashSet::new();
+                let mut conversations = HashSet::new();
+                while let Some(id) = pending_roots.pop() {
+                    if !task_ids.insert(id) {
+                        continue;
+                    }
+                    for record in &records {
+                        if record.task.owner() == &TaskOwner::Task(id) {
+                            pending_roots.push(record.task.id());
+                        }
+                    }
+                    for edge in crate::ownership_edge::EdgeStore::new(self.owner().store())
+                        .children(id)
+                        .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
+                    {
+                        if edge.edge.mode == crate::ownership_edge::Mode::Foreground
+                            && conversations.insert(edge.edge.child)
+                        {
+                            for record in &records {
+                                if record.task.owner() == &TaskOwner::Conversation(edge.edge.child)
+                                {
+                                    pending_roots.push(record.task.id());
+                                }
+                            }
+                        }
+                    }
+                }
+                self.deferred_recovery
+                    .extend(records.iter().filter_map(|item| {
+                        (item.task.state() == &TaskState::Running
+                            && task_ids.contains(&item.task.id()))
+                        .then_some(item.task.id())
+                    }));
+            }
+            let deferred = if pending {
+                HashSet::new()
+            } else {
+                std::mem::take(&mut self.deferred_recovery)
+            };
+            for listed in records {
+                if pending && self.deferred_recovery.contains(&listed.task.id()) {
+                    continue;
+                }
+                if !deferred.is_empty() && !deferred.contains(&listed.task.id()) {
+                    continue;
+                }
+                let Some(item) = self.ts().load(listed.task.id())? else {
+                    continue;
+                };
+                if item.task.state() != &TaskState::Running {
+                    continue;
+                }
+                if item.task.abort_requested() {
+                    // Defer even restart-limit failure until owned cleanup settles.
+                    self.ts().update(&item, |task| task.recover())?;
+                    continue;
+                }
+                if !item.task.replay_safe() {
+                    self.finish_failed(
+                        &item,
+                        "interrupted: execution outcome requires reconciliation".into(),
+                    )?;
+                    self.deferred_recovery.extend(deferred);
+                    continue 'scan;
+                }
+                let Ok(reg) = self.registered(&item.task) else {
+                    // Leave a task blocked until its definition is restored.
+                    continue;
+                };
+                if item.task.replay_safe() && reg.replay_safe {
+                    let exhausted =
+                        item.task.restarts().saturating_add(1) >= item.task.restart_limit();
+                    if exhausted {
+                        self.finish_failed(&item, "restart limit".into())?;
+                        self.deferred_recovery.extend(deferred);
+                        continue 'scan;
+                    } else {
+                        self.ts().update(&item, |task| task.recover())?;
+                    }
+                } else {
+                    self.finish_failed(
+                        &item,
+                        "interrupted: execution outcome requires reconciliation".into(),
+                    )?;
+                    self.deferred_recovery.extend(deferred);
+                    continue 'scan;
+                }
+            }
+            return Ok(());
         }
-        Ok(())
     }
     /// Create a root task. Child creation is performed atomically by `Step::Wait`.
     pub fn submit(&self, task: &Task) -> Result<(), Error> {
@@ -846,10 +971,32 @@ impl Scheduler {
             if !snapshot.task.abort_requested()
                 && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state()
             {
-                self.poisoned = true;
-                self.cancel_failed_siblings(&snapshot, ids)?;
-                self.poisoned = false;
+                if let Some(id) = failed_sibling_to_abort(&self.ts(), &snapshot, ids)? {
+                    // Mark one entire ownership graph, then rescan. In particular,
+                    // a Running handler must return before its record can settle.
+                    if let Some(harness) = self.validator.as_mut() {
+                        drop(gate);
+                        let result = owner
+                            .conversation_controls()
+                            .fence(|| harness.abort_owned_graph(None, Some(id)));
+                        if let Err(error) = result {
+                            // The sibling may have settled after dropping the gate.
+                            if !self.ts().load(id)?.is_some_and(|s| s.task.is_terminal()) {
+                                return Err(Error::Handler(format!("fail-fast abort: {error:?}")));
+                            }
+                        }
+                    } else {
+                        request_abort_subtree(&self.ts(), id)?;
+                    }
+                    return Ok(true);
+                }
             }
+        }
+        if !self.deferred_recovery.is_empty() {
+            self.reconcile()?;
+            return Ok(true);
+        }
+        for snapshot in self.ts().list()? {
             if !snapshot.task.abort_requested()
                 && matches!(snapshot.task.state(), TaskState::Waiting(_))
             {
@@ -1532,33 +1679,41 @@ impl Scheduler {
         }
         unreachable!("last graph conflict is returned")
     }
+}
 
-    fn cancel_failed_siblings(
-        &self,
-        parent: &task_store::StoredTask,
-        ids: &[Uuid],
-    ) -> Result<(), Error> {
-        let records = self.ts().list()?;
-        let mut seen = HashSet::new();
-        let mut failed = false;
-        for id in ids {
-            let child = records
-                .iter()
-                .find(|s| s.task.id() == *id)
-                .ok_or(Error::Ownership)?;
-            if !seen.insert(*id) || child.task.owner() != &TaskOwner::Task(parent.task.id()) {
-                return Err(Error::Ownership);
-            }
-            failed |= matches!(
-                child.task.state(),
-                TaskState::Failed(_) | TaskState::CompletingFailed(_)
-            );
+pub(crate) fn failed_sibling_to_abort(
+    ts: &TaskStore<'_>,
+    parent: &task_store::StoredTask,
+    ids: &[Uuid],
+) -> Result<Option<Uuid>, Error> {
+    let records = ts.list()?;
+    let mut seen = HashSet::new();
+    let mut failed = false;
+    for id in ids {
+        let child = records
+            .iter()
+            .find(|s| s.task.id() == *id)
+            .ok_or(Error::Ownership)?;
+        if !seen.insert(*id) || child.task.owner() != &TaskOwner::Task(parent.task.id()) {
+            return Err(Error::Ownership);
         }
-        if failed {
-            self.cancel_roots(&records, ids, None)?;
-        }
-        Ok(())
+        failed |= matches!(
+            child.task.state(),
+            TaskState::Failed(_) | TaskState::CompletingFailed(_) | TaskState::Cancelled
+        );
     }
+    Ok(failed
+        .then(|| {
+            ids.iter().copied().find(|id| {
+                records.iter().any(|record| {
+                    record.task.id() == *id
+                        && !record.task.is_terminal()
+                        && !record.task.abort_requested()
+                        && !matches!(record.task.state(), TaskState::CompletingFailed(_))
+                })
+            })
+        })
+        .flatten())
 }
 
 // Follow durable waits and live foreground ownership from every target. The
@@ -1959,6 +2114,164 @@ mod tests {
                 parent_state.state()
             );
             assert!(counts.iter().all(|count| count.load(Ordering::SeqCst) == 1));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_tool_crash_fixture() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("PI_TASK_TOOL_CRASH_DB") else {
+            return;
+        };
+        let fail = std::env::var_os("PI_TASK_TOOL_CRASH_FAIL").is_some();
+        let owner = Arc::new(OwnedStore::open(path).unwrap());
+        let store_owner = owner.clone();
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register("nested", false, move |_: &Task| {
+            let store = TaskStore::new(store_owner.store());
+            let parent = store.load(Uuid::from_u128(9)).unwrap().unwrap();
+            store
+                .update(&parent, |task| {
+                    task.start()?;
+                    if fail {
+                        task.hold_failure("failed".into())
+                    } else {
+                        task.hold_success(json!("done"))
+                    }
+                })
+                .unwrap();
+            println!("TASK_TOOL_NESTED_RUNNING");
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        registry.register("generic", true, |_: &Task| {
+            Ok(Step::Succeed(json!("generic")))
+        });
+        let mut scheduler = Scheduler::attach(owner, registry).unwrap();
+        let parent = task(
+            9,
+            TaskOwner::Conversation(Uuid::from_u128(99)),
+            "parent",
+            false,
+            4,
+        )
+        .into_task_tool();
+        let nested = task(1, TaskOwner::Task(parent.id()), "nested", false, 4).into_task_tool();
+        let mut generic = task(2, TaskOwner::Task(parent.id()), "generic", true, 4);
+        generic.start().unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&nested),
+                Save::Create(&generic),
+            ])
+            .unwrap();
+        scheduler.tick(0).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_tool_crash_recovery_defers_nested_but_not_generic() {
+        use std::{
+            io::{BufRead, BufReader},
+            process::{Child, Command, Stdio},
+            sync::mpsc,
+            time::Duration,
+        };
+        struct KillOnDrop(Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "task_scheduler::tests::task_tool_crash_fixture",
+                    "--nocapture",
+                ])
+                .env("PI_TASK_TOOL_CRASH_DB", &path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            if fail {
+                command.env("PI_TASK_TOOL_CRASH_FAIL", "1");
+            }
+            let mut child = KillOnDrop(command.spawn().unwrap());
+            let stdout = child.0.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    if line.unwrap().contains("TASK_TOOL_NESTED_RUNNING") {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+            rx.recv_timeout(Duration::from_secs(20))
+                .expect("nested handler did not start");
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            let mut registry = Registry::default();
+            registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+            registry.register_with_abort(
+                "nested",
+                false,
+                |_: &Task| panic!("must not replay"),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            registry.register("generic", true, |_: &Task| {
+                Ok(Step::Succeed(json!("generic")))
+            });
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            let nested = Uuid::from_u128(1);
+            let generic = Uuid::from_u128(2);
+            let parent = Uuid::from_u128(9);
+            assert_eq!(
+                scheduler.get(nested).unwrap().unwrap().state(),
+                &TaskState::Running
+            );
+            assert_eq!(
+                scheduler.get(generic).unwrap().unwrap().state(),
+                &TaskState::Ready
+            );
+            assert!(!scheduler.get(generic).unwrap().unwrap().abort_requested());
+            scheduler.tick(0).unwrap();
+            assert!(scheduler.get(nested).unwrap().unwrap().abort_requested());
+            assert_eq!(
+                scheduler.get(nested).unwrap().unwrap().state(),
+                &TaskState::Running
+            );
+            assert!(!scheduler.get(generic).unwrap().unwrap().abort_requested());
+            for _ in 0..12 {
+                scheduler.tick(0).unwrap();
+                if scheduler.get(parent).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+            }
+            assert_eq!(
+                scheduler.get(nested).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+            assert_eq!(
+                scheduler.get(generic).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("generic"))
+            );
+            let result = scheduler.get(parent).unwrap().unwrap();
+            if fail {
+                assert_eq!(result.state(), &TaskState::Failed("failed".into()));
+            } else {
+                assert_eq!(result.state(), &TaskState::Succeeded(json!("done")));
+            }
         }
     }
 
@@ -4277,6 +4590,305 @@ mod tests {
     }
 
     #[test]
+    fn fail_fast_recovery_failure_marks_remaining_running_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut first = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        first.start().unwrap();
+        let mut second = task(3, TaskOwner::Task(parent.id()), "child", false, 3);
+        second.start().unwrap();
+        let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&first),
+                Save::Create(&second),
+            ])
+            .unwrap();
+        drop(scheduler);
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register_with_abort(
+            "child",
+            false,
+            |_: &Task| panic!("must not replay"),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert!(matches!(
+            scheduler.get(first.id()).unwrap().unwrap().state(),
+            TaskState::Failed(_)
+        ));
+        assert_eq!(
+            scheduler.get(second.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        scheduler.tick(0).unwrap();
+        assert!(
+            scheduler
+                .get(second.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(second.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(scheduler.get(parent.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[test]
+    fn fail_fast_cancelled_child_marks_and_wakes_before_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut cancelled = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        cancelled.cancel().unwrap();
+        let mut running = task(3, TaskOwner::Task(parent.id()), "child", false, 3);
+        running.start().unwrap();
+        let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&cancelled),
+                Save::Create(&running),
+            ])
+            .unwrap();
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        assert_eq!(
+            scheduler.get(running.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert!(scheduler.wake_snapshot(0).unwrap().active);
+        scheduler.tick(0).unwrap();
+        let marked = scheduler.get(running.id()).unwrap().unwrap();
+        assert_eq!(marked.state(), &TaskState::Running);
+        assert!(marked.abort_requested());
+        assert!(scheduler.wake_snapshot(0).unwrap().active);
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register_with_abort(
+            "child",
+            false,
+            |_: &Task| panic!("must not replay"),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        scheduler.replace_registry(registry).unwrap();
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(running.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(scheduler.get(parent.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[test]
+    fn fail_fast_reopen_marks_before_recovering_non_replay_safe_without_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let root = Uuid::from_u128(1);
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut failed = task(2, TaskOwner::Task(root), "child", false, 3);
+        failed.start().unwrap();
+        failed.fail("failure".into()).unwrap();
+        let mut interrupted = task(3, TaskOwner::Task(root), "child", false, 3);
+        interrupted.start().unwrap();
+        let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&failed),
+                Save::Create(&interrupted),
+            ])
+            .unwrap();
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        assert_eq!(
+            scheduler.get(interrupted.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert!(
+            !scheduler
+                .get(interrupted.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        scheduler.tick(0).unwrap();
+        let marked = scheduler.get(interrupted.id()).unwrap().unwrap();
+        assert_eq!(marked.state(), &TaskState::Running);
+        assert!(marked.abort_requested());
+        drop(scheduler); // another crash immediately after the durable mark
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register_with_abort(
+            "child",
+            false,
+            |_: &Task| panic!("must not replay"),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(root).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(interrupted.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(scheduler.get(root).unwrap().unwrap().is_terminal());
+    }
+
+    #[test]
+    fn fail_fast_marks_running_non_replay_safe_and_recovers_multiple_siblings() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let parent = Uuid::from_u128(1);
+        let running = Uuid::from_u128(3);
+        let other = Uuid::from_u128(5);
+        let mut p = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "p",
+            false,
+            3,
+        );
+        p.start().unwrap();
+        p.wait(WaitFor::TasksFailFast(vec![
+            Uuid::from_u128(2),
+            running,
+            other,
+        ]))
+        .unwrap();
+        let mut failed = task(2, TaskOwner::Task(parent), "c", false, 3);
+        failed.start().unwrap();
+        failed.fail("failed".into()).unwrap();
+        let mut live = task(3, TaskOwner::Task(parent), "c", false, 3);
+        live.start().unwrap();
+        let leaf = task(4, TaskOwner::Task(running), "c", false, 3);
+        let sibling = task(5, TaskOwner::Task(parent), "c", false, 3);
+        let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&p),
+                Save::Create(&failed),
+                Save::Create(&live),
+                Save::Create(&leaf),
+                Save::Create(&sibling),
+            ])
+            .unwrap();
+        let mut scheduler = scheduler;
+        scheduler.tick(0).unwrap();
+        let marked = scheduler.get(running).unwrap().unwrap();
+        assert_eq!(marked.state(), &TaskState::Running);
+        assert!(marked.abort_requested());
+        assert!(!scheduler.get(other).unwrap().unwrap().abort_requested());
+        assert!(matches!(
+            scheduler.get(parent).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        drop(scheduler);
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+        let observed = cleaned.clone();
+        let mut registry = Registry::default();
+        registry.register("p", false, |_t: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register_with_abort(
+            "c",
+            false,
+            |_t: &Task| Ok(Step::Succeed(json!(null))),
+            move |t: &Task| {
+                observed.lock().unwrap().push(t.id());
+                Ok(Step::Succeed(json!(null)))
+            },
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(
+            scheduler.get(running).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        for _ in 0..16 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(parent).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert!(scheduler.get(parent).unwrap().unwrap().is_terminal());
+        for id in [running, Uuid::from_u128(4), other] {
+            assert_eq!(
+                scheduler.get(id).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+        }
+        let cleaned = cleaned.lock().unwrap();
+        let leaf_index = cleaned
+            .iter()
+            .position(|id| *id == Uuid::from_u128(4))
+            .unwrap();
+        let parent_index = cleaned.iter().position(|id| *id == running).unwrap();
+        assert!(leaf_index < parent_index);
+    }
+
+    #[test]
     fn any_and_fail_fast_survive_reopen_and_cancel_descendants() {
         for fail_fast in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -4322,15 +4934,28 @@ mod tests {
                     children: vec![],
                 })
             });
-            r.register("c", false, |_t: &Task| {
-                Ok(Step::Wait {
-                    checkpoint: cp("hold"),
-                    condition: WaitFor::Signal("hold".into()),
-                    children: vec![],
-                })
-            });
+            r.register_with_abort(
+                "c",
+                false,
+                |_t: &Task| {
+                    Ok(Step::Wait {
+                        checkpoint: cp("hold"),
+                        condition: WaitFor::Signal("hold".into()),
+                        children: vec![],
+                    })
+                },
+                |_t: &Task| Ok(Step::Succeed(json!(null))),
+            );
             let mut s = Scheduler::open(&path, r).unwrap();
-            s.tick(0).unwrap();
+            for _ in 0..12 {
+                s.tick(0).unwrap();
+                if matches!(
+                    s.get(parent).unwrap().unwrap().state(),
+                    TaskState::Waiting(WaitFor::Signal(_))
+                ) {
+                    break;
+                }
+            }
             assert!(matches!(
                 s.get(parent).unwrap().unwrap().state(),
                 TaskState::Waiting(WaitFor::Signal(_))

@@ -1075,6 +1075,230 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fail_fast_waits_for_sibling_owned_conversation_cleanup() {
+        use crate::task::{TaskState, WaitFor};
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        };
+        let mut parent = Task::new(Uuid::from_u128(1), owner.clone(), checkpoint.clone(), 3)
+            .unwrap()
+            .registered("parent".into(), true);
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut failed = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(parent.id()),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        failed.start().unwrap();
+        failed.fail("failure".into()).unwrap();
+        let sibling = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Task(parent.id()),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), true);
+        let unrelated = Task::new(Uuid::from_u128(4), owner, checkpoint, 3)
+            .unwrap()
+            .registered("other".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&failed),
+                Save::Create(&sibling),
+                Save::Create(&unrelated),
+            ])
+            .unwrap();
+        let owned = h
+            .ensure_task_owned_subagent(
+                sibling.id(),
+                TaskOwner::Task(parent.id()),
+                "fg",
+                config(),
+                Mode::Foreground,
+            )
+            .unwrap();
+        h.submit(owned.child, None, "hello".into()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::Value::Null))
+        });
+        registry.register("other", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::Value::Null))
+        });
+        registry.register_with_abort(
+            "child",
+            true,
+            |_: &Task| Ok(Step::Succeed(serde_json::Value::Null)),
+            |_: &Task| Ok(Step::Succeed(serde_json::Value::Null)),
+        );
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert!(
+            scheduler
+                .get(sibling.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        assert!(h.conversation(owned.child).unwrap().abort_requested);
+        assert!(matches!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Waiting(_)
+        ));
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            scheduler
+                .get(unrelated.id())
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+        );
+        assert!(!scheduler.tick(0).unwrap());
+        h.resume_conversation(owned.child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(sibling.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(scheduler.get(parent.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn fail_fast_reopen_defers_running_conversation_owner_until_graph_marked() {
+        use crate::task::{TaskState, WaitFor};
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        };
+        let mut parent = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(conversation),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut failed = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(parent.id()),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), false);
+        failed.start().unwrap();
+        failed.fail("failure".into()).unwrap();
+        let mut sibling = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Task(parent.id()),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), false);
+        sibling.start().unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&failed),
+                Save::Create(&sibling),
+            ])
+            .unwrap();
+        let owned = h
+            .ensure_task_owned_subagent(
+                sibling.id(),
+                TaskOwner::Task(parent.id()),
+                "fg",
+                config(),
+                Mode::Foreground,
+            )
+            .unwrap();
+        h.submit(owned.child, None, "hello".into()).unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| {
+            Ok(Step::Succeed(serde_json::Value::Null))
+        });
+        registry.register_with_abort(
+            "child",
+            false,
+            |_: &Task| panic!("must not replay"),
+            |_: &Task| Ok(Step::Succeed(serde_json::Value::Null)),
+        );
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        assert_eq!(
+            scheduler.get(sibling.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(sibling.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        assert!(
+            scheduler
+                .get(sibling.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        assert!(h.conversation(owned.child).unwrap().abort_requested);
+        scheduler.tick(0).unwrap();
+        assert!(!scheduler.get(sibling.id()).unwrap().unwrap().is_terminal());
+        h.resume_conversation(owned.child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(sibling.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(scheduler.get(parent.id()).unwrap().unwrap().is_terminal());
+    }
+
     #[test]
     fn external_wait_rejects_cycle_through_owned_conversation() {
         use crate::task::WaitFor;

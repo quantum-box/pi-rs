@@ -482,8 +482,11 @@ Current limits and differences from upstream Pi Durable:
   persisted, child-first cleanup for generic task-owned subtrees. Cleanup must
   tolerate replay after a crash; a missing handler produces a failed record.
   Handler steps run synchronously, so an abort request waits for the active step
-  and cannot interrupt it. Legacy `cancel` and fail-fast cancellation bypass
-  cleanup. Conversation abort marks foreground conversation-owned task descendants;
+  and cannot interrupt it. Fail-fast persists abort intent for each live sibling
+  and drains its owned work and abort handler before waking the waiting parent.
+  Unlike upstream, siblings are marked in separate scheduling passes. On reopen,
+  interrupted invocations under those graphs wait until the marks are persisted
+  before recovery. Legacy `cancel` bypasses cleanup. Conversation abort marks foreground conversation-owned task descendants;
   foreground task-owned subagent conversations are included. Shutdown waits for an in-flight step.
 - Standalone task signals also support `SignalToken::new(name, version)`,
   `Signal::new_typed`, and `WaitFor::TypedSignal(token.key(key)?)`. The stored
@@ -1401,8 +1404,9 @@ Inspection does not wait for an in-flight synchronous handler, but can wait for
 a task commit and become stale as soon as it returns. Signal and child wait evaluation reads additional records;
 driver and scheduler signal delivery is fenced by the task gate; direct unfenced
 TaskStore writers are outside the consistency protocol. Abort
-cleanup may still depend on foreground conversations, and fail-fast sibling
-cleanup is not independently represented. Unlike upstream `onWake`, hints are
+cleanup may still depend on foreground conversations. A standalone scheduler
+cannot abort a task with foreground owned conversations; use the attached driver
+for that ownership graph. Unlike upstream `onWake`, hints are
 not a change-only `{active, at}` callback, and the snapshot covers generic tasks
 only. The driver continues polling; this is not a host-managed alarm or a
 conversation scheduling snapshot.
