@@ -173,6 +173,13 @@ impl SkillReadGrants {
 }
 
 fn resolve_grant(path: &Path, base: Option<&Path>) -> Result<PathBuf> {
+    if !path.is_absolute()
+        && (path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))))
+    {
+        return Err(Error::Config(
+            "skill path must be fully absolute or relative to the supplied base".into(),
+        ));
+    }
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {

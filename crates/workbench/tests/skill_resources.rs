@@ -221,3 +221,16 @@ fn skill_paths_reject_parent_components_and_non_utf8_directories() {
     };
     assert!(manual.render(SkillReader::Read).is_err());
 }
+
+#[cfg(windows)]
+#[test]
+fn skill_grants_reject_drive_relative_or_rooted_paths() {
+    let base = tempfile::tempdir().unwrap();
+    for path in [r"C:relative\SKILL.md", r"\rooted\SKILL.md"] {
+        let grants = SkillReadGrants {
+            files: vec![path.into()],
+        };
+        let error = grants.load_with_base(base.path()).unwrap_err().to_string();
+        assert!(error.contains("fully absolute or relative"));
+    }
+}
