@@ -664,8 +664,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 .get("description")
                 .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
                 || value.get("timeout").is_some_and(|field| {
-                    !(inherited_global && field.is_null())
-                        && field.as_f64().is_none_or(|timeout| timeout <= 0.0)
+                    !(inherited_global && field.is_null()) && field.as_u64().is_none()
                 })
             {
                 return Err(Error::Config("invalid MCP server configuration".into()));
