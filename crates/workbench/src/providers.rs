@@ -657,6 +657,29 @@ impl Client {
                     ))
                 }
             }
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
+                }
+            }
             Self::Deferred(client) => {
                 if client.observed {
                     super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));

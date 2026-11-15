@@ -3343,6 +3343,14 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 
 ### Anthropic thinking checkpoint
 
+Native Anthropic streams expose individual text and thinking block boundaries,
+and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
+payload for provider replay. The current RPC event representation emits an
+extra placeholder delta for redacted blocks and does not expose the redacted
+flag or signature in partial messages; Pi includes them at block start. RPC
+`get_messages` reconstructs signed Anthropic block order from validated replay;
+unsigned text-only responses are still collapsed into one text block.
+
 The native Anthropic adapter reads the model's advertised thinking mode and
 effort levels. It selects adaptive effort or a bounded manual thinking budget
 and reports thinking progress even when the provider omits visible text.

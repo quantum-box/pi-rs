@@ -1,4 +1,5 @@
 //! Project the native session transcript into the Pi RPC message format.
+mod anthropic;
 use std::collections::{HashMap, HashSet};
 
 use pi_rs::{
@@ -594,6 +595,19 @@ impl Projection {
                     blocks.push(json!({"type":"text","text":content}));
                 }
                 blocks.extend(calls.iter().map(super::rpc_events::tool_call_value));
+                if !edited
+                    && api == "anthropic-messages"
+                    && let Some(projected) = replay.as_deref().and_then(|replay| {
+                        anthropic::blocks(
+                            replay,
+                            content,
+                            finalized.and_then(|entry| entry.metadata.reasoning.as_deref()),
+                            calls,
+                        )
+                    })
+                {
+                    blocks = projected;
+                }
                 let stop = if finalized
                     .is_some_and(|entry| entry.metadata.finish_reason.as_deref() == Some("length"))
                 {
