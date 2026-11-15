@@ -162,13 +162,11 @@ mod tests {
             .unwrap();
         assert!(first.cancel.is_cancelled());
         assert!(first.cleanup_cancel.is_cancelled());
-        assert!(
-            !attached
-                .conversation_controls()
-                .get(id)
-                .cleanup_cancel
-                .is_cancelled()
-        );
+        assert!(!attached
+            .conversation_controls()
+            .get(id)
+            .cleanup_cancel
+            .is_cancelled());
         attached.conversation_controls().root().cancel();
         let cleanup = attached.conversation_controls().get(id);
         assert!(cleanup.cancel.is_cancelled());
@@ -177,14 +175,12 @@ mod tests {
         drop(owner);
         let reopened = OwnedStore::open(&path).unwrap();
         let fresh = reopened.conversation_controls().get(id);
-        assert!(
-            reopened
-                .conversation_controls()
-                .worker_errors()
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .conversation_controls()
+            .worker_errors()
+            .lock()
+            .unwrap()
+            .is_empty());
         assert!(!fresh.cancel.is_cancelled());
         assert!(!Arc::ptr_eq(&first.gate, &fresh.gate));
     }
