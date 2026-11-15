@@ -1372,7 +1372,9 @@ A source entry with a missing parent is recovered as a separate native branch;
 its original parent ID remains in the retained source entry, while RPC presents
 it as a root. Missing ancestors may contain unrecoverable state or tool calls;
 orphan tool results and compactions involving orphaned branches are still rejected.
-Forward parent references are also rejected.
+Forward parent references and compaction boundaries on a different branch are
+also rejected. Pi instead drops a retained boundary that is not on the current
+path; native import rejects it rather than silently retaining unrelated history.
 
 Context edits are projected onto future model context while the imported raw
 entries remain available. Remaining specialized message variants and system
