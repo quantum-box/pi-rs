@@ -188,6 +188,14 @@ enum CacheControlFormat {
     Anthropic,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PromptCacheKeyMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelCompatibility {
@@ -197,6 +205,7 @@ struct ModelCompatibility {
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
+    prompt_cache_key_mode: Option<PromptCacheKeyMode>,
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
@@ -217,6 +226,7 @@ impl ModelCompatibility {
             session_affinity_format: newer
                 .session_affinity_format
                 .or(self.session_affinity_format),
+            prompt_cache_key_mode: newer.prompt_cache_key_mode.or(self.prompt_cache_key_mode),
             supports_long_cache_retention: newer
                 .supports_long_cache_retention
                 .or(self.supports_long_cache_retention),
@@ -1098,6 +1108,18 @@ impl Profiles {
         )
     }
 
+    pub fn responses_prompt_cache_key_enabled(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        !matches!(
+            self.cache_compatibility(provider, model)
+                .prompt_cache_key_mode,
+            Some(PromptCacheKeyMode::Disabled)
+        )
+    }
+
     pub fn chat_cache_support(
         &self,
         provider: &Provider,
@@ -1705,6 +1727,24 @@ mod tests {
                 .session_affinity(&chatgpt, "gpt", "https://example.test")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn responses_prompt_cache_key_mode_inherits_and_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"example":{
+            "baseUrl":"https://example.com/v1", "api":"openai-responses",
+            "compat":{"promptCacheKeyMode":"disabled"},
+            "models":[{"id":"inherited"},{"id":"auto","compat":{"promptCacheKeyMode":"auto"}},{"id":"enabled","compat":{"promptCacheKeyMode":"enabled"}}]
+        }}})).unwrap();
+        let provider = profiles.provider("example").unwrap();
+        for (id, expected) in [("inherited", false), ("auto", true), ("enabled", true)] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(
+                profiles.responses_prompt_cache_key_enabled(&provider, Some(&model)),
+                expected
+            );
+        }
+        assert!(Profiles::parse(&json!({"providers":{"example":{"baseUrl":"https://example.com/v1", "api":"openai-responses", "compat":{"promptCacheKeyMode":"unknown"}}}})).is_err());
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub struct OpenAiResponses {
     explicit_cache_mode: bool,
     session_cache_key: Option<String>,
     session_affinity_format: Option<SessionAffinityFormat>,
+    prompt_cache_key_enabled: bool,
 }
 
 impl OpenAiResponses {
@@ -162,6 +163,7 @@ impl OpenAiResponses {
             explicit_cache_mode: false,
             session_cache_key: None,
             session_affinity_format: None,
+            prompt_cache_key_enabled: true,
         })
     }
 
@@ -235,6 +237,12 @@ impl OpenAiResponses {
         Ok(self)
     }
 
+    /// Enable or disable the automatic session-derived prompt cache key.
+    pub fn with_prompt_cache_key_enabled(mut self, enabled: bool) -> Self {
+        self.prompt_cache_key_enabled = enabled;
+        self
+    }
+
     /// Disable retention while preserving the model cache protocol.
     pub fn without_cache(mut self) -> Self {
         self.cache_retention = CacheRetention::None;
@@ -269,7 +277,8 @@ impl OpenAiResponses {
     }
 
     fn apply_cache(&self, body: &mut Value) {
-        if self.cache_retention != CacheRetention::None
+        if self.prompt_cache_key_enabled
+            && self.cache_retention != CacheRetention::None
             && let Some(key) = &self.session_cache_key
         {
             body.as_object_mut()
@@ -599,11 +608,18 @@ impl Model for OpenAiResponses {
         } else {
             base
         };
-        match self.session_affinity_format {
+        let base = match self.session_affinity_format {
             None => base,
             Some(format) => base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
             }),
+        };
+        if self.prompt_cache_key_enabled {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "prompt-cache-key-disabled"))
+            })
         }
     }
 
@@ -1990,6 +2006,21 @@ mod tests {
         let model =
             OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
         let identity = format!("{}tail", "猫".repeat(64));
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .with_prompt_cache_key_enabled(true)
+                .context_identity()
+        );
         let mut body = json!({});
         model
             .clone()
@@ -2005,6 +2036,20 @@ mod tests {
         let mut body = json!({});
         model
             .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+        let mut body = json!({"prompt_cache_key":"explicit"});
+        model
+            .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "explicit");
+        let mut body = json!({});
+        model
+            .clone()
             .with_session_cache_key("")
             .apply_cache(&mut body);
         assert!(body.get("prompt_cache_key").is_none());
@@ -2014,6 +2059,61 @@ mod tests {
             .without_cache()
             .apply_cache(&mut body);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_prompt_cache_key_is_omitted_from_sdk_session_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut block = [0; 4096];
+            let end = loop {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let size: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + size {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_prompt_cache_key_enabled(false);
+        let _ = model
+            .stream_enriched_in_session_with_identity(
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                "external-session",
+                request(),
+            )
+            .await;
+        assert!(server.join().unwrap().get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]
