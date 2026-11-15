@@ -1175,6 +1175,78 @@ impl Transaction {
     }
 }
 
+/// A store-bound checked host transaction with provisional typed deliveries.
+/// It supports at most one signal call per target and rejects task writes for
+/// those targets, regardless of staging order.
+pub struct HostTransaction<'a> {
+    store: &'a Store,
+    transaction: Transaction,
+    signal_targets: HashSet<Vec<u8>>,
+}
+impl<'a> HostTransaction<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        Self {
+            store,
+            transaction: Transaction::new(),
+            signal_targets: HashSet::new(),
+        }
+    }
+    pub fn put(
+        &mut self,
+        address: &Address,
+        expected: Expected,
+        value: &Map<String, Value>,
+    ) -> Result<(), Error> {
+        self.transaction.put(address, expected, value)
+    }
+    pub fn delete(&mut self, address: &Address, version: u64) -> Result<(), Error> {
+        self.transaction.delete(address, version)
+    }
+    /// Compose another checked batch. Writes to signal namespaces or a
+    /// signalled task are rejected; use `signal_at` for typed deliveries.
+    pub fn append(&mut self, batch: OwnedBatch) -> Result<(), Error> {
+        if batch.mutations.iter().any(|mutation| {
+            let key = match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+            };
+            self.signal_targets.contains(key)
+                || key.starts_with(b"durable/signal/")
+                || key.starts_with(b"durable/signal-revision/")
+        }) {
+            return Err(Error::InvalidBatch);
+        }
+        self.transaction.append(batch)
+    }
+    /// Stage one typed delivery per target. Results remain provisional until
+    /// commit. Target task writes cannot be composed in either order.
+    pub fn signal_at(
+        &mut self,
+        task_id: uuid::Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+    ) -> Result<crate::task_store::SignalResult, Error> {
+        let target = crate::task_store::key(task_id);
+        if self.transaction.written.contains(&target) || self.signal_targets.contains(&target) {
+            return Err(Error::SignalComposition);
+        }
+        let (result, batch) = crate::task_store::TaskStore::new(self.store).prepare_signal_at(
+            task_id,
+            token,
+            key,
+            value,
+            || now_millis,
+        )?;
+        self.transaction.append(batch)?;
+        self.signal_targets.insert(target);
+        Ok(result)
+    }
+    pub fn commit(self) -> Result<(), Error> {
+        self.transaction.commit(self.store)
+    }
+}
+
 /// Checked document operations for one admission attempt. Reads are cached and
 /// validated at commit, including missing and read-only documents. Once any
 /// write is staged, further reads are rejected. A conflict reruns the caller.
@@ -1341,9 +1413,8 @@ impl<'a> TaskDocuments<'a> {
         self.writes.insert(address.clone(), value);
         Ok(())
     }
-    /// Stage typed deliveries before entry writes. Document writes may already
-    /// be staged. The outcome is provisional until the task checkpoint commits.
-    /// A conflict
+    /// Stage typed deliveries alongside document and application-entry writes.
+    /// The outcome is provisional until the task checkpoint commits. A conflict
     /// replays only registered replay-safe handlers. Supply a fresh clock value
     /// on replay; elapsed monotonic time is checked at the storage commit boundary.
     /// Clock jumps after staging are not observed. Repeating a delivered or
@@ -1359,9 +1430,6 @@ impl<'a> TaskDocuments<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
-        if self.entries.as_ref().is_some_and(|entries| entries.4) {
-            return Err(Error::ReadAfterWrite);
-        }
         let identity = (task_id, token.name().to_owned(), key.to_owned());
         if let Some(previous) = self.signal_keys.get(&identity).copied() {
             match previous {
@@ -1662,6 +1730,36 @@ impl<'a> TaskDocuments<'a> {
                 });
             }
         }
+        // Entry ancestry and signal delivery can observe the same task at
+        // different instants. Preserve both fences as one checked condition;
+        // disagreement forces a CAS conflict and the ordinary retry policy.
+        let mut checked: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut normalized: Vec<Check> = Vec::with_capacity(batch.checks.len());
+        for check in batch.checks {
+            if (check.key.starts_with(crate::task_store::PREFIX)
+                || check.key.starts_with(b"durable/signal-revision/"))
+                && let Some(&index) = checked.get(&check.key)
+            {
+                let existing = &mut normalized[index].expected;
+                *existing = match (&*existing, &check.expected) {
+                    (Expected::Version(a), Expected::VersionBefore(b, t))
+                    | (Expected::VersionBefore(b, t), Expected::Version(a))
+                        if a == b =>
+                    {
+                        Expected::VersionBefore(*a, *t)
+                    }
+                    (Expected::VersionBefore(a, x), Expected::VersionBefore(b, y)) if a == b => {
+                        Expected::VersionBefore(*a, (*x).min(*y))
+                    }
+                    (a, b) if a == b => a.clone(),
+                    _ => Expected::VersionBefore(0, std::time::Instant::now()),
+                };
+            } else {
+                checked.insert(check.key.clone(), normalized.len());
+                normalized.push(check);
+            }
+        }
+        batch.checks = normalized;
         Ok(batch)
     }
 }

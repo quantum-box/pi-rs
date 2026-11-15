@@ -777,7 +777,7 @@ fn append_across_steps_with_nested_authors_and_reject_reserved_kinds() {
 }
 
 #[test]
-fn signal_after_application_entry_remains_fail_closed() {
+fn signal_after_application_entry_commits_with_document_and_checkpoint() {
     use pi_rs_durable::task_store::SignalToken;
     struct EntryBeforeSignal;
     impl Handler for EntryBeforeSignal {
@@ -797,10 +797,14 @@ fn signal_after_application_entry_remains_fail_closed() {
             .unwrap();
             docs.append_entry("app.record", json!(1)).unwrap();
             let token = SignalToken::new("answer", 1).unwrap();
-            assert!(matches!(
-                docs.signal_at(task.id(), &token, "a", json!(1), 0),
-                Err(pi_rs_durable::document::Error::ReadAfterWrite)
-            ));
+            assert_eq!(
+                docs.signal_at(task.id(), &token, "a", json!(1), 0).unwrap(),
+                pi_rs_durable::task_store::SignalResult::Delivered
+            );
+            assert_eq!(
+                docs.signal_at(task.id(), &token, "a", json!(2), 0).unwrap(),
+                pi_rs_durable::task_store::SignalResult::Duplicate
+            );
             Ok(Step::Continue(cp("done")))
         }
     }
@@ -819,7 +823,7 @@ fn signal_after_application_entry_remains_fail_closed() {
         TaskStore::new(&db)
             .read_typed_signal(parent().id(), &token, "a")
             .unwrap(),
-        None
+        Some(json!(1))
     );
     assert_eq!(
         application_entry::list(&db, Uuid::from_u128(2))
@@ -835,4 +839,204 @@ fn signal_after_application_entry_remains_fail_closed() {
             .value["n"],
         9
     );
+}
+
+struct ParentWaitingForChildSignal {
+    signal_wait: bool,
+}
+impl Handler for ParentWaitingForChildSignal {
+    fn run(&self, task: &Task) -> Result<Step, String> {
+        if task.checkpoint().phase == "start" {
+            let token = pi_rs_durable::task_store::SignalToken::new("answer", 1).unwrap();
+            Ok(Step::Wait {
+                checkpoint: cp("waiting"),
+                condition: if self.signal_wait {
+                    WaitFor::TypedSleep {
+                        until_millis: Some(60_000),
+                        signals: vec![token.key("a").unwrap()],
+                    }
+                } else {
+                    WaitFor::Tasks(vec![child().id()])
+                },
+                children: vec![child()],
+            })
+        } else {
+            Ok(Step::Succeed(json!(null)))
+        }
+    }
+}
+struct EntryThenAncestorSignal {
+    path: PathBuf,
+    mode: u8,
+    attempts: Arc<AtomicUsize>,
+}
+impl Handler for EntryThenAncestorSignal {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use pi_rs_durable::task_store::{SignalResult, SignalToken};
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        docs.get(&address("write")).unwrap();
+        docs.put(
+            &address("write"),
+            json!({"n": 9}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        docs.append_entry("app.child", json!("child")).unwrap();
+        if self.mode == 1 && attempt == 0 {
+            // Change the ancestor version after entry ancestry was captured.
+            let db = Store::open(&self.path).unwrap();
+            let mut key = b"durable/task/".to_vec();
+            key.extend_from_slice(parent().id().as_bytes());
+            let entry = db.get(&key).unwrap().unwrap();
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: entry.value,
+                }],
+            )
+            .unwrap();
+        }
+        let token = SignalToken::new("answer", 1).unwrap();
+        let result = docs
+            .signal_at(parent().id(), &token, "a", json!(1), 0)
+            .unwrap();
+        assert_eq!(
+            result,
+            if self.mode == 2 && attempt > 0 {
+                SignalResult::Duplicate
+            } else {
+                SignalResult::Delivered
+            }
+        );
+        assert_eq!(
+            docs.signal_at(parent().id(), &token, "a", json!(2), 0)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        if self.mode == 2 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            assert_eq!(
+                TaskStore::new(&db)
+                    .deliver_signal_at(parent().id(), &token, "a", json!(7), 0)
+                    .unwrap(),
+                SignalResult::Delivered
+            );
+        }
+        if self.mode == 3 && attempt == 0 {
+            let db = Store::open(&self.path).unwrap();
+            let mut key = b"durable/task/".to_vec();
+            key.extend_from_slice(task.id().as_bytes());
+            let entry = db.get(&key).unwrap().unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            value["abort_requested"] = json!(true);
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
+            )
+            .unwrap();
+        }
+        if self.mode == 4 {
+            return Ok(Step::Fail("discard".into()));
+        }
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+
+#[test]
+fn entry_then_ancestor_signal_is_atomic_fenced_and_recoverable() {
+    use pi_rs_durable::task_store::SignalToken;
+    for mode in 0..=4 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        initialize(&path);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "parent",
+            true,
+            ParentWaitingForChildSignal {
+                signal_wait: mode != 2,
+            },
+        );
+        registry.register(
+            "child",
+            true,
+            EntryThenAncestorSignal {
+                path: path.clone(),
+                mode,
+                attempts: attempts.clone(),
+            },
+        );
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        scheduler.submit(&parent()).unwrap();
+        assert!(scheduler.tick(0).unwrap()); // Parent creates child and parks.
+        assert!(scheduler.tick(0).unwrap()); // Child stages the entry and signal.
+        if mode == 1 || mode == 2 {
+            let db = Store::open(&path).unwrap();
+            assert!(
+                application_entry::list(&db, Uuid::from_u128(2))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                Documents::new(&db)
+                    .get(&address("write"))
+                    .unwrap()
+                    .unwrap()
+                    .value["n"],
+                0
+            );
+            drop(db);
+            for _ in 0..4 {
+                if attempts.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                scheduler.tick(0).unwrap();
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+        drop(scheduler);
+        let db = Store::open(&path).unwrap();
+        let entries = application_entry::list(&db, Uuid::from_u128(2)).unwrap();
+        let doc = Documents::new(&db).get(&address("write")).unwrap().unwrap();
+        let token = SignalToken::new("answer", 1).unwrap();
+        let signal = TaskStore::new(&db)
+            .read_typed_signal(parent().id(), &token, "a")
+            .unwrap();
+        if mode >= 3 {
+            assert!(entries.is_empty());
+            assert_eq!(doc.value["n"], 0);
+            assert_eq!(signal, None);
+        } else {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].author_task_id, child().id());
+            assert_eq!(doc.value["n"], 9);
+            assert_eq!(signal, Some(if mode == 2 { json!(7) } else { json!(1) }));
+            assert!(matches!(
+                TaskStore::new(&db)
+                    .load(child().id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                TaskState::Succeeded(_)
+            ));
+        }
+    }
 }
