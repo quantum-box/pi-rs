@@ -451,6 +451,54 @@ mod tests {
             &TaskState::Succeeded(serde_json::json!("root"))
         );
     }
+
+    #[tokio::test]
+    async fn failed_owner_aborts_active_owned_conversation_before_finalizing() {
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Step};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let root = Task::new(
+            Uuid::from_u128(1),
+            owner.clone(),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("root".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&root)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap();
+        h.submit(child.child, None, "hello".into()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("root", true, |_: &Task| Ok(Step::Fail("failure".into())));
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::CompletingFailed("failure".into())
+        );
+        scheduler.tick(0).unwrap();
+        assert!(h.conversation(child.child).unwrap().abort_requested);
+        assert!(!scheduler.tick(0).unwrap());
+        h.resume_conversation(child.child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Failed("failure".into())
+        );
+    }
     #[test]
     fn completing_owner_tracks_work_added_to_owned_conversation() {
         use crate::task::TaskState;
