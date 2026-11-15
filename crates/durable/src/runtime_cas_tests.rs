@@ -768,6 +768,148 @@ fn abort_fences_root_and_stale_lifecycle_admissions() {
 }
 
 #[test]
+fn low_level_creation_committing_after_scan_retries_abort_and_survives_reopen() {
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    use serde_json::json;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    // Already marked and terminal task owners, a direct conversation owner,
+    // an atomic host checkpoint, and an independent background branch.
+    for case in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let conversation = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let mut parent = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            4,
+        )
+        .unwrap();
+        if case == 4 {
+            parent = parent.background().unwrap();
+        }
+        if case == 1 {
+            parent.start().unwrap();
+            parent.succeed(json!(null)).unwrap();
+        } else {
+            parent.request_abort().unwrap();
+        }
+        TaskStore::new(h.subagent_store().unwrap())
+            .save(&[Save::Create(&parent)])
+            .unwrap();
+        let parent_version = TaskStore::new(h.subagent_store().unwrap())
+            .load(parent.id())
+            .unwrap()
+            .unwrap()
+            .version;
+        let owner = if case == 2 {
+            TaskOwner::Conversation(conversation)
+        } else {
+            TaskOwner::Task(parent.id())
+        };
+        let make_child = || {
+            Task::new(
+                Uuid::new_v4(),
+                owner.clone(),
+                Checkpoint {
+                    phase: "child".into(),
+                    data: json!(null),
+                },
+                4,
+            )
+            .unwrap()
+            .registered("test".into(), true)
+        };
+        let children = [make_child(), make_child()];
+        let ids = [children[0].id(), children[1].id()];
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = h.worker();
+        let thread = std::thread::spawn(move || {
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let store = writer.subagent_store().unwrap();
+            let tasks = TaskStore::new(store);
+            let batch = if case == 3 {
+                tasks
+                    .prepare_owned_tasks(
+                        &owner,
+                        b"host/checkpoint",
+                        Expected::Missing,
+                        b"atomic",
+                        &children,
+                    )
+                    .unwrap()
+            } else {
+                tasks
+                    .prepare_save(&[Save::Create(&children[0]), Save::Create(&children[1])])
+                    .unwrap()
+            };
+            store.commit(&batch.checks, &batch.mutations).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let mut attempts = 0;
+        h.abort_owned_graph_impl_with(Some(conversation), None, None, false, || {
+            attempts += 1;
+            if attempts == 1 {
+                ready_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        })
+        .unwrap();
+        thread.join().unwrap();
+        assert_eq!(attempts, 2, "abort must rescan a newly committed child");
+        let ts = TaskStore::new(h.subagent_store().unwrap());
+        assert_eq!(
+            ts.load(parent.id()).unwrap().unwrap().version,
+            parent_version
+        );
+        for id in ids {
+            assert_eq!(
+                ts.load(id).unwrap().unwrap().task.abort_requested(),
+                case != 4
+            );
+        }
+        if case == 3 {
+            assert_eq!(
+                h.subagent_store()
+                    .unwrap()
+                    .get(b"host/checkpoint")
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                b"atomic"
+            );
+        }
+        drop(h);
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        for id in ids {
+            assert_eq!(
+                TaskStore::new(reopened.subagent_store().unwrap())
+                    .load(id)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested(),
+                case != 4
+            );
+        }
+        assert!(reopened.conversation(conversation).unwrap().abort_requested);
+    }
+}
+
+#[test]
 fn prepared_low_level_children_are_fenced_after_abort_without_rewriting_owner() {
     use crate::task::{Checkpoint, Task, TaskOwner};
     use crate::task_store::{Save, TaskStore};

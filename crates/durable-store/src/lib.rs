@@ -118,6 +118,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_commit_meta (id INTEGER PRIMARY KEY CHECK(id=1), sequence INTEGER NOT NULL CHECK(sequence>=0), legacy_version INTEGER NOT NULL CHECK(legacy_version>=0));
             INSERT OR IGNORE INTO durable_commit_meta SELECT 1,0,version FROM durable_store_meta WHERE id=1;
             CREATE TABLE IF NOT EXISTS durable_commit_versions (key BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0), sequence INTEGER NOT NULL CHECK(sequence>0), PRIMARY KEY(key,version)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS durable_commit_versions_by_version ON durable_commit_versions(version,key);
             COMMIT;")?;
         // Seed existing live documents once. Earlier overwritten/deleted values cannot
         // be recovered. Both the seed and its marker are committed atomically.
@@ -160,6 +161,16 @@ impl Store {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn.query_row(
             "SELECT sequence FROM durable_commit_meta WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Current database-wide put version, including versions before commit tracking.
+    pub fn put_version(&self) -> Result<u64, Error> {
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT version FROM durable_store_meta WHERE id=1",
             [],
             |r| r.get(0),
         )?)
@@ -825,8 +836,63 @@ impl Store {
     /// All checks are evaluated against the pre-commit state; mutations apply
     /// in order. A failed check rolls back the complete batch.
     pub fn commit(&self, checks: &[Check], mutations: &[Mutation]) -> Result<(), Error> {
+        self.commit_inner(checks, mutations, None)
+    }
+
+    /// Commit the original atomic batch only if no put under the supplied
+    /// prefixes occurred after `boundary`. Deletes alone are not tracked.
+    /// The boundary must be obtained from `put_version` after migration.
+    pub fn commit_with_prefix_put_fence(
+        &self,
+        checks: &[Check],
+        mutations: &[Mutation],
+        prefixes: &[&[u8]],
+        boundary: u64,
+    ) -> Result<(), Error> {
+        self.commit_inner(checks, mutations, Some((prefixes, boundary)))
+    }
+
+    fn commit_inner(
+        &self,
+        checks: &[Check],
+        mutations: &[Mutation],
+        prefix_fence: Option<(&[&[u8]], u64)>,
+    ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((prefixes, boundary)) = prefix_fence {
+            let current: u64 = tx.query_row(
+                "SELECT version FROM durable_store_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let legacy: u64 = tx.query_row(
+                "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            if boundary > current || boundary < legacy {
+                return Err(Error::InvalidSnapshot);
+            }
+            for prefix in prefixes {
+                let changed: bool = if let Some(end) = prefix_end(prefix) {
+                    tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND key<?2 AND version>?3)",
+                        params![prefix, end, boundary], |r| r.get(0),
+                    )?
+                } else {
+                    tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND version>?2)",
+                        params![prefix, boundary], |r| r.get(0),
+                    )?
+                };
+                if changed {
+                    return Err(Error::Conflict {
+                        key: prefix.to_vec(),
+                    });
+                }
+            }
+        }
         for check in checks {
             let version: Option<u64> = tx
                 .query_row(
@@ -988,6 +1054,67 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod document_history_tests {
     use super::*;
+
+    #[test]
+    fn prefix_put_fence_is_atomic_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let boundary = store.put_version().unwrap();
+        let prefixes: &[&[u8]] = &[b"tasks/"];
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"other/key".to_vec(),
+                    value: vec![1],
+                }],
+            )
+            .unwrap();
+        store
+            .commit_with_prefix_put_fence(&[], &[], prefixes, boundary)
+            .unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"tasks/child".to_vec(),
+                    value: vec![2],
+                }],
+            )
+            .unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Delete {
+                    key: b"tasks/child".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit_with_prefix_put_fence(
+                &[],
+                &[Mutation::Put {
+                    key: b"unrelated".to_vec(),
+                    value: vec![3]
+                }],
+                prefixes,
+                boundary
+            ),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(b"unrelated").unwrap().is_none());
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(matches!(
+            reopened.commit_with_prefix_put_fence(&[], &[], prefixes, boundary),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(matches!(
+            reopened.commit_with_prefix_put_fence(&[], &[], prefixes, u64::MAX),
+            Err(Error::InvalidSnapshot)
+        ));
+    }
 
     #[test]
     fn document_commit_tracking_fences_missing_delete_evidence() {
@@ -1165,6 +1292,13 @@ mod document_history_tests {
             .unwrap();
         }
         let db = Store::open(&path).unwrap();
+        assert_eq!(db.put_version().unwrap(), 7);
+        assert!(matches!(
+            db.commit_with_prefix_put_fence(&[], &[], &[b"tasks/"], 6),
+            Err(Error::InvalidSnapshot)
+        ));
+        db.commit_with_prefix_put_fence(&[], &[], &[b"tasks/"], 7)
+            .unwrap();
         assert_eq!(db.document_snapshot().unwrap(), 1);
         assert_eq!(db.document_at(key, 0).unwrap().unwrap().version, 7);
         db.commit(

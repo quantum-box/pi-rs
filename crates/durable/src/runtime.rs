@@ -4561,6 +4561,14 @@ impl Harness {
         &mut self,
         batch: PreparedConversationSave,
     ) -> Result<(), Error> {
+        self.commit_conversation_save_inner(batch, None)
+    }
+
+    fn commit_conversation_save_inner(
+        &mut self,
+        batch: PreparedConversationSave,
+        prefix_fence: Option<u64>,
+    ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -4572,7 +4580,17 @@ impl Harness {
                 "prepared save belongs to a different store".into(),
             ));
         }
-        match self.owner.store().commit(&batch.checks, &batch.mutations) {
+        let store = self.owner.store();
+        let result = match prefix_fence {
+            Some(boundary) => store.commit_with_prefix_put_fence(
+                &batch.checks,
+                &batch.mutations,
+                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                boundary,
+            ),
+            None => store.commit(&batch.checks, &batch.mutations),
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(e @ durable_store::Error::Conflict { .. }) => Err(e.into()),
             Err(e) => {
@@ -8246,6 +8264,9 @@ impl Harness {
         let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         loop {
             let store = owner.store();
+            // Capture before discovery; creation can commit without rewriting
+            // the observed owner. The checked prefixes catch such phantoms.
+            let graph_version = store.put_version()?;
             if let Some((key, _)) = &receipt
                 && store.get(key)?.is_some()
             {
@@ -8430,7 +8451,7 @@ impl Harness {
             }
             batch.mutations.extend(task_batch.mutations);
             before_commit();
-            match self.commit_conversation_save(batch) {
+            match self.commit_conversation_save_inner(batch, Some(graph_version)) {
                 Ok(()) => {
                     return Ok((
                         conversations.into_iter().collect(),

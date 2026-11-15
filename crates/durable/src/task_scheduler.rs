@@ -1213,6 +1213,7 @@ fn request_abort_subtree_with(
     mut before_commit: impl FnMut(),
 ) -> Result<(), Error> {
     loop {
+        let graph_version = ts.store().put_version().map_err(task_store::Error::from)?;
         let records = ts.list()?;
         let root = records
             .iter()
@@ -1278,7 +1279,12 @@ fn request_abort_subtree_with(
         before_commit();
         match ts
             .store()
-            .commit(&batch.checks, &batch.mutations)
+            .commit_with_prefix_put_fence(
+                &batch.checks,
+                &batch.mutations,
+                &[task_store::PREFIX, crate::ownership_edge::PREFIX],
+                graph_version,
+            )
             .map_err(task_store::Error::from)
         {
             Ok(()) => return Ok(()),
@@ -1303,6 +1309,69 @@ mod tests {
             .unwrap()
             .registered(kind.into(), safe)
     }
+    #[test]
+    fn child_commit_after_scan_forces_standalone_abort_retry() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let scheduler = Scheduler::open(&path, Registry::default()).unwrap();
+        let ts = scheduler.ts();
+        let mut root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(100)),
+            "job",
+            true,
+            4,
+        );
+        root.request_abort().unwrap();
+        ts.save(&[Save::Create(&root)]).unwrap();
+        let version = ts.load(root.id()).unwrap().unwrap().version;
+        let child = task(2, TaskOwner::Task(root.id()), "job", true, 4);
+        let owner = scheduler.owner();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let store = owner.store();
+            let batch = TaskStore::new(store)
+                .prepare_save(&[Save::Create(&child)])
+                .unwrap();
+            store.commit(&batch.checks, &batch.mutations).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let mut attempts = 0;
+        request_abort_subtree_with(&ts, root.id(), || {
+            attempts += 1;
+            if attempts == 1 {
+                ready_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        })
+        .unwrap();
+        writer.join().unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(ts.load(root.id()).unwrap().unwrap().version, version);
+        assert!(
+            ts.load(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        drop(scheduler);
+        let reopened = Scheduler::open(&path, Registry::default()).unwrap();
+        assert!(
+            reopened
+                .ts()
+                .load(Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+    }
+
     #[test]
     fn repeated_abort_fences_prepared_child_without_rewriting_reservation() {
         use std::sync::mpsc;
