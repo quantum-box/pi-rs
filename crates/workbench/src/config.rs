@@ -539,7 +539,11 @@ fn read_settings_layer(
     diagnostics: &mut Vec<String>,
 ) -> Value {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
-    let absolute = absolute.canonicalize().unwrap_or(absolute);
+    let absolute = absolute
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
+        .unwrap_or(absolute);
     match read_object(&absolute) {
         Ok(value) => value,
         Err(error) => {
@@ -2107,6 +2111,25 @@ mod tests {
             Settings::load_from_paths_with_previous(&workspace, true, &user, Some(&first)).unwrap();
         assert_eq!(first.diagnostics(), second.diagnostics());
         assert!(second.stored_layer(&alias.join(".pi")).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_settings_keep_settings_specific_parsing() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("other.json");
+        let user = root.path().join("settings.json");
+        symlink(&target, &user).unwrap();
+        for content in ["\u{feff}{\"theme\":\"light\"}", ""] {
+            std::fs::write(&target, content).unwrap();
+            let settings = Settings::load_from_paths(root.path(), false, &user).unwrap();
+            assert!(
+                settings.diagnostics().is_empty(),
+                "{:?}",
+                settings.diagnostics()
+            );
+        }
     }
 
     #[test]
