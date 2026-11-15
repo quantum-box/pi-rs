@@ -1593,6 +1593,9 @@ impl pi_rs_durable::keyed_tool::StreamedTool for StreamedFixture {
     }
 }
 fn stream_options(tool: Arc<StreamedFixture>) -> Options {
+    stream_options_with_policy(tool, ReplayPolicy::Safe)
+}
+fn stream_options_with_policy(tool: Arc<StreamedFixture>, replay: ReplayPolicy) -> Options {
     use pi_rs_durable::keyed_tool::{KeyedToolAdapter, StreamedToolAdapter};
     let adapter = Arc::new(KeyedToolAdapter::new(StreamedToolAdapter(
         SharedStreamedFixture(tool),
@@ -1602,11 +1605,56 @@ fn stream_options(tool: Arc<StreamedFixture>) -> Options {
             calls: AtomicUsize::new(0),
             fail_first: false,
         }),
-        tools: vec![adapter.register(ReplayPolicy::Safe)],
+        tools: vec![adapter.register(replay)],
         restart_limit: 5,
         max_turns: 8,
         uncertain_policy: UncertainPolicy::InterruptedResult,
     }
+}
+
+#[tokio::test]
+async fn interrupted_unsafe_stream_retains_only_committed_attempt_output() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let tool = stream_fixture("replay");
+    let options = || stream_options_with_policy(tool.clone(), ReplayPolicy::Unsafe);
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let attempt = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    let stale = tool.saved.lock().unwrap().take().unwrap();
+    scheduler.shutdown().await.unwrap();
+    assert!(stale.append("late").await.is_err());
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. }
+        if content == "first\ntool interrupted and may have partially run"))
+    );
+    assert!(
+        conversation
+            .tool_results
+            .iter()
+            .any(|result| result.operation_id == attempt.operation_id && result.is_error)
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    let scheduler = Scheduler::open(&path, options()).unwrap();
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "first\ntool interrupted and may have partially run")));
+    scheduler.shutdown().await.unwrap();
 }
 // Keep the fixture reusable when a scheduler is reopened.
 struct SharedStreamedFixture(Arc<StreamedFixture>);

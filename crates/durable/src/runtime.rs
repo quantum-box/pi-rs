@@ -9299,6 +9299,18 @@ impl Harness {
                             } else {
                                 "tool interrupted and may have partially run"
                             };
+                            // Only committed output from this exact attempt is
+                            // eligible; progress and earlier attempts are not
+                            // evidence of what this invocation emitted.
+                            let output = match c.tool_attempt().filter(|a| a.operation_id == operation_id) {
+                                Some(attempt) => crate::streamed_output::load(self.owner.store(), attempt.attempt_id)
+                                    .map_err(|error| Error::Invalid(format!("interrupted tool output: {error}")))?,
+                                None => None,
+                            };
+                            let content = match output.filter(|text| !text.is_empty()) {
+                                Some(text) => format!("{text}\n{reason}"),
+                                None => reason.to_owned(),
+                            };
                             let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
                             record_tool_result(&mut c, &calls, index, operation_id, &Outcome::Failed(reason.into()), reported)?;
                             c.phase = Phase::ToolFinished {
@@ -9307,7 +9319,7 @@ impl Harness {
                                 index,
                                 operation_id,
                                 arguments,
-                                content: reason.to_owned(),
+                                content,
                             };
                         }
                     }
