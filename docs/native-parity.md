@@ -2990,7 +2990,9 @@ Native edit results preserve a numbered display diff alongside the unified
 patch. The display diff uses old-file numbers for deletions and context,
 new-file numbers for insertions, and four context lines on either side of a
 change. Omitted ranges appear as ellipses. The terminal prefers the numbered
-diff, preserves its column width and uses the existing word highlighting.
+diff, preserves each line’s original gutter (including empty line numbers),
+and uses the existing word highlighting for single-line changes. Added, removed
+and context rows use the corresponding Pi theme roles.
 Previously stored unified patches still render through the existing path.
 
 The CLI comparison checks exact numbered and unified diffs for two separate

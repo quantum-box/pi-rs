@@ -17,6 +17,7 @@ struct Row {
     kind: Kind,
     number: Option<usize>,
     text: String,
+    explicit_prefix: Option<String>,
 }
 impl Row {
     fn color(&self) -> &'static str {
@@ -27,6 +28,9 @@ impl Row {
         }
     }
     fn prefix(&self, digits: usize) -> String {
+        if let Some(prefix) = &self.explicit_prefix {
+            return prefix.clone();
+        }
         let marker = match self.kind {
             Kind::Removed => '-',
             Kind::Added => '+',
@@ -76,6 +80,7 @@ fn rows(text: &str) -> Vec<Row> {
             Row {
                 kind,
                 number,
+                explicit_prefix: None,
                 text: if number.is_some() { &line[1..] } else { line }.replace('\t', "   "),
             }
         })
@@ -113,38 +118,37 @@ pub fn render(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 }
 
 pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    let mut digits = 1;
+    // Pi parses the display gutter on each line independently, including empty
+    // line numbers. Preserve that gutter instead of normalizing its padding.
+    static DIFF_LINE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^([+\-\s])(\s*[0-9]*)\s(.*)$").unwrap());
     let rows: Vec<_> = text
         .split('\n')
         .map(|line| {
-            if let Some((marker, body)) = line.split_at_checked(1)
-                && matches!(marker, "-" | "+" | " ")
-            {
-                let trimmed = body.trim_start_matches(' ');
-                if let Some((number, text)) = trimmed.split_once(' ')
-                    && let Ok(number_value) = number.parse::<usize>()
-                {
-                    let kind = match marker {
-                        "-" => Kind::Removed,
-                        "+" => Kind::Added,
-                        _ => Kind::Context,
-                    };
-                    digits = digits.max(body.len() - trimmed.len() + number.len());
-                    return Row {
-                        kind,
-                        number: Some(number_value),
-                        text: text.replace('\t', "   "),
-                    };
-                }
+            if let Some(captures) = DIFF_LINE.captures(line) {
+                let marker = &captures[1];
+                let kind = match marker {
+                    "-" => Kind::Removed,
+                    "+" => Kind::Added,
+                    _ => Kind::Context,
+                };
+                let marker = if kind == Kind::Context { " " } else { marker };
+                return Row {
+                    kind,
+                    number: None,
+                    explicit_prefix: Some(format!("{marker}{} ", &captures[2])),
+                    text: captures[3].replace('\t', "   "),
+                };
             }
             Row {
                 kind: Kind::Text,
                 number: None,
+                explicit_prefix: None,
                 text: line.into(),
             }
         })
         .collect();
-    render_rows(&rows, digits, theme, width)
+    render_rows(&rows, 1, theme, width)
 }
 
 fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<Line> {
@@ -264,6 +268,75 @@ mod tests {
                 .spans
                 .iter()
                 .any(|span| span.inverse && span.text == "new")
+        );
+    }
+
+    #[test]
+    fn numbered_gutters_and_unnumbered_changes_follow_pi() {
+        for source in [
+            include_str!("../../assets/themes/dark.json"),
+            include_str!("../../assets/themes/light.json"),
+        ] {
+            let theme = Theme::parse(source, None).unwrap();
+            let lines = render_numbered(
+                "-  6 old value\n+6 new value\n  10 unchanged\n- before\n+ after\n     ...\nplain",
+                &theme,
+                80,
+            );
+            let text = |line: &Line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+            };
+            assert_eq!(
+                lines.iter().map(text).collect::<Vec<_>>(),
+                [
+                    "-  6 old value",
+                    "+6 new value",
+                    "  10 unchanged",
+                    "- before",
+                    "+ after",
+                    "     ...",
+                    "plain",
+                ]
+            );
+            for (index, role, changed) in [
+                (0, "toolDiffRemoved", "old"),
+                (1, "toolDiffAdded", "new"),
+                (3, "toolDiffRemoved", "before"),
+                (4, "toolDiffAdded", "after"),
+            ] {
+                assert!(
+                    lines[index]
+                        .spans
+                        .iter()
+                        .all(|s| s.color == theme.color(role))
+                );
+                assert!(
+                    lines[index]
+                        .spans
+                        .iter()
+                        .any(|s| s.inverse && s.text == changed)
+                );
+            }
+            assert!(
+                lines[5]
+                    .spans
+                    .iter()
+                    .all(|s| s.color == theme.color("toolDiffContext"))
+            );
+        }
+    }
+
+    #[test]
+    fn unnumbered_multi_line_changes_are_not_paired() {
+        let lines = render_numbered("- first\n- second\n+ replacement", &Theme::system(), 80);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !span.inverse)
         );
     }
 
