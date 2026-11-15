@@ -40,10 +40,10 @@ struct ResourceOrigins {
 
 impl ResourceOrigin {
     fn source_info(path: &std::path::Path, origins: &[Self]) -> Option<serde_json::Value> {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
         let origin = origins
             .iter()
-            .find(|origin| path.starts_with(&origin.root))?;
+            .find(|origin| canonical.starts_with(&origin.root))?;
         let mut result =
             json!({"path":path,"source":origin.source,"scope":"temporary","origin":"top-level"});
         if let Some(base) = &origin.base_dir {
@@ -1055,5 +1055,27 @@ mod resource_origin_tests {
         assert_eq!(source["origin"], "top-level");
         assert_eq!(source["baseDir"], json!(base));
         assert!(ResourceOrigin::source_info(&base.join("skills-other/file"), &origins).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_resource_origin_matches_target_but_reports_selected_path() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let target = base.join("target/SKILL.md");
+        let alias = base.join("alias/SKILL.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(&target, "content").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let origins = vec![ResourceOrigin {
+            root: target,
+            source: "extension:fixture".into(),
+            base_dir: None,
+        }];
+        assert_eq!(
+            ResourceOrigin::source_info(&alias, &origins).unwrap()["path"],
+            json!(alias)
+        );
     }
 }

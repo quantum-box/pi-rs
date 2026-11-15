@@ -116,6 +116,13 @@ impl Resources {
         };
         for additional in additions {
             for (name, skill) in additional.skills {
+                if resources
+                    .skills
+                    .values()
+                    .any(|existing| same_resource_file(&existing.path, &skill.path))
+                {
+                    continue;
+                }
                 match resources.skills.entry(name.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(skill);
@@ -590,7 +597,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
         .or_else(|| path.parent()?.file_name()?.to_str().map(str::to_owned))
         .ok_or_else(|| Error::Config("skill name is required".into()))?;
     let skill = Skill {
-        path: path.canonicalize()?,
+        path: path.to_owned(),
         description: description.clone().unwrap_or_default(),
         automatic: !metadata.manual,
     };
@@ -1002,9 +1009,6 @@ mod tests {
         ];
         args.prompt_template = vec![prompt_a.clone(), prompt_b.clone()];
         let resources = Resources::load(&args).unwrap();
-        let skill_a = skill_a.canonicalize().unwrap();
-        let skill_b = skill_b.canonicalize().unwrap();
-        let skill_c = skill_c.canonicalize().unwrap();
         let skill_warning = format!(
             "Duplicate skill shared at {}; using {}",
             skill_b.display(),
@@ -1121,6 +1125,96 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("Duplicate prompt greet"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_symlink_keeps_its_location_and_deduplicates_the_target() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let target = root.join("target/SKILL.md");
+        let alias = root.join("alias/SKILL.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            "---\ndescription: example\n---\nRead reference.txt",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        args.skill = vec![
+            alias.to_string_lossy().into(),
+            target.to_string_lossy().into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills.len(), 1);
+        assert_eq!(resources.skills["alias"].path, alias);
+        let expanded = resources.expand("/skill:alias").unwrap();
+        assert!(expanded.contains(&format!("location=\"{}\"", alias.display())));
+        assert!(expanded.contains(&format!(
+            "References are relative to {}.",
+            alias.parent().unwrap().display()
+        )));
+        assert!(
+            !resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate skill"))
+        );
+        let discovered = pi_rs::DiscoveredResources {
+            skill_paths: vec![target],
+            ..Default::default()
+        };
+        let resources = Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert_eq!(resources.skills.len(), 1);
+        assert_eq!(resources.skills["alias"].path, alias);
+    }
+
+    #[test]
+    fn skill_path_normalizes_dot_components_without_resolving_symlinks() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("example/SKILL.md");
+        std::fs::create_dir_all(root.join("example/child")).unwrap();
+        std::fs::write(&path, "---\ndescription: example\n---\nbody").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-extensions",
+            "--no-context-files",
+        ]);
+        args.workspace = root;
+        args.skill = vec![
+            path.parent()
+                .unwrap()
+                .join("child/../SKILL.md")
+                .to_string_lossy()
+                .into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["example"].path, path);
+        args.skill = vec![
+            path.parent()
+                .unwrap()
+                .join("child/../*")
+                .to_string_lossy()
+                .into(),
+        ];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.skills["example"].path, path);
     }
 
     #[test]
