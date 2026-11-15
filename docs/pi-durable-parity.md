@@ -406,6 +406,13 @@ adapter identity are unknown. This is a phase-level hint, not upstream's combine
 summaries, and handler availability. Reads across records are not an atomic
 snapshot; callers must recheck before acting. See [tests](../crates/durable/src/conversation_wake_tests.rs).
 
+`RuntimeOwner::wake_snapshot(now)` combines conversation readiness, generic task
+readiness and local workers. It retries if the local commit sequence or worker
+revision changes during inspection; sustained changes return an error instead
+of an inconsistent result. Unknown conversations are returned separately and
+must not be treated as idle. This does not implement `onWake` delivery, and
+external SQLite writers still do not notify local subscriptions.
+
 Nested pending-job reconciliation is a pi-rs host API with a narrower boundary
 than upstream's nested task scheduler. A host can record a verified terminal
 result or confirmed cancellation against the exact persisted operation and

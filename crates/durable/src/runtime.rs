@@ -14633,6 +14633,15 @@ pub struct RuntimeOwner {
     driver: crate::task_driver::Driver,
 }
 
+/// A stable observation of local workers and persisted task and conversation
+/// readiness. Unknown conversations need further recovery or inspection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeWakeSnapshot {
+    pub active: bool,
+    pub at: Option<i64>,
+    pub unknown_conversations: Vec<Uuid>,
+}
+
 impl RuntimeOwner {
     pub fn open(
         path: impl AsRef<Path>,
@@ -14749,6 +14758,57 @@ impl RuntimeOwner {
     }
     pub fn tasks(&self) -> &crate::task_driver::Driver {
         &self.driver
+    }
+
+    /// Inspect readiness without running user code. A stable local commit
+    /// sequence and worker revision fence the individual reads. Unknown
+    /// conversation states must not be interpreted as idle; this is not yet
+    /// the upstream `onWake` callback.
+    pub fn wake_snapshot(&self, now_millis: i64) -> Result<RuntimeWakeSnapshot, Error> {
+        let store = self.scheduler.harness.owner.store();
+        let activity = self.scheduler.worker_activity();
+        for _ in 0..16 {
+            let (revision, workers) = activity.snapshot_with_revision();
+            let sequence = store.commit_sequence()?;
+            let snapshot = (|| {
+                let task = self
+                    .driver
+                    .wake_snapshot(now_millis)
+                    .map_err(|e| Error::Invalid(format!("task wake: {e}")))?;
+                let mut result = RuntimeWakeSnapshot {
+                    active: task.active
+                        || workers.iter().any(|worker| {
+                            worker.phase != crate::worker_activity::WorkerPhase::Waiting
+                        }),
+                    at: task.at,
+                    unknown_conversations: Vec::new(),
+                };
+                for (key, entry) in store.list(b"runtime/conversation/")? {
+                    let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+                    if key != Harness::key(conversation.id) {
+                        return Err(Error::Invalid("conversation key mismatch".into()));
+                    }
+                    match conversation_wake(store, conversation.id, now_millis)? {
+                        ConversationWake::Ready => result.active = true,
+                        ConversationWake::Parked { at: Some(at) } => {
+                            result.at = Some(result.at.map_or(at, |old| old.min(at)));
+                        }
+                        ConversationWake::Parked { at: None } => (),
+                        ConversationWake::Unknown => {
+                            result.unknown_conversations.push(conversation.id);
+                        }
+                    }
+                }
+                result.unknown_conversations.sort_unstable();
+                Ok(result)
+            })();
+            let end_sequence = store.commit_sequence()?;
+            let (end_revision, _) = activity.snapshot_with_revision();
+            if sequence == end_sequence && revision == end_revision {
+                return snapshot;
+            }
+        }
+        Err(Error::Invalid("wake snapshot changed repeatedly".into()))
     }
 
     /// Cancel and join conversations while their task driver remains available,

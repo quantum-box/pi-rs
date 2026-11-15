@@ -158,3 +158,48 @@ fn child_waits_require_all_terminal_and_validate_ownership() {
     save(&store, &c);
     assert!(conversation_wake(&store, c.id, 0).is_err());
 }
+
+#[tokio::test]
+async fn runtime_wake_combines_deadlines_and_preserves_unknown_states() {
+    struct ModelStub;
+    #[async_trait::async_trait]
+    impl Model for ModelStub {
+        async fn stream(
+            &self,
+            _: pi_rs_core::ModelRequest,
+        ) -> Result<pi_rs_core::ModelStream, pi_rs_core::Error> {
+            unreachable!("wake inspection does not call the model")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let owner = RuntimeOwner::open(
+        dir.path().join("db"),
+        Options {
+            model: Arc::new(ModelStub),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 5,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        },
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let store = owner.scheduler.harness.owner.store();
+    let mut sleeping = conversation();
+    sleeping.phase = Phase::RetryWait { turns: 0 };
+    sleeping.retry_state.deadline_ms = Some(100);
+    save(store, &sleeping);
+    let mut uncertain = conversation();
+    uncertain.abort_requested = true;
+    save(store, &uncertain);
+    let snapshot = owner.wake_snapshot(99).unwrap();
+    assert!(!snapshot.active);
+    assert_eq!(snapshot.at, Some(100));
+    assert_eq!(snapshot.unknown_conversations, vec![uncertain.id]);
+    let due = owner.wake_snapshot(100).unwrap();
+    assert!(due.active);
+    assert_eq!(due.at, None);
+    assert_eq!(due.unknown_conversations, vec![uncertain.id]);
+    owner.shutdown().await.unwrap();
+}
