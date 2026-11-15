@@ -2238,6 +2238,19 @@ fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'st
         .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
 }
 
+fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: bool) -> Error {
+    #[cfg(unix)]
+    if unrestricted && error.raw_os_error() == Some(libc::EACCES) {
+        return Error::Config(format!(
+            "Cannot read directory: EACCES: permission denied, scandir '{}'",
+            requested.display()
+        ));
+    }
+    #[cfg(not(unix))]
+    let _ = (requested, unrestricted);
+    Error::Config(format!("Cannot read directory: {error}"))
+}
+
 fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()
@@ -2661,26 +2674,27 @@ impl CodingTool {
             return Err(Error::Cancelled);
         }
         let requested_path = args["path"].as_str().unwrap_or(".");
+        let requested = crate::coding_paths::resolve(
+            &self.root,
+            &crate::coding_paths::normalize(requested_path)?,
+        );
         let path = self.path(requested_path)?;
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
                 "Not a directory: {}",
-                crate::coding_paths::resolve(
-                    &self.root,
-                    &crate::coding_paths::normalize(requested_path)?
-                )
-                .display()
+                requested.display()
             )));
         }
         let directory = std::fs::read_dir(&path)
-            .map_err(|error| Error::Config(format!("Cannot read directory: {error}")))?;
+            .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
         let mut entries = Vec::new();
         for entry in directory {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let entry = entry?;
+            let entry = entry
+                .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
         let locale = directory_locale(|key| std::env::var(key).ok());
@@ -5425,6 +5439,42 @@ mod tests {
             .tool_content();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_permission_error_uses_requested_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let directory = root_path.join("private");
+        let link = root_path.join("alias");
+        std::fs::create_dir(&directory).unwrap();
+        symlink("private", &link).unwrap();
+        let expected = format!(
+            "Cannot read directory: EACCES: permission denied, scandir '{}'",
+            link.display()
+        );
+        assert!(matches!(
+            directory_read_error(std::io::Error::from_raw_os_error(libc::EACCES), &link, true),
+            Error::Config(message) if message == expected
+        ));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+        let probe = std::fs::read_dir(&directory);
+        let tool = CodingTool {
+            root: root_path,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::List,
+        };
+        let result = tool.list(&json!({"path":"alias"}), &pi_rs::CancellationToken::new());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Privileged test runners can still read mode-000 directories.
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Err(Error::Config(message)) if message == expected));
+        }
     }
 
     #[test]
