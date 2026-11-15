@@ -4472,6 +4472,23 @@ mod tests {
             if message == "rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class"),
             "{result:?}"
         );
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: regex parse error:")),
+            "{result:?}"
+        );
     }
 
     #[cfg(unix)]
