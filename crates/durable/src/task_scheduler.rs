@@ -1675,6 +1675,69 @@ mod tests {
     }
 
     #[test]
+    fn failed_parent_holds_outcome_and_drains_child_after_reopen() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let make_registry = || {
+            let mut registry = Registry::default();
+            registry.register("parent", true, |_: &Task| Ok(Step::Fail("failure".into())));
+            let aborts = aborts.clone();
+            registry.register_with_abort(
+                "child",
+                true,
+                |_: &Task| panic!("child must be aborted before invocation"),
+                move |_: &Task| {
+                    aborts.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step::Succeed(json!(null)))
+                },
+            );
+            registry
+        };
+        let root = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            true,
+            4,
+        );
+        let child = task(2, TaskOwner::Task(root.id()), "child", true, 4);
+        let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+        scheduler
+            .ts()
+            .save(&[Save::Create(&root), Save::Create(&child)])
+            .unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::CompletingFailed("failure".into())
+        );
+        drop(scheduler);
+        let mut scheduler = Scheduler::open(&path, make_registry()).unwrap();
+        assert!(scheduler.wake_snapshot(0).unwrap().active);
+        scheduler.tick(0).unwrap();
+        assert!(
+            scheduler
+                .get(child.id())
+                .unwrap()
+                .unwrap()
+                .abort_requested()
+        );
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Failed("failure".into())
+        );
+    }
+
+    #[test]
     fn completing_includes_child_created_with_success() {
         struct Parent;
         impl Handler for Parent {
@@ -2765,10 +2828,19 @@ mod tests {
             });
             if !safe {
                 let mut scheduler = Scheduler::open(&path, registry).unwrap();
-                assert!(matches!(scheduler.get(parent.id()).unwrap().unwrap().state(), TaskState::CompletingFailed(_)));
+                assert!(matches!(
+                    scheduler.get(parent.id()).unwrap().unwrap().state(),
+                    TaskState::CompletingFailed(_)
+                ));
                 assert!(scheduler.wake_snapshot(0).unwrap().active);
                 scheduler.tick(0).unwrap();
-                assert!(scheduler.get(child.id()).unwrap().unwrap().abort_requested());
+                assert!(
+                    scheduler
+                        .get(child.id())
+                        .unwrap()
+                        .unwrap()
+                        .abort_requested()
+                );
                 assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
                 continue;
             }
@@ -3295,14 +3367,23 @@ mod tests {
         r.register("p", false, |_t: &Task| panic!("unsafe parent replayed"));
         r.register("c", true, |_t: &Task| panic!("cancelled child replayed"));
         let mut s = Scheduler::open(&path, r).unwrap();
-        assert!(matches!(s.get(parent.id()).unwrap().unwrap().state(), TaskState::CompletingFailed(_)));
-        assert_eq!(s.get(child.id()).unwrap().unwrap().state(), &TaskState::Ready);
+        assert!(matches!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::CompletingFailed(_)
+        ));
+        assert_eq!(
+            s.get(child.id()).unwrap().unwrap().state(),
+            &TaskState::Ready
+        );
         s.tick(0).unwrap();
         assert!(s.get(child.id()).unwrap().unwrap().abort_requested());
         s.tick(0).unwrap();
         assert!(s.get(child.id()).unwrap().unwrap().is_terminal());
         s.tick(0).unwrap();
-        assert!(matches!(s.get(parent.id()).unwrap().unwrap().state(), TaskState::Failed(_)));
+        assert!(matches!(
+            s.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::Failed(_)
+        ));
     }
 
     #[test]
@@ -3518,8 +3599,13 @@ mod tests {
                 assert_eq!(state.checkpoint(), &cp("read"));
             } else {
                 second.unwrap();
-                assert!(matches!(scheduler.get(parent.id()).unwrap().unwrap().state(), TaskState::CompletingFailed(reason) if reason.contains("reconciliation")));
-                assert_eq!(scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(), &TaskState::Running);
+                assert!(
+                    matches!(scheduler.get(parent.id()).unwrap().unwrap().state(), TaskState::CompletingFailed(reason) if reason.contains("reconciliation"))
+                );
+                assert_eq!(
+                    scheduler.get(Uuid::from_u128(2)).unwrap().unwrap().state(),
+                    &TaskState::Running
+                );
             }
         }
     }
