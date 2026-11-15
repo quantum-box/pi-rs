@@ -11,6 +11,21 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     std::fs::create_dir_all(&project).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let reject_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reject_address = reject_listener.local_addr().unwrap();
+    let reject = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = reject_listener.accept().await {
+            tokio::spawn(async move {
+                let mut bytes = [0; 4096];
+                let _ = socket.read(&mut bytes).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -61,8 +76,8 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
         home.join("mcp.json"),
         json!({"mcpServers":{
             "fixture":{"url":format!("http://{address}/mcp"),"oauth":false},
-            "disabled":{"command":"ignored","enabled":false},
-            "failed":{"url":"http://127.0.0.1:1/mcp","timeout":1,"oauth":false}
+            "disabled":{"command":"ignored","args":["--token","private-argument"],"enabled":false},
+            "failed":{"url":format!("http://{reject_address}/mcp?token=private-query"),"timeout":1,"oauth":false}
         }})
         .to_string(),
     )
@@ -93,11 +108,22 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     .unwrap()
     .unwrap();
     server.abort();
+    reject.abort();
     assert!(!output.status.success());
     let data: Value =
         serde_json::from_slice(&output.stdout).expect("stdout must be one JSON document");
     assert_eq!(data["errors"], json!([]));
     let reports = data["servers"].as_array().unwrap();
+    assert_eq!(
+        reports
+            .iter()
+            .map(|server| server["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["fixture", "disabled", "failed", "local"]
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("private-argument"));
+    assert!(!stdout.contains("private-query"));
     let find = |name: &str| {
         reports
             .iter()
@@ -135,7 +161,9 @@ fn list_json_reports_invalid_entries_and_untrusted_project() {
         home.join("mcp.json"),
         json!({"mcpServers":{
             "invalid":{"command":"ignored","enabled":"yes"},
-            "valid":{"command":"ignored","enabled":false}
+            "valid":{"command":"ignored","enabled":false},
+            "a-b":{"command":"ignored","enabled":"yes"},
+            "a_b":{"command":"ignored","enabled":false}
         }})
         .to_string(),
     )
@@ -153,8 +181,30 @@ fn list_json_reports_invalid_entries_and_untrusted_project() {
         .unwrap();
     assert!(!output.status.success());
     let data: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(data["servers"].as_array().unwrap().len(), 1);
+    assert_eq!(data["servers"].as_array().unwrap().len(), 2);
     assert_eq!(data["servers"][0]["name"], "valid");
-    assert_eq!(data["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(data["servers"][1]["name"], "a_b");
+    assert_eq!(data["errors"].as_array().unwrap().len(), 2);
     assert!(data["note"].as_str().unwrap().contains("not trusted"));
+}
+
+#[test]
+fn list_json_rejects_non_object_mcp_servers() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("mcp.json"), r#"{"mcpServers":[]}"#).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["--no-trust", "mcp", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["servers"], json!([]));
+    assert!(
+        data["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("mcpServers must be an object")
+    );
 }
