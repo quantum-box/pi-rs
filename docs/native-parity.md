@@ -128,10 +128,14 @@ environment variables apply to HTTP servers.
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 For remote packages with a single settings scope, an invalid file URL in a
-package settings filter reports an error when evaluated. Layered package
-settings, local packages, and other resource filter paths still treat invalid
-URLs as non-matches. Pi evaluates the scopes separately and stops processing
-a local package when an error is reached. Package resources are evaluated in
+package settings filter reports an error when evaluated. For a local package
+with one settings scope and native manifest (or no manifest), an error reached
+against a native resource candidate stops that package at the current resource
+type, preserving earlier resources and continuing with later packages. Startup
+theme discovery uses cached candidates when available. Layered package settings,
+upstream Pi package manifests, and other resource filter paths still treat
+invalid URLs as non-matches. Diagnostic candidates for unsupported upstream Pi
+package resources remain incomplete. Package resources are evaluated in
 settings order, with project sources first.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
