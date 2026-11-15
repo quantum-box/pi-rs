@@ -161,6 +161,7 @@ struct ColorQueries {
     initial_started: Option<Instant>,
     color_queries: std::collections::VecDeque<ColorQuery>,
     color_requery: bool,
+    disabled: bool,
 }
 
 impl Terminal {
@@ -272,9 +273,11 @@ impl Terminal {
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
-        let colors = guard
-            .as_mut()
-            .map(|terminal| std::mem::take(&mut terminal.colors));
+        let colors = guard.as_mut().map(|terminal| {
+            let mut colors = std::mem::take(&mut terminal.colors);
+            colors.disable_after_handoff();
+            colors
+        });
         drop(guard.take());
         // The foreground job owns this process group, including its frontend worker.
         let result = unsafe {
@@ -305,6 +308,9 @@ impl Terminal {
 #[cfg(any(unix, windows))]
 impl ColorQueries {
     fn query_terminal_colors(&mut self, output: &mut dyn Write) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
         // Only DA1 separates consecutive queries. All color replies alone do not
         // establish whether a late marker belongs to this request or the next.
         if let Some(query) = self.color_queries.front() {
@@ -351,7 +357,18 @@ impl ColorQueries {
     }
 
     fn receive_color_marker(&mut self, output: &mut dyn Write) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
         self.finish_color_query(output)
+    }
+
+    fn disable_after_handoff(&mut self) {
+        // Another terminal owner may consume our marker or leave its own.
+        // Neither can be attributed reliably once ownership has changed.
+        self.color_queries.clear();
+        self.color_requery = false;
+        self.disabled = true;
     }
 
     fn poll_color_timeout(&mut self) -> Result<()> {
@@ -5310,9 +5327,11 @@ pub(super) async fn run(
                             view.finish_regular()?;
                         }
                         #[cfg(any(unix, windows))]
-                        let colors = _terminal
-                            .as_mut()
-                            .map(|terminal| std::mem::take(&mut terminal.colors));
+                        let colors = _terminal.as_mut().map(|terminal| {
+                            let mut colors = std::mem::take(&mut terminal.colors);
+                            colors.disable_after_handoff();
+                            colors
+                        });
                         drop(_terminal.take());
                         let result = external_editor(&args, &mut view.editor);
                         _terminal = Some(Terminal::enter(
@@ -10256,6 +10275,7 @@ exit {exit}
                 quarantined: false,
             }]),
             color_requery: false,
+            disabled: false,
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -10385,6 +10405,23 @@ exit {exit}
         assert!(colors.accepts_color_reply(0, &mut output).unwrap());
         colors.receive_color_marker(&mut output).unwrap();
         assert!(colors.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn terminal_handoff_rejects_unattributable_markers_and_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.disable_after_handoff();
+        let before = output.len();
+        // The marker may be ours or the external owner's; neither may reopen
+        // queries. Old or external colors must not be applied on return.
+        colors.receive_color_marker(&mut output).unwrap();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), before);
+        assert!(!colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.disabled);
     }
 
     #[cfg(any(unix, windows))]

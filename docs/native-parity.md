@@ -1086,8 +1086,10 @@ requests are serialized and coalesced until the preceding device-attributes
 refresh is waiting and DA1 does not arrive within two seconds, stale replies are
 quarantined and the refresh stays queued until the old marker arrives. This
 keeps stale responses out of a later query but means a terminal that never sends
-DA1 cannot refresh colors during that session. This differs from Pi's behavior.
-The boundary assumes the terminal sends each query's color responses before its
+DA1 cannot refresh colors during that session. After an external editor or
+suspend hands terminal ownership away, further color queries are disabled for
+the session: another owner may consume the old DA1 or leave an unrelated one.
+These restrictions differ from Pi's behavior. The boundary assumes the terminal sends each query's color responses before its
 DA1; arbitrary reordering or unrelated DA1 replies cannot be disambiguated,
 because these protocols contain no request identifiers.
 On an appearance notification, the last reported foreground, background, and
