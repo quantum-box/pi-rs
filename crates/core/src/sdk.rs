@@ -2004,6 +2004,14 @@ impl AgentSession {
         }
         Ok(())
     }
+    /// The host-configured base prompt used when preparing future requests.
+    /// Extension context hooks can change the actual prompt for each request;
+    /// this accessor does not execute hooks or report their effective output.
+    /// Forks copy the configured value and can subsequently change it independently.
+    pub fn configured_system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         self.system_prompt = prompt.into();
@@ -3987,6 +3995,24 @@ mod tests {
         assert!(after_shutdown.token.is_cancelled());
         drop(after_shutdown);
         assert!(session.prompt("after shutdown").await.is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_prompt_tracks_changes_and_forks_independently() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .system_prompt("initial")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.configured_system_prompt(), "initial");
+        session.set_system_prompt("updated").unwrap();
+        let head = session.journal().unwrap().head();
+        let mut fork = session.fork_at(head).unwrap();
+        assert_eq!(fork.configured_system_prompt(), "updated");
+        fork.set_system_prompt("fork prompt").unwrap();
+        assert_eq!(session.configured_system_prompt(), "updated");
+        assert_eq!(fork.configured_system_prompt(), "fork prompt");
+        fork.close().await.unwrap();
         session.close().await.unwrap();
     }
 
