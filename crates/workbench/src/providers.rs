@@ -589,6 +589,11 @@ impl Client {
                 } else {
                     client.clone()
                 };
+                let client = if cache_disabled {
+                    client
+                } else {
+                    client.with_default_headers(defaults)
+                };
                 client.stream(request).await
             }
             Self::Anthropic(client) if cache_disabled => {
@@ -643,6 +648,8 @@ impl Client {
                         .await
                 } else if let Some(key) = session_cache_key {
                     client
+                        .clone()
+                        .with_default_headers(defaults)
                         .stream_enriched_in_session_with_identity(
                             uuid::Uuid::nil(),
                             uuid::Uuid::nil(),

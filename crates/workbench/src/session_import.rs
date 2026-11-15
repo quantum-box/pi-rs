@@ -95,11 +95,53 @@ struct Branch {
     context_target: Option<u64>,
     calls: BTreeMap<String, Uuid>,
     missing_ancestors: bool,
+    ancestry_index: usize,
     model: String,
     provider: Option<String>,
     thinking: Option<String>,
     store: BTreeMap<String, Value>,
 }
+// Source entries form an append-only forest. Binary lifting lets repeated
+// compactions validate their retained boundary without scanning the branch.
+struct SourceAncestry {
+    nodes: Vec<(usize, Vec<usize>)>,
+}
+impl Default for SourceAncestry {
+    fn default() -> Self {
+        Self {
+            nodes: vec![(0, Vec::new())],
+        }
+    }
+}
+impl SourceAncestry {
+    fn add(&mut self, parent: usize) -> usize {
+        let mut jumps = vec![parent];
+        while let Some(next) = self.nodes[*jumps.last().unwrap()].1.get(jumps.len() - 1) {
+            jumps.push(*next);
+        }
+        let index = self.nodes.len();
+        self.nodes.push((self.nodes[parent].0 + 1, jumps));
+        index
+    }
+
+    fn is_ancestor(&self, ancestor: usize, mut node: usize) -> bool {
+        let (ancestor_depth, node_depth) = (self.nodes[ancestor].0, self.nodes[node].0);
+        if ancestor_depth > node_depth {
+            return false;
+        }
+        let mut difference = node_depth - ancestor_depth;
+        let mut bit = 0;
+        while difference != 0 {
+            if difference & 1 != 0 {
+                node = self.nodes[node].1[bit];
+            }
+            difference >>= 1;
+            bit += 1;
+        }
+        node == ancestor
+    }
+}
+
 struct Importer {
     records: Vec<Record>,
     timestamp: Option<String>,
@@ -387,6 +429,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         importer.append(&mut root, Event::ParentSession { path: path.into() });
     }
     let mut branches = BTreeMap::<String, Branch>::new();
+    let mut ancestry = SourceAncestry::default();
     let mut previous = None;
     let mut legacy_ids: Vec<String> = Vec::new();
     let entry_count = entries.len();
@@ -458,9 +501,10 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 converted_entry = Some(migrated);
             }
         }
-        if entry["type"] == "compaction"
+        let converted = converted_entry.as_ref().unwrap_or(&entry);
+        if converted["type"] == "compaction"
             && (branch.missing_ancestors
-                || entry["firstKeptEntryId"]
+                || converted["firstKeptEntryId"]
                     .as_str()
                     .and_then(|target| branches.get(target))
                     .is_some_and(|target| target.missing_ancestors))
@@ -469,11 +513,17 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 "cannot import compaction involving an orphaned branch".into(),
             ));
         }
-        let events = convert(
-            converted_entry.as_ref().unwrap_or(&entry),
-            &mut branch,
-            &branches,
-        )?;
+        if converted["type"] == "compaction"
+            && let Some(target) = converted["firstKeptEntryId"].as_str()
+            && let Some(target_branch) = branches.get(target)
+            && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
+        {
+            return Err(Error::Session(format!(
+                "imported compaction target {target} is outside its branch"
+            )));
+        }
+        let parent_ancestry = branch.ancestry_index;
+        let events = convert(converted, &mut branch, &branches)?;
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
             .then(|| {
@@ -511,6 +561,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 branch.context_target = Some(id);
             }
         }
+        branch.ancestry_index = ancestry.add(parent_ancestry);
         branches.insert(id.clone(), branch);
         legacy_ids.push(id.clone());
         previous = Some(id);
@@ -1776,6 +1827,103 @@ mod tests {
         let path = directory.path().join("reopened.jsonl");
         session.export_jsonl(&path).unwrap();
         check(&read(&path).unwrap());
+    }
+
+    #[test]
+    fn compaction_rejects_boundary_from_another_complete_branch() {
+        let header = json!({"type":"session","version":3});
+        let first = json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"first"}});
+        let second = json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other branch"}});
+        let compact = json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100});
+        let error = match import_pi(vec![header, first, second, compact]) {
+            Ok(_) => panic!("cross-branch compaction was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("outside its branch"));
+    }
+
+    #[test]
+    fn compaction_ancestor_and_self_boundaries_keep_rpc_identity_after_reopen() {
+        for target in ["a", "b", "c"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"before"}}),
+                json!({"type":"thinking_level_change","id":"b","parentId":"a","thinkingLevel":"off"}),
+                json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":target,"summary":"summary","tokensBefore":100}),
+            ]).unwrap();
+            let check = |session: &pi_rs::Session| {
+                let target_record = session
+                    .records()
+                    .iter()
+                    .find(|record| {
+                        matches!(&record.event,
+                    Event::SourceEntry { entry, .. } if entry["id"] == target)
+                    })
+                    .unwrap();
+                let projected = super::super::rpc_entries::Entries::new(session)
+                    .after(None)
+                    .unwrap();
+                let compaction = projected["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["type"] == "compaction")
+                    .unwrap();
+                assert_eq!(compaction["firstKeptEntryId"], target_record.id.to_string());
+                let messages = session.current_messages();
+                assert!(messages.iter().any(|message| matches!(message, pi_rs::Message::User { content } if content.contains("summary"))));
+                assert_eq!(messages.iter().any(|message| matches!(message, pi_rs::Message::User { content } if content == "before")), target == "a");
+            };
+            check(&session);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            session.export_jsonl(&path).unwrap();
+            check(&read(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn source_ancestry_matches_parent_walk_for_branched_forest() {
+        let mut index = SourceAncestry::default();
+        let mut parents = vec![0];
+        for child in 1..512 {
+            let parent = (child * 97 + 31) % child;
+            assert_eq!(index.add(parent), child);
+            parents.push(parent);
+        }
+        for node in 0..512 {
+            let mut expected = std::collections::BTreeSet::new();
+            let mut current = node;
+            loop {
+                expected.insert(current);
+                if current == 0 {
+                    break;
+                }
+                current = parents[current];
+            }
+            for ancestor in 0..512 {
+                assert_eq!(
+                    index.is_ancestor(ancestor, node),
+                    expected.contains(&ancestor)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_ancestry_handles_deep_and_divergent_branches() {
+        let mut ancestry = SourceAncestry::default();
+        let first = ancestry.add(0);
+        let mut leaf = first;
+        for _ in 0..8192 {
+            leaf = ancestry.add(leaf);
+        }
+        let sibling = ancestry.add(first);
+        assert!(ancestry.is_ancestor(first, leaf));
+        assert!(ancestry.is_ancestor(leaf, leaf));
+        assert!(!ancestry.is_ancestor(sibling, leaf));
+        assert!(!ancestry.is_ancestor(leaf, sibling));
+        assert!(ancestry.nodes[leaf].1.len() <= 15);
     }
 
     #[test]

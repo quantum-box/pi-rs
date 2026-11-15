@@ -34,6 +34,7 @@ pub mod oauth_callback;
 pub mod prompt_resources;
 mod shell_config;
 mod shell_output;
+pub mod template_resources;
 mod text_edit;
 mod text_page;
 mod tool_output;

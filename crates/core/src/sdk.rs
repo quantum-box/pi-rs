@@ -1808,6 +1808,33 @@ impl AgentSession {
         &self.model_name
     }
 
+    /// Provider of the selected runtime model. Legacy provider-less selections
+    /// return `None`. Returns an error if the journal is busy, the historical
+    /// model or client binding is unavailable, or direct journal changes have
+    /// not been reconciled. This is a point-in-time check, not an authorization grant.
+    pub fn model_provider(&self) -> Result<Option<&str>> {
+        let journal = self.journal()?;
+        let matches_selection =
+            journal
+                .model_identity_at(journal.head())
+                .is_none_or(|(provider, name, _)| {
+                    provider.as_deref() == self.model_provider.as_deref() && name == self.model_name
+                });
+        let registered = branch_client(
+            &self.registry,
+            self.session_id,
+            self.model_provider.as_deref(),
+            &self.model_name,
+        )
+        .is_some_and(|client| Arc::ptr_eq(&client, &self.model));
+        if !self.model_identity_resolved || !matches_selection || !registered {
+            return Err(Error::Config(
+                "current session model is not registered or reconciled".into(),
+            ));
+        }
+        Ok(self.model_provider.as_deref())
+    }
+
     /// Supply a client for a historical model name in this session.
     pub fn register_branch_model(
         &self,
