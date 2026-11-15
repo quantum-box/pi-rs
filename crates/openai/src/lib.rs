@@ -690,6 +690,7 @@ impl Model for OpenAiResponses {
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         self.clone()
             .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
             .stream_enriched(request)
             .await
     }
@@ -1914,7 +1915,7 @@ mod tests {
     #[tokio::test]
     async fn sdk_session_routing_sends_headers_and_summary_omits_them() {
         use std::io::{Read, Write};
-        for summary in [false, true] {
+        for (summary, enriched) in [(false, false), (true, false), (false, true), (true, true)] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
@@ -1939,19 +1940,41 @@ mod tests {
             let model =
                 OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
                     .unwrap();
-            if summary {
-                let _ = model
-                    .stream_for_summary(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), request())
-                    .await;
-            } else {
-                let _ = model
-                    .stream_in_session_with_identity(
-                        uuid::Uuid::new_v4(),
-                        uuid::Uuid::new_v4(),
-                        "session-one",
-                        request(),
-                    )
-                    .await;
+            match (summary, enriched) {
+                (true, true) => {
+                    let _ = model
+                        .stream_enriched_for_summary(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            request(),
+                        )
+                        .await;
+                }
+                (true, false) => {
+                    let _ = model
+                        .stream_for_summary(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), request())
+                        .await;
+                }
+                (false, true) => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            "session-one",
+                            request(),
+                        )
+                        .await;
+                }
+                (false, false) => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            "session-one",
+                            request(),
+                        )
+                        .await;
+                }
             }
             let sent = server.join().unwrap();
             assert_eq!(sent.contains("session-id: session-one\r\n"), !summary);
