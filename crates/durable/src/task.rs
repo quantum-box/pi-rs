@@ -23,7 +23,7 @@ pub struct Checkpoint {
 }
 
 /// Conditions persisted with the task. Deadlines are absolute Unix milliseconds;
-/// Tasks waits for all listed direct children to reach any terminal state.
+/// `Tasks` waits for all listed tasks to reach any terminal state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaitFor {
     DeadlineMillis(i64),
