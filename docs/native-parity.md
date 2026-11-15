@@ -1265,6 +1265,9 @@ key UI, does not authorize `/v1/decisions`; use an endpointless Pi auth entry or
 
 ### Native codemode checkpoint
 
+Model catalogue search checks provider and ID argument types before dispatch,
+including the sandbox's JSON conversion of omitted and non-finite values.
+
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
 fresh QuickJS context. Scripts can call registered tools through `tools`, use
 `searchTools`, `describeTool` and `describeNamespace`, emit `text` or `image`,
