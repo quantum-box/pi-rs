@@ -36,8 +36,8 @@ pub fn to_file_path(input: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-// Node accepts some malformed ACE labels literally. Only retry simple ASCII
-// authorities, so the regular URL parser still handles all structural syntax.
+// Node accepts some malformed ACE labels literally. Only retry authorities
+// which decode to simple ASCII hostnames; retain structural URL validation.
 #[cfg(any(windows, test))]
 fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
     let prefix = input.get(..7)?;
@@ -46,15 +46,7 @@ fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
     }
     let rest = &input[7..];
     let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
-    let host = &rest[..end];
-    if host.is_empty()
-        || !host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
-    {
-        return None;
-    }
-    let host = host.to_ascii_lowercase();
+    let host = decode_ascii_host(&rest[..end])?;
     let mut invalid_ace = false;
     let mut sanitized = Vec::new();
     let decoded = host
@@ -80,6 +72,23 @@ fn malformed_punycode_url(input: &str) -> Option<(url::Url, String)> {
     }
     let replacement = format!("file://{}{}", sanitized.join("."), &rest[end..]);
     Some((url::Url::parse(&replacement).ok()?, decoded))
+}
+
+#[cfg(any(windows, test))]
+fn decode_ascii_host(host: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(host.len());
+    let mut bytes = host.bytes();
+    while let Some(mut byte) = bytes.next() {
+        if byte == b'%' {
+            let hex = |b: u8| (b as char).to_digit(16).map(|n| n as u8);
+            byte = hex(bytes.next()?)? * 16 + hex(bytes.next()?)?;
+        }
+        if !byte.is_ascii_alphanumeric() && !b"-._".contains(&byte) {
+            return None;
+        }
+        decoded.push(byte.to_ascii_lowercase() as char);
+    }
+    (!decoded.is_empty()).then_some(decoded)
 }
 
 /// Node checks encoded separators before decoding the path as UTF-8.
@@ -187,6 +196,8 @@ mod tests {
             ("file://XN--BAD-/share", "xn--bad-"),
             ("file://xn--bad-.xn--n3h/share", "xn--bad-.☃"),
             ("file://xn--n3h.xn--bad-/share", "☃.xn--bad-"),
+            ("file://%78n--bad-/share", "xn--bad-"),
+            ("file://xn--bad-%2exn--n3h/share", "xn--bad-.☃"),
         ] {
             let (url, host) = malformed_punycode_url(input).unwrap();
             assert_eq!(host, expected);
@@ -198,6 +209,12 @@ mod tests {
             "file://xn--bad-%2f/share",
             "file://xn--bad-.127/share",
             "file://xn--bad-.0x7f/share",
+            "file://xn--bad-.%31%32%37/share",
+            "file://xn--bad-%5c/share",
+            "file://xn--bad-%40/share",
+            "file://xn--bad-%00/share",
+            "file://xn--bad-%zz/share",
+            "file://xn--bad-%ff/share",
             "file://xn--n3h/share",
             "https://xn--bad-/share",
         ] {
@@ -221,5 +238,9 @@ mod tests {
             PathBuf::from(r"\\xn--bad-.☃\share\a b")
         );
         assert!(to_file_path("file://xn--bad-/share/a%2fb").is_err());
+        assert_eq!(
+            to_file_path("file://%78n--bad-%2exn--n3h/share/a%20b").unwrap(),
+            PathBuf::from(r"\\xn--bad-.☃\share\a b")
+        );
     }
 }
