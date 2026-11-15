@@ -685,7 +685,7 @@ impl Model for OpenAiResponses {
                 started |= recognized_response_event(kind);
                 match kind {
                     "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
-                    "response.reasoning_summary_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
@@ -752,6 +752,57 @@ impl Model for OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn streams_reasoning_text_and_retains_it_in_metadata() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let events = [
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+                json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"Consider "}),
+                json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"this."}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"Consider this."}]}]}}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model = OpenAiResponses::new_api_provider(
+            &format!("http://{address}"),
+            "key".into(),
+            "fixture",
+        )
+        .unwrap();
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let mut stream = model.stream(request).await.unwrap();
+        let mut deltas = Vec::new();
+        let mut reasoning = None;
+        let mut complete = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Reasoning(delta) => deltas.push(delta),
+                ModelEvent::Metadata(metadata) => reasoning = metadata.reasoning,
+                ModelEvent::Complete { .. } => complete = true,
+                _ => {}
+            }
+        }
+        worker.join().unwrap();
+        assert_eq!(deltas, ["Consider ", "this."]);
+        assert_eq!(reasoning.as_deref(), Some("Consider this."));
+        assert!(complete);
+    }
+
     #[tokio::test]
     async fn http_400_does_not_classify_echoed_credential_as_subscription_code() {
         use std::io::{Read, Write};
