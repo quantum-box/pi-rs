@@ -75,3 +75,76 @@ fn fifo_template_is_rejected_without_waiting_for_a_writer() {
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
     assert!(TemplateReadGrants { files: vec![path] }.load().is_err());
 }
+
+#[test]
+fn directory_grants_load_only_sorted_direct_markdown_files() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("prompts");
+    std::fs::create_dir_all(directory.join("nested")).unwrap();
+    for (name, text) in [
+        ("z.md", "last"),
+        (".hidden.md", "hidden"),
+        ("a.md", "first"),
+        ("skip.txt", "skip"),
+        ("nested/inner.md", "nested"),
+    ] {
+        std::fs::write(directory.join(name), text).unwrap();
+    }
+    let explicit = root.path().join("explicit.md");
+    std::fs::write(&explicit, "explicit").unwrap();
+    let grants = TemplateReadGrants {
+        files: vec![explicit],
+    };
+    let result = grants
+        .load_with_directories(std::slice::from_ref(&directory))
+        .unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["explicit", ".hidden", "a", "z"]
+    );
+    assert!(
+        grants
+            .load_with_directories(&[directory, root.path().join("missing")])
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_grants_follow_file_symlinks_and_skip_broken_links() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("prompts");
+    std::fs::create_dir(&directory).unwrap();
+    let target = root.path().join("target");
+    std::fs::write(&target, "target text").unwrap();
+    std::os::unix::fs::symlink(&target, directory.join("linked.md")).unwrap();
+    std::os::unix::fs::symlink(root.path().join("missing"), directory.join("broken.md")).unwrap();
+    let result = TemplateReadGrants::default()
+        .load_with_directories(&[directory.clone()])
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].path, directory.join("linked.md"));
+    assert_eq!(result[0].body, "target text");
+}
+
+#[test]
+fn directory_grants_reject_duplicate_names_and_too_many_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("prompts");
+    std::fs::create_dir(&directory).unwrap();
+    let file = directory.join("one.md");
+    std::fs::write(&file, "text").unwrap();
+    assert!(
+        TemplateReadGrants { files: vec![file] }
+            .load_with_directories(&[directory.clone()])
+            .is_err()
+    );
+    assert!(
+        TemplateReadGrants::default()
+            .load_with_directories(&vec![directory; 129])
+            .is_err()
+    );
+}

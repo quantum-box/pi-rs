@@ -651,7 +651,9 @@ cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
 ### Resources checkpoint
 
 Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
-files. No directories, settings, or packages are discovered implicitly. The
+files or direct children of explicitly granted directories. No directories,
+settings, or packages are discovered implicitly. Directory scans are bounded,
+non-recursive and sorted, including hidden `.md` files and symlinks to files. The
 snapshot retains source paths, frontmatter description and argument hint, and
 Pi-style fallback descriptions. Reads follow symlinks, are bounded, and fail
 atomically on unreadable, malformed, duplicate-name or missing files; Pi reports
