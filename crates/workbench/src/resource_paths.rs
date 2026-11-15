@@ -301,10 +301,15 @@ fn expand(
     } else {
         path
     };
-    if path.exists() || !has_pattern(&path.to_string_lossy()) {
+    if path.exists() || !path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+    }) {
         return collect(path, kind, required, warnings);
     }
     let pattern = path.to_string_lossy().replace('\\', "/");
+    // The '?' in a Windows verbatim prefix is a literal, not a wildcard.
+    #[cfg(windows)]
+    let pattern = pattern.replacen("//?/", "//[?]/", 1);
     let matcher = globset::GlobBuilder::new(&pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -313,7 +318,8 @@ fn expand(
         .compile_matcher();
     let mut root = PathBuf::new();
     for component in path.components() {
-        if has_pattern(&component.as_os_str().to_string_lossy()) {
+        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        {
             break;
         }
         root.push(component);
@@ -487,6 +493,24 @@ pub(super) fn skill_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod glob_tests {
     use super::*;
+    #[test]
+    fn escaped_verbatim_prefix_matches_disk_and_unc_glob_paths() {
+        for (pattern, candidate) in [
+            ("//[?]/C:/skills/*", "//?/C:/skills/demo"),
+            (
+                "//[?]/UNC/server/share/skills/*",
+                "//?/UNC/server/share/skills/demo",
+            ),
+        ] {
+            let matcher = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .backslash_escape(false)
+                .build()
+                .unwrap()
+                .compile_matcher();
+            assert!(matcher.is_match(candidate));
+        }
+    }
     #[test]
     fn automatic_themes_are_visible_top_level_files_respecting_local_ignores() {
         use clap::Parser;

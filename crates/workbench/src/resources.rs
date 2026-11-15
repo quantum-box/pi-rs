@@ -965,9 +965,9 @@ mod tests {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let skill_a = root.join("first/SKILL.md");
-        let skill_b = root.join("second/SKILL.md");
-        let skill_c = root.join("third/SKILL.md");
+        let skill_a = root.join("first").join("SKILL.md");
+        let skill_b = root.join("second").join("SKILL.md");
+        let skill_c = root.join("third").join("SKILL.md");
         let prompt_a = root.join("first/greet.md");
         let prompt_b = root.join("second/greet.md");
         let prompt_c = root.join("third/greet.md");
@@ -1132,7 +1132,8 @@ mod tests {
     fn skill_symlink_keeps_its_location_and_deduplicates_the_target() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let root = dunce::simplified(&canonical).to_owned();
         let target = root.join("target/SKILL.md");
         let alias = root.join("alias/SKILL.md");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -1184,7 +1185,8 @@ mod tests {
     fn skill_path_normalizes_dot_components_without_resolving_symlinks() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        let root = canonical.clone();
         let path = root.join("example/SKILL.md");
         std::fs::create_dir_all(root.join("example/child")).unwrap();
         std::fs::write(&path, "---\ndescription: example\n---\nbody").unwrap();
@@ -1197,22 +1199,26 @@ mod tests {
             "--no-context-files",
         ]);
         args.workspace = root;
-        args.skill = vec![
-            path.parent()
-                .unwrap()
-                .join("child/../SKILL.md")
-                .to_string_lossy()
-                .into(),
-        ];
+        #[cfg(not(windows))]
+        let explicit = path
+            .parent()
+            .unwrap()
+            .join("child/../SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let explicit = format!(r"{}\example\child\..\SKILL.md", canonical.display());
+        args.skill = vec![explicit];
         let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.skills["example"].path, path);
-        args.skill = vec![
-            path.parent()
-                .unwrap()
-                .join("child/../*")
-                .to_string_lossy()
-                .into(),
-        ];
+        #[cfg(not(windows))]
+        let pattern = canonical
+            .join("example/child/../*")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let pattern = format!(r"{}\example\child\..\*", canonical.display());
+        args.skill = vec![pattern];
         let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.skills["example"].path, path);
     }
