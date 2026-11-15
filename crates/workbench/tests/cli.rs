@@ -1592,19 +1592,28 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         writeln!(
             input,
             "{}",
-            json!({"id": id, "type": "prompt", "message": "/trigger"})
+            json!({"id": id, "type": "prompt", "message": "/trigger", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
         )
         .unwrap();
         input.flush().unwrap();
         let mut started = false;
         loop {
             let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_ne!(event["message"]["role"], "user", "{event}");
             if event["type"] == "response" && event["id"] == id {
                 assert_eq!(event["data"]["disposition"], "started", "{event}");
                 started = true;
             }
             if event["type"] == "agent_end" {
                 assert!(started, "turn ended before prompt was acknowledged");
+                assert!(
+                    event["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|message| message["role"] != "user"),
+                    "{event}"
+                );
                 break;
             }
         }
@@ -1686,7 +1695,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     writeln!(
         input,
         "{}",
-        json!({"id":"context", "type":"prompt", "message":"/context"})
+        json!({"id":"context", "type":"prompt", "message":"/context", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
     )
     .unwrap();
     input.flush().unwrap();
@@ -5691,6 +5700,99 @@ else:
     assert!(session.pending_custom_trigger().is_none());
     assert_eq!(session.records().iter().filter(|record| matches!(&record.event,
         pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_discovered_prompt_reports_extension_source() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("fixture.js");
+    let prompt = root.path().join("discovered.md");
+    std::fs::write(&prompt, "---\ndescription: discovered prompt\n---\nHello").unwrap();
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request=json.load(sys.stdin)
+if request['type']=='describe': result={'id':'fixture','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True}
+elif request['type']=='discover_resources': result={'skillPaths':[],'promptPaths':['discovered.md'],'themePaths':[]}
+else: result=None
+print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--mode",
+                "rpc",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver.recv_timeout(remaining).unwrap();
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    let command = response["data"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "discovered")
+        .unwrap();
+    assert_eq!(
+        command["sourceInfo"],
+        json!({
+            "path":prompt.canonicalize().unwrap(), "source":"extension:fixture",
+            "scope":"temporary", "origin":"top-level", "baseDir":root.path().canonicalize().unwrap()
+        })
+    );
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "RPC process did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    assert!(status.success(), "RPC process exited with {status}");
 }
 
 #[cfg(unix)]

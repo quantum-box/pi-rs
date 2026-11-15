@@ -385,7 +385,12 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance follows input and command validation. A prompt
-that runs an extension command returns `handled`. A model turn returns
+that runs an extension command returns `handled`. Idle extension commands
+take precedence over valid attached images in RPC; the
+attachments are not sent to the model even when the command triggers a turn.
+RPC validates images before command dispatch. Unlike Pi, a command that
+triggers a model turn reports `started`, and commands submitted while a turn
+is active cannot yet execute immediately. A model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
@@ -411,6 +416,8 @@ remain in progress.
 `get_commands` identifies discovered skills and prompt templates with their
 extension source, temporary scope, resolved file path, and executable base
 directory. Resource provenance in other surfaces remains in progress.
+Discovered resources identify inline and built-in extensions separately as
+`extension:inline:<id>` and `extension:builtin:<id>`.
 Extension-provided relative paths resolve from the session working directory;
 home-relative paths and local file URLs are accepted. A missing resource is
 reported without preventing other discovered resources from loading.
@@ -1226,6 +1233,10 @@ Non-chat model APIs and remaining execution-limit differences remain open.
 
 Classifier results include their API and invocation timestamp even if the
 request fails early or is cancelled, as they do on successful requests.
+
+Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
+`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
+server-delay cap still applies to the parsed value.
 
 ### Resource selection checkpoint
 
@@ -3484,6 +3495,8 @@ Bearer-token export checks its requested minimum validity after refresh; a
 token that falls short is persisted before the command fails, preserving any
 rotated refresh token. Ordinary model, MCP and sharing requests accept a
 successfully refreshed token without imposing that export requirement.
+Normal Radius access refreshes credentials within five minutes of expiry,
+matching the upstream OAuth resolver's minimum refresh window.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
@@ -4173,8 +4186,9 @@ For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
 supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
 overrides can disable long retention. Summary requests remove configured cache
 fields and, for explicit-mode models, request explicit caching with no
-breakpoints. ChatGPT plan requests omit these API-specific options. The
-Responses adapter does not yet send Pi's session-derived prompt cache key.
+breakpoints. ChatGPT plan requests omit these API-specific options. Responses requests use the active session ID as their prompt cache key,
+clamped to 64 Unicode characters, and omit it for summary requests. Pi’s
+Responses session-routing headers remain unsupported.
 
 ### Native Messages cache control checkpoint
 
@@ -4700,3 +4714,8 @@ loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.
+
+The SDK model catalog can enumerate its host-registered provider/model identities
+in deterministic order for host model pickers. This lists the immutable catalog
+snapshot, not Pi's discovered model registry or a live credential availability
+check. The host remains responsible for rebuilding it when authorization changes.
