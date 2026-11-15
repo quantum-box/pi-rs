@@ -2001,7 +2001,7 @@ mod tests {
                 docs: &mut crate::document::TaskDocuments<'_>,
             ) -> Result<Step, String> {
                 let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
-                docs.stage_task_tool_child("key", "tool", &json!({}), child, self.0.clone())?;
+                docs.stage_task_tool_child("key", "tool", &json!(null), child, self.0.clone())?;
                 Ok(Step::Succeed(json!("not committed")))
             }
         }
