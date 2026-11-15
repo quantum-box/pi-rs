@@ -959,10 +959,10 @@ file URL validation: malformed UTF-8, percent escapes and encoded path separator
 are rejected before backend calls; query and fragment escapes are not path
 escapes. On Unix encoded backslashes remain literal filename characters. On
 Windows valid IDN UNC hostnames are decoded to Unicode before backend dispatch,
-matching Node's `fileURLToPath`. Simple ASCII UNC hosts with malformed punycode
-labels retain those labels literally, while valid labels are decoded. The URL
-parser remains stricter than Node for some other malformed punycode authorities,
-including percent-encoded host labels. Backends enforce access controls and search semantics,
+matching Node's `fileURLToPath`. ASCII UNC hosts, including percent-encoded ASCII,
+with malformed punycode labels retain those labels literally, while valid labels
+are decoded. Some malformed punycode authorities containing non-ASCII host input
+remain stricter than Node. Backends enforce access controls and search semantics,
 including matching, ignore rules, and ordering. A set is an `Extension` and can
 be registered directly with `Registry`; overlapping sets have duplicate tool names.
 

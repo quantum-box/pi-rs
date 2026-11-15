@@ -361,6 +361,14 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
             .await,
             Outcome::Failed(_)
         ));
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"*", "path":"file://xn--bad-%2fother/share"}),
+                context()
+            )
+            .await,
+            Outcome::Failed(_)
+        ));
         assert_eq!(backend.exists.load(Ordering::SeqCst), 2);
         assert!(
             matches!(tool.invoke(json!({"pattern":"*", "path":format!("{base}bad%5Cname")}), context()).await, Outcome::Failed(message) if message.contains("encoded"))
@@ -381,6 +389,14 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
             .await,
             Outcome::Succeeded(_)
         ));
+        assert!(matches!(
+            tool.invoke(
+                json!({"pattern":"*", "path":"file://%78n--bad-%2exn--n3h/share/a%20b"}),
+                context()
+            )
+            .await,
+            Outcome::Succeeded(_)
+        ));
     }
     let paths = backend.paths.lock().unwrap();
     assert_eq!(paths[0], root.path().join("with space"));
@@ -391,5 +407,7 @@ async fn file_url_validation_precedes_remote_backend_dispatch() {
     assert_eq!(paths[2], PathBuf::from(r"\\☃\share\a b"));
     #[cfg(windows)]
     assert_eq!(paths[3], PathBuf::from(r"\\xn--bad-.☃\share\a b"));
-    assert_eq!(paths.len(), if cfg!(windows) { 4 } else { 3 });
+    #[cfg(windows)]
+    assert_eq!(paths[4], PathBuf::from(r"\\xn--bad-.☃\share\a b"));
+    assert_eq!(paths.len(), if cfg!(windows) { 5 } else { 3 });
 }
