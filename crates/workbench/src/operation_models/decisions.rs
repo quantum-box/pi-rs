@@ -189,6 +189,19 @@ mod tests {
             entry.credential_with_env(&keys, env).unwrap().literal(),
             Some("fixture-key")
         );
+        let endpointless =
+            crate::model_auth::Keys::parse(&json!({"openai":{"type":"api_key","key":"saved"}}));
+        assert_eq!(
+            entry
+                .credential_with_env(&endpointless, |_| None)
+                .unwrap()
+                .literal(),
+            Some("saved")
+        );
+        let scoped = crate::model_auth::Keys::parse(
+            &json!({"openai":{"type":"api_key","key":"saved","endpoint":"https://api.openai.com/v1/responses"}}),
+        );
+        assert!(entry.credential_with_env(&scoped, |_| None).is_none());
         let custom = Catalogue::parse(
             json!({"openai":{"baseUrl":"http://127.0.0.1:1/v1"}})
                 .as_object()
