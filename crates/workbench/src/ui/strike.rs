@@ -259,14 +259,10 @@ fn repair_split_mail(tokens: &[Value], source: &str, refs: &RefDefs<'_>) -> Opti
                     {
                         split_link |= cursor != range.start || end != range.end;
                     }
-                    // An unclosed dollar inside a valid local part can be
-                    // classified as pending math by Marked. The whole token
-                    // belongs to the mailbox, so restore the validated link.
-                    "latex"
-                        if cursor >= range.start
-                            && (end <= range.end
-                                || token.get("pending").and_then(Value::as_bool) == Some(true)) =>
-                    {
+                    // A dollar inside a validated local part can start a
+                    // math token extending past the mailbox. Re-lex its
+                    // suffix below after restoring the complete link.
+                    "latex" if cursor >= range.start => {
                         split_link = true;
                     }
                     _ => valid = false,

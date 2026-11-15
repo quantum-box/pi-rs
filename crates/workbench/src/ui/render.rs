@@ -2450,6 +2450,27 @@ mod tests {
                 .any(|span| span.text == "a$foo_bar@example.com" && span.underline)
         );
         assert!(spans.iter().any(|span| span.text == "bold" && span.bold));
+        let lines = markdown(
+            "a$foo_bar@example.com or b$foo_bar@example.com",
+            &theme,
+            120,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "a$foo_bar@example.com or b$foo_bar@example.com"
+        );
+        for address in ["a$foo_bar@example.com", "b$foo_bar@example.com"] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.text == address && span.underline),
+                "{spans:?}"
+            );
+        }
     }
 
     #[test]
