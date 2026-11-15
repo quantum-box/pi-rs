@@ -1766,8 +1766,9 @@ pub(crate) struct DetachedTaskDocuments {
     runtime_config: Option<crate::runtime::Config>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
-    keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
-    keyed_child_handlers: HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
+    pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
+    pub(crate) keyed_child_handlers:
+        HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
 }
 
 /// Prepared effects remain bound to the same owner and reservation. The caller

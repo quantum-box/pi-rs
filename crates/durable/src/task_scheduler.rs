@@ -1224,6 +1224,7 @@ impl Scheduler {
         drop(gate);
         let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
         let result = handler.run_with_documents(&running.task, &mut documents);
+        let documents = documents.detach(owner.clone(), &running)?;
         self.settle_handler_result(running, result, documents)
     }
 
@@ -1231,7 +1232,7 @@ impl Scheduler {
         &mut self,
         running: task_store::StoredTask,
         result: Result<Step, String>,
-        mut documents: crate::document::TaskDocuments<'_>,
+        mut documents: crate::document::DetachedTaskDocuments,
     ) -> Result<bool, Error> {
         let owner = self.owner();
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
@@ -1433,10 +1434,7 @@ impl Scheduler {
         batch.extend(staged.iter().filter_map(|(_, child, prepared)| {
             (!prepared.mutations.is_empty()).then_some(Save::Create(child))
         }));
-        let mut transaction = crate::document::Transaction::new();
-        documents.stage_acquisitions(&mut transaction)?;
-        documents.rebase_self_signal_check(running.version);
-        let document_result = documents.into_batch();
+        let document_result = documents.prepare(&running);
         #[cfg(test)]
         let document_result = if self.inject_batch_prepare_conflict {
             Err(crate::document::Error::Store(
@@ -1447,8 +1445,8 @@ impl Scheduler {
         } else {
             document_result
         };
-        let mut document_batch = match document_result {
-            Ok(batch) => batch,
+        let prepared_documents = match document_result {
+            Ok(prepared) => prepared,
             Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {
                 if let Some(root) = pending_abort_root_for_running(
                     &self.ts(),
@@ -1476,6 +1474,8 @@ impl Scheduler {
             }
             Err(error) => return Err(error.into()),
         };
+        let mut transaction = prepared_documents.transaction;
+        let mut document_batch = prepared_documents.document_batch;
         // Checks observed at reservation are equivalent to the reloaded task.
         // Preserve independently observed versions and any deadline.
         for check in &mut document_batch.checks {
