@@ -224,11 +224,13 @@ struct CancelAfterTool(CancellationToken);
 impl Hook for CancelAfterTool {
     async fn after_tool(
         &self,
-        _: &pi_rs_durable::extension::ToolCall,
+        call: &pi_rs_durable::extension::ToolCall,
         _: &serde_json::Value,
         _: &Context<'_>,
     ) -> Result<Option<serde_json::Value>, String> {
-        self.0.cancel();
+        if call.name == "loader" {
+            self.0.cancel();
+        }
         Ok(None)
     }
 }
