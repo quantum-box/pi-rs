@@ -576,6 +576,8 @@ pub struct Scheduler {
     #[cfg(test)]
     result_commit_hook: Option<CommitHook>,
     #[cfg(test)]
+    after_result_load_hook: Option<CommitHook>,
+    #[cfg(test)]
     failure_commit_hook: Option<CommitHook>,
     #[cfg(test)]
     inject_batch_prepare_conflict: bool,
@@ -711,6 +713,8 @@ impl Scheduler {
             deferred_recovery: HashSet::new(),
             #[cfg(test)]
             result_commit_hook: None,
+            #[cfg(test)]
+            after_result_load_hook: None,
             #[cfg(test)]
             failure_commit_hook: None,
             #[cfg(test)]
@@ -1429,9 +1433,20 @@ impl Scheduler {
     ) -> Result<bool, Error> {
         let owner = self.owner();
         let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        // Capture the graph boundary before loading the reservation. A task
+        // rewrite after that load must trigger the graph retry, even when the
+        // writer does not share this owner's gate.
+        let success_graph_version = owner
+            .store()
+            .put_version()
+            .map_err(task_store::Error::from)?;
         // An abort can commit while the synchronous handler is running. Its
         // output (including proposed children) must never cross that fence.
         let current = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.after_result_load_hook {
+            hook(0, owner.store());
+        }
         if current.version != running.version && current.task.abort_requested() {
             self.ts().update(&current, |task| task.yield_ready())?;
             self.poisoned = false;
@@ -1447,12 +1462,6 @@ impl Scheduler {
         // handler ran. The gate keeps cooperating admissions out until commit.
         let original_version = running.version;
         let mut running = current.clone();
-        // Capture before scanning so the eventual commit cannot pass a
-        // concurrent task/ownership graph update after this decision.
-        let success_graph_version = owner
-            .store()
-            .put_version()
-            .map_err(task_store::Error::from)?;
         if let Some(root) =
             pending_abort_root_for_running(&self.ts(), running.task.id(), self.validator.is_none())?
         {
@@ -5729,6 +5738,84 @@ mod tests {
                 .unwrap(),
             Some(json!(2))
         );
+    }
+
+    #[test]
+    fn result_survives_same_reservation_rewrite_after_load_and_respects_abort() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct HandlerWithDocument(Arc<AtomicUsize>, Address);
+        impl Handler for HandlerWithDocument {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                docs.get(&self.1).unwrap();
+                docs.put(
+                    &self.1,
+                    json!({"result": "retained"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("retained")))
+            }
+        }
+
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let address = Address {
+                scope: "test".into(),
+                name: "result".into(),
+                key: "".into(),
+            };
+            let mut registry = Registry::default();
+            registry.register(
+                "handler",
+                false,
+                HandlerWithDocument(calls.clone(), address.clone()),
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let root = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "handler",
+                false,
+                3,
+            );
+            scheduler.ts().save(&[Save::Create(&root)]).unwrap();
+            scheduler.after_result_load_hook = Some(Arc::new(move |_, store| {
+                let tasks = TaskStore::new(store);
+                let running = tasks.load(Uuid::from_u128(1)).unwrap().unwrap();
+                tasks
+                    .update(&running, |task| {
+                        if abort {
+                            task.request_abort()?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+            scheduler.tick(0).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let result = scheduler.get(root.id()).unwrap().unwrap();
+            let document = Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap();
+            if abort {
+                assert_eq!(result.state(), &TaskState::Ready);
+                assert!(result.abort_requested());
+                assert!(document.is_none());
+            } else {
+                assert_eq!(result.state(), &TaskState::Succeeded(json!("retained")));
+                assert_eq!(document.unwrap().value["result"], "retained");
+            }
+        }
     }
 
     #[test]
