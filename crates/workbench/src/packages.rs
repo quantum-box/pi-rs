@@ -205,7 +205,7 @@ pub fn transient_resources(args: &Cli) -> Result<PackageResources> {
 fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     let installed = index()?;
     let mut result = PackageResources::default();
-    for declaration in declarations(args)?
+    'declarations: for declaration in declarations(args)?
         .into_iter()
         .filter(|entry| entry.transient == transient)
     {
@@ -232,13 +232,22 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 .as_ref()
                 .map(|value| ResourceFilter::new(value, name))
                 .transpose()?;
-            for path in paths {
-                let base_enabled = inherited
-                    .as_ref()
-                    .map(|filter| filter.includes(path, &package.root, false))
-                    .transpose()?
-                    .unwrap_or(false);
-                if filter.includes(path, &package.root, base_enabled)? && !target.contains(path) {
+            let evaluate = || -> Result<Vec<bool>> {
+                let base = match &inherited {
+                    Some(filter) => {
+                        filter.apply(paths, &package.root, &vec![false; paths.len()])?
+                    }
+                    None => vec![false; paths.len()],
+                };
+                filter.apply(paths, &package.root, &base)
+            };
+            let enabled = match evaluate() {
+                Ok(enabled) => enabled,
+                Err(_) if !remote(&declaration.source) => continue 'declarations,
+                Err(error) => return Err(error),
+            };
+            for (path, enabled) in paths.iter().zip(enabled) {
+                if enabled && !target.contains(path) {
                     target.push(path.clone());
                 }
             }
@@ -332,15 +341,22 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             .as_ref()
             .map(|value| ResourceFilter::new(value, "themes"))
             .transpose()?;
-        for path in package.resources.themes {
-            let inherited_enabled = inherited
-                .as_ref()
-                .map(|filter| filter.includes(&path, &package.root, false))
-                .transpose()?
-                .unwrap_or(false);
-            if filter.includes(&path, &package.root, inherited_enabled)? && !themes.contains(&path)
-            {
-                themes.push(path);
+        let paths = &package.resources.themes;
+        let evaluate = || -> Result<Vec<bool>> {
+            let base = match &inherited {
+                Some(filter) => filter.apply(paths, &package.root, &vec![false; paths.len()])?,
+                None => vec![false; paths.len()],
+            };
+            filter.apply(paths, &package.root, &base)
+        };
+        let enabled = match evaluate() {
+            Ok(enabled) => enabled,
+            Err(_) if !remote(&declaration.source) => continue,
+            Err(error) => return Err(error),
+        };
+        for (path, enabled) in paths.iter().zip(enabled) {
+            if enabled && !themes.contains(path) {
+                themes.push(path.clone());
             }
         }
     }
@@ -600,11 +616,20 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
+    #[cfg(test)]
     fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
+        Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])
+    }
+
+    fn apply(&self, paths: &[PathBuf], root: &Path, inherited: &[bool]) -> Result<Vec<bool>> {
         let Some(patterns) = &self.patterns else {
-            return Ok(self.autoload || inherited);
+            return Ok(if self.autoload {
+                vec![true; paths.len()]
+            } else {
+                inherited.to_vec()
+            });
         };
-        let matches = |pattern: &str, exact: bool| -> Result<bool> {
+        let matches = |path: &Path, pattern: &str, exact: bool| -> Result<bool> {
             let normalized = if exact {
                 pattern
                     .strip_prefix("./")
@@ -619,7 +644,7 @@ impl ResourceFilter {
             Ok(resource_matches(path, root, pattern, exact, false))
         };
         if !self.autoload {
-            let mut enabled = inherited;
+            let mut enabled = inherited.to_vec();
             for pattern in patterns {
                 let prefix = pattern.chars().next();
                 let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
@@ -628,16 +653,18 @@ impl ResourceFilter {
                 } else {
                     pattern.as_str()
                 };
-                if matches(target, matches!(prefix, Some('+' | '-')))? {
-                    enabled = !matches!(prefix, Some('-' | '!'));
+                for (path, enabled) in paths.iter().zip(&mut enabled) {
+                    if matches(path, target, matches!(prefix, Some('+' | '-')))? {
+                        *enabled = !matches!(prefix, Some('-' | '!'));
+                    }
                 }
             }
             return Ok(enabled);
         }
         if patterns.is_empty() {
-            return Ok(false);
+            return Ok(vec![false; paths.len()]);
         }
-        let any = |prefix: Option<char>, exact: bool| -> Result<bool> {
+        let any = |path: &Path, prefix: Option<char>, exact: bool| -> Result<bool> {
             for pattern in patterns {
                 let target = match prefix {
                     Some(prefix) => match pattern.strip_prefix(prefix) {
@@ -647,22 +674,29 @@ impl ResourceFilter {
                     None if !pattern.starts_with(['!', '+', '-']) => pattern.as_str(),
                     None => continue,
                 };
-                if matches(target, exact)? {
+                if matches(path, target, exact)? {
                     return Ok(true);
                 }
             }
             Ok(false)
         };
         let has_plain = patterns.iter().any(|p| !p.starts_with(['!', '+', '-']));
-        let mut enabled = !has_plain || any(None, false)?;
-        if enabled && any(Some('!'), false)? {
-            enabled = false;
+        let mut enabled = vec![!has_plain; paths.len()];
+        if has_plain {
+            for (path, enabled) in paths.iter().zip(&mut enabled) {
+                *enabled = any(path, None, false)?;
+            }
         }
-        if !enabled && any(Some('+'), true)? {
-            enabled = true;
-        }
-        if enabled && any(Some('-'), true)? {
-            enabled = false;
+        for (prefix, exact, current, replacement) in [
+            ('!', false, true, false),
+            ('+', true, false, true),
+            ('-', true, true, false),
+        ] {
+            for (path, enabled) in paths.iter().zip(&mut enabled) {
+                if *enabled == current && any(path, Some(prefix), exact)? {
+                    *enabled = replacement;
+                }
+            }
         }
         Ok(enabled)
     }
@@ -2572,6 +2606,20 @@ mod tests {
         assert!(filter.includes(&path, &root, true).is_err());
         let filter = ResourceFilter::new(&json!({"prompts": ["**", invalid]}), "prompts").unwrap();
         assert!(filter.includes(&path, &root, false).unwrap());
+    }
+
+    #[test]
+    fn package_filters_evaluate_all_candidates_per_stage() {
+        let root = std::env::temp_dir();
+        let base = reqwest::Url::from_directory_path(&root).unwrap();
+        let paths = vec![root.join("a.md"), root.join("b.md")];
+        let filter = ResourceFilter::new(
+            &json!({"prompts": ["a.md", format!("{base}bad%ZZ"), format!("-{base}bad%2Fpath")]}),
+            "prompts",
+        )
+        .unwrap();
+        let error = filter.apply(&paths, &root, &[false, false]).unwrap_err();
+        assert!(error.to_string().contains("URI malformed"));
     }
 
     #[cfg(windows)]
