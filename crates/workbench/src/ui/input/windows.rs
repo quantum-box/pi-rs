@@ -52,10 +52,7 @@ impl Reader {
                 return Ok(Some(event));
             }
             let mut remaining = timeout.saturating_sub(started.elapsed());
-            if (self.decoder.buffer == b"\x1b"
-                || (self.decoder.buffer.starts_with(b"\x1b]")
-                    && self.decoder.buffer.len() < 5
-                    && !self.decoder.buffer.starts_with(b"\x1b]4;")))
+            if self.decoder.waits_for_escape_timeout()
                 && let Some(started) = self.decoder.escape_started
             {
                 remaining = remaining.min(escape_delay().saturating_sub(started.elapsed()));
@@ -220,6 +217,50 @@ mod tests {
         assert!(
             matches!(decode_key(release, &mut decoder, &mut surrogate, &mut reply_surrogate), Some(Event::Key(key)) if key.kind == KeyEventKind::Release)
         );
+    }
+
+    #[test]
+    fn delayed_console_color_reply_does_not_hide_physical_keys() {
+        let mut decoder = Decoder::default();
+        let mut surrogate = None;
+        let mut reply_surrogate = None;
+        for value in "\x1b]10;rgb:ffff/".encode_utf16() {
+            decode_key(
+                key(value, 0),
+                &mut decoder,
+                &mut surrogate,
+                &mut reply_surrogate,
+            );
+        }
+        decoder.escape_started = Some(Instant::now() - Duration::from_secs(5));
+        decoder.flush_escape();
+        let event = decode_key(
+            key(u16::from(b'A'), 65),
+            &mut decoder,
+            &mut surrogate,
+            &mut reply_surrogate,
+        );
+        assert!(
+            matches!(event, Some(Event::Key(key)) if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
+        );
+        for value in "0000/8080\x07".encode_utf16() {
+            decode_key(
+                key(value, 0),
+                &mut decoder,
+                &mut surrogate,
+                &mut reply_surrogate,
+            );
+        }
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalColor {
+                foreground: true,
+                red: 255,
+                green: 0,
+                blue: 128
+            })
+        );
+        assert!(decoder.next().is_none());
     }
 
     #[test]

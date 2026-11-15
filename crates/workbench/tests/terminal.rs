@@ -307,6 +307,100 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
 }
 
 #[test]
+fn delayed_color_reply_does_not_type_tail_or_open_editor() {
+    use std::os::unix::fs::PermissionsExt;
+    fn wait_for(master: &mut File, expected: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        while Instant::now() < deadline {
+            match master.read(&mut buffer) {
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => panic!("terminal read failed: {error}"),
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains(expected) {
+                return text.into_owned();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "terminal did not render {expected}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let editor = root.path().join("editor.sh");
+    let marker = root.path().join("editor-opened");
+    std::fs::write(&editor, b"#!/bin/sh\ntouch \"$PI_TEST_EDITOR_MARKER\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _process = Process(
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .env("EDITOR", &editor)
+            .env("PI_TEST_EDITOR_MARKER", &marker)
+            .env_remove("VISUAL")
+            .args(["--no-trust", "--no-mcp", "--offline"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&mut master, "Enter to send", Duration::from_secs(30));
+    master.write_all(b"\x1b]11;rgb:0000/").unwrap();
+    std::thread::sleep(Duration::from_millis(650));
+    master.write_all(b"0000/0000\x07typed-after-color").unwrap();
+    let text = wait_for(&mut master, "typed-after-color", Duration::from_secs(10));
+    assert!(
+        !text.contains("0000/0000"),
+        "OSC tail reached the editor: {text}"
+    );
+    assert!(!marker.exists(), "OSC BEL opened the external editor");
+}
+
+#[test]
 fn debug_command_writes_session_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
