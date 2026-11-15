@@ -443,3 +443,130 @@ fn actual_operation_writes_are_atomic_under_competing_transactions() {
         value
     );
 }
+
+#[test]
+fn recorded_document_watch_replays_original_nested_batches_after_races_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recorded.db");
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let mut initial = Transaction::new();
+    initial
+        .put(
+            &address(),
+            Expected::Missing,
+            json!({"rows":[{"text":"A😀tail", "items":[1,2,3]}]})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+    initial.commit(&store).unwrap();
+    let (snapshot, mut first) = docs.watch(&address()).unwrap();
+    let version = snapshot.document.unwrap().version;
+    let start = first.cursor();
+    let mut second = docs.resume_watch(&address(), start).unwrap();
+    let ops = vec![
+        json!(["t", ["rows", 0, "text"], 3]),
+        json!(["a", ["rows", 0, "text"], "🌟"]),
+        json!(["p", ["rows", 0, "items"], 1, 99, [4, 5]]),
+        json!(["m", ["rows", 0, "items"], [2, 0, 1]]),
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let ops = ops.clone();
+            std::thread::spawn(move || {
+                let store = Store::open(path).unwrap();
+                let mut tx = Transaction::new();
+                tx.apply_operations(&store, &address(), version, &ops)
+                    .unwrap();
+                barrier.wait();
+                tx.commit(&store).is_ok()
+            })
+        })
+        .collect();
+    barrier.wait();
+    assert_eq!(
+        threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count(),
+        1
+    );
+    assert!(first.poll_recorded_operations(0).is_err());
+    assert!(first.poll_recorded_operations(257).is_err());
+    assert_eq!(first.cursor(), start);
+    let frame = first.poll_recorded_operations(1).unwrap();
+    assert_eq!(frame.len(), 1);
+    assert!(frame[0].actual);
+    assert_eq!(frame[0].ops, ops);
+    assert_eq!(
+        json!(frame[0].document.as_ref().unwrap().value),
+        json!({"rows":[{"text":"tail🌟", "items":[5,1,4]}]})
+    );
+    assert_eq!(second.poll_recorded_operations(1).unwrap(), frame);
+    let saved = first.cursor();
+    let mut legacy = docs.resume_watch(&address(), start).unwrap();
+    assert!(!legacy.poll_incremental_operations(1).unwrap()[0].actual);
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let docs = Documents::new(&store);
+    let mut replay = docs.resume_watch(&address(), start).unwrap();
+    assert_eq!(replay.poll_recorded_operations(1).unwrap(), frame);
+    // A raw overwrite is outside the namespace contract; it must not be
+    // accepted as evidence from the original document commit.
+    let mut evidence = b"durable/document-operations/v1/".to_vec();
+    let addr = address();
+    evidence.extend(serde_json::to_vec(&(&addr.scope, &addr.name, &addr.key, version)).unwrap());
+    store
+        .commit(
+            &[],
+            &[durable_store::Mutation::Put {
+                key: evidence,
+                value: b"{}".to_vec(),
+            }],
+        )
+        .unwrap();
+    let mut unproven = docs.resume_watch(&address(), start).unwrap();
+    let fallback = unproven.poll_recorded_operations(1).unwrap();
+    assert!(!fallback[0].actual);
+    assert_eq!(fallback[0].document, frame[0].document);
+    let mut resumed = docs.resume_watch(&address(), saved).unwrap();
+    let version = docs.get(&address()).unwrap().unwrap().version;
+    let mut invalid = Transaction::new();
+    assert!(
+        invalid
+            .apply_operations(
+                &store,
+                &address(),
+                version,
+                &[
+                    json!(["a", ["rows", 0, "text"], "😀"]),
+                    json!(["t", ["rows", 0, "text"], 7])
+                ]
+            )
+            .is_err()
+    );
+    invalid.commit(&store).unwrap();
+    assert_eq!(docs.get(&address()).unwrap().unwrap().version, version);
+    let mut tx = Transaction::new();
+    tx.put(
+        &address(),
+        Expected::Version(version),
+        json!({"legacy":true}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    let fallback = resumed.poll_recorded_operations(1).unwrap();
+    assert!(!fallback[0].actual);
+    assert_eq!(fallback[0].document.as_ref().unwrap().value["legacy"], true);
+    let version = fallback[0].document.as_ref().unwrap().version;
+    let mut tx = Transaction::new();
+    tx.delete(&address(), version).unwrap();
+    tx.commit(&store).unwrap();
+    let deletion = resumed.poll_recorded_operations(1).unwrap();
+    assert!(deletion[0].retired && !deletion[0].actual && deletion[0].ops.is_empty());
+}

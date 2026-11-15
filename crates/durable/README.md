@@ -904,6 +904,16 @@ operations from successive immutable states, resuming from the existing document
 cursor. The caller must retain the value at that cursor; creation/recreation
 falls back to replacement and deletion is a retirement frame.
 
+`DocumentWatch::poll_recorded_operations` uses the same cursor but prefers the
+original decoded batch from `Transaction::apply_operations` when the document
+version, operation record and store transaction can be verified together. Its
+`actual` flag distinguishes verified original batches from derived or replacement
+fallbacks. Tracking begins with each opt-in write; legacy writes, missing or
+invalid evidence and deletions retain the existing fallback semantics. There is
+no reconstruction of old operations. Pages contain at most 256 document
+changes, but the page limit does not bound total bytes from legacy documents.
+On errors the cursor remains unchanged.
+
 `DocumentWatch::poll_operations` also returns one frame per committed state:
 a put produces a Chord root replacement `["r", value]`, and a delete produces
 an empty-operation retirement frame with no live document. It shares the same
@@ -911,8 +921,9 @@ exclusive cursor as `poll`, including after reopen; callers should not mix the
 methods unless they intend to consume the same stream. These replacements are
 synthesized from final states, not the original mutation operations. Unlike the
 upstream retired frame, deletion exposes no previous value. This is a subset of
-upstream `watchDoc`: it does not provide fine-grained operations, callbacks,
-abort/lifecycle handling or live notifications.
+upstream `watchDoc`: the recorded-operation variant provides fine-grained
+operations for opted-in writes, but callbacks, abort/lifecycle handling and live
+notifications are not provided.
 Upstream attaches only to an existing address and delivers operation batches,
 folding pending operations and falling back to a root replacement above 10,000
 operations. Its retirement/incarnation and task-end semantics, listener

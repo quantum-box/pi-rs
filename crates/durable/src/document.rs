@@ -379,15 +379,16 @@ impl DocumentCommitWatch<'_> {
     }
 }
 
-/// One committed document operation frame. The store retains complete states,
-/// so puts are represented by a Chord root replacement, not a reconstructed diff.
-/// A deletion is a retirement with no replacement and no live document.
+/// One committed document operation frame. `actual` marks a verified original
+/// batch; other puts are derived or replacements. A deletion is a retirement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentOperationFrame {
     pub revision: u64,
     pub document: Option<Document>,
     pub ops: Vec<Value>,
     pub retired: bool,
+    /// True only for a verified original opt-in operation batch.
+    pub actual: bool,
 }
 
 /// Pull-based watch. Persist the cursor only after consuming its entire page.
@@ -418,6 +419,7 @@ impl DocumentWatch<'_> {
                     retired: change.document.is_none(),
                     document: change.document,
                     ops,
+                    actual: false,
                 }
             })
             .collect())
@@ -431,26 +433,69 @@ impl DocumentWatch<'_> {
         &mut self,
         limit: usize,
     ) -> Result<Vec<DocumentOperationFrame>, Error> {
+        self.poll_incremental(limit, false)
+    }
+
+    /// Prefer the original opt-in batches when their atomic commit and result
+    /// can be verified. Legacy writes and missing evidence use derived operations.
+    /// The cursor advances only after the entire page has been validated.
+    pub fn poll_recorded_operations(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<DocumentOperationFrame>, Error> {
+        self.poll_incremental(limit, true)
+    }
+
+    fn poll_incremental(
+        &mut self,
+        limit: usize,
+        prefer_recorded: bool,
+    ) -> Result<Vec<DocumentOperationFrame>, Error> {
         let mut previous = Documents::decode(self.store.document_at(&self.key, self.cursor)?)?;
         let changes = self.store.document_changes(&self.key, self.cursor, limit)?;
         let mut frames = Vec::with_capacity(changes.len());
+        let address = if prefer_recorded {
+            Some(Address::from_storage_key(&self.key)?)
+        } else {
+            None
+        };
         for (revision, entry) in changes {
             let document = Documents::decode(entry)?;
-            let ops = match (&previous, &document) {
-                (Some(old), Some(new)) => crate::chord_ops::diff(
-                    &Value::Object(old.value.clone()),
-                    &Value::Object(new.value.clone()),
-                ),
-                (None, Some(new)) => {
-                    crate::chord_ops::replacement(&Value::Object(new.value.clone()))
+            let recorded = match (&address, &previous, &document) {
+                (Some(address), Some(old), Some(new)) => {
+                    match self.store.document_commit_sequence(revision)? {
+                        Some(sequence)
+                            if self.store.commit_for_version(&self.key, new.version)?
+                                == Some(sequence) =>
+                        {
+                            committed_operations(self.store, address, old, new, sequence)?
+                        }
+                        _ => None,
+                    }
                 }
-                (_, None) => Vec::new(),
+                _ => None,
+            };
+            let actual = recorded.is_some();
+            let ops = if let Some(ops) = recorded {
+                ops
+            } else {
+                match (&previous, &document) {
+                    (Some(old), Some(new)) => crate::chord_ops::diff(
+                        &Value::Object(old.value.clone()),
+                        &Value::Object(new.value.clone()),
+                    ),
+                    (None, Some(new)) => {
+                        crate::chord_ops::replacement(&Value::Object(new.value.clone()))
+                    }
+                    (_, None) => Vec::new(),
+                }
             };
             frames.push(DocumentOperationFrame {
                 revision,
                 retired: document.is_none(),
                 document: document.clone(),
                 ops,
+                actual,
             });
             previous = document;
         }
