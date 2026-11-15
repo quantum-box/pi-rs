@@ -326,8 +326,9 @@ fn startup_fork_preserves_inert_sibling_history() {
     let entries = [
         json!({"type":"session","version":3,"id":"legacy"}),
         json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"root"}}),
-        json!({"type":"message","id":"b","parentId":"a","message":{"role":"user","content":"sibling"}}),
-        json!({"type":"message","id":"c","parentId":"a","message":{"role":"user","content":"active"}}),
+        json!({"type":"session_info","id":"n","parentId":"a","name":"shared name"}),
+        json!({"type":"message","id":"b","parentId":"n","message":{"role":"user","content":"sibling"}}),
+        json!({"type":"message","id":"c","parentId":"n","message":{"role":"user","content":"active"}}),
     ];
     let source_text = entries
         .iter()
@@ -364,6 +365,18 @@ fn startup_fork_preserves_inert_sibling_history() {
     let mut session = Session::open(destination).unwrap();
     assert_ne!(session.external_session_id(), "legacy");
     assert_eq!(session.parent_session(), Some(source.to_str().unwrap()));
+    assert_eq!(session.name(), Some("shared name"));
+    assert_eq!(
+        session
+            .records()
+            .iter()
+            .filter(|record| matches!(
+                &record.event,
+                pi_rs::Event::SessionInfo { name: Some(_), .. }
+            ))
+            .count(),
+        1
+    );
     assert!(
         session
             .current_messages()
