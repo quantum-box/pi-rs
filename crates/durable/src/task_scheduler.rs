@@ -454,6 +454,9 @@ impl WakeDefinitions {
     }
 }
 
+#[cfg(test)]
+type CommitHook = Arc<dyn Fn(usize, &durable_store::Store) + Send + Sync>;
+
 pub struct Scheduler {
     attachment: Attachment,
     wake_reader: WakeReader,
@@ -464,9 +467,9 @@ pub struct Scheduler {
     // Interrupted invocations held until pending fail-fast marks have landed.
     deferred_recovery: HashSet<Uuid>,
     #[cfg(test)]
-    result_commit_hook: Option<Arc<dyn Fn(usize, &durable_store::Store) + Send + Sync>>,
+    result_commit_hook: Option<CommitHook>,
     #[cfg(test)]
-    failure_commit_hook: Option<Arc<dyn Fn(usize, &durable_store::Store) + Send + Sync>>,
+    failure_commit_hook: Option<CommitHook>,
     #[cfg(test)]
     inject_batch_prepare_conflict: bool,
     activity: crate::worker_activity::WorkerActivity,
@@ -1015,26 +1018,25 @@ impl Scheduler {
         for snapshot in self.ts().list()? {
             if !snapshot.task.abort_requested()
                 && let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = snapshot.task.state()
+                && let Some(id) = failed_sibling_to_abort(&self.ts(), &snapshot, ids)?
             {
-                if let Some(id) = failed_sibling_to_abort(&self.ts(), &snapshot, ids)? {
-                    // Mark one entire ownership graph, then rescan. In particular,
-                    // a Running handler must return before its record can settle.
-                    if let Some(harness) = self.validator.as_mut() {
-                        drop(gate);
-                        let result = owner
-                            .conversation_controls()
-                            .fence(|| harness.abort_owned_graph(None, Some(id)));
-                        if let Err(error) = result {
-                            // The sibling may have settled after dropping the gate.
-                            if !self.ts().load(id)?.is_some_and(|s| s.task.is_terminal()) {
-                                return Err(Error::Handler(format!("fail-fast abort: {error:?}")));
-                            }
+                // Mark one entire ownership graph, then rescan. In particular,
+                // a Running handler must return before its record can settle.
+                if let Some(harness) = self.validator.as_mut() {
+                    drop(gate);
+                    let result = owner
+                        .conversation_controls()
+                        .fence(|| harness.abort_owned_graph(None, Some(id)));
+                    if let Err(error) = result {
+                        // The sibling may have settled after dropping the gate.
+                        if !self.ts().load(id)?.is_some_and(|s| s.task.is_terminal()) {
+                            return Err(Error::Handler(format!("fail-fast abort: {error:?}")));
                         }
-                    } else {
-                        request_abort_subtree(&self.ts(), id)?;
                     }
-                    return Ok(true);
+                } else {
+                    request_abort_subtree(&self.ts(), id)?;
                 }
+                return Ok(true);
             }
         }
         if !self.deferred_recovery.is_empty() {
