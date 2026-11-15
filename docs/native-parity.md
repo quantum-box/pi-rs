@@ -1225,6 +1225,17 @@ policies, and preserve uncertainty after cancellation. Tests cover denied and
 invalid calls, concurrent reads and blocked replay after interruption. This is
 the execution boundary for the pending codemode sandbox.
 
+### Codemode OpenAI Decisions checkpoint
+
+Codemode supports OpenAI Decisions classifier models, including the pinned
+GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
+and the Decisions-specific 504 retry exclusion. Native image validation and
+endpoint-bound credentials continue to apply. Classifier usage identifies its
+calculated costs as estimates with `totalFromProvider: false`.
+An OpenAI key explicitly saved for `/v1/responses`, including by the provider
+key UI, does not authorize `/v1/decisions`; use an endpointless Pi auth entry or
+`OPENAI_API_KEY` for the official Decisions endpoint.
+
 ### Native codemode checkpoint
 
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
