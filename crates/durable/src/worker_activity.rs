@@ -44,7 +44,9 @@ impl State {
     }
 
     fn publish(&self) {
-        self.updates.send_replace(self.snapshot());
+        if self.updates.receiver_count() != 0 {
+            self.updates.send_replace(self.snapshot());
+        }
     }
 }
 
@@ -68,13 +70,12 @@ impl WorkerActivity {
     /// value is current at attachment; slow subscribers may skip transitions.
     /// This does not include persisted work and is not an upstream `onWake`.
     pub fn subscribe(&self) -> WorkerUpdates {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.updates.receiver_count() == 0 {
+            state.updates.send_replace(state.snapshot());
+        }
         WorkerUpdates {
-            receiver: self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .updates
-                .subscribe(),
+            receiver: state.updates.subscribe(),
         }
     }
     pub(crate) fn enter(&self, kind: WorkerKind, id: Uuid) -> Guard {
@@ -167,5 +168,17 @@ mod tests {
         drop(activity);
         assert!(first.changed().await.is_err());
         assert!(second.changed().await.is_err());
+    }
+
+    #[test]
+    fn first_subscriber_receives_current_state_without_prior_listeners() {
+        let activity = WorkerActivity::default();
+        let guard = activity.enter(WorkerKind::Summary, Uuid::new_v4());
+        let mut updates = activity.subscribe();
+        assert_eq!(updates.current().len(), 1);
+        drop(updates);
+        drop(guard);
+        let mut later = activity.subscribe();
+        assert!(later.current().is_empty());
     }
 }
