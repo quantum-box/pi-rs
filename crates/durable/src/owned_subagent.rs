@@ -499,6 +499,56 @@ mod tests {
             &TaskState::Failed("failure".into())
         );
     }
+
+    #[test]
+    fn external_wait_rejects_cycle_through_owned_conversation() {
+        use crate::task::WaitFor;
+        use crate::task_scheduler::{Error as TaskError, Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        };
+        let root = Task::new(Uuid::from_u128(2), owner.clone(), checkpoint.clone(), 3)
+            .unwrap()
+            .registered("root".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&root)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap();
+        let waiter = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(child.child),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("waiter".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&waiter)])
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.register("root", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::Value::Null))
+        });
+        registry.register("waiter", true, |_: &Task| {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "waiting".into(),
+                    data: serde_json::Value::Null,
+                },
+                condition: WaitFor::TasksAny(vec![Uuid::from_u128(2)]),
+                children: vec![],
+            })
+        });
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        assert!(matches!(scheduler.tick(0), Err(TaskError::Ownership)));
+    }
     #[test]
     fn completing_owner_tracks_work_added_to_owned_conversation() {
         use crate::task::TaskState;
