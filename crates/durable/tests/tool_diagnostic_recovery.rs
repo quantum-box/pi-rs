@@ -79,12 +79,39 @@ impl KeyedTool for ReplayDiagnostics {
         host: KeyedHost,
     ) -> pi_rs_core::ToolReply {
         let attempt = self.count.fetch_add(1, Ordering::SeqCst);
-        host.diagnostic(diagnostic("repeated")).unwrap();
-        host.diagnostic(diagnostic("repeated")).unwrap();
+        host.diagnostic_keyed("event-1", diagnostic("repeated"))
+            .unwrap();
+        host.diagnostic_keyed("event-1", diagnostic("repeated"))
+            .unwrap();
+        let mut concurrent = Vec::new();
+        for _ in 0..4 {
+            let host = host.clone();
+            concurrent.push(tokio::spawn(async move {
+                host.diagnostic_keyed("race", diagnostic("repeated"))
+            }));
+        }
+        for result in concurrent {
+            result.await.unwrap().unwrap();
+        }
+        host.diagnostic_keyed("event-2", diagnostic("repeated"))
+            .unwrap();
+        assert!(
+            host.diagnostic_keyed("event-1", diagnostic("conflict"))
+                .is_err()
+        );
+        assert!(host.diagnostic_keyed("", diagnostic("invalid")).is_err());
+        assert!(
+            host.diagnostic_keyed(&"x".repeat(129), diagnostic("invalid"))
+                .is_err()
+        );
+        host.diagnostic(diagnostic("unkeyed")).unwrap();
         if attempt == 0 {
             self.cancel.cancel();
             std::future::pending().await
         } else {
+            host.diagnostic_keyed("event-3", diagnostic("repeated"))
+                .unwrap();
+            host.diagnostic(diagnostic("repeated")).unwrap();
             host.diagnostic(diagnostic("new")).unwrap();
             Outcome::Succeeded("done".into()).into()
         }
@@ -113,7 +140,7 @@ impl KeyedTool for ReplayParent {
     }
 }
 #[tokio::test]
-async fn replay_deduplicates_diagnostics_but_keeps_repetitions_within_attempt() {
+async fn stable_diagnostic_ids_deduplicate_recovery_but_keep_new_identical_events() {
     for nested in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -166,8 +193,26 @@ async fn replay_deduplicates_diagnostics_but_keeps_repetitions_within_attempt() 
             .iter()
             .map(|d| d.message.as_str())
             .collect();
-        assert_eq!(messages, ["repeated", "repeated", "new"]);
+        assert_eq!(
+            messages,
+            [
+                "repeated", "repeated", "repeated", "unkeyed", "unkeyed", "repeated", "repeated",
+                "new"
+            ]
+        );
         assert_eq!(count.load(Ordering::SeqCst), 2);
+        let expected = c.tool_results[0].diagnostics.clone();
+        let fork = h.fork(id).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(CancellationToken::new())).unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().tool_results[0].diagnostics,
+            expected
+        );
+        assert_eq!(
+            h.conversation(fork).unwrap().tool_results[0].diagnostics,
+            expected
+        );
     }
 }
 struct Unsettled {

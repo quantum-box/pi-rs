@@ -1432,6 +1432,98 @@ struct RuntimeToolProgress {
 fn diagnostic_key(conversation: Uuid, operation: Uuid) -> Vec<u8> {
     format!("runtime/tool-diagnostics/{conversation}/{operation}").into_bytes()
 }
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct DiagnosticJournal {
+    diagnostics: Vec<ToolDiagnostic>,
+    #[serde(default)]
+    keys: std::collections::BTreeMap<String, usize>,
+}
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DiagnosticCheckpoint {
+    Legacy(Vec<ToolDiagnostic>),
+    Journal(DiagnosticJournal),
+}
+impl DiagnosticCheckpoint {
+    fn journal(self) -> DiagnosticJournal {
+        match self {
+            Self::Legacy(diagnostics) => DiagnosticJournal {
+                diagnostics,
+                keys: Default::default(),
+            },
+            Self::Journal(journal) => journal,
+        }
+    }
+}
+#[cfg(test)]
+mod diagnostic_identity_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_records_are_retained_without_inventing_event_ids() {
+        let diagnostic = ToolDiagnostic {
+            severity: DiagnosticSeverity::Warn,
+            message: "same".into(),
+            code: None,
+        };
+        let bytes = serde_json::to_vec(&vec![diagnostic.clone()]).unwrap();
+        let mut journal = serde_json::from_slice::<DiagnosticCheckpoint>(&bytes)
+            .unwrap()
+            .journal();
+        insert_diagnostic(
+            &mut journal.diagnostics,
+            &mut journal.keys,
+            Some("new"),
+            diagnostic.clone(),
+        )
+        .unwrap();
+        insert_diagnostic(
+            &mut journal.diagnostics,
+            &mut journal.keys,
+            Some("new"),
+            diagnostic.clone(),
+        )
+        .unwrap();
+        assert_eq!(journal.diagnostics, vec![diagnostic.clone(), diagnostic]);
+        let encoded = serde_json::to_vec(&journal).unwrap();
+        let reopened = serde_json::from_slice::<DiagnosticCheckpoint>(&encoded)
+            .unwrap()
+            .journal();
+        assert_eq!(reopened.keys.get("new"), Some(&1));
+        assert_eq!(reopened.diagnostics.len(), 2);
+    }
+}
+pub(crate) fn insert_diagnostic(
+    diagnostics: &mut Vec<ToolDiagnostic>,
+    keys: &mut std::collections::BTreeMap<String, usize>,
+    key: Option<&str>,
+    diagnostic: ToolDiagnostic,
+) -> Result<(), String> {
+    if let Some(key) = key
+        && let Some(index) = keys.get(key)
+    {
+        return match diagnostics.get(*index) {
+            Some(existing) if existing == &diagnostic => Ok(()),
+            Some(_) => Err("tool diagnostic key already has different content".into()),
+            None => Err("invalid tool diagnostic key index".into()),
+        };
+    }
+    if diagnostics.len() >= 32 {
+        return Err("too many tool diagnostics".into());
+    }
+    if let Some(key) = key {
+        keys.insert(key.to_owned(), diagnostics.len());
+    }
+    diagnostics.push(diagnostic);
+    if serde_json::to_vec(&(&diagnostics, &keys))
+        .map_err(|e| e.to_string())?
+        .len()
+        > 65_536
+    {
+        return Err("tool diagnostics exceed size limit".into());
+    }
+    Ok(())
+}
 fn read_tool_diagnostics(
     owner: &OwnedStore,
     conversation: Uuid,
@@ -1440,7 +1532,11 @@ fn read_tool_diagnostics(
     owner
         .store()
         .get(&diagnostic_key(conversation, operation))?
-        .map(|entry| serde_json::from_slice(&entry.value).map_err(Error::from))
+        .map(|entry| {
+            serde_json::from_slice::<DiagnosticCheckpoint>(&entry.value)
+                .map(|v| v.journal().diagnostics)
+                .map_err(Error::from)
+        })
         .transpose()
         .map(|value| value.unwrap_or_default())
 }
@@ -1450,40 +1546,24 @@ struct RuntimeDiagnostic {
     attempt: ToolAttempt,
     cancel: CancellationToken,
     storage_failed: Arc<AtomicBool>,
-    state: std::sync::Mutex<DiagnosticAttempt>,
-}
-#[derive(Default)]
-pub(crate) struct DiagnosticAttempt {
-    closed: bool,
-    seen: Vec<(ToolDiagnostic, usize)>,
-}
-impl DiagnosticAttempt {
-    pub(crate) fn next(&self, diagnostic: &ToolDiagnostic) -> usize {
-        self.seen
-            .iter()
-            .find(|(item, _)| item == diagnostic)
-            .map_or(1, |(_, count)| count + 1)
-    }
-    pub(crate) fn accepted(&mut self, diagnostic: ToolDiagnostic) {
-        if let Some((_, count)) = self.seen.iter_mut().find(|(item, _)| *item == diagnostic) {
-            *count += 1;
-        } else {
-            self.seen.push((diagnostic, 1));
-        }
-    }
+    closed: std::sync::Mutex<bool>,
 }
 impl RuntimeDiagnostic {
     fn close(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
     }
 }
 impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
-    fn record(&self, diagnostic: ToolDiagnostic) -> Result<(), String> {
-        let mut attempt = self
-            .state
+    fn record(
+        &self,
+        diagnostic_id: Option<&str>,
+        diagnostic: ToolDiagnostic,
+    ) -> Result<(), String> {
+        let closed = self
+            .closed
             .lock()
             .map_err(|_| "tool diagnostic lock poisoned")?;
-        if attempt.closed {
+        if *closed {
             return Err("tool attempt is no longer active".into());
         }
         let store = self.owner.store();
@@ -1509,26 +1589,22 @@ impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
                 }
                 let diag_key = diagnostic_key(self.conversation, self.attempt.operation_id);
                 let prior = store.get(&diag_key)?;
-                let mut diagnostics: Vec<ToolDiagnostic> = prior
+                let mut journal = prior
                     .as_ref()
-                    .map(|e| serde_json::from_slice(&e.value))
+                    .map(|e| {
+                        serde_json::from_slice::<DiagnosticCheckpoint>(&e.value)
+                            .map(DiagnosticCheckpoint::journal)
+                    })
                     .transpose()?
                     .unwrap_or_default();
-                let duplicate = diagnostics
-                    .iter()
-                    .filter(|item| *item == &diagnostic)
-                    .count()
-                    >= attempt.next(&diagnostic);
-                if !duplicate && diagnostics.len() >= 32 {
-                    return Err(Error::Invalid("too many tool diagnostics".into()));
-                }
-                if !duplicate {
-                    diagnostics.push(diagnostic.clone());
-                }
-                let value = serde_json::to_vec(&diagnostics)?;
-                if value.len() > 65_536 {
-                    return Err(Error::Invalid("tool diagnostics exceed size limit".into()));
-                }
+                insert_diagnostic(
+                    &mut journal.diagnostics,
+                    &mut journal.keys,
+                    diagnostic_id,
+                    diagnostic.clone(),
+                )
+                .map_err(Error::Invalid)?;
+                let value = serde_json::to_vec(&journal)?;
                 match store.commit(
                     &[
                         Check {
@@ -1553,10 +1629,7 @@ impl crate::keyed_tool::DiagnosticSink for RuntimeDiagnostic {
                 }
             })();
             match result {
-                Ok(true) => {
-                    attempt.accepted(diagnostic);
-                    return Ok(());
-                }
+                Ok(true) => return Ok(()),
                 Ok(false) => continue,
                 Err(error) => {
                     if matches!(error, Error::Storage(_)) {
@@ -10588,7 +10661,7 @@ impl Harness {
                             attempt,
                             cancel: cancel.clone(),
                             storage_failed: self.storage_failed.clone(),
-                            state: std::sync::Mutex::new(DiagnosticAttempt::default()),
+                            closed: std::sync::Mutex::new(false),
                         })
                     });
                     let mut tool_panicked = false;

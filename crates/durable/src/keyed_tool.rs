@@ -112,11 +112,35 @@ pub struct KeyedHost {
     diagnostics: Option<Arc<dyn DiagnosticSink>>,
 }
 pub(crate) trait DiagnosticSink: Send + Sync {
-    fn record(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String>;
+    fn record(
+        &self,
+        key: Option<&str>,
+        diagnostic: crate::runtime::ToolDiagnostic,
+    ) -> Result<(), String>;
 }
 impl KeyedHost {
-    /// Durably record a bounded diagnostic for this attempt.
+    /// Record a new bounded diagnostic. Replayed calls without an identity are
+    /// recorded again because they cannot safely be distinguished from new events.
     pub fn diagnostic(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String> {
+        self.record_diagnostic(None, diagnostic)
+    }
+    /// Record an event under a caller-supplied identity stable across retries of
+    /// this tool operation. Reusing a key with different content is an error.
+    pub fn diagnostic_keyed(
+        &self,
+        key: &str,
+        diagnostic: crate::runtime::ToolDiagnostic,
+    ) -> Result<(), String> {
+        if key.is_empty() || key.len() > 128 {
+            return Err("tool diagnostic key must be 1..=128 bytes".into());
+        }
+        self.record_diagnostic(Some(key), diagnostic)
+    }
+    fn record_diagnostic(
+        &self,
+        key: Option<&str>,
+        diagnostic: crate::runtime::ToolDiagnostic,
+    ) -> Result<(), String> {
         if diagnostic.message.len() > 4096
             || diagnostic
                 .code
@@ -128,7 +152,7 @@ impl KeyedHost {
         self.diagnostics
             .as_ref()
             .ok_or("tool diagnostic checkpoint is unavailable")?
-            .record(diagnostic)
+            .record(key, diagnostic)
     }
     pub fn ordinary(&self) -> &Arc<dyn ToolHost> {
         &self.ordinary

@@ -43,6 +43,8 @@ struct Record {
     hooks_required: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    diagnostic_keys: std::collections::BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolution: Option<Resolution>,
 }
@@ -331,7 +333,6 @@ struct NestedDiagnostic {
     shared: Arc<Shared>,
     key: Vec<u8>,
     operation: Uuid,
-    attempt: Mutex<crate::runtime::DiagnosticAttempt>,
 }
 impl NestedDiagnostic {
     fn storage_error(&self, error: impl std::fmt::Display) -> String {
@@ -343,11 +344,11 @@ impl NestedDiagnostic {
     }
 }
 impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
-    fn record(&self, diagnostic: crate::runtime::ToolDiagnostic) -> Result<(), String> {
-        let mut attempt = self
-            .attempt
-            .lock()
-            .map_err(|_| "nested diagnostic lock poisoned")?;
+    fn record(
+        &self,
+        diagnostic_id: Option<&str>,
+        diagnostic: crate::runtime::ToolDiagnostic,
+    ) -> Result<(), String> {
         let store = self.shared.owner.store();
         loop {
             if self.shared.cancellation.is_cancelled() {
@@ -375,26 +376,13 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
             {
                 return Err("nested attempt is no longer active".into());
             }
-            let duplicate = record
-                .diagnostics
-                .iter()
-                .filter(|item| *item == &diagnostic)
-                .count()
-                >= attempt.next(&diagnostic);
-            if !duplicate && record.diagnostics.len() >= 32 {
-                return Err("too many tool diagnostics".into());
-            }
-            if !duplicate {
-                record.diagnostics.push(diagnostic.clone());
-            }
+            crate::runtime::insert_diagnostic(
+                &mut record.diagnostics,
+                &mut record.diagnostic_keys,
+                diagnostic_id,
+                diagnostic.clone(),
+            )?;
             let value = serde_json::to_vec(&record).map_err(|e| self.storage_error(e))?;
-            if serde_json::to_vec(&record.diagnostics)
-                .map_err(|e| e.to_string())?
-                .len()
-                > 65_536
-            {
-                return Err("tool diagnostics exceed size limit".into());
-            }
             match store.commit(
                 &[Check {
                     key: self.key.clone(),
@@ -405,10 +393,7 @@ impl crate::keyed_tool::DiagnosticSink for NestedDiagnostic {
                     value,
                 }],
             ) {
-                Ok(()) => {
-                    attempt.accepted(diagnostic);
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(error) => return Err(self.storage_error(error)),
             }
@@ -1011,6 +996,7 @@ impl NestedHost {
                 staged_outcome: None,
                 hooks_required: self.shared.hooks.is_some(),
                 diagnostics: Vec::new(),
+                diagnostic_keys: Default::default(),
                 resolution: None,
             };
             let value = match serde_json::to_vec(&record) {
@@ -1068,7 +1054,6 @@ impl NestedHost {
             shared: self.shared.clone(),
             key: key.clone(),
             operation: record.operation_id,
-            attempt: Mutex::new(Default::default()),
         });
         let reply = crate::keyed_tool::scope_with_control(
             child.clone(),
@@ -1276,6 +1261,7 @@ impl NestedHost {
         record.staged_outcome = None;
         record.outcome = Some(outcome.clone());
         record.diagnostics = result.diagnostics;
+        record.diagnostic_keys.clear();
         let value = match serde_json::to_vec(&record) {
             Ok(value) => value,
             Err(error) => return self.fail(error.to_string()),
@@ -1487,6 +1473,7 @@ mod tests {
             staged_outcome: None,
             hooks_required: false,
             diagnostics: Vec::new(),
+            diagnostic_keys: Default::default(),
             resolution: None,
         };
         store

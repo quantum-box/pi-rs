@@ -630,8 +630,7 @@ alongside its outcome; a reattached child keeps the same diagnostics. Diagnostic
 remain private until incorporated into a finalized result, so legacy output
 redaction can withhold them. Checkpoints and result records have no retention
 policy. Older records and synthetic skips without operation identities are not
-backfilled. Diagnostics recorded by a replayed attempt can be repeated.
-Reconciliation accepts the existing terminal outcome types.
+backfilled. Use `KeyedHost::diagnostic_keyed(event_id, diagnostic)` when the tool can provide a stable event identity across retries. An event ID is scoped to the tool operation, must contain 1–128 UTF-8 bytes, and must identify the same diagnostic content on every retry. Repeating that ID and content is idempotent; conflicting content is rejected. Different IDs preserve distinct events even with identical content. Calls to `diagnostic` have no identity and always append, including on replay. Existing checkpoints retain their diagnostics but cannot retroactively gain event identities. This differs from upstream, which clears interrupted non-wake progress before replay and retains prior diagnostics across wake. Reconciliation accepts the existing terminal outcome types.
 
 `Harness::set_tool_output_schema` and `Scheduler::set_tool_output_schema` set
 an optional JSON schema for a registered tool on a settled conversation. The
