@@ -659,12 +659,14 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     return Err(Error::Config(format!("invalid MCP server field {key}")));
                 }
             }
+            let inherited_global = !project_definitions.contains(&name);
             if value
                 .get("description")
-                .is_some_and(|field| !field.is_string())
-                || value
-                    .get("timeout")
-                    .is_some_and(|field| field.as_f64().is_none_or(|timeout| timeout <= 0.0))
+                .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
+                || value.get("timeout").is_some_and(|field| {
+                    !(inherited_global && field.is_null())
+                        && field.as_f64().is_none_or(|timeout| timeout <= 0.0)
+                })
             {
                 return Err(Error::Config("invalid MCP server configuration".into()));
             }
