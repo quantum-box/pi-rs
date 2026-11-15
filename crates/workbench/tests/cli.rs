@@ -80,7 +80,7 @@ async fn mcp_login_sigint_cancels_discovery() {
         .await
         .unwrap()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(130));
     assert_eq!(
         std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
         config
