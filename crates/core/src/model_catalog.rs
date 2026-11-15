@@ -231,6 +231,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_provider_rejects_revoked_client() {
+        let registry = crate::Registry::default();
+        let mut session = SessionBuilder::new(Arc::new(NamedModel("a")), "shared")
+            .provider("provider-a")
+            .unwrap()
+            .registry(registry.clone())
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("provider-a"));
+        let id = session.journal().unwrap().session_id();
+        registry.remove_session_branch_models(id);
+        assert!(session.model_provider().is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn selected_provider_rejects_unavailable_historical_model() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
