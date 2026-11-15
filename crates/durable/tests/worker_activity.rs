@@ -76,18 +76,18 @@ async fn activity_subscription_tracks_a_real_worker_without_polling() {
     let conversation = scheduler.create_conversation(config()).unwrap();
     let activity = scheduler.worker_activity();
     let mut updates = activity.subscribe();
-    assert!(updates.borrow_and_update().is_empty());
+    assert!(updates.current().is_empty());
     scheduler.submit(conversation, None, "go".into()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), model.entered.acquire())
         .await
         .unwrap()
         .unwrap()
         .forget();
-    tokio::time::timeout(Duration::from_secs(5), updates.changed())
+    let running = tokio::time::timeout(Duration::from_secs(5), updates.changed())
         .await
         .unwrap()
         .unwrap();
-    assert!(updates.borrow_and_update().iter().any(|worker| {
+    assert!(running.iter().any(|worker| {
         worker.kind == WorkerKind::Conversation
             && worker.id == conversation
             && worker.phase == WorkerPhase::Running
@@ -97,11 +97,11 @@ async fn activity_subscription_tracks_a_real_worker_without_polling() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), updates.changed())
+    let stopped = tokio::time::timeout(Duration::from_secs(5), updates.changed())
         .await
         .unwrap()
         .unwrap();
-    assert!(updates.borrow_and_update().is_empty());
+    assert!(stopped.is_empty());
     scheduler.shutdown().await.unwrap();
 }
 

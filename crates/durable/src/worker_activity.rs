@@ -67,12 +67,15 @@ impl WorkerActivity {
     /// Subscribe to coalesced process-local lifecycle snapshots. The initial
     /// value is current at attachment; slow subscribers may skip transitions.
     /// This does not include persisted work and is not an upstream `onWake`.
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<Worker>> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .updates
-            .subscribe()
+    pub fn subscribe(&self) -> WorkerUpdates {
+        WorkerUpdates {
+            receiver: self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .updates
+                .subscribe(),
+        }
     }
     pub(crate) fn enter(&self, kind: WorkerKind, id: Uuid) -> Guard {
         self.enter_at(kind, id, WorkerPhase::Running)
@@ -92,6 +95,23 @@ impl WorkerActivity {
             activity: self.clone(),
             token,
         }
+    }
+}
+
+/// A coalesced subscription which never exposes the internal watch lock.
+pub struct WorkerUpdates {
+    receiver: tokio::sync::watch::Receiver<Vec<Worker>>,
+}
+impl WorkerUpdates {
+    /// Return the latest snapshot and mark it observed.
+    pub fn current(&mut self) -> Vec<Worker> {
+        self.receiver.borrow_and_update().clone()
+    }
+
+    /// Wait for a later lifecycle update. Intermediate states may coalesce.
+    pub async fn changed(&mut self) -> Result<Vec<Worker>, tokio::sync::watch::error::RecvError> {
+        self.receiver.changed().await?;
+        Ok(self.current())
     }
 }
 pub(crate) struct Guard {
