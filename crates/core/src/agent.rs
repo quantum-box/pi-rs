@@ -2734,6 +2734,7 @@ impl Agent<'_> {
         let mut text_delta_bytes = 0usize;
         let mut text_final_bytes = 0usize;
         let mut reasoning_item_ids = HashSet::new();
+        let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
         let mut reasoning_final_bytes = 0_usize;
         let collect = async {
             let session_id = session.session_id();
@@ -2883,6 +2884,10 @@ impl Agent<'_> {
                         }
                         reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
                         if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            observed_reasoning
+                                .entry(index)
+                                .or_default()
+                                .push_str(&delta);
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Delta { index },
                                 || observer(Notification::Reasoning(&delta)),
@@ -2902,11 +2907,17 @@ impl Agent<'_> {
                     EnrichedModelEvent::ReasoningEnd { index, content } => {
                         reasoning_item_ids.insert(index);
                         reasoning_final_bytes = reasoning_final_bytes.saturating_add(content.len());
-                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS
-                            || reasoning_final_bytes > MAX_RESPONSE_BYTES
-                        {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("reasoning items exceed size limit".into()));
                         }
+                        // Always close the item. If the final-content budget is
+                        // exhausted, use only deltas already delivered for this item.
+                        let observed = observed_reasoning.remove(&index).unwrap_or_default();
+                        let content = if reasoning_final_bytes <= MAX_RESPONSE_BYTES {
+                            content
+                        } else {
+                            observed
+                        };
                         with_reasoning_event_metadata(
                             ReasoningEventMetadata::End { index, content },
                             || observer(Notification::Reasoning("")),

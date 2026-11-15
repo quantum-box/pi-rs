@@ -3350,6 +3350,11 @@ extra placeholder delta for redacted blocks and does not expose the redacted
 flag or signature in partial messages; Pi includes them at block start. RPC
 `get_messages` reconstructs signed Anthropic block order from validated replay;
 unsigned text-only responses are still collapsed into one text block.
+Unlike Pi, the native agent has separate 1 MiB cumulative budgets for reasoning
+deltas and provider-supplied finalized reasoning. When the finalized budget is
+exceeded, block-end notifications contain only that block's observed deltas;
+the response can still complete and retain its provider replay. Provider metadata
+and replay are not covered by these notification budgets.
 
 The native Anthropic adapter reads the model's advertised thinking mode and
 effort levels. It selects adaptive effort or a bounded manual thinking budget

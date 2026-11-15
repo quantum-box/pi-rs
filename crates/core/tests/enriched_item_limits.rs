@@ -218,3 +218,232 @@ async fn mixed_indexed_and_legacy_text_respects_separate_limits() {
         }
     }
 }
+
+struct LargeReasoning {
+    bytes: usize,
+}
+
+#[async_trait::async_trait]
+impl Model for LargeReasoning {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        unreachable!("agent should request enriched events")
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: &str,
+        _: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        let content = "x".repeat(self.bytes);
+        let mut events = vec![
+            EnrichedModelEvent::ReasoningStart { index: 0 },
+            EnrichedModelEvent::ReasoningDelta {
+                index: 0,
+                delta: content[..self.bytes.min(1024 * 1024)].into(),
+            },
+        ];
+        if self.bytes > 1024 * 1024 {
+            events.push(EnrichedModelEvent::ReasoningDelta {
+                index: 0,
+                delta: content[1024 * 1024..].into(),
+            });
+        }
+        let metadata = pi_rs_core::ModelMetadata {
+            reasoning: Some(content.clone()),
+            ..Default::default()
+        };
+        events.extend([
+            EnrichedModelEvent::ReasoningEnd { index: 0, content },
+            EnrichedModelEvent::Legacy(ModelEvent::Text("answer".into())),
+            EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)),
+            EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: vec![],
+                usage: Some(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            }),
+        ]);
+        Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn oversized_reasoning_is_suppressed_without_failing_reply() {
+    const LIMIT: usize = 1024 * 1024;
+    for bytes in [LIMIT, LIMIT + 1] {
+        let model = LargeReasoning { bytes };
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut starts = 0;
+        let mut deltas = 0;
+        let mut ends = 0;
+        let answer = agent
+            .run_with_events(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| match event {
+                    AgentEvent::ReasoningStart { index: 0 } => starts += 1,
+                    AgentEvent::ReasoningDelta { index: 0, delta } => deltas += delta.len(),
+                    AgentEvent::ReasoningEnd { index: 0, content } => ends += content.len(),
+                    _ => {}
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(starts, 1);
+        assert_eq!(deltas, LIMIT);
+        assert_eq!(ends, LIMIT);
+        assert!(session.records().iter().any(|record| matches!(
+            &record.event,
+            pi_rs_core::Event::ModelFinished { metadata, failure: None, .. }
+                if metadata.reasoning.as_ref().is_some_and(|text| text.len() == bytes)
+        )));
+
+        let mut session = Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut legacy_bytes = 0;
+        let answer = agent
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let pi_rs_core::Notification::Reasoning(delta) = event {
+                        legacy_bytes += delta.len();
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(legacy_bytes, LIMIT);
+    }
+}
+
+struct InterleavedReasoning;
+
+#[async_trait::async_trait]
+impl Model for InterleavedReasoning {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        unreachable!("agent should request enriched events")
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: &str,
+        _: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        const LIMIT: usize = 1024 * 1024;
+        let events = vec![
+            EnrichedModelEvent::ReasoningStart { index: 1 },
+            EnrichedModelEvent::ReasoningStart { index: 2 },
+            EnrichedModelEvent::ReasoningDelta {
+                index: 1,
+                delta: "a".into(),
+            },
+            EnrichedModelEvent::ReasoningDelta {
+                index: 2,
+                delta: "bc".into(),
+            },
+            EnrichedModelEvent::ReasoningEnd {
+                index: 1,
+                content: "z".repeat(LIMIT - 1),
+            },
+            // The second final crosses the cumulative budget, but its already
+            // observed deltas must be used to close the correct item.
+            EnrichedModelEvent::ReasoningEnd {
+                index: 2,
+                content: "final".into(),
+            },
+            EnrichedModelEvent::ReasoningStart { index: 3 },
+            EnrichedModelEvent::ReasoningDelta {
+                index: 3,
+                delta: "d".into(),
+            },
+            EnrichedModelEvent::ReasoningEnd {
+                index: 3,
+                content: "final d".into(),
+            },
+            EnrichedModelEvent::ReasoningStart { index: 4 },
+            EnrichedModelEvent::ReasoningDelta {
+                index: 4,
+                delta: "x".repeat(LIMIT),
+            },
+            EnrichedModelEvent::ReasoningEnd {
+                index: 4,
+                content: "not observed".into(),
+            },
+            EnrichedModelEvent::Legacy(ModelEvent::Text("answer".into())),
+            EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: vec![],
+                usage: Some(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            }),
+        ];
+        Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn reasoning_closures_use_each_items_observed_deltas_after_cumulative_limit() {
+    let registry = Registry::default();
+    let agent = Agent {
+        model: &InterleavedReasoning,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: Limits::default(),
+    };
+    let mut session = Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+    let mut ends = Vec::new();
+    let mut deltas = Vec::new();
+    let answer = agent
+        .run_with_events(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| match event {
+                AgentEvent::ReasoningDelta { index, delta } => {
+                    deltas.push((index, delta.to_owned()))
+                }
+                AgentEvent::ReasoningEnd { index, content } => {
+                    ends.push((index, content.to_owned()))
+                }
+                _ => {}
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer, "answer");
+    assert_eq!(deltas, [(1, "a".into()), (2, "bc".into()), (3, "d".into())]);
+    assert_eq!(
+        ends,
+        [
+            (1, "z".repeat(1024 * 1024 - 1)),
+            (2, "bc".into()),
+            (3, "d".into()),
+            (4, String::new())
+        ]
+    );
+}
