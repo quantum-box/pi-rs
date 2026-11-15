@@ -105,9 +105,6 @@ fn parse_credential(value: &serde_json::Value) -> Result<Option<pi_rs::openai::o
         })
         .transpose()
 }
-async fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
-    load_at(&auth_path()).await
-}
 async fn load_at(path: &std::path::Path) -> Result<Option<pi_rs::openai::oauth::Credential>> {
     parse_credential(&super::config::read_auth_object(path).await?)
 }
@@ -369,12 +366,59 @@ pub(super) async fn login(
 }
 
 pub(super) async fn access(settings: &super::config::Settings) -> Result<String> {
-    let chat_lock = lock().await?;
-    let active = load()
+    access_options(settings, None, false).await
+}
+
+pub(super) async fn access_options(
+    settings: &super::config::Settings,
+    minimum: Option<Duration>,
+    no_refresh: bool,
+) -> Result<String> {
+    let settings = settings.clone();
+    access_at(
+        super::config::agent_dir(),
+        minimum,
+        no_refresh,
+        move |previous| async move { previous.refresh(&client(&settings)?).await },
+    )
+    .await
+}
+
+async fn access_at<F, Fut>(
+    directory: std::path::PathBuf,
+    minimum: Option<Duration>,
+    no_refresh: bool,
+    exchange: F,
+) -> Result<String>
+where
+    F: FnOnce(pi_rs::openai::oauth::Credential) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<pi_rs::openai::oauth::Credential>> + Send + 'static,
+{
+    if no_refresh {
+        let credential = load_at(&directory.join("auth.json"))
+            .await?
+            .ok_or_else(|| Error::Config("sign in with pi login openai-chatgpt".into()))?;
+        if !credential.has_plan_access() {
+            return Err(Error::Config(
+                "ChatGPT plan permission is not granted".into(),
+            ));
+        }
+        return Ok(credential.access_token);
+    }
+    let chat_lock = lock_path(directory.join("chatgpt-refresh.lock")).await?;
+    let active = load_at(&directory.join("auth.json"))
         .await?
         .ok_or_else(|| Error::Config("sign in with pi login openai-chatgpt".into()))?;
     let mut credential = active.clone();
-    if let Some(saved) = saved_session(&credential.client_id)?
+    let sessions = super::config::read_object(&directory.join("chatgpt-sessions.json"))?;
+    let saved = sessions
+        .get(&credential.client_id)
+        .map(|value| {
+            serde_json::from_value::<pi_rs::openai::oauth::Credential>(value.clone())
+                .map_err(|_| Error::Config("invalid ChatGPT session".into()))
+        })
+        .transpose()?;
+    if let Some(saved) = saved
         && saved.subject == credential.subject
         && saved.expires_at >= credential.expires_at
     {
@@ -389,16 +433,27 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Error::Config("invalid system clock".into()))?
         .as_secs();
-    if credential.expires_at <= now.saturating_add(180) {
-        let http = client(settings)?;
-        credential = refresh_with(
-            super::config::agent_dir(),
-            credential,
-            Some(active),
-            chat_lock,
-            move |previous| async move { previous.refresh(&http).await },
-        )
-        .await?;
+    // Stored expiry is unadjusted; Pi subtracts three minutes before applying
+    // its five-minute OAuth refresh window.
+    let requested = minimum.unwrap_or_default().max(Duration::from_secs(300));
+    let seconds = requested
+        .as_secs()
+        .saturating_add(u64::from(requested.subsec_nanos() != 0))
+        .saturating_add(180);
+    if credential.expires_at <= now.saturating_add(seconds) {
+        credential = refresh_with(directory, credential, Some(active), chat_lock, exchange).await?;
+        if minimum.is_some()
+            && credential.expires_at
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| Error::Config("invalid system clock".into()))?
+                    .as_secs()
+                    .saturating_add(seconds)
+        {
+            return Err(Error::Config(
+                "Refreshed ChatGPT credential expires too soon".into(),
+            ));
+        }
     }
     if !credential.has_plan_access() {
         return Err(Error::Config(
@@ -534,6 +589,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn access_options_preserve_rotation_and_honor_no_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let value = access_at(dir.path().into(), None, true, |_| async {
+            panic!("no-refresh must not contact the token service")
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, "old-access");
+
+        let error = access_at(
+            dir.path().into(),
+            Some(Duration::from_secs(1800)),
+            false,
+            |mut value| async move {
+                value.access_token = "new-access".into();
+                value.refresh_token = "rotated".into();
+                value.expires_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 600;
+                Ok(value)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("expires too soon"));
+        let stored = load_at(&dir.path().join("auth.json"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.refresh_token, "rotated");
+        assert_eq!(stored.access_token, "new-access");
+    }
     fn fixture(directory: &std::path::Path) -> pi_rs::openai::oauth::Credential {
         let value = pi_rs::openai::oauth::Credential {
             client_id: "client".into(),
