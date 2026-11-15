@@ -78,7 +78,7 @@ fn owns(path: &Path, held: &Identity) -> bool {
     identity(path).is_ok_and(|current| same_dir(held, &current))
 }
 fn busy() -> Error {
-    Error::Config("auth.json lock is busy or compromised".into())
+    Error::Config("auth.json lock is busy or compromised; if stale, stop all Pi and pi-rs processes before removing auth.json.lock from the agent directory".into())
 }
 
 pub(super) struct Guard {
