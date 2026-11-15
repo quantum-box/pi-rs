@@ -264,3 +264,82 @@ fn malformed_remote_package_filter_is_reported_during_startup() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn invalid_remote_filters_follow_package_settings_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("agent");
+    let mut sources = Vec::new();
+    for name in ["z", "a"] {
+        let repo = directory.path().join(name);
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        std::fs::create_dir(repo.join("prompts")).unwrap();
+        std::fs::write(repo.join("prompts/review.md"), "review").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "--quiet", "-m", "fixture"]);
+        let url = reqwest::Url::from_directory_path(&repo).unwrap();
+        let source = format!("git:{}", url.as_str().trim_end_matches('/'));
+        let install = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("PI_OFFLINE")
+            .args(["--no-trust", "install", &source])
+            .output()
+            .unwrap();
+        assert!(
+            install.status.success(),
+            "{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        sources.push(source);
+    }
+    for reverse in [false, true] {
+        let z = serde_json::json!({"source":sources[0], "prompts":["file:///bad%2Fpath"]});
+        let a = serde_json::json!({"source":sources[1], "prompts":["file:///bad%ZZ"]});
+        let packages = if reverse { vec![a, z] } else { vec![z, a] };
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages": packages}).to_string(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .env("PI_OFFLINE", "1")
+            .args(["--no-trust", "--no-mcp", "--print", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains(if reverse { "URI malformed" } else { "encoded" }),
+            "{stderr}"
+        );
+    }
+    let project = directory.path().join(".pi");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"packages":[{"source":sources[1],"prompts":["file:///bad%ZZ"]}]})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("settings.json"),
+        serde_json::json!({"packages":[{"source":sources[0],"prompts":["file:///bad%2Fpath"]}]})
+            .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("PI_OFFLINE", "1")
+        .args(["--trust", "--no-mcp", "--print", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("encoded"), "{stderr}");
+}

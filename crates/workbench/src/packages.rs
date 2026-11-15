@@ -1035,6 +1035,7 @@ fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
     let mut global = BTreeMap::new();
+    let mut order = BTreeMap::new();
     let mut files = vec![(
         config::agent_dir().join("settings.json"),
         config::agent_dir(),
@@ -1050,9 +1051,11 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     for (file, base, project) in files {
         let document = config::read_object(&file)?;
         if let Some(packages) = document.get("packages") {
-            for value in packages
+            for (position, value) in packages
                 .as_array()
                 .ok_or_else(|| Error::Config("packages must be an array".into()))?
+                .iter()
+                .enumerate()
             {
                 let source = source_field(value)
                     .ok_or_else(|| Error::Config("package needs a source".into()))?;
@@ -1066,6 +1069,7 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 } else {
                     None
                 };
+                order.insert(identity.clone(), (if project { 0 } else { 1 }, position));
                 result.insert(
                     identity,
                     Declaration {
@@ -1078,14 +1082,17 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
             }
         }
     }
-    for entry in args
+    for (position, entry) in args
         .extensions
         .iter()
-        .filter(|entry| is_package_source(entry, &args.workspace))
+        .enumerate()
+        .filter(|(_, entry)| is_package_source(entry, &args.workspace))
     {
         let source = normalize(entry, &args.workspace)?;
+        let identity = source_identity(&source);
+        order.insert(identity.clone(), (2, position));
         result.insert(
-            source_identity(&source),
+            identity,
             Declaration {
                 value: json!(source),
                 source,
@@ -1094,7 +1101,12 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
             },
         );
     }
-    Ok(result.into_values().collect())
+    let mut entries: Vec<_> = result.into_iter().collect();
+    entries.sort_by_key(|(identity, _)| order[identity]);
+    Ok(entries
+        .into_iter()
+        .map(|(_, declaration)| declaration)
+        .collect())
 }
 pub fn is_package_source(source: &str, workspace: &Path) -> bool {
     !super::resource_paths::named_extension(source)
