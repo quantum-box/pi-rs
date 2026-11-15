@@ -467,3 +467,9 @@ Host transactional signals reuse the task-handler staging protocol. Different ta
 Normal Scheduler/Driver polling follows the same signal-first deadline ordering as upstream `sleepWake`, including at the boundary, and commits the wake and receipt changes with task and signal-revision fences. Unlike upstream’s normal well-formed records, mismatched identities and ambiguous duplicate receipts fail closed. A consumed receipt advances the signal revision. The [scheduler tests](../crates/durable/tests/scheduler_typed_wake.rs) cover delivery races, driver polling and process kill/reopen.
 
 Host `wake_at` does not schedule a timer: callers supply a scheduler-consistent time and retry the whole transaction after conflicts. Timeout markers, the task wake and checked document writes commit together; delivery races are fenced by task and signal revisions. See [timeout tests](../crates/durable/tests/host_timeout_wake.rs).
+
+**User image admission:** `UserImageAdmission` is an opt-in pi-rs admission
+operation that fits user blocks against the selected model before the atomic
+submission commit. It returns and stores preparation notes, refuses busy
+conversations, and fences concurrent model changes. Upstream instead asks the
+host to call `fitImages` before submit; other pi-rs input paths remain unchanged.

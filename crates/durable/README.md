@@ -1568,3 +1568,36 @@ selected profile to hosts preparing user images with `fit_image` or `fit_images`
 before admission. User image fitting remains explicit and existing history is
 not refitted on model changes. Model input limits are based on catalog metadata,
 not runtime probing, and do not imply provider acceptance.
+
+### Opt-in user image admission
+
+`UserImageAdmission::new(Arc<dyn ImageProcessor>)` selects the processor for
+`Harness::submit_fitted_user_blocks` or the corresponding `Scheduler` method.
+The method fits an ordered nonempty text/image block array using the selected
+adapter's current model limits, then commits the fitted blocks and submission
+in one transition. The scheduler schedules only after that commit; a harness
+caller drives the run with `resume_conversation`. Unselected ordinary string
+submissions and `append_user_blocks` do not fit images. A selected block-aware
+adapter is required; an unknown image profile uses the default limits.
+
+The returned `ImageAdmissionResult` contains the submission ID and preparation
+notes. Notes are stored in `Submission::image_notes` and appended as a text
+block visible to the model. An image that cannot be prepared is omitted with a
+note, including processor and malformed-base64 errors. Existing block metadata
+is retained on unchanged images; transformed images use the fitter's output
+shape. Reusing an input request ID returns the original ID and notes without
+running the processor again, even after reopen. A conflict, cancellation or
+invalid input commits no submission; after an indeterminate storage error, reopen
+and use the same request ID to check the outcome. Processors can run again after
+a conflict or interruption and must tolerate retries and cancellation. Model
+configuration is version-fenced
+across the asynchronous fit, and the adapter profile is rechecked before commit.
+Hosts must keep adapter profile configuration stable during admission.
+
+This API currently admits only settled conversations and returns `Busy` for
+queued, active, reset or independent-summary work; it does not implement busy
+steering, document-composed admission, or automatic fitting of continuations
+and resets. Fitted history is never refitted after a model change. These are
+pi-rs extensions: upstream exposes `fitImages` for the host to call before
+submit, not a general user-admission hook. Installing a tool-result fit extension
+alone does not select this user-input API.

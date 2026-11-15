@@ -196,6 +196,9 @@ pub struct Submission {
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
+    /// Model-visible preparation diagnostics for an image admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_notes: Vec<String>,
     pub status: Status,
 }
 /// A durable application entry. Queued entries wait for their preceding reset.
@@ -1109,6 +1112,7 @@ impl Conversation {
             id,
             request_id: None,
             content: content.clone(),
+            image_notes: Vec::new(),
             status: Status::Running,
         });
         self.input_modes.insert(id, InputMode::FollowUp);
@@ -7466,6 +7470,155 @@ impl Harness {
         }
         Ok(page)
     }
+    /// Admit fitted user blocks atomically. This opt-in API requires a settled
+    /// conversation and a selected block-aware adapter. A concurrent state or
+    /// model change makes the commit fail; the caller may retry from the start.
+    pub async fn submit_fitted_user_blocks(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        if request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
+        {
+            return Err(Error::Invalid(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
+        let (mut state, version) = self.load(id)?;
+        if let Some(key) = request_id.as_ref() {
+            if state
+                .application_writes
+                .iter()
+                .any(|w| w.request_id.as_ref() == Some(key))
+            {
+                return Err(Error::Invalid(
+                    "request ID identifies a write submission".into(),
+                ));
+            }
+            if let Some(existing) = state
+                .submissions
+                .iter()
+                .find(|s| s.request_id.as_ref() == Some(key))
+            {
+                if existing.kind != SubmissionKind::Input {
+                    return Err(Error::Invalid(
+                        "request ID identifies a continue submission".into(),
+                    ));
+                }
+                return Ok(crate::images::ImageAdmissionResult {
+                    submission_id: existing.id,
+                    notes: existing.image_notes.clone(),
+                });
+            }
+        }
+        if !matches!(state.phase, Phase::Idle | Phase::FailedIdle)
+            || state.active.is_some()
+            || state.abort_requested
+            || !state.pending_resets.is_empty()
+            || state.pending_independent_summary.is_some()
+            || state
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+            || state
+                .submissions
+                .iter()
+                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+        {
+            return Err(AdmissionError::Busy.into());
+        }
+        let adapter = self
+            .provider_adapter
+            .as_ref()
+            .filter(|a| {
+                state.provider_adapter.as_deref() == Some(a.id()) && a.supports_durable_blocks()
+            })
+            .ok_or_else(|| {
+                Error::Invalid("image admission requires a selected block-aware adapter".into())
+            })?;
+        if !self.supports_context_blocks(&state) {
+            return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
+        }
+        if blocks.is_empty()
+            || crate::content::UserContent::from_yield(
+                serde_json::Value::Array(blocks.clone()),
+                false,
+            )
+            .is_none()
+        {
+            return Err(Error::Invalid(
+                "invalid or empty user content blocks".into(),
+            ));
+        }
+        let profile = adapter.image_profile(&state.config.model);
+        let limits = profile.map(|p| p.limits).unwrap_or_default();
+        let fitted = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Interrupted),
+            result = admission.fit(&blocks, limits) => result.map_err(Error::Invalid)?,
+        };
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted);
+        }
+        if self
+            .provider_adapter
+            .as_ref()
+            .filter(|a| state.provider_adapter.as_deref() == Some(a.id()))
+            .and_then(|a| a.image_profile(&state.config.model))
+            != profile
+        {
+            return Err(Error::Invalid(
+                "model image profile changed during admission".into(),
+            ));
+        }
+        let (mut output, notes) = match fitted {
+            crate::images::FittedImages::Unchanged => (blocks, Vec::new()),
+            crate::images::FittedImages::Fitted { content, notes } => (content, notes),
+        };
+        if !notes.is_empty() {
+            output.push(serde_json::json!({"type":"text", "text":notes.join(" ")}));
+        }
+        if output.is_empty() {
+            return Err(Error::Invalid(
+                "image admission produced empty content".into(),
+            ));
+        }
+        let sid = Uuid::new_v4();
+        state.submissions.push(Submission {
+            kind: SubmissionKind::Input,
+            id: sid,
+            request_id,
+            content: String::new(),
+            image_notes: notes.clone(),
+            status: Status::Running,
+        });
+        state.input_modes.insert(sid, InputMode::FollowUp);
+        state.active = Some(sid);
+        Self::append_yield(
+            &mut state,
+            crate::content::UserContent::Blocks(output),
+            true,
+        );
+        state.auto_compaction_attempted = false;
+        state.retry_state = RetryState::default();
+        state.overflow_compaction_attempted = false;
+        state.phase = Phase::ModelReady { turns: 0 };
+        let merge = self.merge_admissions;
+        self.merge_admissions = false;
+        let saved = self.save(&state, Expected::Version(version));
+        self.merge_admissions = merge;
+        saved?;
+        Ok(crate::images::ImageAdmissionResult {
+            submission_id: sid,
+            notes,
+        })
+    }
+
     /// Append an ordered user block occurrence to an idle conversation.
     /// Forks, resets, and supported compactions preserve retained block history.
     pub fn append_user_blocks(
@@ -7827,6 +7980,7 @@ impl Harness {
                 id: sid,
                 request_id: request_id.clone(),
                 content: content.clone(),
+                image_notes: Vec::new(),
                 status: if place_now {
                     Status::Running
                 } else {
@@ -7970,6 +8124,7 @@ impl Harness {
                 id: sid,
                 request_id: request_id.clone(),
                 content: String::new(),
+                image_notes: Vec::new(),
                 status: Status::Running,
             });
             c.active = Some(sid);
@@ -13128,6 +13283,22 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Fit and commit user blocks before scheduling their run.
+    pub async fn submit_fitted_user_blocks(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        let result = self
+            .harness
+            .submit_fitted_user_blocks(id, request_id, blocks, admission, cancel)
+            .await?;
+        self.schedule(id);
+        Ok(result)
+    }
     /// Commit a steering or follow-up input and schedule the conversation.
     pub fn submit_with_mode(
         &mut self,
@@ -14580,6 +14751,7 @@ fn summary_progress_only(base: &Conversation, latest: &Conversation) -> Result<b
             || old.kind != new.kind
             || old.request_id != new.request_id
             || old.content != new.content
+            || old.image_notes != new.image_notes
             || base.input_modes.get(&old.id) != latest.input_modes.get(&old.id)
         {
             return Ok(false);
@@ -18333,6 +18505,7 @@ mod scheduler_tests {
                 kind: SubmissionKind::Input,
                 request_id: None,
                 content: content.into(),
+                image_notes: Vec::new(),
                 status: Status::Queued,
             });
         }
@@ -18445,6 +18618,7 @@ mod scheduler_tests {
             id: Uuid::new_v4(),
             request_id: None,
             content: "queued".into(),
+            image_notes: Vec::new(),
             status: Status::Queued,
         });
         assert!(admission_only(&base, &latest).unwrap());

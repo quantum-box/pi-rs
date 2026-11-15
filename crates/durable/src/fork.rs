@@ -313,6 +313,7 @@ mod tests {
             id: Uuid::new_v4(),
             request_id: None,
             content: "q".into(),
+            image_notes: Vec::new(),
             status: Status::Queued,
         });
         assert!(matches!(extract(id, &record(&s)), Err(Error::Unsettled)));

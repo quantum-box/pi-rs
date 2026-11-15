@@ -216,6 +216,29 @@ fn omitted(mime_type: &str, reason: Option<&str>) -> FittedImage {
     }
 }
 
+/// Explicit host-selected processor for user input admission.
+pub struct UserImageAdmission {
+    processor: std::sync::Arc<dyn ImageProcessor>,
+}
+impl UserImageAdmission {
+    pub fn new(processor: std::sync::Arc<dyn ImageProcessor>) -> Self {
+        Self { processor }
+    }
+    pub(crate) async fn fit(
+        &self,
+        content: &[Value],
+        limits: ImageLimits,
+    ) -> Result<FittedImages, String> {
+        fit_images(content, limits, self.processor.as_ref()).await
+    }
+}
+/// Durable submission identity and preparation notes. Notes also enter the transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageAdmissionResult {
+    pub submission_id: uuid::Uuid,
+    pub notes: Vec<String>,
+}
+
 /// Prepare bytes before admission; detected image types take precedence over the declaration.
 pub async fn fit_image(
     bytes: &[u8],
