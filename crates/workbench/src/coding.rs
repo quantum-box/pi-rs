@@ -5460,7 +5460,7 @@ mod tests {
             directory_read_error(std::io::Error::from_raw_os_error(libc::EACCES), &link, true),
             Error::Config(message) if message == expected
         ));
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
         let probe = std::fs::read_dir(&directory);
         let tool = CodingTool {
             root: root_path,
