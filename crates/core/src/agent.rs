@@ -4393,6 +4393,18 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<bool> {
+        let file_details = if extension_result.is_none() {
+            minimum_retention.map(|retention| {
+                let files =
+                    crate::compaction_files::FileOperations::collect(session, retention.boundary);
+                if !compaction.summary.trim().is_empty() {
+                    compaction.summary.push_str(&files.suffix());
+                }
+                files.details()
+            })
+        } else {
+            None
+        };
         let original_summary = compaction.summary.clone();
         for extension in &self.registry.extensions {
             let (sender, incoming) = mpsc::channel(32);
@@ -4481,8 +4493,8 @@ impl Agent<'_> {
             |result| result.tokens_before,
         );
         let from_extension = extension_result.is_some() || original_summary != compaction.summary;
-        let persist_metadata =
-            from_extension && (extension_result.is_some() || session.supports_record_metadata());
+        let persist_metadata = (from_extension && extension_result.is_some())
+            || (session.supports_record_metadata() && (from_extension || file_details.is_some()));
         commit_compaction_record(
             session,
             Event::Compacted {
@@ -4495,8 +4507,14 @@ impl Agent<'_> {
                 usage_metadata,
             },
             persist_metadata.then(|| {
-                let mut metadata = serde_json::json!({"fromExtension": true});
-                if let Some(details) = extension_result.and_then(|result| result.details.clone()) {
+                let mut metadata = serde_json::json!({});
+                if from_extension {
+                    metadata["fromExtension"] = true.into();
+                }
+                if let Some(details) = extension_result
+                    .and_then(|result| result.details.clone())
+                    .or_else(|| (!from_extension).then_some(file_details).flatten())
+                {
                     metadata["details"] = details;
                 }
                 metadata
@@ -6882,6 +6900,198 @@ mod tree_tests {
                 }),
             ])))
         }
+    }
+
+    #[tokio::test]
+    async fn generated_compaction_persists_file_details_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compaction-files.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let calls: Vec<_> = [("read", "r", "read.txt"), ("write", "w", "written.txt")]
+            .into_iter()
+            .map(|(name, id, path)| Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({"path":path}).to_string(),
+                },
+            })
+            .collect();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: calls.clone(),
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        for invocation in calls {
+            session
+                .append(Event::ToolFinished {
+                    operation_id: invocation.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        struct EmptySummary;
+        #[async_trait::async_trait]
+        impl Model for EmptySummary {
+            async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                    ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    },
+                )])))
+            }
+        }
+        let mut empty_session = Session::from_records(session.records().to_vec()).unwrap();
+        let empty_registry = Registry::default();
+        let empty_agent = Agent {
+            model: &EmptySummary,
+            model_name: "fixture",
+            registry: &empty_registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(
+            empty_agent
+                .summarize(
+                    &mut empty_session,
+                    1,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !empty_session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        let mut hook_session = Session::from_records(session.records().to_vec()).unwrap();
+        let mut hook_registry = Registry::default();
+        hook_registry
+            .register(Arc::new(ProvidedCompaction {
+                cancel: false,
+                invalid: false,
+                events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .unwrap();
+        let hook_agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &hook_registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        hook_agent
+            .summarize(&mut hook_session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let hook_record = hook_session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert!(
+            matches!(&hook_record.event, Event::Compacted { summary, .. } if summary == "extension summary")
+        );
+        assert_eq!(
+            hook_session.record_metadata(hook_record.id).unwrap()["details"],
+            serde_json::json!({"origin":"hook"})
+        );
+        let registry = Registry::default();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let record = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, Event::Compacted { .. }))
+            .unwrap();
+        let id = record.id;
+        assert!(
+            matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer\n\n<read-files>\nread.txt\n</read-files>\n\n<modified-files>\nwritten.txt\n</modified-files>")
+        );
+        assert_eq!(
+            session.record_metadata(id).unwrap()["details"],
+            serde_json::json!({"readFiles":["read.txt"],"modifiedFiles":["written.txt"]})
+        );
+        drop(session);
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id).unwrap()["details"],
+            serde_json::json!({"readFiles":["read.txt"],"modifiedFiles":["written.txt"]})
+        );
+        let edit = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "edit".into(),
+                name: "edit".into(),
+                arguments: serde_json::json!({"path":"read.txt"}).to_string(),
+            },
+        };
+        reopened
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![edit.clone()],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        reopened
+            .append(Event::ToolFinished {
+                operation_id: edit.operation_id,
+                outcome: Outcome::Succeeded("ok".into()),
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        reopened
+            .append(Event::User {
+                content: "latest".into(),
+                input_id: None,
+            })
+            .unwrap();
+        agent
+            .summarize(&mut reopened, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let second = reopened
+            .records()
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            reopened.record_metadata(second.id).unwrap()["details"],
+            serde_json::json!({"readFiles":[], "modifiedFiles":["read.txt", "written.txt"]})
+        );
     }
 
     struct RecoverySettlementModel {
