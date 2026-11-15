@@ -1571,7 +1571,13 @@ mod estimation_tests {
     #[tokio::test]
     async fn chat_cache_key_reaches_resolved_and_deferred_client_sessions() {
         use std::io::{Read, Write};
-        for (deferred, summary) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (deferred, summary, path) in [false, true].into_iter().flat_map(|deferred| {
+            [false, true].into_iter().flat_map(move |summary| {
+                ["legacy", "enriched", "detailed"]
+                    .into_iter()
+                    .map(move |path| (deferred, summary, path))
+            })
+        }) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -1658,23 +1664,55 @@ mod estimation_tests {
                 tools: vec![],
                 max_output_tokens: 10,
             };
-            if summary {
-                let _ = model
-                    .stream_enriched_for_summary(
-                        uuid::Uuid::new_v4(),
-                        uuid::Uuid::new_v4(),
-                        request,
-                    )
-                    .await;
-            } else {
-                let _ = model
-                    .stream_enriched_in_session_with_identity(
-                        uuid::Uuid::new_v4(),
-                        uuid::Uuid::new_v4(),
-                        "imported-session",
-                        request,
-                    )
-                    .await;
+            let request_id = uuid::Uuid::new_v4();
+            let session_id = uuid::Uuid::new_v4();
+            match (summary, path) {
+                (true, "legacy") => {
+                    let _ = model
+                        .stream_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "legacy") => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                (true, "enriched") => {
+                    let _ = model
+                        .stream_enriched_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "enriched") => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                (true, "detailed") => {
+                    let _ = model
+                        .stream_detailed_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "detailed") => {
+                    let _ = model
+                        .stream_detailed_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                _ => unreachable!(),
             }
             let body = server.join().unwrap();
             assert_eq!(
