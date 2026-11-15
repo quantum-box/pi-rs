@@ -8,7 +8,7 @@ pub(super) const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", 
 pub(super) fn reported(args: &Cli) -> Option<&[String]> {
     args.thinking_profile
         .as_ref()
-        .filter(|(model, _, _)| model == &args.model)
+        .filter(|(model, levels, _)| model == &args.model && !levels.is_empty())
         .map(|(_, levels, _)| levels.as_slice())
 }
 
@@ -97,6 +97,17 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         }
         super::providers::Adapter::Google => pi_rs::google::model_thinking_levels(&args.model),
     };
+    // A capability can be known even when the server did not enumerate levels.
+    // Reuse that discovery without treating fallback levels as server-reported.
+    if args
+        .thinking_profile
+        .as_ref()
+        .is_some_and(|(model, levels, reasoning)| {
+            model == &args.model && levels.is_empty() && reasoning.is_some()
+        })
+    {
+        return filter_levels(configured.unwrap_or_else(fallback));
+    }
     if !args.allow_model_probes() {
         return filter_levels(fallback());
     }
@@ -117,8 +128,15 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     .ok()
     .flatten();
     if let Some((levels, reasoning)) = discovered {
-        let levels = filter_levels(levels);
-        args.thinking_profile = Some((args.model.clone(), levels.clone(), reasoning));
+        let known_levels = levels.map(&filter_levels);
+        let levels = known_levels
+            .clone()
+            .unwrap_or_else(|| filter_levels(configured.unwrap_or_else(&fallback)));
+        args.thinking_profile = Some((
+            args.model.clone(),
+            known_levels.unwrap_or_default(),
+            reasoning,
+        ));
         levels
     } else {
         filter_levels(configured.unwrap_or_else(fallback))
@@ -200,6 +218,25 @@ fn persist(args: &mut Cli, level: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_without_levels_preserves_fallback_and_is_not_reported_levels() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model = "dynamic".into();
+        args.thinking_profile = Some((args.model.clone(), vec![], Some(true)));
+        assert_eq!(adopted_reasoning(&args), Some(true));
+        assert!(reported(&args).is_none());
+        assert_eq!(
+            available(&mut args),
+            LEVELS
+                .iter()
+                .map(|level| (*level).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(adopted_reasoning(&args), Some(true));
+        assert!(reported(&args).is_none());
+    }
 
     #[test]
     fn cycle_uses_reasoning_flag_when_only_off_is_available() {
