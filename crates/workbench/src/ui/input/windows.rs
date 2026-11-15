@@ -241,7 +241,7 @@ mod tests {
             &mut reply_surrogate,
         );
         assert!(
-            matches!(event, Some(Event::Key(key)) if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
+            matches!(event, Some(Event::Key(key)) if matches!(key.code, KeyCode::Char('a' | 'A')))
         );
         for value in "0000/8080\x07".encode_utf16() {
             decode_key(
