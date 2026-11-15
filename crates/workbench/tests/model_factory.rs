@@ -221,3 +221,95 @@ fn anonymous_chat_is_explicit_and_validates_provider() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn typed_chat_supports_host_compatibility_and_explicit_anonymous_requests() {
+    use pi_rs::{Message, Model, ModelRequest};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    for anonymous in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let mut auth = HostAuthBuilder::new();
+        auth.register(
+            "custom",
+            &endpoint,
+            HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+        )
+        .unwrap();
+        let factory = ModelClientFactory::new(auth.build());
+        let client = if anonymous {
+            factory.anonymous_chat("custom", &endpoint).unwrap()
+        } else {
+            factory.chat_client("custom", &endpoint).unwrap()
+        };
+        let compatibility =
+            serde_json::from_value(serde_json::json!({"maxTokensField":"max_completion_tokens"}))
+                .unwrap();
+        let client = client.with_chat_compatibility(compatibility, None, false, true);
+        let request = ModelRequest {
+            model: "example".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 2048];
+            let header_end = loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() - header_end < length {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            (
+                headers,
+                serde_json::from_slice::<serde_json::Value>(
+                    &bytes[header_end..header_end + length],
+                )
+                .unwrap(),
+            )
+        };
+        let ((headers, body), _) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve, client.stream(request))
+        })
+        .await
+        .unwrap();
+        assert_eq!(body["max_completion_tokens"], 16);
+        assert!(body.get("max_tokens").is_none());
+        let has_auth = headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
+        assert_eq!(has_auth, !anonymous);
+    }
+}

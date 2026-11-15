@@ -958,7 +958,9 @@ The factory does not perform implicit credential or model discovery, OAuth
 refresh, proxy discovery, model metadata probes, or network I/O at construction. Gemini
 uses a base URL and appends model-specific streaming paths. Hosts own endpoint
 policy and existing clients outlive replacement of the credential snapshot.
-Unauthenticated chat clients require a separate explicit factory method.
+Unauthenticated chat clients require a separate explicit factory method. Typed
+chat clients let hosts supply provider/model compatibility; the factory does not
+automatically infer that configuration.
 
 
 `/thinking`, Shift+Tab and `--thinking` select a reasoning effort. Selection is

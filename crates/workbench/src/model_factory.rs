@@ -48,11 +48,7 @@ impl ModelClientFactory {
             (
                 NativeModelApi::OpenAiChat,
                 HostCredentialKind::ApiKey | HostCredentialKind::Bearer,
-            ) => Ok(Arc::new(
-                pi_rs::ollama::Ollama::new(endpoint, Some(credential.secret().to_owned()))?
-                    .with_provider(provider)
-                    .with_native_probes(false),
-            )),
+            ) => Ok(Arc::new(self.chat_client(provider, endpoint)?)),
             (NativeModelApi::OpenAiResponses, HostCredentialKind::ApiKey) => {
                 Ok(Arc::new(pi_rs::openai::OpenAiResponses::new_api_provider(
                     endpoint,
@@ -89,17 +85,30 @@ impl ModelClientFactory {
         }
     }
 
-    /// Construct an unauthenticated chat client only when the host explicitly
-    /// chooses that mode. No credential lookup or environment fallback occurs.
-    pub fn anonymous_chat(&self, provider: &str, endpoint: &str) -> Result<Arc<dyn Model>> {
+    /// Construct a typed chat client so the host can explicitly configure
+    /// provider/model compatibility before adding it to a catalog. Defaults do
+    /// not infer Pi provider profiles or enable native endpoint probes.
+    pub fn chat_client(&self, provider: &str, endpoint: &str) -> Result<pi_rs::ollama::Ollama> {
+        let credential = self
+            .credentials
+            .get(provider, endpoint)
+            .ok_or_else(|| Error::Config("model credential is not registered".into()))?;
+        Ok(
+            pi_rs::ollama::Ollama::new(endpoint, Some(credential.secret().to_owned()))?
+                .with_provider(provider)
+                .with_native_probes(false),
+        )
+    }
+
+    /// Construct a typed unauthenticated chat client only when the host
+    /// explicitly chooses that mode. No credential lookup or fallback occurs.
+    pub fn anonymous_chat(&self, provider: &str, endpoint: &str) -> Result<pi_rs::ollama::Ollama> {
         if provider.trim().is_empty() {
             return Err(Error::Config("model provider is empty".into()));
         }
-        Ok(Arc::new(
-            pi_rs::ollama::Ollama::new(endpoint, None)?
-                .with_provider(provider)
-                .with_native_probes(false),
-        ))
+        Ok(pi_rs::ollama::Ollama::new(endpoint, None)?
+            .with_provider(provider)
+            .with_native_probes(false))
     }
 
     /// Register one host-authorized identity in a catalog builder. A duplicate
