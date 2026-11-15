@@ -6,6 +6,33 @@ the webview does not need to compile pi-rs to WebAssembly. The SDK does not
 automatically install the workbench's tools, load its configuration, or manage
 credentials for an embedding host.
 
+## Host-owned model catalog
+
+`ModelCatalogBuilder` collects already constructed clients by exact provider
+and model name. Its immutable `ModelCatalog` creates a `SessionBuilder` and
+resolves provider-qualified historical selections when sessions reopen or
+navigate branches. This is useful when two providers use the same model name:
+the SDK never guesses a provider or silently replaces an existing binding.
+
+```rust,no_run
+use std::sync::Arc;
+use pi_rs::{Model, ModelCatalogBuilder};
+
+fn session_builder(client: Arc<dyn Model>) -> pi_rs::Result<pi_rs::SessionBuilder> {
+    let mut models = ModelCatalogBuilder::new();
+    models.register("my-provider", "my-model", client)?;
+    models.build().session_builder("my-provider", "my-model")
+}
+```
+
+Clients, endpoints and credentials remain the host's responsibility. Journal
+identities are used only for exact lookups in this trusted snapshot; unknown
+identities do not cause a network request or automatic fallback. Build a new
+catalog and new sessions after changing credentials or endpoint policy. Existing
+sessions retain their original clients. Hosts needing automatic fallback can
+provide their own `HistoricalModelResolver` instead. This provider-neutral API
+does not depend on Tauri or a desktop runtime.
+
 ## Native quickstart
 
 The [Ollama SDK example](../crates/ollama/examples/sdk_chat.rs) creates an
