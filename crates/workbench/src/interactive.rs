@@ -3541,9 +3541,9 @@ fn load_resolved_theme(
 
 #[cfg(any(unix, windows))]
 fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
-    crate::ui::theme::invalidate_terminal_default_colors();
+    // A reported background remains authoritative until a newer color reply arrives.
     let changed = crate::ui::theme::set_appearance(dark);
-    let redraw_system = theme.name == "system";
+    let redraw_system = changed && theme.name == "system";
     if redraw_system {
         *theme = Theme::system();
     }
@@ -10050,12 +10050,17 @@ exit {exit}
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn appearance_event_rebuilds_system_theme_before_partial_requery() {
+    fn appearance_event_retains_colors_during_partial_requery() {
         const CHILD: &str = "PI_RS_SYSTEM_APPEARANCE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "interactive::tests::appearance_event_rebuilds_system_theme_before_partial_requery"])
-                .env(CHILD, "1").status().unwrap();
+                .args([
+                    "--exact",
+                    "interactive::tests::appearance_event_retains_colors_during_partial_requery",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
             assert!(status.success());
             return;
         }
@@ -10073,13 +10078,13 @@ exit {exit}
         let mut theme = super::Theme::system();
         assert_eq!(theme.color("accent"), Color::Rgb { r: 5, g: 10, b: 20 });
         let (_, redraw) = super::apply_terminal_appearance(&mut theme, false);
-        assert!(redraw);
-        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 5, g: 10, b: 20 });
         begin_terminal_palette_query();
         for index in 0..8 {
             set_terminal_palette(index, index, 30, 40);
         }
-        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        assert_eq!(theme.color("accent"), Color::Rgb { r: 5, g: 10, b: 20 });
         set_terminal_color(false, 255, 255, 255);
         let refreshed = super::Theme::system();
         assert_eq!(refreshed.color("accent"), Color::Rgb { r: 5, g: 10, b: 20 });
