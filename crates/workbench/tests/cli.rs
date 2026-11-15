@@ -305,6 +305,23 @@ fn worker_returns_keyed_share_journal_tag() {
     mac.update(b"pi-rs-live-share-context-v2\0");
     mac.update(&serde_json::to_vec(&(captured.records(), &context)).unwrap());
     assert!(mac.verify_slice(&tag).is_ok());
+    let moved = root.path().join("moved-session.jsonl");
+    std::fs::rename(&path, &moved).unwrap();
+    writeln!(input, "{}", json!({"id":"missing", "type":"get_share_context", "session":path, "journal_key":key, "include_journal":true})).unwrap();
+    input.flush().unwrap();
+    let missing = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "missing" {
+            break event;
+        }
+    };
+    assert_eq!(
+        missing["success"], false,
+        "worker returned stale journal: {missing}"
+    );
+    std::fs::rename(&moved, &path).unwrap();
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     drop(input);
     while child.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
