@@ -714,6 +714,10 @@ expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
 
+`pi mcp login --timeout SECONDS` bounds OAuth discovery and sign-in; the
+default is 300 seconds. Once credential persistence starts, it is allowed to
+finish even if the deadline passes, so its outcome can be reported reliably.
+
 `pi mcp logout NAME --local` requires a server defined in the trusted project
 configuration and removes credentials for that server URL. A partial project
 override retains the global server's scope and does not satisfy `--local`.
