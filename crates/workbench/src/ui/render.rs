@@ -1783,6 +1783,13 @@ fn markdown_plain_at_depth(
             }
             Event::Start(Tag::Table(alignments)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if lists.is_empty()
+                    && lines
+                        .last()
+                        .is_some_and(|line| line.spans.iter().any(|span| !span.text.is_empty()))
+                {
+                    lines.push(Line::default());
+                }
                 table = Some(Table {
                     alignments,
                     ..Table::default()
@@ -2529,6 +2536,22 @@ mod tests {
             let source = format!("before{newline}$${newline}x^2{newline}$${newline}after");
             assert_eq!(rendered(&source, 80), ["before", "", "x²", "", "after"]);
         }
+        let source = "$$\nx = 1\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n$$\ny^2\n$$";
+        assert_eq!(
+            rendered(source, 80),
+            [
+                "$$",
+                "x = 1",
+                "",
+                "┌───┬───┐",
+                "│ A │ B │",
+                "├───┼───┤",
+                "│ 1 │ 2 │",
+                "└───┴───┘",
+                "",
+                "y²"
+            ]
+        );
     }
 
     #[test]
