@@ -16,6 +16,8 @@ pub(super) mod strike;
 mod system_theme;
 mod system_theme_color;
 mod system_theme_data;
+#[cfg(any(unix, windows))]
+pub(super) mod terminal_color_batch;
 pub mod theme;
 pub mod transcript_search;
 pub mod viewport;
