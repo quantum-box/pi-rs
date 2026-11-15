@@ -1240,7 +1240,7 @@ async fn run_worker(
                     ))
                     .await?;
                 }
-                Request::McpStatus => runtime.mcp_status(&args)?,
+                Request::McpStatus => runtime.mcp_status(&args).await?,
                 Request::Review {
                     child,
                     from_record,

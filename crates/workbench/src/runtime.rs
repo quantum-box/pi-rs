@@ -365,9 +365,10 @@ impl Runtime {
             limits: effective_limits(args),
         }
     }
-    pub fn mcp_status(&self, args: &Cli) -> Result<()> {
+    pub async fn mcp_status(&self, args: &Cli) -> Result<()> {
+        let configurations = mcp_config::configurations(args).await?;
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
-        for (name, value) in mcp_config::configurations(args)? {
+        for (name, value) in configurations {
             if let Some(server) = servers.iter().find(|server| server.server_name == name) {
                 output(
                     json!({"type":"mcp_server","name":name,"status":"connected","tools":server.tool_count(),"description":server.description}),
@@ -404,17 +405,21 @@ impl Runtime {
             challenge,
         }) = self.mcp_sign_in.front().cloned()
         {
-            let current = || {
-                mcp_config::configurations(args)?
-                    .remove(&name)
-                    .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
-                    .transpose()
-                    .map_err(pi_rs::Error::from)
+            let current = || async {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(pi_rs::Error::Cancelled),
+                    result = mcp_config::configurations(args) => result?
+                        .remove(&name)
+                        .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
+                        .transpose()
+                        .map_err(pi_rs::Error::from),
+                }
             };
             if args
                 .disable_extension
                 .contains(&format!("mcp-{}", name.replace('-', "_")))
-                || current()?.as_ref() != Some(&config)
+                || current().await?.as_ref() != Some(&config)
             {
                 self.mcp_sign_in.pop_front();
                 continue;
@@ -438,7 +443,7 @@ impl Runtime {
             }
             let url = config.url.as_deref().expect("OAuth requires HTTP");
             let result = async {
-                if current()?.as_ref() != Some(&config) {
+                if current().await?.as_ref() != Some(&config) {
                     return Err(pi_rs::Error::Config(
                         "MCP configuration changed before sign-in".into(),
                     ));
@@ -453,7 +458,7 @@ impl Runtime {
                     |_| {},
                 )
                 .await?;
-                if current()?.as_ref() != Some(&config) {
+                if current().await?.as_ref() != Some(&config) {
                     return Err(pi_rs::Error::Config(
                         "MCP configuration changed during sign-in".into(),
                     ));
@@ -471,6 +476,7 @@ impl Runtime {
             self.mcp_sign_in.pop_front();
             let extension = match result {
                 Ok(extension) => Arc::new(extension),
+                Err(pi_rs::Error::Cancelled) => return Err(pi_rs::Error::Cancelled),
                 Err(error) => {
                     eprintln!("MCP {name}: {error}");
                     continue;

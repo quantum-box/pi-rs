@@ -792,8 +792,10 @@ Login selects the effective trusted-project server by default; `--local` require
 a project definition, not a partial override. After authorization, pi-rs checks
 both configurations before saving credentials and updates the layer that supplies
 `oauth` when needed. Its MCP configuration writers share a user-directory gate;
-external editors and older versions do not honor that gate. A project lock file is
-needed only when the project configuration must be updated. Configuration and
+configuration readers wait for finalization before taking their snapshot and
+release the gate before connecting. External editors and older versions do not
+honor that gate. A project lock file is needed only when the project configuration
+must be updated. Configuration and
 credentials are separate files. If credential persistence reports failure after
 a config update, pi-rs attempts to restore the prior OAuth setting while holding
 its locks, provided authentication configuration has not changed. A rollback

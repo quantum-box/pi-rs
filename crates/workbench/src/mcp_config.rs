@@ -93,8 +93,8 @@ pub struct McpOAuthAddOptions {
     oauth_client_registration: Option<String>,
 }
 
-pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
-    Ok(configurations_with_project_scope(args, false)?.0)
+pub async fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    Ok(configurations_with_project_scope(args, false).await?.0)
 }
 
 type ScopedConfigurations = (
@@ -112,7 +112,10 @@ fn valid_server_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
 }
 
-fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
+async fn configurations_with_project_scope(
+    args: &Cli,
+    strict: bool,
+) -> Result<ScopedConfigurations> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok((
             BTreeMap::new(),
@@ -122,6 +125,9 @@ fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedC
             Vec::new(),
         ));
     }
+    // Do not observe a configuration between OAuth enablement and credential
+    // persistence. Release the gate before connecting or acquiring credentials.
+    let _guard = mcp_write_guard(None, None).await?;
     let mut configuration_errors = Vec::new();
     let user_path = config::agent_dir().join("mcp.json");
     let user = match config::read_object(&user_path) {
@@ -671,7 +677,7 @@ pub(super) struct PendingSignIn {
 pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Result<Discovery> {
     let mut normalized = BTreeSet::new();
     let mut pending = Vec::new();
-    for (name, value) in configurations(args)? {
+    for (name, value) in configurations(args).await? {
         if !normalized.insert(name.replace('-', "_")) {
             if report {
                 output(
@@ -838,7 +844,7 @@ async fn list_json(args: &Cli) -> Result<()> {
 
     let mut errors = Vec::new();
     let (servers, project_definitions, project_overrides, order, config_errors) =
-        match configurations_with_project_scope(args, true) {
+        match configurations_with_project_scope(args, true).await {
             Ok(configurations) => configurations,
             Err(error) => {
                 errors.push(error.to_string());
@@ -997,7 +1003,8 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             return list_json(args).await;
         }
         McpCommand::List { json: false } => {
-            let expected = configurations(args)?
+            let expected = configurations(args)
+                .await?
                 .values()
                 .filter(|value| value["enabled"] != false)
                 .count();
@@ -1200,13 +1207,16 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             let deadline = tokio::time::Instant::now()
                 .checked_add(timeout)
                 .ok_or_else(|| Error::Config("--timeout is too large".into()))?;
-            let user = config::read_object(&path(args, false))?;
-            let project = if args.trusted {
-                Some(config::read_object(&path(args, true))?)
-            } else {
-                None
+            let snapshot = tokio::select! {
+                biased;
+                _ = args.mcp_login_cancel.cancelled() => return Err(Error::Cancelled),
+                result = tokio::time::timeout_at(deadline, async {
+                    let _guard = mcp_write_guard(None, None).await?;
+                    let user = config::read_object(&path(args, false))?;
+                    let project = if args.trusted { Some(config::read_object(&path(args, true))?) } else { None };
+                    login_snapshot(&user, project.as_ref(), &name, local)
+                }) => result.map_err(|_| Error::Config("MCP login timed out".into()))??,
             };
-            let snapshot = login_snapshot(&user, project.as_ref(), &name, local)?;
             let server = &snapshot.server;
             if let Some(auth) = &server.auth {
                 return Err(Error::Config(format!(
@@ -1294,7 +1304,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
         }
         McpCommand::Logout { name, local } => {
             let (servers, project_definitions, _, _, _) =
-                configurations_with_project_scope(args, false)?;
+                configurations_with_project_scope(args, false).await?;
             if local && !project_definitions.contains(&name) {
                 return Err(Error::Config(format!(
                     "MCP server {name} is not configured in the trusted project"
