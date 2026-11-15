@@ -427,65 +427,6 @@ async fn abort_cancels_and_joins_live_poll_without_replay_after_reopen() {
     s.shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn selected_extension_prevents_automatic_poll_and_replay_across_reopen() {
-    use pi_rs_durable::extension::{Extension, Registry};
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db");
-    let pc = Arc::new(AtomicUsize::new(0));
-    let started = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let parent = Arc::new(KeyedToolAdapter::new(Parent(pc.clone())));
-    let child = Arc::new(HangingChild {
-        started: started.clone(),
-        active,
-    });
-    let mut extensions = Registry::default();
-    extensions
-        .install(Extension {
-            name: "selected".into(),
-            ..Default::default()
-        })
-        .unwrap();
-    let mut s = Scheduler::open_with_extensions(
-        &path,
-        hanging_options(parent.clone(), child.clone()),
-        extensions.clone(),
-    )
-    .unwrap();
-    let id = s
-        .create_conversation(Config {
-            model: "test".into(),
-            system_prompt: "".into(),
-            max_output_tokens: 100,
-        })
-        .unwrap();
-    s.select_extensions(id, vec!["selected".into()]).unwrap();
-    s.submit(id, None, "work".into()).unwrap();
-    wait(&mut s, id).await;
-    let root = s.blocked(id).unwrap().unwrap().0;
-    assert!(!s.conversation(id).unwrap().nested_suspended());
-    assert_eq!(started.load(Ordering::SeqCst), 0);
-    let job = s.nested_pending_jobs(id, root).unwrap().pop().unwrap();
-    s.shutdown().await.unwrap();
-    let mut s =
-        Scheduler::open_with_extensions(&path, hanging_options(parent, child), extensions).unwrap();
-    wait(&mut s, id).await;
-    s.reconcile_nested_pending(
-        id,
-        root,
-        job.operation_id,
-        &job.reference,
-        Outcome::Succeeded("done".into()),
-    )
-    .unwrap();
-    wait(&mut s, id).await;
-    assert!(s.blocked(id).unwrap().is_some());
-    assert_eq!(pc.load(Ordering::SeqCst), 1);
-    assert_eq!(started.load(Ordering::SeqCst), 0);
-    s.shutdown().await.unwrap();
-}
-
 struct FileChild(std::path::PathBuf);
 #[async_trait]
 impl Tool for FileChild {
@@ -519,7 +460,10 @@ impl Tool for FileChild {
         std::future::pending().await
     }
 }
-fn file_options(parent: Arc<KeyedToolAdapter<Parent>>, root: &std::path::Path) -> Options {
+fn file_options<T: KeyedTool + 'static>(
+    parent: Arc<KeyedToolAdapter<T>>,
+    root: &std::path::Path,
+) -> Options {
     Options {
         model: Arc::new(ModelStub),
         tools: vec![
@@ -600,5 +544,548 @@ async fn killed_suspended_poller_reopens_and_wakes_without_child_redispatch() {
             .iter()
             .any(|m| matches!(m, Message::Tool {content, ..} if content == "after-kill"))
     );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct OrderedHooks {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+struct OrderedParent {
+    calls: Arc<AtomicUsize>,
+    hooks: Arc<std::sync::Mutex<Vec<String>>>,
+}
+#[async_trait]
+impl KeyedTool for OrderedParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if self.calls.load(Ordering::SeqCst) > 0 {
+            assert_eq!(*self.hooks.lock().unwrap(), vec!["legacy", "rich"]);
+        }
+        Parent(self.calls.clone())
+            .invoke(args, context, state, host)
+            .await
+    }
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for OrderedHooks {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        self.calls.lock().unwrap().push("legacy".into());
+        Ok(Some(Value::String(format!(
+            "legacy:{}",
+            result.as_str().unwrap()
+        ))))
+    }
+    async fn after_tool_result(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        result: &pi_rs_durable::extension::ToolResult,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<pi_rs_durable::extension::ToolResult>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        self.calls.lock().unwrap().push("rich".into());
+        let mut result = result.clone();
+        result.output = format!("rich:{}", result.output);
+        Ok(Some(result))
+    }
+}
+fn hook_registry(
+    hook: Arc<dyn pi_rs_durable::extension::Hook>,
+) -> pi_rs_durable::extension::Registry {
+    let mut registry = pi_rs_durable::extension::Registry::default();
+    registry
+        .install(pi_rs_durable::extension::Extension {
+            name: "hooks".into(),
+            hooks: vec![hook],
+            ..Default::default()
+        })
+        .unwrap();
+    registry
+}
+#[tokio::test]
+async fn selected_extension_runs_nested_hooks_in_order_before_automatic_parent_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let parent_calls = Arc::new(AtomicUsize::new(0));
+    let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let parent = Arc::new(KeyedToolAdapter::new(OrderedParent {
+        calls: parent_calls.clone(),
+        hooks: hooks.clone(),
+    }));
+    let registry = hook_registry(Arc::new(OrderedHooks {
+        calls: hooks.clone(),
+    }));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), file_options(parent, root), registry)
+            .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(*hooks.lock().unwrap(), vec!["legacy", "rich"]);
+    assert_eq!(parent_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        scheduler.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, Message::Tool {content,..} if content == "rich:legacy:after-kill")
+        )
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct PauseHook {
+    entered: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl pi_rs_durable::extension::Hook for PauseHook {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        _: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name == "child" {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActivePoll(self.active.clone());
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        Ok(None)
+    }
+}
+#[tokio::test]
+async fn abort_joins_nested_result_hook_and_never_publishes_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let entered = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(Arc::new(AtomicUsize::new(0)))));
+    let registry = hook_registry(Arc::new(PauseHook {
+        entered: entered.clone(),
+        active: active.clone(),
+    }));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), file_options(parent, root), registry)
+            .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(
+        !scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "after-kill"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+struct FileHook(std::path::PathBuf);
+#[async_trait]
+impl pi_rs_durable::extension::Hook for FileHook {
+    async fn after_tool(
+        &self,
+        call: &pi_rs_durable::extension::ToolCall,
+        _: &Value,
+        context: &pi_rs_durable::extension::Context<'_>,
+    ) -> Result<Option<Value>, String> {
+        if call.name != "child" {
+            return Ok(None);
+        }
+        use std::io::Write;
+        let snapshot = serde_json::to_vec(context.snapshot).unwrap();
+        let snapshot_path = self.0.join("hook-snapshot");
+        if snapshot_path.exists() {
+            assert_eq!(std::fs::read(snapshot_path).unwrap(), snapshot);
+        } else {
+            std::fs::write(snapshot_path, snapshot).unwrap();
+        }
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("hook-attempts"))
+                .unwrap(),
+            "attempt"
+        )
+        .unwrap();
+        if !self.0.join("release-hook").exists() {
+            std::fs::write(self.0.join("hook-entered"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        Ok(Some(Value::String("hook-finished".into())))
+    }
+}
+#[tokio::test]
+async fn nested_hook_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_HOOK_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(Arc::new(AtomicUsize::new(0)))));
+    let registry = hook_registry(Arc::new(FileHook(root.clone())));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), file_options(parent, &root), registry)
+            .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_nested_result_hook_replays_staged_result_without_child_redispatch() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_hook_kill_worker"])
+            .env("PI_NESTED_HOOK_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("hook-entered").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("release-hook"), b"ready").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let parent = Arc::new(KeyedToolAdapter::new(Parent(calls.clone())));
+    let registry = hook_registry(Arc::new(FileHook(root.into())));
+    let mut scheduler =
+        Scheduler::open_with_extensions(root.join("db"), file_options(parent, root), registry)
+            .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content,..} if content == "hook-finished"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_extension_runs_hooks_for_every_automatically_polled_child() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let pc = Arc::new(AtomicUsize::new(0));
+    let cc = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let parent = Arc::new(KeyedToolAdapter::new(MultiParent(pc.clone())));
+    let child = Arc::new(AutoChild {
+        invoked: cc.clone(),
+        polls,
+        ready_a: Arc::new(AtomicBool::new(true)),
+        ready_b: Arc::new(AtomicBool::new(true)),
+    });
+    let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = hook_registry(Arc::new(OrderedHooks {
+        calls: hooks.clone(),
+    }));
+    let mut scheduler = Scheduler::open_with_extensions(
+        dir.path().join("db"),
+        multi_options(parent, child),
+        registry,
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        *hooks.lock().unwrap(),
+        vec!["legacy", "rich", "legacy", "rich"]
+    );
+    assert_eq!(cc.load(Ordering::SeqCst), 2);
+    assert_eq!(pc.load(Ordering::SeqCst), 2);
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(
+        |m| matches!(m,Message::Tool {content,..} if content == "rich:legacy:a,rich:legacy:b")
+    ));
+    scheduler.shutdown().await.unwrap();
+}
+
+struct PauseAfterChild(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for PauseAfterChild {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let result = host
+            .call_keyed_unpolled("child-key", "child", json!({}))
+            .await;
+        if matches!(result, Outcome::Pending { .. }) {
+            host.suspend_pending().unwrap();
+            return Outcome::Succeeded("discarded".into()).into();
+        }
+        if !self.0.join("release-parent").exists() {
+            std::fs::write(self.0.join("parent-after-child"), b"ready").unwrap();
+            std::future::pending::<()>().await;
+        }
+        result.into()
+    }
+}
+fn pause_parent_options(root: &std::path::Path) -> Options {
+    let parent = Arc::new(KeyedToolAdapter::new(PauseAfterChild(root.into())));
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            parent.register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(FileChild(root.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+#[tokio::test]
+async fn nested_after_hook_kill_worker() {
+    let Some(root) = std::env::var_os("PI_NESTED_AFTER_HOOK_KILL_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    std::fs::write(root.join("release-hook"), b"ready").unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        pause_parent_options(&root),
+        hook_registry(Arc::new(FileHook(root.clone()))),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    std::fs::write(root.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn killed_parent_after_hook_does_not_repeat_completed_nested_hook() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "nested_after_hook_kill_worker"])
+            .env("PI_NESTED_AFTER_HOOK_KILL_DIR", root)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| root.join("parent-after-child").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(root.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(root.join("release-parent"), b"ready").unwrap();
+    let mut scheduler = Scheduler::open_with_extensions(
+        root.join("db"),
+        pause_parent_options(root),
+        hook_registry(Arc::new(FileHook(root.into()))),
+    )
+    .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("hook-attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Tool {content,..} if content == "hook-finished"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct OverrideParent(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for OverrideParent {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Succeeded("unexpected".into())
+    }
+}
+#[tokio::test]
+async fn selected_extension_override_fences_parent_replay() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let parent_calls = Arc::new(AtomicUsize::new(0));
+    let child_calls = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let a = Arc::new(AtomicBool::new(false));
+    let b = Arc::new(AtomicBool::new(false));
+    let parent = Arc::new(KeyedToolAdapter::new(MultiParent(parent_calls.clone())));
+    let child = Arc::new(AutoChild {
+        invoked: child_calls,
+        polls: polls.clone(),
+        ready_a: a.clone(),
+        ready_b: b.clone(),
+    });
+    let hooks = Arc::new(OrderedHooks {
+        calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let mut scheduler = Scheduler::open_with_extensions(
+        dir.path().join("db"),
+        multi_options(parent, child),
+        hook_registry(hooks.clone()),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler
+        .select_extensions(id, vec!["hooks".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| polls.load(Ordering::SeqCst) >= 2).await;
+    let override_calls = Arc::new(AtomicUsize::new(0));
+    scheduler
+        .install_extension(pi_rs_durable::extension::Extension {
+            name: "hooks".into(),
+            tools: vec![Arc::new(OverrideParent(override_calls.clone()))],
+            hooks: vec![hooks],
+            ..Default::default()
+        })
+        .unwrap();
+    a.store(true, Ordering::SeqCst);
+    b.store(true, Ordering::SeqCst);
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_some());
+    assert_eq!(parent_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(override_calls.load(Ordering::SeqCst), 0);
     scheduler.shutdown().await.unwrap();
 }

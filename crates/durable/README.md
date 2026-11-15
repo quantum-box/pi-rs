@@ -368,8 +368,12 @@ Selected extensions may provide tools and before/after-tool hooks. The runtime
 commits terminal tool output and state before invoking after-tool hooks; a crash
 replays the hook with the same operation memo, not the completed tool. Hook
 callbacks can run more than once and must memoize or make external effects
-idempotent. Extension tools are conservatively unsafe to replay, and recovery
-with selected extensions also avoids replaying potentially overridden host tools.
+idempotent. For an explicitly suspended replay-safe keyed parent, pollable
+children commit their result and finish selected nested result hooks before the
+parent wakes, including after reopening. The child hook uses its stored snapshot
+and memo; interrupted hooks may repeat. Extension tools are conservatively unsafe
+to replay, and a selected extension overriding the parent prevents this replay.
+The host must retain the same extension and tool semantics across recovery.
 The runtime supports before-request message replacement and observes completed
 responses. Non-string after-tool replacements are ignored without reporting. After-tools receives the completed round's calls; after-run receives
 `{"answer": ...}` after the answer and submission settlement are committed.

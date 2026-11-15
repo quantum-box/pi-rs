@@ -8273,6 +8273,34 @@ impl Harness {
                     replay_ready,
                     dispatch_identity: stored_identity,
                 } => {
+                    // An explicit suspended replay retains its marker until the
+                    // parent finishes. Registry installation happens after open,
+                    // so park it again and validate the selected tools on drive.
+                    let panic_key = format!(
+                        "runtime/extension-report/{id}/{operation_id}/tool_execution_panic"
+                    );
+                    let panicked = self.owner.store().get(panic_key.as_bytes())?.is_some();
+                    if !c.extensions.is_empty()
+                        && !panicked
+                        && replay == ReplayPolicy::Safe
+                        && c.nested_resume.as_ref().is_some_and(|resume| {
+                            resume.explicit_suspend && resume.operation_id == operation_id
+                        })
+                    {
+                        c.phase = Phase::Blocked {
+                            tool_panicked: false,
+                            turns,
+                            calls,
+                            index,
+                            operation_id,
+                            reason: "interrupted suspended replay".into(),
+                            arguments: Some(arguments),
+                        };
+                        self.recovering = true;
+                        let result = self.save(&c, Expected::Version(version));
+                        self.recovering = false;
+                        return result;
+                    }
                     let n = if replay_ready {
                         restarts
                     } else {
@@ -8806,7 +8834,7 @@ impl Harness {
         Ok(Some((continuation, children, handlers)))
     }
     fn prepare_nested_resume(&self, c: &mut Conversation) -> Result<bool, Error> {
-        if c.abort_requested || !c.extensions.is_empty() {
+        if c.abort_requested {
             return Ok(false);
         }
         let Some(resume) = c.nested_resume.clone() else {
@@ -8835,16 +8863,23 @@ impl Harness {
         if !model_tool_selected(c, &call.name) {
             return Ok(false);
         }
-        let Some(reg) = self.tools.get(&call.name) else {
+        let tools = self.resolved_tools(c)?;
+        let Some(reg) = tools.get(&call.name) else {
             return Ok(false);
         };
         if reg.replay != ReplayPolicy::Safe
             || dispatch_identity(&reg.tool).ok() != Some(resume.dispatch_identity.clone())
+            || (resume.explicit_suspend
+                && crate::nested::has_staged_results(self.owner.store(), operation_id)?)
             || !crate::nested::resolved_for_replay(self.owner.store(), operation_id)?
         {
             return Ok(false);
         }
-        c.nested_resume = None;
+        if resume.explicit_suspend && !c.extensions.is_empty() {
+            c.nested_resume.as_mut().unwrap().restarts = resume.restarts.saturating_add(1);
+        } else {
+            c.nested_resume = None;
+        }
         c.phase = Phase::ToolRunning {
             turns,
             calls,
@@ -10771,6 +10806,7 @@ impl Harness {
                                                 snapshot: serde_json::to_value(&c)?,
                                                 conversation: c.id,
                                                 storage_failed: self.storage_failed.clone(),
+                                                conversation_fence: None,
                                             })
                                         },
                                     ),
@@ -10925,6 +10961,9 @@ impl Harness {
                         self.failed = true;
                         return Err(Error::Interrupted);
                     }
+                    if !matches!(reply.outcome, Outcome::Unknown(_)) {
+                        c.nested_resume = None;
+                    }
                     if let Some(state) = reply.state {
                         c.tool_states.insert(call.name.clone(), state);
                     }
@@ -10961,7 +11000,7 @@ impl Harness {
                             c.nested_resume = if nested_resume_candidate
                                 && replay == ReplayPolicy::Safe
                                 && restarts.saturating_add(1) < self.options.restart_limit
-                                && c.extensions.is_empty()
+                                && (c.extensions.is_empty() || explicitly_suspended)
                                 && stored_identity == Some(DispatchIdentity::Other)
                             {
                                 Some(NestedResume {
@@ -13950,7 +13989,7 @@ async fn poll_suspended_nested(
         guard = control.nested_poll.lock() => guard,
     };
     let (state, version) = worker.load(id)?;
-    if state.abort_requested || !state.nested_suspended() || !state.extensions.is_empty() {
+    if state.abort_requested || !state.nested_suspended() {
         return Ok(false);
     }
     let Phase::Blocked { operation_id, .. } = &state.phase else {
@@ -13958,6 +13997,56 @@ async fn poll_suspended_nested(
     };
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
+        if crate::nested::has_staged_results(worker.owner.store(), *operation_id)? {
+            if state.extensions.is_empty() {
+                return Ok(false);
+            }
+            let host = crate::nested::NestedHost::new_with_schemas(
+                worker.owner.clone(),
+                *operation_id,
+                worker
+                    .resolved_tools(&state)?
+                    .into_iter()
+                    .filter(|(name, reg)| {
+                        caller_allowed(&state, name, false)
+                            && !crate::tool_search::is_search(&reg.tool)
+                    })
+                    .map(|(_, reg)| reg)
+                    .collect(),
+                cancel.child_token(),
+                Duration::from_secs(120),
+                8,
+                (
+                    state.tool_filters.output_schemas.clone(),
+                    Some(crate::nested::NestedHooks {
+                        selected: worker.selected_extensions(&state)?,
+                        snapshot: serde_json::to_value(&state)?,
+                        conversation: id,
+                        storage_failed: worker.storage_failed.clone(),
+                        conversation_fence: Some((Harness::key(id), version)),
+                    }),
+                ),
+            )
+            .map_err(|error| Error::Invalid(format!("nested hook host: {error}")))?;
+            return match fenced_poll(
+                host.finish_staged_results(),
+                worker.execution_gate.as_ref(),
+                cancel,
+            )
+            .await
+            {
+                Some(Ok(())) => Ok(true),
+                None => Ok(false),
+                Some(Err(error)) => {
+                    let (_, current) = worker.load(id)?;
+                    if current != version {
+                        Ok(true)
+                    } else {
+                        Err(Error::Invalid(error))
+                    }
+                }
+            };
+        }
         return worker.prepare_nested_resume(&mut state.clone());
     }
     let tools = worker.resolved_tools(&state)?;
@@ -13969,7 +14058,6 @@ async fn poll_suspended_nested(
         if !caller_allowed(&state, job.name(), false)
             || reg.replay != job.policy()
             || !reg.tool.can_poll()
-            || job.requires_hooks()
         {
             continue;
         }

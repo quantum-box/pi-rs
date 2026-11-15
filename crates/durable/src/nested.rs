@@ -41,6 +41,8 @@ struct Record {
     staged_outcome: Option<Outcome>,
     #[serde(default)]
     hooks_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hook_snapshot: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<crate::runtime::ToolDiagnostic>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -86,9 +88,6 @@ impl PendingPoll {
     pub(crate) fn policy(&self) -> ReplayPolicy {
         self.record.policy
     }
-    pub(crate) fn requires_hooks(&self) -> bool {
-        self.record.hooks_required
-    }
     pub(crate) fn operation(&self) -> Uuid {
         self.record.operation_id
     }
@@ -107,20 +106,24 @@ impl PendingPoll {
         outcome: Outcome,
         schemas: &std::collections::BTreeMap<String, Value>,
     ) -> Result<(), crate::runtime::Error> {
-        if self.record.hooks_required {
-            return Err(crate::runtime::Error::Invalid(
-                "nested result hooks require reconciliation".into(),
-            ));
-        }
         if matches!(outcome, Outcome::Unknown(_)) {
             return Err(crate::runtime::Error::Invalid(
                 "uncertain nested poll".into(),
             ));
         }
         let reference = self.reference().to_owned();
-        let outcome = validate_nested_output(schemas, &self.record.name, outcome);
+        let outcome = if self.record.hooks_required {
+            outcome
+        } else {
+            validate_nested_output(schemas, &self.record.name, outcome)
+        };
         let mut record = self.record;
-        record.outcome = Some(outcome.clone());
+        if !matches!(outcome, Outcome::Pending { .. }) && record.hooks_required {
+            record.staged_outcome = Some(outcome.clone());
+            record.outcome = None;
+        } else {
+            record.outcome = Some(outcome.clone());
+        }
         if !matches!(outcome, Outcome::Pending { .. }) {
             record.resolution = Some(Resolution {
                 reference,
@@ -203,6 +206,19 @@ pub(crate) fn resolved_for_replay(
         resolved |= record.resolution.is_some();
     }
     Ok(resolved)
+}
+
+pub(crate) fn has_staged_results(
+    store: &durable_store::Store,
+    root: Uuid,
+) -> Result<bool, crate::runtime::Error> {
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.staged_outcome.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn resolve_pending(
@@ -328,6 +344,7 @@ pub(crate) struct NestedHooks {
     pub snapshot: Value,
     pub conversation: Uuid,
     pub storage_failed: Arc<AtomicBool>,
+    pub conversation_fence: Option<(Vec<u8>, u64)>,
 }
 struct NestedDiagnostic {
     shared: Arc<Shared>,
@@ -995,6 +1012,11 @@ impl NestedHost {
                 outcome: None,
                 staged_outcome: None,
                 hooks_required: self.shared.hooks.is_some(),
+                hook_snapshot: self
+                    .shared
+                    .hooks
+                    .as_ref()
+                    .map(|hooks| hooks.snapshot.clone()),
                 diagnostics: Vec::new(),
                 diagnostic_keys: Default::default(),
                 resolution: None,
@@ -1155,6 +1177,25 @@ impl NestedHost {
         validate_nested_output(&self.shared.output_schemas, name, outcome)
     }
 
+    /// Finalize staged children before waking their suspended parent.
+    pub(crate) async fn finish_staged_results(&self) -> Result<(), String> {
+        for (key, entry) in self
+            .shared
+            .owner
+            .store()
+            .list(&self.prefix())
+            .map_err(|e| e.to_string())?
+        {
+            let record: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            if record.staged_outcome.is_some()
+                && matches!(self.finish_staged(&key, record).await, Outcome::Unknown(_))
+            {
+                return Err("nested result hook did not complete".into());
+            }
+        }
+        Ok(())
+    }
+
     async fn finish_staged(&self, key: &[u8], mut record: Record) -> Outcome {
         let Some(hooks) = &self.shared.hooks else {
             return self.fail("nested result hooks unavailable for staged outcome");
@@ -1172,7 +1213,7 @@ impl NestedHost {
             hooks.storage_failed.clone(),
         );
         let context = crate::extension::Context {
-            snapshot: &hooks.snapshot,
+            snapshot: record.hook_snapshot.as_ref().unwrap_or(&hooks.snapshot),
             memo: &memo,
         };
         let output = original.tool_content();
@@ -1266,11 +1307,18 @@ impl NestedHost {
             Ok(value) => value,
             Err(error) => return self.fail(error.to_string()),
         };
+        let mut checks = vec![Check {
+            key: key.to_vec(),
+            expected: Expected::Version(entry.version),
+        }];
+        if let Some((key, version)) = &hooks.conversation_fence {
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Version(*version),
+            });
+        }
         if let Err(error) = self.shared.owner.store().commit(
-            &[Check {
-                key: key.to_vec(),
-                expected: Expected::Version(entry.version),
-            }],
+            &checks,
             &[Mutation::Put {
                 key: key.to_vec(),
                 value,
@@ -1472,6 +1520,7 @@ mod tests {
             }),
             staged_outcome: None,
             hooks_required: false,
+            hook_snapshot: None,
             diagnostics: Vec::new(),
             diagnostic_keys: Default::default(),
             resolution: None,

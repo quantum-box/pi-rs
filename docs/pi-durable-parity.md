@@ -392,22 +392,28 @@ An opt-in keyed parent can instead call `call_keyed_unpolled` and then
 `suspend_pending`. Once its invocation has returned and the nested host has
 sealed and joined local calls, the existing blocked-operation transition
 persists an explicit suspension marker and releases the conversation worker.
-For a replay-safe parent without selected extensions, the scheduler polls
+For a replay-safe parent, including one with selected extensions, the scheduler polls
 pending children whose registered tools opt in to polling, commits their results
 with conversation and child version checks, and automatically replays the
 parent after all children have terminal results. Polling releases the parent
 conversation worker; process-local poll rounds are serialized, while children
 in a round are polled concurrently. Reopen resumes polling without redispatching
 the accepted jobs. Abort fences polling and replay and retains unresolved
-references for reconciliation. Selected extensions still prevent creating an
-automatic replay candidate, including after reopening or a manually confirmed
-child result; extension hooks do not yet have a replay fence for this path.
-Automatic polling also rejects records that require result hooks. A process-kill
-test reopens a suspended poll and verifies automatic parent wake without
-redispatching the accepted child.
-As with existing nested reattachment, the host must preserve tool registration
-semantics across reopen; the journal checks the name and replay policy, not a
-versioned implementation identity.
+references for reconciliation. With selected extensions, a terminal child result
+is staged before the ordered legacy and rich result hooks run; their committed
+result is visible before the parent wakes. The hook receives the persisted
+invocation snapshot and stable child memo. A crash during a hook can repeat it,
+so external hook effects require idempotency or memoization; a completed hook
+result is not repeated when the parent subsequently restarts. The host must
+preserve extension and tool registration semantics across reopen; the journal
+does not bind a versioned implementation identity. Extension-provided tools
+remain unsafe for replay, and an extension override of the parent prevents
+automatic parent replay. Process-kill tests cover polling, interrupted hooks,
+and a parent killed after its child's hook committed.
+Older blocked records that never committed an explicit suspension marker are
+not inferred to be safe to replay. Nested results still use the legacy and rich
+result hooks; the newer ordered block-aware hook chain is not wired for nested
+results.
 This is a restricted external-pending-job bridge: it does not start an
 independent task, cancel a remote job, store a tool checkpoint, implement
 wait-any, or connect the private `nested_suspension` protocol to `TaskTool`.
