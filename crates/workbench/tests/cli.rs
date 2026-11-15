@@ -167,6 +167,13 @@ fn worker_returns_keyed_share_journal_tag() {
         .append_user_with_images("fixture 🌸\nsecond".into(), Vec::new(), None)
         .unwrap();
     drop(session);
+    let foreign = root.path().join("foreign.jsonl");
+    std::fs::copy(&path, &foreign).unwrap();
+    let mut other = Session::open(&foreign).unwrap();
+    other
+        .append_user_with_images("foreign continuation".into(), Vec::new(), None)
+        .unwrap();
+    drop(other);
     let stderr = tempfile::NamedTempFile::new().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
@@ -207,6 +214,21 @@ fn worker_returns_keyed_share_journal_tag() {
         }
     });
     let key = [37u8; 32];
+    writeln!(input, "{}", json!({"id":"foreign", "type":"get_share_context", "session":foreign, "journal_key":key, "include_journal":true})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let denied = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["id"] == "foreign" {
+            break event;
+        }
+    };
+    assert_eq!(
+        denied["success"], false,
+        "worker accepted another path: {denied}"
+    );
     writeln!(
         input,
         "{}",
