@@ -1917,10 +1917,10 @@ impl Harness {
             }
         });
         for name in &c.tool_filters.model_add {
-            if !c.tool_filters.model_excluded.contains(name) {
-                if let Some(spec) = deferred.remove(name) {
-                    specs.push(spec);
-                }
+            if !c.tool_filters.model_excluded.contains(name)
+                && let Some(spec) = deferred.remove(name)
+            {
+                specs.push(spec);
             }
         }
         Ok(specs)
@@ -7410,7 +7410,7 @@ impl Harness {
         let Some(call) = calls.get(index) else {
             return Ok(false);
         };
-        if !model_tool_selected(&c, &call.name) {
+        if !model_tool_selected(c, &call.name) {
             return Ok(false);
         }
         let Some(reg) = self.tools.get(&call.name) else {
