@@ -25,6 +25,7 @@ pub struct Span {
     pub text: String,
     // Search-only text may retain U+0085; `text` is always terminal-safe.
     search_text: Option<String>,
+    base_text: bool,
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
@@ -42,6 +43,7 @@ impl Span {
         Self {
             text: clean(&text),
             search_text,
+            base_text: false,
             color,
             background: None,
             bold: false,
@@ -82,6 +84,7 @@ impl Span {
     }
     pub(super) fn themed(text: impl Into<String>, theme: &Theme, role: &str) -> Self {
         let mut span = Self::new(text, theme.color(role));
+        span.base_text = role == "text";
         span.dim = theme.is_dim(role);
         span
     }
@@ -385,12 +388,7 @@ impl Entry {
                 lines.push(Line::default());
                 let mut body =
                     markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
-                for span in body.iter_mut().flat_map(|line| &mut line.spans) {
-                    if span.color == theme.color("text") && !span.dim {
-                        span.color = theme.color("customMessageText");
-                        span.dim = theme.is_dim("customMessageText");
-                    }
-                }
+                custom_message_base_style(&mut body, theme);
                 lines.extend(body);
                 lines.push(Line::default());
                 for line in &mut lines {
@@ -576,6 +574,14 @@ impl Entry {
             }
         }
         lines
+    }
+}
+fn custom_message_base_style(lines: &mut [Line], theme: &Theme) {
+    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+        if span.base_text {
+            span.color = theme.color("customMessageText");
+            span.dim = theme.is_dim("customMessageText");
+        }
     }
 }
 
@@ -1768,9 +1774,10 @@ fn markdown_at_depth(
                 for mut line in quoted {
                     for span in &mut line.spans {
                         span.italic = true;
-                        if span.color == theme.color("text") && !span.dim {
+                        if span.base_text {
                             span.color = theme.color("mdQuote");
                             span.dim = theme.is_dim("mdQuote");
+                            span.base_text = false;
                         }
                     }
                     if bordered {
@@ -1875,6 +1882,7 @@ fn markdown_at_depth(
                             let mut link = span.clone();
                             link.set_source(&label);
                             link.color = theme.color("mdLink");
+                            link.base_text = false;
                             link.dim = theme.is_dim("mdLink");
                             link.underline = true;
                             link.hyperlink =
@@ -2928,6 +2936,35 @@ mod tests {
             );
             assert!(!output.contains(&7));
         }
+    }
+
+    #[test]
+    fn custom_message_base_style_does_not_replace_colliding_markdown_roles() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
+        json["colors"]["mdCode"] = json["colors"]["text"].clone();
+        json["colors"]["customMessageText"] = serde_json::json!("#ff0000");
+        let theme = Theme::parse(&json.to_string(), None).unwrap();
+        let entry = Entry::CustomMessage {
+            custom_type: "x".into(),
+            text: "plain `code`".into(),
+        };
+        let lines = entry.render(&theme, 80, false, false, TranscriptOptions::default());
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans.iter().any(|span| span.text.contains("plain")
+                && span.color == theme.color("customMessageText"))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text == "code" && span.color == theme.color("mdCode"))
+        );
+        let mut dim = Line::themed("text", &theme, "text");
+        dim.spans[0].dim = true;
+        custom_message_base_style(std::slice::from_mut(&mut dim), &theme);
+        assert_eq!(dim.spans[0].color, theme.color("customMessageText"));
+        assert_eq!(dim.spans[0].dim, theme.is_dim("customMessageText"));
     }
 
     #[test]
