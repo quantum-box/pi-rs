@@ -248,7 +248,7 @@ async fn send_model_request(
     unreachable!("retry loop returns on its last attempt")
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ImageInput {
     Assets,
@@ -256,10 +256,12 @@ enum ImageInput {
     Images,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Compat {
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_input: Option<ImageInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     send_image_opt_in_header: Option<bool>,
 }
 
@@ -293,6 +295,7 @@ struct Configured {
     base_url: Option<String>,
     input: Option<Vec<String>>,
     output: Option<Vec<String>>,
+    input_limits: Option<Value>,
     context_window: Option<u32>,
     #[serde(default)]
     cost: Cost,
@@ -753,6 +756,14 @@ impl Entry {
         if let Some(window) = self.model.context_window {
             value["contextWindow"] = json!(window);
         }
+        if let Some(limits) = &self.model.input_limits {
+            value["inputLimits"] = limits.clone();
+        }
+        if self.model.compat.image_input.is_some()
+            || self.model.compat.send_image_opt_in_header.is_some()
+        {
+            value["compat"] = json!(self.model.compat);
+        }
         if self.api.kind() == Kind::Image {
             value["output"] = json!(
                 self.model
@@ -1205,6 +1216,59 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
+        let catalog = Catalogue::parse(&Map::new()).unwrap();
+        let images: Vec<_> = catalog
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "openrouter" && entry.api.kind() == Kind::Image)
+            .collect();
+        assert_eq!(
+            images
+                .iter()
+                .filter(|entry| entry.descriptor().get("inputLimits").is_some())
+                .count(),
+            63
+        );
+        let flux = images
+            .iter()
+            .find(|entry| entry.model.id == "black-forest-labs/flux-3-image")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            flux["inputLimits"]["images"]["resize"],
+            json!({"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80})
+        );
+        assert!(flux.get("headers").is_none());
+        let recraft = images
+            .iter()
+            .find(|entry| entry.model.id == "recraft/recraft-v4.1-flash")
+            .unwrap()
+            .descriptor();
+        assert!(recraft.get("inputLimits").is_none());
+        let classifier = catalog
+            .0
+            .iter()
+            .find(|entry| entry.provider == "openrouter" && entry.model.id == "~liquid/d1-latest")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            classifier["compat"],
+            json!({"imageInput":"state-image-urls","sendImageOptInHeader":false})
+        );
+        let configured = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"type":"image","id":"custom","api":"openrouter-images","headers":{"x-secret":"hidden"},"inputLimits":{"images":{"maxPerRequest":2}}}]}});
+        let custom = Catalogue::parse(configured.as_object().unwrap()).unwrap();
+        let value = custom
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap()
+            .descriptor();
+        assert_eq!(value["inputLimits"]["images"]["maxPerRequest"], 2);
+        assert!(value.get("headers").is_none());
+    }
 
     #[test]
     fn vercel_builtin_classifier_catalogue_is_endpoint_bound() {
