@@ -209,10 +209,13 @@ impl OpenAiResponses {
             _ => None,
         };
         if let Some((key, value)) = cache {
-            body.as_object_mut()
-                .expect("Responses request object")
-                .entry(key)
-                .or_insert(value);
+            let object = body.as_object_mut().expect("Responses request object");
+            // An explicitly configured cache policy takes precedence as a whole.
+            if !object.contains_key("prompt_cache_options")
+                && !object.contains_key("prompt_cache_retention")
+            {
+                object.insert(key.into(), value);
+            }
         }
     }
 
@@ -273,6 +276,14 @@ impl OpenAiResponses {
 
 /// Protect fields that control the agent's conversation, tools, and transport.
 pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
+    if sampling.contains_key("prompt_cache_options")
+        && sampling.contains_key("prompt_cache_retention")
+    {
+        return Err(Error::Config(
+            "sampling parameters cannot combine prompt_cache_options and prompt_cache_retention"
+                .into(),
+        ));
+    }
     if let Some(key) = sampling.keys().find(|key| {
         matches!(
             key.as_str(),
@@ -1334,6 +1345,25 @@ mod tests {
             .with_cache_retention(CacheRetention::Long, false)
             .apply_cache(&mut body);
         assert_eq!(body["prompt_cache_retention"], "user");
+        let mut body = json!({"prompt_cache_retention":"24h"});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, true)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_retention":"24h"}));
+        let mut body = json!({"prompt_cache_options":{"mode":"explicit"}});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, false)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_options":{"mode":"explicit"}}));
+        assert!(
+            validate_sampling(&BTreeMap::from([
+                ("prompt_cache_retention".into(), json!("24h")),
+                ("prompt_cache_options".into(), json!({"ttl":"30m"})),
+            ]))
+            .is_err()
+        );
         let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
         client
             .clone()
@@ -1350,6 +1380,63 @@ mod tests {
         let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
         plan.without_cache().apply_cache(&mut body);
         assert_eq!(body, json!({}));
+    }
+
+    #[tokio::test]
+    async fn configured_cache_policy_is_sent_without_an_automatic_alternative() {
+        use std::io::{Read, Write};
+        for (explicit, key, value) in [
+            (true, "prompt_cache_retention", json!("24h")),
+            (false, "prompt_cache_options", json!({"mode":"explicit"})),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let client =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap()
+                    .with_cache_retention(CacheRetention::Long, explicit)
+                    .with_sampling(BTreeMap::from([(key.into(), value.clone())]))
+                    .unwrap();
+            let _ = client.stream(request()).await;
+            let body = server.join().unwrap();
+            assert_eq!(body[key], value);
+            let other = if explicit {
+                "prompt_cache_options"
+            } else {
+                "prompt_cache_retention"
+            };
+            assert!(body.get(other).is_none());
+        }
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
