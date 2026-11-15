@@ -3462,6 +3462,10 @@ origin. Radius sharing refreshes expiring credentials, serializes
 concurrent refreshes and saves rotated refresh tokens. A local OAuth
 fixture exercised both login methods, a rejected callback, cancellation,
 concurrent refresh, endpoint isolation, authenticated share and logout.
+Bearer-token export checks its requested minimum validity after refresh; a
+token that falls short is persisted before the command fails, preserving any
+rotated refresh token. Ordinary model, MCP and sharing requests accept a
+successfully refreshed token without imposing that export requirement.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
