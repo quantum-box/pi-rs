@@ -316,3 +316,51 @@ fn list_json_keeps_global_on_invalid_project_replacement_and_redacts_values() {
     assert_eq!(servers[5]["scope"], "project");
     assert_eq!(data["errors"].as_array().unwrap().len(), 6);
 }
+
+#[test]
+fn list_json_collision_identifies_project_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"a-b":{"command":"ignored","enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"a_b":{"command":"ignored","enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--trust", "mcp", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["servers"][0]["name"], "a-b");
+    let error = data["errors"][0].as_str().unwrap();
+    assert!(error.contains(".pi") && error.contains("mcp.json") && error.contains("a_b"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn list_json_fails_when_stdout_cannot_be_written() {
+    let root = tempfile::tempdir().unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["--no-trust", "mcp", "list", "--json"])
+        .stdout(full)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}

@@ -569,23 +569,29 @@ async fn list_json(args: &Cli) -> Result<()> {
         let Some(value) = servers.remove(&name) else {
             continue;
         };
+        let project = project_definitions.contains(&name);
+        let source = if project { &project_path } else { &global_path };
         if name.is_empty()
             || !name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
         {
-            errors.push(format!("invalid MCP server name {name}"));
+            errors.push(format!(
+                "{}: invalid MCP server name {name}",
+                source.display()
+            ));
             continue;
         }
         let config = match report_server_config(&value) {
             Some(config) => config,
             None => {
-                errors.push(format!("invalid MCP server configuration for {name}"));
+                errors.push(format!(
+                    "{}: invalid MCP server configuration for {name}",
+                    source.display()
+                ));
                 continue;
             }
         };
-        let project = project_definitions.contains(&name);
-        let source = if project { &project_path } else { &global_path };
         let transport = if let Some(command) = &config.command {
             if config.args.is_empty() {
                 command.clone()
@@ -611,7 +617,10 @@ async fn list_json(args: &Cli) -> Result<()> {
             continue;
         };
         if !normalized.insert(name.replace('-', "_")) {
-            errors.push(format!("MCP server {name} collides after normalization"));
+            errors.push(format!(
+                "{}: MCP server {name} collides after normalization",
+                source.display()
+            ));
             continue;
         }
         let enabled = config.enabled != Some(false);
@@ -682,8 +691,8 @@ async fn list_json(args: &Cli) -> Result<()> {
         ));
     }
     let mut stdout = std::io::stdout().lock();
-    let _ = serde_json::to_writer_pretty(&mut stdout, &result);
-    let _ = writeln!(stdout);
+    serde_json::to_writer_pretty(&mut stdout, &result)?;
+    writeln!(stdout)?;
     if failed {
         return Err(Error::Config(
             "one or more MCP servers failed to connect".into(),
