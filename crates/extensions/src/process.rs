@@ -2175,6 +2175,8 @@ struct DuplexRequest {
     #[serde(default)]
     has_custom_entries: bool,
     #[serde(default)]
+    has_custom_entry_read: bool,
+    #[serde(default)]
     has_keyed_messages: bool,
     #[serde(default)]
     has_prevalidated_calls: bool,
@@ -2182,6 +2184,10 @@ struct DuplexRequest {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    ListCustomEntries {
+        #[serde(default)]
+        custom_type: Option<String>,
+    },
     AppendEntry {
         entry: pi_rs_core::CustomEntry,
     },
@@ -2658,6 +2664,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                     | DuplexFrame::CheckedCall { .. }
                     | DuplexFrame::SendMessage { .. }
                     | DuplexFrame::AppendEntry { .. }
+                    | DuplexFrame::ListCustomEntries { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
             );
@@ -2675,6 +2682,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
                 has_progress: host.supports_progress(),
                 has_custom_messages: host.supports_custom_messages(),
                 has_custom_entries: host.supports_custom_entries(),
+                has_custom_entry_read: host.supports_custom_entry_read(),
                 has_keyed_messages: host.supports_keyed_messages(),
                 has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
             })
@@ -2691,6 +2699,18 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(DuplexFrame::ListCustomEntries { custom_type })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during entry lookup".to_owned()),
+                        result = host.custom_entries(custom_type.as_deref()) => result,
+                    }
+                });
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
             Ok(Ok(DuplexFrame::AppendEntry { entry })) => {
                 let response = runtime.block_on(async {
                     tokio::select! {
@@ -2789,6 +2809,7 @@ struct RemoteHost {
     has_progress: bool,
     has_custom_messages: bool,
     has_custom_entries: bool,
+    has_custom_entry_read: bool,
     entry_lifetime: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     entry_waiting: Option<std::sync::mpsc::Sender<()>>,
@@ -2835,6 +2856,35 @@ fn wire_prevalidated_calls(
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn supports_custom_entry_read(&self) -> bool {
+        self.has_custom_entry_read
+            && self
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> ExtensionResult<Vec<pi_rs_core::CustomEntryRecord>> {
+        if !self.supports_custom_entry_read() {
+            return Err("custom entry reading is unavailable".into());
+        }
+        let io = self.io.clone();
+        let lifetime = self.entry_lifetime.clone();
+        let custom_type = custom_type.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !lifetime.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("extension callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &DuplexFrame::ListCustomEntries { custom_type })?;
+            duplex_read_line::<ExtensionResult<Vec<pi_rs_core::CustomEntryRecord>>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     fn close_custom_entry_scope(&self) {
         self.entry_lifetime
             .store(false, std::sync::atomic::Ordering::Release);
@@ -3020,6 +3070,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         has_progress: request.has_progress,
         has_custom_messages: request.has_custom_messages,
         has_custom_entries: request.has_custom_entries,
+        has_custom_entry_read: request.has_custom_entry_read,
         entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         #[cfg(test)]
         entry_waiting: None,
@@ -3639,7 +3690,10 @@ async fn dispatch_inner(
                 .await,
         ),
         ProtocolRequest::DiscoverResources { event, state } => {
-            if host.supports_custom_messages() || host.supports_custom_entries() {
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
                 let result = extension
                     .discover_resources_with_host(&event, state.as_ref(), host.clone())
                     .await;
@@ -4615,6 +4669,7 @@ mod tests {
             has_progress: false,
             has_custom_messages: false,
             has_custom_entries: false,
+            has_custom_entry_read: false,
             entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             entry_waiting: None,
             has_keyed_messages: false,
@@ -5843,9 +5898,13 @@ if '--pi-rs-extension-v1' in sys.argv:
     print(json.dumps({'version':1,'response':{'Ok':result}}))
 else:
     frame=json.loads(sys.stdin.readline())
-    assert frame['has_custom_entries'] and frame['request']['type']=='discover_resources'
+    assert frame['has_custom_entries'] and frame['has_custom_entry_read'] and frame['request']['type']=='discover_resources'
+    print(json.dumps({'type':'list_custom_entries','custom_type':'fixture'}),flush=True)
+    assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'count':1}
     print(json.dumps({'type':'append_entry','entry':{'customType':'fixture','data':{'count':7}}}),flush=True)
     assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'list_custom_entries','custom_type':'fixture'}),flush=True)
+    assert [r['entry']['data']['count'] for r in json.loads(sys.stdin.readline())['Ok']]==[1,7]
     print(json.dumps({'type':'complete','response':{'Ok':{'skillPaths':[],'promptPaths':[],'themePaths':[]}}}),flush=True)
 "##).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -5854,6 +5913,12 @@ else:
         registry.register(Arc::new(extension)).unwrap();
         let mut session =
             pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "fixture".into(),
+                data: Some(serde_json::json!({"count":1})),
+            })
+            .unwrap();
         registry
             .discover_resources_in_session(
                 &pi_rs_core::ResourceDiscoveryEvent {
@@ -6823,6 +6888,7 @@ else:
             has_progress: false,
             has_custom_messages: false,
             has_custom_entries: false,
+            has_custom_entry_read: false,
             entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             entry_waiting: None,
             has_keyed_messages: false,
@@ -6869,6 +6935,7 @@ else:
             has_progress: false,
             has_custom_messages: false,
             has_custom_entries: true,
+            has_custom_entry_read: true,
             entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             entry_waiting: Some(waiting),
             has_keyed_messages: false,
