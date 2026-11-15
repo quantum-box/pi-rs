@@ -888,7 +888,7 @@ fn configure_thinking(
         })?;
     match details.thinking {
         Some(ThinkingMode::Adaptive) => {
-            body["thinking"] = json!({"type":"adaptive"});
+            body["thinking"] = json!({"type":"adaptive","display":"summarized"});
             // A model can advertise adaptive thinking without effort controls.
             if details.effort_levels {
                 body["output_config"] = json!({"effort":level});
@@ -2273,7 +2273,10 @@ mod tests {
         let mut body = json!({});
         assert!(configure_thinking(&mut body, Some(&adaptive), "off", 2048, None).is_err());
         configure_thinking(&mut body, Some(&adaptive), "high", 2048, None).unwrap();
-        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"adaptive","display":"summarized"})
+        );
         assert_eq!(body["output_config"]["effort"], "high");
 
         let legacy = decode_model(&json!({
