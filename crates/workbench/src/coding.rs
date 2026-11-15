@@ -1328,6 +1328,18 @@ pub trait EditOperations: Send + Sync {
 /// Local Pi-style edit operations; the default local tool retains atomic writes.
 pub struct LocalEditOperations;
 
+#[cfg(unix)]
+fn local_edit_access(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn open_local_edit_file(path: &Path) -> Result<std::fs::File> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(Error::Config("expected a regular file".into()));
@@ -2631,18 +2643,28 @@ impl CodingTool {
                     "Could not edit file: {display_path}. Error code: ENOENT."
                 ))
             }
+            #[cfg(unix)]
+            Error::Io(ref cause)
+                if self.unrestricted && cause.raw_os_error() == Some(libc::EACCES) =>
+            {
+                Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: EACCES."
+                ))
+            }
             error => error,
         })?;
         let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
+        #[cfg(unix)]
         if self.unrestricted {
-            open_local_edit_file(&path).map_err(|error| match error {
-                Error::Io(ref cause) if cause.kind() == std::io::ErrorKind::PermissionDenied => {
-                    Error::Config(format!(
-                        "Could not edit file: {display_path}. Error code: EACCES."
-                    ))
-                }
-                error => error,
+            local_edit_access(&path).map_err(|error| match error.raw_os_error() {
+                Some(libc::EACCES) => Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: EACCES."
+                )),
+                Some(libc::ENOENT) => Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: ENOENT."
+                )),
+                _ => error.into(),
             })?;
         }
         let original = self.text(&path)?;
@@ -4459,10 +4481,7 @@ mod tests {
         let path = root.join("readonly.txt");
         std::fs::write(&path, "before\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path);
+        let probe = local_edit_access(&path);
         let tool = CodingTool {
             root,
             unrestricted: true,
@@ -4486,6 +4505,43 @@ mod tests {
                 matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
             );
             assert_eq!(content, "before\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        std::fs::create_dir(&parent).unwrap();
+        let file = parent.join("file");
+        std::fs::write(&file, "before").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = local_edit_access(&file);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: private/file. Error code: EACCES.")
+            );
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
         }
     }
 

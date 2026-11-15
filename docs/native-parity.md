@@ -2996,9 +2996,10 @@ errors and restricted workspace path checks retain their existing behavior.
 ### Write and edit result checkpoint
 
 The model-facing `write` and `edit` success messages now match Pi and preserve
-the requested path spelling. Unrestricted local `edit` checks that the existing
-file is readable and writable before replacing it, and reports denied access
-using Pi's `EACCES` diagnostic. The edit result journals its bounded unified patch
+the requested path spelling. On Unix, unrestricted local `edit` checks read and
+write access before replacing the file and reports Pi's `EACCES` diagnostic.
+As with Pi, this check does not prevent external permission or pathname changes
+afterward. The edit result journals its bounded unified patch
 and first changed line separately from model-facing text. The terminal uses
 that patch for its diff presentation, and programmatic text callers receive the
 success text. Successful imported text results preserve their original details.
