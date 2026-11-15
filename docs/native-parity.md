@@ -2847,11 +2847,16 @@ lookaround support. Invalid expressions produce no matches. Remaining JavaScript
 regular-expression edge compatibility has not been declared complete. In
 patterns without bracket expressions that the linear regex engine accepts,
 `\d`, `\D`, `\w`, `\W`, `\b`, and `\B` use JavaScript's ASCII classes
-and word boundaries. Patterns without brackets or word boundaries that require
+and word boundaries. Single-shorthand bracket expressions such as `[\d]`,
+`[^\w]`, and `[\D]` also use those ASCII classes, including their negations;
+shorthands outside complex brackets are translated independently by the linear
+engine. Patterns without brackets or word boundaries that require
 lookaround or backreferences use ASCII digit and word shorthand classes in the
-bounded engine. Advanced patterns with word boundaries retain the engine's
-previous Unicode classes and boundaries; bracket expressions and other Unicode
-case folding differences remain open.
+bounded engine. Advanced patterns with brackets or word boundaries retain the
+engine's previous Unicode classes and boundaries. Mixed bracket expressions and
+other Unicode case folding differences remain open. The native engine matches
+Unicode scalar values rather than JavaScript's non-Unicode UTF-16 code units:
+for example, `^[\D]$` matches an emoji natively but not in Pi.
 
 Name and working-directory fields support Pi's fuzzy alignment and letter/digit
 swap. Message text and IDs use literal matching. Relevance sorting uses the same
