@@ -1233,7 +1233,10 @@ fn resource_declarations(args: &Cli, transient: bool) -> Result<Vec<Declaration>
     let agent = config::agent_dir();
     let project = args.workspace.join(".pi");
     let read = |base: &Path| -> Result<Vec<Declaration>> {
-        let settings = config::read_object(&base.join("settings.json"))?;
+        let settings = match args.settings.stored_layer(base) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(&base.join("settings.json"))?,
+        };
         let Some(packages) = settings.get("packages") else {
             return Ok(Vec::new());
         };
@@ -2446,6 +2449,13 @@ mod tests {
                 entries[0].source.contains("old.git"),
                 "{}",
                 entries[0].source
+            );
+            let layered = resource_declarations(&args, false).unwrap();
+            assert_eq!(layered.len(), 1);
+            assert!(
+                layered[0].source.contains("old.git"),
+                "{}",
+                layered[0].source
             );
             let sources = configured_update_sources(&args).unwrap();
             assert_eq!(sources.len(), 1);
