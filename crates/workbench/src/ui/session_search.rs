@@ -77,8 +77,8 @@ impl Query {
             if let Ok(regex) = regex::Regex::new(&linear) {
                 return Self::Regex(SearchRegex::Linear(regex));
             }
-            // fancy-regex does not support disabling Unicode for boundaries.
-            // Preserve those boundaries while translating safe shorthands.
+            // The advanced engine cannot disable Unicode for boundaries.
+            // Avoid mixing its Unicode boundaries with ASCII word classes.
             let advanced = format!("(?i){}", translate_regex_classes(pattern, false));
             return fancy_regex::RegexBuilder::new(&advanced)
                 .backtrack_limit(100_000)
@@ -179,6 +179,9 @@ fn translate_regex_classes(pattern: &str, ascii_boundary: bool) -> String {
     let mut escaped = false;
     for character in pattern.chars() {
         if escaped {
+            if !ascii_boundary && matches!(character, 'b' | 'B') {
+                return pattern.to_owned();
+            }
             escaped = false;
         } else if character == '\\' {
             escaped = true;
@@ -431,6 +434,9 @@ mod tests {
             (r"re:^(.)\1\d$", "éé١", false),
             (r"re:(?<=\w)!", "é!", false),
             (r"re:(?<=\w)!", "a!", true),
+            (r"re:\b\w+\b(?=$)", "Kfoo", true),
+            (r"re:\b\w+\b(?=á|$)", "fooá", true),
+            (r"re:\B\w+\B(?=o)", "fooá", true),
             (r"re:^(?=\\w)\\w$", r"\w", true),
         ] {
             assert_eq!(
@@ -439,6 +445,15 @@ mod tests {
                 "{pattern} {text}"
             );
         }
+        // The bounded engine retains its previous Unicode behavior for a
+        // boundary-containing expression. Pi returns false for this input;
+        // translating only \w would introduce a different false negative.
+        assert!(Query::new(r"re:\b\w+\b(?=$)").score(&doc("fooá")).is_some());
+        assert_eq!(translate_regex_classes(r"\b\w+(?=$)", false), r"\b\w+(?=$)");
+        assert_ne!(
+            translate_regex_classes(r"\\b\w+(?=$)", false),
+            r"\\b\w+(?=$)"
+        );
     }
 
     #[test]
