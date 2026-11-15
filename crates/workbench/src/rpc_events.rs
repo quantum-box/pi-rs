@@ -127,6 +127,11 @@ impl Stream {
         let mut events = Vec::new();
         if !self.assistant.is_null() && !self.ended {
             self.assistant["stopReason"] = json!(if self.aborted { "aborted" } else { "error" });
+            self.assistant["errorMessage"] = json!(if self.aborted {
+                "Model request cancelled"
+            } else {
+                "Model request failed"
+            });
             self.finish_message(None, &mut events);
         }
         self.finish_turn(&mut events);
@@ -185,6 +190,11 @@ impl Stream {
                     self.aborted |= failure == ModelFailure::Cancelled;
                     self.assistant["stopReason"] =
                         json!(if self.aborted { "aborted" } else { "error" });
+                    self.assistant["errorMessage"] = json!(match failure {
+                        ModelFailure::Cancelled => "Model request cancelled",
+                        ModelFailure::Retryable => "Model request failed temporarily",
+                        ModelFailure::Failed => "Model request failed",
+                    });
                     self.finish_message(None, events);
                     self.finish_turn(events);
                 } else if let UsageReport::Measured { usage } = usage
@@ -683,6 +693,53 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn failed_model_attempts_expose_classification_without_provider_text() {
+        let args = Cli::parse_from(["pi"]);
+        for (failure, reason, message) in [
+            (ModelFailure::Failed, "error", "Model request failed"),
+            (
+                ModelFailure::Retryable,
+                "error",
+                "Model request failed temporarily",
+            ),
+            (
+                ModelFailure::Cancelled,
+                "aborted",
+                "Model request cancelled",
+            ),
+        ] {
+            let mut stream = Stream::default();
+            stream.assistant = json!({"role":"assistant","content":[]});
+            let mut events = Vec::new();
+            stream.begin_turn(&mut events);
+            stream.record(
+                Event::ModelFinished {
+                    request_id: Uuid::new_v4(),
+                    metadata: ModelMetadata::default(),
+                    usage: UsageReport::Unconfirmed,
+                    failure: Some(failure),
+                    partial: String::new(),
+                    reply: None,
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "message_end")
+                .unwrap();
+            assert_eq!(end["message"]["stopReason"], reason);
+            assert_eq!(end["message"]["errorMessage"], message);
+            assert_eq!(stream.messages[0], end["message"]);
+            let turn = events
+                .iter()
+                .find(|event| event["type"] == "turn_end")
+                .unwrap();
+            assert_eq!(turn["message"], end["message"]);
+        }
+    }
 
     #[test]
     fn structured_read_metadata_is_correlated_and_not_added_to_messages() {

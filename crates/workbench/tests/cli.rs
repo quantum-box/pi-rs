@@ -2737,13 +2737,28 @@ fn rpc_replacement_retry_case(live_retry: bool) {
     .unwrap();
     input.flush().unwrap();
     let mut retry_event = false;
+    let mut failed_message = None;
+    let mut final_messages = None;
     loop {
         let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
         retry_event |= event.to_string().contains("auto_retry_start");
+        if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
+            failed_message = Some(event["message"].clone());
+        }
+        if event["type"] == "agent_end" {
+            final_messages = event["messages"].as_array().cloned();
+        }
         if event["type"] == "agent_settled" {
             break;
         }
     }
+    let failed_message = failed_message.expect("failed assistant message");
+    assert_eq!(failed_message["stopReason"], "error");
+    assert_eq!(
+        failed_message["errorMessage"],
+        "Model request failed temporarily"
+    );
+    assert!(final_messages.unwrap().contains(&failed_message));
     assert!(
         !retry_event,
         "replacement worker retried despite the live override"
