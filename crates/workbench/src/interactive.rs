@@ -494,6 +494,7 @@ enum LocalEditor {
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
+    AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -550,6 +551,7 @@ enum RemoteEvent {
     Notice(String),
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    AnthropicCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -3064,6 +3066,20 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("anthropic") => show_anthropic_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("anthropic browser") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::Browser,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic copy-code") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::CopyCode,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic api-key") => {
+            edit_provider_key(super::Provider::Anthropic, view)
+        }
         "/login" if rest.eq_ignore_ascii_case("xai") => start_xai_login(view, &args.settings),
         "/login" if rest.eq_ignore_ascii_case("xai api-key") => {
             edit_provider_key(super::Provider::named("xai").expect("xAI provider"), view)
@@ -3147,6 +3163,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "anthropic · Subscription OAuth".into(),
+                            selection: Selection::AnthropicMethods,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -4269,6 +4292,13 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::AnthropicCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::AnthropicCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret("Anthropic code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
                 Ok(RemoteEvent::ForgetModelKey(provider)) => {
                     args.model_keys.forget(provider);
                     view.invalidate_model_catalog();
@@ -4706,6 +4736,10 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
+                                LocalEditor::AnthropicCode(sender) => {
+                                    if let Some(sender) = sender.take() { let _ = sender.send(text); }
+                                    Ok(())
+                                }
                                 LocalEditor::BedrockChain => super::model_auth::save_bedrock_profile(None)
                                     .and_then(|()| super::model_auth::Keys::load())
                                     .map(|keys| { args.model_keys = keys; view.invalidate_model_catalog(); view.append("Using existing AWS credential chain for amazon-bedrock"); }),
@@ -4745,6 +4779,8 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
+                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                                interrupt_remote_task(&mut view);
                             }
                         }
                         None => view.local_editor = Some((editor, dialog)),
@@ -5831,6 +5867,49 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
+fn show_anthropic_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Sign in to Anthropic",
+        vec![
+            Item {
+                label: "Browser login".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::Browser),
+            },
+            Item {
+                label: "Copy code login (headless)".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::CopyCode),
+            },
+        ],
+    ));
+}
+
+fn start_anthropic_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::anthropic_auth::LoginMethod,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to Anthropic",
+        "Anthropic login cancelled",
+        move |sender| async move {
+            super::anthropic_auth::login(&settings, method, task_control, |url, manual| {
+                let _ = sender.send(RemoteEvent::Notice(format!(
+                    "Continue in your browser: {url}"
+                )));
+                let _ = sender.send(RemoteEvent::AnthropicCode(manual));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Anthropic".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_kimi_logout(view: &mut View) {
     view.remote_task = Some(RemoteTask::start(
         "Signing out of Kimi Code",
@@ -6012,6 +6091,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to Anthropic" {
+            "Anthropic sign-in is completing; waiting for the result"
         } else {
             "Meta sign-in is completing; waiting for the result"
         });
@@ -6021,7 +6102,13 @@ fn interrupt_remote_task(view: &mut View) {
 }
 
 fn clear_openrouter_editor(view: &mut View) {
-    if matches!(view.local_editor, Some((LocalEditor::OpenRouterCode(_), _))) {
+    if matches!(
+        view.local_editor,
+        Some((
+            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            _
+        ))
+    ) {
         view.local_editor = None;
     }
 }
@@ -6970,6 +7057,8 @@ fn select(
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
+        Selection::AnthropicMethods => show_anthropic_methods(view),
+        Selection::LoginAnthropic(method) => start_anthropic_login(view, &args.settings, method),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
         Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
         Selection::LoginChatGptAccount(id) => {
