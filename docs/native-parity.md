@@ -424,7 +424,14 @@ is active cannot yet execute immediately. A model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
-blocks, tool calls, tool results and turn boundaries. Tool-call deltas expose
+blocks, tool calls, tool results and turn boundaries.
+Failed live assistant messages include a fixed `errorMessage` based on the
+native failure classification, including cancellation and retryable failures.
+Unlike Pi, native live failures do not retain provider error text in the journal
+or include it in that field, and historical message snapshots do not reconstruct
+every failed live attempt. Imported Pi records preserve their original error text.
+Other error and retry notifications retain their own diagnostics.
+Tool-call deltas expose
 incremental argument previews, including nested objects, arrays and partial
 strings. The fullscreen and regular terminals also show the prepared tool and
 its partial path, command or pattern while the model streams it. Completed
