@@ -163,6 +163,14 @@ pub enum Event {
         format: String,
         entry: serde_json::Value,
     },
+    /// An imported result whose reused call ID cannot identify one operation.
+    ImportedUnattributedToolResult {
+        call_id: String,
+        tool_name: String,
+        content: crate::ContextContent,
+        is_error: bool,
+        details: Option<serde_json::Value>,
+    },
     /// Replace or omit one message in future model context, preserving raw history.
     ContextEdited {
         target: u64,
@@ -2079,6 +2087,59 @@ impl Session {
         timestamps
     }
 
+    /// Clone every branch only when the journal contains no executable or queued work.
+    /// Unsupported histories return `None` so callers may retain branch-only behavior.
+    pub fn fork_inert_full_history(&self) -> Result<Option<Self>> {
+        if self.host_binding().is_some()
+            || self.records.iter().any(|record| {
+                matches!(
+                    record.event,
+                    Event::HostBound { .. } | Event::HostRunBound { .. }
+                )
+            })
+        {
+            return Err(Error::Session(
+                "managed sessions must be forked by their host".into(),
+            ));
+        }
+        let inert = self.records.iter().all(|record| {
+            record.run_id.is_none()
+                && match &record.event {
+                    Event::Created { .. }
+                    | Event::SessionInfo { .. }
+                    | Event::ParentSession { .. }
+                    | Event::Checkout { .. }
+                    | Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::UserImages { .. }
+                    | Event::ModelSelected { .. }
+                    | Event::Label { .. }
+                    | Event::ContextEdited { .. }
+                    | Event::Compacted { .. }
+                    | Event::BranchSummary { .. }
+                    | Event::BashExecution { .. } => true,
+                    Event::SourceEntry { format, .. } => {
+                        matches!(format.as_str(), "pi" | "pi-rs:external-session-id")
+                    }
+                    Event::ModelFinished { reply, .. } => reply.is_none(),
+                    Event::Assistant { invocations, .. } => invocations.is_empty(),
+                    _ => false,
+                }
+        });
+        if !inert {
+            return Ok(None);
+        }
+        let mut records = self.records.clone();
+        if let Event::Created { session_id } = &mut records[0].event {
+            *session_id = Uuid::new_v4();
+            records[0].timestamp = Some(record_timestamp());
+        }
+        Ok(Some(Self::from_records_with_metadata(
+            records,
+            self.record_metadata.clone(),
+        )?))
+    }
+
     /// Export one settled branch with fresh session identity and remapped record references.
     /// Auxiliary record metadata is not representable in this legacy return type;
     /// use `fork_session` or `fork_to` when it must be preserved.
@@ -2609,6 +2670,7 @@ fn validate_context_edit(
                 | Event::UserWithImages { .. }
                 | Event::ToolFinished { .. }
                 | Event::ToolReconciled { .. }
+                | Event::ImportedUnattributedToolResult { .. }
         )
     {
         return Err(Error::Session(
@@ -3389,6 +3451,18 @@ fn conversation_entries_since_inner(
             })
             .collect()
     };
+    let unattributed: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ImportedUnattributedToolResult {
+                call_id,
+                tool_name,
+                is_error,
+                ..
+            } => Some((record.id, (call_id, tool_name, is_error))),
+            _ => None,
+        })
+        .collect();
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
@@ -3398,6 +3472,10 @@ fn conversation_entries_since_inner(
                 Message::User {
                     content: content.clone(),
                 },
+            )),
+            Event::ImportedUnattributedToolResult { content, .. } => messages.push((
+                record.id,
+                project_content(Message::User { content: String::new() }, content),
             )),
             Event::BashExecution { execution } if !execution.exclude_from_context => {
                 messages.push((
@@ -3499,6 +3577,18 @@ fn conversation_entries_since_inner(
             None => Some((source, message)),
         })
         .map(|(source, mut message)| {
+            if let Some((call_id, tool_name, is_error)) = unattributed.get(&source) {
+                let status = if **is_error { "error" } else { "success" };
+                let label = format!(
+                    "Historical unattributed tool result ({tool_name}, call {call_id}, {status}):\n"
+                );
+                match &mut message {
+                    Message::User { content } | Message::UserWithImages { content, .. } => {
+                        content.insert_str(0, &label)
+                    }
+                    _ => {}
+                }
+            }
             if let (Some(omitted), Message::Assistant { calls, replay, .. }) =
                 (omitted_calls.get(&source), &mut message)
             {
@@ -3964,6 +4054,123 @@ mod record_metadata_tests {
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn inert_full_history_preserves_branches_and_record_metadata() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "root".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let root = session.head();
+        session
+            .append_with_record_metadata(
+                Event::User {
+                    content: "sibling".into(),
+                    input_id: None,
+                },
+                serde_json::json!({"fixture":"retained"}),
+            )
+            .unwrap();
+        let sibling = session.head();
+        session.checkout(root).unwrap();
+        session
+            .append(Event::User {
+                content: "active".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let active = session.head();
+        session.checkout(sibling).unwrap();
+        let original_id = session.session_id();
+        let mut fork = session.fork_inert_full_history().unwrap().unwrap();
+        assert_ne!(fork.session_id(), original_id);
+        assert_eq!(fork.head(), sibling);
+        assert_eq!(
+            fork.record_metadata(sibling),
+            Some(&serde_json::json!({"fixture":"retained"}))
+        );
+        fork.checkout(active).unwrap();
+        assert!(
+            fork.current_messages()
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "active"))
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        fork.export_jsonl(&path).unwrap();
+        assert_eq!(
+            Session::open(&path).unwrap().record_metadata(sibling),
+            Some(&serde_json::json!({"fixture":"retained"}))
+        );
+    }
+
+    #[test]
+    fn inert_full_history_excludes_recoverable_and_queued_work() {
+        let message = crate::CustomMessage {
+            custom_type: "queue".into(),
+            content: crate::ContextContent::Text("text".into()),
+            display: false,
+            details: None,
+        };
+        let events = [
+            Event::Run {
+                state: RunState::Running,
+                initial: None,
+            },
+            Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message,
+                },
+            },
+            Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id: Uuid::new_v4(),
+                    call: crate::ToolCall {
+                        id: "x".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            },
+            Event::ModelFinished {
+                request_id: Uuid::new_v4(),
+                metadata: Default::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: "reply".into(),
+                    invocations: Vec::new(),
+                    advertised_tools: Vec::new(),
+                    max_output_tokens: 16,
+                }),
+            },
+        ];
+        for event in events {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session.append(event).unwrap();
+            assert!(session.fork_inert_full_history().unwrap().is_none());
+        }
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.set_run_id(Some(Uuid::new_v4()));
+        session
+            .append(Event::Assistant {
+                content: "partial".into(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        assert!(session.fork_inert_full_history().unwrap().is_none());
+    }
 
     #[test]
     fn fork_does_not_resurrect_tree_message_consumed_on_another_branch() {

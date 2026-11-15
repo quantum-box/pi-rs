@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    AnthropicOAuth,
     Kimi,
     Meta,
     Xai,
@@ -53,6 +54,7 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
+            | Self::AnthropicOAuth
             | Self::Kimi
             | Self::Meta
             | Self::Xai
@@ -62,7 +64,10 @@ impl Credential {
     }
 
     pub fn is_bearer(&self) -> bool {
-        matches!(self, Self::Bearer(_) | Self::ChatGpt | Self::Kimi)
+        matches!(
+            self,
+            Self::Bearer(_) | Self::ChatGpt | Self::Kimi | Self::AnthropicOAuth
+        )
     }
 
     pub fn is_command(&self) -> bool {
@@ -74,6 +79,7 @@ impl Credential {
             || matches!(
                 self,
                 Self::ChatGpt
+                    | Self::AnthropicOAuth
                     | Self::Kimi
                     | Self::Meta
                     | Self::Xai
@@ -95,6 +101,10 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::AnthropicOAuth => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::anthropic_auth::access(&settings, None, false).await;
             }
             Self::Kimi => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -173,20 +183,43 @@ impl Keys {
             .into_iter()
             .flatten()
             .filter_map(|(name, entry)| {
+                // A pending Radius refresh is not an API key. Radius owns
+                // its recovery and presents it in the OAuth logout picker.
+                if name.eq_ignore_ascii_case("radius")
+                    && entry[super::radius_auth::REFRESH_PENDING].is_object()
+                {
+                    return None;
+                }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
                 let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
                 let xai = name.eq_ignore_ascii_case("xai") && entry["type"] == "oauth";
-                let oauth =
-                    (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi || meta || xai)
-                        && entry["type"] == "oauth";
+                let anthropic = name.eq_ignore_ascii_case("anthropic") && entry["type"] == "oauth";
+                let oauth = (name.eq_ignore_ascii_case("openrouter")
+                    || chatgpt
+                    || kimi
+                    || meta
+                    || xai
+                    || anthropic)
+                    && entry["type"] == "oauth";
                 let key = if chatgpt {
                     serde_json::from_value::<pi_rs::openai::oauth::Credential>(
                         entry["credential"].clone(),
                     )
                     .ok()?;
                     Some(Credential::ChatGpt)
+                } else if anthropic {
+                    let valid =
+                        serde_json::from_value::<super::anthropic_auth::Credential>(entry.clone())
+                            .is_ok_and(|credential| {
+                                valid_key(&credential.access) && valid_key(&credential.refresh)
+                            });
+                    Some(if valid {
+                        Credential::AnthropicOAuth
+                    } else {
+                        Credential::Invalid
+                    })
                 } else if kimi {
                     let credential: super::kimi_auth::Credential =
                         serde_json::from_value(entry.clone()).ok()?;
@@ -269,6 +302,7 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
+                    && !anthropic
                     && super::builtin_chat::find(if kimi {
                         "kimi-coding"
                     } else if meta {
@@ -280,6 +314,9 @@ impl Keys {
                     })
                     .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
+                    return None;
+                }
+                if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
                     return None;
                 }
                 Some((
@@ -534,8 +571,10 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
             .get(provider.id())
             .and_then(|value| value["type"].as_str());
         if kind == Some("api_key")
-            || (matches!(provider.id(), "openrouter" | "kimi-coding" | "meta" | "xai")
-                && kind == Some("oauth"))
+            || (matches!(
+                provider.id(),
+                "openrouter" | "kimi-coding" | "meta" | "xai" | "anthropic"
+            ) && kind == Some("oauth"))
         {
             data.remove(provider.id());
             removed = true;
@@ -832,6 +871,31 @@ mod tests {
         );
         assert!(
             keys.get(&Provider::Anthropic, "http://127.0.0.1:8001/v1/messages")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn anthropic_oauth_is_bound_to_official_endpoint() {
+        let provider = Provider::Anthropic;
+        let keys = Keys::parse(
+            &json!({"anthropic":{"type":"oauth","access":"sk-ant-oat-access","refresh":"refresh","expires":123}}),
+        );
+        assert!(matches!(
+            keys.credential(&provider, provider.default_endpoint()),
+            Some(Credential::AnthropicOAuth)
+        ));
+        assert!(keys.oauth(&provider, provider.default_endpoint()));
+        assert!(
+            keys.credential(&provider, "http://127.0.0.1:1234/v1/messages")
+                .is_none()
+        );
+        let invalid = Keys::parse(
+            &json!({"anthropic":{"type":"oauth","access":"sk-ant-oat-access","refresh":"refresh","expires":123,"endpoint":"https://attacker.example/v1/messages"}}),
+        );
+        assert!(
+            invalid
+                .credential(&provider, "https://attacker.example/v1/messages")
                 .is_none()
         );
     }

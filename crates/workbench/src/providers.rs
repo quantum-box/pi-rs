@@ -197,11 +197,14 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if bearer
+                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                    Anthropic::with_oauth_token(endpoint, &token)?
+                } else if bearer
                     || matches!(
                         self.id(),
                         "fireworks" | "openrouter" | "minimax" | "minimax-cn"
-                    ) {
+                    )
+                {
                     Anthropic::with_bearer_token(endpoint, &token)?
                 } else {
                     Anthropic::new(endpoint, &token)?
@@ -360,6 +363,14 @@ impl Deferred {
     ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
+            Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
+                super::anthropic_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    None,
+                    false,
+                )
+                .await?,
+            ),
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
@@ -647,9 +658,14 @@ impl Client {
                         .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
                         .await
                 } else if let Some(key) = session_cache_key {
+                    // Workbench applies its own model-specific affinity headers.
+                    // Do not let the standalone SDK add a second default set.
                     client
                         .clone()
                         .with_default_headers(defaults)
+                        .with_session_affinity_format(
+                            pi_rs::openai::SessionAffinityFormat::Disabled,
+                        )
                         .stream_enriched_in_session_with_identity(
                             uuid::Uuid::nil(),
                             uuid::Uuid::nil(),
@@ -662,6 +678,29 @@ impl Client {
                     Ok(Box::pin(
                         stream.map(|event| event.map(pi_rs::EnrichedModelEvent::Legacy)),
                     ))
+                }
+            }
+            Self::Anthropic(client) => {
+                if cache_disabled {
+                    client
+                        .clone()
+                        .without_cache()
+                        .stream_enriched_for_summary(uuid::Uuid::nil(), uuid::Uuid::nil(), request)
+                        .await
+                } else {
+                    let client = if defaults.is_empty() {
+                        client.clone()
+                    } else {
+                        client.clone().with_default_headers(defaults)
+                    };
+                    client
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            session_cache_key.unwrap_or_default(),
+                            request,
+                        )
+                        .await
                 }
             }
             Self::Deferred(client) => {
@@ -1204,6 +1243,149 @@ mod contention_tests {
 mod estimation_tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn bundled_chat_models_send_model_specific_strict_field() {
+        use std::io::{Read, Write};
+        for (provider, model_id, config, expected) in [
+            (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({}),
+                Some(false),
+            ),
+            (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":false}}}}),
+                None,
+            ),
+            (
+                "openrouter",
+                "~deepseek/deepseek-flash-latest",
+                serde_json::json!({}),
+                Some(false),
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({}),
+                None,
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":true}}}}),
+                Some(false),
+            ),
+            (
+                "huggingface",
+                "deepseek-ai/DeepSeek-R1",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":true},"modelOverrides":{"deepseek-ai/DeepSeek-R1":{"compat":{"supportsStrictMode":false}}}}}}),
+                None,
+            ),
+            (
+                "huggingface",
+                "custom",
+                serde_json::json!({"providers":{"huggingface":{"compat":{"supportsStrictMode":true},"models":[{"id":"custom","compat":{"supportsStrictMode":false}}]}}}),
+                None,
+            ),
+            (
+                "together",
+                "deepseek-ai/DeepSeek-V4-Pro-0813",
+                serde_json::json!({"providers":{"together":{"compat":{"supportsStrictMode":false},"models":[{"id":"deepseek-ai/DeepSeek-V4-Pro-0813","compat":{"supportsStrictMode":true}}]}}}),
+                Some(false),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
+            args.provider = args.model_profiles.provider(provider).unwrap();
+            args.model = model_id.into();
+            let client = Client::Ollama(
+                pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                    .unwrap()
+                    .with_provider(provider)
+                    .with_native_probes(false),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let _ = client
+                .stream(ModelRequest {
+                    model: model_id.into(),
+                    messages: vec![],
+                    tools: vec![pi_rs::ToolSpec {
+                        name: "probe".into(),
+                        description: "probe".into(),
+                        parameters: serde_json::json!({"type":"object","properties":{}}),
+                    }],
+                    max_output_tokens: 10,
+                })
+                .await;
+            let body = server.join().unwrap();
+            assert_eq!(
+                body["tools"][0]["function"]
+                    .get("strict")
+                    .and_then(serde_json::Value::as_bool),
+                expected,
+                "{provider}/{model_id}"
+            );
+        }
+    }
 
     #[cfg(any(unix, windows))]
     #[test]

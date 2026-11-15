@@ -12,9 +12,12 @@ pub(super) fn run(
     mut args: Cli,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    if args.command.is_some() || !args.prompt.is_empty() {
+    if args.command.is_some() {
         return Err(Error::Config("RPC accepts prompts through stdin".into()));
     }
+    // Pi prepares positional messages at startup but does not submit them in
+    // RPC mode. Keep stdin exclusively for RPC commands.
+    args.prompt.clear();
     if let Some(parent) = args
         .session
         .parent()
@@ -686,7 +689,7 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
         image.validate()?;
     }
     let message = request["message"].as_str().unwrap_or_default();
-    if message.trim().is_empty() && images.is_empty() {
+    if request["message"].as_str().is_none() && images.is_empty() {
         return Err(Error::Config("message or images are required".into()));
     }
     let queue_kind = match name {

@@ -938,6 +938,34 @@ pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     }
 }
 
+#[cfg(test)]
+static JSON_WRITE_FAULT: std::sync::Mutex<Vec<(std::path::PathBuf, bool, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn fail_json_write_for_test(path: &Path, pending: bool, stage: &'static str) {
+    JSON_WRITE_FAULT
+        .lock()
+        .unwrap()
+        .push((path.to_owned(), pending, stage));
+}
+
+#[cfg(test)]
+fn injected_json_write_failure(path: &Path, value: &Value, stage: &'static str) -> Result<()> {
+    let mut fault = JSON_WRITE_FAULT.lock().unwrap();
+    let pending = value["radius"][super::radius_auth::REFRESH_PENDING].is_object();
+    if let Some(index) = fault
+        .iter()
+        .position(|(target, phase, point)| target == path && *phase == pending && *point == stage)
+    {
+        fault.remove(index);
+        return Err(Error::Io(std::io::Error::other(
+            "injected JSON write failure",
+        )));
+    }
+    Ok(())
+}
+
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     let parent = path
         .parent()
@@ -947,8 +975,14 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut file, value)?;
     writeln!(file)?;
+    #[cfg(test)]
+    injected_json_write_failure(path, value, "file-sync")?;
     file.as_file().sync_all()?;
+    #[cfg(test)]
+    injected_json_write_failure(path, value, "rename")?;
     file.persist(path).map_err(|error| Error::Io(error.error))?;
+    #[cfg(all(test, unix))]
+    injected_json_write_failure(path, value, "directory-sync")?;
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
