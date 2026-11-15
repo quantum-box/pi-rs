@@ -187,6 +187,26 @@ pub struct ToolResult {
     pub attachments: Vec<pi_rs_core::AttachmentRef>,
     pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
 }
+/// A block-aware tool result for hosts that can persist and deliver ordered output.
+/// Unknown result fields are retained when a hook rewrites the output.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ToolBlockResult {
+    pub output: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+impl ToolBlockResult {
+    fn valid(&self) -> bool {
+        !self.extra.contains_key("output")
+            && !self.extra.contains_key("diagnostics")
+            && crate::content::UserContent::from_yield(Value::Array(self.output.clone()), false)
+                .is_some()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sleep {
     pub signals: Vec<String>,
@@ -285,6 +305,41 @@ pub trait Hook: Send + Sync {
         _ctx: &Context<'_>,
     ) -> Result<Option<ToolResult>, String> {
         Ok(None)
+    }
+    /// Block-aware result hook for hosts that can persist and deliver blocks.
+    /// Legacy string hooks are bridged only for one plain text block.
+    async fn after_tool_blocks(
+        &self,
+        call: &ToolCall,
+        result: &ToolBlockResult,
+        _nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<Option<ToolBlockResult>, String> {
+        if result.output.len() != 1 {
+            return Ok(None);
+        }
+        let block = &result.output[0];
+        let Some(object) = block.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 2 || block.get("type").and_then(Value::as_str) != Some("text") {
+            return Ok(None);
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        match self
+            .after_tool(call, &Value::String(text.to_owned()), ctx)
+            .await?
+        {
+            None => Ok(None),
+            Some(Value::String(text)) => {
+                let mut rewritten = result.clone();
+                rewritten.output = vec![serde_json::json!({"type":"text", "text":text})];
+                Ok(Some(rewritten))
+            }
+            Some(_) => Err("legacy after-tool hook returned non-text output".into()),
+        }
     }
     async fn generation(
         &self,
@@ -670,6 +725,36 @@ impl Resolved {
             }
         }
         (result, replaced, reports)
+    }
+    /// Run ordered block-aware hooks. The caller must durably persist the returned
+    /// result before exposing it to a model. This is not wired to `Harness` yet.
+    pub async fn after_tool_blocks(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<(ToolBlockResult, Vec<Report>), String> {
+        if !result.valid() {
+            return Err("invalid tool output blocks".into());
+        }
+        let mut reports = vec![];
+        for e in &self.extensions {
+            for h in &e.hooks {
+                match protect(async { h.after_tool_blocks(call, &result, nested, ctx).await }).await
+                {
+                    Ok(Some(value)) if value.valid() => result = value,
+                    Ok(Some(_)) => reports.push(failure(
+                        &e.name,
+                        "after_tool",
+                        "invalid tool output blocks".into(),
+                    )),
+                    Ok(None) => (),
+                    Err(err) => reports.push(failure(&e.name, "after_tool", err)),
+                }
+            }
+        }
+        Ok((result, reports))
     }
     /// Request replacements pass down the chain; the first onYield decision wins.
     /// Returned task requests are only collected, never scheduled here.

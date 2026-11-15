@@ -433,3 +433,61 @@ mod tests {
         assert_eq!(detect_image_mime_type(&png), None);
     }
 }
+
+/// Resolve limits for the current conversation snapshot. The host must supply
+/// model-specific limits because core does not expose upstream's image catalog.
+pub type ToolImageLimits = dyn Fn(&serde_json::Value) -> ImageLimits + Send + Sync;
+
+struct FitToolImages {
+    processor: std::sync::Arc<dyn ImageProcessor>,
+    limits: std::sync::Arc<ToolImageLimits>,
+}
+
+/// Create an opt-in block-aware after-tool hook. Hosts must invoke the block
+/// hook chain and persist its output before dispatching a model request.
+pub fn create_fit_images_extension(
+    processor: std::sync::Arc<dyn ImageProcessor>,
+    limits: std::sync::Arc<ToolImageLimits>,
+) -> crate::extension::Extension {
+    crate::extension::Extension {
+        name: "fit-images".into(),
+        hooks: vec![std::sync::Arc::new(FitToolImages { processor, limits })],
+        ..Default::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::extension::Hook for FitToolImages {
+    async fn after_tool_blocks(
+        &self,
+        _call: &crate::extension::ToolCall,
+        result: &crate::extension::ToolBlockResult,
+        nested: bool,
+        ctx: &crate::extension::Context<'_>,
+    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+        if nested || !result.output.iter().any(|block| block["type"] == "image") {
+            return Ok(None);
+        }
+        match fit_images(
+            &result.output,
+            (self.limits)(ctx.snapshot),
+            self.processor.as_ref(),
+        )
+        .await?
+        {
+            FittedImages::Unchanged => Ok(None),
+            FittedImages::Fitted { content, notes } => {
+                let mut fitted = result.clone();
+                fitted.output = content;
+                if !notes.is_empty() {
+                    fitted.diagnostics.push(crate::runtime::ToolDiagnostic {
+                        severity: crate::runtime::DiagnosticSeverity::Info,
+                        code: Some("image".into()),
+                        message: notes.join(" "),
+                    });
+                }
+                Ok(Some(fitted))
+            }
+        }
+    }
+}
