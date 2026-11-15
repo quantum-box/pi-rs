@@ -243,6 +243,16 @@ windowed Chord diffs. Standalone progress writers are not included. Polling is
 synchronous, retained history and observation bytes are not globally bounded,
 and pages contain at most 256 frames.
 
+`watch_merged_progress_handle` adds a lifecycle-aware pull handle over the same
+v1/v2 cursors and bounded pages. Attach from now or resume a consumed cursor;
+`next` advances only when returning a complete page, and dropping a pending wait
+leaves the cursor unchanged. `close`, `abort` and token cancellation preserve the
+first stopped or aborted reason; a read error ends the handle with a failure
+reason. A terminal progress record does not itself close the watch. Like other
+pull watches, this handle retains the store owner until closed or dropped; it has
+no callback listener, automatic source-close notification or upstream Chord
+queue. It does not change the forward-only coverage boundary.
+
 `progress_history_from_now` captures a versioned, conversation-scoped exclusive
 cursor. `progress_history` and `watch_progress_history` page committed generation
 and tool progress records after that boundary. Runtime checkpoints and terminal

@@ -1087,6 +1087,14 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
     let id = scheduler.create_conversation(config()).unwrap();
     let other = scheduler.create_conversation(config()).unwrap();
     let history_start = scheduler.progress_history_from_now(id).unwrap();
+    let mut merged = scheduler
+        .watch_merged_progress_handle(
+            id,
+            None,
+            std::num::NonZeroUsize::MIN,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
     scheduler.submit(id, None, "work".into()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), tool.started.acquire())
         .await
@@ -1165,11 +1173,23 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
         pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. }
         if *seen == attempt && *value == json!({"text":"later"})
     ))));
+    loop {
+        let page = tokio::time::timeout(std::time::Duration::from_secs(5), merged.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if page.frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|progress| progress.changes.iter().any(|change| matches!(change,
+            pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Running(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"})
+        )))) { break; }
+    }
+    let merged_cursor = merged.cursor().clone();
     let error = scheduler.abort_and_wait(id).await.unwrap_err();
     assert!(error.to_string().contains("abort cleanup remains pending"));
     let host = tool.host.lock().unwrap().take().unwrap();
     host.report_progress(json!("late")).await.unwrap();
     drop(host);
+    merged.close();
     scheduler.shutdown().await.unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     drop(store);
@@ -1189,6 +1209,25 @@ async fn runtime_tool_progress_is_visible_and_abort_fences_late_callbacks_after_
             .value["attempt"],
         json!(attempt)
     );
+    let mut merged = reopened
+        .watch_merged_progress_handle(
+            id,
+            Some(merged_cursor),
+            std::num::NonZeroUsize::MIN,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+    loop {
+        let page = tokio::time::timeout(std::time::Duration::from_secs(5), merged.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if page.frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|progress| progress.changes.iter().any(|change| matches!(change,
+            pi_rs_durable::runtime::ProgressHistoryChange::Tool { attempt: seen, state: State::Aborted(Some(value)), .. } if *seen == attempt && *value == json!({"text":"later"})
+        )))) { break; }
+    }
+    merged.close();
     let history_terminal = reopened
         .progress_history(&history_cursor, std::num::NonZeroUsize::new(256).unwrap())
         .unwrap();

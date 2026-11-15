@@ -1307,6 +1307,68 @@ pub struct MergedProgressPage {
     pub has_more: bool,
 }
 
+/// A resumable pull watch over complete merged commit frames. The cursor
+/// advances only when a page is returned; persist it after processing the page.
+pub struct MergedProgressWatch {
+    reader: Option<Harness>,
+    cursor: MergedProgressCursor,
+    limit: std::num::NonZeroUsize,
+    interval: Duration,
+    end: Option<ViewWatchEnd>,
+}
+impl MergedProgressWatch {
+    pub fn cursor(&self) -> &MergedProgressCursor {
+        &self.cursor
+    }
+    pub fn end_reason(&self) -> Option<&ViewWatchEnd> {
+        self.end.as_ref()
+    }
+    pub fn close(&mut self) {
+        self.end_with(ViewWatchEnd::Stopped);
+    }
+    pub fn abort(&mut self) {
+        self.end_with(ViewWatchEnd::Aborted);
+    }
+    fn end_with(&mut self, reason: ViewWatchEnd) {
+        if self.end.is_none() {
+            self.end = Some(reason);
+            self.reader = None;
+        }
+    }
+    /// Dropping a pending wait neither ends the watch nor advances its cursor.
+    pub async fn next(&mut self) -> Result<Option<MergedProgressPage>, Error> {
+        loop {
+            let Some(reader) = self.reader.as_ref() else {
+                return Ok(None);
+            };
+            match reader.merged_progress(&self.cursor, self.limit) {
+                Ok(page) if !page.frames.is_empty() => {
+                    self.cursor = page.next.clone();
+                    return Ok(Some(page));
+                }
+                Ok(_) => tokio::time::sleep(self.interval).await,
+                Err(error) => {
+                    self.end_with(ViewWatchEnd::Failed(error.to_string()));
+                    return Err(error);
+                }
+            }
+        }
+    }
+    /// An explicitly cancelled token ends the watch as aborted.
+    pub async fn next_with_cancel(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<MergedProgressPage>, Error> {
+        if self.end.is_some() {
+            return Ok(None);
+        }
+        tokio::select! { biased;
+            _ = cancel.cancelled() => { self.abort(); Ok(None) }
+            page = self.next() => page,
+        }
+    }
+}
+
 const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
 fn prepare_progress_history(
     store: &durable_store::Store,
@@ -5435,6 +5497,41 @@ impl Harness {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some((revision, sequence, changes)))
     }
+    /// Attach a lifecycle-aware merged watch from now or after a consumed cursor.
+    /// Both v1 and v2 cursor semantics are preserved on resume.
+    pub fn watch_merged_progress_handle(
+        &self,
+        conversation: Uuid,
+        after: Option<MergedProgressCursor>,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<MergedProgressWatch, Error> {
+        if interval.is_zero() || limit.get() > 256 {
+            return Err(Error::Invalid(
+                "invalid merged watch interval or page limit".into(),
+            ));
+        }
+        let cursor = match after {
+            Some(cursor) => {
+                if cursor.conversation != conversation {
+                    return Err(Error::Invalid(
+                        "merged cursor belongs to another conversation".into(),
+                    ));
+                }
+                self.validate_merged_progress_cursor(&cursor)?;
+                cursor
+            }
+            None => self.merged_progress_from_now(conversation)?,
+        };
+        Ok(MergedProgressWatch {
+            reader: Some(self.worker()),
+            cursor,
+            limit,
+            interval,
+            end: None,
+        })
+    }
+
     /// Start after a consistent current store boundary. Prior progress is not
     /// backfilled; this is explicit even in stores with no legacy metadata.
     pub fn merged_progress_from_now(
@@ -10720,6 +10817,16 @@ impl Scheduler {
         registry: crate::task_scheduler::Registry,
     ) -> Result<crate::task_driver::Driver, Error> {
         self.harness.start_tasks(registry)
+    }
+    pub fn watch_merged_progress_handle(
+        &self,
+        conversation: Uuid,
+        after: Option<MergedProgressCursor>,
+        limit: std::num::NonZeroUsize,
+        interval: Duration,
+    ) -> Result<MergedProgressWatch, Error> {
+        self.harness
+            .watch_merged_progress_handle(conversation, after, limit, interval)
     }
     pub fn merged_progress_from_now(
         &self,

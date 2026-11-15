@@ -975,3 +975,203 @@ fn merged_document_frame_limit_fails_without_consuming_cursor() {
         );
     }
 }
+
+#[tokio::test]
+async fn merged_watch_handle_delivers_progress_documents_and_reopens() {
+    use pi_rs_durable::{
+        document::{Address, Documents, Transaction},
+        progress::State,
+        runtime::{AdmissionOptions, ProgressHistoryChange, Scheduler, ViewWatchEnd},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("handle.db");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+    });
+    let mut s = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let id = s
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "note".into(),
+        key: "".into(),
+    };
+    assert!(
+        s.watch_merged_progress_handle(
+            id,
+            None,
+            NonZeroUsize::new(257).unwrap(),
+            Duration::from_millis(1)
+        )
+        .is_err()
+    );
+    assert!(
+        s.watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::ZERO)
+            .is_err()
+    );
+    let mut watch = s
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let start = watch.cursor().clone();
+    let mut other = s
+        .watch_merged_progress_handle(
+            id,
+            Some(start.clone()),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    let mut legacy = serde_json::to_value(&start).unwrap();
+    legacy["version"] = serde_json::json!(1);
+    legacy.as_object_mut().unwrap().remove("document_position");
+    let legacy = serde_json::from_value(legacy).unwrap();
+    let mut old = s
+        .watch_merged_progress_handle(
+            id,
+            Some(legacy),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    s.submit_with_documents(
+        id,
+        None,
+        "work".into(),
+        AdmissionOptions::default(),
+        |docs| {
+            docs.get(&address)?;
+            docs.put(
+                &address,
+                serde_json::json!({"value":1}).as_object().unwrap().clone(),
+            )
+        },
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    let first = watch.next().await.unwrap().unwrap();
+    let first_other = other.next().await.unwrap().unwrap();
+    assert_eq!(first.frames, first_other.frames);
+    assert!(first.frames[0].observation.is_some());
+    assert_eq!(first.frames[0].documents[0].address, address);
+    assert!(
+        old.next().await.unwrap().unwrap().frames[0]
+            .documents
+            .is_empty()
+    );
+    loop {
+        let page = tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if page.frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|change| matches!(change, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Running(_)))))) { break; }
+    }
+    let before_abort = watch.cursor().clone();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), watch.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(watch.cursor(), &before_abort);
+    assert_eq!(watch.end_reason(), None);
+    s.abort_and_wait(id).await.unwrap();
+    loop {
+        let page = tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Some(terminal) = page.frames.iter().find(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|change| matches!(change, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Aborted(_)))))) {
+            assert!(terminal.observation.is_some());
+            break;
+        }
+    }
+    let saved = watch.cursor().clone();
+    watch.close();
+    watch.abort();
+    assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Stopped));
+    assert!(watch.next().await.unwrap().is_none());
+    other.close();
+    old.close();
+    s.shutdown().await.unwrap();
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut resumed = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let version = Documents::new(&store)
+        .get(&address)
+        .unwrap()
+        .unwrap()
+        .version;
+    let mut tx = Transaction::new();
+    tx.delete(&address, version).unwrap();
+    tx.commit(&store).unwrap();
+    loop {
+        let page = tokio::time::timeout(Duration::from_secs(5), resumed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Some(change) = page
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.documents)
+            .find(|change| change.address == address)
+        {
+            assert!(change.document.is_none());
+            break;
+        }
+    }
+    let cursor = resumed.cursor().clone();
+    let token = CancellationToken::new();
+    token.cancel();
+    assert!(resumed.next_with_cancel(&token).await.unwrap().is_none());
+    assert_eq!(resumed.end_reason(), Some(&ViewWatchEnd::Aborted));
+    assert_eq!(resumed.cursor(), &cursor);
+}
+
+#[tokio::test]
+async fn merged_watch_handle_failure_is_terminal_without_cursor_advance() {
+    use pi_rs_durable::{observer::Observer, runtime::ViewWatchEnd};
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let cursor = watch.cursor().clone();
+    let store = durable_store::Store::open(&path).unwrap();
+    let append = Observer::new(&store, id)
+        .prepare_append(&serde_json::json!({"forged":true}))
+        .unwrap();
+    store.commit(&append.checks, &append.mutations).unwrap();
+    assert!(watch.next().await.is_err());
+    assert!(matches!(watch.end_reason(), Some(ViewWatchEnd::Failed(_))));
+    assert_eq!(watch.cursor(), &cursor);
+    watch.close();
+    assert!(matches!(watch.end_reason(), Some(ViewWatchEnd::Failed(_))));
+    assert!(watch.next().await.unwrap().is_none());
+}
