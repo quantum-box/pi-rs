@@ -203,3 +203,79 @@ async fn runtime_wake_combines_deadlines_and_preserves_unknown_states() {
     assert_eq!(due.unknown_conversations, vec![uncertain.id]);
     owner.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_wake_retries_overlapping_conversation_commits() {
+    struct ModelStub;
+    #[async_trait::async_trait]
+    impl Model for ModelStub {
+        async fn stream(
+            &self,
+            _: pi_rs_core::ModelRequest,
+        ) -> Result<pi_rs_core::ModelStream, pi_rs_core::Error> {
+            unreachable!()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let owner = RuntimeOwner::open(
+        dir.path().join("db"),
+        Options {
+            model: Arc::new(ModelStub),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 5,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        },
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let mut first = conversation();
+    let mut second = conversation();
+    first.phase = Phase::RetryWait { turns: 0 };
+    second.phase = Phase::RetryWait { turns: 0 };
+    first.retry_state.deadline_ms = Some(100);
+    second.retry_state.deadline_ms = Some(300);
+    let store_owner = owner.scheduler.harness.owner.clone();
+    let write = |first: &Conversation, second: &Conversation| {
+        vec![
+            Mutation::Put {
+                key: Harness::key(first.id),
+                value: serde_json::to_vec(first).unwrap(),
+            },
+            Mutation::Put {
+                key: Harness::key(second.id),
+                value: serde_json::to_vec(second).unwrap(),
+            },
+        ]
+    };
+    let a = write(&first, &second);
+    first.retry_state.deadline_ms = Some(300);
+    second.retry_state.deadline_ms = Some(200);
+    let b = write(&first, &second);
+    store_owner.store().commit(&[], &a).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let writer_running = running.clone();
+    let writer = std::thread::spawn(move || {
+        while writer_running.load(Ordering::Acquire) {
+            store_owner.store().commit(&[], &b).unwrap();
+            store_owner.store().commit(&[], &a).unwrap();
+        }
+    });
+    let mut inconsistent = false;
+    for _ in 0..100 {
+        if let Ok(snapshot) = owner.wake_snapshot(0) {
+            inconsistent |= !matches!(snapshot.at, Some(100 | 200))
+                || snapshot.active
+                || !snapshot.unknown_conversations.is_empty();
+        }
+    }
+    running.store(false, Ordering::Release);
+    writer.join().unwrap();
+    assert!(!inconsistent);
+    assert!(matches!(
+        owner.wake_snapshot(0).unwrap().at,
+        Some(100 | 200)
+    ));
+    owner.shutdown().await.unwrap();
+}
