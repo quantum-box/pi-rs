@@ -10,6 +10,113 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn mcp_add_persists_oauth_client_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "https://example.com/mcp",
+        "--oauth-client-id",
+        "client",
+        "--oauth-client-secret",
+        "${CLIENT_SECRET}",
+        "--oauth-callback-port",
+        "12345",
+        "--oauth-client-name",
+        "client name",
+        "--oauth-client-registration",
+        "dcr",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = root.path().join("mcp.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["remote"]["oauth"],
+        json!({"clientId":"client","clientSecret":"${CLIENT_SECRET}","callbackPort":12345,"clientName":"client name","clientRegistration":"dcr"})
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--oauth-client-id",
+            "client",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-secret",
+            "secret",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-registration",
+            "cimd",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-callback-port",
+            "0",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--header",
+            "authorization=Bearer token",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
 fn mcp_logout_local_targets_trusted_project_credentials() {
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
