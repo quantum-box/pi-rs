@@ -423,7 +423,7 @@ fn token_nodes(
 }
 
 #[derive(Clone, Copy)]
-enum Container {
+pub(super) enum Container {
     Quote,
     Item(usize),
 }
@@ -455,7 +455,10 @@ fn normalize_newlines(source: &str) -> (String, Vec<usize>) {
 
 // Marked's block lexer removes container prefixes before inline lexing. Keep
 // byte boundaries into the original document for rendering and link guards.
-fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(String, Vec<usize>)> {
+pub(super) fn normalize_continuations(
+    source: &str,
+    containers: &[Container],
+) -> Option<(String, Vec<usize>)> {
     let bytes = source.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut offsets = vec![0];
@@ -538,7 +541,7 @@ fn normalize_continuations(source: &str, containers: &[Container]) -> Option<(St
     ))
 }
 
-fn item_indent(original: &str, start: usize) -> Option<usize> {
+pub(super) fn item_indent(original: &str, start: usize) -> Option<usize> {
     let line = original.get(start..)?.split('\n').next()?.as_bytes();
     let leading = line.iter().take_while(|byte| **byte == b' ').count();
     if leading > 3 {

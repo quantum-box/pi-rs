@@ -1604,6 +1604,105 @@ fn append_math_section(output: &mut Vec<Line>, mut next: Vec<Line>) {
     output.append(&mut next);
 }
 
+// Replace only complete inline events within list math ranges. Containers stay
+// intact so the usual list marker and continuation indentation are retained.
+fn insert_list_math(
+    events: Vec<(Event<'static>, Range<usize>)>,
+    blocks: &[super::math_blocks::ListMathBlock],
+    source: &str,
+) -> Vec<(Event<'static>, Range<usize>)> {
+    if events.len().saturating_mul(blocks.len()) > 100_000 || super::strike::frame_expired() {
+        return events;
+    }
+    let container = |event: &Event<'_>| {
+        matches!(
+            event,
+            Event::Start(Tag::List(_) | Tag::Item | Tag::Paragraph)
+                | Event::End(TagEnd::List(_) | TagEnd::Item | TagEnd::Paragraph)
+        )
+    };
+    for block in blocks {
+        let mut found = false;
+        for (event, range) in &events {
+            if container(event)
+                || range.end <= block.source.start
+                || range.start >= block.source.end
+            {
+                continue;
+            }
+            if range.start < block.source.start || range.end > block.source.end {
+                return events;
+            }
+            found = true;
+        }
+        if !found {
+            return events;
+        }
+    }
+    let mut output: Vec<(Event<'static>, Range<usize>)> = Vec::with_capacity(events.len());
+    let mut inserted = vec![false; blocks.len()];
+    let mut after_math = false;
+    for (mut event, mut range) in events {
+        if !container(&event)
+            && let Some((index, block)) = blocks
+                .iter()
+                .enumerate()
+                .find(|(_, block)| range.start < block.source.end && block.source.start < range.end)
+        {
+            if !inserted[index] {
+                if let Some((Event::Text(value), previous)) = output.last_mut()
+                    && value.ends_with('\n')
+                {
+                    *value = value[..value.len() - 1].to_owned().into();
+                    while previous.end > previous.start
+                        && matches!(source.as_bytes()[previous.end - 1], b' ' | b'\t')
+                    {
+                        previous.end -= 1;
+                    }
+                    if previous.end > previous.start && source.as_bytes()[previous.end - 1] == b'\n'
+                    {
+                        previous.end -= 1;
+                    }
+                } else if matches!(output.last(), Some((Event::SoftBreak, _))) {
+                    output.pop();
+                }
+                output.push((
+                    Event::DisplayMath(block.expression.clone().into()),
+                    block.source.clone(),
+                ));
+                inserted[index] = true;
+                after_math = true;
+            }
+            continue;
+        }
+        if after_math && !container(&event) {
+            match &mut event {
+                Event::SoftBreak if source[range.clone()].starts_with('\n') => {
+                    after_math = false;
+                    continue;
+                }
+                Event::Text(value) if value.starts_with('\n') => {
+                    let rest = value[1..].to_owned();
+                    range.start += 1;
+                    while range.start < range.end
+                        && matches!(source.as_bytes()[range.start], b' ' | b'\t')
+                    {
+                        range.start += 1;
+                    }
+                    *value = rest.into();
+                }
+                _ => {}
+            }
+            after_math = false;
+        }
+        if matches!(event, Event::End(TagEnd::Item)) {
+            after_math = false;
+        }
+        output.push((event, range));
+    }
+    output
+}
+
 fn markdown_plain_at_depth(
     text: &str,
     parsed: &str,
@@ -1634,9 +1733,14 @@ fn markdown_plain_at_depth(
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
     let protected_text = protect_bare_links(parsed, options);
-    let mut events = super::strike::events(parsed, &protected_text, options)
-        .into_iter()
-        .peekable();
+    let list_math = super::math_blocks::list_blocks(parsed);
+    let mut events = insert_list_math(
+        super::strike::events(parsed, &protected_text, options),
+        &list_math,
+        parsed,
+    )
+    .into_iter()
+    .peekable();
     while let Some((event, mut range)) = events.next() {
         if quote_skip > 0 {
             match event {
@@ -2070,6 +2174,51 @@ fn markdown_plain_at_depth(
                 span.strikethrough = strikethrough > 0;
                 spans.push(span);
             }
+            Event::DisplayMath(_) => {
+                let Some(block) = list_math.iter().find(|block| block.source == range) else {
+                    continue;
+                };
+                let marker_only = item_prefixes
+                    .last()
+                    .is_some_and(|prefix| spans.as_slice() == [prefix.clone()]);
+                if !marker_only {
+                    flush(&mut spans, &mut lines, width, item_prefixes.last());
+                }
+                let previous_line_blank =
+                    text[..range.start]
+                        .rsplit_once('\n')
+                        .is_some_and(|(before, _)| {
+                            before
+                                .rsplit('\n')
+                                .next()
+                                .is_some_and(|line| line.trim().is_empty())
+                        });
+                if previous_line_blank
+                    && !lines.is_empty()
+                    && lines
+                        .last()
+                        .is_some_and(|line| line.spans.iter().any(|span| !span.text.is_empty()))
+                {
+                    lines.push(Line::default());
+                }
+                let available = width.saturating_sub(
+                    item_prefixes
+                        .last()
+                        .map_or(0, |prefix| UnicodeWidthStr::width(prefix.text.as_str())),
+                );
+                let expression = super::math_parser::trim_js(&block.expression);
+                let rendered = (!block.pending)
+                    .then(|| super::math_parser::render(expression, true))
+                    .flatten()
+                    .filter(|value| {
+                        value
+                            .lines()
+                            .all(|line| UnicodeWidthStr::width(line) <= available)
+                    })
+                    .unwrap_or_else(|| super::math_parser::trim_js(&block.raw).to_owned());
+                spans.push(Span::themed(rendered, theme, "text"));
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
+            }
             Event::Code(text) => {
                 if let Some((_, label, _)) = links.last_mut() {
                     label.push_str(&text);
@@ -2085,6 +2234,9 @@ fn markdown_plain_at_depth(
                 spans.push(span);
             }
             Event::SoftBreak => {
+                if matches!(events.peek(), Some((Event::DisplayMath(_), _))) {
+                    continue;
+                }
                 if let Some((_, label, _)) = links.last_mut() {
                     label.push(' ');
                 }
@@ -2248,6 +2400,54 @@ mod tests {
         assert_eq!(rendered("$$x$$\n$$y$$", 80), ["x", "", "y"]);
         assert_eq!(rendered("\\[\nx^2", 80), ["\\[", "x^2"]);
         assert_eq!(rendered("$$\\unknown{x}$$", 80), ["$$\\unknown{x}$$"]);
+    }
+
+    #[test]
+    fn display_math_uses_list_indentation() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("- $$x^2$$", vec!["- x²"]),
+            ("- $$\\frac{1}{2}$$\n- z", vec!["- 1", "  ─", "  2", "- z"]),
+            (
+                "- item\n  $$\\frac{1}{2}$$\n  after",
+                vec!["- item", "  1", "  ─", "  2", "  after"],
+            ),
+            (
+                "- item\n  $$\n  \\frac{1}{2}\n  $$\n  after",
+                vec!["- item", "  1", "  ─", "  2", "  after"],
+            ),
+            (
+                "- outer\n  - $$\\frac{1}{2}$$\n  - z",
+                vec!["- outer", "    - 1", "      ─", "      2", "    - z"],
+            ),
+            (
+                "- item\n  \\[\n  x^2\n  \\]\n  after",
+                vec!["- item", "  x²", "  after"],
+            ),
+            (
+                "- item\n\n  $$x^2$$\n\n  after",
+                vec!["- item", "", "  x²", "  after"],
+            ),
+            ("- `$$x^2$$`\n- $$x^2$$", vec!["- $$x^2$$", "- x²"]),
+            (
+                "- [link](https://e.co)\n  $$x^2$$",
+                vec!["- link (https://e.co)", "  x²"],
+            ),
+            ("- $$\\unknown{x}$$", vec!["- $$\\unknown{x}$$"]),
+            ("- \\[\n  x^2", vec!["- \\[", "  x^2"]),
+            ("> - $$\\frac{1}{2}$$", vec!["│ - 1", "│   ─", "│   2"]),
+        ] {
+            let actual: Vec<_> = markdown(source, &theme, 80)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.text)
+                        .collect::<String>()
+                })
+                .collect();
+            assert_eq!(actual, expected, "{source:?}");
+        }
     }
 
     #[test]
