@@ -3626,10 +3626,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     }
     impl Drop for PickerTerminal {
         fn drop(&mut self) {
-            // Do not consume input during handoff: it may belong to the shell
-            // or the next mode, even while a terminal reply is outstanding.
-            #[cfg(any(unix, windows))]
-            let _ = execute!(self.output, Print("\x1b[?2031l"));
+            // Preserve input queued for the next terminal owner.
             let _ = execute!(
                 self.output,
                 ResetColor,
@@ -3653,16 +3650,6 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     )?;
     screen.input = Some(crate::ui::input::Reader::new_for_handoff()?);
     let keys = Keys::load()?;
-    #[cfg(any(unix, windows))]
-    let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
-    #[cfg(any(unix, windows))]
-    let mut colors = {
-        crate::ui::theme::reset_terminal_background();
-        let mut colors = ColorQueries::default();
-        execute!(screen.output, Print("\x1b[?2031h\x1b[?996n"))?;
-        colors.query_terminal_colors(&mut screen.output)?;
-        colors
-    };
     let mut theme = startup_picker_theme(args)?;
     let mut view = View::default();
     slash("/resume", args, &mut view, None)?;
@@ -3688,85 +3675,12 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
             screen.output.flush()?;
             dirty = false;
         }
-        #[cfg(any(unix, windows))]
-        {
-            colors.poll_color_timeout()?;
-            dirty |= expire_initial_terminal_colors(&colors, &mut theme);
-        }
         match screen
             .input
             .as_mut()
             .expect("picker input")
             .next(Duration::from_millis(40))?
         {
-            #[cfg(any(unix, windows))]
-            Some(
-                event @ (crate::ui::input::InputEvent::PrimaryDeviceAttributes
-                | crate::ui::input::InputEvent::TerminalColorInvalid { .. }
-                | crate::ui::input::InputEvent::TerminalPalette { .. }
-                | crate::ui::input::InputEvent::TerminalColor { .. }
-                | crate::ui::input::InputEvent::Appearance { .. }),
-            ) => {
-                let mut appearance_changed = false;
-                match event {
-                    crate::ui::input::InputEvent::PrimaryDeviceAttributes => {
-                        colors.receive_color_marker(&mut screen.output)?;
-                        dirty |= finish_initial_terminal_colors(&mut theme);
-                    }
-                    crate::ui::input::InputEvent::TerminalColorInvalid { target } => {
-                        colors.accepts_color_reply(target, &mut screen.output)?;
-                    }
-                    crate::ui::input::InputEvent::TerminalPalette {
-                        index,
-                        red,
-                        green,
-                        blue,
-                    } => {
-                        if colors.accepts_color_reply(index, &mut screen.output)?
-                            && crate::ui::theme::set_terminal_palette(index, red, green, blue)
-                            && theme.name == "system"
-                        {
-                            theme = Theme::system();
-                            dirty = true;
-                        }
-                    }
-                    crate::ui::input::InputEvent::TerminalColor {
-                        foreground,
-                        red,
-                        green,
-                        blue,
-                    } => {
-                        if colors.accepts_color_reply(
-                            if foreground { 16 } else { 17 },
-                            &mut screen.output,
-                        )? {
-                            appearance_changed =
-                                crate::ui::theme::set_terminal_color(foreground, red, green, blue);
-                            if theme.name == "system" {
-                                theme = Theme::system();
-                                dirty = true;
-                            }
-                        }
-                    }
-                    crate::ui::input::InputEvent::Appearance { dark } => {
-                        let (changed, redraw) = apply_terminal_appearance(&mut theme, dark);
-                        appearance_changed = changed;
-                        dirty |= redraw;
-                        colors.query_terminal_colors(&mut screen.output)?;
-                    }
-                    _ => unreachable!(),
-                }
-                dirty |= settle_complete_colors(&colors, &mut theme);
-                if appearance_changed
-                    && args
-                        .use_theme
-                        .as_deref()
-                        .is_some_and(|name| name.contains('/'))
-                {
-                    theme = startup_picker_theme(args)?;
-                    dirty = true;
-                }
-            }
             Some(crate::ui::input::InputEvent::Event(Event::Resize(..))) => dirty = true,
             Some(crate::ui::input::InputEvent::Event(Event::Paste(text))) => {
                 if let Some(picker) = &mut view.picker {

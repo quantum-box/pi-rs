@@ -1213,21 +1213,17 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
             .unwrap(),
     );
     output_until(&mut master, |text| {
-        text.contains("Resume session") && text.contains("\x1b]11;?\x07") && text.contains("\x1b[c")
+        assert!(!text.contains("\x1b]10;?"));
+        assert!(!text.contains("\x1b]11;?"));
+        assert!(!text.contains("\x1b]4;"));
+        assert!(!text.contains("\x1b[c"));
+        text.contains("Resume session")
     });
-    // A background response arriving after the initial timeout must repaint the
-    // selector, while the RPC stdout remains a clean JSON protocol stream.
-    std::thread::sleep(Duration::from_millis(160));
-    master
-        .write_all(b"\x1b]11;rgb:0000/0000/0000\x1b\\")
-        .unwrap();
-    output_until(&mut master, |text| text.contains("\x1b[38;2;"));
     master.write_all(b"Resume Fixture").unwrap();
     output_until(&mut master, |text| {
         text.contains("Resume session") && text.contains("Resume Fixture")
     });
-    // Keep DA1 outstanding and queue input for the next terminal owner in the
-    // same write as the selection, so read-ahead cannot silently swallow it.
+    // Queue input for the next terminal owner in the same write as selection.
     master.write_all(b"\rnext shell command\n").unwrap();
     output_until(&mut master, |text| text.contains("\x1b[?1049l"));
     let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
@@ -1363,7 +1359,10 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
     if let Ok(count) = master.read(&mut buffer) {
         terminal_output.extend_from_slice(&buffer[..count]);
     }
-    assert!(String::from_utf8_lossy(&terminal_output).contains("\x1b[?2031l"));
+    let terminal_output = String::from_utf8_lossy(&terminal_output);
+    assert!(!terminal_output.contains("\x1b]10;?"));
+    assert!(!terminal_output.contains("\x1b]11;?"));
+    assert!(!terminal_output.contains("\x1b[c"));
     let mut output = String::new();
     process
         .0
