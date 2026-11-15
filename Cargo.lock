@@ -2255,12 +2255,15 @@ dependencies = [
  "jsonschema",
  "pi-rs-core",
  "pi-rs-workbench",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "unicode-normalization",
+ "unicode-segmentation",
  "uuid",
 ]
 

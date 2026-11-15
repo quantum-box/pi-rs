@@ -47,4 +47,5 @@ pub mod task_store;
 pub mod task_tool;
 pub mod tool;
 pub mod tool_progress;
+pub mod tool_search;
 pub mod transcript;

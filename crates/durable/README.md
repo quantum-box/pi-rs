@@ -534,7 +534,20 @@ this control. The filter and deferred declarations survive reopen and forks;
 updates require a settled conversation. Unlike upstream's registration-level
 deferred metadata, these declarations are set per conversation, and unset host
 tools are ordered by name. Selection APIs reject empty or duplicate names.
-There is no built-in deferred-tool search; a host tool can return `add_tools`.
+Install `tool_search::extension()` and select `tool-search` on a conversation
+to offer the model-only `tool_search` tool. It searches currently enabled,
+model-callable deferred tools that are not already offered, including names
+removed by the model filter, and loads matches at the tool-round boundary.
+Ranking uses BM25 over names, descriptions and parameter metadata, including
+local schema references. The default limit is eight; this implementation caps
+it at 128, query size at 4 KiB, candidates at 256, and candidate metadata at
+1 MiB. Exceeding a bound fails the search without loading tools. Registered
+tools are searched in name order for ties. Install the same extension before
+resuming an interrupted conversation. A committed search control survives
+reopen; interruption before its outcome is committed follows the existing
+extension-tool recovery and reconciliation policy.
+The model-visible result lists loaded names; this runtime currently discards
+the tool outcome's separate structured details when recording the result.
 `Harness::set_tool_callers` and `Scheduler::set_tool_callers` persist a
 registered tool's caller override for a settled conversation: `Both`,
 `ModelOnly`, `ToolsOnly`, or `Neither`; `None` restores the default of both.

@@ -9511,6 +9511,25 @@ impl Harness {
                         .get(index)
                         .ok_or_else(|| Error::Invalid("invalid tool index".into()))?;
                     let tools = self.resolved_tools(&c)?;
+                    let search_candidates = if tools
+                        .get(&call.name)
+                        .is_some_and(|reg| crate::tool_search::is_search(&reg.tool))
+                    {
+                        let offered = self.ordered_tool_specs(&c)?;
+                        let mut candidates: Vec<_> = tools
+                            .iter()
+                            .filter(|(name, _)| {
+                                c.tool_filters.deferred.contains(name)
+                                    && caller_allowed(&c, name, true)
+                                    && !offered.iter().any(|tool| &tool.name == *name)
+                            })
+                            .map(|(_, reg)| reg.tool.spec())
+                            .collect();
+                        candidates.sort_by(|a, b| a.name.cmp(&b.name));
+                        candidates
+                    } else {
+                        Vec::new()
+                    };
                     let control =
                         Arc::new(std::sync::Mutex::new(crate::reset::ToolControl::default()));
                     let mut tool_panicked = false;
@@ -9555,7 +9574,10 @@ impl Harness {
                                     operation_id,
                                     tools
                                         .iter()
-                                        .filter(|(name, _)| caller_allowed(&c, name, false))
+                                        .filter(|(name, tool)| {
+                                            caller_allowed(&c, name, false)
+                                                && !crate::tool_search::is_search(&tool.tool)
+                                        })
                                         .map(|(_, tool)| tool.clone())
                                         .collect(),
                                     cancel.child_token(),
@@ -9580,14 +9602,16 @@ impl Harness {
                                             .unwrap_or_else(|| host.clone());
                                         let reply = fenced_poll(
                                             std::panic::AssertUnwindSafe(
-                                                crate::keyed_tool::scope_with_control(
-                                                    host.clone(),
-                                                    reg.tool.clone(),
-                                                    invocation.operation_id,
-                                                    progress_host.clone(),
-                                                    control.clone(),
-                                                    c.tool_attempt().map(|attempt| {
-                                                        Arc::new(RuntimeStreamOutput {
+                                                crate::tool_search::scope(
+                                                    search_candidates,
+                                                    crate::keyed_tool::scope_with_control(
+                                                        host.clone(),
+                                                        reg.tool.clone(),
+                                                        invocation.operation_id,
+                                                        progress_host.clone(),
+                                                        control.clone(),
+                                                        c.tool_attempt().map(|attempt| {
+                                                            Arc::new(RuntimeStreamOutput {
                                                             owner: Arc::downgrade(&self.owner),
                                                             conversation: id,
                                                             attempt,
@@ -9598,18 +9622,19 @@ impl Harness {
                                                             as Arc<
                                                                 dyn crate::keyed_tool::StreamSink,
                                                             >
-                                                    }),
-                                                    crate::task_tool::scope(
-                                                        task_adapter.clone(),
-                                                        operation_id,
-                                                        crate::tool::execute(
-                                                            reg.tool.as_ref(),
-                                                            &invocation,
-                                                            prepared,
-                                                            c.tool_states.get(&call.name),
-                                                            progress_host,
-                                                            cancel,
-                                                            Duration::from_secs(120),
+                                                        }),
+                                                        crate::task_tool::scope(
+                                                            task_adapter.clone(),
+                                                            operation_id,
+                                                            crate::tool::execute(
+                                                                reg.tool.as_ref(),
+                                                                &invocation,
+                                                                prepared,
+                                                                c.tool_states.get(&call.name),
+                                                                progress_host,
+                                                                cancel,
+                                                                Duration::from_secs(120),
+                                                            ),
                                                         ),
                                                     ),
                                                 ),

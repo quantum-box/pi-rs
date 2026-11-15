@@ -22,6 +22,9 @@ durable-store = { path = "../durable-store" }
 thiserror = "2"
 jsonschema = { version = "0.33", default-features = false }
 async-trait = "0.1"
+regex = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.12"
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
