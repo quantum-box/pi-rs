@@ -2636,6 +2636,7 @@ fn json_mode_reports_a_failed_assistant_message() {
                 }
                 Err(error) => panic!("fixture: {error}"),
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
