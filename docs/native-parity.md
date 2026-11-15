@@ -3439,6 +3439,13 @@ and reopened a session with its saved provider.
 
 ### Provider API-key authentication checkpoint
 
+Native SDK hosts may build immutable in-memory credential snapshots keyed by exact
+provider and endpoint strings. Secrets have redacted debug output; clients must be
+constructed explicitly by the host, which remains responsible for endpoint and
+redirect authorization. Replacing a snapshot does not revoke existing copies or
+clients. Unlike Pi's auth storage, this focused API performs no file, environment,
+command, OAuth, or automatic credential discovery.
+
 Use `/login` to select a provider or `/login <provider>` to open its masked
 input directly. `/logout` removes a saved key. Keys are saved atomically in
 the user agent directory's `auth.json`, bound to the endpoint selected when
