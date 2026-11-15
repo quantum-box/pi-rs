@@ -122,7 +122,12 @@ impl FileOperations {
     // Bound the encoded JSON, not the unescaped path length: controls may
     // expand sixfold on the journal wire. Keep modified files first.
     pub(crate) fn bounded_details(&self, limit: usize) -> (serde_json::Value, bool) {
-        let mut remaining = limit.saturating_sub(64);
+        let empty = serde_json::json!({"readFiles":[], "modifiedFiles":[]});
+        let mut remaining = limit.saturating_sub(
+            serde_json::to_vec(&empty)
+                .expect("details serialization")
+                .len(),
+        );
         let mut truncated = self.truncated;
         let mut collect = |paths: &HashSet<String>| {
             let mut kept = Vec::new();
@@ -130,7 +135,7 @@ impl FileOperations {
                 let encoded = serde_json::to_string(&path)
                     .expect("string serialization")
                     .len()
-                    .saturating_add(1);
+                    .saturating_add(usize::from(!kept.is_empty()));
                 if encoded <= remaining {
                     remaining -= encoded;
                     kept.push(path.to_owned());

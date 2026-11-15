@@ -564,8 +564,44 @@ impl Session {
     pub fn supports_record_metadata(&self) -> bool {
         self.store.supports_record_metadata()
     }
-    pub(crate) fn encoded_record_limit(&self) -> Option<usize> {
-        self.store.encoded_record_limit()
+    pub(crate) fn compaction_details_budget(
+        &self,
+        event: &Event,
+        from_extension: bool,
+        truncated: bool,
+    ) -> Result<usize> {
+        let Some(limit) = self.store.encoded_record_limit() else {
+            return Ok(4 * 1024 * 1024);
+        };
+        let mut metadata = serde_json::json!({"details":null});
+        if truncated {
+            metadata["nativeFileDetailsTruncated"] = true.into();
+        }
+        if from_extension {
+            metadata["fromExtension"] = true.into();
+            metadata["nativeGeneratedFileDetails"] = true.into();
+        }
+        let record = Record {
+            timestamp: Some(record_timestamp()),
+            run_id: self.run_id,
+            version: self
+                .records
+                .last()
+                .map_or(TURN_END_JOURNAL_VERSION, |record| {
+                    record.version.max(TURN_END_JOURNAL_VERSION)
+                }),
+            id: self.records.len() as u64 + 1,
+            parent: (self.head != 0).then_some(self.head),
+            event: event.clone(),
+        };
+        let envelope = encode_record(&record, Some(&metadata))?
+            .len()
+            .saturating_add(1);
+        // `null` in the template occupies four bytes; replace it with details.
+        Ok(limit
+            .saturating_sub(envelope)
+            .saturating_add(4)
+            .min(4 * 1024 * 1024))
     }
     pub fn retry_control(&self) -> crate::RetryControl {
         self.retry.clone()
