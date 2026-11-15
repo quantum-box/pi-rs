@@ -797,6 +797,8 @@ struct View {
     thinking: String,
     thinking_items: std::collections::BTreeMap<u64, String>,
     text_items: std::collections::BTreeMap<u64, String>,
+    thinking_items_consistent: bool,
+    text_items_consistent: bool,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
@@ -833,6 +835,26 @@ struct View {
     shell_running: bool,
     restoring_queue: bool,
 }
+fn append_indexed(
+    items: &mut std::collections::BTreeMap<u64, String>,
+    combined: &mut String,
+    consistent: &mut bool,
+    index: u64,
+    delta: &str,
+) {
+    let append = *consistent
+        && items
+            .last_key_value()
+            .is_none_or(|(&last, _)| index >= last);
+    items.entry(index).or_default().push_str(delta);
+    if append {
+        combined.push_str(delta);
+    } else {
+        *combined = items.values().cloned().collect();
+        *consistent = true;
+    }
+}
+
 impl View {
     fn invalidate_model_catalog(&mut self) {
         self.available_models.clear();
@@ -1725,9 +1747,8 @@ impl View {
             Some("reasoning_delta") if !self.summarizing => {
                 let delta = value["delta"].as_str().unwrap_or_default();
                 if let Some(index) = value["reasoningIndex"].as_u64() {
-                    self.thinking_items.entry(index).or_default().push_str(delta);
-                    self.thinking = self.thinking_items.values().cloned().collect();
-                } else { self.thinking.push_str(delta); }
+                    append_indexed(&mut self.thinking_items, &mut self.thinking, &mut self.thinking_items_consistent, index, delta);
+                } else { self.thinking.push_str(delta); self.thinking_items_consistent = false; }
             }
             Some("reasoning_item_start") if !self.summarizing => {
                 if let Some(index) = value["index"].as_u64() { self.thinking_items.entry(index).or_default(); }
@@ -1736,6 +1757,7 @@ impl View {
                 if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
                     self.thinking_items.insert(index, content.to_owned());
                     self.thinking = self.thinking_items.values().cloned().collect();
+                    self.thinking_items_consistent = true;
                 }
             }
             Some("text_item_start") if !self.summarizing => {
@@ -1743,22 +1765,21 @@ impl View {
             }
             Some("text_item_delta") if !self.summarizing => {
                 if let (Some(index), Some(delta)) = (value["index"].as_u64(), value["delta"].as_str()) {
-                    self.text_items.entry(index).or_default().push_str(delta);
-                    self.streaming = self.text_items.values().cloned().collect();
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
                 }
             }
             Some("text_item_end") if !self.summarizing => {
                 if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
                     self.text_items.insert(index, content.to_owned());
                     self.streaming = self.text_items.values().cloned().collect();
+                    self.text_items_consistent = true;
                 }
             }
             Some("text_delta") if !self.summarizing => {
                 let delta = value["delta"].as_str().unwrap_or_default();
                 if let Some(index) = value["textIndex"].as_u64() {
-                    self.text_items.entry(index).or_default().push_str(delta);
-                    self.streaming = self.text_items.values().cloned().collect();
-                } else { self.streaming.push_str(delta); }
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
             }
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
@@ -7585,6 +7606,25 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexed_delta_append_handles_interleaving_and_legacy_text() {
+        let mut items = std::collections::BTreeMap::new();
+        let mut combined = String::new();
+        let mut consistent = false;
+        for (index, delta, expected) in [
+            (0, "a", "a"),
+            (1, "b", "ab"),
+            (0, "c", "acb"),
+            (1, "d", "acbd"),
+        ] {
+            super::append_indexed(&mut items, &mut combined, &mut consistent, index, delta);
+            assert_eq!(combined, expected);
+        }
+        combined.push_str("legacy");
+        consistent = false;
+        super::append_indexed(&mut items, &mut combined, &mut consistent, 1, "e");
+        assert_eq!(combined, "acbde");
+    }
     #[test]
     fn indexed_text_finalization_keeps_item_order() {
         let mut view = super::View::default();
