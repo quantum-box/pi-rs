@@ -959,9 +959,15 @@ impl Tool for Operations {
                 Outcome::Failed(message)
             };
         }
-        let keys = match Keys::load_async().await {
-            Ok(keys) => keys,
-            Err(error) => return Outcome::Failed(error.to_string()),
+        // Unfiltered catalogue lookups do not consult credentials in Pi.
+        // Preserve discovery even when auth.json is unreadable or malformed.
+        let keys = if args["action"] == "list" && args["available"] != true {
+            Keys::default()
+        } else {
+            match Keys::load_async().await {
+                Ok(keys) => keys,
+                Err(error) => return Outcome::Failed(error.to_string()),
+            }
         };
         if args["action"] == "list" {
             let kind = serde_json::from_value::<Kind>(args["type"].clone()).unwrap_or(Kind::Chat);
@@ -1205,6 +1211,66 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unfiltered_catalogue_does_not_read_auth_file() {
+        use clap::Parser;
+        const CHILD: &str = "PI_RS_CATALOG_AUTH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("auth.json"), "{").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::unfiltered_catalogue_does_not_read_auth_file",
+                ])
+                .env(CHILD, "1")
+                .env("PI_RS_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{}})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = || ToolContext {
+            operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            cancellation: Default::default(),
+        };
+        let args =
+            json!({"action":"list","type":"classifier","provider":"typesafe","available":false});
+        let Outcome::Structured { data, .. } = operation.invoke(args, context()).await else {
+            panic!("unfiltered discovery should succeed")
+        };
+        assert!(
+            data.as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == "jev-latest")
+        );
+        let chat = json!({"action":"list","type":"chat","provider":"openai","available":false});
+        let Outcome::Structured { data, .. } = operation.invoke(chat, context()).await else {
+            panic!("unfiltered chat discovery should succeed")
+        };
+        assert!(!data.as_array().unwrap().is_empty());
+        let args =
+            json!({"action":"list","type":"classifier","provider":"typesafe","available":true});
+        assert!(matches!(
+            operation.invoke(args, context()).await,
+            Outcome::Failed(_)
+        ));
+    }
 
     #[test]
     fn vercel_builtin_classifier_catalogue_is_endpoint_bound() {
