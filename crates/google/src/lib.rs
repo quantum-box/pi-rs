@@ -903,9 +903,11 @@ impl Model for Google {
                         Error::Model("Google Gemini returned a stream error".into())
                     })?;
                 }
+                let mut new_response_id = false;
                 if let Some(id) = value["responseId"].as_str().filter(|id| !id.is_empty() && id.len() <= 160)
                     && metadata.provider_request_id.is_none() {
                     metadata.provider_request_id = Some(id.into());
+                    new_response_id = true;
                 }
                 if let Some(version) = value["modelVersion"].as_str().filter(|version| valid_model_id(version)) {
                     metadata.resolved_model = Some(identity(&provider, version));
@@ -921,12 +923,16 @@ impl Model for Google {
                 if value["promptFeedback"]["blockReason"].as_str().is_some_and(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED") {
                     Err(Error::Model("Google Gemini blocked the prompt".into()))?;
                 }
-                let Some(candidates) = value["candidates"].as_array() else {
-                    continue;
-                };
-                if candidates.len() > 1 || candidates.first().is_some_and(|candidate| candidate["index"].as_u64().unwrap_or_default() != 0) {
+                let candidates = value["candidates"].as_array();
+                if candidates.is_some_and(|candidates| candidates.len() > 1 || candidates.first().is_some_and(|candidate| candidate["index"].as_u64().unwrap_or_default() != 0)) {
                     Err(Error::Model("unexpected Google Gemini candidate".into()))?;
                 }
+                if new_response_id {
+                    yield ModelEvent::Metadata(metadata.clone());
+                }
+                let Some(candidates) = candidates else {
+                    continue;
+                };
                 let Some(candidate) = candidates.first() else {
                     continue;
                 };
@@ -1012,6 +1018,114 @@ fn report_progress(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn response_id_survives_handled_agent_cancellation() {
+        use pi_rs_core::{
+            Agent, CancellationToken, Event, Limits, MemoryStore, ModelFailure, Notification,
+            Registry, Session,
+        };
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"responseId":"first"}),
+                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"partial"}]}}]})
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+                body
+            )
+            .unwrap();
+            socket.flush().unwrap();
+            wait.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        let model = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "m",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let result = agent
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &cancel,
+                &mut |event| {
+                    if matches!(event, Notification::Text("partial")) {
+                        cancel.cancel();
+                    }
+                },
+            )
+            .await;
+        release.send(()).unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            session
+                .records()
+                .iter()
+                .any(|record| matches!(&record.event,
+            Event::ModelFinished { metadata, failure: Some(ModelFailure::Cancelled), .. }
+                if metadata.provider_request_id.as_deref() == Some("first")))
+        );
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_id_is_reported_before_an_interrupted_stream() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"responseId":"first"}),
+                json!({"error":{"code":503,"message":"unavailable"}})
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let mut stream = model.stream(request).await.unwrap();
+        match stream.next().await.unwrap().unwrap() {
+            ModelEvent::Metadata(metadata) => {
+                assert_eq!(metadata.provider_request_id.as_deref(), Some("first"))
+            }
+            _ => panic!("expected early response metadata"),
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(Error::RetryableModel(_)))
+        ));
+        worker.join().unwrap();
+    }
+
     #[tokio::test]
     async fn keeps_first_valid_nonempty_response_id() {
         use std::io::{Read, Write};
