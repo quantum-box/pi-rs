@@ -462,6 +462,12 @@ enum NestedResumeDecision {
     Busy,
     NotReady,
 }
+type UnsafeResumeLeases = (
+    ToolAttempt,
+    Vec<crate::nested_identity::IdentityLease>,
+    HashMap<String, RegisteredTool>,
+);
+type PreparationLease = (Uuid, RegisteredTool, crate::nested_identity::IdentityLease);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum PreparedKeyedVersion {
@@ -10009,16 +10015,8 @@ impl Harness {
         // Held from before the durable unsafe claim until the checked result
         // commit. Process death drops these and recovery treats the claim as
         // uncertain, never as the old park.
-        let mut unsafe_resume_leases: Option<(
-            ToolAttempt,
-            Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>,
-            HashMap<String, RegisteredTool>,
-        )> = None;
-        let mut preparation_lease: Option<(
-            Uuid,
-            RegisteredTool,
-            tokio::sync::OwnedRwLockReadGuard<Option<String>>,
-        )> = None;
+        let mut unsafe_resume_leases: Option<UnsafeResumeLeases> = None;
+        let mut preparation_lease: Option<PreparationLease> = None;
         loop {
             if cancel.is_cancelled() {
                 self.failed = true;
@@ -12017,12 +12015,11 @@ impl Harness {
                         }
                         _ => self.resolved_tools(&c)?,
                     };
-                    if unsafe_resume_leases.is_none() {
-                        if let Some((prepared_operation, reg, _)) = &preparation_lease {
-                            if *prepared_operation == operation_id {
-                                tools.insert(call.name.clone(), reg.clone());
-                            }
-                        }
+                    if unsafe_resume_leases.is_none()
+                        && let Some((prepared_operation, reg, _)) = &preparation_lease
+                        && *prepared_operation == operation_id
+                    {
+                        tools.insert(call.name.clone(), reg.clone());
                     }
                     let search_candidates = if tools
                         .get(&call.name)
@@ -12352,27 +12349,22 @@ impl Harness {
                                                 })?
                                                 .eq(&crate::reset::ToolControl::default());
                                         }
-                                        if explicitly_suspended {
-                                            if let Some(Ok(reply)) = &reply {
-                                                if replay == ReplayPolicy::Unsafe
-                                                    && matches!(
-                                                        reply.outcome,
-                                                        Outcome::Failed(_) | Outcome::Skipped(_)
-                                                    )
-                                                {
-                                                    park_return_failure =
-                                                        Some(reply.outcome.tool_content());
-                                                }
+                                        if explicitly_suspended && replay == ReplayPolicy::Unsafe {
+                                            if let Some(Ok(reply)) = &reply
+                                                && matches!(
+                                                    reply.outcome,
+                                                    Outcome::Failed(_) | Outcome::Skipped(_)
+                                                )
+                                            {
+                                                park_return_failure =
+                                                    Some(reply.outcome.tool_content());
                                             }
-                                            if replay == ReplayPolicy::Unsafe {
-                                                unsafe_children_match =
-                                                    crate::nested::children_match(
-                                                        self.owner.store(),
-                                                        operation_id,
-                                                        &tools,
-                                                        true,
-                                                    )?;
-                                            }
+                                            unsafe_children_match = crate::nested::children_match(
+                                                self.owner.store(),
+                                                operation_id,
+                                                &tools,
+                                                true,
+                                            )?;
                                         }
                                         nested_resume_candidate = inspection.is_err()
                                             && host.only_pending_failure()

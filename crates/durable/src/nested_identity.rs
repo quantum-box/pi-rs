@@ -4,6 +4,7 @@ use pi_rs_core::Tool;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
+pub(crate) type IdentityLease = OwnedRwLockReadGuard<Option<String>>;
 type Entry = (Weak<dyn Tool>, Arc<RwLock<Option<String>>>);
 static ENTRIES: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
 

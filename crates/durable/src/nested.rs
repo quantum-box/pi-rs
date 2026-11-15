@@ -226,6 +226,7 @@ pub(crate) fn pending_jobs(
 
 /// Bind only a legacy unbound pending reference after an operator has
 /// independently verified the remote job and its backend identity.
+#[allow(clippy::too_many_arguments)] // The checked binding needs every part of the operator's assertion and its store fence.
 pub(crate) fn bind_pending_identity(
     store: &durable_store::Store,
     conversation: (Vec<u8>, u64),
@@ -325,17 +326,15 @@ pub(crate) fn children_match(
 
 /// Lease all recorded child identities before an unsafe parent claims its
 /// next attempt. Nonblocking acquisition avoids lock-order deadlocks.
+type ChildLeaseResult = Result<
+    Result<Vec<crate::nested_identity::IdentityLease>, crate::nested_identity::LeaseFailure>,
+    crate::runtime::Error,
+>;
 pub(crate) fn lease_children(
     store: &durable_store::Store,
     root: Uuid,
     tools: &std::collections::HashMap<String, RegisteredTool>,
-) -> Result<
-    Result<
-        Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>,
-        crate::nested_identity::LeaseFailure,
-    >,
-    crate::runtime::Error,
-> {
+) -> ChildLeaseResult {
     lease_children_for_resume(store, root, tools, true)
 }
 
@@ -344,13 +343,7 @@ pub(crate) fn lease_children_for_resume(
     root: Uuid,
     tools: &std::collections::HashMap<String, RegisteredTool>,
     require_identity: bool,
-) -> Result<
-    Result<
-        Vec<tokio::sync::OwnedRwLockReadGuard<Option<String>>>,
-        crate::nested_identity::LeaseFailure,
-    >,
-    crate::runtime::Error,
-> {
+) -> ChildLeaseResult {
     let mut leases = Vec::new();
     let mut any = false;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
