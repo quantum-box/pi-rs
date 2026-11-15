@@ -2061,13 +2061,13 @@ impl Tool for CodingTool {
             Kind::Find => (
                 "find",
                 "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
-                json!({"pattern":{"type":"string"},"path":path,"limit": if self.unrestricted { json!({"type":"integer","minimum":1,"maximum":u64::MAX}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
+                json!({"pattern":{"type":"string"},"path":path,"limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::List => (
                 "ls",
                 "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
-                json!({"path":path,"limit": if self.unrestricted { json!({"type":"integer","minimum":1,"maximum":u64::MAX}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
+                json!({"path":path,"limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec![],
             ),
         };
@@ -2350,6 +2350,32 @@ fn is_unix_access_denied(error: &std::io::Error) -> bool {
 #[cfg(not(unix))]
 fn is_unix_access_denied(_error: &std::io::Error) -> bool {
     false
+}
+
+// Pi parses JSON numbers as JavaScript doubles and formats them using Number.toString.
+fn local_numeric_limit(args: &Value, default: f64) -> f64 {
+    args.get("limit").and_then(Value::as_f64).unwrap_or(default)
+}
+
+fn js_number(value: f64) -> String {
+    ryu_js::Buffer::new().format(value).to_owned()
+}
+
+// fd receives String(limit), and its --max-results parser accepts usize. Zero
+// is fd's unlimited sentinel; the original number remains relevant to notices.
+fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
+    let text = js_number(value);
+    let reason = if text.starts_with('-') {
+        return Err("error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.".into());
+    } else {
+        match text.parse::<usize>() {
+            Ok(limit) => return Ok(limit),
+            Err(error) => error.to_string(),
+        }
+    };
+    Err(format!(
+        "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+    ))
 }
 
 impl CodingTool {
@@ -2811,13 +2837,8 @@ impl CodingTool {
             &crate::coding_paths::normalize(requested_path)?,
         );
         let path = self.path(requested_path)?;
-        let requested_limit = args["limit"].as_u64().unwrap_or(500);
-        let limit = usize::try_from(if self.unrestricted {
-            requested_limit
-        } else {
-            requested_limit.min(100_000)
-        })
-        .unwrap_or(usize::MAX);
+        let numeric_limit = local_numeric_limit(args, 500.0);
+        let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
                 "Not a directory: {}",
@@ -2845,7 +2866,11 @@ impl CodingTool {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            if result_count >= limit {
+            if if self.unrestricted {
+                (result_count as f64) >= numeric_limit
+            } else {
+                result_count >= limit
+            } {
                 entry_limit_reached = true;
                 break;
             }
@@ -2864,11 +2889,20 @@ impl CodingTool {
         let mut details = Map::new();
         let mut notices = Vec::new();
         if entry_limit_reached {
-            details.insert("entryLimitReached".into(), json!(limit));
-            notices.push(format!(
-                "{limit} entries limit reached. Use limit={} for more",
-                limit.saturating_mul(2)
-            ));
+            if self.unrestricted {
+                details.insert("entryLimitReached".into(), json!(numeric_limit));
+                notices.push(format!(
+                    "{} entries limit reached. Use limit={} for more",
+                    js_number(numeric_limit),
+                    js_number(numeric_limit * 2.0)
+                ));
+            } else {
+                details.insert("entryLimitReached".into(), json!(limit));
+                notices.push(format!(
+                    "{limit} entries limit reached. Use limit={} for more",
+                    limit.saturating_mul(2)
+                ));
+            }
         }
         Ok(listing.finish(details, notices))
     }
@@ -2877,8 +2911,24 @@ impl CodingTool {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let base = self.path(args["path"].as_str().unwrap_or("."))?;
         let is_find = matches!(self.kind, Kind::Find);
+        let numeric_find_limit = local_numeric_limit(args, 1000.0);
+        // fd parses its arguments before checking the search path.
+        let unrestricted_find_limit = if is_find && self.unrestricted {
+            match fd_numeric_limit(numeric_find_limit) {
+                Ok(limit) => Some(limit),
+                Err(output) => {
+                    return Ok(Outcome::TextResult {
+                        output,
+                        details: None,
+                        is_error: true,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let base = self.path(args["path"].as_str().unwrap_or("."))?;
         // Keep the requested name for a single-file grep, even when path()
         // resolves a symlink to enforce workspace boundaries.
         let grep_file_name = if !is_find && base.is_file() {
@@ -2892,12 +2942,8 @@ impl CodingTool {
         let requested_limit = args["limit"]
             .as_u64()
             .unwrap_or(if is_find { 1000 } else { 100 });
-        let limit = usize::try_from(if is_find && self.unrestricted {
-            requested_limit
-        } else {
-            requested_limit.min(100_000)
-        })
-        .unwrap_or(usize::MAX);
+        let limit = unrestricted_find_limit
+            .unwrap_or_else(|| usize::try_from(requested_limit.min(100_000)).unwrap_or(usize::MAX));
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
@@ -3058,7 +3104,7 @@ impl CodingTool {
                     results.push(path);
                 }
                 find_count += 1;
-                if find_count >= limit {
+                if find_count >= limit && !(self.unrestricted && limit == 0) {
                     break;
                 }
             }
@@ -3075,11 +3121,12 @@ impl CodingTool {
             }
             let mut details = Map::new();
             let mut notices = Vec::new();
-            if find_line_count >= limit {
-                details.insert("resultLimitReached".into(), json!(limit));
+            if (find_line_count as f64) >= numeric_find_limit {
+                details.insert("resultLimitReached".into(), json!(numeric_find_limit));
                 notices.push(format!(
-                    "{limit} results limit reached. Use limit={} for more, or refine pattern",
-                    limit.saturating_mul(2)
+                    "{} results limit reached. Use limit={} for more, or refine pattern",
+                    js_number(numeric_find_limit),
+                    js_number(numeric_find_limit * 2.0)
                 ));
             }
             return Ok(find_listing.finish(details, notices));
@@ -6199,10 +6246,78 @@ mod tests {
                 ..tool
             };
             assert_eq!(
-                unrestricted.spec().parameters["properties"]["limit"]["maximum"],
-                json!(u64::MAX)
+                unrestricted.spec().parameters["properties"]["limit"],
+                json!({"type":"number"})
             );
         }
+    }
+
+    #[test]
+    fn local_numeric_limit_details_and_javascript_formatting() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::List,
+        };
+        let token = pi_rs::CancellationToken::new();
+        let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
+        assert!(
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.5))
+        );
+        tool.kind = Kind::Find;
+        let outcome = tool
+            .search(&json!({"pattern":"*", "limit": 0.0}), &token)
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(0.0))
+        );
+        let failed = tool
+            .search(&json!({"pattern":"*", "limit":1.5}), &token)
+            .unwrap();
+        assert!(failed.is_error());
+        assert_eq!(
+            failed.tool_content(),
+            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'."
+        );
+        let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
+        let missing_outcome = tool.search(&missing, &token).unwrap();
+        assert!(missing_outcome.is_error());
+        assert_eq!(missing_outcome.tool_content(), failed.tool_content());
+        tool.unrestricted = false;
+        assert!(tool.search(&missing, &token).is_err());
+        assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
+        assert_eq!(js_number(u64::MAX as f64), "18446744073709552000");
+        assert_eq!(js_number(-0.0), "0");
+        assert_eq!(js_number(f64::MAX * 2.0), "Infinity");
+        assert_eq!(fd_numeric_limit(0.0).unwrap(), 0);
+        assert_eq!(fd_numeric_limit(2_147_483_647.0).unwrap(), 2_147_483_647);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                fd_numeric_limit(18_446_744_073_709_550_000.0).unwrap(),
+                18_446_744_073_709_550_000usize
+            );
+            assert!(
+                fd_numeric_limit(u64::MAX as f64)
+                    .unwrap_err()
+                    .contains("number too large")
+            );
+        }
+        assert!(
+            fd_numeric_limit(f64::MAX)
+                .unwrap_err()
+                .contains("invalid digit found in string")
+        );
+        assert!(
+            fd_numeric_limit(f64::MIN_POSITIVE)
+                .unwrap_err()
+                .contains("invalid digit found in string")
+        );
     }
 
     #[test]

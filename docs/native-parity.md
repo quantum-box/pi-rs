@@ -1622,9 +1622,14 @@ and byte limits. Large text files remain searchable. Overlapping context ranges
 are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
 radius is limited to 1,000 lines.
 
-Unrestricted local `find` and `ls` accept positive integer limits representable as `u64`
-(and clamp them to `usize::MAX` on narrower hosts); scoped tools retain the
-100,000-entry cap. Their incremental output formatter retains at most 50 KiB
+Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
+JSON numbers as JavaScript doubles. `ls` compares the number directly, including
+zero, negative and fractional values. Local `find` reproduces fd's numeric
+argument parsing: zero means unlimited, while negative, fractional, and values
+outside fd's host-sized integer range produce fd-style errors before checking
+the search path. These diagnostics retain error status and reach the model
+without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
 serial walker's sibling-sorted depth-first traversal, which has the same
