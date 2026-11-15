@@ -2096,7 +2096,7 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"integer","minimum":1}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
+                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::Find => (
@@ -2943,6 +2943,11 @@ impl CodingTool {
                 }
                 error => error,
             })?;
+            let grep = if self.unrestricted {
+                grep.with_numeric_limit(args["limit"].as_f64().unwrap_or(100.0))
+            } else {
+                grep
+            };
             Some(if base.is_file() {
                 grep.with_explicit_file()
             } else {
@@ -4622,6 +4627,88 @@ mod tests {
                 .unwrap()
                 .is_valid(&args)
         );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_numeric_limits_through_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(4)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        for (limit, count, notice, effective) in [
+            (
+                json!(0),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(-3),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(2.0),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+            (
+                json!(2.5),
+                3,
+                "2.5 matches limit reached. Use limit=5",
+                json!(2.5),
+            ),
+        ] {
+            let args = json!({"pattern":"needle", "limit":limit, "context":1});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            match outcome {
+                Outcome::SucceededWithDetails { output, details } => {
+                    assert_eq!(
+                        output
+                            .lines()
+                            .filter(|line| line.contains(": needle"))
+                            .count(),
+                        count
+                    );
+                    assert!(output.contains(notice), "{output}");
+                    assert_eq!(details["matchLimitReached"], effective);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        for limit in [json!(1e100), json!(18446744073709551615u64)] {
+            let args = json!({"pattern":"needle", "limit":limit});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert_eq!(outcome.tool_content().lines().count(), 4);
+        }
+        tool.unrestricted = false;
+        let scoped = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        assert!(!scoped.is_valid(&json!({"pattern":"needle", "limit":2.5})));
     }
 
     #[tokio::test]
