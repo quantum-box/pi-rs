@@ -2552,7 +2552,8 @@ with chunked multibyte output; other local-tool parity gaps remain open.
 ### Grep context and line-limit checkpoint
 
 Invalid regular expressions in unrestricted local `grep` include the `rg:`
-prefix used by Pi's ripgrep diagnostic.
+prefix used by Pi's ripgrep diagnostic. Unsupported look-around and
+backreferences include ripgrep's PCRE2 suggestion.
 
 Grep now emits a separate context block for each match, including repeated lines
 where adjacent matches overlap. The matching marker belongs to that block's

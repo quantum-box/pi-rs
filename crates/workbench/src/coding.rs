@@ -2772,7 +2772,14 @@ impl CodingTool {
                 Error::Config(message)
                     if self.unrestricted && message.starts_with("regex parse error:") =>
                 {
-                    Error::Config(format!("rg: {message}"))
+                    let advice = if message.contains("look-around, including look-ahead and look-behind, is not supported")
+                        || message.contains("backreferences are not supported")
+                    {
+                        "\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."
+                    } else {
+                        ""
+                    };
+                    Error::Config(format!("rg: {message}{advice}"))
                 }
                 error => error,
             })?;
@@ -4470,6 +4477,20 @@ mod tests {
         assert!(
             matches!(&result, Outcome::Failed(message)
             if message == "rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(
+                json!({"pattern":"(?=a)","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:(?=a))\n       ^^^\nerror: look-around, including look-ahead and look-behind, is not supported\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."),
             "{result:?}"
         );
         let scoped = CodingTool {
