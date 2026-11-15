@@ -377,13 +377,14 @@ pub(crate) mod windows_mutex {
         },
         Security::Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+            ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
         },
         Security::{
             ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
             GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-            GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-            SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            GetSecurityDescriptorSacl, GetTokenInformation, LABEL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+            SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
         },
         System::Threading::{
             CreateMutexExW, GetCurrentProcess, MUTEX_MODIFY_STATE, OpenProcessToken, ReleaseMutex,
@@ -477,7 +478,7 @@ pub(crate) mod windows_mutex {
     fn descriptor(user: &User) -> io::Result<Local> {
         // One explicit ACE, no inheritance, granting only requested rights.
         let sddl = wide(&format!(
-            "O:{}D:P(A;;0x{:08x};;;{})",
+            "O:{}D:P(A;;0x{:08x};;;{})S:(ML;;NW;;;ME)",
             user.text, RIGHTS, user.text
         ));
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
@@ -501,7 +502,7 @@ pub(crate) mod windows_mutex {
             GetSecurityInfo(
                 handle,
                 SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
                 null_mut(),
                 null_mut(),
                 null_mut(),
@@ -565,7 +566,87 @@ pub(crate) mod windows_mutex {
         if unsafe { EqualSid(ace_sid.cast(), user.sid) } == 0 {
             return Err(denied("mutex ACE SID does not match user"));
         }
+        validate_medium_label(sd.0)?;
         Ok(())
+    }
+
+    // Require exactly one medium integrity label with NO_WRITE_UP. Missing or
+    // higher labels are rejected even when this process can open the object:
+    // another same-user process at medium integrity must be able to use it.
+    fn validate_medium_label(sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut sacl: *mut ACL = null_mut();
+        if unsafe { GetSecurityDescriptorSacl(sd, &mut present, &mut sacl, &mut defaulted) } == 0
+            || present == 0
+            || sacl.is_null()
+            || unsafe { (*sacl).AceCount } != 1
+        {
+            return Err(denied("mutex integrity label is missing or unexpected"));
+        }
+        let mut ptr: *mut c_void = null_mut();
+        if unsafe { GetAce(sacl, 0, &mut ptr) } == 0 || ptr.is_null() {
+            return Err(denied("invalid mutex integrity label"));
+        }
+        let ace = ptr.cast::<SYSTEM_MANDATORY_LABEL_ACE>();
+        // SYSTEM_MANDATORY_LABEL_ACE_TYPE = 0x11; NO_WRITE_UP = 1.
+        if unsafe { (*ace).Header.AceType } != 0x11
+            || unsafe { (*ace).Header.AceFlags } != 0
+            || unsafe { (*ace).Header.AceSize } != 20
+            || unsafe { (*ace).Mask } != 1
+        {
+            return Err(denied("unexpected mutex integrity label"));
+        }
+        let mut medium: PSID = null_mut();
+        if unsafe { ConvertStringSidToSidW(wide("S-1-16-8192").as_ptr(), &mut medium) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let medium = Local(medium);
+        let label_sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<u8>() };
+        if unsafe { *label_sid.add(1) } != 1 || unsafe { EqualSid(label_sid.cast(), medium.0) } == 0
+        {
+            return Err(denied("mutex integrity level is not medium"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod integrity_tests {
+        use super::*;
+
+        fn parse(sddl: &str) -> Local {
+            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        wide(sddl).as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut sd,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            Local(sd)
+        }
+
+        #[test]
+        fn only_medium_no_write_up_label_is_accepted() {
+            for (sddl, accepted) in [
+                ("S:(ML;;NW;;;ME)", true),
+                ("S:(ML;;NW;;;HI)", false),
+                ("S:(ML;;NW;;;LW)", false),
+                ("S:(ML;;NR;;;ME)", false),
+                ("D:(A;;GA;;;SY)", false),
+            ] {
+                let descriptor = parse(sddl);
+                assert_eq!(
+                    validate_medium_label(descriptor.0).is_ok(),
+                    accepted,
+                    "{sddl}"
+                );
+            }
+        }
     }
 
     fn open_mutex() -> io::Result<Handle> {
