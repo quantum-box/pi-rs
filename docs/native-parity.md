@@ -640,6 +640,14 @@ cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
 
 ### Resources checkpoint
 
+Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
+files. No directories, settings, or packages are discovered implicitly. The
+snapshot retains source paths, frontmatter description and argument hint, and
+Pi-style fallback descriptions. Reads follow symlinks, are bounded, and fail
+atomically on unreadable, malformed, duplicate-name or missing files; Pi reports
+warnings and can continue. Expansion and automatic command registration remain
+the host's responsibility.
+
 Skill frontmatter treats non-string names as absent and falls back to the
 parent directory. Only the boolean `true` disables model invocation;
 other types leave a skill with a valid description available. Non-string
