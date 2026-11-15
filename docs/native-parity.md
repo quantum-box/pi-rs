@@ -3157,7 +3157,9 @@ identifies the requested file when a parent directory is missing. On Unix, a
 non-directory parent reports Pi's `ENOTDIR` access diagnostic with the requested
 path. An inaccessible file or parent reports the requested path in Pi's
 `EACCES` access diagnostic. Other I/O errors and restricted workspace path
-checks retain their existing behavior.
+checks retain their existing behavior. A directory read reports Pi's Unix
+`EISDIR` diagnostic, and an out-of-range offset preserves Pi's message without
+a configuration-error prefix.
 
 ### Write and edit result checkpoint
 
