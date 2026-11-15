@@ -4435,6 +4435,7 @@ mod tests {
         .unwrap();
         assert!(!request.has_progress);
         assert!(!request.has_keyed_messages);
+        assert!(!request.has_custom_entry_read);
         let legacy: DuplexFrame = serde_json::from_value(serde_json::json!({"type":"send_message","message":{"customType":"test","content":"hello","display":false},"delivery":"steer"})).unwrap();
         assert!(matches!(legacy, DuplexFrame::SendMessage { key: None, .. }));
         let keyed = DuplexFrame::SendMessage {
@@ -4693,6 +4694,8 @@ mod tests {
             "custom message delivery is unavailable"
         );
         assert!(!remote.supports_custom_entries());
+        assert!(!remote.supports_custom_entry_read());
+        assert!(remote.custom_entries(None).await.is_err());
         assert_eq!(
             remote
                 .append_entry(pi_rs_core::CustomEntry {
