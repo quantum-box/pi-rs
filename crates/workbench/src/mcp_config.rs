@@ -559,7 +559,12 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 if project
                     .get("mcpServers")
                     .and_then(|entries| entries.get(&name))
-                    .is_none()
+                    .and_then(Value::as_object)
+                    .is_none_or(|entry| {
+                        !["command", "url", "type"]
+                            .iter()
+                            .any(|key| entry.contains_key(*key))
+                    })
                 {
                     return Err(Error::Config(format!(
                         "MCP server {name} is not configured in the trusted project"
