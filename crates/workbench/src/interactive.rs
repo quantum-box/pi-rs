@@ -1286,7 +1286,7 @@ impl View {
 
     fn panel_expansion(&mut self, panel: TranscriptPanel) -> Option<&mut Option<bool>> {
         if panel == TranscriptPanel::StreamingThinking {
-            return Some(&mut self.thinking_expanded);
+            return (!self.thinking.trim().is_empty()).then_some(&mut self.thinking_expanded);
         }
         let entry = match panel {
             TranscriptPanel::Summary(id) => self.lines.iter_mut().find(
@@ -7768,6 +7768,10 @@ mod tests {
         view.settle();
         assert!(
             matches!(&view.lines[2], Entry::Thinking { text, expanded: Some(false) } if text == "streamed")
+        );
+        assert!(
+            view.panel_expansion(super::TranscriptPanel::StreamingThinking)
+                .is_none()
         );
         view.set_hide_thinking(true);
         assert!(view.hide_thinking);
