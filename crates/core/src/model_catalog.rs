@@ -13,7 +13,8 @@ use crate::{
 #[serde(default, rename_all = "camelCase")]
 pub struct CatalogModelInfo {
     pub display_name: Option<String>,
-    pub api: Option<crate::ModelApi>,
+    /// The host-supplied API name, including custom or future Pi API names.
+    pub api: Option<String>,
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<bool>,
@@ -355,7 +356,7 @@ mod tests {
         let first: Arc<dyn Model> = Arc::new(NamedModel("first"));
         let info = CatalogModelInfo {
             display_name: Some("Example".into()),
-            api: Some(crate::ModelApi::OpenaiResponses),
+            api: Some("openai-codex-responses".into()),
             context_window: Some(12345),
             reasoning: Some(true),
             cost: Some(CatalogModelCost {
@@ -396,6 +397,13 @@ mod tests {
         assert_eq!(cloned.info("p", "m"), Some(&info));
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["contextWindow"], 12345);
+        let custom: CatalogModelInfo =
+            serde_json::from_value(serde_json::json!({"api":"custom-future-api"})).unwrap();
+        assert_eq!(custom.api.as_deref(), Some("custom-future-api"));
+        assert_eq!(
+            serde_json::to_value(custom).unwrap()["api"],
+            "custom-future-api"
+        );
         assert_eq!(
             serde_json::from_value::<CatalogModelInfo>(json).unwrap(),
             info
