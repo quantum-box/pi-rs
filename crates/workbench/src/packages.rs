@@ -1061,6 +1061,15 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                     .ok_or_else(|| Error::Config("package needs a source".into()))?;
                 let source = normalize(source, &base)?;
                 let identity = source_identity(&source);
+                let scope = if project { 0 } else { 1 };
+                // User duplicates keep the first value; project duplicates replace
+                // that value while retaining its original position.
+                let same_scope = order
+                    .get(&identity)
+                    .is_some_and(|(seen_scope, _)| *seen_scope == scope);
+                if same_scope && !project {
+                    continue;
+                }
                 if !project {
                     global.insert(identity.clone(), value.clone());
                 }
@@ -1069,7 +1078,9 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 } else {
                     None
                 };
-                order.insert(identity.clone(), (if project { 0 } else { 1 }, position));
+                if !same_scope {
+                    order.insert(identity.clone(), (scope, position));
+                }
                 result.insert(
                     identity,
                     Declaration {

@@ -318,6 +318,26 @@ fn invalid_remote_filters_follow_package_settings_order() {
             "{stderr}"
         );
     }
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::json!({"packages":[
+            {"source":sources[0],"prompts":["file:///bad%2Fpath"]},
+            {"source":sources[1],"prompts":["file:///bad%ZZ"]},
+            {"source":sources[0],"prompts":["file:///bad%ZZ"]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", &home)
+        .env("PI_OFFLINE", "1")
+        .args(["--no-trust", "--no-mcp", "--print", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("encoded"), "{stderr}");
     let project = directory.path().join(".pi");
     std::fs::create_dir(&project).unwrap();
     std::fs::write(
@@ -330,6 +350,16 @@ fn invalid_remote_filters_follow_package_settings_order() {
         project.join("settings.json"),
         serde_json::json!({"packages":[{"source":sources[0],"prompts":["file:///bad%2Fpath"]}]})
             .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("settings.json"),
+        serde_json::json!({"packages":[
+            {"source":sources[0],"prompts":["file:///bad%ZZ"]},
+            {"source":sources[1],"prompts":["file:///bad%ZZ"]},
+            {"source":sources[0],"prompts":["file:///bad%2Fpath"]}
+        ]})
+        .to_string(),
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_pi"))
