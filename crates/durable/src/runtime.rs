@@ -880,6 +880,7 @@ pub struct ConversationView {
 pub enum ViewWatchEnd {
     Stopped,
     Aborted,
+    Ended,
     Failed(String),
 }
 
@@ -1103,6 +1104,7 @@ pub struct ExtensionReportBatch {
 
 struct RuntimeStreamOutput {
     owner: std::sync::Weak<OwnedStore>,
+    source: std::sync::Weak<MergedSourceLease>,
     conversation: Uuid,
     attempt: ToolAttempt,
     storage_failed: Arc<AtomicBool>,
@@ -1111,6 +1113,10 @@ struct RuntimeStreamOutput {
 #[async_trait::async_trait]
 impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
     async fn record(&self, text: &str) -> pi_rs_core::ExtensionResult<()> {
+        let _lease = self
+            .source
+            .upgrade()
+            .ok_or_else(|| "stream source closed".to_owned())?;
         let owner = self
             .owner
             .upgrade()
@@ -1173,6 +1179,7 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
 
 struct RuntimeToolProgress {
     owner: Arc<OwnedStore>,
+    source: std::sync::Weak<MergedSourceLease>,
     conversation: Uuid,
     attempt: ToolAttempt,
     storage_failed: Arc<AtomicBool>,
@@ -1181,6 +1188,9 @@ struct RuntimeToolProgress {
 #[async_trait::async_trait]
 impl crate::tool_progress::Sink for RuntimeToolProgress {
     async fn update(&self, partial: serde_json::Value) -> pi_rs_core::ExtensionResult<()> {
+        let Some(_lease) = self.source.upgrade() else {
+            return Ok(());
+        };
         let store = self.owner.store();
         loop {
             let result = (|| -> Result<bool, Error> {
@@ -1329,16 +1339,90 @@ pub struct MergedProgressPage {
     pub has_more: bool,
 }
 
+fn merged_source_page(
+    reader: &Harness,
+    source: &MergedSourceSignal,
+    cursor: &MergedProgressCursor,
+    limit: std::num::NonZeroUsize,
+) -> Result<(MergedProgressPage, bool), Error> {
+    if source.closed.is_cancelled() {
+        return Ok((
+            reader.merged_progress_through(cursor, limit, source.boundary()?)?,
+            true,
+        ));
+    }
+    let page = reader.merged_progress(cursor, limit)?;
+    // Serialize this decision with boundary capture. If closure started while
+    // the read ran, wait for its boundary and re-read before advancing.
+    if let Some(boundary) = source.boundary_if_closed()? {
+        return Ok((
+            reader.merged_progress_through(cursor, limit, boundary)?,
+            true,
+        ));
+    }
+    Ok((page, false))
+}
+
+// Source-capable harnesses and workers retain this lease. Read-only watch
+// workers retain only the signal, so they cannot keep the source alive.
+struct MergedSourceLease {
+    owner: std::sync::Weak<OwnedStore>,
+    signal: Arc<MergedSourceSignal>,
+}
+struct MergedSourceSignal {
+    closed: CancellationToken,
+    boundary: std::sync::Mutex<Option<Result<u64, String>>>,
+}
+impl Drop for MergedSourceLease {
+    fn drop(&mut self) {
+        if let Ok(mut stored) = self.signal.boundary.lock() {
+            let boundary = self
+                .owner
+                .upgrade()
+                .ok_or_else(|| "source store already closed".to_owned())
+                .and_then(|owner| {
+                    owner
+                        .store()
+                        .commit_sequence()
+                        .map_err(|error| error.to_string())
+                });
+            *stored = Some(boundary);
+        }
+        self.signal.closed.cancel();
+    }
+}
+impl MergedSourceSignal {
+    fn boundary_if_closed(&self) -> Result<Option<u64>, Error> {
+        let stored = self.boundary.lock().map_err(|_| Error::Failed)?;
+        match stored.as_ref() {
+            Some(Ok(sequence)) => Ok(Some(*sequence)),
+            Some(Err(error)) => Err(Error::Invalid(format!("source close boundary: {error}"))),
+            None => Ok(None),
+        }
+    }
+    fn boundary(&self) -> Result<u64, Error> {
+        self.boundary_if_closed()?
+            .ok_or_else(|| Error::Invalid("missing source close boundary".into()))
+    }
+}
+
 /// A resumable pull watch over complete merged commit frames. The cursor
 /// advances only when a page is returned; persist it after processing the page.
 pub struct MergedProgressWatch {
     reader: Option<Harness>,
+    source: Arc<MergedSourceSignal>,
     cursor: MergedProgressCursor,
     limit: std::num::NonZeroUsize,
     interval: Duration,
     end: Option<ViewWatchEnd>,
 }
 impl MergedProgressWatch {
+    /// Wait for the last source-capable lease to close and return its store
+    /// commit boundary. The watch ends only after pages through it are drained.
+    pub async fn source_closed(&self) -> Result<u64, Error> {
+        self.source.closed.cancelled().await;
+        self.source.boundary()
+    }
     pub fn cursor(&self) -> &MergedProgressCursor {
         &self.cursor
     }
@@ -1363,12 +1447,18 @@ impl MergedProgressWatch {
             let Some(reader) = self.reader.as_ref() else {
                 return Ok(None);
             };
-            match reader.merged_progress(&self.cursor, self.limit) {
-                Ok(page) if !page.frames.is_empty() => {
+            match merged_source_page(reader, &self.source, &self.cursor, self.limit) {
+                Ok((page, _)) if !page.frames.is_empty() => {
                     self.cursor = page.next.clone();
                     return Ok(Some(page));
                 }
-                Ok(_) => tokio::time::sleep(self.interval).await,
+                Ok((_, true)) => {
+                    self.end_with(ViewWatchEnd::Ended);
+                    return Ok(None);
+                }
+                Ok((_, false)) => {
+                    tokio::select! { _ = self.source.closed.cancelled() => {}, _ = tokio::time::sleep(self.interval) => {} }
+                }
                 Err(error) => {
                     self.end_with(ViewWatchEnd::Failed(error.to_string()));
                     return Err(error);
@@ -1391,8 +1481,8 @@ impl MergedProgressWatch {
     }
 }
 
-/// Terminal result of an explicit merged listener. A source-close signal is
-/// supplied by the host; it is not inferred from scheduler shutdown.
+/// Terminal result of a merged listener. Source-lease closure drains through
+/// its captured boundary; the optional host source-close signal ends directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergedListenerEnd {
     Stopped,
@@ -1414,6 +1504,7 @@ pub struct MergedListenerSignals {
 /// acknowledged page. This does not spawn a worker or buffer pages.
 pub struct MergedProgressListener {
     reader: Option<Harness>,
+    source: Arc<MergedSourceSignal>,
     cursor: MergedProgressCursor,
     limit: std::num::NonZeroUsize,
     interval: Duration,
@@ -1429,6 +1520,7 @@ impl MergedProgressWatch {
             .ok_or_else(|| Error::Invalid("merged watch already ended".into()))?;
         Ok(MergedProgressListener {
             reader: Some(reader),
+            source: self.source,
             cursor: self.cursor,
             limit: self.limit,
             interval: self.interval,
@@ -1437,6 +1529,11 @@ impl MergedProgressWatch {
     }
 }
 impl MergedProgressListener {
+    /// Wait for source-lease closure without acknowledging or discarding pages.
+    pub async fn source_closed(&self) -> Result<u64, Error> {
+        self.source.closed.cancelled().await;
+        self.source.boundary()
+    }
     pub fn cursor(&self) -> &MergedProgressCursor {
         &self.cursor
     }
@@ -1476,17 +1573,21 @@ impl MergedProgressListener {
             if signals.source_closed.is_cancelled() {
                 return self.finish(MergedListenerEnd::Ended);
             }
-            let page = match self
-                .reader
-                .as_ref()
-                .expect("open listener")
-                .merged_progress(&self.cursor, self.limit)
-            {
-                Ok(page) => page,
+            let (page, source_ended) = match merged_source_page(
+                self.reader.as_ref().expect("open listener"),
+                &self.source,
+                &self.cursor,
+                self.limit,
+            ) {
+                Ok(result) => result,
                 Err(error) => return self.finish(MergedListenerEnd::Failed(error.to_string())),
             };
+            if page.frames.is_empty() && source_ended {
+                return self.finish(MergedListenerEnd::Ended);
+            }
             if page.frames.is_empty() {
                 tokio::select! { biased;
+                    _ = self.source.closed.cancelled() => continue,
                     _ = signals.stop.cancelled() => return self.finish(MergedListenerEnd::Stopped),
                     _ = signals.abort.cancelled() => return self.finish(MergedListenerEnd::Aborted),
                     _ = signals.source_closed.cancelled() => return self.finish(MergedListenerEnd::Ended),
@@ -1585,6 +1686,7 @@ pub struct UnifiedHistoryPage {
 
 pub struct Harness {
     pub(crate) owner: Arc<OwnedStore>,
+    merged_source: Option<Arc<MergedSourceLease>>,
     options: Options,
     tools: HashMap<String, RegisteredTool>,
     provider_adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
@@ -1990,8 +2092,17 @@ impl Harness {
                 )));
             }
         }
+        let owner = Arc::new(OwnedStore::open(path)?);
+        let merged_source = Arc::new(MergedSourceLease {
+            owner: Arc::downgrade(&owner),
+            signal: Arc::new(MergedSourceSignal {
+                closed: CancellationToken::new(),
+                boundary: std::sync::Mutex::new(None),
+            }),
+        });
         let mut harness = Self {
-            owner: Arc::new(OwnedStore::open(path)?),
+            owner,
+            merged_source: Some(merged_source),
             options,
             tools,
             provider_adapter: None,
@@ -2013,6 +2124,7 @@ impl Harness {
     pub(crate) fn worker(&self) -> Self {
         Self {
             owner: self.owner.clone(),
+            merged_source: self.merged_source.clone(),
             options: self.options.clone(),
             tools: self.tools.clone(),
             provider_adapter: self.provider_adapter.clone(),
@@ -2028,6 +2140,11 @@ impl Harness {
             task_driver: self.task_driver.clone(),
             clock: self.clock.clone(),
         }
+    }
+    fn watch_worker(&self) -> Self {
+        let mut worker = self.worker();
+        worker.merged_source = None;
+        worker
     }
     pub(crate) async fn drive_owned_cleanup(
         &mut self,
@@ -4956,7 +5073,7 @@ impl Harness {
         let initial = self.committed_view_frame(id, cursor.position)?;
         Ok(CommittedViewWatch {
             initial,
-            reader: Some(self.worker()),
+            reader: Some(self.watch_worker()),
             cursor,
             interval,
             end: None,
@@ -4978,7 +5095,7 @@ impl Harness {
         Ok(ViewWatch {
             initial,
             end: None,
-            reader: Some(self.worker()),
+            reader: Some(self.watch_worker()),
             id,
             limit,
             interval,
@@ -5739,8 +5856,15 @@ impl Harness {
             }
             None => self.merged_progress_from_now(conversation)?,
         };
+        let source = self
+            .merged_source
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("merged watch source already closed".into()))?
+            .signal
+            .clone();
         Ok(MergedProgressWatch {
-            reader: Some(self.worker()),
+            reader: Some(self.watch_worker()),
+            source,
             cursor,
             limit,
             interval,
@@ -5929,8 +6053,22 @@ impl Harness {
                 "merged progress page limit exceeds 256".into(),
             ));
         }
-        self.validate_merged_progress_cursor(cursor)?;
         let through = self.owner.store().commit_sequence()?;
+        self.merged_progress_through(cursor, limit, through)
+    }
+    fn merged_progress_through(
+        &self,
+        cursor: &MergedProgressCursor,
+        limit: std::num::NonZeroUsize,
+        through: u64,
+    ) -> Result<MergedProgressPage, Error> {
+        if limit.get() > 256
+            || through < cursor.after_sequence
+            || through > self.owner.store().commit_sequence()?
+        {
+            return Err(Error::Invalid("invalid merged progress boundary".into()));
+        }
+        self.validate_merged_progress_cursor(cursor)?;
         let mut next = cursor.clone();
         let mut frames = Vec::new();
         while frames.len() < limit.get() {
@@ -9590,6 +9728,11 @@ impl Harness {
                                                 host.clone(),
                                                 Arc::new(RuntimeToolProgress {
                                                     owner: self.owner.clone(),
+                                                    source: self
+                                                        .merged_source
+                                                        .as_ref()
+                                                        .map(Arc::downgrade)
+                                                        .unwrap_or_default(),
                                                     conversation: id,
                                                     attempt,
                                                     storage_failed: self.storage_failed.clone(),
@@ -9613,6 +9756,11 @@ impl Harness {
                                                         c.tool_attempt().map(|attempt| {
                                                             Arc::new(RuntimeStreamOutput {
                                                             owner: Arc::downgrade(&self.owner),
+                                                            source: self
+                                                                .merged_source
+                                                                .as_ref()
+                                                                .map(Arc::downgrade)
+                                                                .unwrap_or_default(),
                                                             conversation: id,
                                                             attempt,
                                                             storage_failed: self
@@ -15274,6 +15422,54 @@ mod scheduler_tests {
             h.conversation(fork).unwrap().content_blocks[&0].message_id,
             first_id
         );
+    }
+
+    #[tokio::test]
+    async fn merged_watch_tracks_source_capable_worker_but_not_reader_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        let mut worker = h.worker();
+        let weak = Arc::downgrade(h.merged_source.as_ref().unwrap());
+        let active_callback = weak.upgrade().unwrap();
+        let mut watch = h
+            .watch_merged_progress_handle(
+                id,
+                None,
+                std::num::NonZeroUsize::MIN,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        let mut other_reader = h
+            .watch_view(id, std::num::NonZeroUsize::MIN, Duration::from_millis(1))
+            .unwrap();
+        drop(h);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(15), watch.next())
+                .await
+                .is_err()
+        );
+        worker.reset(id, Some("live".into())).unwrap();
+        assert!(watch.next().await.unwrap().is_some());
+        drop(worker);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(15), watch.source_closed())
+                .await
+                .is_err()
+        );
+        drop(active_callback);
+        assert!(weak.upgrade().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Ended));
+        other_reader.close();
     }
 
     fn placement_model() -> Arc<GatedModel> {

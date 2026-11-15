@@ -1542,3 +1542,314 @@ async fn merged_listener_cancelled_callback_replays_unacknowledged_page() {
     );
     assert_eq!(listener.cursor(), &pages[0].next);
 }
+
+#[tokio::test]
+async fn merged_watch_drains_shutdown_commits_then_releases_owner() {
+    use pi_rs_durable::{
+        progress::State,
+        runtime::{ProgressHistoryChange, Scheduler, ViewWatchEnd},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shutdown.db");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+    });
+    let mut scheduler = Scheduler::open(&path, opts(model.clone())).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = scheduler
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), watch.source_closed())
+            .await
+            .unwrap()
+            .unwrap()
+            > 0
+    );
+    let mut frames = Vec::new();
+    while let Some(page) = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        frames.extend(page.frames);
+    }
+    assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Ended));
+    assert!(frames.iter().any(|f| f.progress.as_ref().is_some_and(|p| p.changes.iter().any(|c| matches!(c, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Running(_)))))));
+    let saved = watch.cursor().clone();
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut resumed = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(20), resumed.next()).await {
+            Ok(Ok(Some(_))) => continue,
+            Err(_) => break,
+            other => panic!("reopened source ended unexpectedly: {other:?}"),
+        }
+    }
+    assert_eq!(resumed.end_reason(), None);
+}
+
+struct LifetimeGateModel {
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+#[async_trait]
+impl Model for LifetimeGateModel {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Ok(stream::once(async move {
+            started.add_permits(1);
+            release.acquire().await.unwrap().forget();
+            Ok(ModelEvent::Text("finished".into()))
+        })
+        .chain(stream::iter(vec![Ok(ModelEvent::Complete {
+            calls: vec![],
+            usage: None,
+        })]))
+        .boxed())
+    }
+}
+#[tokio::test]
+async fn merged_watch_waits_for_worker_after_scheduler_drop() {
+    use pi_rs_durable::runtime::{Scheduler, ViewWatchEnd};
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drop.db");
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let options = || Options {
+        model: Arc::new(LifetimeGateModel {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        tools: vec![],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = scheduler
+        .watch_merged_progress_handle(
+            id,
+            None,
+            NonZeroUsize::new(256).unwrap(),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    drop(scheduler);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), watch.next()).await {
+            Ok(Ok(Some(_))) => continue,
+            Err(_) => break,
+            other => panic!("source ended while worker was active: {other:?}"),
+        }
+    }
+    assert_eq!(watch.end_reason(), None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(15), watch.source_closed())
+            .await
+            .is_err()
+    );
+    release.add_permits(1);
+    let mut frames = Vec::new();
+    while let Some(page) = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        frames.extend(page.frames);
+    }
+    assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Ended));
+    assert!(frames.iter().any(|f| {
+        f.observation
+            .as_ref()
+            .is_some_and(|o| o.value["submissions"].to_string().contains("finished"))
+    }));
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    assert!(reopened.conversation(id).is_ok());
+}
+
+#[tokio::test]
+async fn merged_watch_close_boundary_excludes_later_external_commits() {
+    use pi_rs_durable::{
+        document::{Address, Transaction},
+        runtime::ViewWatchEnd,
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boundary.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut watch = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    h.submit(id, None, "before".into()).unwrap();
+    drop(h);
+    let store = durable_store::Store::open(&path).unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "after".into(),
+        key: "".into(),
+    };
+    let mut tx = Transaction::new();
+    tx.put(
+        &address,
+        durable_store::Expected::Missing,
+        serde_json::json!({"n":1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&store).unwrap();
+    let mut seen = Vec::new();
+    while let Some(page) = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        seen.extend(page.frames);
+    }
+    assert_eq!(watch.end_reason(), Some(&ViewWatchEnd::Ended));
+    assert!(seen.iter().any(|frame| frame.observation.is_some()));
+    assert!(seen.iter().all(|frame| frame.documents.is_empty()));
+    let saved = watch.cursor().clone();
+    drop(store);
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut resumed = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    loop {
+        let page = tokio::time::timeout(Duration::from_secs(5), resumed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if page.frames.iter().any(|frame| {
+            frame
+                .documents
+                .iter()
+                .any(|change| change.address == address)
+        }) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn merged_listener_drains_to_automatic_close_after_inflight_ack() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("listener-close.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut listener = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    h.submit(id, None, "one".into()).unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let signals = MergedListenerSignals::default();
+    {
+        let started = entered.clone();
+        let gate = release.clone();
+        let seen = pages.clone();
+        let count = calls.clone();
+        let run = listener.run(&signals, move |page| {
+            let started = started.clone();
+            let gate = gate.clone();
+            let seen = seen.clone();
+            let count = count.clone();
+            async move {
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                if first {
+                    started.add_permits(1);
+                    gate.acquire().await.unwrap().forget();
+                }
+                seen.lock().unwrap().push(page);
+                Ok(())
+            }
+        });
+        tokio::pin!(run);
+        tokio::select! { result = &mut run => panic!("early end: {result:?}"), permit = entered.acquire() => permit.unwrap().forget() }
+        h.submit(id, None, "two".into()).unwrap();
+        drop(h);
+        release.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut run)
+                .await
+                .unwrap(),
+            MergedListenerEnd::Ended
+        );
+    }
+    let saved = listener.cursor().clone();
+    {
+        let seen = pages.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.last().unwrap().next, saved);
+    }
+    assert_eq!(listener.end_reason(), Some(&MergedListenerEnd::Ended));
+    assert!(listener.source_closed().await.unwrap() > 0);
+    drop(listener);
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut watch = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watch.next())
+            .await
+            .is_err()
+    );
+}

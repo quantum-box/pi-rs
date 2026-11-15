@@ -248,23 +248,32 @@ v1/v2 cursors and bounded pages. Attach from now or resume a consumed cursor;
 `next` advances only when returning a complete page, and dropping a pending wait
 leaves the cursor unchanged. `close`, `abort` and token cancellation preserve the
 first stopped or aborted reason; a read error ends the handle with a failure
-reason. A terminal progress record does not itself close the watch. Like other
-pull watches, this handle retains the store owner until closed or dropped; it
-has no automatic source-close notification or upstream Chord queue. It does not change the forward-only coverage boundary.
+reason. A terminal progress record does not itself close the watch. When the last
+source-capable harness or worker releases its lease, the watch captures a store
+commit boundary, drains pages through it and ends with `Ended`, releasing its
+reader. `source_closed().await` reports the captured boundary without consuming
+pages; the drained watch end remains distinct. Watch-only clones do not keep the source alive. Dropping a scheduler
+does not stop its spawned workers, so closure waits for them; awaited shutdown
+joins them. Active progress callbacks retain the source only while they write,
+and stale callbacks cannot write after it closes. A task driver holding a
+source-capable harness also keeps it live. Independent raw store writers are not
+source leases: commits after the close boundary require reattachment. The handle
+retains the store owner until it ends, is closed or is dropped. It does not change
+the forward-only coverage boundary or implement an upstream Chord queue.
 
 `MergedProgressWatch::into_listener` transfers a pull handle into an explicit
 serialized callback driver. `run` calls the listener with one bounded page at a
 time, advancing its cursor only when the callback returns successfully. A
 listener error or panic leaves that page unacknowledged for replay. Independent
 stop, abort and host-attested source-close tokens produce stopped, aborted and
-ended results; source closure is not inferred from scheduler shutdown. A signal
-is checked before each callback, while an already running callback is awaited
+ended results. Automatic source closure drains through its captured boundary
+before returning ended; the host-attested close signal ends without that drain.
+A signal is checked before each callback, while an already running callback is awaited
 before the result is returned; listeners must therefore eventually return. If
 signals are simultaneously ready, stop takes precedence over abort, then source
 close. Dropping `run` can interrupt a callback and replays its unacknowledged page after reattachment,
 so effects need idempotency. This pull-driven API has no background callback
-queue, upstream listener context, automatic source lifetime or recoverable error
-frames; total page bytes remain subject to the merged stream's existing limits.
+queue, upstream listener context or recoverable error frames; total page bytes remain subject to the merged stream's existing limits.
 
 `progress_history_from_now` captures a versioned, conversation-scoped exclusive
 cursor. `progress_history` and `watch_progress_history` page committed generation
