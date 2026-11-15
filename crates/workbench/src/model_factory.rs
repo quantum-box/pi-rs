@@ -40,59 +40,101 @@ impl ModelClientFactory {
         provider: &str,
         endpoint: &str,
     ) -> Result<Arc<dyn Model>> {
-        let credential = self
-            .credentials
-            .get(provider, endpoint)
-            .ok_or_else(|| Error::Config("model credential is not registered".into()))?;
-        match (api, credential.kind()) {
-            (
-                NativeModelApi::OpenAiChat,
-                HostCredentialKind::ApiKey | HostCredentialKind::Bearer,
-            ) => Ok(Arc::new(self.chat_client(provider, endpoint)?)),
-            (NativeModelApi::OpenAiResponses, HostCredentialKind::ApiKey) => {
-                Ok(Arc::new(pi_rs::openai::OpenAiResponses::new_api_provider(
-                    endpoint,
-                    credential.secret().to_owned(),
-                    provider,
-                )?))
+        match api {
+            NativeModelApi::OpenAiChat => Ok(Arc::new(self.chat_client(provider, endpoint)?)),
+            NativeModelApi::OpenAiResponses => {
+                Ok(Arc::new(self.responses_client(provider, endpoint)?))
             }
-            (NativeModelApi::ChatGptResponses, HostCredentialKind::Bearer)
-                if provider == "openai-chatgpt" =>
-            {
-                Ok(Arc::new(pi_rs::openai::OpenAiResponses::new(
-                    endpoint,
-                    credential.secret().to_owned(),
-                )?))
+            NativeModelApi::ChatGptResponses => {
+                Ok(Arc::new(self.chatgpt_client(provider, endpoint)?))
             }
-            (NativeModelApi::AnthropicMessages, HostCredentialKind::ApiKey) => Ok(Arc::new(
-                pi_rs::anthropic::Anthropic::new(endpoint, credential.secret())?
-                    .with_provider(provider, endpoint)
-                    .with_context_probe(false),
-            )),
-            (NativeModelApi::AnthropicMessages, HostCredentialKind::Bearer) => Ok(Arc::new(
-                pi_rs::anthropic::Anthropic::with_bearer_token(endpoint, credential.secret())?
-                    .with_provider(provider, endpoint)
-                    .with_context_probe(false),
-            )),
-            (NativeModelApi::GoogleGemini, HostCredentialKind::ApiKey) => Ok(Arc::new(
-                pi_rs::google::Google::new(endpoint, credential.secret())?
-                    .with_provider(provider, endpoint)
-                    .with_context_probe(false),
-            )),
-            _ => Err(Error::Config(
-                "credential kind is not supported for this model API".into(),
-            )),
+            NativeModelApi::AnthropicMessages => {
+                Ok(Arc::new(self.anthropic_client(provider, endpoint)?))
+            }
+            NativeModelApi::GoogleGemini => Ok(Arc::new(self.gemini_client(provider, endpoint)?)),
         }
+    }
+
+    fn credential(&self, provider: &str, endpoint: &str) -> Result<&pi_rs::HostCredential> {
+        self.credentials
+            .get(provider, endpoint)
+            .ok_or_else(|| Error::Config("model credential is not registered".into()))
+    }
+
+    /// A typed Responses client, configurable by the host before registration.
+    pub fn responses_client(
+        &self,
+        provider: &str,
+        endpoint: &str,
+    ) -> Result<pi_rs::openai::OpenAiResponses> {
+        let credential = self.credential(provider, endpoint)?;
+        if credential.kind() != HostCredentialKind::ApiKey {
+            return Err(Error::Config(
+                "credential kind is not supported for this model API".into(),
+            ));
+        }
+        pi_rs::openai::OpenAiResponses::new_api_provider(
+            endpoint,
+            credential.secret().to_owned(),
+            provider,
+        )
+    }
+
+    /// A typed ChatGPT plan client. Only the exact `openai-chatgpt` identity
+    /// and a bearer credential are accepted; endpoint validation is delegated to
+    /// the native adapter.
+    pub fn chatgpt_client(
+        &self,
+        provider: &str,
+        endpoint: &str,
+    ) -> Result<pi_rs::openai::OpenAiResponses> {
+        let credential = self.credential(provider, endpoint)?;
+        if provider != "openai-chatgpt" || credential.kind() != HostCredentialKind::Bearer {
+            return Err(Error::Config(
+                "credential kind is not supported for this model API".into(),
+            ));
+        }
+        pi_rs::openai::OpenAiResponses::new(endpoint, credential.secret().to_owned())
+    }
+
+    /// A typed Messages client with implicit metadata probes disabled.
+    pub fn anthropic_client(
+        &self,
+        provider: &str,
+        endpoint: &str,
+    ) -> Result<pi_rs::anthropic::Anthropic> {
+        let credential = self.credential(provider, endpoint)?;
+        let client = match credential.kind() {
+            HostCredentialKind::ApiKey => {
+                pi_rs::anthropic::Anthropic::new(endpoint, credential.secret())?
+            }
+            HostCredentialKind::Bearer => {
+                pi_rs::anthropic::Anthropic::with_bearer_token(endpoint, credential.secret())?
+            }
+        };
+        Ok(client
+            .with_provider(provider, endpoint)
+            .with_context_probe(false))
+    }
+
+    /// A typed Gemini client with implicit metadata probes disabled.
+    pub fn gemini_client(&self, provider: &str, endpoint: &str) -> Result<pi_rs::google::Google> {
+        let credential = self.credential(provider, endpoint)?;
+        if credential.kind() != HostCredentialKind::ApiKey {
+            return Err(Error::Config(
+                "credential kind is not supported for this model API".into(),
+            ));
+        }
+        Ok(pi_rs::google::Google::new(endpoint, credential.secret())?
+            .with_provider(provider, endpoint)
+            .with_context_probe(false))
     }
 
     /// Construct a typed chat client so the host can explicitly configure
     /// provider/model compatibility before adding it to a catalog. Defaults do
     /// not infer Pi provider profiles or enable native endpoint probes.
     pub fn chat_client(&self, provider: &str, endpoint: &str) -> Result<pi_rs::ollama::Ollama> {
-        let credential = self
-            .credentials
-            .get(provider, endpoint)
-            .ok_or_else(|| Error::Config("model credential is not registered".into()))?;
+        let credential = self.credential(provider, endpoint)?;
         Ok(
             pi_rs::ollama::Ollama::new(endpoint, Some(credential.secret().to_owned()))?
                 .with_provider(provider)

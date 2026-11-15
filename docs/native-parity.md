@@ -959,7 +959,7 @@ refresh, proxy discovery, model metadata probes, or network I/O at construction.
 uses a base URL and appends model-specific streaming paths. Hosts own endpoint
 policy and existing clients outlive replacement of the credential snapshot.
 Unauthenticated chat clients require a separate explicit factory method. Typed
-chat clients let hosts supply provider/model compatibility; the factory does not
+clients let hosts supply provider/model configuration; the factory does not
 automatically infer that configuration.
 
 

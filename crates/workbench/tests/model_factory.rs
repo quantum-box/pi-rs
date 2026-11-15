@@ -313,3 +313,87 @@ async fn typed_chat_supports_host_compatibility_and_explicit_anonymous_requests(
         assert_eq!(has_auth, !anonymous);
     }
 }
+
+#[test]
+fn typed_clients_allow_host_configuration_without_changing_credential_rules() {
+    let mut auth = HostAuthBuilder::new();
+    for (provider, endpoint, kind) in [
+        (
+            "custom",
+            "https://example.com/v1/responses",
+            HostCredentialKind::ApiKey,
+        ),
+        (
+            "anthropic",
+            "https://example.com/v1/messages",
+            HostCredentialKind::Bearer,
+        ),
+        (
+            "google",
+            "https://example.com/v1beta",
+            HostCredentialKind::ApiKey,
+        ),
+    ] {
+        auth.register(
+            provider,
+            endpoint,
+            HostCredential::new(kind, "fixture-key").unwrap(),
+        )
+        .unwrap();
+    }
+    let factory = ModelClientFactory::new(auth.build());
+    let _ = factory
+        .responses_client("custom", "https://example.com/v1/responses")
+        .unwrap()
+        .with_thinking(Some("low"));
+    let _ = factory
+        .anthropic_client("anthropic", "https://example.com/v1/messages")
+        .unwrap()
+        .with_thinking(Some("low"));
+    let _ = factory
+        .gemini_client("google", "https://example.com/v1beta")
+        .unwrap()
+        .with_thinking(Some("low"));
+    assert!(
+        factory
+            .responses_client("anthropic", "https://example.com/v1/messages")
+            .is_err()
+    );
+    assert!(
+        factory
+            .gemini_client("anthropic", "https://example.com/v1/messages")
+            .is_err()
+    );
+}
+
+#[test]
+fn typed_chatgpt_client_enforces_provider_and_plan_endpoint() {
+    let mut auth = HostAuthBuilder::new();
+    for (provider, endpoint) in [
+        ("openai-chatgpt", pi_rs::openai::DEFAULT_ENDPOINT),
+        ("openai-chatgpt", "https://other.example/v1/responses"),
+        ("other", pi_rs::openai::DEFAULT_ENDPOINT),
+    ] {
+        auth.register(
+            provider,
+            endpoint,
+            HostCredential::new(HostCredentialKind::Bearer, "fixture-token").unwrap(),
+        )
+        .unwrap();
+    }
+    let factory = ModelClientFactory::new(auth.build());
+    let _ = factory
+        .chatgpt_client("openai-chatgpt", pi_rs::openai::DEFAULT_ENDPOINT)
+        .unwrap()
+        .with_thinking(Some("low"));
+    assert!(
+        factory
+            .chatgpt_client("openai-chatgpt", "https://other.example/v1/responses")
+            .is_err()
+    );
+    assert!(
+        factory
+            .chatgpt_client("other", pi_rs::openai::DEFAULT_ENDPOINT)
+            .is_err()
+    );
+}
