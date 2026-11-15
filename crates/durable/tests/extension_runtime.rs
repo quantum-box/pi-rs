@@ -2140,16 +2140,18 @@ async fn after_tools_termination_settles_before_after_run_and_recovers_queued_in
                 "expected {expected}: {:?}",
                 c.submissions[0].status
             );
-            let snapshots = after_run.lock().unwrap();
-            if terminates {
-                assert_eq!(snapshots.len(), 2);
-                let first = &snapshots[0];
-                assert!(first["submissions"][0]["status"]["Done"].is_object());
-                assert_eq!(first["submissions"][1]["status"], "Queued");
-                assert_eq!(first["submissions"][2]["status"], "Queued");
-                assert_eq!(model.0.lock().unwrap().len(), 2);
-            } else {
-                assert!(!snapshots.is_empty());
+            {
+                let snapshots = after_run.lock().unwrap();
+                if terminates {
+                    assert_eq!(snapshots.len(), 2);
+                    let first = &snapshots[0];
+                    assert!(first["submissions"][0]["status"]["Done"].is_object());
+                    assert_eq!(first["submissions"][1]["status"], "Queued");
+                    assert_eq!(first["submissions"][2]["status"], "Queued");
+                    assert_eq!(model.0.lock().unwrap().len(), 2);
+                } else {
+                    assert!(!snapshots.is_empty());
+                }
             }
             assert_eq!(tool.0.lock().unwrap().len(), 1);
             let reports = h
