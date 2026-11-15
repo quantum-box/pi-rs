@@ -77,6 +77,20 @@ impl ModelCatalog {
             .provider(provider)?
             .historical_model_resolver(Arc::new(self.clone())))
     }
+
+    /// Explicitly bind a legacy, provider-less model name to a trusted client.
+    /// Use only when the host knows which provider owned that historical name.
+    pub fn session_builder_with_legacy_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<SessionBuilder> {
+        let client = self
+            .get(provider, model)
+            .ok_or_else(|| Error::Config("model is not registered in the catalog".into()))?;
+        self.session_builder(provider, model)?
+            .branch_model(model, client)
+    }
 }
 
 impl HistoricalModelResolver for ModelCatalog {
@@ -156,6 +170,65 @@ mod tests {
             .unwrap()
             .open(&path)
             .unwrap();
+        assert_eq!(reopened.prompt("three").await.unwrap(), "first");
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_fork_before_selection_retains_provider() {
+        let mut builder = ModelCatalogBuilder::new();
+        builder
+            .register("a", "shared", Arc::new(NamedModel("first")))
+            .unwrap();
+        let catalog = builder.build();
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .append(crate::Event::SessionInfo {
+                name: Some("before".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let before_selection = journal.head();
+        let session = catalog
+            .session_builder("a", "shared")
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let mut fork = session.fork_at(before_selection).unwrap();
+        assert_eq!(fork.prompt("one").await.unwrap(), "first");
+        assert_eq!(fork.prompt("two").await.unwrap(), "first");
+        fork.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_legacy_binding_requires_host_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.jsonl");
+        let mut legacy = SessionBuilder::new(Arc::new(NamedModel("old")), "shared")
+            .open(&path)
+            .unwrap();
+        assert_eq!(legacy.prompt("one").await.unwrap(), "old");
+        legacy.close().await.unwrap();
+        drop(legacy);
+        let mut builder = ModelCatalogBuilder::new();
+        builder
+            .register("a", "shared", Arc::new(NamedModel("first")))
+            .unwrap();
+        let catalog = builder.build();
+        let mut unbound = catalog
+            .session_builder("a", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert!(unbound.prompt("two").await.is_err());
+        unbound.close().await.unwrap();
+        drop(unbound);
+        let mut reopened = catalog
+            .session_builder_with_legacy_model("a", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.prompt("two").await.unwrap(), "first");
         assert_eq!(reopened.prompt("three").await.unwrap(), "first");
         reopened.close().await.unwrap();
     }

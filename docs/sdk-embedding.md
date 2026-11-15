@@ -14,6 +14,11 @@ resolves provider-qualified historical selections when sessions reopen or
 navigate branches. This is useful when two providers use the same model name:
 the SDK never guesses a provider or silently replaces an existing binding.
 
+For older journals that recorded a model name without its provider, the host
+may explicitly authorize that name with `session_builder_with_legacy_model`.
+Use this only when the host knows which provider the old name represents; the
+ordinary `session_builder` deliberately leaves such histories unbound.
+
 ```rust,no_run
 use std::sync::Arc;
 use pi_rs::{Model, ModelCatalogBuilder};

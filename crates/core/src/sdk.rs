@@ -1362,7 +1362,7 @@ impl SessionBuilder {
                 if let (Some((provider, name, _)), Some(_)) = (&resolved, &model_fallback) {
                     session.select_provider_model_atomic(provider, name)?;
                 } else if initial_selection && let Some(provider) = &self.model_provider {
-                    session.select_provider_model(Some(provider), &self.model_name, None)?;
+                    session.select_provider_model_atomic(provider, &self.model_name)?;
                 }
                 Ok(())
             },
@@ -2538,7 +2538,14 @@ impl AgentSession {
             })?;
             (provider, name, model)
         } else {
-            (None, self.model_name.clone(), self.model.clone())
+            // A fork before the first model selection still uses the source's
+            // active client. Preserve its qualified identity when it is known.
+            let journal = self.journal()?;
+            let provider = journal
+                .model_identity_at(journal.head())
+                .and_then(|(provider, name, _)| (name == self.model_name).then_some(provider))
+                .flatten();
+            (provider, self.model_name.clone(), self.model.clone())
         };
         session
             .auto_compaction_control()
@@ -4625,6 +4632,42 @@ mod tests {
             }
             self.records.lock().unwrap().push(record.clone());
             Ok(())
+        }
+    }
+
+    #[test]
+    fn initial_provider_selection_on_imported_head_is_atomic() {
+        let mut original = Session::with_store(MemoryStore::default()).unwrap();
+        original
+            .append(crate::Event::SourceEntry {
+                format: "pi".into(),
+                entry: serde_json::json!({"type":"message"}),
+            })
+            .unwrap();
+        let head = original.head();
+        for fail_on in [1, 2] {
+            let records = Arc::new(Mutex::new(original.records().to_vec()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let journal = Session::with_store(SeededStore {
+                records: records.clone(),
+                writes: writes.clone(),
+                fail_on,
+            })
+            .unwrap();
+            let result = SessionBuilder::new(Arc::new(ProviderBranchModel("provider")), "shared")
+                .provider("provider")
+                .unwrap()
+                .build(journal);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let restored = Session::from_records(records.lock().unwrap().clone()).unwrap();
+            if fail_on == 1 {
+                assert!(result.is_err());
+                assert_eq!(restored.head(), head);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(restored.head(), head + 1);
+                assert_eq!(restored.model_provider(), Some("provider"));
+            }
         }
     }
 
