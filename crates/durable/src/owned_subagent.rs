@@ -624,6 +624,61 @@ mod tests {
         let mut scheduler = h.attach_tasks(registry).unwrap();
         assert!(matches!(scheduler.tick(0), Err(TaskError::Ownership)));
     }
+
+    #[test]
+    fn external_wait_on_terminal_owner_is_already_satisfied() {
+        use crate::task::WaitFor;
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(conversation);
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        };
+        let root = Task::new(Uuid::from_u128(2), owner.clone(), checkpoint.clone(), 3)
+            .unwrap()
+            .registered("root".into(), true);
+        let shared = h.owner.clone();
+        let store = TaskStore::new(shared.store());
+        store.save(&[Save::Create(&root)]).unwrap();
+        let child = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap();
+        let mut root = store.load(root.id()).unwrap().unwrap();
+        root.task.start().unwrap();
+        root.task.succeed(serde_json::Value::Null).unwrap();
+        store.save(&[Save::Update(&root)]).unwrap();
+        let waiter = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(child.child),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("waiter".into(), true);
+        store.save(&[Save::Create(&waiter)]).unwrap();
+        let mut registry = Registry::default();
+        registry.register("waiter", true, |task: &Task| {
+            if task.checkpoint().phase == "start" {
+                Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "woken".into(),
+                        data: serde_json::Value::Null,
+                    },
+                    condition: WaitFor::TasksAny(vec![Uuid::from_u128(2)]),
+                    children: vec![],
+                })
+            } else {
+                Ok(Step::Succeed(serde_json::Value::Null))
+            }
+        });
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.get(waiter.id()).unwrap().unwrap().is_terminal());
+    }
     #[test]
     fn completing_owner_tracks_work_added_to_owned_conversation() {
         use crate::task::TaskState;
