@@ -55,6 +55,19 @@ fn executable(path: &Path) -> bool {
 fn has_pattern(value: &str) -> bool {
     value.contains(['*', '?', '[', '{'])
 }
+fn pattern_before_parent(path: &Path) -> bool {
+    let mut patterned = false;
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) && patterned {
+            return true;
+        }
+        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        {
+            patterned = true;
+        }
+    }
+    false
+}
 // Windows may collapse a patterned component followed by `..` during a
 // metadata check. Test the literal prefix first, preserving real bracket names.
 fn wildcard_parent_path(path: &Path) -> bool {
@@ -130,7 +143,8 @@ pub fn resolve(
             matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
         });
         let path = if kind == Kind::Prompt
-            && !patterned
+            && (!patterned
+                || cfg!(windows) && pattern_before_parent(&path) && !wildcard_parent_path(&path))
             && path
                 .components()
                 .any(|part| matches!(part, std::path::Component::ParentDir))
@@ -139,6 +153,10 @@ pub fn resolve(
         } else {
             path
         };
+        let pattern_path = path.strip_prefix(&workspace).unwrap_or(&path);
+        let patterned = pattern_path.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        });
         if kind == Kind::Skill {
             let normalized = normalize_resource_path(&path);
             let pattern_path = normalized.strip_prefix(&workspace).unwrap_or(&normalized);

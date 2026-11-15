@@ -1788,6 +1788,9 @@ mod tests {
         );
         std::fs::create_dir(root.join("literal[dir]")).unwrap();
         args.prompt_template = vec!["literal[dir]/../valid.md".into()];
+        #[cfg(windows)]
+        args.prompt_template
+            .insert(0, "literal[dir]/../missing.md".into());
         assert_eq!(
             Resources::load(&args).unwrap().prompts["valid"].body,
             "available"
@@ -1798,6 +1801,7 @@ mod tests {
             "no-match-*/../.",
             "[ab]/../valid.md",
             "{a,b}/../.",
+            "missing/../*.md",
         ] {
             args.prompt_template = vec![pattern.into()];
             assert!(
