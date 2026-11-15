@@ -10,6 +10,85 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn mcp_logout_local_targets_trusted_project_credentials() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    let auth = home.join("mcp-auth");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&auth).unwrap();
+    let global_url = "https://global.example/mcp";
+    let local_url = "https://local.example/mcp";
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url},"global-only":{"url":global_url}}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":local_url}}}).to_string(),
+    )
+    .unwrap();
+    let credential = |url| {
+        let digest = Sha256::digest(serde_json::to_vec(&("service", url)).unwrap());
+        auth.join(format!("{digest:x}.json"))
+    };
+    let global = credential(global_url);
+    let local = credential(local_url);
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(&local, "local").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        !run(&["--trust", "mcp", "logout", "global-only", "--local"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists() && local.exists());
+    let output = run(&["--trust", "mcp", "logout", "service", "-l"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"headers":{"authorization":"Bearer static"}}}}).to_string()).unwrap();
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+}
+
+#[test]
 fn repeated_session_id_selects_the_last_journal() {
     let root = tempfile::tempdir().unwrap();
     let sessions = root.path().join("sessions");

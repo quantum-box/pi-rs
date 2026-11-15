@@ -643,6 +643,9 @@ expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
 
+`pi mcp logout NAME --local` requires a server defined in the trusted project
+configuration and removes credentials for the effective project server URL.
+
 `pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
 `mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for
 stdio and streamable HTTP. It exposes namespaced server tools and resource

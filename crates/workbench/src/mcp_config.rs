@@ -31,6 +31,8 @@ pub enum McpCommand {
     },
     Logout {
         name: String,
+        #[arg(short = 'l', long)]
+        local: bool,
     },
     Add {
         name: String,
@@ -546,8 +548,24 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             })?;
             output(json!({"type":"mcp_logged_in","name":name}));
         }
-        McpCommand::Logout { name } => {
+        McpCommand::Logout { name, local } => {
             let servers = configurations(args)?;
+            if local {
+                let project = if args.trusted {
+                    config::read_object(&path(args, true))?
+                } else {
+                    Default::default()
+                };
+                if project
+                    .get("mcpServers")
+                    .and_then(|entries| entries.get(&name))
+                    .is_none()
+                {
+                    return Err(Error::Config(format!(
+                        "MCP server {name} is not configured in the trusted project"
+                    )));
+                }
+            }
             let server: ServerConfig = serde_json::from_value(
                 servers
                     .get(&name)
@@ -559,6 +577,15 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     "MCP {name} uses credentials from provider {}; sign out of that provider",
                     auth.provider
                 )));
+            }
+            if server
+                .headers
+                .keys()
+                .any(|header| header.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(Error::Config(
+                    "MCP OAuth cannot be combined with an Authorization header".into(),
+                ));
             }
             let url = server
                 .url
