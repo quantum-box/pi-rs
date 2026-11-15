@@ -14657,6 +14657,8 @@ impl Scheduler {
 /// awaiting `shutdown` requests driver stop but does not wait for either worker.
 /// A synchronous task handler must eventually return for shutdown to finish.
 pub struct RuntimeOwner {
+    // Dropped first, before the scheduler and driver when the owner is dropped.
+    wake_subscriptions: WakeSubscriptions,
     scheduler: Scheduler,
     driver: crate::task_driver::Driver,
 }
@@ -14668,6 +14670,166 @@ pub struct RuntimeWakeSnapshot {
     pub active: bool,
     pub at: Option<i64>,
     pub unknown_conversations: Vec<Uuid>,
+}
+
+/// Errors from combined wake observation or the host callback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WakeSubscriptionError {
+    Snapshot(String),
+    Delivery(crate::wake_delivery::DeliveryError),
+}
+
+struct WakeSubscriptionInner {
+    delivery: crate::wake_delivery::WakeDelivery,
+    cancel: CancellationToken,
+    kick: tokio::sync::Notify,
+}
+impl WakeSubscriptionInner {
+    fn shutdown(&self) {
+        self.cancel.cancel();
+        self.delivery.shutdown();
+    }
+}
+
+/// Owns a combined wake subscription. `kick` recomputes before attempting
+/// delivery, so it can retry a failed callback or recover from a snapshot error.
+/// Callbacks must not block; they may call `kick` or `shutdown` reentrantly.
+/// Shutdown is nonblocking and a callback already claimed may still run.
+pub struct WakeSubscription {
+    inner: Arc<WakeSubscriptionInner>,
+}
+impl WakeSubscription {
+    pub fn kick(&self) {
+        if !self.inner.cancel.is_cancelled() {
+            self.inner.kick.notify_one();
+        }
+    }
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+}
+impl Drop for WakeSubscription {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Default)]
+struct WakeSubscriptions(std::sync::Mutex<Vec<std::sync::Weak<WakeSubscriptionInner>>>);
+impl Drop for WakeSubscriptions {
+    fn drop(&mut self) {
+        for subscription in self
+            .0
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if let Some(subscription) = subscription.upgrade() {
+                subscription.shutdown();
+            }
+        }
+    }
+}
+
+fn conservative_wake(snapshot: RuntimeWakeSnapshot) -> crate::wake_delivery::Wake {
+    crate::wake_delivery::Wake {
+        active: snapshot.active || !snapshot.unknown_conversations.is_empty(),
+        at: snapshot.at,
+    }
+}
+
+async fn watch_wake(
+    mut changes: SchedulerChanges,
+    owner: std::sync::Weak<durable_store::owner::OwnedStore>,
+    driver: std::sync::Weak<crate::task_driver::Shared>,
+    activity: crate::worker_activity::WorkerActivity,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    on_error: Arc<dyn Fn(WakeSubscriptionError) + Send + Sync>,
+    inner: Arc<WakeSubscriptionInner>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = inner.cancel.cancelled() => break,
+            _ = inner.kick.notified() => {},
+            change = changes.changed() => if change.is_none() { break },
+        }
+        if inner.cancel.is_cancelled() {
+            break;
+        }
+        let (Some(owner), Some(driver)) = (owner.upgrade(), driver.upgrade()) else {
+            break;
+        };
+        let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime_wake_snapshot(&owner, &activity, &driver, clock())
+        }))
+        .unwrap_or_else(|_| Err(Error::Invalid("wake snapshot or clock panicked".into())));
+        match snapshot {
+            Ok(snapshot) => inner.delivery.publish(conservative_wake(snapshot)),
+            Err(error) => {
+                // A failed read cannot justify hibernation. Offer a conservative
+                // wake and let a later change or kick reattempt the snapshot.
+                inner.delivery.publish(crate::wake_delivery::Wake {
+                    active: true,
+                    at: None,
+                });
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    on_error(WakeSubscriptionError::Snapshot(error.to_string()))
+                }));
+            }
+        }
+    }
+    inner.shutdown();
+}
+
+fn runtime_wake_snapshot(
+    owner: &durable_store::owner::OwnedStore,
+    activity: &crate::worker_activity::WorkerActivity,
+    driver: &crate::task_driver::Shared,
+    now_millis: i64,
+) -> Result<RuntimeWakeSnapshot, Error> {
+    let store = owner.store();
+    for _ in 0..16 {
+        let (revision, workers) = activity.snapshot_with_revision();
+        let sequence = store.commit_sequence()?;
+        let snapshot = (|| {
+            let task = driver
+                .wake_snapshot(now_millis)
+                .map_err(|e| Error::Invalid(format!("task wake: {e}")))?;
+            let mut result = RuntimeWakeSnapshot {
+                active: task.active
+                    || workers
+                        .iter()
+                        .any(|worker| worker.phase != crate::worker_activity::WorkerPhase::Waiting),
+                at: task.at,
+                unknown_conversations: Vec::new(),
+            };
+            for (key, entry) in store.list(b"runtime/conversation/")? {
+                let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+                if key != Harness::key(conversation.id) {
+                    return Err(Error::Invalid("conversation key mismatch".into()));
+                }
+                match conversation_wake(store, conversation.id, now_millis)? {
+                    ConversationWake::Ready => result.active = true,
+                    ConversationWake::Parked { at: Some(at) } => {
+                        result.at = Some(result.at.map_or(at, |old| old.min(at)));
+                    }
+                    ConversationWake::Parked { at: None } => (),
+                    ConversationWake::Unknown => {
+                        result.unknown_conversations.push(conversation.id);
+                    }
+                }
+            }
+            result.unknown_conversations.sort_unstable();
+            Ok(result)
+        })();
+        let end_sequence = store.commit_sequence()?;
+        let (end_revision, _) = activity.snapshot_with_revision();
+        if sequence == end_sequence && revision == end_revision {
+            return snapshot;
+        }
+    }
+    Err(Error::Invalid("wake snapshot changed repeatedly".into()))
 }
 
 impl RuntimeOwner {
@@ -14775,6 +14937,7 @@ impl RuntimeOwner {
         Ok(Self {
             scheduler,
             driver: driver.expect("task registry supplied"),
+            wake_subscriptions: WakeSubscriptions::default(),
         })
     }
 
@@ -14793,57 +14956,83 @@ impl RuntimeOwner {
     /// conversation states must not be interpreted as idle; this is not yet
     /// the upstream `onWake` callback.
     pub fn wake_snapshot(&self, now_millis: i64) -> Result<RuntimeWakeSnapshot, Error> {
-        let store = self.scheduler.harness.owner.store();
-        let activity = self.scheduler.worker_activity();
-        for _ in 0..16 {
-            let (revision, workers) = activity.snapshot_with_revision();
-            let sequence = store.commit_sequence()?;
-            let snapshot = (|| {
-                let task = self
-                    .driver
-                    .wake_snapshot(now_millis)
-                    .map_err(|e| Error::Invalid(format!("task wake: {e}")))?;
-                let mut result = RuntimeWakeSnapshot {
-                    active: task.active
-                        || workers.iter().any(|worker| {
-                            worker.phase != crate::worker_activity::WorkerPhase::Waiting
-                        }),
-                    at: task.at,
-                    unknown_conversations: Vec::new(),
-                };
-                for (key, entry) in store.list(b"runtime/conversation/")? {
-                    let conversation: Conversation = serde_json::from_slice(&entry.value)?;
-                    if key != Harness::key(conversation.id) {
-                        return Err(Error::Invalid("conversation key mismatch".into()));
-                    }
-                    match conversation_wake(store, conversation.id, now_millis)? {
-                        ConversationWake::Ready => result.active = true,
-                        ConversationWake::Parked { at: Some(at) } => {
-                            result.at = Some(result.at.map_or(at, |old| old.min(at)));
-                        }
-                        ConversationWake::Parked { at: None } => (),
-                        ConversationWake::Unknown => {
-                            result.unknown_conversations.push(conversation.id);
-                        }
-                    }
-                }
-                result.unknown_conversations.sort_unstable();
-                Ok(result)
-            })();
-            let end_sequence = store.commit_sequence()?;
-            let (end_revision, _) = activity.snapshot_with_revision();
-            if sequence == end_sequence && revision == end_revision {
-                return snapshot;
-            }
+        let driver = self
+            .driver
+            .weak()
+            .upgrade()
+            .ok_or_else(|| Error::Invalid("task driver stopped".into()))?;
+        runtime_wake_snapshot(
+            &self.scheduler.harness.owner,
+            &self.scheduler.worker_activity(),
+            &driver,
+            now_millis,
+        )
+    }
+
+    /// Subscribe to combined wake delivery. The clock returns Unix milliseconds.
+    /// Subscribes before the initial snapshot, which must succeed. Later snapshot
+    /// errors are reported and conservatively publish an active wake; unknown
+    /// conversations also force active. Changes coalesce and the delivered value
+    /// can be stale by the time the callback runs. Callbacks can run before this
+    /// method returns on a multithreaded runtime and must not block.
+    ///
+    /// Keep the Tokio runtime alive. The host is responsible for arming a timer
+    /// for `at` and kicking or causing a change when it fires. Changes through
+    /// other SQLite connections do not notify this subscription. Dropping the
+    /// returned handle or this owner stops it; an already claimed callback can
+    /// still run after shutdown.
+    pub fn subscribe_wake(
+        &self,
+        clock: impl Fn() -> i64 + Send + Sync + 'static,
+        callback: impl Fn(crate::wake_delivery::Wake) -> Result<(), String> + Send + Sync + 'static,
+        on_error: impl Fn(WakeSubscriptionError) + Send + Sync + 'static,
+    ) -> Result<WakeSubscription, Error> {
+        let changes = self.scheduler.subscribe_changes()?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+            Error::Invalid(format!("wake subscription requires a Tokio runtime: {e}"))
+        })?;
+        let clock = Arc::new(clock);
+        let initial =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.wake_snapshot(clock())))
+                .map_err(|_| Error::Invalid("wake snapshot or clock panicked".into()))??;
+        let on_error = Arc::new(on_error);
+        let callback_error = on_error.clone();
+        let delivery = crate::wake_delivery::WakeDelivery::new(
+            runtime.clone(),
+            conservative_wake(initial),
+            callback,
+            move |error| callback_error(WakeSubscriptionError::Delivery(error)),
+        );
+        let inner = Arc::new(WakeSubscriptionInner {
+            delivery,
+            cancel: CancellationToken::new(),
+            kick: tokio::sync::Notify::new(),
+        });
+        {
+            let mut subscriptions = self.wake_subscriptions.0.lock().unwrap();
+            subscriptions.retain(|entry| entry.strong_count() != 0);
+            subscriptions.push(Arc::downgrade(&inner));
         }
-        Err(Error::Invalid("wake snapshot changed repeatedly".into()))
+        let watcher = inner.clone();
+        let owner = Arc::downgrade(&self.scheduler.harness.owner);
+        let driver = self.driver.weak();
+        let activity = self.scheduler.worker_activity();
+        runtime.spawn(async move {
+            watch_wake(changes, owner, driver, activity, clock, on_error, watcher).await;
+        });
+        Ok(WakeSubscription { inner })
     }
 
     /// Cancel and join conversations while their task driver remains available,
     /// then stop and join the driver even if conversation shutdown failed.
     /// Await this future to completion for deterministic release of ownership.
     pub async fn shutdown(self) -> Result<(), Error> {
-        let Self { scheduler, driver } = self;
+        let Self {
+            scheduler,
+            driver,
+            wake_subscriptions,
+        } = self;
+        drop(wake_subscriptions);
         let conversations = scheduler.shutdown().await;
         let tasks = tokio::task::spawn_blocking(move || driver.shutdown()).await;
         match (conversations, tasks) {

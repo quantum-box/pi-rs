@@ -380,7 +380,7 @@ settlement, exactly-once network execution, or automatic adapter installation.
 
 **Retry worker release:** Scheduler-owned conversations park outside their worker lock while a persisted model retry deadline is in the future. Another scheduled driver can acquire the worker and abort remains responsive; the persisted deadline still controls the next model request. Direct `Harness` execution retains its existing awaited retry behavior. See [retry integration tests](../crates/durable/tests/model_retry_integration.rs).
 
-**Commit notifications:** `Store::subscribe_commits` exposes the current sequence and coalesced notifications after successful local mutation batches. Failed and read-only batches do not notify. The subscription is scoped to one store instance; writes through another SQLite connection are reflected when a new subscription attaches, but do not wake existing subscribers. `Scheduler::subscribe_changes` combines these with worker lifecycle, task registry changes and failed task migrations as coalesced hints. Registry and migration changes can produce unchanged worker snapshots, and the returned views are not an atomic wake decision. This is a notification source for future combined wake delivery, not the upstream `onWake` callback. See [store tests](../crates/durable-store/tests/store.rs), [worker tests](../crates/durable/tests/worker_activity.rs), and [wake tests](../crates/durable/tests/task_wake_snapshot.rs).
+**Commit notifications:** `Store::subscribe_commits` exposes the current sequence and coalesced notifications after successful local mutation batches. Failed and read-only batches do not notify. The subscription is scoped to one store instance; writes through another SQLite connection are reflected when a new subscription attaches, but do not wake existing subscribers. `Scheduler::subscribe_changes` combines these with worker lifecycle, task registry changes, failed task migrations and task-driver stops as coalesced hints. Registry and migration changes can produce unchanged worker snapshots, and the returned views are not an atomic wake decision. These hints also drive the opt-in combined wake subscription described below. See [store tests](../crates/durable-store/tests/store.rs), [worker tests](../crates/durable/tests/worker_activity.rs), and [wake tests](../crates/durable/tests/task_wake_snapshot.rs).
 
 **Generic task wake hints and snapshot:** `Driver::subscribe_wake` supplies a
 single initially signaled, capacity-one coalescing channel. `wake_snapshot(now)`
@@ -412,8 +412,24 @@ snapshot; callers must recheck before acting. See [tests](../crates/durable/src/
 readiness and local workers. It retries if the local commit sequence or worker
 revision changes during inspection; sustained changes return an error instead
 of an inconsistent result. Unknown conversations are returned separately and
-must not be treated as idle. This does not implement `onWake` delivery, and
-external SQLite writers still do not notify local subscriptions.
+must not be treated as idle. `RuntimeOwner::subscribe_wake` attaches to scheduler
+changes before taking the initial snapshot and delivers coalesced `{active, at}`
+values through `WakeDelivery`. Unknown conversations force `active: true`;
+a later snapshot error reports the failure and offers `{active: true, at: None}`.
+A failed callback is retried on the next change or explicit kick. The handle's
+kick recomputes with the supplied clock; it does not run work or arm a timer.
+Dropping the handle or shutting down/dropping the owner stops delivery, but an
+already claimed callback may start or finish afterwards. The runtime must stay
+running and callbacks must not block. Snapshot reads can wait on storage gates.
+
+This opt-in subscription differs from upstream `onWake`: it is attached after
+opening, uses Tokio scheduling rather than a microtask, and conservatively marks
+unknown work active. Values are coalesced and can become stale before callback
+execution; external SQLite writers do not notify the local subscription. The
+host must arrange its own timer for `at`, resume work as appropriate, and kick
+or otherwise cause a change when it fires. Snapshot errors and callback errors
+are passed to the supplied error callback rather than upstream host reports.
+See [subscription tests](../crates/durable/src/conversation_wake_tests.rs).
 
 Nested pending-job reconciliation is a pi-rs host API with a narrower boundary
 than upstream's nested task scheduler. A host can record a verified terminal
@@ -501,4 +517,4 @@ explicitly prepare continuations against the lifecycle model profile. Upstream
 instead asks the host to call `fitImages` before submit; other pi-rs input
 paths remain unchanged.
 
-**Standalone wake callback delivery:** [`wake_delivery`](../crates/durable/src/wake_delivery.rs) provides a Tokio-scheduled, coalescing callback lane for host-supplied `{ active, at }` values. It suppresses only successful equal deliveries, retries failures on a later publication or kick, and permits callback reentry and nonblocking shutdown. A callback already claimed by the delivery task may start or finish after shutdown; the supplied runtime must remain running. This is a delivery primitive only: it is not connected to the harness, conversation or task wake calculation, scheduler notifications, built-in timers, or upstream host reports. Integrators must publish an initial combined value and every relevant change and report callback failures themselves. See [delivery tests](../crates/durable/tests/wake_delivery.rs).
+**Standalone wake callback delivery:** [`wake_delivery`](../crates/durable/src/wake_delivery.rs) provides a Tokio-scheduled, coalescing callback lane for host-supplied `{ active, at }` values. It suppresses only successful equal deliveries, retries failures on a later publication or kick, and permits callback reentry and nonblocking shutdown. A callback already claimed by the delivery task may start or finish after shutdown; the supplied runtime must remain running. The primitive is also usable independently. `RuntimeOwner::subscribe_wake` now connects it to the combined snapshot and scheduler hints, as described above; it does not connect built-in timers or upstream host reports. See [delivery tests](../crates/durable/tests/wake_delivery.rs).

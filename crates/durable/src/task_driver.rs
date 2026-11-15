@@ -124,6 +124,7 @@ impl Driver {
                         state.stop = true;
                         state.failure = Some("task worker panicked".into());
                     }
+                    self.0.activity.notify();
                     self.0.close_notifications();
                 }
             }
@@ -273,6 +274,7 @@ impl Driver {
             state.failure = Some(error.to_string());
             state.stop = true;
             self.shared.wake.notify_all();
+            self.shared.activity.notify();
             self.shared.close_notifications();
             return Err(error.into());
         }
@@ -283,10 +285,7 @@ impl Driver {
     /// Inspect generic task wake state at a scheduling boundary using the supplied
     /// Unix-millisecond clock. Does not acquire the handler's scheduler mutex.
     pub fn wake_snapshot(&self, now_millis: i64) -> Result<task_scheduler::WakeSnapshot, Error> {
-        drop(self.check()?);
-        let snapshot = self.shared.wake_reader.snapshot(now_millis)?;
-        drop(self.check()?);
-        Ok(snapshot)
+        self.shared.wake_snapshot(now_millis)
     }
 
     /// Snapshot nonterminal tasks currently blocked by their definitions.
@@ -428,6 +427,7 @@ impl Driver {
             state.stop = true;
             self.shared.wake.notify_all();
         }
+        self.shared.activity.notify();
     }
 }
 impl Drop for Driver {
@@ -554,11 +554,31 @@ fn fail_cleanup(shared: &Shared, error: String) {
         state.stop = true;
         shared.wake.notify_all();
     }
+    shared.activity.notify();
     shared.cleanup_stop.cancel();
     shared.close_notifications();
 }
 
 impl Shared {
+    pub(crate) fn wake_snapshot(
+        &self,
+        now_millis: i64,
+    ) -> Result<task_scheduler::WakeSnapshot, Error> {
+        let check = || {
+            let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+            if state.stop {
+                return Err(Error::Stopped(
+                    state.failure.clone().unwrap_or_else(|| "shutdown".into()),
+                ));
+            }
+            Ok(())
+        };
+        check()?;
+        let snapshot = self.wake_reader.snapshot(now_millis)?;
+        check()?;
+        Ok(snapshot)
+    }
+
     // Publish a failed tick before releasing the scheduler mutex. Otherwise a
     // quiescent commit can slip between an unpoisoned tick error and stop.
     fn tick_and_record_failure(&self, now: i64) -> Result<bool, String> {
@@ -567,11 +587,12 @@ impl Shared {
             .lock()
             .map_err(|_| "task scheduler lock poisoned".to_string())?;
         let result = scheduler.tick(now).map_err(|e| e.to_string());
-        if let Err(error) = &result
-            && let Ok(mut state) = self.state.lock()
-        {
-            state.failure = Some(error.clone());
-            state.stop = true;
+        if let Err(error) = &result {
+            if let Ok(mut state) = self.state.lock() {
+                state.failure = Some(error.clone());
+                state.stop = true;
+            }
+            self.activity.notify();
         }
         result
     }
@@ -1001,7 +1022,9 @@ mod tests {
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         };
+        let revision = shared.activity.snapshot_with_revision().0;
         assert!(shared.tick_and_record_failure(0).is_err());
+        assert!(shared.activity.snapshot_with_revision().0 > revision);
         assert!(shared.scheduler.lock().unwrap().check().is_ok());
         assert!(shared.state.lock().unwrap().failure.is_some());
         let binding = Binding {

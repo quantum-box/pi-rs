@@ -551,6 +551,15 @@ Current limits and differences from upstream Pi Durable:
 - `Driver::wake_snapshot(now)` reads task definitions and durable waits under
   the task gate without waiting for the handler-held scheduler mutex. It does
   not include conversation deadlines or provide `onWake` notifications.
+- `RuntimeOwner::subscribe_wake(clock, callback, on_error)` attaches a
+  coalescing combined conversation/task wake subscription. The clock returns
+  Unix milliseconds; keep the returned handle alive and call `kick()` to
+  recompute after a host timer fires or to retry a failed callback. Unknown
+  conversations are reported as active. Snapshot failures are reported and
+  yield a conservative active wake. Dropping the handle or shutting down the
+  owner stops delivery, although an already claimed callback may still run.
+  The host supplies its own timer; external SQLite writers do not notify the
+  subscription. Callbacks must not block and the Tokio runtime must stay alive.
 - Polling uses an in-process interval rather than a durable timer; reopening
   resumes it. Model retry deadlines use persisted bounded exponential backoff;
   scheduled conversations release their worker lock until the deadline.
