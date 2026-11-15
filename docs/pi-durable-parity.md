@@ -184,8 +184,10 @@ original audit table below remains a historical baseline.
 **Independent summary accounting checkpoint:** Completed generations are persisted before usage settlement, including invalid summaries whose usage still needs accounting. Per-attempt receipts record successful settlement for both measured generations and interrupted attempts; publication requires all relevant receipts. The private worker transfers a pending checkpoint only after acquiring the per-operation guard. A crash between provider acknowledgement and receipt requires replay with the same request ID and report, so external settlement must be idempotent. See [worker tests](../crates/durable/src/summary_worker_tests.rs).
 
 **Narrow busy independent summary:** A public opt-in accepts a summary while a
-model request or one proven model-issued tool attempt is running, or that tool
-is parked on a known pending reference. A bounded durable selection snapshot proves that any
+model request or a proven model-issued tool attempt is running, or that tool
+is parked on a known pending reference or an identified owned task. It checks
+the issued call list and the exact preceding result sequence, including in a
+multi-call round. A bounded durable selection snapshot proves that any
 intervening changes retain the original submission and write identities and
 configuration; the context generation and selected source prefix must also
 match. Append-only model progress and fenced model restarts can therefore use a
@@ -195,10 +197,11 @@ parked lifecycle hook task waits, or at idle. An after-tools hook's completed
 decision and child tasks commit with its phase transition; an admission race
 does not rerun the hook. A parked after-tools task settles the round first; a tool handoff
 changes context before the boundary and makes an older summary stale. The
-unfinished tool call is retained, and its result is settled before placement.
+unfinished tool round is retained, and all results settle before placement.
 Interrupted unsafe calls remain blocked until explicitly reconciled; summary
-recovery does not redispatch them. Multi-call rounds, task-owned tool waits,
-blocked or replay-ready tools, and unproven attempts remain ineligible; a
+recovery does not redispatch them. Task waits require a persisted adapter
+identity and matching adapter and driver for recovery. Blocked or replay-ready
+tools and unproven attempts remain ineligible; a
 transient unsupported phase can conservatively settle a result stale. The
 summary-and-task recovery constructor installs both registries before scheduling.
 On-yield decisions are checkpointed before inbox

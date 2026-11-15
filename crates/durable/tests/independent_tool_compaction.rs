@@ -449,66 +449,400 @@ async fn tool_finishes_before_summary_and_result_is_retained() {
 }
 #[tokio::test]
 async fn running_tool_reset_order_fences_summary() {
-    for prior in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let model = Arc::new(ModelStub::default());
-        let tool = Arc::new(ToolState::default());
-        let (mut s, id) = setup(
-            &dir.path().join("db"),
-            model.clone(),
-            active_registration(tool.clone()),
-        )
-        .await;
-        tool.started.acquire().await.unwrap().forget();
-        let op = Uuid::new_v4();
-        assert!(s.request_busy_independent_compaction(id, op, 0).unwrap());
-        model.summary_started.acquire().await.unwrap().forget();
-        if prior {
-            s.reset(id, Some("before".into())).unwrap();
-        }
-        model.summary_release.add_permits(1);
-        assert_eq!(
-            s.wait_independent_compaction(op).await.unwrap(),
-            IndependentCompactionStatus::Running
-        );
-        if !prior {
-            s.reset(id, Some("after".into())).unwrap();
-        }
-        tool.release.add_permits(1);
-        s.wait(id).await.unwrap();
-        assert_eq!(
-            s.independent_compaction_status(op).unwrap(),
+    for multi in [false, true] {
+        for prior in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(ModelStub::default());
+            let tool = Arc::new(ToolState::default());
+            model.issue_multiple.store(multi, Ordering::SeqCst);
+            let (mut s, id) = setup(
+                &dir.path().join("db"),
+                model.clone(),
+                active_registration(tool.clone()),
+            )
+            .await;
+            tool.started.acquire().await.unwrap().forget();
+            let op = Uuid::new_v4();
+            assert!(s.request_busy_independent_compaction(id, op, 0).unwrap());
+            model.summary_started.acquire().await.unwrap().forget();
             if prior {
-                IndependentCompactionStatus::Stale
-            } else {
-                IndependentCompactionStatus::Applied
+                s.reset(id, Some("before".into())).unwrap();
             }
-        );
-        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
-        s.shutdown().await.unwrap();
+            model.summary_release.add_permits(1);
+            assert_eq!(
+                s.wait_independent_compaction(op).await.unwrap(),
+                IndependentCompactionStatus::Running
+            );
+            if !prior {
+                s.reset(id, Some("after".into())).unwrap();
+            }
+            tool.release.add_permits(if multi { 2 } else { 1 });
+            s.wait(id).await.unwrap();
+            assert_eq!(
+                s.independent_compaction_status(op).unwrap(),
+                if prior {
+                    IndependentCompactionStatus::Stale
+                } else {
+                    IndependentCompactionStatus::Applied
+                }
+            );
+            assert_eq!(tool.calls.load(Ordering::SeqCst), if multi { 2 } else { 1 });
+            s.shutdown().await.unwrap();
+        }
     }
 }
 #[tokio::test]
-async fn multiple_tool_calls_remain_ineligible() {
+async fn multi_call_round_places_after_both_results_and_queued_input() {
+    use pi_rs_durable::state::InputMode;
+    for select_second in [false, true] {
+        for mode in [InputMode::Steer, InputMode::FollowUp] {
+            let dir = tempfile::tempdir().unwrap();
+            let model = Arc::new(ModelStub::default());
+            let tool = Arc::new(ToolState::default());
+            model.issue_multiple.store(true, Ordering::SeqCst);
+            let (mut s, id) = setup(
+                &dir.path().join("db"),
+                model.clone(),
+                active_registration(tool.clone()),
+            )
+            .await;
+            tool.started.acquire().await.unwrap().forget();
+            if select_second {
+                tool.release.add_permits(1);
+                tool.started.acquire().await.unwrap().forget();
+            }
+            let op = request_summary(&mut s, id, &model).await;
+            s.submit_with_mode(id, None, "queued".into(), mode).unwrap();
+            tool.release.add_permits(if select_second { 1 } else { 2 });
+            s.wait(id).await.unwrap();
+            assert_eq!(
+                s.independent_compaction_status(op).unwrap(),
+                IndependentCompactionStatus::Applied
+            );
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+            let c = s.conversation(id).unwrap();
+            let pos = |id: &str| {
+                c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == id && content == "tool result")).unwrap()
+            };
+            let queued = c
+                .messages
+                .iter()
+                .position(
+                    |m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"),
+                )
+                .unwrap();
+            assert!(pos("tool-call") < pos("second-call") && pos("second-call") < queued);
+            assert_eq!(
+                c.messages
+                    .iter()
+                    .filter(|m| matches!(m, pi_rs_core::Message::Tool { .. }))
+                    .count(),
+                2
+            );
+            s.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn summary_selected_on_first_call_completes_during_second_call() {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(ModelStub::default());
     let tool = Arc::new(ToolState::default());
     model.issue_multiple.store(true, Ordering::SeqCst);
     let (mut s, id) = setup(
         &dir.path().join("db"),
-        model,
+        model.clone(),
         active_registration(tool.clone()),
     )
     .await;
     tool.started.acquire().await.unwrap().forget();
-    assert!(
-        s.request_busy_independent_compaction(id, Uuid::new_v4(), 0)
-            .is_err()
+    let op = Uuid::new_v4();
+    assert!(s.request_busy_independent_compaction(id, op, 0).unwrap());
+    model.summary_started.acquire().await.unwrap().forget();
+    tool.release.add_permits(1);
+    tool.started.acquire().await.unwrap().forget();
+    model.summary_release.add_permits(1);
+    assert_eq!(
+        s.wait_independent_compaction(op).await.unwrap(),
+        IndependentCompactionStatus::Running
     );
+    s.submit(id, None, "queued".into()).unwrap();
+    tool.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    assert_eq!(
+        s.independent_compaction_status(op).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        s.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| matches!(m, pi_rs_core::Message::Tool { .. }))
+            .count(),
+        2
+    );
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn multi_call_handoff_stales_summary_after_full_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ModelStub::default());
+    let tool = Arc::new(ToolState::default());
+    model.issue_multiple.store(true, Ordering::SeqCst);
+    tool.handoff.store(true, Ordering::SeqCst);
+    let (mut s, id, op, _) = active_setup(&dir.path().join("db"), model, tool.clone()).await;
     tool.release.add_permits(2);
     s.wait(id).await.unwrap();
+    assert_eq!(
+        s.independent_compaction_status(op).unwrap(),
+        IndependentCompactionStatus::Stale
+    );
     assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        s.conversation(id).unwrap().messages.iter().any(
+            |m| matches!(m, pi_rs_core::Message::User { content } if content == "tool handoff")
+        )
+    );
     s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn multi_call_abort_reconciles_dispatched_call_and_skips_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ModelStub::default());
+    let tool = Arc::new(ToolState::default());
+    model.issue_multiple.store(true, Ordering::SeqCst);
+    let (mut s, id, op, attempt) = active_setup(&dir.path().join("db"), model, tool.clone()).await;
+    s.submit(id, None, "withdraw me".into()).unwrap();
+    assert!(
+        s.abort_and_wait(id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("abort cleanup remains pending")
+    );
+    assert_eq!(s.blocked(id).unwrap().unwrap().0, attempt);
+    s.reconcile(id, attempt, Outcome::Succeeded("confirmed".into()))
+        .unwrap();
+    s.wait(id).await.unwrap();
+    assert_eq!(
+        s.independent_compaction_status(op).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    let c = s.conversation(id).unwrap();
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "tool-call" && content == "confirmed")).count(), 1);
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "second-call" && content.contains("aborted"))).count(), 1);
+    assert!(
+        !c.messages.iter().any(
+            |m| matches!(m, pi_rs_core::Message::User { content } if content == "withdraw me")
+        )
+    );
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn multi_call_reopen_reconciles_second_without_repeating_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(ModelStub::default());
+    let tool = Arc::new(ToolState::default());
+    model.issue_multiple.store(true, Ordering::SeqCst);
+    let (mut s, id) = setup(&path, model.clone(), active_registration(tool.clone())).await;
+    tool.started.acquire().await.unwrap().forget();
+    tool.release.add_permits(1);
+    tool.started.acquire().await.unwrap().forget();
+    let attempt = s
+        .conversation(id)
+        .unwrap()
+        .tool_attempt()
+        .unwrap()
+        .operation_id;
+    let op = request_summary(&mut s, id, &model).await;
+    s.submit(id, None, "queued".into()).unwrap();
+    s.shutdown().await.unwrap();
+    let mut s = Scheduler::open_with_summary_recovery(
+        &path,
+        options(model, active_registration(tool.clone())),
+        Default::default(),
+        None,
+        provider(),
+    )
+    .unwrap();
+    assert_eq!(s.blocked(id).unwrap().unwrap().0, attempt);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    s.reconcile(id, attempt, Outcome::Succeeded("confirmed second".into()))
+        .unwrap();
+    s.wait(id).await.unwrap();
+    assert_eq!(
+        s.independent_compaction_status(op).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+    let c = s.conversation(id).unwrap();
+    assert_eq!(
+        c.messages
+            .iter()
+            .filter(
+                |m| matches!(m, pi_rs_core::Message::Tool { call_id, .. } if call_id == "tool-call")
+            )
+            .count(),
+        1
+    );
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "second-call" && content == "confirmed second")).count(), 1);
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_backed_second_call_waits_across_reopen_before_summary_placement() {
+    use pi_rs_durable::{
+        task::{Checkpoint, Task, TaskState, WaitFor},
+        task_scheduler::{Handler, Registry, Step},
+        task_store::Signal,
+        task_tool::TaskTool,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(ModelStub::default());
+    let effects = Arc::new(AtomicUsize::new(0));
+    let effect_count = effects.clone();
+    let handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
+        if task.delivered_signal().is_some() {
+            effect_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(serde_json::json!("task result")))
+        } else {
+            Ok(Step::Wait {
+                checkpoint: Checkpoint {
+                    phase: "waiting".into(),
+                    data: task.checkpoint().data.clone(),
+                },
+                condition: WaitFor::Signal("go".into()),
+                children: vec![],
+            })
+        }
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "job".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+        "summary-task-job",
+        true,
+        1,
+        handler.clone(),
+    ));
+    let registry = || {
+        let mut r = Registry::default();
+        assert!(r.register_shared_versioned("summary-task-job", 1, true, handler.clone()));
+        r
+    };
+    let open = || {
+        Scheduler::open_with_summary_recovery_and_tasks(
+            &path,
+            options(model.clone(), adapter.register()),
+            Default::default(),
+            None,
+            provider(),
+            registry(),
+        )
+        .unwrap()
+    };
+    let (mut s, driver) = open();
+    let id = s
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 64,
+        })
+        .unwrap();
+    for input in ["first", "second"] {
+        s.submit(id, None, input.into()).unwrap();
+        s.wait(id).await.unwrap();
+    }
+    model.issue_multiple.store(true, Ordering::SeqCst);
+    model.issue_tool.store(true, Ordering::SeqCst);
+    s.submit(id, None, "third".into()).unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(attempt) = s.conversation(id).unwrap().tool_attempt() {
+                if driver
+                    .get(attempt.operation_id)
+                    .unwrap()
+                    .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
+                {
+                    break attempt.operation_id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    driver
+        .signal(&Signal::new(
+            Uuid::new_v4(),
+            first,
+            "go".into(),
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(attempt) = s.conversation(id).unwrap().tool_attempt() {
+                if attempt.operation_id != first
+                    && driver
+                        .get(attempt.operation_id)
+                        .unwrap()
+                        .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
+                {
+                    break attempt.operation_id;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let op = request_summary(&mut s, id, &model).await;
+    s.submit(id, None, "queued".into()).unwrap();
+    s.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+    let (mut s, driver) = open();
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    driver
+        .signal(&Signal::new(
+            Uuid::new_v4(),
+            second,
+            "go".into(),
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), s.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s.independent_compaction_status(op).unwrap(),
+        IndependentCompactionStatus::Applied
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 2);
+    let c = s.conversation(id).unwrap();
+    let pos = |id: &str| {
+        c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == id && content.contains("task result"))).unwrap()
+    };
+    let queued = c
+        .messages
+        .iter()
+        .position(|m| matches!(m, pi_rs_core::Message::User { content } if content == "queued"))
+        .unwrap();
+    assert!(pos("tool-call") < pos("second-call") && pos("second-call") < queued);
+    s.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
 }
 #[tokio::test]
 async fn running_tool_kill_child() {

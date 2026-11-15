@@ -10451,7 +10451,7 @@ impl Scheduler {
     }
 
     /// Admit an independent summary during a model request or an eligible
-    /// single-call tool attempt. Results settle at the next safe boundary.
+    /// tool attempt in a proven round. Results settle at the next safe boundary.
     pub fn request_busy_independent_compaction(
         &mut self,
         conversation: Uuid,
@@ -11788,8 +11788,8 @@ impl Drop for Scheduler {
     }
 }
 
-// Only a single issued call with a durable attempt can be selected while the
-// tool is active. Unknown/blocked outcomes and legacy attempts stay fenced.
+// Prove the issued round and every completed result before selecting an active
+// attempt. Unknown/blocked outcomes and legacy attempts stay fenced.
 fn summary_tool_phase_eligible(state: &Conversation) -> bool {
     if state.active.is_none() || state.abort_requested {
         return false;
@@ -11811,15 +11811,28 @@ fn summary_tool_phase_eligible(state: &Conversation) -> bool {
             arguments: Some(_),
             ..
         } if !reference.is_empty() => (calls, *index, *operation_id),
+        Phase::TaskPending {
+            calls,
+            index,
+            operation_id,
+            task,
+            identity: Some(_),
+            ..
+        } if task == operation_id => (calls, *index, *operation_id),
         _ => return false,
     };
+    let Some(start) = state.messages.len().checked_sub(index.saturating_add(1)) else {
+        return false;
+    };
     !operation.is_nil()
-        && calls.len() == 1
-        && index == 0
+        && index < calls.len()
         && state
             .tool_attempt()
             .is_some_and(|attempt| !attempt.attempt_id.is_nil())
-        && matches!(state.messages.last(), Some(Message::Assistant { calls: issued, .. }) if issued == calls)
+        && matches!(&state.messages[start], Message::Assistant { calls: issued, .. } if issued == calls)
+        && calls[..index].iter().zip(&state.messages[start + 1..]).all(
+            |(call, message)| matches!(message, Message::Tool { call_id, .. } if call_id == &call.id),
+        )
 }
 
 // Prove that model progress has retained the selected ownership and inbox
