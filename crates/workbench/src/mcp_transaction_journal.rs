@@ -101,6 +101,30 @@ pub(crate) struct Target {
     pub(crate) previous_generation: Option<OpaqueId>,
     pub(crate) new_generation: OpaqueId,
 }
+/// Stable, privacy-preserving target IDs that can be reconstructed on restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetScope {
+    pub(crate) credential: OpaqueId,
+    pub(crate) store: OpaqueId,
+    pub(crate) config: OpaqueId,
+}
+/// Read-only recovery information. This is not a capability to advance or
+/// clear the journal; recovery must first validate the credential store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Inspection {
+    pub(crate) stage: Stage,
+    pub(crate) previous_generation: Option<OpaqueId>,
+    pub(crate) new_generation: OpaqueId,
+}
+impl Target {
+    pub(crate) fn scope(self) -> TargetScope {
+        TargetScope {
+            credential: self.credential,
+            store: self.store,
+            config: self.config,
+        }
+    }
+}
 /// Combines caller targets with the transaction ID created by `begin`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
@@ -119,6 +143,9 @@ impl Identity {
     }
     pub(crate) fn transaction(self) -> OpaqueId {
         self.transaction
+    }
+    pub(crate) fn target(self) -> Target {
+        self.target
     }
 }
 impl Target {
@@ -374,6 +401,22 @@ impl Journal {
             record => Ok(record),
         }
     }
+    /// Inspect the exact expected scope after restart. Generations returned by
+    /// this method must still be verified before any recovery action.
+    /// An absent record is not proof of durability or authorization to proceed.
+    pub(crate) fn inspect_scope(&self, scope: TargetScope) -> io::Result<Option<Inspection>> {
+        match self.read()? {
+            Some(record) if record.identity.target.scope() != scope => {
+                Err(conflict("transaction target does not match"))
+            }
+            Some(record) => Ok(Some(Inspection {
+                stage: record.stage,
+                previous_generation: record.identity.target.previous_generation,
+                new_generation: record.identity.target.new_generation,
+            })),
+            None => Ok(None),
+        }
+    }
     pub(crate) fn begin(&self, target: Target) -> io::Result<Record> {
         self.check_ready()?;
         target.validate()?;
@@ -621,6 +664,36 @@ mod tests {
             j.clear_complete(r.identity(), r).unwrap();
         }
     }
+    #[test]
+    fn restart_can_inspect_only_the_exact_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::new(dir.path()).unwrap();
+        let record = journal.begin(target()).unwrap();
+        let reopened = Journal::new(dir.path()).unwrap();
+        assert_eq!(
+            reopened.inspect_scope(target().scope()).unwrap(),
+            Some(Inspection {
+                stage: Stage::Prepared,
+                previous_generation: target().previous_generation,
+                new_generation: target().new_generation,
+            })
+        );
+        assert_eq!(record.identity().target(), target());
+        let mut wrong = target().scope();
+        wrong.credential = id(7);
+        assert!(reopened.inspect_scope(wrong).is_err());
+        wrong = target().scope();
+        wrong.store = id(7);
+        assert!(reopened.inspect_scope(wrong).is_err());
+        wrong = target().scope();
+        wrong.config = id(7);
+        assert!(reopened.inspect_scope(wrong).is_err());
+        assert_eq!(
+            reopened.read_matching(record.identity()).unwrap(),
+            Some(record)
+        );
+    }
+
     #[test]
     fn wrong_target_or_generation_cannot_read_advance_or_clear() {
         let dir = tempfile::tempdir().unwrap();
