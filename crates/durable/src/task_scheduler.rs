@@ -606,6 +606,10 @@ impl Scheduler {
                     self.failed_migrations
                         .insert(snapshot.task.id(), (identity, error));
                     self.publish_wake_definitions()?;
+                    // A failed migration changes readiness without a store
+                    // commit or a handler invocation. Wake observers must
+                    // still re-read the newly published definition view.
+                    self.activity.notify();
                     return Ok(false);
                 }
             }

@@ -107,6 +107,39 @@ fn driver_exposes_blocked_snapshot_and_coalesced_registry_hints() {
     driver.shutdown().unwrap();
 }
 
+#[tokio::test]
+async fn failed_migration_notifies_readiness_observers_without_a_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut original = Registry::default();
+    original.register("nap", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+    let mut scheduler = Scheduler::open(dir.path().join("db"), original).unwrap();
+    scheduler.submit(&task(1, "nap")).unwrap();
+    let mut newer = Registry::default();
+    newer.register_versioned(
+        "nap",
+        2,
+        true,
+        |_: &Task| Ok(Step::Succeed(json!(null))),
+        Some(Arc::new(|_, _, _| Err("migration refused".into()))),
+    );
+    scheduler.replace_registry(newer).unwrap();
+    let activity = scheduler.worker_activity();
+    let mut updates = activity.subscribe();
+    assert!(scheduler.wake_snapshot(0).unwrap().active);
+    assert!(!scheduler.tick(0).unwrap());
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(2), updates.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(changed.is_empty());
+    let after = scheduler.wake_snapshot(0).unwrap();
+    assert!(!after.active);
+    assert_eq!(
+        after.blocked[0].reason,
+        BlockedReason::MigrationFailed("migration refused".into())
+    );
+}
+
 #[test]
 fn inspecting_a_signalled_wait_does_not_consume_it() {
     use pi_rs_durable::{task::TaskState, task_store::Signal};
