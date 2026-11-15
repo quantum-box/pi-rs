@@ -1242,7 +1242,7 @@ impl Scheduler {
         // Admission may have rewritten an identical reservation while the
         // handler ran. The gate keeps cooperating admissions out until commit.
         let original_version = running.version;
-        let running = current.clone();
+        let mut running = current.clone();
         // Capture before scanning so the eventual commit cannot pass a
         // concurrent task/ownership graph update after this decision.
         let success_graph_version = owner
@@ -1545,10 +1545,33 @@ impl Scheduler {
                 self.poisoned = false;
                 return Ok(true);
             }
-            if matches!(next.task.state(), TaskState::Succeeded(_))
-                && has_live_owned(owner.store(), next.task.id(), &self.ts().list()?)?
-            {
+            let latest = self.ts().load(running.task.id())?.ok_or(Error::Ownership)?;
+            if latest.task.abort_requested() {
+                self.ts().update(&latest, |task| task.yield_ready())?;
+                self.poisoned = false;
+                return Ok(true);
+            }
+            if latest.task != running.task {
                 break result;
+            }
+            let mut candidate = next.task.clone();
+            if matches!(candidate.state(), TaskState::Succeeded(_))
+                && has_live_owned(owner.store(), candidate.id(), &self.ts().list()?)?
+            {
+                candidate
+                    .hold_prepared_success()
+                    .map_err(Error::Transition)?;
+            }
+            if latest.version != running.version || candidate != next.task {
+                transaction.rebase_task_candidate(
+                    running.task.id(),
+                    running.version,
+                    latest.version,
+                    &next.task,
+                    &candidate,
+                )?;
+                running = latest;
+                next.task = candidate;
             }
             let refs: HashMap<_, _> = retry_children
                 .iter()
@@ -5348,11 +5371,633 @@ mod tests {
         assert_eq!(current.checkpoint().phase, "external");
     }
 
-    // A new live child changes a successful terminal result into a held result.
-    // Until the checked transaction can be rebuilt, document the safe fallback,
-    // including an identical running-task rewrite from concurrent admission.
+    #[cfg(unix)]
     #[test]
-    fn successful_non_replay_safe_result_with_late_child_is_not_rebased() {
+    fn late_child_process_fixture() {
+        use crate::document::{Address, TaskDocuments};
+        use crate::task_store::SignalToken;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Ok(path) = std::env::var("PI_LATE_CHILD_CRASH_DB") else {
+            return;
+        };
+        struct Writer;
+        impl Handler for Writer {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let address = Address {
+                    scope: "crash".into(),
+                    name: "result".into(),
+                    key: "".into(),
+                };
+                docs.get(&address).unwrap();
+                docs.put(
+                    &address,
+                    json!({"value":"committed"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                let token = SignalToken::new("answer", 1).unwrap();
+                docs.signal_at(Uuid::from_u128(3), &token, "key", json!(7), 0)
+                    .unwrap();
+                Ok(Step::Succeed(json!("success")))
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register("parent", false, Writer);
+        registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(path, registry).unwrap();
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        let child = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        let receiver = task(
+            3,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "receiver",
+            false,
+            3,
+        );
+        scheduler
+            .ts()
+            .save(&[Save::Create(&parent), Save::Create(&receiver)])
+            .unwrap();
+        let once = Arc::new(AtomicBool::new(false));
+        scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                let ts = TaskStore::new(store);
+                ts.save(&[Save::Create(&child)]).unwrap();
+                let parent = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+                ts.update(&parent, |_| Ok(())).unwrap();
+            }
+        }));
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            &TaskState::Completing(json!("success"))
+        );
+        println!("LATE_CHILD_COMMITTED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_child_result_survives_process_kill_without_replay() {
+        use crate::document::{Address, Documents};
+        use crate::task_store::SignalToken;
+        use std::{
+            io::{BufRead, BufReader},
+            process::{Child, Command, Stdio},
+            sync::mpsc,
+            time::Duration,
+        };
+        struct KillOnDrop(Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut child = KillOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "task_scheduler::tests::late_child_process_fixture",
+                    "--nocapture",
+                ])
+                .env("PI_LATE_CHILD_CRASH_DB", &path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("LATE_CHILD_COMMITTED") {
+                    let _ = tx.send(());
+                    break;
+                }
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("held outcome did not commit");
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| panic!("parent must not replay"));
+        registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        let mut scheduler = Scheduler::open(&path, registry).unwrap();
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Completing(json!("success"))
+        );
+        let address = Address {
+            scope: "crash".into(),
+            name: "result".into(),
+            key: "".into(),
+        };
+        assert_eq!(
+            Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            "committed"
+        );
+        let token = SignalToken::new("answer", 1).unwrap();
+        assert_eq!(
+            scheduler
+                .ts()
+                .read_typed_signal(Uuid::from_u128(3), &token, "key")
+                .unwrap(),
+            Some(json!(7))
+        );
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler
+                .get(Uuid::from_u128(1))
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(Uuid::from_u128(1)).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("success"))
+        );
+    }
+
+    #[test]
+    fn late_child_rebase_keeps_signals_keyed_children_and_runtime_update() {
+        use crate::document::{Address, TaskDocuments};
+        use crate::runtime::{Config, Harness, Options};
+        use crate::task_store::{SignalResult, SignalToken};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        fn options() -> Options {
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            }
+        }
+        fn config(model: &str) -> Config {
+            Config {
+                model: model.into(),
+                system_prompt: "prompt".into(),
+                max_output_tokens: 20,
+            }
+        }
+        struct Staging {
+            address: Address,
+            keyed: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.get(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value":"staged"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    docs.signal_at(task.id(), &token, "self", json!(7), 0)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                assert_eq!(
+                    docs.signal_at(Uuid::from_u128(3), &token, "other", json!(8), 0)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                if self.keyed {
+                    let child = Task::new(
+                        Uuid::from_u128(4),
+                        TaskOwner::Task(task.id()),
+                        Checkpoint {
+                            phase: "start".into(),
+                            data: json!(null),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered("child".into(), false);
+                    docs.stage_keyed_child("nested", "tool", child.input(), child.clone())
+                        .unwrap();
+                }
+                docs.append_entry("app.before", json!(1)).unwrap();
+                docs.configure_runtime_at_checkpoint(config("changed"))
+                    .unwrap();
+                docs.append_entry("app.after", json!(2)).unwrap();
+                Ok(Step::Succeed(json!("success")))
+            }
+        }
+        for keyed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(&path, options()).unwrap();
+            let conversation = harness.create_conversation(config("original")).unwrap();
+            let address = Address {
+                scope: conversation.to_string(),
+                name: "late".into(),
+                key: "".into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "parent",
+                false,
+                Staging {
+                    address: address.clone(),
+                    keyed,
+                    calls: calls.clone(),
+                },
+            );
+            registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!("child"))));
+            let mut scheduler = harness.attach_tasks(registry.clone()).unwrap();
+            let root = task(1, TaskOwner::Conversation(conversation), "parent", false, 3);
+            let late = task(2, TaskOwner::Task(root.id()), "child", false, 3);
+            let receiver = task(
+                3,
+                TaskOwner::Conversation(conversation),
+                "receiver",
+                false,
+                3,
+            );
+            scheduler
+                .ts()
+                .save(&[Save::Create(&root), Save::Create(&receiver)])
+                .unwrap();
+            let once = Arc::new(AtomicBool::new(false));
+            scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+                if !once.swap(true, Ordering::SeqCst) {
+                    let ts = TaskStore::new(store);
+                    ts.save(&[Save::Create(&late)]).unwrap();
+                    let parent = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+                    ts.update(&parent, |_| Ok(())).unwrap();
+                }
+            }));
+            scheduler.tick(0).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                scheduler.get(root.id()).unwrap().unwrap().state(),
+                &TaskState::Completing(json!("success"))
+            );
+            assert_eq!(
+                harness.conversation(conversation).unwrap().config.model,
+                "changed"
+            );
+            assert_eq!(
+                harness.document(&address).unwrap().unwrap().value["value"],
+                "staged"
+            );
+            let entries =
+                crate::application_entry::list(scheduler.owner().store(), conversation).unwrap();
+            assert_eq!(entries.len(), 2);
+            let token = SignalToken::new("answer", 1).unwrap();
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .read_typed_signal(root.id(), &token, "self")
+                    .unwrap(),
+                Some(json!(7))
+            );
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .read_typed_signal(receiver.id(), &token, "other")
+                    .unwrap(),
+                Some(json!(8))
+            );
+            assert_eq!(scheduler.get(Uuid::from_u128(4)).unwrap().is_some(), keyed);
+            drop(scheduler);
+            drop(harness);
+            let harness = Harness::open_paused(&path, options()).unwrap();
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            for _ in 0..12 {
+                scheduler.tick(0).unwrap();
+                if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                scheduler.get(root.id()).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("success"))
+            );
+            assert_eq!(
+                harness.conversation(conversation).unwrap().config.model,
+                "changed"
+            );
+            assert_eq!(
+                crate::application_entry::list(scheduler.owner().store(), conversation)
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn late_child_rebase_preserves_real_document_and_signal_conflicts() {
+        use crate::document::{Address, Documents, TaskDocuments, Transaction};
+        use crate::task_store::{SignalResult, SignalToken};
+        use durable_store::Expected;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Writer {
+            address: Address,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Writer {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.get(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value":"staged"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    docs.signal_at(Uuid::from_u128(3), &token, "key", json!(7), 0)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                Ok(Step::Succeed(json!("must not commit")))
+            }
+        }
+        for signal_conflict in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let address = Address {
+                scope: "late-conflict".into(),
+                name: "doc".into(),
+                key: "".into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "parent",
+                false,
+                Writer {
+                    address: address.clone(),
+                    calls: calls.clone(),
+                },
+            );
+            registry.register_with_abort(
+                "child",
+                false,
+                |_: &Task| panic!("child must not run"),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let root = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                false,
+                3,
+            );
+            let late = task(2, TaskOwner::Task(root.id()), "child", false, 3);
+            let receiver = task(
+                3,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "receiver",
+                false,
+                3,
+            );
+            scheduler
+                .ts()
+                .save(&[Save::Create(&root), Save::Create(&receiver)])
+                .unwrap();
+            let mut tx = Transaction::new();
+            tx.put(
+                &address,
+                Expected::Missing,
+                json!({"value":"initial"}).as_object().unwrap(),
+            )
+            .unwrap();
+            tx.commit(scheduler.owner().store()).unwrap();
+            let changed = address.clone();
+            scheduler.result_commit_hook = Some(Arc::new(move |attempt, store| {
+                let ts = TaskStore::new(store);
+                if attempt == 0 {
+                    ts.save(&[Save::Create(&late)]).unwrap();
+                    let parent = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+                    ts.update(&parent, |_| Ok(())).unwrap();
+                } else if attempt == 1 && signal_conflict {
+                    let token = SignalToken::new("answer", 1).unwrap();
+                    assert_eq!(
+                        ts.deliver_signal_at(Uuid::from_u128(3), &token, "key", json!(8), 0)
+                            .unwrap(),
+                        SignalResult::Delivered
+                    );
+                } else if attempt == 1 {
+                    let version = Documents::new(store)
+                        .get(&changed)
+                        .unwrap()
+                        .unwrap()
+                        .version;
+                    let mut tx = Transaction::new();
+                    tx.put(
+                        &changed,
+                        Expected::Version(version),
+                        json!({"value":"external"}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                    tx.commit(store).unwrap();
+                }
+            }));
+            scheduler.tick(0).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                scheduler.get(root.id()).unwrap().unwrap().state(),
+                TaskState::CompletingFailed(_)
+            ));
+            let value = Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"]
+                .clone();
+            assert_eq!(
+                value,
+                if signal_conflict {
+                    json!("initial")
+                } else {
+                    json!("external")
+                }
+            );
+            let token = SignalToken::new("answer", 1).unwrap();
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .read_typed_signal(receiver.id(), &token, "key")
+                    .unwrap(),
+                if signal_conflict {
+                    Some(json!(8))
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn late_child_rebase_rejects_changed_attempt_and_respects_abort() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Writer {
+            address: Address,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Writer {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.get(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value":"must not commit"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("must not commit")))
+            }
+        }
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let address = Address {
+                scope: "fence".into(),
+                name: "late".into(),
+                key: "".into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register_with_abort(
+                "parent",
+                false,
+                Writer {
+                    address: address.clone(),
+                    calls: calls.clone(),
+                },
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            registry.register_with_abort(
+                "child",
+                false,
+                |_: &Task| panic!("child must not run"),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let root = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                false,
+                3,
+            );
+            let child = task(2, TaskOwner::Task(root.id()), "child", false, 3);
+            scheduler.ts().save(&[Save::Create(&root)]).unwrap();
+            let once = Arc::new(AtomicBool::new(false));
+            scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+                if !once.swap(true, Ordering::SeqCst) {
+                    let ts = TaskStore::new(store);
+                    ts.save(&[Save::Create(&child)]).unwrap();
+                    if abort {
+                        request_abort_subtree(&ts, Uuid::from_u128(1)).unwrap();
+                    } else {
+                        let current = ts.load(Uuid::from_u128(1)).unwrap().unwrap();
+                        ts.update(&current, |task| task.advance(cp("changed")))
+                            .unwrap();
+                    }
+                }
+            }));
+            let result = scheduler.tick(0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                Documents::new(scheduler.owner().store())
+                    .get(&address)
+                    .unwrap()
+                    .is_none()
+            );
+            let current = scheduler.ts().load(root.id()).unwrap().unwrap().task;
+            if abort {
+                assert!(result.unwrap());
+                assert_eq!(current.state(), &TaskState::Ready);
+                assert!(current.abort_requested());
+                for _ in 0..8 {
+                    scheduler.tick(0).unwrap();
+                    if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    scheduler.get(root.id()).unwrap().unwrap().state(),
+                    &TaskState::Cancelled
+                );
+            } else {
+                assert!(result.is_err());
+                assert_eq!(current.state(), &TaskState::Running);
+                assert_eq!(current.checkpoint().phase, "changed");
+            }
+        }
+    }
+
+    #[test]
+    fn successful_non_replay_safe_result_with_late_child_survives_reopen() {
         use crate::document::{Address, Documents, TaskDocuments, Transaction};
         use durable_store::Expected;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -5381,14 +6026,13 @@ mod tests {
         }
         for identical_rewrite in [false, true] {
             let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
             let owned = Address {
                 scope: "late-child".into(),
                 name: "owned".into(),
                 key: "".into(),
             };
             let calls = Arc::new(AtomicUsize::new(0));
-            let aborts = Arc::new(AtomicUsize::new(0));
-            let observed = aborts.clone();
             let mut registry = Registry::default();
             registry.register(
                 "parent",
@@ -5398,16 +6042,8 @@ mod tests {
                     calls: calls.clone(),
                 },
             );
-            registry.register_with_abort(
-                "child",
-                false,
-                |_: &Task| panic!("late child must not run"),
-                move |_: &Task| {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    Ok(Step::Succeed(json!(null)))
-                },
-            );
-            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!("child"))));
+            let mut scheduler = Scheduler::open(&path, registry.clone()).unwrap();
             let root = task(
                 1,
                 TaskOwner::Conversation(Uuid::from_u128(9)),
@@ -5437,49 +6073,39 @@ mod tests {
                     }
                 }
             }));
-            let outcome = scheduler.tick(0);
+            scheduler.tick(0).unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 1);
-            let ts = scheduler.ts();
-            let state = ts.load(root.id()).unwrap().unwrap().task;
+            assert_eq!(
+                scheduler.get(root.id()).unwrap().unwrap().state(),
+                &TaskState::Completing(json!("success"))
+            );
             assert_eq!(
                 Documents::new(scheduler.owner().store())
                     .get(&owned)
                     .unwrap()
                     .unwrap()
                     .value["value"],
-                "original"
+                "staged"
             );
-            if identical_rewrite {
-                assert!(outcome.is_err());
-                assert_eq!(state.state(), &TaskState::Running);
-                assert_eq!(aborts.load(Ordering::SeqCst), 0);
-                assert_eq!(
-                    ts.load(Uuid::from_u128(2)).unwrap().unwrap().task.state(),
-                    &TaskState::Ready
-                );
-            } else {
-                assert!(outcome.unwrap());
-                assert!(
-                    matches!(state.state(), TaskState::CompletingFailed(reason) if reason.contains("document conflict"))
-                );
-                for _ in 0..8 {
-                    scheduler.tick(0).unwrap();
-                    if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
-                        break;
-                    }
+            drop(scheduler);
+            let mut scheduler = Scheduler::open(&path, registry).unwrap();
+            for _ in 0..8 {
+                scheduler.tick(0).unwrap();
+                if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                    break;
                 }
-                assert!(matches!(
-                    scheduler.get(root.id()).unwrap().unwrap().state(),
-                    TaskState::Failed(_)
-                ));
-                assert_eq!(aborts.load(Ordering::SeqCst), 1);
-                assert!(
-                    Documents::new(scheduler.owner().store())
-                        .get(&owned)
-                        .unwrap()
-                        .is_none()
-                );
             }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                scheduler.get(root.id()).unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("success"))
+            );
+            assert!(
+                Documents::new(scheduler.owner().store())
+                    .get(&owned)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 

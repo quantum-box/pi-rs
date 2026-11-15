@@ -486,11 +486,10 @@ Current limits and differences from upstream Pi Durable:
   and drains its owned work and abort handler before waking the waiting parent.
   Unlike upstream, siblings are marked in separate scheduling passes. On reopen,
   interrupted invocations under those graphs wait until the marks are persisted
-  before recovery. If a child is admitted after a non-replay-safe successful
-  step was prepared, the scheduler currently holds a reconciliation failure rather
-  than rebuilding the successful result as `Completing`; staged effects are
-  discarded. An identical concurrent task rewrite can instead require reopen.
-  Legacy `cancel` bypasses cleanup. Conversation abort marks foreground conversation-owned task descendants;
+  before recovery. If an owned child is admitted after a successful step was
+  prepared, a graph-fenced retry holds that result as `Completing` without
+  rerunning the handler. Same-value reservation rewrites are rebased while
+  document, signal and deadline checks remain in force. Legacy `cancel` bypasses cleanup. Conversation abort marks foreground conversation-owned task descendants;
   foreground task-owned subagent conversations are included. Shutdown waits for an in-flight step.
 - Standalone task signals also support `SignalToken::new(name, version)`,
   `Signal::new_typed`, and `WaitFor::TypedSignal(token.key(key)?)`. The stored

@@ -1315,6 +1315,56 @@ impl Transaction {
         store.commit_with_task_documents(&self.checks, &self.mutations, &self.acquisitions)?;
         Ok(())
     }
+    /// Rebase only observations of the same running task, preserving deadline
+    /// fences and every independently observed version. Replace exactly the
+    /// prepared candidate, leaving staged documents, signals and entries intact.
+    pub(crate) fn rebase_task_candidate(
+        &mut self,
+        id: uuid::Uuid,
+        old_version: u64,
+        new_version: u64,
+        old: &crate::task::Task,
+        next: &crate::task::Task,
+    ) -> Result<(), Error> {
+        let key = crate::task_store::key(id);
+        let old_value = serde_json::to_vec(old)?;
+        let next_value = serde_json::to_vec(next)?;
+        let mut found_check = false;
+        for check in &mut self.checks {
+            if check.key != key {
+                continue;
+            }
+            match &mut check.expected {
+                Expected::Version(version) | Expected::VersionBefore(version, _)
+                    if *version == old_version =>
+                {
+                    *version = new_version;
+                    found_check = true;
+                }
+                _ => (),
+            }
+        }
+        let mut found_mutation = false;
+        for mutation in &mut self.mutations {
+            if let Mutation::Put {
+                key: mutation_key,
+                value,
+            } = mutation
+                && *mutation_key == key
+            {
+                if found_mutation || *value != old_value {
+                    return Err(Error::InvalidBatch);
+                }
+                *value = next_value.clone();
+                found_mutation = true;
+            }
+        }
+        if !found_check || !found_mutation {
+            return Err(Error::InvalidBatch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn commit_task_graph(&self, store: &Store, version: u64) -> Result<(), Error> {
         store.commit_task_documents_with_prefix_put_fence(
             &self.checks,
@@ -2274,6 +2324,58 @@ mod nested_entry_tests {
     use crate::task_store::{Save, TaskStore};
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn late_child_rebase_keeps_original_deadline_and_task_version_fence() {
+        use std::time::{Duration, Instant};
+        let db = Store::memory().unwrap();
+        let store = TaskStore::new(&db);
+        let mut running = task(1, TaskOwner::Conversation(Uuid::from_u128(9)));
+        running.start_attempt(Uuid::new_v4()).unwrap();
+        store.save(&[Save::Create(&running)]).unwrap();
+        let before = store.load(running.id()).unwrap().unwrap();
+        let mut candidate = before.clone();
+        candidate.task.succeed(json!("done")).unwrap();
+        candidate
+            .task
+            .record_completed_attempt(&before.task)
+            .unwrap();
+        let mut held = candidate.task.clone();
+        held.hold_prepared_success().unwrap();
+        let mut graph = store.prepare_save(&[Save::Update(&candidate)]).unwrap();
+        let key = crate::task_store::key(running.id());
+        let deadline = Instant::now() - Duration::from_secs(1);
+        graph
+            .checks
+            .iter_mut()
+            .find(|check| check.key == key)
+            .unwrap()
+            .expected = Expected::VersionBefore(before.version, deadline);
+        let mut tx = Transaction::new();
+        tx.append(graph).unwrap();
+        store.update(&before, |_| Ok(())).unwrap();
+        let after = store.load(running.id()).unwrap().unwrap();
+        assert_eq!(before.task, after.task);
+        tx.rebase_task_candidate(
+            running.id(),
+            before.version,
+            after.version,
+            &candidate.task,
+            &held,
+        )
+        .unwrap();
+        assert!(
+            matches!(tx.checks.iter().find(|check| check.key == key).unwrap().expected, Expected::VersionBefore(version, when) if version == after.version && when == deadline)
+        );
+        assert!(matches!(
+            tx.commit_task_graph(&db, db.put_version().unwrap()),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(
+            store.load(running.id()).unwrap().unwrap().task.state(),
+            &crate::task::TaskState::Running
+        );
+    }
 
     #[test]
     fn racing_child_observations_conflict_and_preserve_deadlines() {

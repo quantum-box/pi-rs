@@ -348,6 +348,16 @@ impl Task {
         Ok(())
     }
 
+    /// Turn a prepared successful candidate into a held outcome after a
+    /// fenced rescan discovers newly admitted owned work.
+    pub(crate) fn hold_prepared_success(&mut self) -> Result<(), TransitionError> {
+        let TaskState::Succeeded(value) = &self.state else {
+            return Err(TransitionError::InvalidState);
+        };
+        self.state = TaskState::Completing(value.clone());
+        Ok(())
+    }
+
     pub fn is_completing(&self) -> bool {
         matches!(
             self.state,
