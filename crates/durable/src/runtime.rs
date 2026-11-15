@@ -1391,6 +1391,155 @@ impl MergedProgressWatch {
     }
 }
 
+/// Terminal result of an explicit merged listener. A source-close signal is
+/// supplied by the host; it is not inferred from scheduler shutdown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergedListenerEnd {
+    Stopped,
+    Aborted,
+    Ended,
+    ListenerError(String),
+    Failed(String),
+}
+
+/// Independent, first-observed termination signals for a listener.
+#[derive(Clone, Default)]
+pub struct MergedListenerSignals {
+    pub stop: CancellationToken,
+    pub abort: CancellationToken,
+    pub source_closed: CancellationToken,
+}
+
+/// Serialized callback delivery with at-least-once replay from the last
+/// acknowledged page. This does not spawn a worker or buffer pages.
+pub struct MergedProgressListener {
+    reader: Option<Harness>,
+    cursor: MergedProgressCursor,
+    limit: std::num::NonZeroUsize,
+    interval: Duration,
+    end: Option<MergedListenerEnd>,
+}
+impl MergedProgressWatch {
+    /// Transfer this watch to a single callback driver. An ended watch cannot
+    /// be restarted; it may instead be reattached from its saved cursor.
+    pub fn into_listener(mut self) -> Result<MergedProgressListener, Error> {
+        let reader = self
+            .reader
+            .take()
+            .ok_or_else(|| Error::Invalid("merged watch already ended".into()))?;
+        Ok(MergedProgressListener {
+            reader: Some(reader),
+            cursor: self.cursor,
+            limit: self.limit,
+            interval: self.interval,
+            end: None,
+        })
+    }
+}
+impl MergedProgressListener {
+    pub fn cursor(&self) -> &MergedProgressCursor {
+        &self.cursor
+    }
+    pub fn end_reason(&self) -> Option<&MergedListenerEnd> {
+        self.end.as_ref()
+    }
+    fn finish(&mut self, end: MergedListenerEnd) -> MergedListenerEnd {
+        if self.end.is_none() {
+            self.end = Some(end);
+            self.reader = None;
+        }
+        self.end.as_ref().expect("end recorded").clone()
+    }
+    /// Run one listener at a time. The callback accepts a whole page; an error,
+    /// panic, or dropped run leaves its cursor unchanged. Signals are checked
+    /// before delivery; an already running callback is awaited so it can be
+    /// acknowledged safely. The callback must eventually return.
+    pub async fn run<F, Fut>(
+        &mut self,
+        signals: &MergedListenerSignals,
+        mut listener: F,
+    ) -> MergedListenerEnd
+    where
+        F: FnMut(MergedProgressPage) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        if let Some(end) = &self.end {
+            return end.clone();
+        }
+        loop {
+            if signals.stop.is_cancelled() {
+                return self.finish(MergedListenerEnd::Stopped);
+            }
+            if signals.abort.is_cancelled() {
+                return self.finish(MergedListenerEnd::Aborted);
+            }
+            if signals.source_closed.is_cancelled() {
+                return self.finish(MergedListenerEnd::Ended);
+            }
+            let page = match self
+                .reader
+                .as_ref()
+                .expect("open listener")
+                .merged_progress(&self.cursor, self.limit)
+            {
+                Ok(page) => page,
+                Err(error) => return self.finish(MergedListenerEnd::Failed(error.to_string())),
+            };
+            if page.frames.is_empty() {
+                tokio::select! { biased;
+                    _ = signals.stop.cancelled() => return self.finish(MergedListenerEnd::Stopped),
+                    _ = signals.abort.cancelled() => return self.finish(MergedListenerEnd::Aborted),
+                    _ = signals.source_closed.cancelled() => return self.finish(MergedListenerEnd::Ended),
+                    _ = tokio::time::sleep(self.interval) => {},
+                }
+                continue;
+            }
+            // A synchronous storage read may have overlapped termination.
+            if signals.stop.is_cancelled() {
+                return self.finish(MergedListenerEnd::Stopped);
+            }
+            if signals.abort.is_cancelled() {
+                return self.finish(MergedListenerEnd::Aborted);
+            }
+            if signals.source_closed.is_cancelled() {
+                return self.finish(MergedListenerEnd::Ended);
+            }
+            let callback = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                listener(page.clone())
+            })) {
+                Ok(callback) => callback,
+                Err(payload) => {
+                    crate::extension::discard_panic_payload(payload);
+                    return self
+                        .finish(MergedListenerEnd::ListenerError("listener panicked".into()));
+                }
+            };
+            let callback = std::panic::AssertUnwindSafe(callback).catch_unwind();
+            tokio::pin!(callback);
+            let (result, signalled) = tokio::select! { biased;
+                result = &mut callback => (result, None),
+                _ = signals.stop.cancelled() => (callback.await, Some(MergedListenerEnd::Stopped)),
+                _ = signals.abort.cancelled() => (callback.await, Some(MergedListenerEnd::Aborted)),
+                _ = signals.source_closed.cancelled() => (callback.await, Some(MergedListenerEnd::Ended)),
+            };
+            let failure = match result {
+                Ok(Ok(())) => {
+                    self.cursor = page.next;
+                    None
+                }
+                Ok(Err(error)) => Some(MergedListenerEnd::ListenerError(error)),
+                Err(payload) => {
+                    crate::extension::discard_panic_payload(payload);
+                    Some(MergedListenerEnd::ListenerError("listener panicked".into()))
+                }
+            };
+            if let Some(end) = signalled.or(failure) {
+                return self.finish(end);
+            }
+        }
+    }
+}
+
 const MAX_PROGRESS_HISTORY_BYTES: usize = 2 * 1024 * 1024 + 8192;
 fn prepare_progress_history(
     store: &durable_store::Store,

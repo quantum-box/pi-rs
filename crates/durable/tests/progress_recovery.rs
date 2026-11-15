@@ -1163,6 +1163,16 @@ async fn merged_watch_handle_failure_is_terminal_without_cursor_advance() {
         .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
         .unwrap();
     let cursor = watch.cursor().clone();
+    let mut listener = h
+        .watch_merged_progress_handle(
+            id,
+            Some(cursor.clone()),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .into_listener()
+        .unwrap();
     let store = durable_store::Store::open(&path).unwrap();
     let append = Observer::new(&store, id)
         .prepare_append(&serde_json::json!({"forged":true}))
@@ -1174,4 +1184,361 @@ async fn merged_watch_handle_failure_is_terminal_without_cursor_advance() {
     watch.close();
     assert!(matches!(watch.end_reason(), Some(ViewWatchEnd::Failed(_))));
     assert!(watch.next().await.unwrap().is_none());
+    let end = listener
+        .run(
+            &pi_rs_durable::runtime::MergedListenerSignals::default(),
+            |_| async { panic!("invalid frame delivered") },
+        )
+        .await;
+    assert!(matches!(
+        end,
+        pi_rs_durable::runtime::MergedListenerEnd::Failed(_)
+    ));
+    assert_eq!(listener.cursor(), &cursor);
+}
+
+#[tokio::test]
+async fn merged_listener_source_close_waits_for_ack_and_replays_later_commits() {
+    use pi_rs_durable::{
+        document::Address,
+        runtime::{AdmissionOptions, MergedListenerEnd, MergedListenerSignals},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("listener.db");
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(&path, opts(model.clone())).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let address = Address {
+        scope: id.to_string(),
+        name: "note".into(),
+        key: "".into(),
+    };
+    let mut listener = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    let start = listener.cursor().clone();
+    h.submit_with_documents(
+        id,
+        None,
+        "one".into(),
+        AdmissionOptions::default(),
+        |docs| {
+            docs.get(&address)?;
+            docs.put(
+                &address,
+                serde_json::json!({"n":1}).as_object().unwrap().clone(),
+            )
+        },
+    )
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let signals = MergedListenerSignals::default();
+    {
+        let entered2 = entered.clone();
+        let release2 = release.clone();
+        let seen2 = seen.clone();
+        let run = listener.run(&signals, move |page| {
+            let entered = entered2.clone();
+            let release = release2.clone();
+            let seen = seen2.clone();
+            async move {
+                seen.lock().unwrap().push(page);
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                Ok(())
+            }
+        });
+        tokio::pin!(run);
+        tokio::select! { result = &mut run => panic!("ended early: {result:?}"), permit = entered.acquire() => { permit.unwrap().forget(); } }
+        h.submit(id, None, "two".into()).unwrap();
+        signals.source_closed.cancel();
+        release.add_permits(1);
+        assert_eq!(run.await, MergedListenerEnd::Ended);
+    }
+    let saved = listener.cursor().clone();
+    {
+        let pages = seen.lock().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].frames.len(), 1);
+        assert!(pages[0].frames[0].observation.is_some());
+        assert_eq!(pages[0].frames[0].documents[0].address, address);
+        assert_ne!(saved, start);
+        assert_eq!(saved, pages[0].next);
+    }
+    assert_eq!(listener.end_reason(), Some(&MergedListenerEnd::Ended));
+    let mut legacy_value = serde_json::to_value(&start).unwrap();
+    legacy_value["version"] = serde_json::json!(1);
+    legacy_value
+        .as_object_mut()
+        .unwrap()
+        .remove("document_position");
+    let legacy_cursor = serde_json::from_value(legacy_value).unwrap();
+    let mut legacy = h
+        .watch_merged_progress_handle(
+            id,
+            Some(legacy_cursor),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    let legacy_signals = MergedListenerSignals::default();
+    let legacy_stop = legacy_signals.stop.clone();
+    let legacy_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let legacy_capture = legacy_seen.clone();
+    assert_eq!(
+        legacy
+            .run(&legacy_signals, move |page| {
+                let stop = legacy_stop.clone();
+                let capture = legacy_capture.clone();
+                async move {
+                    capture.lock().unwrap().push(page);
+                    stop.cancel();
+                    Ok(())
+                }
+            })
+            .await,
+        MergedListenerEnd::Stopped
+    );
+    assert!(
+        legacy_seen.lock().unwrap()[0].frames[0]
+            .documents
+            .is_empty()
+    );
+    drop(legacy);
+    drop(listener);
+    drop(h);
+    let h = Harness::open_paused(&path, opts(model)).unwrap();
+    let mut resumed = h
+        .watch_merged_progress_handle(id, Some(saved), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    let next = resumed.next().await.unwrap().unwrap();
+    assert_eq!(
+        next.frames[0].observation.as_ref().unwrap().value["submissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn merged_listener_failure_does_not_ack_and_abort_is_terminal() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(dir.path().join("db"), opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut listener = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    let start = listener.cursor().clone();
+    h.submit(id, None, "one".into()).unwrap();
+    let signals = MergedListenerSignals::default();
+    let end = listener
+        .run(&signals, |_| async { Err("rejected".to_owned()) })
+        .await;
+    assert_eq!(end, MergedListenerEnd::ListenerError("rejected".into()));
+    assert_eq!(listener.cursor(), &start);
+    signals.stop.cancel();
+    assert_eq!(listener.run(&signals, |_| async { Ok(()) }).await, end);
+    let mut panicking = h
+        .watch_merged_progress_handle(
+            id,
+            Some(start.clone()),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    assert_eq!(
+        panicking
+            .run(&MergedListenerSignals::default(), |_| async {
+                panic!("listener failure")
+            })
+            .await,
+        MergedListenerEnd::ListenerError("listener panicked".into())
+    );
+    assert_eq!(panicking.cursor(), &start);
+    let mut replay = h
+        .watch_merged_progress_handle(
+            id,
+            Some(start.clone()),
+            NonZeroUsize::MIN,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    let abort = MergedListenerSignals::default();
+    abort.abort.cancel();
+    assert_eq!(
+        replay
+            .run(&abort, |_| async { panic!("cancelled listener called") })
+            .await,
+        MergedListenerEnd::Aborted
+    );
+    assert_eq!(replay.cursor(), &start);
+    let mut pull = h
+        .watch_merged_progress_handle(id, Some(start), NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(
+        pull.next().await.unwrap().unwrap().frames[0]
+            .observation
+            .as_ref()
+            .unwrap()
+            .value["submissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn merged_listener_delivers_model_progress_and_atomic_abort() {
+    use pi_rs_durable::{
+        progress::State,
+        runtime::{MergedListenerEnd, MergedListenerSignals, ProgressHistoryChange, Scheduler},
+    };
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+    });
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts(model)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut listener = scheduler
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    scheduler.abort_and_wait(id).await.unwrap();
+    let signals = MergedListenerSignals::default();
+    let stop = signals.stop.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let end = tokio::time::timeout(Duration::from_secs(5), listener.run(&signals, move |page| {
+        let capture = capture.clone(); let stop = stop.clone();
+        async move {
+            if page.frames.iter().any(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|change| matches!(change, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Aborted(_)))))) { stop.cancel(); }
+            capture.lock().unwrap().push(page);
+            Ok(())
+        }
+    })).await.unwrap();
+    assert_eq!(end, MergedListenerEnd::Stopped);
+    {
+        let pages = seen.lock().unwrap();
+        assert!(pages.iter().flat_map(|p| &p.frames).any(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|change| matches!(change, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Running(_)))))));
+        let terminal = pages.iter().flat_map(|p| &p.frames).find(|frame| frame.progress.as_ref().is_some_and(|p| p.changes.iter().any(|change| matches!(change, ProgressHistoryChange::Generation { state, .. } if matches!(state.as_ref(), State::Aborted(_)))))).unwrap();
+        assert!(terminal.observation.is_some());
+        assert_eq!(listener.cursor(), &pages.last().unwrap().next);
+    }
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn merged_listener_cancelled_callback_replays_unacknowledged_page() {
+    use pi_rs_durable::runtime::{MergedListenerEnd, MergedListenerSignals};
+    use std::{num::NonZeroUsize, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(PartialModel {
+        calls: AtomicUsize::new(0),
+        reached: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut h = Harness::open_paused(dir.path().join("db"), opts(model)).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let mut listener = h
+        .watch_merged_progress_handle(id, None, NonZeroUsize::MIN, Duration::from_millis(1))
+        .unwrap()
+        .into_listener()
+        .unwrap();
+    let start = listener.cursor().clone();
+    h.submit(id, None, "one".into()).unwrap();
+    let signals = MergedListenerSignals::default();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            listener.run(&signals, |_| async {
+                std::future::pending::<Result<(), String>>().await
+            })
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(listener.cursor(), &start);
+    assert_eq!(listener.end_reason(), None);
+    let stop = signals.stop.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    assert_eq!(
+        listener
+            .run(&signals, move |page| {
+                let stop = stop.clone();
+                let capture = capture.clone();
+                async move {
+                    capture.lock().unwrap().push(page);
+                    stop.cancel();
+                    Ok(())
+                }
+            })
+            .await,
+        MergedListenerEnd::Stopped
+    );
+    let pages = seen.lock().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(
+        pages[0].frames[0].observation.as_ref().unwrap().value["submissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(listener.cursor(), &pages[0].next);
 }
