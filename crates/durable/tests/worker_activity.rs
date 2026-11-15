@@ -66,6 +66,46 @@ fn task(id: Uuid, conversation: Uuid) -> Task {
 }
 
 #[tokio::test]
+async fn activity_subscription_tracks_a_real_worker_without_polling() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(HoldingModel {
+        entered: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options(model.clone())).unwrap();
+    let conversation = scheduler.create_conversation(config()).unwrap();
+    let activity = scheduler.worker_activity();
+    let mut updates = activity.subscribe();
+    assert!(updates.borrow_and_update().is_empty());
+    scheduler.submit(conversation, None, "go".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), model.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(5), updates.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(updates.borrow_and_update().iter().any(|worker| {
+        worker.kind == WorkerKind::Conversation
+            && worker.id == conversation
+            && worker.phase == WorkerPhase::Running
+    }));
+    scheduler.abort(conversation).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), scheduler.wait(conversation))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), updates.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(updates.borrow_and_update().is_empty());
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn shared_activity_tracks_concurrent_workers_abort_and_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(HoldingModel {

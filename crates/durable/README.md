@@ -539,8 +539,8 @@ Current limits and differences from upstream Pi Durable:
   workers, and scheduled conversation drivers (including lock queues and poll sleeps) without
   locking the task scheduler. Summary entries use their operation ID. It is
   process-local and excludes direct harness drives and persisted waiting work.
-  It is not an
-  `onWake` or durable-idleness API.
+  `WorkerActivity::subscribe` supplies coalesced lifecycle snapshots; slow
+  readers can skip transitions. It is not an `onWake` or durable-idleness API.
 - `Driver::wake_snapshot(now)` reads task definitions and durable waits under
   the task gate without waiting for the handler-held scheduler mutex. It does
   not include conversation deadlines or provide `onWake` notifications.

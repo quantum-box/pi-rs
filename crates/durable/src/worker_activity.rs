@@ -31,33 +31,63 @@ pub struct Worker {
 /// A cloneable, nonblocking-on-handlers view of currently live executors.
 /// Empty means no tracked executor remains; persisted runnable or sleeping work
 /// may still exist. This is not an onWake value or a durable task listing.
-#[derive(Clone, Default)]
-pub struct WorkerActivity(Arc<Mutex<HashMap<Uuid, Worker>>>);
-impl WorkerActivity {
-    pub fn snapshot(&self) -> Vec<Worker> {
-        let mut workers: Vec<_> = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .copied()
-            .collect();
+struct State {
+    workers: HashMap<Uuid, Worker>,
+    updates: tokio::sync::watch::Sender<Vec<Worker>>,
+}
+
+impl State {
+    fn snapshot(&self) -> Vec<Worker> {
+        let mut workers: Vec<_> = self.workers.values().copied().collect();
         workers.sort_unstable_by_key(|w| (w.id, w.kind as u8, w.phase as u8));
         workers
+    }
+
+    fn publish(&self) {
+        self.updates.send_replace(self.snapshot());
+    }
+}
+
+#[derive(Clone)]
+pub struct WorkerActivity(Arc<Mutex<State>>);
+
+impl Default for WorkerActivity {
+    fn default() -> Self {
+        let (updates, _) = tokio::sync::watch::channel(Vec::new());
+        Self(Arc::new(Mutex::new(State {
+            workers: HashMap::new(),
+            updates,
+        })))
+    }
+}
+impl WorkerActivity {
+    pub fn snapshot(&self) -> Vec<Worker> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
+    }
+    /// Subscribe to coalesced process-local lifecycle snapshots. The initial
+    /// value is current at attachment; slow subscribers may skip transitions.
+    /// This does not include persisted work and is not an upstream `onWake`.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<Worker>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .updates
+            .subscribe()
     }
     pub(crate) fn enter(&self, kind: WorkerKind, id: Uuid) -> Guard {
         self.enter_at(kind, id, WorkerPhase::Running)
     }
     pub(crate) fn enter_at(&self, kind: WorkerKind, id: Uuid, phase: WorkerPhase) -> Guard {
-        let mut workers = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let token = loop {
             let token = Uuid::new_v4();
-            if let std::collections::hash_map::Entry::Vacant(slot) = workers.entry(token) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = state.workers.entry(token) {
                 slot.insert(Worker { kind, id, phase });
                 break token;
             }
         };
-        drop(workers);
+        state.publish();
+        drop(state);
         Guard {
             activity: self.clone(),
             token,
@@ -70,23 +100,20 @@ pub(crate) struct Guard {
 }
 impl Guard {
     pub(crate) fn set(&self, phase: WorkerPhase) {
-        if let Some(worker) = self
-            .activity
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&self.token)
+        let mut state = self.activity.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(worker) = state.workers.get_mut(&self.token)
+            && worker.phase != phase
         {
             worker.phase = phase;
+            state.publish();
         }
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.activity
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.token);
+        let mut state = self.activity.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.workers.remove(&self.token).is_some() {
+            state.publish();
+        }
     }
 }
