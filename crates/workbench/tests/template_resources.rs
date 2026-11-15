@@ -133,7 +133,7 @@ fn directory_grants_follow_file_symlinks_and_skip_broken_links() {
     std::os::unix::fs::symlink(&target, directory.join("linked.md")).unwrap();
     std::os::unix::fs::symlink(root.path().join("missing"), directory.join("broken.md")).unwrap();
     let result = TemplateReadGrants::default()
-        .load_with_directories(&[directory.clone()])
+        .load_with_directories(std::slice::from_ref(&directory))
         .unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].path, directory.join("linked.md"));
@@ -149,7 +149,7 @@ fn directory_grants_reject_duplicate_names_and_too_many_paths() {
     std::fs::write(&file, "text").unwrap();
     assert!(
         TemplateReadGrants { files: vec![file] }
-            .load_with_directories(&[directory.clone()])
+            .load_with_directories(std::slice::from_ref(&directory))
             .is_err()
     );
     assert!(
