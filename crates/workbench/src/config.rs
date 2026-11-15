@@ -52,6 +52,11 @@ impl Settings {
             }
         }
         self.refresh_effective();
+        self.update_remembered_user(path, |settings| {
+            for (key, value) in values {
+                settings.insert(key.clone(), value.clone());
+            }
+        });
         Ok(())
     }
     fn refresh_effective(&mut self) {
@@ -105,13 +110,36 @@ impl Settings {
         let (old_workspace, old_trusted, layers) = history.as_ref()?;
         let same = old_workspace == workspace
             || matches!((old_workspace.canonicalize(), workspace.canonicalize()), (Ok(a), Ok(b)) if a == b);
-        if !same || *old_trusted != trusted {
-            return None;
-        }
         let mut fallback = self.clone();
-        fallback.resource_layers = layers.clone();
+        fallback.resource_layers = if same && *old_trusted == trusted {
+            layers.clone()
+        } else {
+            layers.first().cloned().into_iter().collect()
+        };
         fallback.refresh_effective();
         Some(fallback)
+    }
+    fn update_remembered_user(&self, path: &Path, update: impl FnOnce(&mut Map<String, Value>)) {
+        let Some(base) = path.parent() else {
+            return;
+        };
+        let Ok(mut history) = self.worker_history.lock() else {
+            return;
+        };
+        let Some((_, _, layers)) = history.as_mut() else {
+            return;
+        };
+        let Some((old_base, value)) = layers.first_mut() else {
+            return;
+        };
+        if old_base != base
+            && !matches!((old_base.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        {
+            return;
+        }
+        if let Some(object) = value.as_object_mut() {
+            update(object);
+        }
     }
     pub(super) fn remember_worker_snapshot(
         &self,
@@ -447,19 +475,33 @@ impl Settings {
             update(layer.as_object_mut().expect("settings layer"))?;
         }
         self.refresh_effective();
+        self.update_remembered_user(path, |settings| {
+            let object = settings
+                .entry(key)
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !object.is_object() {
+                *object = Value::Object(Map::new());
+            }
+            object
+                .as_object_mut()
+                .expect("object")
+                .insert(member.into(), value);
+        });
         Ok(())
     }
 
     pub fn remove_user_member(&mut self, key: &str, member: &str) -> Result<()> {
-        let path = agent_dir().join("settings.json");
-        update_object(&path, |settings| {
+        self.remove_user_member_at(&agent_dir().join("settings.json"), key, member)
+    }
+    fn remove_user_member_at(&mut self, path: &Path, key: &str, member: &str) -> Result<()> {
+        update_object(path, |settings| {
             if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
                 object.remove(member);
                 if object.is_empty() {
                     settings.remove(key);
                 }
             }
-            validate_settings(&Value::Object(settings.clone()), &path)
+            validate_settings(&Value::Object(settings.clone()), path)
         })?;
         if let Some((_, user)) = self.resource_layers.first_mut()
             && let Some(settings) = user.as_object_mut()
@@ -492,6 +534,14 @@ impl Settings {
         {
             settings.remove(key);
         }
+        self.update_remembered_user(path, |settings| {
+            if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
+                object.remove(member);
+                if object.is_empty() {
+                    settings.remove(key);
+                }
+            }
+        });
         Ok(())
     }
     pub fn set_user(&mut self, key: &str, value: Value) -> Result<()> {
@@ -524,9 +574,12 @@ impl Settings {
             layer
                 .as_object_mut()
                 .expect("settings layer")
-                .insert(key.into(), value);
+                .insert(key.into(), value.clone());
         }
         self.refresh_effective();
+        self.update_remembered_user(path, |settings| {
+            settings.insert(key.into(), value);
+        });
         Ok(())
     }
 }
@@ -2133,6 +2186,45 @@ mod tests {
     }
 
     #[test]
+    fn saved_user_settings_update_worker_history_without_losing_other_values() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let user = root.path().join("settings.json");
+        std::fs::write(&user, r#"{"theme":"dark","retry":{"enabled":true}}"#).unwrap();
+        let mut settings = Settings::load_from_paths(&workspace, false, &user).unwrap();
+        let mut snapshot = settings.clone();
+        snapshot.resource_layers[0].1["extensionValue"] = json!("newer");
+        settings.remember_worker_snapshot(&workspace, false, &snapshot);
+        settings
+            .set_user_at(&user, "theme", json!("light"))
+            .unwrap();
+        settings
+            .set_user_member_at(&user, "retry", "enabled", json!(false))
+            .unwrap();
+        settings
+            .set_user_values_at(&user, &[("hideThinkingBlock".into(), json!(true))])
+            .unwrap();
+        let fallback = settings
+            .worker_fallback(&root.path().join("other"), false)
+            .unwrap();
+        assert_eq!(fallback.value()["theme"], "light");
+        assert_eq!(fallback.value()["retry"]["enabled"], false);
+        assert_eq!(fallback.value()["hideThinkingBlock"], true);
+        assert_eq!(fallback.value()["extensionValue"], "newer");
+        settings
+            .remove_user_member_at(&user, "retry", "enabled")
+            .unwrap();
+        assert!(
+            settings
+                .worker_fallback(&workspace, false)
+                .unwrap()
+                .value()
+                .get("retry")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn worker_snapshot_survives_reload_but_respects_workspace_and_trust() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -2154,8 +2246,14 @@ mod tests {
             reloaded.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
             "new"
         );
-        assert!(reloaded.worker_fallback(&workspace, false).is_none());
-        assert!(reloaded.worker_fallback(&other, true).is_none());
+        for fallback in [
+            reloaded.worker_fallback(&workspace, false),
+            reloaded.worker_fallback(&other, true),
+        ] {
+            let fallback = fallback.unwrap();
+            assert_eq!(fallback.value()["skills"][0], "new");
+            assert_eq!(fallback.resource_layers.len(), 1);
+        }
         let mut staged = reloaded.clone();
         staged.fork_worker_history();
         let newer = Settings {
