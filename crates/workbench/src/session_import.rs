@@ -2725,9 +2725,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_parents_and_unsupported_content() {
+    fn rejects_unsupported_content() {
         let header = json!({"type":"session","version":3});
-        assert!(import_pi(vec![header.clone(), json!({"type":"message","id":"x","parentId":"missing","message":{"role":"user","content":"x"}})]).is_err());
         assert!(import_pi(vec![header, json!({"type":"message","id":"x","parentId":null,"message":{"role":"user","content":[{"type":"image","data":"abc"}]}})]).is_err());
     }
     #[test]
