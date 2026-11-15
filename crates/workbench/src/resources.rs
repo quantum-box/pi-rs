@@ -476,7 +476,7 @@ impl Resources {
         if let Some(command) = input.strip_prefix("/skill:") {
             let (name, arguments) = command.split_once(' ').unwrap_or((command, ""));
             if let Some(skill) = self.skills.get(name) {
-                match read_without_bom(&skill.path).and_then(|text| frontmatter(&text)) {
+                match read_resource(&skill.path).and_then(|text| frontmatter(&text)) {
                     Ok((_, body)) => {
                         let location = skill.path.display();
                         let directory = skill.path.parent().unwrap_or(Path::new(".")).display();
@@ -599,7 +599,7 @@ fn parse_skill(path: &Path, warnings: &mut Vec<String>) -> Result<Option<(String
 }
 
 fn parse_prompt(path: &Path) -> Result<Prompt> {
-    let (metadata, body) = frontmatter_with_trim(&read_resource(path)?, true)?;
+    let (metadata, body) = frontmatter(&read_resource(path)?)?;
     let mut fallback_surrogate = None;
     let description = metadata
         .description
@@ -634,15 +634,7 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
 }
 
 fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
-    frontmatter_with_trim(text, false)
-}
-
-fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, String)> {
-    let text = if prompt {
-        text.strip_prefix('\u{feff}').unwrap_or(text)
-    } else {
-        text.trim_start_matches('\u{feff}')
-    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let Some(end) = normalized
         .strip_prefix("---")
@@ -673,15 +665,7 @@ fn frontmatter_with_trim(text: &str, prompt: bool) -> Result<(Frontmatter, Strin
             == Some(true),
     };
     let body = &normalized[end + 4..];
-    Ok((
-        metadata,
-        if prompt {
-            body.trim_matches(is_prompt_space)
-        } else {
-            body.trim()
-        }
-        .into(),
-    ))
+    Ok((metadata, body.trim_matches(is_prompt_space).into()))
 }
 fn context_file(
     directory: &Path,
@@ -1750,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_frontmatter_body_uses_ecmascript_trim_without_changing_skill_trim() {
+    fn frontmatter_body_uses_ecmascript_trim() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("review.md");
         for (input, body, description) in [
@@ -1774,7 +1758,7 @@ mod tests {
             frontmatter("---\nother: value\n---\n\u{0085}body\u{0085}")
                 .unwrap()
                 .1,
-            "body"
+            "\u{0085}body\u{0085}"
         );
     }
 
@@ -1800,8 +1784,51 @@ mod tests {
             assert_eq!(prompt.body, body);
             assert_eq!(prompt.description, description);
         }
-        // Keep existing non-prompt callers' BOM behavior.
-        assert_eq!(frontmatter("\u{feff}\u{feff}body").unwrap().1, "body");
+        assert_eq!(
+            frontmatter("\u{feff}\u{feff}body").unwrap().1,
+            "\u{feff}body"
+        );
+    }
+
+    #[test]
+    fn discovered_skill_expands_lossy_utf8_and_ecmascript_whitespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("SKILL.md");
+        let mut bytes = b"---\nname: fixture\ndescription: example\n---\n".to_vec();
+        bytes.extend_from_slice("\u{0085}".as_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice("\u{0085}".as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let (name, skill) = parse_skill(&path, &mut Vec::new()).unwrap().unwrap();
+        let resources = Resources {
+            skills: BTreeMap::from([(name, skill)]),
+            ..Resources::default()
+        };
+        let expanded = resources.expand("/skill:fixture").unwrap();
+        assert!(
+            expanded.contains("\n\n\u{0085}\u{fffd}\u{0085}\n</skill>"),
+            "{expanded:?}"
+        );
+    }
+
+    #[test]
+    fn skill_discovery_and_invocation_strip_only_one_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("SKILL.md");
+        let content = "---\nname: fixture\ndescription: example\n---\nbody";
+        std::fs::write(&path, format!("\u{feff}{content}")).unwrap();
+        let (name, skill) = parse_skill(&path, &mut Vec::new()).unwrap().unwrap();
+        let resources = Resources {
+            skills: BTreeMap::from([(name, skill)]),
+            ..Resources::default()
+        };
+        std::fs::write(&path, format!("\u{feff}\u{feff}{content}")).unwrap();
+        assert!(parse_skill(&path, &mut Vec::new()).unwrap().is_none());
+        let expanded = resources.expand("/skill:fixture").unwrap();
+        assert!(
+            expanded.contains(&format!("\n\n{content}\n</skill>")),
+            "{expanded:?}"
+        );
     }
 
     #[test]

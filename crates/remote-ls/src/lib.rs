@@ -257,12 +257,15 @@ fn finish(mut output: String, details: Map<String, Value>, notices: Vec<String>)
     }
 }
 
-fn directory_collator() -> Result<icu_collator::CollatorBorrowed<'static>> {
-    let locale = ["LC_ALL", "LANG"]
+fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find(|value| !value.is_empty())
-        .unwrap_or_default();
+        .find_map(&mut get)
+        .unwrap_or_default()
+}
+
+fn directory_collator() -> Result<icu_collator::CollatorBorrowed<'static>> {
+    let locale = directory_locale(|key| std::env::var(key).ok());
     let locale = locale
         .split(['.', '@'])
         .next()
@@ -403,6 +406,29 @@ impl Tool for RemoteLs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_locale_observes_message_locale_and_empty_overrides() {
+        let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
+            directory_locale(|key| match key {
+                "LC_ALL" => all.map(str::to_owned),
+                "LC_MESSAGES" => messages.map(str::to_owned),
+                "LANG" => lang.map(str::to_owned),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")),
+            "sv_SE.UTF-8"
+        );
+        assert_eq!(
+            select(Some("en_US.UTF-8"), Some("sv_SE.UTF-8"), None),
+            "en_US.UTF-8"
+        );
+        assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
+        assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
+    }
+
     #[tokio::test]
     async fn listing_keeps_bounded_prefix_and_checks_cancellation() {
         let token = pi_rs::CancellationToken::new();

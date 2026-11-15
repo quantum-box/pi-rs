@@ -6,8 +6,8 @@ pub mod oauth;
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -64,6 +64,8 @@ pub struct OpenAiResponses {
     headers: reqwest::header::HeaderMap,
     sampling: BTreeMap<String, Value>,
     identity_safe_transport: bool,
+    cache_retention: CacheRetention,
+    explicit_cache_mode: bool,
 }
 
 impl OpenAiResponses {
@@ -142,11 +144,26 @@ impl OpenAiResponses {
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
             sampling: BTreeMap::new(),
+            cache_retention: CacheRetention::Short,
+            explicit_cache_mode: false,
         })
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+        self
+    }
+
+    /// Configure Responses prompt cache retention for the selected model.
+    pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
+        self.cache_retention = retention;
+        self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Disable retention while preserving the model cache protocol.
+    pub fn without_cache(mut self) -> Self {
+        self.cache_retention = CacheRetention::None;
         self
     }
 
@@ -165,6 +182,41 @@ impl OpenAiResponses {
         validate_sampling(&sampling)?;
         self.sampling = sampling;
         Ok(self)
+    }
+
+    fn apply_cache(&self, body: &mut Value) {
+        if self.provider == "openai-chatgpt" {
+            let object = body.as_object_mut().expect("Responses request object");
+            object.remove("prompt_cache_retention");
+            object.remove("prompt_cache_options");
+            if self.cache_retention == CacheRetention::None {
+                object.remove("prompt_cache_key");
+            }
+            return;
+        }
+        if self.cache_retention == CacheRetention::None {
+            let object = body.as_object_mut().expect("Responses request object");
+            object.remove("prompt_cache_key");
+            object.remove("prompt_cache_retention");
+            object.remove("prompt_cache_options");
+        }
+        let cache = match (self.explicit_cache_mode, self.cache_retention) {
+            (true, CacheRetention::None) => {
+                Some(("prompt_cache_options", json!({"mode":"explicit"})))
+            }
+            (true, CacheRetention::Long) => Some(("prompt_cache_options", json!({"ttl":"30m"}))),
+            (false, CacheRetention::Long) => Some(("prompt_cache_retention", json!("24h"))),
+            _ => None,
+        };
+        if let Some((key, value)) = cache {
+            let object = body.as_object_mut().expect("Responses request object");
+            // An explicitly configured cache policy takes precedence as a whole.
+            if !object.contains_key("prompt_cache_options")
+                && !object.contains_key("prompt_cache_retention")
+            {
+                object.insert(key.into(), value);
+            }
+        }
     }
 
     /// Return the signed-in account's displayable models in server order.
@@ -224,6 +276,14 @@ impl OpenAiResponses {
 
 /// Protect fields that control the agent's conversation, tools, and transport.
 pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
+    if sampling.contains_key("prompt_cache_options")
+        && sampling.contains_key("prompt_cache_retention")
+    {
+        return Err(Error::Config(
+            "sampling parameters cannot combine prompt_cache_options and prompt_cache_retention"
+                .into(),
+        ));
+    }
     if let Some(key) = sampling.keys().find(|key| {
         matches!(
             key.as_str(),
@@ -405,6 +465,17 @@ impl Model for OpenAiResponses {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
+        if self.cache_retention == CacheRetention::Short || self.provider == "openai-chatgpt" {
+            return pi_rs_core::protected_model_fingerprint(&(
+                headers,
+                "openai-responses-v1",
+                self.endpoint.as_str(),
+                &self.provider,
+                &self.token,
+                &self.thinking,
+                &self.sampling,
+            ));
+        }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
             "openai-responses-v1",
@@ -413,6 +484,12 @@ impl Model for OpenAiResponses {
             &self.token,
             &self.thinking,
             &self.sampling,
+            match self.cache_retention {
+                CacheRetention::None => "none",
+                CacheRetention::Short => "short",
+                CacheRetention::Long => "long",
+            },
+            self.explicit_cache_mode,
         ))
     }
 
@@ -454,6 +531,7 @@ impl Model for OpenAiResponses {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+        self.apply_cache(&mut body);
         let error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
             self.headers.iter().filter_map(|(name, value)| {
@@ -1229,6 +1307,136 @@ mod tests {
         let output = &payload(&request, "openai", "openai")["input"][2]["output"];
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
+    }
+
+    #[test]
+    fn responses_cache_modes_follow_model_capabilities() {
+        let client =
+            OpenAiResponses::new_api("https://example.com/v1/responses", "token".into()).unwrap();
+        for (retention, explicit, expected) in [
+            (CacheRetention::Short, false, json!({})),
+            (CacheRetention::Short, true, json!({})),
+            (
+                CacheRetention::Long,
+                false,
+                json!({"prompt_cache_retention":"24h"}),
+            ),
+            (
+                CacheRetention::Long,
+                true,
+                json!({"prompt_cache_options":{"ttl":"30m"}}),
+            ),
+            (
+                CacheRetention::None,
+                true,
+                json!({"prompt_cache_options":{"mode":"explicit"}}),
+            ),
+        ] {
+            let mut body = json!({});
+            client
+                .clone()
+                .with_cache_retention(retention, explicit)
+                .apply_cache(&mut body);
+            assert_eq!(body, expected);
+        }
+        let mut body = json!({"prompt_cache_retention":"user"});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, false)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_retention"], "user");
+        let mut body = json!({"prompt_cache_retention":"24h"});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, true)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_retention":"24h"}));
+        let mut body = json!({"prompt_cache_options":{"mode":"explicit"}});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, false)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_options":{"mode":"explicit"}}));
+        assert!(
+            validate_sampling(&BTreeMap::from([
+                ("prompt_cache_retention".into(), json!("24h")),
+                ("prompt_cache_options".into(), json!({"ttl":"30m"})),
+            ]))
+            .is_err()
+        );
+        let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
+        client
+            .clone()
+            .with_cache_retention(CacheRetention::Long, true)
+            .without_cache()
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({"prompt_cache_options":{"mode":"explicit"}}));
+        let plan = OpenAiResponses::new("http://localhost/responses", "token".into()).unwrap();
+        let mut body = json!({});
+        plan.with_cache_retention(CacheRetention::Long, true)
+            .apply_cache(&mut body);
+        assert_eq!(body, json!({}));
+        let plan = OpenAiResponses::new("http://localhost/responses", "token".into()).unwrap();
+        let mut body = json!({"prompt_cache_key":"key", "prompt_cache_retention":"24h", "prompt_cache_options":{"ttl":"30m"}});
+        plan.without_cache().apply_cache(&mut body);
+        assert_eq!(body, json!({}));
+    }
+
+    #[tokio::test]
+    async fn configured_cache_policy_is_sent_without_an_automatic_alternative() {
+        use std::io::{Read, Write};
+        for (explicit, key, value) in [
+            (true, "prompt_cache_retention", json!("24h")),
+            (false, "prompt_cache_options", json!({"mode":"explicit"})),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let client =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap()
+                    .with_cache_retention(CacheRetention::Long, explicit)
+                    .with_sampling(BTreeMap::from([(key.into(), value.clone())]))
+                    .unwrap();
+            let _ = client.stream(request()).await;
+            let body = server.join().unwrap();
+            assert_eq!(body[key], value);
+            let other = if explicit {
+                "prompt_cache_options"
+            } else {
+                "prompt_cache_retention"
+            };
+            assert!(body.get(other).is_none());
+        }
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {

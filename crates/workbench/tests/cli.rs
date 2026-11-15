@@ -93,6 +93,126 @@ fn mcp_logout_local_targets_trusted_project_credentials() {
 }
 
 #[test]
+fn mcp_add_saves_stdio_and_http_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--cwd",
+            "subdir",
+            "--description",
+            "Local tools",
+            "--",
+            "server",
+            "--flag",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-First=one",
+            "--header",
+            "X-Second=two=three",
+            "--header",
+            "x-first=latest",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--description",
+            "Remote tools",
+        ],
+    ] {
+        let output = run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["local"],
+        json!({"command":"server", "args":["--flag"], "cwd":"subdir", "description":"Local tools"})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["headers"],
+        json!({"x-first":"latest", "x-second":"two=three", "Authorization":"Bearer ${TOKEN}"})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["description"],
+        "Remote tools"
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--cwd",
+            "dir",
+        ],
+        vec!["mcp", "add", "bad", "--header", "X=1", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "bad",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "Bad Name=value",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-Test=bad\nvalue",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "authorization=secret",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
 fn repeated_session_id_selects_the_last_journal() {
     let root = tempfile::tempdir().unwrap();
     let sessions = root.path().join("sessions");
