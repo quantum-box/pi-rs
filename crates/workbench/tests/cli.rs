@@ -117,6 +117,52 @@ fn mcp_add_persists_oauth_client_options() {
 }
 
 #[test]
+fn mcp_added_oauth_secret_reference_is_resolved_for_login() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |args: &[&str], secret: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_TEST_MCP_SECRET")
+            .args(args);
+        if let Some(secret) = secret {
+            command.env("PI_RS_TEST_MCP_SECRET", secret);
+        }
+        command.output().unwrap()
+    };
+    let added = command(
+        &[
+            "mcp",
+            "add",
+            "fixture",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-secret",
+            "${PI_RS_TEST_MCP_SECRET}",
+        ],
+        None,
+    );
+    assert!(added.status.success());
+    let path = root.path().join("mcp.json");
+    let before = std::fs::read(&path).unwrap();
+    let missing = command(&["mcp", "login", "fixture"], None);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("missing environment variable PI_RS_TEST_MCP_SECRET")
+    );
+    let resolved = command(&["mcp", "login", "fixture"], Some("private-fixture-secret"));
+    assert!(!resolved.status.success());
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("missing environment variable"));
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("private-fixture-secret"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!String::from_utf8_lossy(&before).contains("private-fixture-secret"));
+}
+
+#[test]
 fn mcp_logout_local_targets_trusted_project_credentials() {
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();

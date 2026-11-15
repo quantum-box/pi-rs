@@ -128,6 +128,9 @@ HTTP `mcp add` also accepts `--oauth-client-id`, `--oauth-client-secret`,
 `--oauth-callback-port`, `--oauth-client-name`, and
 `--oauth-client-registration`. pi-rs requires a client ID when a client secret
 is supplied and disallows mixing OAuth settings with an Authorization header.
+The secret option is saved as supplied in `mcp.json`. Quote a reference such
+as `'${CLIENT_SECRET}'` or use `!command` to resolve the secret during login
+without storing its value in that configuration file.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
