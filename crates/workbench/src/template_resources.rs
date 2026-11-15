@@ -47,7 +47,8 @@ impl TemplateReadGrants {
                 }
                 let entry = item?;
                 let path = entry.path();
-                if path.extension().is_none_or(|ext| ext != "md") {
+                let dot_md = path.file_name().is_some_and(|name| name == ".md");
+                if !dot_md && path.extension().is_none_or(|ext| ext != "md") {
                     continue;
                 }
                 let kind = entry.file_type()?;
@@ -87,7 +88,6 @@ impl TemplateReadGrants {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".md"))
-                .filter(|name| !name.is_empty())
                 .ok_or_else(|| {
                     Error::Config("prompt template must have a UTF-8 .md filename".into())
                 })?;

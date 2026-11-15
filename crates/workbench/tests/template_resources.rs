@@ -83,6 +83,7 @@ fn directory_grants_load_only_sorted_direct_markdown_files() {
     std::fs::create_dir_all(directory.join("nested")).unwrap();
     for (name, text) in [
         ("z.md", "last"),
+        (".md", "empty name"),
         (".hidden.md", "hidden"),
         ("a.md", "first"),
         ("skip.txt", "skip"),
@@ -103,7 +104,7 @@ fn directory_grants_load_only_sorted_direct_markdown_files() {
             .iter()
             .map(|entry| entry.name.as_str())
             .collect::<Vec<_>>(),
-        ["explicit", ".hidden", "a", "z"]
+        ["explicit", ".hidden", "", "a", "z"]
     );
     assert!(
         grants
@@ -147,4 +148,24 @@ fn directory_grants_reject_duplicate_names_and_too_many_paths() {
             .load_with_directories(&vec![directory; 129])
             .is_err()
     );
+}
+
+#[test]
+fn directory_grants_enforce_template_count_at_the_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("prompts");
+    std::fs::create_dir(&directory).unwrap();
+    for index in 0..128 {
+        std::fs::write(directory.join(format!("{index}.md")), "text").unwrap();
+    }
+    let grants = TemplateReadGrants::default();
+    assert_eq!(
+        grants
+            .load_with_directories(std::slice::from_ref(&directory))
+            .unwrap()
+            .len(),
+        128
+    );
+    std::fs::write(directory.join("extra.md"), "text").unwrap();
+    assert!(grants.load_with_directories(&[directory]).is_err());
 }
