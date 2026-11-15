@@ -1140,9 +1140,13 @@ impl Profiles {
         let model = self.model(provider, model);
         let model = model.as_ref().map(|model| &model.compat);
         let openrouter = provider.id() == "openrouter"
-            || reqwest::Url::parse(endpoint)
-                .ok()
-                .is_some_and(|url| url.host_str() == Some("openrouter.ai"));
+            || if adapter == Adapter::OpenAiResponses {
+                endpoint.contains("openrouter.ai")
+            } else {
+                reqwest::Url::parse(endpoint)
+                    .ok()
+                    .is_some_and(|url| url.host_str() == Some("openrouter.ai"))
+            };
         let send = model
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
@@ -1645,6 +1649,10 @@ mod tests {
         );
         assert_eq!(
             profiles.session_affinity(&provider, "default", "https://openrouter.ai/api/v1"),
+            ["x-session-id"]
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "default", "https://edge.openrouter.ai/api/v1"),
             ["x-session-id"]
         );
         let chatgpt = profiles.provider("openai-chatgpt").unwrap();
