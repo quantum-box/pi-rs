@@ -62,6 +62,7 @@ struct Declaration {
     value: Value,
     inherited: Option<Value>,
     transient: bool,
+    scope_order: u8,
 }
 
 pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
@@ -150,7 +151,15 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
         }
         PackageCommand::List => {
             let index = index()?;
-            for declaration in declarations(args)? {
+            let mut configured = declarations(args)?;
+            // Pi lists user packages before project packages, while resource
+            // resolution gives project packages precedence.
+            configured.sort_by_key(|entry| match entry.scope_order {
+                1 => 0,
+                0 => 1,
+                _ => 2,
+            });
+            for declaration in configured {
                 let installed = index
                     .get(&key(&declaration.source))
                     .cloned()
@@ -232,11 +241,29 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
                 .as_ref()
                 .map(|value| ResourceFilter::new(value, name))
                 .transpose()?;
-            for path in paths {
-                let base_enabled = inherited
-                    .as_ref()
-                    .is_some_and(|filter| filter.includes(path, &package.root, false));
-                if filter.includes(path, &package.root, base_enabled) && !target.contains(path) {
+            if !remote(&declaration.source) || inherited.is_some() {
+                for path in paths {
+                    let base = inherited
+                        .as_ref()
+                        .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
+                    if filter.includes_legacy(path, &package.root, base) && !target.contains(path) {
+                        target.push(path.clone());
+                    }
+                }
+                continue;
+            }
+            let evaluate = || -> Result<Vec<bool>> {
+                let base = match &inherited {
+                    Some(filter) => {
+                        filter.apply(paths, &package.root, &vec![false; paths.len()])?
+                    }
+                    None => vec![false; paths.len()],
+                };
+                filter.apply(paths, &package.root, &base)
+            };
+            let enabled = evaluate()?;
+            for (path, enabled) in paths.iter().zip(enabled) {
+                if enabled && !target.contains(path) {
                     target.push(path.clone());
                 }
             }
@@ -330,12 +357,29 @@ pub(super) fn startup_themes(args: &Cli, transient: bool) -> Result<Vec<PathBuf>
             .as_ref()
             .map(|value| ResourceFilter::new(value, "themes"))
             .transpose()?;
-        for path in package.resources.themes {
-            let inherited_enabled = inherited
-                .as_ref()
-                .is_some_and(|filter| filter.includes(&path, &package.root, false));
-            if filter.includes(&path, &package.root, inherited_enabled) && !themes.contains(&path) {
-                themes.push(path);
+        let paths = &package.resources.themes;
+        if !remote(&declaration.source) || inherited.is_some() {
+            for path in paths {
+                let base = inherited
+                    .as_ref()
+                    .is_some_and(|filter| filter.includes_legacy(path, &package.root, false));
+                if filter.includes_legacy(path, &package.root, base) && !themes.contains(path) {
+                    themes.push(path.clone());
+                }
+            }
+            continue;
+        }
+        let evaluate = || -> Result<Vec<bool>> {
+            let base = match &inherited {
+                Some(filter) => filter.apply(paths, &package.root, &vec![false; paths.len()])?,
+                None => vec![false; paths.len()],
+            };
+            filter.apply(paths, &package.root, &base)
+        };
+        let enabled = evaluate()?;
+        for (path, enabled) in paths.iter().zip(enabled) {
+            if enabled && !themes.contains(path) {
+                themes.push(path.clone());
             }
         }
     }
@@ -595,7 +639,9 @@ impl ResourceFilter {
             autoload: value["autoload"] != false,
         })
     }
-    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> bool {
+    // Local and layered packages retain the previous behavior until their
+    // separately caught errors and evaluation order can be reproduced.
+    fn includes_legacy(&self, path: &Path, root: &Path, inherited: bool) -> bool {
         if self.autoload {
             return self
                 .patterns
@@ -607,8 +653,7 @@ impl ResourceFilter {
             .flatten()
             .fold(inherited, |enabled, pattern| {
                 let prefix = pattern.chars().next();
-                let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
-                let target = if override_pattern {
+                let target = if matches!(prefix, Some('+' | '-' | '!')) {
                     &pattern[1..]
                 } else {
                     pattern.as_str()
@@ -619,6 +664,91 @@ impl ResourceFilter {
                     enabled
                 }
             })
+    }
+
+    #[cfg(test)]
+    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> Result<bool> {
+        Ok(self.apply(&[path.to_path_buf()], root, &[inherited])?[0])
+    }
+
+    fn apply(&self, paths: &[PathBuf], root: &Path, inherited: &[bool]) -> Result<Vec<bool>> {
+        let Some(patterns) = &self.patterns else {
+            return Ok(if self.autoload {
+                vec![true; paths.len()]
+            } else {
+                inherited.to_vec()
+            });
+        };
+        let matches = |path: &Path, pattern: &str, exact: bool| -> Result<bool> {
+            let normalized = if exact {
+                pattern
+                    .strip_prefix("./")
+                    .or_else(|| pattern.strip_prefix(".\\"))
+                    .unwrap_or(pattern)
+            } else {
+                pattern
+            };
+            if normalized.starts_with("file://") {
+                pi_rs_file_url::to_file_path(normalized).map_err(Error::Config)?;
+            }
+            Ok(resource_matches(path, root, pattern, exact, false))
+        };
+        if !self.autoload {
+            let mut enabled = inherited.to_vec();
+            for pattern in patterns {
+                let prefix = pattern.chars().next();
+                let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
+                let target = if override_pattern {
+                    &pattern[1..]
+                } else {
+                    pattern.as_str()
+                };
+                for (path, enabled) in paths.iter().zip(&mut enabled) {
+                    if matches(path, target, matches!(prefix, Some('+' | '-')))? {
+                        *enabled = !matches!(prefix, Some('-' | '!'));
+                    }
+                }
+            }
+            return Ok(enabled);
+        }
+        if patterns.is_empty() {
+            return Ok(vec![false; paths.len()]);
+        }
+        let any = |path: &Path, prefix: Option<char>, exact: bool| -> Result<bool> {
+            for pattern in patterns {
+                let target = match prefix {
+                    Some(prefix) => match pattern.strip_prefix(prefix) {
+                        Some(target) => target,
+                        None => continue,
+                    },
+                    None if !pattern.starts_with(['!', '+', '-']) => pattern.as_str(),
+                    None => continue,
+                };
+                if matches(path, target, exact)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let has_plain = patterns.iter().any(|p| !p.starts_with(['!', '+', '-']));
+        let mut enabled = vec![!has_plain; paths.len()];
+        if has_plain {
+            for (path, enabled) in paths.iter().zip(&mut enabled) {
+                *enabled = any(path, None, false)?;
+            }
+        }
+        for (prefix, exact, current, replacement) in [
+            ('!', false, true, false),
+            ('+', true, false, true),
+            ('-', true, true, false),
+        ] {
+            for (path, enabled) in paths.iter().zip(&mut enabled) {
+                if *enabled == current && any(path, Some(prefix), exact)? {
+                    *enabled = replacement;
+                }
+            }
+        }
+        Ok(enabled)
     }
 }
 
@@ -914,6 +1044,7 @@ fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
     let mut global = BTreeMap::new();
+    let mut order = BTreeMap::new();
     let mut files = vec![(
         config::agent_dir().join("settings.json"),
         config::agent_dir(),
@@ -929,14 +1060,25 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     for (file, base, project) in files {
         let document = config::read_object(&file)?;
         if let Some(packages) = document.get("packages") {
-            for value in packages
+            for (position, value) in packages
                 .as_array()
                 .ok_or_else(|| Error::Config("packages must be an array".into()))?
+                .iter()
+                .enumerate()
             {
                 let source = source_field(value)
                     .ok_or_else(|| Error::Config("package needs a source".into()))?;
                 let source = normalize(source, &base)?;
                 let identity = source_identity(&source);
+                let scope = if project { 0 } else { 1 };
+                // User duplicates keep the first value; project duplicates replace
+                // that value while retaining its original position.
+                let same_scope = order
+                    .get(&identity)
+                    .is_some_and(|(seen_scope, _)| *seen_scope == scope);
+                if same_scope && !project {
+                    continue;
+                }
                 if !project {
                     global.insert(identity.clone(), value.clone());
                 }
@@ -945,6 +1087,9 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 } else {
                     None
                 };
+                if !same_scope {
+                    order.insert(identity.clone(), (scope, position));
+                }
                 result.insert(
                     identity,
                     Declaration {
@@ -952,28 +1097,41 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                         value: value.clone(),
                         inherited,
                         transient: false,
+                        scope_order: scope,
                     },
                 );
             }
         }
     }
-    for entry in args
+    for (position, entry) in args
         .extensions
         .iter()
-        .filter(|entry| is_package_source(entry, &args.workspace))
+        .enumerate()
+        .filter(|(_, entry)| is_package_source(entry, &args.workspace))
     {
         let source = normalize(entry, &args.workspace)?;
+        let identity = source_identity(&source);
+        if order.get(&identity).is_some_and(|(scope, _)| *scope == 2) {
+            continue;
+        }
+        order.insert(identity.clone(), (2, position));
         result.insert(
-            source_identity(&source),
+            identity,
             Declaration {
                 value: json!(source),
                 source,
                 inherited: None,
                 transient: true,
+                scope_order: 2,
             },
         );
     }
-    Ok(result.into_values().collect())
+    let mut entries: Vec<_> = result.into_iter().collect();
+    entries.sort_by_key(|(identity, _)| order[identity]);
+    Ok(entries
+        .into_iter()
+        .map(|(_, declaration)| declaration)
+        .collect())
 }
 pub fn is_package_source(source: &str, workspace: &Path) -> bool {
     !super::resource_paths::named_extension(source)
@@ -2325,13 +2483,13 @@ mod tests {
         assert!(!selected(&path, &root, &[format!("-{url}")]));
         let filter =
             ResourceFilter::new(&json!({"prompts": [format!("-{url}")]}), "prompts").unwrap();
-        assert!(!filter.includes(&path, &root, true));
+        assert!(!filter.includes(&path, &root, true).unwrap());
         let filter = ResourceFilter::new(
             &json!({"autoload": false, "prompts": [format!("+{url}")]}),
             "prompts",
         )
         .unwrap();
-        assert!(filter.includes(&path, &root, false));
+        assert!(filter.includes(&path, &root, false).unwrap());
 
         if let Some(home) = filter_home_dir() {
             let path = home.join("pi-filter-test").join("prompt.md");
@@ -2412,7 +2570,7 @@ mod tests {
                     "prompts",
                 )
                 .unwrap();
-                assert!(filter.includes(path, &root, false));
+                assert!(filter.includes(path, &root, false).unwrap());
             }
             // Upstream removes exactly one prefix, not an arbitrary number.
             assert!(selected(path, &root, &[format!("-././{pattern}")]));
@@ -2492,6 +2650,54 @@ mod tests {
         assert!(!resource_matches(&path, &root, &invalid, true, false));
         assert!(!resource_matches(&path, &root, &invalid, false, false));
         assert!(selected(&path, &root, &[format!("-{invalid}")]));
+    }
+
+    #[test]
+    fn package_filter_reports_invalid_file_urls_when_evaluated() {
+        let root = std::env::temp_dir();
+        let path = root.join("prompts/review.md");
+        let invalid = format!(
+            "{}prompts%2Freview.md",
+            reqwest::Url::from_directory_path(&root).unwrap()
+        );
+        for prefix in ["", "!", "+", "-", "+./", "-./"] {
+            let filters = if prefix.starts_with('+') {
+                vec!["no-match".to_owned(), format!("{prefix}{invalid}")]
+            } else {
+                vec![format!("{prefix}{invalid}")]
+            };
+            let filter = ResourceFilter::new(&json!({"prompts": filters}), "prompts").unwrap();
+            assert!(
+                filter
+                    .includes(&path, &root, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("encoded"),
+                "{prefix}"
+            );
+        }
+        let filter = ResourceFilter::new(
+            &json!({"autoload": false, "prompts": [format!("-{invalid}")]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(filter.includes(&path, &root, true).is_err());
+        let filter = ResourceFilter::new(&json!({"prompts": ["**", invalid]}), "prompts").unwrap();
+        assert!(filter.includes(&path, &root, false).unwrap());
+    }
+
+    #[test]
+    fn package_filters_evaluate_all_candidates_per_stage() {
+        let root = std::env::temp_dir();
+        let base = reqwest::Url::from_directory_path(&root).unwrap();
+        let paths = vec![root.join("a.md"), root.join("b.md")];
+        let filter = ResourceFilter::new(
+            &json!({"prompts": ["a.md", format!("{base}bad%ZZ"), format!("-{base}bad%2Fpath")]}),
+            "prompts",
+        )
+        .unwrap();
+        let error = filter.apply(&paths, &root, &[false, false]).unwrap_err();
+        assert!(error.to_string().contains("URI malformed"));
     }
 
     #[cfg(windows)]
@@ -3648,20 +3854,24 @@ mod tests {
         let root = Path::new("/package");
         let path = root.join("prompts/keep.md");
         let empty = ResourceFilter::new(&json!({"autoload":false}), "prompts").unwrap();
-        assert!(!empty.includes(&path, root, false));
-        assert!(empty.includes(&path, root, true));
+        assert!(!empty.includes(&path, root, false).unwrap());
+        assert!(empty.includes(&path, root, true).unwrap());
         let filter = ResourceFilter::new(&json!({"autoload":false,"prompts":["prompts/*.md","-prompts/keep.md","+prompts/keep.md"]}), "prompts").unwrap();
-        assert!(filter.includes(&path, root, false));
-        assert!(!filter.includes(&root.join("other.md"), root, false));
+        assert!(filter.includes(&path, root, false).unwrap());
+        assert!(
+            !filter
+                .includes(&root.join("other.md"), root, false)
+                .unwrap()
+        );
         let filter = ResourceFilter::new(
             &json!({"autoload":false,"prompts":["!prompts/*.md"]}),
             "prompts",
         )
         .unwrap();
-        assert!(!filter.includes(&path, root, true));
-        assert!(filter.includes(&root.join("other.md"), root, true));
+        assert!(!filter.includes(&path, root, true).unwrap());
+        assert!(filter.includes(&root.join("other.md"), root, true).unwrap());
         let normal = ResourceFilter::new(&json!({"prompts":[]}), "prompts").unwrap();
-        assert!(!normal.includes(&path, root, true));
+        assert!(!normal.includes(&path, root, true).unwrap());
     }
 
     #[test]
