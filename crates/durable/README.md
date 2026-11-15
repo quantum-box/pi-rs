@@ -373,11 +373,12 @@ The runtime persists it with the outcome and ends the run without another model
 request only when every result in the nonempty tool round requests termination.
 The last defined handoff in model call order (including empty text) appends a reset after after-tools tasks and before queued boundary items. It starts a new model context while preserving history. Controls are persisted with tool outcomes and survive reopen; nested calls do not control their caller’s round.
 
-**Nested pending identity migration.** Automatic polling of nested pending jobs
-now requires a durable host-supplied identity for the exact registered child
-`Arc<dyn Tool>`, for both replay-safe and unsafe parents. Before starting or
-reopening the scheduler, call `nested_identity::register(&registered.tool,
-Some(identity))` on each nested backend. The non-secret identity is persisted
+**Nested pending identity.** An unsafe park requires a durable host-supplied
+identity for every child. For identity-bound jobs under any parent, polling
+requires the same identity on the exact registered child `Arc<dyn Tool>`.
+Before starting or reopening the scheduler, call
+`nested_identity::register(&registered.tool, Some(identity))` on each backend
+to bind new jobs. The non-secret identity is persisted
 in plaintext and must distinguish the implementation, backend configuration and
 tenant; restore the same identity for the same backend. A duplicate registration
 for a live allocation is rejected. Keep the returned `IdentityHandle`, and make
@@ -388,11 +389,10 @@ retry after it finishes. The identity is cleared before the callback, so a
 panic leaves the tool unbound. Never mutate backend configuration outside this
 handle or change it during a call.
 
-This intentionally changes older behavior: an unbound or changed-identity
-nested pending job is not automatically polled, including for replay-safe
-parents. Existing accepted references and jobs are retained. The runtime cannot
-safely recover the old automatic behavior from a legacy record alone: it
-contains no proof of which backend or tenant accepted the reference. Operators can
+For compatibility, a replay-safe parent's unbound legacy job continues to poll:
+the host must restore the original backend and tenant because such a record
+cannot prove either. A bound job with missing or changed registration never
+polls. An unsafe park cannot poll or resume with any unbound child. Operators can
 inspect `nested_pending_jobs`, verify the remote reference and tenant through an
 independent authoritative channel, then explicitly call
 `bind_nested_pending_identity(conversation, root, operation, reference,

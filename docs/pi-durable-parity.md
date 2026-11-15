@@ -647,9 +647,10 @@ commit still follows the recorded replay policy and cannot recover an
 uncommitted non-replay-safe external effect.
 ### Identity-bound nested pending recovery
 
-Both safe and unsafe parents now require the exact nested tool allocation to be
-registered with a non-secret, host-declared implementation/configuration/tenant
-identity before automatic polling. Identity is captured on child admission and
+Unsafe parks require the exact nested tool allocation to be registered with a
+non-secret, host-declared implementation/configuration/tenant identity. A bound
+job under any parent requires a matching registration before polling. Identity
+is captured on child admission and
 rechecked under a nonblocking read lease through the poll and its checked
 commit. `IdentityHandle::update` takes a nonblocking write lease, returns busy
 instead of deadlocking on reentry, and clears the identity before calling the
@@ -659,8 +660,10 @@ its own live, host-declared identity and version; it is checked at invocation,
 park, poll and wake, not cached by allocation. The host must restore equivalent
 identity registrations before reopening.
 
-This is an intentional compatibility change: old nested pending records with
-no identity no longer auto-poll, even for safe parents. An operator who has
+For compatibility, unbound pending jobs under replay-safe parents retain legacy
+polling; their records cannot verify the backend or tenant, so the host must
+restore the original backend. Unsafe parks never poll or resume unbound jobs.
+An operator who has
 independently verified the original backend and reference can use
 `bind_nested_pending_identity` to bind a missing identity to the currently
 registered tool; the reference, operation and conversation versions are checked.

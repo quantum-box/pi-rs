@@ -623,7 +623,44 @@ async fn reopen_rejects_same_spec_different_parent_or_child_tenant_for_safe_and_
 }
 
 #[tokio::test]
-async fn legacy_pending_requires_operator_verified_binding_for_safe_and_unsafe() {
+async fn safe_legacy_suspension_does_not_poll_after_parent_becomes_unsafe() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (scheduler, id, _) = start_parked(
+        root,
+        options_custom(
+            root,
+            "finish",
+            Some(1),
+            "parent/tenant-a",
+            None,
+            ReplayPolicy::Safe,
+        ),
+    )
+    .await;
+    scheduler.shutdown().await.unwrap();
+    let before = count(root, "child-polls");
+    std::fs::write(root.join("finish"), b"ready").unwrap();
+    let scheduler = Scheduler::open(
+        root.join("db"),
+        options_custom(
+            root,
+            "finish",
+            Some(1),
+            "parent/tenant-a",
+            None,
+            ReplayPolicy::Unsafe,
+        ),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(count(root, "child-polls"), before);
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_pending_safe_polls_but_unsafe_requires_verified_binding() {
     use durable_store::{Check, Expected, Mutation, Store};
     for policy in [ReplayPolicy::Safe, ReplayPolicy::Unsafe] {
         let dir = tempfile::tempdir().unwrap();
@@ -682,6 +719,13 @@ async fn legacy_pending_requires_operator_verified_binding_for_safe_and_unsafe()
             ),
         )
         .unwrap();
+        if policy == ReplayPolicy::Safe {
+            wait(&mut scheduler, id).await;
+            assert!(scheduler.blocked(id).unwrap().is_none());
+            assert!(count(root, "child-polls") > before);
+            scheduler.shutdown().await.unwrap();
+            continue;
+        }
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(
             count(root, "child-polls"),

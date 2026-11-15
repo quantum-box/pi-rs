@@ -121,7 +121,7 @@ impl PendingPoll {
         self.record
             .durable_identity
             .as_ref()
-            .is_some_and(|identity| durable_tool_identity(tool).as_ref() == Some(identity))
+            .is_none_or(|identity| durable_tool_identity(tool).as_ref() == Some(identity))
     }
     pub(crate) fn expected_identity(&self) -> Option<&str> {
         self.record.durable_identity.as_deref()
@@ -299,8 +299,8 @@ pub(crate) fn bind_pending_identity(
 }
 
 /// Recheck bound child identities before replay. Legacy unbound children may
-/// be used only by safe parents after authoritative reconciliation; unsafe
-/// parents require every child to have a matching identity.
+/// be used by safe parents under the legacy backend trust contract; unsafe
+/// parks require every child to have a matching identity.
 pub(crate) fn children_match(
     store: &durable_store::Store,
     root: Uuid,
@@ -2118,13 +2118,15 @@ impl NestedHost {
         reg: &RegisteredTool,
     ) -> Outcome {
         loop {
-            let Some(expected) = record.durable_identity.as_deref() else {
-                return self
-                    .pending_failure("nested poll identity missing; pending reference retained");
-            };
-            let Some(identity_lease) = crate::nested_identity::lease(&reg.tool, expected) else {
-                return self
-                    .pending_failure("nested poll identity changed; pending reference retained");
+            let identity_lease = if let Some(expected) = record.durable_identity.as_deref() {
+                let Some(lease) = crate::nested_identity::lease(&reg.tool, expected) else {
+                    return self.pending_failure(
+                        "nested poll identity changed; pending reference retained",
+                    );
+                };
+                Some(lease)
+            } else {
+                None
             };
             let Some(Outcome::Pending { reference }) = &record.outcome else {
                 return self.fail("invalid nested pending record");

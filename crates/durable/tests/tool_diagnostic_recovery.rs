@@ -15,13 +15,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-fn identified<T: pi_rs_core::Tool + 'static>(tool: Arc<T>) -> Arc<T> {
-    let erased: Arc<dyn pi_rs_core::Tool> = tool.clone();
-    let identity = format!("test-backend:{}:v1", erased.spec().name);
-    let _ = pi_rs_durable::nested_identity::register(&erased, Some(identity));
-    tool
-}
-
 struct FakeModel(&'static str);
 #[async_trait::async_trait]
 impl Model for FakeModel {
@@ -951,7 +944,7 @@ async fn polled_nested_result_runs_legacy_hook_before_parent() {
         tools: vec![
             Arc::new(KeyedToolAdapter::new(PollParent)).register(ReplayPolicy::Safe),
             pi_rs_durable::runtime::RegisteredTool {
-                tool: identified::<PollChild>(Arc::new(PollChild)),
+                tool: Arc::new(PollChild),
                 replay: ReplayPolicy::Unsafe,
             },
         ],

@@ -15674,6 +15674,15 @@ async fn poll_suspended_nested(
         }
         Some((reg.tool.clone(), proof.identity.clone()))
     } else {
+        // An unproven suspension may only use the legacy polling path while
+        // its parent is still registered replay-safe.
+        if !calls
+            .get(*index)
+            .and_then(|call| tools.get(&call.name))
+            .is_some_and(|reg| reg.replay == ReplayPolicy::Safe)
+        {
+            return Ok(false);
+        }
         None
     };
     match fenced_poll(
@@ -15770,11 +15779,15 @@ async fn poll_suspended_nested(
         let owner = &worker.owner;
         let unsafe_parent = unsafe_parent.clone();
         polls.push(async move {
-            let Some(expected) = job.expected_identity() else {
+            let identity_lease = if let Some(expected) = job.expected_identity() {
+                let Some(lease) = crate::nested_identity::lease(&tool, expected) else {
+                    return Ok(false);
+                };
+                Some(lease)
+            } else if unsafe_parent.is_some() {
                 return Ok(false);
-            };
-            let Some(identity_lease) = crate::nested_identity::lease(&tool, expected) else {
-                return Ok(false);
+            } else {
+                None
             };
             let _parent_lease = if let Some((parent, expected)) = &unsafe_parent {
                 let Some(lease) = crate::nested_identity::lease(parent, &expected.identity) else {

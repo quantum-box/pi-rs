@@ -16,13 +16,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-fn identified<T: pi_rs_core::Tool + 'static>(tool: Arc<T>) -> Arc<T> {
-    let erased: Arc<dyn pi_rs_core::Tool> = tool.clone();
-    let identity = format!("test-backend:{}:v1", erased.spec().name);
-    let _ = pi_rs_durable::nested_identity::register(&erased, Some(identity));
-    tool
-}
-
 struct ModelStub;
 #[async_trait]
 impl Model for ModelStub {
@@ -220,24 +213,24 @@ fn multigate_options(root: &std::path::Path, stop: bool, unsafe_parent: bool) ->
                 ReplayPolicy::Safe
             }),
             RegisteredTool {
-                tool: identified::<MultiGateTool>(Arc::new(MultiGateTool {
+                tool: Arc::new(MultiGateTool {
                     root: root.into(),
                     name: "gate_a",
-                })),
+                }),
                 replay: ReplayPolicy::Unsafe,
             },
             RegisteredTool {
-                tool: identified::<MultiGateTool>(Arc::new(MultiGateTool {
+                tool: Arc::new(MultiGateTool {
                     root: root.into(),
                     name: "gate_b",
-                })),
+                }),
                 replay: ReplayPolicy::Unsafe,
             },
             RegisteredTool {
-                tool: identified::<MultiGateTool>(Arc::new(MultiGateTool {
+                tool: Arc::new(MultiGateTool {
                     root: root.into(),
                     name: "remote",
-                })),
+                }),
                 replay: ReplayPolicy::Unsafe,
             },
         ],
@@ -1111,12 +1104,12 @@ async fn multiple_children_are_polled_and_parent_wakes_automatically() {
     let a = Arc::new(AtomicBool::new(false));
     let b = Arc::new(AtomicBool::new(false));
     let parent = Arc::new(KeyedToolAdapter::new(MultiParent(pc.clone())));
-    let child = identified::<AutoChild>(Arc::new(AutoChild {
+    let child = Arc::new(AutoChild {
         invoked: cc.clone(),
         polls: polls.clone(),
         ready_a: a.clone(),
         ready_b: b.clone(),
-    }));
+    });
     let mut s = Scheduler::open(dir.path().join("db"), multi_options(parent, child)).unwrap();
     let id = s
         .create_conversation(Config {
@@ -1205,10 +1198,10 @@ async fn abort_cancels_and_joins_live_poll_without_replay_after_reopen() {
     let started = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let parent = Arc::new(KeyedToolAdapter::new(Parent(pc.clone())));
-    let child = identified::<HangingChild>(Arc::new(HangingChild {
+    let child = Arc::new(HangingChild {
         started: started.clone(),
         active: active.clone(),
-    }));
+    });
     let mut s = Scheduler::open(&path, hanging_options(parent.clone(), child.clone())).unwrap();
     let id = s
         .create_conversation(Config {
@@ -1275,7 +1268,7 @@ fn file_options<T: KeyedTool + 'static>(
         tools: vec![
             parent.register(ReplayPolicy::Safe),
             RegisteredTool {
-                tool: identified::<FileChild>(Arc::new(FileChild(root.into()))),
+                tool: Arc::new(FileChild(root.into())),
                 replay: ReplayPolicy::Unsafe,
             },
         ],
@@ -1661,12 +1654,12 @@ async fn selected_extension_runs_hooks_for_every_automatically_polled_child() {
     let cc = Arc::new(AtomicUsize::new(0));
     let polls = Arc::new(AtomicUsize::new(0));
     let parent = Arc::new(KeyedToolAdapter::new(MultiParent(pc.clone())));
-    let child = identified::<AutoChild>(Arc::new(AutoChild {
+    let child = Arc::new(AutoChild {
         invoked: cc.clone(),
         polls,
         ready_a: Arc::new(AtomicBool::new(true)),
         ready_b: Arc::new(AtomicBool::new(true)),
-    }));
+    });
     let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
     let registry = hook_registry(Arc::new(OrderedHooks {
         calls: hooks.clone(),
@@ -1735,7 +1728,7 @@ fn pause_parent_options(root: &std::path::Path) -> Options {
         tools: vec![
             parent.register(ReplayPolicy::Safe),
             RegisteredTool {
-                tool: identified::<FileChild>(Arc::new(FileChild(root.into()))),
+                tool: Arc::new(FileChild(root.into())),
                 replay: ReplayPolicy::Unsafe,
             },
         ],
@@ -1851,12 +1844,12 @@ async fn selected_extension_override_fences_parent_replay() {
     let a = Arc::new(AtomicBool::new(false));
     let b = Arc::new(AtomicBool::new(false));
     let parent = Arc::new(KeyedToolAdapter::new(MultiParent(parent_calls.clone())));
-    let child = identified::<AutoChild>(Arc::new(AutoChild {
+    let child = Arc::new(AutoChild {
         invoked: child_calls,
         polls: polls.clone(),
         ready_a: a.clone(),
         ready_b: b.clone(),
-    }));
+    });
     let hooks = Arc::new(OrderedHooks {
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
@@ -2758,12 +2751,12 @@ async fn checkpoint_wake_lists_all_original_pending_operations() {
     let a = Arc::new(AtomicBool::new(false));
     let b = Arc::new(AtomicBool::new(false));
     let parent = Arc::new(KeyedToolAdapter::new(MultiCheckpointParent(calls.clone())));
-    let child = identified::<AutoChild>(Arc::new(AutoChild {
+    let child = Arc::new(AutoChild {
         invoked: invoked.clone(),
         polls: polls.clone(),
         ready_a: a.clone(),
         ready_b: b.clone(),
-    }));
+    });
     let mut scheduler =
         Scheduler::open(dir.path().join("db"), multi_options(parent, child)).unwrap();
     let id = scheduler
@@ -2869,17 +2862,17 @@ fn wake_then_gate_options(root: &std::path::Path, stop_at_gate: bool) -> Options
             }))
             .register(ReplayPolicy::Safe),
             RegisteredTool {
-                tool: identified::<MultiGateTool>(Arc::new(MultiGateTool {
+                tool: Arc::new(MultiGateTool {
                     root: root.into(),
                     name: "remote",
-                })),
+                }),
                 replay: ReplayPolicy::Unsafe,
             },
             RegisteredTool {
-                tool: identified::<MultiGateTool>(Arc::new(MultiGateTool {
+                tool: Arc::new(MultiGateTool {
                     root: root.into(),
                     name: "gate_a",
-                })),
+                }),
                 replay: ReplayPolicy::Unsafe,
             },
         ],
