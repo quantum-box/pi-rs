@@ -10,7 +10,11 @@ use std::sync::Arc;
 
 #[derive(Clone, Subcommand)]
 pub enum McpCommand {
-    List,
+    List {
+        /// Print server reports as a single JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Sign in to an HTTP MCP server using OAuth and a browser.
     Login {
         name: String,
@@ -54,6 +58,8 @@ pub enum McpCommand {
         /// Authenticate with credentials saved by mcp login.
         #[arg(long)]
         oauth: bool,
+        #[command(flatten)]
+        oauth_client: Box<McpOAuthAddOptions>,
         #[arg(long, value_parser = ["direct", "deferred", "codemode", "hidden"])]
         exposure: Option<String>,
         #[arg(long = "env")]
@@ -68,26 +74,148 @@ pub enum McpCommand {
     },
 }
 
-pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
-    Ok(configurations_with_project_scope(args)?.0)
+#[derive(Clone, clap::Args)]
+pub struct McpOAuthAddOptions {
+    /// Pre-registered OAuth client ID.
+    #[arg(long)]
+    oauth_client_id: Option<String>,
+    /// OAuth client secret or reference such as '${CLIENT_SECRET}' or '!command'.
+    #[arg(long)]
+    oauth_client_secret: Option<String>,
+    /// Fixed loopback OAuth callback port.
+    #[arg(long)]
+    oauth_callback_port: Option<u16>,
+    /// Client name sent during dynamic registration.
+    #[arg(long)]
+    oauth_client_name: Option<String>,
+    /// OAuth client registration mode.
+    #[arg(long, value_parser = ["auto", "cimd", "dcr"])]
+    oauth_client_registration: Option<String>,
 }
 
-fn configurations_with_project_scope(
-    args: &Cli,
-) -> Result<(BTreeMap<String, Value>, BTreeSet<String>)> {
+pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    Ok(configurations_with_project_scope(args, false)?.0)
+}
+
+type ScopedConfigurations = (
+    BTreeMap<String, Value>,
+    BTreeSet<String>,
+    BTreeSet<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+fn configurations_with_project_scope(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
-        return Ok((BTreeMap::new(), BTreeSet::new()));
+        return Ok((
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
-    let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
+    let mut configuration_errors = Vec::new();
+    let user_path = config::agent_dir().join("mcp.json");
+    let user = match config::read_object(&user_path) {
+        Ok(user) => user,
+        Err(_) if strict => {
+            configuration_errors.push(format!(
+                "{}: could not read or parse MCP configuration",
+                user_path.display()
+            ));
+            Default::default()
+        }
+        Err(error) => return Err(error),
+    };
+    if strict
+        && user
+            .get("mcpServers")
+            .is_some_and(|value| !value.is_object())
+    {
+        configuration_errors.push(format!(
+            "{}: mcpServers must be an object",
+            user_path.display()
+        ));
+    }
     let mut servers = user
         .get("mcpServers")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    if strict {
+        servers.retain(|name, value| {
+            if !valid_server_name(name) || report_server_config(value).is_none() {
+                configuration_errors.push(format!(
+                    "{}: invalid MCP server configuration for {name}",
+                    user_path.display()
+                ));
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let mut order: Vec<_> = servers.keys().cloned().collect();
     let mut project_definitions = BTreeSet::new();
+    let mut project_overrides = BTreeSet::new();
     if args.trusted {
-        let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
+        let project_path = args.workspace.join(".pi/mcp.json");
+        let project = match config::read_object(&project_path) {
+            Ok(project) => project,
+            Err(_) if strict => {
+                configuration_errors.push(format!(
+                    "{}: could not read or parse MCP configuration",
+                    project_path.display()
+                ));
+                Default::default()
+            }
+            Err(error) => return Err(error),
+        };
+        if strict
+            && project
+                .get("mcpServers")
+                .is_some_and(|value| !value.is_object())
+        {
+            configuration_errors.push(format!(
+                "{}: mcpServers must be an object",
+                project_path.display()
+            ));
+        }
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
+            let mut entries = entries.clone();
+            if strict {
+                entries.retain(|name, entry| {
+                    let full = ["command", "url", "type"]
+                        .iter()
+                        .any(|key| entry.get(*key).is_some());
+                    if !valid_server_name(name)
+                        || !entry.is_object()
+                        || (full && report_server_config(entry).is_none())
+                    {
+                        configuration_errors.push(format!(
+                            "{}: invalid MCP server configuration for {name}",
+                            project_path.display()
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            order.extend(
+                entries
+                    .keys()
+                    .filter(|name| !servers.contains_key(*name))
+                    .cloned(),
+            );
             project_definitions.extend(entries.iter().filter_map(|(name, entry)| {
                 entry
                     .as_object()
@@ -98,10 +226,22 @@ fn configurations_with_project_scope(
                     })
                     .map(|_| name.clone())
             }));
-            merge_project_servers(&mut servers, entries)?;
+            project_overrides.extend(
+                entries
+                    .keys()
+                    .filter(|name| !project_definitions.contains(*name))
+                    .cloned(),
+            );
+            merge_project_servers(&mut servers, &entries)?;
         }
     }
-    Ok((servers.into_iter().collect(), project_definitions))
+    Ok((
+        servers.into_iter().collect(),
+        project_definitions,
+        project_overrides,
+        order,
+        configuration_errors,
+    ))
 }
 
 fn merge_project_servers(
@@ -384,9 +524,219 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
     .await
 }
 
+fn report_exposure(value: &str) -> &str {
+    match value {
+        "codemode-deferred" => "codemode",
+        "off" => "hidden",
+        other => other,
+    }
+}
+
+fn report_server_config(value: &Value) -> Option<ServerConfig> {
+    let config: ServerConfig = serde_json::from_value(value.clone()).ok()?;
+    if config.command.is_some() == config.url.is_some()
+        || config
+            .exposure
+            .iter()
+            .chain(config.tool_exposure.values())
+            .any(|value| !valid_exposure(&json!(value)))
+        || config.oauth_client().is_some_and(|client| {
+            pi_rs_workbench::mcp_auth::validate_oauth_client_settings(client).is_err()
+        })
+        || config.command.is_some()
+            && matches!(
+                &config.oauth,
+                Some(
+                    pi_rs_workbench::mcp_auth::OAuthSetting::Enabled(true)
+                        | pi_rs_workbench::mcp_auth::OAuthSetting::Client(_)
+                )
+            )
+        || config.command.is_some()
+            && config
+                .transport
+                .as_deref()
+                .is_some_and(|kind| kind != "stdio")
+        || config.command.is_none()
+            && config.url.is_some()
+            && config
+                .transport
+                .as_deref()
+                .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
+        || config.url.as_ref().is_some_and(|url| {
+            reqwest_mcp::Url::parse(url)
+                .ok()
+                .is_none_or(|url| !matches!(url.scheme(), "http" | "https"))
+        })
+    {
+        return None;
+    }
+    Some(config)
+}
+
+async fn list_json(args: &Cli) -> Result<()> {
+    use std::io::Write;
+
+    let mut errors = Vec::new();
+    let (servers, project_definitions, project_overrides, order, config_errors) =
+        match configurations_with_project_scope(args, true) {
+            Ok(configurations) => configurations,
+            Err(error) => {
+                errors.push(error.to_string());
+                (
+                    BTreeMap::new(),
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+        };
+    errors.extend(config_errors);
+    let global_path = config::agent_dir().join("mcp.json");
+    let project_path = std::fs::canonicalize(&args.workspace)
+        .unwrap_or_else(|_| args.workspace.clone())
+        .join(".pi/mcp.json");
+    let mut normalized = BTreeSet::new();
+    let mut pending = Vec::new();
+    let mut servers = servers;
+    for name in order {
+        let Some(value) = servers.remove(&name) else {
+            continue;
+        };
+        let project = project_definitions.contains(&name);
+        let source = if project { &project_path } else { &global_path };
+        if !valid_server_name(&name) {
+            errors.push(format!(
+                "{}: invalid MCP server name {name}",
+                source.display()
+            ));
+            continue;
+        }
+        let config = match report_server_config(&value) {
+            Some(config) => config,
+            None => {
+                errors.push(format!(
+                    "{}: invalid MCP server configuration for {name}",
+                    source.display()
+                ));
+                continue;
+            }
+        };
+        let transport = if let Some(command) = &config.command {
+            if config.args.is_empty() {
+                command.clone()
+            } else {
+                format!("{command} [arguments omitted]")
+            }
+        } else if let Some(url) = &config.url {
+            let Ok(mut parsed) = reqwest_mcp::Url::parse(url) else {
+                errors.push(format!("invalid MCP URL for {name}"));
+                continue;
+            };
+            if !matches!(parsed.scheme(), "http" | "https") {
+                errors.push(format!("invalid MCP URL for {name}"));
+                continue;
+            }
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            format!("{}/[path omitted]", parsed.origin().ascii_serialization())
+        } else {
+            errors.push(format!("MCP server {name} requires a command or URL"));
+            continue;
+        };
+        if !normalized.insert(name.replace('-', "_")) {
+            errors.push(format!(
+                "{}: MCP server {name} collides after normalization",
+                source.display()
+            ));
+            continue;
+        }
+        let enabled = config.enabled != Some(false);
+        let base_exposure =
+            report_exposure(config.exposure.as_deref().unwrap_or("codemode")).to_owned();
+        let mut report = json!({"name":name,"scope":if project {"project"} else {"global"},"source":source.to_string_lossy(),"enabled":enabled,"exposure":base_exposure,"transport":transport,"state":"disabled","tools":[]});
+        if project_overrides.contains(&name) {
+            report["override"] = json!(project_path.to_string_lossy());
+        }
+        let args = args.clone();
+        pending.push(async move {
+            if !enabled {
+                return (report, false);
+            }
+            match connect(&args, &name, &config).await {
+                Ok(connection) => {
+                    let tools = connection.remote_tool_names();
+                    report["state"] = json!("connected");
+                    report["tools"] = json!(tools);
+                    let changes: serde_json::Map<String, Value> = tools
+                        .iter()
+                        .filter(|tool| {
+                            report_exposure(pi_rs_workbench::mcp::tool_exposure(&config, tool))
+                                != base_exposure
+                        })
+                        .map(|tool| {
+                            let exposure =
+                                report_exposure(pi_rs_workbench::mcp::tool_exposure(&config, tool));
+                            (tool.clone(), json!(exposure))
+                        })
+                        .collect();
+                    if !changes.is_empty() {
+                        report["toolExposure"] = Value::Object(changes);
+                    }
+                    if connection.offers_resources() {
+                        report["resources"] = json!(true);
+                    }
+                    connection.close().await;
+                    (report, false)
+                }
+                Err(error) => {
+                    report["state"] =
+                        json!(if matches!(&error, Error::AuthorizationRequired { .. }) {
+                            "needs-auth"
+                        } else {
+                            "failed"
+                        });
+                    // Transport errors can include URLs or server-supplied text.
+                    // Avoid exposing configured credentials in machine-readable output.
+                    report["error"] =
+                        json!(if matches!(&error, Error::AuthorizationRequired { .. }) {
+                            "MCP server requires sign-in"
+                        } else {
+                            "MCP server connection failed"
+                        });
+                    (report, true)
+                }
+            }
+        });
+    }
+    let reports = futures_util::future::join_all(pending).await;
+    let failed = !errors.is_empty() || reports.iter().any(|(_, failed)| *failed);
+    let mut result = json!({"servers":reports.into_iter().map(|(report, _)| report).collect::<Vec<_>>(),"errors":errors});
+    if !args.trusted && project_path.exists() {
+        result["note"] = json!(format!(
+            "{} is ignored because the project is not trusted.",
+            project_path.display()
+        ));
+    }
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, &result)?;
+    writeln!(stdout)?;
+    if failed {
+        return Err(Error::Config(
+            "one or more MCP servers failed to connect".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
     match command {
-        McpCommand::List => {
+        McpCommand::List { json: true } => {
+            return list_json(args).await;
+        }
+        McpCommand::List { json: false } => {
             let expected = configurations(args)?
                 .values()
                 .filter(|value| value["enabled"] != false)
@@ -411,10 +761,18 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             description,
             bearer_token_env_var,
             oauth,
+            oauth_client,
             exposure,
             environment,
             command,
         } => {
+            let McpOAuthAddOptions {
+                oauth_client_id,
+                oauth_client_secret,
+                oauth_callback_port,
+                oauth_client_name,
+                oauth_client_registration,
+            } = *oauth_client;
             if name.is_empty()
                 || !name
                     .bytes()
@@ -459,7 +817,26 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 }
                 value["headers"] = Value::Object(map);
             }
-            if oauth {
+            let mut oauth_options = serde_json::Map::new();
+            for (key, option) in [
+                ("clientId", oauth_client_id),
+                ("clientSecret", oauth_client_secret),
+                ("clientName", oauth_client_name),
+                ("clientRegistration", oauth_client_registration),
+            ] {
+                if let Some(option) = option {
+                    oauth_options.insert(key.into(), json!(option));
+                }
+            }
+            if let Some(port) = oauth_callback_port {
+                if port == 0 {
+                    return Err(Error::Config(
+                        "OAuth callback port must be between 1 and 65535".into(),
+                    ));
+                }
+                oauth_options.insert("callbackPort".into(), json!(port));
+            }
+            if oauth || !oauth_options.is_empty() {
                 if value.get("url").is_none()
                     || bearer_token_env_var.is_some()
                     || value["headers"].as_object().is_some_and(|headers| {
@@ -472,7 +849,15 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                         "--oauth requires --url and cannot use --bearer-token-env-var".into(),
                     ));
                 }
-                value["oauth"] = json!(true);
+                if oauth_options.is_empty() {
+                    value["oauth"] = json!(true);
+                } else {
+                    let options = Value::Object(oauth_options);
+                    if !valid_oauth(&options) {
+                        return Err(Error::Config("invalid MCP OAuth client settings".into()));
+                    }
+                    value["oauth"] = options;
+                }
             }
             if let Some(exposure) = exposure {
                 value["exposure"] = json!(exposure);
@@ -658,7 +1043,8 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             output(json!({"type":"mcp_logged_in","name":name}));
         }
         McpCommand::Logout { name, local } => {
-            let (servers, project_definitions) = configurations_with_project_scope(args)?;
+            let (servers, project_definitions, _, _, _) =
+                configurations_with_project_scope(args, false)?;
             if local && !project_definitions.contains(&name) {
                 return Err(Error::Config(format!(
                     "MCP server {name} is not configured in the trusted project"

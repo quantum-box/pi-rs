@@ -56,6 +56,19 @@ pub enum SessionEvent {
     },
 }
 
+/// A configured extension command for native host command pickers.
+/// `source_path` is a lossy UTF-8 rendering suitable for JSON; it is display
+/// metadata and must not be used as a filesystem authorization boundary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SdkRegisteredCommand {
+    pub extension_id: String,
+    pub name: String,
+    pub invocation_name: String,
+    pub description: Option<String>,
+    pub source_path: Option<String>,
+    pub source_kind: crate::ExtensionCommandSourceKind,
+}
+
 /// Result of navigating to a transcript entry through extension hooks.
 #[derive(Clone, Debug)]
 pub struct TreeNavigationResult {
@@ -1733,6 +1746,44 @@ impl AgentSession {
     /// Per-request registry refreshes during a run are not reflected here.
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
+    }
+    /// Inspect configured extension commands, including collision-resolved
+    /// invocation names and extension provenance. Prompt templates, skills and
+    /// built-in host commands remain the host's responsibility. Per-request
+    /// registry refreshes are not reflected in this configured snapshot.
+    pub fn registered_commands(&self) -> Vec<SdkRegisteredCommand> {
+        self.registry
+            .registered_commands()
+            .into_iter()
+            .map(|command| SdkRegisteredCommand {
+                extension_id: command.extension_id,
+                name: command.name,
+                invocation_name: command.invocation_name,
+                description: command.description,
+                source_path: command
+                    .source_path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                source_kind: command.source_kind,
+            })
+            .collect()
+    }
+
+    /// Execute a collision-resolved invocation returned by `registered_commands`.
+    /// Unlike Pi's `prompt`, native `prompt` does not dispatch slash commands;
+    /// hosts explicitly route commands through this method.
+    pub async fn invoke_registered_command(
+        &mut self,
+        invocation: &str,
+        arguments: &str,
+    ) -> Result<Option<String>> {
+        let command = self
+            .registry
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == invocation)
+            .ok_or_else(|| Error::Config("extension command is not registered".into()))?;
+        self.extension_command_and_run(&command.extension_id, &command.name, arguments)
+            .await
     }
     pub fn pending_inputs(&self) -> Result<usize> {
         let input = self

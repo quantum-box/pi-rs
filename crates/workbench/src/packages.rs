@@ -1389,14 +1389,23 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
     }
     let path = if trimmed.starts_with("file://") {
         pi_rs_file_url::to_file_path(trimmed).map_err(Error::Config)?
-    } else if trimmed == "~" || trimmed.starts_with("~/") {
-        let path = trimmed.strip_prefix("~/").unwrap_or("");
-        PathBuf::from(
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .ok_or_else(|| Error::Config("home directory unavailable".into()))?,
-        )
-        .join(path)
+    } else if trimmed == "~"
+        || trimmed.starts_with("~/")
+        || (cfg!(windows) && trimmed.starts_with("~\\"))
+    {
+        // Package source resolution uses HOME when nonempty, then os.homedir().
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(filter_home_dir)
+            .ok_or_else(|| Error::Config("home directory unavailable".into()))?;
+        let suffix = if trimmed == "~" { "" } else { &trimmed[2..] };
+        let expanded = normalize_filter_home(&home, suffix);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            base.join(expanded)
+        }
     } else {
         base.join(trimmed)
     };
@@ -3605,6 +3614,87 @@ mod tests {
             normalize(" ~/pi-package ", directory.path()).unwrap(),
             normalize("~/pi-package", directory.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn package_source_home_fallback_and_relative_base() {
+        const CHILD: &str = "PI_RS_PACKAGE_HOME_CHILD";
+        if let Some(case) = std::env::var_os(CHILD) {
+            let root = std::env::current_dir()
+                .unwrap()
+                .join("package-home-test-base");
+            let actual = normalize("~/child", &root).unwrap();
+            let expected_home = if case == "relative" {
+                root.join("relative-home")
+            } else if (case == "empty" && cfg!(unix)) || (case != "relative" && cfg!(windows)) {
+                root.clone()
+            } else {
+                filter_home_dir().unwrap()
+            };
+            assert_eq!(
+                actual,
+                resolve_source_path(&expected_home.join("child"))
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            assert_eq!(
+                normalize("~", &root).unwrap(),
+                resolve_source_path(&expected_home)
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            let doubled = normalize("~//child", &root).unwrap();
+            let expected_doubled = if case == "empty" && cfg!(unix) {
+                resolve_source_path(Path::new("/child"))
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                actual.clone()
+            };
+            assert_eq!(doubled, expected_doubled);
+            #[cfg(windows)]
+            {
+                assert_eq!(normalize(r"~\child", &root).unwrap(), actual);
+                assert_eq!(normalize(r"~\\child", &root).unwrap(), actual);
+            }
+            return;
+        }
+        for case in ["relative", "empty", "missing"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "packages::tests::package_source_home_fallback_and_relative_base",
+                    "--nocapture",
+                ])
+                .env(CHILD, case);
+            #[cfg(windows)]
+            command.env(
+                "USERPROFILE",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("package-home-test-base"),
+            );
+            match case {
+                "relative" => {
+                    command.env("HOME", "relative-home");
+                }
+                "empty" => {
+                    command.env("HOME", "");
+                }
+                _ => {
+                    command.env_remove("HOME");
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[cfg(unix)]

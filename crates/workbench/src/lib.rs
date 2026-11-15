@@ -29,9 +29,11 @@ pub mod mcp_oauth_client;
 mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod mcp_refresh;
+pub mod model_factory;
 #[doc(hidden)]
 pub mod oauth_callback;
 pub mod prompt_resources;
+pub mod prompt_template_arguments;
 mod shell_config;
 mod shell_output;
 pub mod template_resources;
