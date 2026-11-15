@@ -115,6 +115,53 @@ pub fn resolve_strict_tool_schema(
     }
 }
 
+/// Normalize a copy of strict-tool arguments against their original schema.
+///
+/// Strict schemas make optional fields required and nullable. A null supplied
+/// for an optional field that rejects null is treated as an omitted field. The
+/// original arguments remain available for journaling and provider replay.
+/// Only schemas accepted by [`strict_tool_schema`] are supported.
+pub fn normalize_strict_tool_arguments(
+    schema: &Value,
+    arguments: &Value,
+) -> Result<Value, StrictSchemaError> {
+    strict_tool_schema(schema, |_, _| false)?;
+    let mut normalized = arguments.clone();
+    drop_optional_nulls(schema, &mut normalized);
+    Ok(normalized)
+}
+
+fn drop_optional_nulls(schema: &Value, value: &mut Value) {
+    if let Some(items) = value.as_array_mut() {
+        if let Some(item_schema) = schema.get("items") {
+            for item in items {
+                drop_optional_nulls(item_schema, item);
+            }
+        }
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let required = schema.get("required").and_then(Value::as_array);
+    for (key, property_schema) in properties {
+        let is_required =
+            required.is_some_and(|items| items.iter().any(|v| v.as_str() == Some(key)));
+        let remove = !is_required
+            && object.get(key) == Some(&Value::Null)
+            && jsonschema::validator_for(property_schema)
+                .is_ok_and(|validator| !validator.is_valid(&Value::Null));
+        if remove {
+            object.remove(key);
+        } else if let Some(item) = object.get_mut(key) {
+            drop_optional_nulls(property_schema, item);
+        }
+    }
+}
+
 /// Clone a tool schema and make object properties required and closed.
 ///
 /// Optional properties are made nullable. `unsupported` checks additional
@@ -320,6 +367,30 @@ fn make_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_only_optional_nulls_on_a_copy() {
+        let schema = json!({"type":"object","properties":{
+            "required":{"type":"string"},"optional":{"type":"string"},
+            "nullable":{"type":["string","null"]},
+            "items":{"type":"array","items":{"type":"object","properties":{"x":{"type":"integer"}}}}
+        },"required":["required"]});
+        let arguments = json!({"required":null,"optional":null,"nullable":null,"items":[{"x":null},{"x":3}],"extra":null});
+        let normalized = normalize_strict_tool_arguments(&schema, &arguments).unwrap();
+        assert_eq!(
+            normalized,
+            json!({"required":null,"nullable":null,"items":[{},{"x":3}],"extra":null})
+        );
+        assert_eq!(arguments["optional"], Value::Null);
+        assert!(arguments.as_object().unwrap().contains_key("optional"));
+        assert!(
+            normalize_strict_tool_arguments(
+                &json!({"type":"object","properties":{"x":{"$ref":"#/x"}}}),
+                &arguments
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn declarations_preserve_pi_constraint_shapes() {
