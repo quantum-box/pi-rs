@@ -49,13 +49,23 @@ async fn commit_updates_follow_committed_batches_and_reopen() {
 
 #[tokio::test]
 async fn commit_subscription_starts_from_current_cross_connection_state() {
+    use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.db");
     let first = Store::open(&path).unwrap();
     let second = Store::open(&path).unwrap();
+    let mut existing = first.subscribe_commits().unwrap();
+    let before = existing.current();
     second.commit(&[], &[put(b"other", b"value")]).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), existing.changed())
+            .await
+            .is_err()
+    );
     let mut updates = first.subscribe_commits().unwrap();
     assert_eq!(updates.current(), second.commit_sequence().unwrap());
+    assert!(updates.current() > before);
+    assert_eq!(existing.changed().await.unwrap(), updates.current());
     first.commit(&[], &[put(b"local", b"value")]).unwrap();
     assert_eq!(
         updates.changed().await.unwrap(),
