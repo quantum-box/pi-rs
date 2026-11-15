@@ -3071,6 +3071,8 @@ impl CodingTool {
         let mut drain_max = None;
         let mut cancelled = false;
         let mut timed_out = false;
+        #[cfg(test)]
+        let mut drain_reason = "pipes closed";
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
         let mut stdout_filter = UserShellFilter::default();
@@ -3147,13 +3149,19 @@ impl CodingTool {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                } => break,
+                } => {
+                    #[cfg(test)] { drain_reason = "idle deadline"; }
+                    break;
+                },
                 _ = async {
                     match drain_max {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                } => break,
+                } => {
+                    #[cfg(test)] { drain_reason = "maximum deadline"; }
+                    break;
+                },
             }
         }
         if let Some(input_task) = input_task {
@@ -3186,6 +3194,8 @@ impl CodingTool {
             output: output.finish()?,
             status: status.expect("shell status observed"),
             elapsed: started.elapsed().as_secs_f64(),
+            #[cfg(test)]
+            drain_reason,
         })
     }
 }
@@ -3319,6 +3329,8 @@ struct ShellResult {
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
+    #[cfg(test)]
+    drain_reason: &'static str,
 }
 
 struct UserShellFilter {
@@ -6139,8 +6151,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_keeps_draining_active_descendants_after_exit() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
-        let command = r#"parent=$$; (touch ready; while kill -0 "$parent" 2>/dev/null; do sleep .005; done; i=0; while [ $i -lt 12 ]; do printf 'out%s\n' "$i"; printf 'err%s\n' "$i" >&2; sleep 0.04; i=$((i+1)); done) & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
+        let command = "python3 -c 'import os,time; parent=os.getppid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nend=time.monotonic()+.6; os.write(1,b\"out0\\n\"); os.write(2,b\"err0\\n\");\nwhile time.monotonic()<end:\n os.write(1,b\".\"); os.write(2,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass\nos.write(1,b\"out11\\n\"); os.write(2,b\"err11\\n\")' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0";
         let local = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: true,
@@ -6160,12 +6181,16 @@ mod tests {
         assert!(result.status.success());
         assert!(
             result.output.script.contains("out11\n"),
-            "{:?}",
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
             result.output.script
         );
         assert!(
             result.output.script.contains("err11\n"),
-            "{:?}",
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
             result.output.script
         );
 
@@ -6213,7 +6238,7 @@ mod tests {
         };
         // The child escapes the shell's process group and continues writing after
         // the shell exits, so killing the group cannot close its inherited pipe.
-        let command = "python3 -c 'import os,time; parent=os.getppid(); os.setsid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.005)\nopen(\"active\",\"w\").close(); [(print(i,flush=True),time.sleep(.02)) for i in range(100)]' & while [ ! -f ready ]; do sleep .01; done; exit 0";
+        let command = "python3 -c 'import os,time; parent=os.getppid(); os.setsid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nopen(\"active\",\"w\").close(); os.write(1,b\"0\\n\"); end=time.monotonic()+2\nwhile time.monotonic()<end:\n os.write(1,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass' & while [ ! -f ready ]; do sleep .01; done; exit 0";
         let cancellation = pi_rs::CancellationToken::new();
         let cancel = cancellation.clone();
         let ready = root.path().join("active");
@@ -6226,31 +6251,44 @@ mod tests {
         });
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            tool.shell(&json!({"command":command}), &cancellation),
+            tool.shell_stream(
+                &json!({"command":command}),
+                &cancellation,
+                &mut |_| {},
+                false,
+                None,
+            ),
         )
         .await
         .expect("cancelled shell kept draining");
         task.await.unwrap();
-        let error = result.err();
+        let result = result.unwrap();
         assert!(
-            matches!(&error, Some(Error::Config(message)) if message.contains("Command aborted")),
-            "unexpected cancellation result: {error:?}"
+            result.cancelled,
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason, result.elapsed, result.output.script
         );
         std::fs::remove_file(root.path().join("ready")).unwrap();
         std::fs::remove_file(root.path().join("active")).unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            tool.shell(
+            tool.shell_stream(
                 &json!({"command":command,"timeout":0.7}),
                 &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+                false,
+                None,
             ),
         )
         .await
         .expect("timed out shell kept draining");
-        let error = result.err();
+        let result = result.unwrap();
         assert!(
-            matches!(&error, Some(Error::Config(message)) if message.starts_with("0\n") && message.contains("timed out")),
-            "unexpected timeout result: {error:?}"
+            result.timed_out && result.output.script.starts_with("0\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
         );
     }
 
