@@ -1808,11 +1808,16 @@ impl AgentSession {
         &self.model_name
     }
 
-    /// Provider of the currently selected runtime model, if it has one.
-    /// Legacy provider-less selections return `None`. Together with
-    /// `model_name`, this identifies the client selected for subsequent runs.
-    pub fn model_provider(&self) -> Option<&str> {
-        self.model_provider.as_deref()
+    /// Provider of the selected runtime model. Legacy provider-less selections
+    /// return `None`. An unavailable historical model returns an error instead
+    /// of exposing the builder's unrelated default provider.
+    pub fn model_provider(&self) -> Result<Option<&str>> {
+        if !self.model_identity_resolved {
+            return Err(Error::Config(
+                "current session model is not registered".into(),
+            ));
+        }
+        Ok(self.model_provider.as_deref())
     }
 
     /// Supply a client for a historical model name in this session.

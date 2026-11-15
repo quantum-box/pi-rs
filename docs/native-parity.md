@@ -4751,7 +4751,8 @@ modify individual requests after the configured prompt is read.
 
 SDK hosts can read a session's selected provider with `model_provider()`
 alongside `model_name()`, including after model switches and branch checkout.
-Provider-less legacy selections return `None`.
+Provider-less legacy selections return `None`; an unavailable historical model
+returns an error rather than the builder default.
 
 ### Native SDK prompt resource factory
 

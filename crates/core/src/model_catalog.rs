@@ -189,7 +189,7 @@ mod tests {
             .in_memory()
             .unwrap();
         assert_eq!(
-            (session.model_provider(), session.model_name()),
+            (session.model_provider().unwrap(), session.model_name()),
             (Some("provider-a"), "shared")
         );
         let before = session.journal().unwrap().head();
@@ -197,21 +197,55 @@ mod tests {
             .set_provider_model(b, "provider-b", "shared")
             .unwrap();
         assert_eq!(
-            (session.model_provider(), session.model_name()),
+            (session.model_provider().unwrap(), session.model_name()),
             (Some("provider-b"), "shared")
         );
         session.checkout(before).unwrap();
         assert_eq!(
-            (session.model_provider(), session.model_name()),
+            (session.model_provider().unwrap(), session.model_name()),
             (Some("provider-a"), "shared")
         );
         session
             .set_model(Arc::new(NamedModel("legacy")), "legacy")
             .unwrap();
         assert_eq!(
-            (session.model_provider(), session.model_name()),
+            (session.model_provider().unwrap(), session.model_name()),
             (None, "legacy")
         );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_provider_rejects_unavailable_historical_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut original = ModelCatalogBuilder::new();
+        original
+            .register("provider-b", "shared", Arc::new(NamedModel("b")))
+            .unwrap();
+        let mut session = original
+            .build()
+            .session_builder("provider-b", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        session.close().await.unwrap();
+        drop(session);
+        let mut replacement = ModelCatalogBuilder::new();
+        replacement
+            .register("provider-a", "shared", Arc::new(NamedModel("a")))
+            .unwrap();
+        let mut session = replacement
+            .build()
+            .session_builder("provider-a", "shared")
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        assert!(session.model_provider().is_err());
+        session
+            .set_provider_model(Arc::new(NamedModel("b")), "provider-b", "shared")
+            .unwrap();
+        assert_eq!(session.model_provider().unwrap(), Some("provider-b"));
         session.close().await.unwrap();
     }
 
