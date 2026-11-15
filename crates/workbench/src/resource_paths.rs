@@ -294,10 +294,22 @@ fn expand(
     required: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
-    if path.exists() || !has_pattern(&path.to_string_lossy()) {
+    let normalized;
+    let path = if kind == Kind::Skill {
+        normalized = normalize_skill_path(path);
+        normalized.as_path()
+    } else {
+        path
+    };
+    if path.exists() || !path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+    }) {
         return collect(path, kind, required, warnings);
     }
     let pattern = path.to_string_lossy().replace('\\', "/");
+    // The '?' in a Windows verbatim prefix is a literal, not a wildcard.
+    #[cfg(windows)]
+    let pattern = pattern.replacen("//?/", "//[?]/", 1);
     let matcher = globset::GlobBuilder::new(&pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -306,7 +318,8 @@ fn expand(
         .compile_matcher();
     let mut root = PathBuf::new();
     for component in path.components() {
-        if has_pattern(&component.as_os_str().to_string_lossy()) {
+        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        {
             break;
         }
         root.push(component);
@@ -325,7 +338,25 @@ fn collect(
     required: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
-    collect_matching(path, kind, required, warnings, None)
+    if kind == Kind::Skill {
+        collect_matching(&normalize_skill_path(path), kind, required, warnings, None)
+    } else {
+        collect_matching(path, kind, required, warnings, None)
+    }
+}
+// Node's resolve removes lexical dot components without resolving symlinks.
+fn normalize_skill_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            component => result.push(component.as_os_str()),
+        }
+    }
+    result
 }
 fn collect_matching(
     path: &Path,
@@ -335,7 +366,7 @@ fn collect_matching(
     matcher: Option<&globset::GlobMatcher>,
 ) -> Result<Vec<PathBuf>> {
     if path.is_file() {
-        return Ok(vec![if kind == Kind::Prompt {
+        return Ok(vec![if matches!(kind, Kind::Prompt | Kind::Skill) {
             path.to_owned()
         } else {
             path.canonicalize()?
@@ -355,8 +386,7 @@ fn collect_matching(
         let mut files: Vec<_> = skill_files(path)
             .into_iter()
             .filter(|file| matches_pattern(file, path, matcher))
-            .map(|file| file.canonicalize())
-            .collect::<std::io::Result<_>>()?;
+            .collect();
         files.sort();
         files.dedup();
         return Ok(files);
@@ -463,6 +493,24 @@ pub(super) fn skill_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod glob_tests {
     use super::*;
+    #[test]
+    fn escaped_verbatim_prefix_matches_disk_and_unc_glob_paths() {
+        for (pattern, candidate) in [
+            ("//[?]/C:/skills/*", "//?/C:/skills/demo"),
+            (
+                "//[?]/UNC/server/share/skills/*",
+                "//?/UNC/server/share/skills/demo",
+            ),
+        ] {
+            let matcher = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .backslash_escape(false)
+                .build()
+                .unwrap()
+                .compile_matcher();
+            assert!(matcher.is_match(candidate));
+        }
+    }
     #[test]
     fn automatic_themes_are_visible_top_level_files_respecting_local_ignores() {
         use clap::Parser;

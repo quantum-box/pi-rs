@@ -23,6 +23,7 @@ pub(super) fn parse(
         "name",
         "use-theme",
         "system-prompt",
+        "tools",
         "exclude-tools",
         "mode",
         "tui-mode",
@@ -38,9 +39,31 @@ pub(super) fn parse(
             command = command.mut_arg(id.clone(), |arg| arg.overrides_with(id));
         }
     }
+    command = command.mut_arg("tools", |arg| arg.value_parser(validate_tool_list));
     command.build();
     let (args, flags) = normalize(&command, args);
     Ok((command.try_get_matches_from(args)?, flags))
+}
+
+fn validate_tool_list(value: &str) -> Result<String, String> {
+    let entries: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let modifiers: Vec<_> = entries
+        .iter()
+        .filter(|s| s.starts_with(['+', '-']))
+        .collect();
+    if !modifiers.is_empty() && modifiers.len() != entries.len() {
+        return Err("tool names cannot be mixed with +name or -name entries".into());
+    }
+    if let Some(pattern) = modifiers.iter().find(|s| s.contains('*')) {
+        return Err(format!(
+            "+name and -name entries take exact tool names, not patterns: {pattern}"
+        ));
+    }
+    Ok(value.into())
 }
 
 fn normalize(
@@ -459,6 +482,21 @@ mod tests {
             ][..],
         ] {
             assert!(parse(args.iter().map(OsString::from)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_tool_selections_keep_the_last_value() {
+        for arguments in [
+            &["pi", "--tools", "read", "--tools", "bash"][..],
+            &["pi", "-t", "read", "--tools", "bash"][..],
+            &["pi", "--tools=read", "-t", "bash"][..],
+        ] {
+            let args = cli(arguments);
+            assert_eq!(args.tools.as_deref(), Some("bash"));
+        }
+        for invalid in ["read,+bash", "+b*"] {
+            assert!(parse(["pi", "--tools", invalid, "-t", "bash"].map(OsString::from)).is_err());
         }
     }
 

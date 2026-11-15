@@ -2248,19 +2248,29 @@ async fn execute(
         let mut stream = (args.mode == Some(OutputMode::Json))
             .then(rpc_events::Stream::default);
         let mut truncated = false;
-        let mut observer = |event: Notification<'_>| {
-            if let Notification::Committed(record) = &event
-                && let Event::ModelFinished { metadata, .. } = &record.event
-            {
-                truncated = metadata.finish_reason.as_deref() == Some("length");
-            }
-            if let Some(stream) = &mut stream {
-                for event in stream.notify(&event, &args) {
-                    output(event);
+        let mut event_observer = |event: pi_rs::AgentEvent<'_>| {
+            match event {
+                pi_rs::AgentEvent::Notification(event) => {
+                    if let Notification::Committed(record) = &event
+                        && let Event::ModelFinished { metadata, .. } = &record.event
+                    {
+                        truncated = metadata.finish_reason.as_deref() == Some("length");
+                    }
+                    if let Some(stream) = &mut stream {
+                        for event in stream.notify(&event, &args) { output(event); }
+                    }
+                    observe_with_stream(event, args.trace, stream.is_some());
+                }
+                event => {
+                    let event = reasoning_event_json(event);
+                    if let Some(stream) = &mut stream {
+                        for output_event in stream.observe(&event, &args) { output(output_event); }
+                    }
+                    if args.trace { output(trace_agent_event_json(event)); }
                 }
             }
-            observe_with_stream(event, args.trace, stream.is_some());
         };
+        let mut observer = |event: Notification<'_>| event_observer(pi_rs::AgentEvent::Notification(event));
         if let Some(prompt) = &mut input {
             if index == 0 && skip_initial_prompt {
                 continue;
@@ -2313,8 +2323,8 @@ async fn execute(
         if let Some(record) = image_record {
             observer(Notification::Committed(record));
         }
-        let answer = agent.run_correlated(
-            &mut session, run_id, input, &mut receiver, &cancel, &mut observer,
+        let answer = agent.run_correlated_with_events(
+            &mut session, run_id, input, &mut receiver, &cancel, &mut event_observer,
         ).await;
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
@@ -2379,6 +2389,47 @@ fn observe(event: Notification<'_>, trace: bool) {
     observe_with_stream(event, trace, false);
 }
 
+fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
+    match event {
+        pi_rs::AgentEvent::TextStart { index } => json!({"type":"text_item_start","index":index}),
+        pi_rs::AgentEvent::TextDelta { index, delta } => {
+            json!({"type":"text_item_delta","index":index,"delta":delta})
+        }
+        pi_rs::AgentEvent::TextEnd { index, content } => {
+            json!({"type":"text_item_end","index":index,"content":content})
+        }
+        pi_rs::AgentEvent::ReasoningStart { index } => {
+            json!({"type":"reasoning_item_start","index":index})
+        }
+        pi_rs::AgentEvent::ReasoningDelta { index, delta } => {
+            json!({"type":"reasoning_item_delta","index":index,"delta":delta})
+        }
+        pi_rs::AgentEvent::ReasoningEnd { index, content } => {
+            json!({"type":"reasoning_item_end","index":index,"content":content})
+        }
+        pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+    }
+}
+
+// Trace is also the backend transport. rpc_events::Stream::observe must map
+// text_delta.textIndex and reasoning_delta.reasoningIndex to indexed blocks.
+fn trace_agent_event_json(mut event: serde_json::Value) -> serde_json::Value {
+    match event["type"].as_str() {
+        Some("text_item_delta") => {
+            event["type"] = json!("text_delta");
+            event["textIndex"] = event["index"].take();
+            event.as_object_mut().expect("event object").remove("index");
+        }
+        Some("reasoning_item_delta") => {
+            event["type"] = json!("reasoning_delta");
+            event["reasoningIndex"] = event["index"].take();
+            event.as_object_mut().expect("event object").remove("index");
+        }
+        _ => {}
+    }
+    event
+}
+
 fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
     match event {
         Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
@@ -2397,9 +2448,18 @@ fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) 
             output(json!({"type": "request", "request": request}))
         }
         Notification::Text(delta) if trace => output(json!({"type": "text_delta", "delta": delta})),
-        Notification::Reasoning(delta) if trace => {
-            output(json!({"type":"reasoning_delta","delta":delta}))
-        }
+        Notification::Reasoning(delta) if trace => match pi_rs::reasoning_event_metadata() {
+            Some(pi_rs::ReasoningEventMetadata::Start { index }) => {
+                output(json!({"type":"reasoning_item_start","index":index}))
+            }
+            Some(pi_rs::ReasoningEventMetadata::Delta { index }) => {
+                output(json!({"type":"reasoning_delta","reasoningIndex":index,"delta":delta}))
+            }
+            Some(pi_rs::ReasoningEventMetadata::End { index, content }) => {
+                output(json!({"type":"reasoning_item_end","index":index,"content":content}))
+            }
+            None => output(json!({"type":"reasoning_delta","delta":delta})),
+        },
         Notification::ToolProgress(event) => {
             if let Some(event) = trace_tool_progress(event, trace, json_stream) {
                 output(event);

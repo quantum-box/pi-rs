@@ -227,6 +227,21 @@ impl Gateway {
             .map(|(token, _)| token))
     }
 
+    pub(super) async fn access_with_minimum(
+        &self,
+        min_validity: Duration,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .access_with_login_at_before_barrier(
+                auth_path(),
+                min_validity.max(Duration::from_secs(300)),
+                true,
+                || {},
+            )
+            .await?
+            .map(|(token, _)| token))
+    }
+
     pub(super) async fn access_with_login(
         &self,
         min_validity: Duration,
@@ -239,7 +254,7 @@ impl Gateway {
         path: PathBuf,
         min_validity: Duration,
     ) -> Result<Option<(String, String)>> {
-        self.access_with_login_at_before_barrier(path, min_validity, || {})
+        self.access_with_login_at_before_barrier(path, min_validity, false, || {})
             .await
     }
 
@@ -247,13 +262,17 @@ impl Gateway {
         &self,
         path: PathBuf,
         min_validity: Duration,
+        require_minimum: bool,
         before_barrier: impl FnOnce() + Send + 'static,
     ) -> Result<Option<(String, String)>> {
         let value = super::config::read_auth_object(&path).await?;
         let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
-        let min_validity = u64::try_from(min_validity.as_millis()).unwrap_or(u64::MAX);
+        // Pi refreshes OAuth credentials within five minutes of expiry even
+        // when the caller does not request a longer minimum.
+        let min_validity = u64::try_from(min_validity.max(Duration::from_secs(300)).as_millis())
+            .unwrap_or(u64::MAX);
         if credential.expires > now().saturating_add(min_validity) {
             return Ok(Some(credential.access()));
         }
@@ -304,6 +323,11 @@ impl Gateway {
                 data.insert("radius".into(), serde_json::to_value(&refreshed)?);
                 Ok(())
             })?;
+            if require_minimum && refreshed.expires <= now().saturating_add(min_validity) {
+                return Err(Error::Config(
+                    "Refreshed Radius credential expires too soon".into(),
+                ));
+            }
             Ok(Some(refreshed.access()))
         })
         .await
@@ -721,7 +745,7 @@ mod tests {
             let path = path.clone();
             async move {
                 gateway
-                    .access_with_login_at_before_barrier(path, Duration::ZERO, || {
+                    .access_with_login_at_before_barrier(path, Duration::ZERO, false, || {
                         let _ = started.send(());
                     })
                     .await
@@ -750,6 +774,92 @@ mod tests {
                 .is_err()
         );
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_rotated_token_and_checks_explicit_validity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for require_minimum in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin =
+                Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+                stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            });
+            let gateway = Gateway::build(origin, &[], None).unwrap();
+            let result = gateway
+                .access_with_login_at_before_barrier(
+                    path.clone(),
+                    Duration::from_secs(300),
+                    require_minimum,
+                    || {},
+                )
+                .await;
+            if require_minimum {
+                assert!(result.unwrap_err().to_string().contains("expires too soon"));
+            } else {
+                assert_eq!(result.unwrap().unwrap().0, "new");
+            }
+            server.await.unwrap();
+            let stored = super::super::config::read_auth_object(&path).await.unwrap();
+            assert_eq!(stored["radius"]["refresh"], "rotated");
+            assert_eq!(stored["radius"]["access"], "new");
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_access_refreshes_within_five_minutes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":now() + 120_000}}).to_string()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            gateway.access_with_login_at(path.clone(), Duration::ZERO),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, "new");
+        server.await.unwrap();
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(stored["radius"]["refresh"], "rotated");
     }
 
     #[tokio::test]

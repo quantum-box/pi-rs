@@ -1657,6 +1657,13 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Whether a registered extension without a source path is a host built-in.
+    pub fn extension_source_is_builtin(&self, id: &str) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.id() == id && extension.source_is_builtin())
+    }
+
     /// Register a model instance for recovery on a branch that selected it.
     pub fn register_branch_model(
         &self,

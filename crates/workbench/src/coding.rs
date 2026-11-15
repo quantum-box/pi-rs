@@ -1613,6 +1613,10 @@ struct LocalBashOperations {
     shell: ShellConfig,
 }
 
+const SHELL_POST_EXIT_IDLE: Duration = Duration::from_millis(100);
+// Bound completion even when a descendant writes continuously without a timeout.
+const SHELL_POST_EXIT_MAX: Duration = Duration::from_secs(2);
+
 #[async_trait::async_trait]
 impl BashOperations for LocalBashOperations {
     fn is_local(&self) -> bool {
@@ -1664,6 +1668,7 @@ impl BashOperations for LocalBashOperations {
         let mut stderr_buffer = [0u8; 8192];
         let mut status = None;
         let mut drain_deadline = None;
+        let mut drain_max = None;
         let deadline = async {
             match timeout {
                 Some(value) => tokio::time::sleep(value).await,
@@ -1671,35 +1676,61 @@ impl BashOperations for LocalBashOperations {
             }
         };
         tokio::pin!(deadline);
-        while status.is_none() || stdout_open || stderr_open {
+        'drain: while status.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                 _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
                 result = process.wait(), if status.is_none() => {
                     status = Some(result?);
-                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                 },
                 _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
+                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     let count = count?; stdout_open = count != 0;
                     if count != 0 {
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                            _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                            result = output.send(stdout_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
+                        if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                                result = process.wait(), if status.is_none() => {
+                                    status = Some(result?);
+                                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                                },
+                                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break 'drain,
+                                result = output.send(stdout_buffer[..count].to_vec()) => {
+                                    if result.is_err() { return Err(Error::Cancelled); }
+                                    break;
+                                },
+                            }
                         }
                     }
                 },
                 count = stderr.read(&mut stderr_buffer), if stderr_open => {
                     let count = count?; stderr_open = count != 0;
                     if count != 0 {
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                            _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                            result = output.send(stderr_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
+                        if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                                result = process.wait(), if status.is_none() => {
+                                    status = Some(result?);
+                                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                                },
+                                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break 'drain,
+                                result = output.send(stderr_buffer[..count].to_vec()) => {
+                                    if result.is_err() { return Err(Error::Cancelled); }
+                                    break;
+                                },
+                            }
                         }
                     }
                 },
@@ -2127,7 +2158,9 @@ impl Tool for CodingTool {
             Err(Error::Config(message))
                 if self.unrestricted
                     && matches!(self.kind, Kind::Read { .. })
-                    && message.starts_with("ENOENT: no such file or directory, access '") =>
+                    && (message.starts_with("ENOENT: no such file or directory, access '")
+                        || message.starts_with("ENOTDIR: not a directory, access '")
+                        || message.starts_with("EACCES: permission denied, access '")) =>
             {
                 Outcome::Failed(message)
             }
@@ -2238,6 +2271,23 @@ fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'st
         .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
 }
 
+fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(&mut get)
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn is_unix_access_denied(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EACCES)
+}
+
+#[cfg(not(unix))]
+fn is_unix_access_denied(_error: &std::io::Error) -> bool {
+    false
+}
+
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
@@ -2261,6 +2311,23 @@ impl CodingTool {
             {
                 Error::Config(format!(
                     "ENOENT: no such file or directory, access '{}'",
+                    path.display()
+                ))
+            } else if self.unrestricted
+                && cfg!(unix)
+                && error.kind() == std::io::ErrorKind::NotADirectory
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "ENOTDIR: not a directory, access '{}'",
+                    path.display()
+                ))
+            } else if self.unrestricted
+                && is_unix_access_denied(&error)
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "EACCES: permission denied, access '{}'",
                     path.display()
                 ))
             } else if error.kind() == std::io::ErrorKind::NotFound
@@ -2517,6 +2584,27 @@ impl CodingTool {
         }
         let display_path = string(args, "path")?;
         let path = self.path(display_path)?;
+        #[cfg(unix)]
+        if self.unrestricted {
+            use std::os::unix::ffi::OsStrExt;
+            let access_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|error| Error::Config(error.to_string()))?;
+            if unsafe { libc::access(access_path.as_ptr(), libc::R_OK) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EACCES) {
+                    let requested =
+                        crate::coding_paths::read_variant(crate::coding_paths::resolve(
+                            &self.root,
+                            &crate::coding_paths::normalize(display_path)?,
+                        ));
+                    return Err(Error::Config(format!(
+                        "EACCES: permission denied, access '{}'",
+                        requested.display()
+                    )));
+                }
+                return Err(error.into());
+            }
+        }
         if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
             if self.unrestricted
                 && matches!(
@@ -2676,11 +2764,7 @@ impl CodingTool {
             let entry = entry?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        let locale = ["LC_ALL", "LANG"]
-            .into_iter()
-            .filter_map(|key| std::env::var(key).ok())
-            .find(|value| !value.is_empty())
-            .unwrap_or_default();
+        let locale = directory_locale(|key| std::env::var(key).ok());
         let collator = directory_collator(&locale)?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
         let mut results = Vec::new();
@@ -3037,8 +3121,11 @@ impl CodingTool {
         let mut stdout_chunk = [0; 8192];
         let mut stderr_chunk = [0; 8192];
         let mut drain_deadline = None;
+        let mut drain_max = None;
         let mut cancelled = false;
         let mut timed_out = false;
+        #[cfg(all(test, unix))]
+        let mut drain_reason = "pipes closed";
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
         let mut stdout_filter = UserShellFilter::default();
@@ -3047,21 +3134,31 @@ impl CodingTool {
                 _ = cancellation.cancelled(), if !cancelled => {
                     cancelled = true;
                     process.terminate();
+                    if status.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                 }
                 _ = &mut deadline, if !cancelled => {
                     timed_out = true;
                     cancelled = true;
                     process.terminate();
+                    if status.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                 }
                 result = process.wait(), if status.is_none() => {
                     status = Some(result?);
                     process.finished = true;
                     // Descendants may retain inherited pipes after the shell exits.
-                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                 }
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
                     stdout_open = count != 0;
+                    if count != 0 && status.is_some() && !cancelled {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
@@ -3081,6 +3178,9 @@ impl CodingTool {
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
+                    if count != 0 && status.is_some() && !cancelled {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
@@ -3102,7 +3202,19 @@ impl CodingTool {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                } => break,
+                } => {
+                    #[cfg(all(test, unix))] { drain_reason = "idle deadline"; }
+                    break;
+                },
+                _ = async {
+                    match drain_max {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    #[cfg(all(test, unix))] { drain_reason = "maximum deadline"; }
+                    break;
+                },
             }
         }
         if let Some(input_task) = input_task {
@@ -3135,6 +3247,8 @@ impl CodingTool {
             output: output.finish()?,
             status: status.expect("shell status observed"),
             elapsed: started.elapsed().as_secs_f64(),
+            #[cfg(all(test, unix))]
+            drain_reason,
         })
     }
 }
@@ -3268,6 +3382,8 @@ struct ShellResult {
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
+    #[cfg(all(test, unix))]
+    drain_reason: &'static str,
 }
 
 struct UserShellFilter {
@@ -4438,6 +4554,127 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_non_directory_parent_with_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file"), "contents").unwrap();
+        std::os::unix::fs::symlink("file", root.join("alias")).unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"alias/child"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == &format!("ENOTDIR: not a directory, access '{}'", root.join("alias/child").display())),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_access_denied_with_requested_symlink_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        assert!(is_unix_access_denied(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!is_unix_access_denied(&std::io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("private");
+        let link = root.join("alias");
+        std::fs::write(&path, "contents").unwrap();
+        symlink("private", &link).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"alias"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Outcome::Failed(message)
+                if message == format!("EACCES: permission denied, access '{}'", link.display())));
+        } else {
+            assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        let path = parent.join("file");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&path, "contents").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Outcome::Failed(message)
+                if message == format!("EACCES: permission denied, access '{}'", path.display())));
+        } else {
+            assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn grep_single_file_uses_requested_symlink_name() {
         let root = tempfile::tempdir().unwrap();
@@ -5454,6 +5691,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn directory_locale_uses_node_message_locale_precedence() {
+        let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
+            directory_locale(|key| match key {
+                "LC_ALL" => all.map(str::to_owned),
+                "LC_MESSAGES" => messages.map(str::to_owned),
+                "LANG" => lang.map(str::to_owned),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")),
+            "sv_SE.UTF-8"
+        );
+        assert_eq!(
+            select(Some("en_US.UTF-8"), Some("sv_SE.UTF-8"), None),
+            "en_US.UTF-8"
+        );
+        assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
+        assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
+        let collator =
+            directory_collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8"))).unwrap();
+        assert!(collator.compare("z", "ä").is_lt());
+    }
+
     #[cfg(unix)]
     #[test]
     fn listing_a_symlink_to_a_file_reports_the_requested_path() {
@@ -6083,6 +6345,151 @@ mod tests {
         .unwrap();
         assert_eq!(result.output.script, "done");
         assert!(result.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_draining_active_descendants_after_exit() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let command = "python3 -c 'import os,time; parent=os.getppid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nend=time.monotonic()+.6; os.write(1,b\"out0\\n\"); os.write(2,b\"err0\\n\");\nwhile time.monotonic()<end:\n os.write(1,b\".\"); os.write(2,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass\nos.write(1,b\"out11\\n\"); os.write(2,b\"err11\\n\")' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0";
+        let local = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            local.shell(
+                &json!({"command":command}),
+                &pi_rs::CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.status.success());
+        assert!(
+            result.output.script.contains("out11\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
+        );
+        assert!(
+            result.output.script.contains("err11\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
+        );
+
+        let backend = create_bash_tool(
+            root.path(),
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            backend.invoke(
+                json!({"command":command}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let output = result.tool_content();
+        assert!(output.contains("out11\n"), "{output:?}");
+        assert!(output.contains("err11\n"), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_or_timed_out_shell_bounds_active_descendant_drain() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        // The child escapes the shell's process group and continues writing after
+        // the shell exits, so killing the group cannot close its inherited pipe.
+        let command = "python3 -c 'import os,time; parent=os.getppid(); os.setsid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nopen(\"active\",\"w\").close(); os.write(1,b\"0\\n\"); end=time.monotonic()+2\nwhile time.monotonic()<end:\n os.write(1,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass' & while [ ! -f ready ]; do sleep .01; done; exit 0";
+        let cancellation = pi_rs::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let ready = root.path().join("active");
+        let task = tokio::spawn(async move {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            cancel.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            tool.shell_stream(
+                &json!({"command":command}),
+                &cancellation,
+                &mut |_| {},
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("cancelled shell kept draining");
+        task.abort();
+        let _ = task.await;
+        let result = result.unwrap();
+        assert!(
+            result.cancelled,
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason, result.elapsed, result.output.script
+        );
+        std::fs::remove_file(root.path().join("ready")).unwrap();
+        std::fs::remove_file(root.path().join("active")).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            tool.shell_stream(
+                &json!({"command":command,"timeout":0.7}),
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("timed out shell kept draining");
+        let result = result.unwrap();
+        assert!(
+            result.timed_out && result.output.script.starts_with("0\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
+        );
     }
 
     #[tokio::test]

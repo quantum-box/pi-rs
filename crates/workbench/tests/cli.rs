@@ -10,6 +10,316 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn mcp_logout_local_targets_trusted_project_credentials() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    let auth = home.join("mcp-auth");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&auth).unwrap();
+    let global_url = "https://global.example/mcp";
+    let local_url = "https://local.example/mcp";
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url},"global-only":{"url":global_url}}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":local_url}}}).to_string(),
+    )
+    .unwrap();
+    let credential = |url| {
+        let digest = Sha256::digest(serde_json::to_vec(&("service", url)).unwrap());
+        auth.join(format!("{digest:x}.json"))
+    };
+    let global = credential(global_url);
+    let local = credential(local_url);
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(&local, "local").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        !run(&["--trust", "mcp", "logout", "global-only", "--local"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists() && local.exists());
+    let output = run(&["--trust", "mcp", "logout", "service", "-l"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(&local, "local").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(!output.status.success());
+    assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"type":"sse","url":global_url}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"exposure":"typo"}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"enabled":null,"exposure":null,"oauth":null,"description":null,"timeout":null}}}).to_string()).unwrap();
+    for project_config in [
+        json!({"mcpServers":{}}),
+        json!({"mcpServers":{"service":{"enabled":true}}}),
+    ] {
+        std::fs::write(project.join("mcp.json"), project_config.to_string()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        let output = run(&["--trust", "mcp", "logout", "service"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!global.exists());
+    }
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"oauth":{"callbackUrl":null,"callbackPort":null}}}}).to_string()).unwrap();
+    for project_config in [
+        json!({"mcpServers":{}}),
+        json!({"mcpServers":{"service":{"enabled":true}}}),
+    ] {
+        std::fs::write(project.join("mcp.json"), project_config.to_string()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        let output = run(&["--trust", "mcp", "logout", "service"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!global.exists());
+    }
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":true}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&global, "global").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&global, "global").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"headers":{"authorization":"Bearer static"}}}}).to_string()).unwrap();
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+}
+
+#[test]
+fn mcp_add_saves_stdio_and_http_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--cwd",
+            "subdir",
+            "--description",
+            "Local tools",
+            "--env",
+            "FIRST=one=two",
+            "--env",
+            "EMPTY=",
+            "--",
+            "server",
+            "--flag",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-First=one",
+            "--header",
+            "X-Second=two=three",
+            "--header",
+            "x-first=latest",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--description",
+            "Remote tools",
+        ],
+    ] {
+        let output = run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["local"],
+        json!({"command":"server", "args":["--flag"], "cwd":"subdir", "description":"Local tools", "env":{"FIRST":"one=two", "EMPTY":""}})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["headers"],
+        json!({"x-first":"latest", "x-second":"two=three", "Authorization":"Bearer ${TOKEN}"})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["description"],
+        "Remote tools"
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--cwd",
+            "dir",
+        ],
+        vec!["mcp", "add", "bad", "--header", "X=1", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--env",
+            "VAR=value",
+        ],
+        vec!["mcp", "add", "local", "--env", "=value", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "bad",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "Bad Name=value",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-Test=bad\nvalue",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "authorization=secret",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
 fn repeated_session_id_selects_the_last_journal() {
     let root = tempfile::tempdir().unwrap();
     let sessions = root.path().join("sessions");
@@ -1472,19 +1782,28 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         writeln!(
             input,
             "{}",
-            json!({"id": id, "type": "prompt", "message": "/trigger"})
+            json!({"id": id, "type": "prompt", "message": "/trigger", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
         )
         .unwrap();
         input.flush().unwrap();
         let mut started = false;
         loop {
             let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_ne!(event["message"]["role"], "user", "{event}");
             if event["type"] == "response" && event["id"] == id {
                 assert_eq!(event["data"]["disposition"], "started", "{event}");
                 started = true;
             }
             if event["type"] == "agent_end" {
                 assert!(started, "turn ended before prompt was acknowledged");
+                assert!(
+                    event["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|message| message["role"] != "user"),
+                    "{event}"
+                );
                 break;
             }
         }
@@ -1566,7 +1885,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     writeln!(
         input,
         "{}",
-        json!({"id":"context", "type":"prompt", "message":"/context"})
+        json!({"id":"context", "type":"prompt", "message":"/context", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
     )
     .unwrap();
     input.flush().unwrap();
@@ -5575,6 +5894,99 @@ else:
 
 #[cfg(unix)]
 #[test]
+fn rpc_discovered_prompt_reports_extension_source() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("fixture.js");
+    let prompt = root.path().join("discovered.md");
+    std::fs::write(&prompt, "---\ndescription: discovered prompt\n---\nHello").unwrap();
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request=json.load(sys.stdin)
+if request['type']=='describe': result={'id':'fixture','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True}
+elif request['type']=='discover_resources': result={'skillPaths':[],'promptPaths':['discovered.md'],'themePaths':[]}
+else: result=None
+print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--mode",
+                "rpc",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver.recv_timeout(remaining).unwrap();
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    let command = response["data"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "discovered")
+        .unwrap();
+    assert_eq!(
+        command["sourceInfo"],
+        json!({
+            "path":prompt.canonicalize().unwrap(), "source":"extension:fixture",
+            "scope":"temporary", "origin":"top-level", "baseDir":root.path().canonicalize().unwrap()
+        })
+    );
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "RPC process did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    assert!(status.success(), "RPC process exited with {status}");
+}
+
+#[cfg(unix)]
+#[test]
 fn resource_discovery_trigger_runs_before_print_prompt() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -6628,6 +7040,36 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn chatgpt_auth_check_no_refresh_uses_saved_credential() {
+    let root = tempfile::tempdir().unwrap();
+    let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":1,"scopes":["chatgpt.tokens.use.direct"]});
+    let auth = root.path().join("auth.json");
+    let original = json!({"openai-chatgpt":{"type":"oauth","credential":credential}}).to_string();
+    std::fs::write(&auth, &original).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--provider",
+            "openai-chatgpt",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "ready");
+    assert_eq!(std::fs::read_to_string(auth).unwrap(), original);
 }
 
 #[test]

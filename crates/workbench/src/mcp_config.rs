@@ -31,6 +31,8 @@ pub enum McpCommand {
     },
     Logout {
         name: String,
+        #[arg(short = 'l', long)]
+        local: bool,
     },
     Add {
         name: String,
@@ -38,6 +40,12 @@ pub enum McpCommand {
         local: bool,
         #[arg(long)]
         url: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
         #[arg(long)]
         bearer_token_env_var: Option<String>,
         /// Authenticate with credentials saved by mcp login.
@@ -58,8 +66,14 @@ pub enum McpCommand {
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    Ok(configurations_with_project_scope(args)?.0)
+}
+
+fn configurations_with_project_scope(
+    args: &Cli,
+) -> Result<(BTreeMap<String, Value>, BTreeSet<String>)> {
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeSet::new()));
     }
     let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
     let mut servers = user
@@ -67,13 +81,24 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let mut project_definitions = BTreeSet::new();
     if args.trusted {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
+            project_definitions.extend(entries.iter().filter_map(|(name, entry)| {
+                entry
+                    .as_object()
+                    .filter(|entry| {
+                        ["command", "url", "type"]
+                            .iter()
+                            .any(|key| entry.contains_key(*key))
+                    })
+                    .map(|_| name.clone())
+            }));
             merge_project_servers(&mut servers, entries)?;
         }
     }
-    Ok(servers.into_iter().collect())
+    Ok((servers.into_iter().collect(), project_definitions))
 }
 
 fn merge_project_servers(
@@ -187,8 +212,6 @@ fn valid_exposure(value: &Value) -> bool {
 }
 
 fn valid_oauth(value: &Value) -> bool {
-    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
-
     // Serde treats null in an optional member as absent, but Pi validates
     // explicitly supplied OAuth fields and rejects null values.
     if value
@@ -197,6 +220,11 @@ fn valid_oauth(value: &Value) -> bool {
     {
         return false;
     }
+    valid_inherited_oauth(value)
+}
+
+fn valid_inherited_oauth(value: &Value) -> bool {
+    use pi_rs_workbench::mcp_auth::{OAuthSetting, validate_oauth_client_settings};
     match serde_json::from_value::<OAuthSetting>(value.clone()) {
         Ok(OAuthSetting::Enabled(_)) => true,
         Ok(OAuthSetting::Client(client)) => validate_oauth_client_settings(&client).is_ok(),
@@ -375,6 +403,9 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             name,
             local,
             url,
+            cwd,
+            headers,
+            description,
             bearer_token_env_var,
             oauth,
             exposure,
@@ -398,8 +429,42 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             } else {
                 json!({"command":command[0],"args":command[1..]})
             };
+            if let Some(cwd) = cwd {
+                if value.get("command").is_none() {
+                    return Err(Error::Config("--cwd requires a stdio server".into()));
+                }
+                value["cwd"] = json!(cwd);
+            }
+            if let Some(description) = description {
+                value["description"] = json!(description);
+            }
+            if !headers.is_empty() {
+                if value.get("url").is_none() {
+                    return Err(Error::Config("--header requires an HTTP server".into()));
+                }
+                let mut map = serde_json::Map::new();
+                for item in headers {
+                    let (name, header_value) = item
+                        .split_once('=')
+                        .filter(|(name, _)| !name.is_empty())
+                        .ok_or_else(|| Error::Config("--header expects NAME=VALUE".into()))?;
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| Error::Config("invalid MCP header name".into()))?;
+                    http::header::HeaderValue::from_str(header_value)
+                        .map_err(|_| Error::Config("invalid MCP header value".into()))?;
+                    map.insert(name.as_str().into(), json!(header_value));
+                }
+                value["headers"] = Value::Object(map);
+            }
             if oauth {
-                if value.get("url").is_none() || bearer_token_env_var.is_some() {
+                if value.get("url").is_none()
+                    || bearer_token_env_var.is_some()
+                    || value["headers"].as_object().is_some_and(|headers| {
+                        headers
+                            .keys()
+                            .any(|name| name.eq_ignore_ascii_case("authorization"))
+                    })
+                {
                     return Err(Error::Config(
                         "--oauth requires --url and cannot use --bearer-token-env-var".into(),
                     ));
@@ -410,6 +475,11 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 value["exposure"] = json!(exposure);
             }
             if let Some(variable) = bearer_token_env_var {
+                if value.get("url").is_none() {
+                    return Err(Error::Config(
+                        "--bearer-token-env-var requires an HTTP server".into(),
+                    ));
+                }
                 if !variable
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -417,14 +487,36 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 {
                     return Err(Error::Config("invalid token environment variable".into()));
                 }
-                value["headers"] = json!({"Authorization":format!("Bearer ${{{variable}}}")});
+                let headers = value
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("headers")
+                    .or_insert_with(|| json!({}));
+                let headers = headers.as_object_mut().unwrap();
+                if headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(Error::Config(
+                        "--bearer-token-env-var cannot be combined with an Authorization header"
+                            .into(),
+                    ));
+                }
+                headers.insert(
+                    "Authorization".into(),
+                    json!(format!("Bearer ${{{variable}}}")),
+                );
             }
             if !environment.is_empty() {
+                if value.get("command").is_none() {
+                    return Err(Error::Config("--env requires a stdio server".into()));
+                }
                 let mut env = serde_json::Map::new();
                 for item in environment {
-                    let (name, value) = item
-                        .split_once('=')
-                        .ok_or_else(|| Error::Config("--env expects NAME=VALUE".into()))?;
+                    let (name, value) =
+                        item.split_once('=')
+                            .filter(|(name, _)| !name.is_empty())
+                            .ok_or_else(|| Error::Config("--env expects NAME=VALUE".into()))?;
                     env.insert(name.into(), json!(value));
                 }
                 value["env"] = Value::Object(env);
@@ -546,24 +638,79 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             })?;
             output(json!({"type":"mcp_logged_in","name":name}));
         }
-        McpCommand::Logout { name } => {
-            let servers = configurations(args)?;
-            let server: ServerConfig = serde_json::from_value(
-                servers
-                    .get(&name)
-                    .ok_or_else(|| Error::Config("MCP server is not configured".into()))?
-                    .clone(),
-            )?;
+        McpCommand::Logout { name, local } => {
+            let (servers, project_definitions) = configurations_with_project_scope(args)?;
+            if local && !project_definitions.contains(&name) {
+                return Err(Error::Config(format!(
+                    "MCP server {name} is not configured in the trusted project"
+                )));
+            }
+            let value = servers
+                .get(&name)
+                .ok_or_else(|| Error::Config("MCP server is not configured".into()))?;
+            for key in ["enabled", "exposure", "toolExposure", "oauth"] {
+                if !project_definitions.contains(&name)
+                    && matches!(key, "enabled" | "exposure" | "oauth")
+                    && value.get(key).is_some_and(Value::is_null)
+                {
+                    continue;
+                }
+                if key == "oauth"
+                    && !project_definitions.contains(&name)
+                    && value.get(key).is_some_and(valid_inherited_oauth)
+                {
+                    continue;
+                }
+                if value
+                    .get(key)
+                    .is_some_and(|field| !valid_override_value(key, field))
+                {
+                    return Err(Error::Config(format!("invalid MCP server field {key}")));
+                }
+            }
+            let inherited_global = !project_definitions.contains(&name);
+            if value
+                .get("description")
+                .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
+                || value.get("timeout").is_some_and(|field| {
+                    !(inherited_global && field.is_null()) && field.as_u64().is_none()
+                })
+            {
+                return Err(Error::Config("invalid MCP server configuration".into()));
+            }
+            let server: ServerConfig = serde_json::from_value(value.clone())?;
             if let Some(auth) = &server.auth {
                 return Err(Error::Config(format!(
                     "MCP {name} uses credentials from provider {}; sign out of that provider",
                     auth.provider
                 )));
             }
+            if server
+                .headers
+                .keys()
+                .any(|header| header.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(Error::Config(
+                    "MCP OAuth cannot be combined with an Authorization header".into(),
+                ));
+            }
+            if server.command.is_some()
+                || server
+                    .transport
+                    .as_deref()
+                    .is_some_and(|kind| !matches!(kind, "http" | "streamable-http"))
+            {
+                return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
+            }
             let url = server
                 .url
                 .as_deref()
                 .ok_or_else(|| Error::Config("MCP OAuth requires an HTTP server".into()))?;
+            let parsed = reqwest_mcp::Url::parse(url)
+                .map_err(|_| Error::Config("invalid MCP URL".into()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
+            }
             pi_rs_workbench::mcp_auth::logout(&name, url).await?;
             output(json!({"type":"mcp_logged_out","name":name}));
         }

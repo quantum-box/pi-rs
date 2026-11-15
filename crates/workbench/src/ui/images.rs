@@ -268,6 +268,16 @@ impl Default for Renderer {
     }
 }
 impl Renderer {
+    #[cfg(test)]
+    pub(crate) fn test_with_protocol(protocol: Option<Protocol>) -> Self {
+        Self {
+            protocol,
+            uploaded: BTreeSet::new(),
+            placed: BTreeSet::new(),
+            cleanup: Cleanup::default(),
+            crops: BTreeMap::new(),
+        }
+    }
     pub fn enabled(&self) -> bool {
         self.protocol.is_some()
     }

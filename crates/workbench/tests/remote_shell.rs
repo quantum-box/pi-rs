@@ -240,6 +240,40 @@ async fn coding_tools_share_transcripts_between_injected_backends() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn post_exit_drain_is_bounded_when_output_receiver_stalls() {
+    let root = tempfile::tempdir().unwrap();
+    let operations = pi_rs_workbench::coding::create_local_bash_operations(None);
+    let (output, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let context = ShellSpawnContext {
+        command: "printf '%*s' 12000 ''; while [ ! -f release ]; do sleep .01; done".into(),
+        cwd: root.path().to_owned(),
+        env: std::env::vars_os().collect(),
+    };
+    let task = tokio::spawn(async move {
+        operations
+            .exec(context, None, CancellationToken::new(), output)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while receiver.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Leave the receiver full long enough for the next send to block.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await
+    .unwrap();
+    std::fs::write(root.path().join("release"), "").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(4), task)
+        .await
+        .expect("stalled receiver prevented observing shell exit")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, Some(0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn continuous_descendant_output_cannot_starve_post_exit_drain_deadline() {
     let root = tempfile::tempdir().unwrap();
     let operations = pi_rs_workbench::coding::create_local_bash_operations(None);
