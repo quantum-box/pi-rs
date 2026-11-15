@@ -832,6 +832,8 @@ while scanning a single long line. Directory listing runs off the async
 runtime and checks for cancellation during enumeration and metadata reads.
 It sorts lowercased filenames with Unicode collation, using the process
 locale for language-specific ordering before applying the entry limit.
+Local and injected `ls` select the locale in Node's environment order:
+`LC_ALL`, `LC_MESSAGES`, then `LANG`, including an explicitly empty value.
 
 `read` returns bounded PNG image content for PNG, JPEG, GIF, WebP, BMP and TIFF
 inputs. It preserves alpha, avoids upscaling and reduces large images before
