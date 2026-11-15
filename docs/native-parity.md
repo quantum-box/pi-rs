@@ -4663,7 +4663,8 @@ thumbnailing and each PNG encoding attempt. Individual image operations remain
 synchronous and are interrupted at their checkpoints.
 
 SDK hosts can load ordered context-file snapshots from explicitly granted directories.
-Each directory uses Pi’s context filename precedence; hosts choose directories and
+Each directory uses Pi’s context filename precedence; repeated resolved files are
+loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.

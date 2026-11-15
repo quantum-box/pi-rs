@@ -68,7 +68,14 @@ pub struct ContextReadGrants {
 /// An immutable, ordered snapshot of context files.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContextResources {
-    pub files: Vec<PromptResource>,
+    pub files: Vec<ContextResource>,
+}
+
+/// A context file and the path used to read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextResource {
+    pub text: String,
+    pub path: PathBuf,
 }
 
 impl ContextReadGrants {
@@ -76,6 +83,7 @@ impl ContextReadGrants {
     /// a caller can retain its previous snapshot until it chooses to replace it.
     pub fn load(&self) -> Result<ContextResources> {
         let mut files = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for directory in &self.directories {
             for name in [
                 "AGENTS.override.md",
@@ -85,11 +93,16 @@ impl ContextReadGrants {
                 "CLAUDE.MD",
             ] {
                 let path = directory.join(name);
+                match std::fs::metadata(&path) {
+                    Ok(metadata) if !metadata.is_file() => continue,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                }
                 if let Some(text) = read_optional(&path)? {
-                    files.push(PromptResource {
-                        text,
-                        source: Some(path),
-                    });
+                    if seen.insert(path.canonicalize()?) {
+                        files.push(ContextResource { text, path });
+                    }
                     break;
                 }
             }
@@ -106,13 +119,11 @@ impl ContextResources {
         }
         let mut result = String::from("Project-specific instructions and guidelines:");
         for file in &self.files {
-            if let Some(path) = &file.source {
-                result.push_str(&format!(
-                    "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-                    path.display(),
-                    file.text
-                ));
-            }
+            result.push_str(&format!(
+                "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+                file.path.display(),
+                file.text
+            ));
         }
         result
     }

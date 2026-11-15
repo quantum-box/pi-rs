@@ -223,11 +223,12 @@ fn context_snapshots_use_granted_order_and_pi_filename_precedence() {
     let project = root.path().join("project");
     std::fs::create_dir_all(&global).unwrap();
     std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir(global.join("AGENTS.override.md")).unwrap();
     std::fs::write(global.join("CLAUDE.md"), "global").unwrap();
     std::fs::write(project.join("AGENTS.md"), "normal").unwrap();
     std::fs::write(project.join("AGENTS.override.md"), "\u{feff}override").unwrap();
     let grants = ContextReadGrants {
-        directories: vec![global.clone(), project.clone()],
+        directories: vec![global.clone(), project.clone(), global.clone()],
     };
     let snapshot = grants.load().unwrap();
     assert_eq!(
