@@ -776,6 +776,16 @@ pub(crate) fn resource_matches(
     let path = dunce::simplified(path);
     let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    // Upstream removes one leading ./ or .\ from exact overrides before
+    // expanding a tilde or converting a file URL.
+    let pattern = if exact {
+        pattern
+            .strip_prefix("./")
+            .or_else(|| pattern.strip_prefix(".\\"))
+            .unwrap_or(pattern)
+    } else {
+        pattern
+    };
     // Pi normalizes home-relative paths and file URLs before matching both
     // ordinary patterns and exact +/- overrides.
     let expanded = if pattern == "~"
@@ -801,7 +811,11 @@ pub(crate) fn resource_matches(
         .as_deref()
         .map(normalize)
         .unwrap_or_else(|| pattern.replace('\\', "/"));
-    let pattern = pattern.trim_start_matches("./").to_owned();
+    let pattern = if exact {
+        pattern
+    } else {
+        pattern.trim_start_matches("./").to_owned()
+    };
     let mut candidates = vec![
         normalize(path),
         normalize(path.strip_prefix(root).unwrap_or(path)),
@@ -2371,6 +2385,38 @@ mod tests {
             normalize_filter_home(Path::new(""), "a/../b"),
             PathBuf::from("b")
         );
+    }
+
+    #[test]
+    fn exact_resource_overrides_expand_after_one_relative_prefix() {
+        let home = filter_home_dir().expect("account home");
+        let home_path = normalize_filter_home(&home, "pi-filter-test/prompt.md");
+        let root = std::env::temp_dir();
+        let url_path = root.join("pi-filter-test").join("prompt space.md");
+        let url = reqwest::Url::from_file_path(&url_path).unwrap().to_string();
+
+        for (path, pattern) in [
+            (&home_path, "~/pi-filter-test/prompt.md".to_owned()),
+            (&url_path, url),
+        ] {
+            for prefix in ["./", ".\\"] {
+                let target = format!("{prefix}{pattern}");
+                assert!(!selected(path, &root, &[format!("-{target}")]));
+                assert!(selected(
+                    path,
+                    &root,
+                    &["!*.md".into(), format!("+{target}")]
+                ));
+                let filter = ResourceFilter::new(
+                    &json!({"autoload": false, "prompts": [format!("+{target}")]}),
+                    "prompts",
+                )
+                .unwrap();
+                assert!(filter.includes(path, &root, false));
+            }
+            // Upstream removes exactly one prefix, not an arbitrary number.
+            assert!(selected(path, &root, &[format!("-././{pattern}")]));
+        }
     }
 
     #[test]
