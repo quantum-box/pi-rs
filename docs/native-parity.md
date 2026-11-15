@@ -1231,6 +1231,11 @@ script line numbers. The native JSON code argument differs from Pi's
 provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
+Codemode supports OpenAI Decisions classifier models, including the pinned
+GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
+and the Decisions-specific 504 retry exclusion. Native image validation and
+endpoint-bound credentials continue to apply.
+
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
 `Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
 server-delay cap still applies to the parsed value.
