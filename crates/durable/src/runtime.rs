@@ -4119,24 +4119,21 @@ fn admit_task_draft(
     notify: &Option<SubmissionNotify>,
 ) -> Result<Uuid, crate::document::Error> {
     match draft {
-        crate::document::TaskSubmissionDraft::Continue => tx
-            .submit_continue(request_id.map(str::to_owned), notify.clone()),
-        crate::document::TaskSubmissionDraft::Input {
-            content,
-            options,
-        } => tx.submit_input(
+        crate::document::TaskSubmissionDraft::Continue => {
+            tx.submit_continue(request_id.map(str::to_owned), notify.clone())
+        }
+        crate::document::TaskSubmissionDraft::Input { content, options } => tx.submit_input(
             request_id.map(str::to_owned),
             content.clone(),
             *options,
             notify.clone(),
         ),
-        crate::document::TaskSubmissionDraft::Write { kind, data } => tx
-            .submit_write(
-                request_id.map(str::to_owned),
-                kind.clone(),
-                data.clone(),
-                notify.clone(),
-            ),
+        crate::document::TaskSubmissionDraft::Write { kind, data } => tx.submit_write(
+            request_id.map(str::to_owned),
+            kind.clone(),
+            data.clone(),
+            notify.clone(),
+        ),
     }
 }
 
@@ -4153,18 +4150,13 @@ fn check_submission_destination(
         return Ok(false);
     }
     if crate::task_store::TaskStore::new(store)
-        .read_typed_signal_state(
-            notify.task_id,
-            &submission_settled_signal(),
-            &notify.key,
-        )?
+        .read_typed_signal_state(notify.task_id, &submission_settled_signal(), &notify.key)?
         .is_some()
     {
         return Ok(false);
     }
     for (_, entry) in store.list(b"runtime/conversation/")? {
-        let conversation: Conversation =
-            serde_json::from_slice(&entry.value)?;
+        let conversation: Conversation = serde_json::from_slice(&entry.value)?;
         if conversation.has_submission_notification(notify) {
             return Ok(false);
         }
@@ -4195,22 +4187,18 @@ pub(crate) fn validate_task_submissions(
                 .state
                 .submissions
                 .iter()
-                .find(|submission| {
-                    submission.request_id.as_ref() == Some(request_id)
-                })
+                .find(|submission| submission.request_id.as_ref() == Some(request_id))
                 .map(|submission| submission.id)
                 .or_else(|| {
                     tx.state
                         .application_writes
                         .iter()
-                        .find(|write| {
-                            write.request_id.as_ref() == Some(request_id)
-                        })
+                        .find(|write| write.request_id.as_ref() == Some(request_id))
                         .map(|write| write.id)
                 });
-            if existing_id.is_some_and(|id| {
-                tx.state.submission_notification(id) != item.notify.as_ref()
-            }) {
+            if existing_id
+                .is_some_and(|id| tx.state.submission_notification(id) != item.notify.as_ref())
+            {
                 return Err(crate::document::Error::InvalidSessionAdmission(
                     "duplicate request has a different settlement notification".into(),
                 ));
@@ -4225,7 +4213,8 @@ pub(crate) fn validate_task_submissions(
             &item.draft,
             &item.notify,
         )?;
-        if cross_conversation && tx.table_written
+        if cross_conversation
+            && tx.table_written
             && let Some(notify) = &item.notify
         {
             let key = (notify.task_id, notify.key.clone());
@@ -4249,7 +4238,8 @@ pub(crate) fn validate_task_submissions(
                 "submission notification key is reserved".into(),
             ));
         }
-        if cross_conversation && tx.table_written
+        if cross_conversation
+            && tx.table_written
             && let Some(notify) = &item.notify
             && !check_submission_destination(store, notify)?
         {
@@ -4278,9 +4268,7 @@ fn check_task_notification_binding(
     Ok(())
 }
 
-fn reset_manifest_lookup_error(
-    error: crate::reset_manifest::LookupError,
-) -> Error {
+fn reset_manifest_lookup_error(error: crate::reset_manifest::LookupError) -> Error {
     match error {
         crate::reset_manifest::LookupError::Store(error)
         | crate::reset_manifest::LookupError::Transcript(crate::transcript::Error::Store(error)) => {
@@ -4355,9 +4343,11 @@ impl Harness {
             return Err(durable_store::Error::Conflict { key }.into());
         }
         // Recheck the exact persisted state and the selected adapter's capabilities.
-        let record = self.owner.store().get(&key)?.ok_or_else(|| {
-            DError::InvalidSessionAdmission("conversation missing".into())
-        })?;
+        let record = self
+            .owner
+            .store()
+            .get(&key)?
+            .ok_or_else(|| DError::InvalidSessionAdmission("conversation missing".into()))?;
         if record.version != version {
             return Err(durable_store::Error::Conflict { key }.into());
         }
@@ -4403,7 +4393,8 @@ impl Harness {
                 &item.draft,
                 &item.notify,
             )?;
-            if intent.cross_conversation && tx.table_written
+            if intent.cross_conversation
+                && tx.table_written
                 && let Some(notify) = &item.notify
             {
                 reservations.push((id, notify.clone()));
@@ -4424,33 +4415,23 @@ impl Harness {
                 key,
                 expected: Expected::Version(version),
             }];
-            merge_reset_proof_checks(
-                &mut checks,
-                cached_reset_proof_checks(&self.owner),
-            );
+            merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
             return Ok(crate::task_store::OwnedBatch {
                 checks,
                 mutations: vec![],
             });
         }
-        let prepared =
-            match self.prepare_save(&state, Expected::Version(version)) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    check_task_notification_binding(
-                        self.owner.store(),
-                        intent,
-                    )?;
-                    return Err(task_input_admission_error(error));
-                }
-            };
+        let prepared = match self.prepare_save(&state, Expected::Version(version)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                check_task_notification_binding(self.owner.store(), intent)?;
+                return Err(task_input_admission_error(error));
+            }
+        };
         let wake_key = task_input_wake_key(intent.conversation);
         let wake = self.owner.store().get(&wake_key)?;
         let mut checks = prepared.checks;
-        merge_reset_proof_checks(
-            &mut checks,
-            cached_reset_proof_checks(&self.owner),
-        );
+        merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
         let mut mutations = prepared.mutations;
         if !reservations.is_empty() {
             checks.push(Check {
@@ -4460,41 +4441,28 @@ impl Harness {
                 ),
             });
             for (id, notify) in reservations {
-                let revision_key =
-                    crate::task_store::signal_revision_key(notify.task_id);
+                let revision_key = crate::task_store::signal_revision_key(notify.task_id);
                 let revision = self.owner.store().get(&revision_key)?;
-                if !check_submission_destination(
-                    self.owner.store(),
-                    &notify,
-                )? {
-                    return Err(durable_store::Error::Conflict {
-                        key: revision_key,
-                    }
-                    .into());
+                if !check_submission_destination(self.owner.store(), &notify)? {
+                    return Err(durable_store::Error::Conflict { key: revision_key }.into());
                 }
                 if !checks.iter().any(|check| check.key == revision_key) {
                     checks.push(Check {
                         key: revision_key,
                         expected: revision
-                            .map_or(Expected::Missing, |entry| {
-                                Expected::Version(entry.version)
-                            }),
+                            .map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
                     });
                 }
                 // prepare_save has already fenced this exact missing binding.
                 mutations.push(Mutation::Put {
-                    key: crate::owned_subagent::notification_binding_key(
-                        &notify,
-                    ),
+                    key: crate::owned_subagent::notification_binding_key(&notify),
                     value: serde_json::to_vec(&(intent.conversation, id))?,
                 });
             }
         }
         checks.push(Check {
             key: wake_key.clone(),
-            expected: wake.map_or(Expected::Missing, |entry| {
-                Expected::Version(entry.version)
-            }),
+            expected: wake.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
         });
         mutations.push(Mutation::Put {
             key: wake_key,

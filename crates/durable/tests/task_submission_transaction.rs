@@ -4191,8 +4191,7 @@ fn cross_session_committed_action_wake_kill_worker() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reopen()
- {
+async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reopen() {
     use std::{
         io::{BufRead, BufReader},
         process::{Command, Stdio},
@@ -4225,8 +4224,7 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
         let stdout = child.stdout.take().unwrap();
         let (sent, received) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok)
-            {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if line.contains("CROSS_ACTION_WAKE_COMMITTED") {
                     let _ = sent.send(());
                     break;
@@ -4248,10 +4246,9 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
             "durable/owned-subagent-notify/{}/{hex}",
             Uuid::from_u128(10019)
         );
-        let binding: (Uuid, Uuid) = serde_json::from_slice(
-            &store.get(binding_key.as_bytes()).unwrap().unwrap().value,
-        )
-        .unwrap();
+        let binding: (Uuid, Uuid) =
+            serde_json::from_slice(&store.get(binding_key.as_bytes()).unwrap().unwrap().value)
+                .unwrap();
         assert_eq!(binding.0, target);
         assert!(
             TaskStore::new(&store)
@@ -4263,9 +4260,7 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
                 .unwrap()
                 .is_none()
         );
-        let scheduler =
-            pi_rs_durable::runtime::Scheduler::open(&path, options())
-                .unwrap();
+        let scheduler = pi_rs_durable::runtime::Scheduler::open(&path, options()).unwrap();
         let mut registry = Registry::default();
         registry.register("action", true, cross_action(target, write));
         let driver = scheduler.start_tasks(registry).unwrap();
@@ -4274,8 +4269,7 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
             loop {
                 let state = scheduler.conversation(target).unwrap();
                 let settled = if write {
-                    state.application_writes.len() == 1
-                        && state.application_writes[0].placed
+                    state.application_writes.len() == 1 && state.application_writes[0].placed
                 } else {
                     state.submissions.len() == 1
                         && matches!(
@@ -4286,13 +4280,8 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
                 let task_done = TaskStore::new(&store)
                     .load(task_id)
                     .unwrap()
-                    .is_some_and(|item| {
-                        matches!(item.task.state(), TaskState::Succeeded(_))
-                    });
-                if settled
-                    && task_done
-                    && store.get(wake.as_bytes()).unwrap().is_none()
-                {
+                    .is_some_and(|item| matches!(item.task.state(), TaskState::Succeeded(_)));
+                if settled && task_done && store.get(wake.as_bytes()).unwrap().is_none() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4302,30 +4291,17 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
         .expect("reopened scheduler did not drive committed target wake");
         let state = scheduler.conversation(target).unwrap();
         let receipt = TaskStore::new(&store)
-            .read_typed_signal(
-                task_id,
-                &submission_settled_signal(),
-                "action-settled",
-            )
+            .read_typed_signal(task_id, &submission_settled_signal(), "action-settled")
             .unwrap()
             .unwrap();
         assert_eq!(receipt["conversationId"], target.to_string());
         assert_eq!(receipt["id"], binding.1.to_string());
-        assert_eq!(
-            receipt["type"],
-            if write { "write" } else { "continue" }
-        );
+        assert_eq!(receipt["type"], if write { "write" } else { "continue" });
         if write {
             assert_eq!(state.application_writes.len(), 1);
-            assert_eq!(
-                receipt["entry"],
-                state.application_writes[0].id.to_string()
-            );
+            assert_eq!(receipt["entry"], state.application_writes[0].id.to_string());
             assert_eq!(state.application_writes[0].after_reset, last_reset);
-            assert_eq!(
-                state.resets.last().map(|reset| reset.id),
-                last_reset
-            );
+            assert_eq!(state.resets.last().map(|reset| reset.id), last_reset);
             assert_eq!(state.submissions.len(), 1);
         } else {
             assert_eq!(state.submissions.len(), 1);
@@ -4729,8 +4705,7 @@ fn cross_session_unkeyed_batch_kill_replays_once() {
     );
     let store = Store::open(&path).unwrap();
     let binding_key = |name: &str| {
-        let hex: String =
-            name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let hex: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
         format!(
             "durable/owned-subagent-notify/{}/{hex}",
             Uuid::from_u128(10031)
@@ -4738,8 +4713,7 @@ fn cross_session_unkeyed_batch_kill_replays_once() {
         .into_bytes()
     };
     assert!(store.get(&binding_key("one")).unwrap().is_none());
-    let membership =
-        pi_rs_durable::session_membership::SessionMembership::new(&store);
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
     membership.revoke(session, target).unwrap();
     membership.enroll(session, target).unwrap();
     let mut registry = Registry::default();
@@ -4759,8 +4733,7 @@ fn cross_session_unkeyed_batch_kill_replays_once() {
     assert_eq!(state.application_writes.len(), 3);
     assert_eq!(state.submissions.len(), 3);
     let binding = store.get(&binding_key("one")).unwrap().unwrap();
-    let bound: (Uuid, Uuid) =
-        serde_json::from_slice(&binding.value).unwrap();
+    let bound: (Uuid, Uuid) = serde_json::from_slice(&binding.value).unwrap();
     assert_eq!(bound, (target, state.application_writes[0].id));
 }
 
@@ -5158,7 +5131,16 @@ impl Handler for CrossReservationSteps {
             }));
         }
         for key in ["receipt", "pending", "unrelated"] {
-            assert!(docs.submit_write_to_session_conversation_without_request_id(self.0, "app.collision".into(), None, notify(key)).is_err(), "{key}");
+            assert!(
+                docs.submit_write_to_session_conversation_without_request_id(
+                    self.0,
+                    "app.collision".into(),
+                    None,
+                    notify(key)
+                )
+                .is_err(),
+                "{key}"
+            );
         }
         docs.submit_write_to_session_conversation(
             self.0,
@@ -5188,31 +5170,19 @@ fn task_notification_reservations_survive_steps_and_reopen() {
     assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
     assert!(
         TaskStore::new(&store)
-            .read_typed_signal(
-                child.id(),
-                &submission_settled_signal(),
-                "receipt"
-            )
+            .read_typed_signal(child.id(), &submission_settled_signal(), "receipt")
             .unwrap()
             .is_some()
     );
     assert!(
         TaskStore::new(&store)
-            .read_typed_signal(
-                child.id(),
-                &submission_settled_signal(),
-                "unrelated"
-            )
+            .read_typed_signal(child.id(), &submission_settled_signal(), "unrelated")
             .unwrap()
             .is_some()
     );
     assert!(
         TaskStore::new(&store)
-            .read_typed_signal(
-                child.id(),
-                &submission_settled_signal(),
-                "pending"
-            )
+            .read_typed_signal(child.id(), &submission_settled_signal(), "pending")
             .unwrap()
             .is_none()
     );
@@ -5252,18 +5222,16 @@ impl Handler for ReservationRace {
         task: &Task,
         docs: &mut TaskDocuments<'_>,
     ) -> Result<Step, String> {
-        let result = docs
-            .submit_write_to_session_conversation_without_request_id(
-                self.target,
-                "app.race".into(),
-                None,
-                Some(SubmissionNotify {
-                    task_id: task.id(),
-                    key: "raced".into(),
-                }),
-            );
-        let call =
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = docs.submit_write_to_session_conversation_without_request_id(
+            self.target,
+            "app.race".into(),
+            None,
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: "raced".into(),
+            }),
+        );
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call > 0 {
             assert!(result.is_err());
             return Ok(Step::Succeed(json!("collision")));

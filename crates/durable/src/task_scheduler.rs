@@ -18555,22 +18555,16 @@ mod standalone_foreground_cleanup_tests {
     fn cross_notification_reservation_fences_signal_at_commit() {
         use crate::document::{Address, Documents, TaskDocuments};
         use crate::runtime::{
-            Config, Harness, Options, SubmissionNotify,
-            submission_settled_signal,
+            Config, Harness, Options, SubmissionNotify, submission_settled_signal,
         };
         use crate::task_store::{Signal, TaskStore};
         use async_trait::async_trait;
-        use pi_rs_core::{
-            Error as ModelError, Model, ModelRequest, ModelStream,
-        };
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         struct Stub;
         #[async_trait]
         impl Model for Stub {
-            async fn stream(
-                &self,
-                _: ModelRequest,
-            ) -> Result<ModelStream, ModelError> {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
                 unreachable!()
             }
         }
@@ -18589,8 +18583,13 @@ mod standalone_foreground_cleanup_tests {
             ) -> Result<Step, String> {
                 let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
                 let result = docs.submit_write_to_session_conversation_without_request_id(
-                    self.target, "app.reservation".into(), None,
-                    Some(SubmissionNotify { task_id: task.id(), key: "collision".into() }),
+                    self.target,
+                    "app.reservation".into(),
+                    None,
+                    Some(SubmissionNotify {
+                        task_id: task.id(),
+                        key: "collision".into(),
+                    }),
                 );
                 if attempt > 0 {
                     assert!(result.is_err());
@@ -18623,8 +18622,7 @@ mod standalone_foreground_cleanup_tests {
                 tools: vec![],
                 restart_limit: 3,
                 max_turns: 3,
-                uncertain_policy:
-                    crate::recovery::UncertainPolicy::InterruptedResult,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
             },
         )
         .unwrap();
@@ -18636,8 +18634,7 @@ mod standalone_foreground_cleanup_tests {
         let owner = harness.create_conversation(config()).unwrap();
         let target = harness.create_conversation(config()).unwrap();
         let store = durable_store::Store::open(&path).unwrap();
-        let sessions =
-            crate::session_membership::SessionMembership::new(&store);
+        let sessions = crate::session_membership::SessionMembership::new(&store);
         let session = sessions.create().unwrap();
         sessions.enroll(session, owner).unwrap();
         sessions.enroll(session, target).unwrap();
@@ -18700,11 +18697,7 @@ mod standalone_foreground_cleanup_tests {
         assert!(Documents::new(&store).get(&address).unwrap().is_none());
         assert!(
             TaskStore::new(&store)
-                .read_typed_signal(
-                    writer.id(),
-                    &submission_settled_signal(),
-                    "collision"
-                )
+                .read_typed_signal(writer.id(), &submission_settled_signal(), "collision")
                 .unwrap()
                 .is_some()
         );
