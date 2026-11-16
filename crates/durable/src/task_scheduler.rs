@@ -1088,11 +1088,14 @@ pub struct Scheduler {
     validator: Option<crate::runtime::Harness>,
     poisoned: Arc<std::sync::atomic::AtomicBool>,
     reservations_stopped: bool,
+    reservation_stop: Arc<std::sync::atomic::AtomicBool>,
     failed_migrations: HashMap<Uuid, (Arc<()>, String)>,
     // Interrupted invocations held until pending fail-fast marks have landed.
     deferred_recovery: HashSet<Uuid>,
     #[cfg(test)]
     result_commit_hook: Option<CommitHook>,
+    #[cfg(test)]
+    reservation_commit_hook: Option<CommitHook>,
     #[cfg(test)]
     after_result_load_hook: Option<CommitHook>,
     #[cfg(test)]
@@ -1986,6 +1989,26 @@ impl Scheduler {
     /// still settle while the scheduler remains healthy.
     pub fn stop_reservations(&mut self) {
         self.reservations_stopped = true;
+        self.reservation_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn has_live_invocations(&self) -> Result<bool, Error> {
+        Ok(!self
+            .live_invocations
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .attempts
+            .is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reservation_commit_hook(&mut self, hook: CommitHook) {
+        self.reservation_commit_hook = Some(hook);
+    }
+
+    pub(crate) fn reservation_stop_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.reservation_stop.clone()
     }
 
     /// Reserve one independent conversation-root task without running graph
@@ -1995,7 +2018,11 @@ impl Scheduler {
         let fence = self.failure_fence.clone();
         let _failure = fence.lock().map_err(|_| Error::Poisoned)?;
         self.check()?;
-        if self.reservations_stopped {
+        if self.reservations_stopped
+            || self
+                .reservation_stop
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(Error::Stopped);
         }
         let owner = self.owner();
@@ -2125,10 +2152,13 @@ impl Scheduler {
             validator: None,
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reservations_stopped: false,
+            reservation_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_migrations: HashMap::new(),
             deferred_recovery: HashSet::new(),
             #[cfg(test)]
             result_commit_hook: None,
+            #[cfg(test)]
+            reservation_commit_hook: None,
             #[cfg(test)]
             after_result_load_hook: None,
             #[cfg(test)]
@@ -2358,6 +2388,12 @@ impl Scheduler {
                 )
             }))
             .unwrap_or_else(|_| Err("migration panicked".into()));
+            if self
+                .reservation_stop
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(Error::Stopped);
+            }
             match result {
                 Ok((input, checkpoint)) => next.task.migrate(version, input, checkpoint),
                 Err(error) => {
@@ -2380,6 +2416,20 @@ impl Scheduler {
             .store(true, std::sync::atomic::Ordering::Release);
         let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
         batch.checks.extend(child_checks);
+        #[cfg(test)]
+        if let Some(hook) = &self.reservation_commit_hook {
+            hook(0, self.ts().store());
+        }
+        // Reservation starts at this fenced stop check. A concurrent stop
+        // after it joins this already-started reservation.
+        if self
+            .reservation_stop
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.poisoned
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(Error::Stopped);
+        }
         match self.ts().store().commit(&batch.checks, &batch.mutations) {
             Ok(()) => (),
             Err(durable_store::Error::Conflict { .. }) => {
@@ -2699,7 +2749,11 @@ impl Scheduler {
             fence.lock().map_err(|_| Error::Poisoned)?
         };
         self.check()?;
-        if self.reservations_stopped {
+        if self.reservations_stopped
+            || self
+                .reservation_stop
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(Error::Stopped);
         }
         let owner = self.owner();

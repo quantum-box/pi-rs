@@ -38,6 +38,7 @@ pub enum Error {
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
     failure_publication: task_scheduler::FailurePublication,
+    reservation_stop: Arc<std::sync::atomic::AtomicBool>,
     activity: crate::worker_activity::WorkerActivity,
     wake_reader: task_scheduler::WakeReader,
     owner: Arc<OwnedStore>,
@@ -148,6 +149,7 @@ impl Driver {
         // Seed the subscription so recovery before subscription cannot be missed.
         let _ = notify_tx.try_send(());
         let shared = Arc::new(Shared {
+            reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             activity,
@@ -173,6 +175,9 @@ impl Driver {
                 fn drop(&mut self) {
                     if std::thread::panicking() {
                         self.0.failure_publication.indeterminate(|| {
+                            self.0
+                                .reservation_stop
+                                .store(true, std::sync::atomic::Ordering::Release);
                             if let Ok(mut state) = self.0.state.lock() {
                                 state.stop = true;
                                 state.failure = Some("task worker panicked".into());
@@ -213,6 +218,9 @@ impl Driver {
                             continue;
                         }
                         Err(error) => {
+                            task_shared
+                                .reservation_stop
+                                .store(true, std::sync::atomic::Ordering::Release);
                             if let Ok(mut state) = task_shared.state.lock() {
                                 state.failure.get_or_insert(error);
                                 state.stop = true;
@@ -238,6 +246,9 @@ impl Driver {
                     }
                     Ok(false) => {}
                     Err(error) => {
+                        task_shared
+                            .reservation_stop
+                            .store(true, std::sync::atomic::Ordering::Release);
                         if let Ok(mut state) = task_shared.state.lock() {
                             state.failure.get_or_insert(error);
                             state.stop = true;
@@ -357,29 +368,72 @@ impl Driver {
             .as_ref()
             .map(|h| h.lock().map(|h| h.worker()).map_err(|_| Error::Poisoned))
             .transpose()?;
-        let mut scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
-        let mut state = self.check()?;
-        let _gate = self
+        loop {
+            let mut scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
+            let failure = match self.shared.failure_publication.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    drop(scheduler);
+                    self.wait_for_registry_boundary()?;
+                    continue;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+            };
+            if scheduler.has_live_invocations()? {
+                drop(failure);
+                drop(scheduler);
+                self.wait_for_registry_boundary()?;
+                continue;
+            }
+            let mut state = self.check()?;
+            let gate = self
+                .shared
+                .owner
+                .task_gate()
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            if let Some(harness) = &validator {
+                harness.validate_task_tool_registry(&registry)?;
+            }
+            let result = scheduler.replace_registry_locked(registry.clone());
+            if matches!(result, Err(task_scheduler::Error::Busy)) {
+                drop(gate);
+                drop(state);
+                drop(failure);
+                drop(scheduler);
+                self.wait_for_registry_boundary()?;
+                continue;
+            }
+            state.policies = scheduler.policies();
+            state.definitions = scheduler.definitions();
+            if let Err(error) = result {
+                state.failure = Some(error.to_string());
+                state.stop = true;
+                self.shared
+                    .reservation_stop
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.shared.wake.notify_all();
+                self.shared.activity.notify();
+                self.shared.close_notifications();
+                return Err(error.into());
+            }
+            self.shared.notify_work();
+            return Ok(());
+        }
+    }
+
+    fn wait_for_registry_boundary(&self) -> Result<(), Error> {
+        let state = self.check()?;
+        let (state, _) = self
             .shared
-            .owner
-            .task_gate()
-            .lock()
+            .wake
+            .wait_timeout(state, Duration::from_millis(100))
             .map_err(|_| Error::Poisoned)?;
-        if let Some(harness) = validator {
-            harness.validate_task_tool_registry(&registry)?;
+        if state.stop {
+            return Err(Error::Stopped(
+                state.failure.clone().unwrap_or_else(|| "shutdown".into()),
+            ));
         }
-        let result = scheduler.replace_registry_locked(registry);
-        state.policies = scheduler.policies();
-        state.definitions = scheduler.definitions();
-        if let Err(error) = result {
-            state.failure = Some(error.to_string());
-            state.stop = true;
-            self.shared.wake.notify_all();
-            self.shared.activity.notify();
-            self.shared.close_notifications();
-            return Err(error.into());
-        }
-        self.shared.notify_work();
         Ok(())
     }
 
@@ -544,6 +598,9 @@ impl Driver {
         self.stop_worker();
     }
     fn stop_worker(&self) {
+        self.shared
+            .reservation_stop
+            .store(true, std::sync::atomic::Ordering::Release);
         self.shared.close_notifications();
         if let Ok(mut state) = self.shared.state.lock() {
             state.stop = true;
@@ -672,6 +729,9 @@ fn cleanup_loop(shared: Arc<Shared>) {
 }
 fn fail_cleanup(shared: &Shared, error: String) {
     shared.failure_publication.indeterminate(|| {
+        shared
+            .reservation_stop
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Ok(mut state) = shared.state.lock() {
             state.failure = Some(error);
             state.stop = true;
@@ -714,7 +774,16 @@ impl Shared {
             return Ok(false);
         }
         let result = (|| -> Result<bool, String> {
-            let reservation = scheduler.reserve_tick(now).map_err(|e| e.to_string())?;
+            let reservation = match scheduler.reserve_tick(now) {
+                Err(task_scheduler::Error::Stopped)
+                    if self
+                        .reservation_stop
+                        .load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    return Ok(false);
+                }
+                other => other.map_err(|e| e.to_string())?,
+            };
             match reservation {
                 task_scheduler::TickReservation::Progress(progress) => Ok(progress),
                 task_scheduler::TickReservation::Maintenance(_) => {
@@ -727,6 +796,8 @@ impl Shared {
             }
         })();
         if let Err(error) = &result {
+            self.reservation_stop
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Ok(mut state) = self.state.lock() {
                 state.failure.get_or_insert_with(|| error.clone());
                 state.stop = true;
@@ -1002,6 +1073,173 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn shutdown_fences_migration_and_last_reservation_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for boundary in ["migration", "commit"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release = Arc::new(Mutex::new(release_rx));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = calls.clone();
+            let mut registry = task_scheduler::Registry::default();
+            if boundary == "migration" {
+                let release = release.clone();
+                let migration_entered = entered_tx.clone();
+                registry.register_versioned(
+                    "work",
+                    2,
+                    false,
+                    move |_: &Task| {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(task_scheduler::Step::Succeed(json!(null)))
+                    },
+                    Some(Arc::new(move |input, checkpoint, _| {
+                        migration_entered.send(()).unwrap();
+                        release.lock().unwrap().recv().unwrap();
+                        Ok((input.clone(), checkpoint.clone()))
+                    })),
+                );
+            } else {
+                registry.register("work", false, move |_: &Task| {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(task_scheduler::Step::Succeed(json!(null)))
+                });
+            }
+            let mut scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let owner = scheduler.owner();
+            let task = Task::new(
+                Uuid::from_u128(1),
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), false);
+            TaskStore::new(owner.store())
+                .save(&[Save::Create(&task)])
+                .unwrap();
+            if boundary == "commit" {
+                let release = release.clone();
+                scheduler.set_reservation_commit_hook(Arc::new(move |_, _| {
+                    entered_tx.send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                }));
+            }
+            let driver = Driver::start(scheduler);
+            let shared = driver.shared.clone();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let shutdown =
+                thread::spawn(move || done_tx.send(driver.shutdown_with_pending()).unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !shared.reservation_stop.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline);
+                thread::yield_now();
+            }
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            release_tx.send(()).unwrap();
+            let report = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            shutdown.join().unwrap();
+            assert!(report.failure().is_none());
+            assert!(report.pending().is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let stored = TaskStore::new(owner.store())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .task;
+            assert_eq!(stored.state(), &TaskState::Ready);
+            assert!(stored.attempt_id().is_none());
+            assert_eq!(stored.definition_version(), 1);
+        }
+    }
+
+    #[test]
+    fn registry_replacement_waits_for_detached_live_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", false, move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("old")))
+        });
+        let mut scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+        let task_scheduler::TickReservation::Invocation(invocation) =
+            scheduler.reserve_tick(0).unwrap()
+        else {
+            panic!("reservation")
+        };
+        let execution = thread::spawn(move || invocation.execute().unwrap());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let driver = Arc::new(Driver::start(scheduler));
+        let replacing = driver.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let replacement = thread::spawn(move || {
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("work", false, |_: &Task| {
+                Ok(task_scheduler::Step::Succeed(json!("new")))
+            });
+            started_tx.send(()).unwrap();
+            done_tx.send(replacing.replace_registry(registry)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!driver.shared.state.lock().unwrap().stop);
+        release_tx.send(()).unwrap();
+        let completed = execution.join().unwrap();
+        driver
+            .shared
+            .scheduler
+            .lock()
+            .unwrap()
+            .settle_invocation(completed)
+            .unwrap();
+        driver.shared.wake.notify_all();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        replacement.join().unwrap();
+        assert!(!driver.shared.state.lock().unwrap().stop);
+        assert_eq!(
+            driver.get(task.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("old"))
+        );
+        Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+    }
 
     #[test]
     fn shutdown_transfers_uncertain_outcome_and_keeps_attachment() {
@@ -1431,6 +1669,7 @@ mod tests {
                 state: Mutex::new(State::default()),
                 wake_reader: scheduler.wake_reader(),
                 activity: scheduler.worker_activity(),
+                reservation_stop: scheduler.reservation_stop_token(),
                 failure_publication: scheduler.failure_publication(),
                 scheduler: Mutex::new(scheduler),
                 pending: Mutex::new(Vec::new()),
@@ -1596,6 +1835,7 @@ mod tests {
             state: Mutex::new(State::default()),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             pending: Mutex::new(Vec::new()),
@@ -1815,6 +2055,7 @@ mod tests {
             owner,
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             state: Mutex::new(State::default()),
@@ -1915,6 +2156,7 @@ mod tests {
             state: Mutex::new(State::default()),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             pending: Mutex::new(Vec::new()),
@@ -1990,6 +2232,7 @@ mod tests {
             }),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             pending: Mutex::new(Vec::new()),
@@ -2273,6 +2516,7 @@ mod tests {
             }),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             pending: Mutex::new(Vec::new()),
