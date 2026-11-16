@@ -292,7 +292,7 @@ async fn invalid_sleep_is_a_hooked_tool_result_and_does_not_dispatch() {
                 }
             }
         }
-        let mut h = Harness::open_paused(&path, options(model, tool.clone())).unwrap();
+        let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
         if interrupted {
             assert!(h.conversation(id).unwrap().tool_results.is_empty());
         }
@@ -311,6 +311,7 @@ async fn invalid_sleep_is_a_hooked_tool_result_and_does_not_dispatch() {
             .unwrap();
         let c = h.conversation(id).unwrap();
         assert_eq!(tool_message(&c), "invalid gate handled");
+        assert!(model.0.lock().unwrap().iter().flat_map(|request| &request.messages).any(|message| matches!(message, Message::Tool { content, .. } if content == "invalid gate handled")));
         assert!(c.tool_results[0].is_error);
         assert_eq!(
             c.tool_results[0].diagnostics[0].code.as_deref(),
@@ -951,8 +952,18 @@ async fn extension_tool_and_generation_hooks_are_used() {
         .await
         .unwrap();
     assert_eq!(*tool.0.lock().unwrap(), vec![json!({"n":1})]);
-    assert_eq!(tool_message(&h.conversation(id).unwrap()), "hooked: ok");
+    let conversation = h.conversation(id).unwrap();
+    assert_eq!(tool_message(&conversation), "hooked: ok");
+    assert!(
+        conversation.tool_results[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("output_redacted"))
+    );
     let requests = model.0.lock().unwrap();
+    assert!(requests.iter().flat_map(|request| &request.messages).any(
+        |message| matches!(message, Message::Tool { content, .. } if content == "hooked: ok")
+    ));
     assert_eq!(requests[0].tools[0].name, "test");
     assert!(
         requests[0]
@@ -4234,4 +4245,107 @@ async fn yield_child_persists_ordered_blocks_for_durable_provider() {
         binding
     );
     driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn unmodified_invalid_gate_diagnostic_reaches_model() {
+    struct InvalidGate;
+    #[async_trait]
+    impl Hook for InvalidGate {
+        async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+            Ok(BeforeTool::Sleep(Sleep {
+                signals: vec![],
+                until_millis: None,
+            }))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let mut h =
+        Harness::open_paused(dir.path().join("db"), options(model.clone(), tool.clone())).unwrap();
+    h.install_extension(ext("gate", "p", Arc::new(InvalidGate)))
+        .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["gate".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(tool.0.lock().unwrap().is_empty());
+    let state = h.conversation(id).unwrap();
+    assert!(
+        state.tool_results[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("invalid_park"))
+    );
+    assert!(model.0.lock().unwrap().iter().flat_map(|request| &request.messages).any(|message| matches!(message, Message::Tool { content, .. } if content.contains("[error] Tool call") && content.contains("cannot wait at its gates"))));
+}
+
+#[tokio::test]
+async fn block_hook_retains_invalid_gate_metadata_without_exposing_reason() {
+    struct GateAndRedact;
+    #[async_trait]
+    impl Hook for GateAndRedact {
+        async fn before_tool(&self, _: &HookCall, _: &Context<'_>) -> Result<BeforeTool, String> {
+            Ok(BeforeTool::Sleep(Sleep {
+                signals: vec![],
+                until_millis: None,
+            }))
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            true
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            result: &pi_rs_durable::extension::ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<pi_rs_durable::extension::ToolBlockResult>, String> {
+            let mut result = result.clone();
+            result.output = vec![json!({"type":"text","text":"gate handled"})];
+            Ok(Some(result))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(FakeModel::default());
+    let tool = Arc::new(FakeTool::default());
+    let mut h = Harness::open_paused(&path, options(model.clone(), tool.clone())).unwrap();
+    h.install_extension(ext("gate", "p", Arc::new(GateAndRedact)))
+        .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["gate".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(tool.0.lock().unwrap().is_empty());
+    let state = h.conversation(id).unwrap();
+    assert_eq!(tool_message(&state), "gate handled");
+    assert!(
+        state.tool_results[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("invalid_park"))
+    );
+    assert!(
+        model
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|r| &r.messages)
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "gate handled"))
+    );
+    drop(h);
+    let h = Harness::open_paused(&path, options(model, tool)).unwrap();
+    let reopened = h.conversation(id).unwrap();
+    assert_eq!(tool_message(&reopened), "gate handled");
+    assert!(
+        reopened.tool_results[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("invalid_park"))
+    );
 }

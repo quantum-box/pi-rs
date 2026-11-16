@@ -5900,3 +5900,52 @@ async fn legacy_finished_abort_with_hooks_redacts_published_metadata_and_content
     assert!(requests.iter().flat_map(|request| &request.messages).any(|message| matches!(message, Message::Tool { content, .. } if content.contains("tool result unavailable after abort before hooks"))));
     assert!(!format!("{requests:?}").contains("private"));
 }
+
+#[test]
+fn host_only_redaction_notice_does_not_hide_explicit_identical_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, _) = h.load(id).unwrap();
+    let calls = vec![ToolCall {
+        id: "call".into(),
+        name: "tool".into(),
+        arguments: "{}".into(),
+    }];
+    let explicit = ToolDiagnostic {
+        severity: DiagnosticSeverity::Info,
+        code: Some("output_redacted".into()),
+        message: "tool metadata withheld after output replacement".into(),
+    };
+    record_tool_result(
+        &mut state,
+        &calls,
+        0,
+        Uuid::new_v4(),
+        &Outcome::Succeeded("ok".into()),
+        vec![explicit],
+    )
+    .unwrap();
+    let metadata = &mut state.tool_results[0];
+    assert!(
+        render_metadata_diagnostics(metadata, &[])
+            .unwrap()
+            .contains("tool metadata withheld")
+    );
+    redact_tool_metadata(
+        metadata,
+        "output_redacted",
+        "tool metadata withheld after output replacement",
+    );
+    assert!(render_metadata_diagnostics(metadata, &[]).is_none());
+    assert_eq!(
+        metadata.diagnostics[0].code.as_deref(),
+        Some("output_redacted")
+    );
+}

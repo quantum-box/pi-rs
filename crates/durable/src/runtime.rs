@@ -1349,6 +1349,31 @@ fn render_tool_diagnostics(diagnostics: &[ToolDiagnostic]) -> Option<String> {
     (!lines.is_empty()).then(|| format!("<harness>\n{}\n</harness>", lines.join("\n")))
 }
 
+// `output_redacted` is a pi-rs host notification, not a tool diagnostic.
+// Gate reasons retained for host metadata can also be withheld after a hook
+// replaces their output. Remove occurrences, not every equal explicit event.
+fn render_metadata_diagnostics(
+    metadata: &ToolResultMetadata,
+    withheld: &[ToolDiagnostic],
+) -> Option<String> {
+    let mut diagnostics = metadata.diagnostics.clone();
+    if metadata.redacted
+        && let Some(index) = diagnostics.iter().position(|d| {
+            d.severity == DiagnosticSeverity::Info
+                && d.code.as_deref() == Some("output_redacted")
+                && d.message == "tool metadata withheld after output replacement"
+        })
+    {
+        diagnostics.remove(index);
+    }
+    for diagnostic in withheld {
+        if let Some(index) = diagnostics.iter().rposition(|item| item == diagnostic) {
+            diagnostics.remove(index);
+        }
+    }
+    render_tool_diagnostics(&diagnostics)
+}
+
 fn append_diagnostic_text(content: &mut String, diagnostic: &str) {
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
@@ -3985,7 +4010,7 @@ impl Harness {
             .tool_results
             .iter()
             .find(|m| m.operation_id == operation_id)
-            && let Some(diagnostic) = render_tool_diagnostics(&metadata.diagnostics)
+            && let Some(diagnostic) = render_metadata_diagnostics(metadata, &[])
         {
             append_diagnostic_text(&mut content, &diagnostic);
         }
@@ -14233,9 +14258,24 @@ impl Harness {
                     });
                     let mut derived = Vec::new();
                     let mut explicit_diagnostics = Vec::new();
+                    let mut gate_diagnostics = Vec::new();
+                    let mut host_notice = None;
                     if let Some(mut metadata) = metadata {
                         (derived, explicit_diagnostics) =
                             diagnostic_origins(&c, operation_id, &metadata.diagnostics);
+                        // A proved gate rejection is host metadata even when a
+                        // rich or block hook replaces its model-facing text.
+                        if c.pending_diagnostic_provenance
+                            .as_ref()
+                            .is_some_and(|p| p.operation_id == operation_id)
+                        {
+                            gate_diagnostics = derived
+                                .iter()
+                                .filter(|d| d.code.as_deref() == Some("invalid_park"))
+                                .cloned()
+                                .collect();
+                            derived.retain(|d| d.code.as_deref() != Some("invalid_park"));
+                        }
                         if let Some(diagnostic) = &interrupted_truncation
                             && let Some(index) = metadata
                                 .diagnostics
@@ -14251,6 +14291,7 @@ impl Harness {
                                 "output_redacted",
                                 "tool metadata withheld after output replacement",
                             );
+                            host_notice = metadata.diagnostics.first().cloned();
                         }
                         if let Some(proof) = &result_limits
                             && (proof.prebounded.is_some()
@@ -14456,7 +14497,16 @@ impl Harness {
                             );
                             append_harness_diagnostic(metadata, diagnostic);
                         }
-                        if let Some(diagnostic) = render_tool_diagnostics(&metadata.diagnostics) {
+                        let mut withheld = Vec::new();
+                        if !retained_output_unchanged {
+                            withheld.extend(gate_diagnostics.iter().cloned());
+                        }
+                        if !metadata.redacted
+                            && let Some(notice) = &host_notice
+                        {
+                            withheld.push(notice.clone());
+                        }
+                        if let Some(diagnostic) = render_metadata_diagnostics(metadata, &withheld) {
                             if block_result.output.len() == 1
                                 && block_result.output[0]
                                     .as_object()

@@ -319,7 +319,7 @@ async fn redaction_hides_pending_and_final_metadata_across_hook_interruption() {
     assert!(
         c.messages
             .iter()
-            .any(|m| matches!(m,Message::Tool { content,.. } if content=="REDACTED\n<harness>\n[info] tool metadata withheld after output replacement\n</harness>"))
+            .any(|m| matches!(m,Message::Tool { content,.. } if content=="REDACTED"))
     );
     assert!(
         !h.history(
@@ -462,7 +462,7 @@ async fn output_replacement_withholds_schema_bearing_structured_value() {
     assert!(
         c.messages
             .iter()
-            .any(|m| matches!(m, Message::Tool { content, .. } if content == "REDACTED\n<harness>\n[info] tool metadata withheld after output replacement\n</harness>"))
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "REDACTED"))
     );
     assert!(
         !h.history(

@@ -2821,11 +2821,6 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
             "new\n"
         };
         let mut content = base.to_owned();
-        if kind == "legacy-replace" {
-            content.push_str(
-                "\n<harness>\n[info] tool metadata withheld after output replacement\n</harness>",
-            );
-        }
         if expected {
             if !content.ends_with('\n') {
                 content.push('\n');
@@ -3323,10 +3318,6 @@ async fn bounded_explicit_output_and_hook_replacements_reach_model() {
             .await
             .unwrap();
         let mut diagnostic_lines = Vec::new();
-        if hook == "legacy" {
-            diagnostic_lines
-                .push("[info] tool metadata withheld after output replacement".to_owned());
-        }
         if let Some(warning) = expected_warning {
             diagnostic_lines.push(format!("[warn] Output truncated to its {warning}"));
         }
@@ -3479,7 +3470,7 @@ async fn bounded_explicit_output_survives_hook_process_crash() {
     assert_eq!(
         messages,
         vec![
-            "y\nz\n<harness>\n[info] tool metadata withheld after output replacement\n[warn] Output truncated to its end: 1 lines, 2 bytes dropped\n</harness>"
+            "y\nz\n<harness>\n[warn] Output truncated to its end: 1 lines, 2 bytes dropped\n</harness>"
         ]
     );
 }
