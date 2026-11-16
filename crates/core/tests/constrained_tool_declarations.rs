@@ -449,3 +449,208 @@ async fn strict_tool_execution_records_decision_and_normalizes_a_copy() {
         .unwrap();
     assert!(raw.call.arguments.contains("null"));
 }
+
+struct StrictPendingTool(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl Tool for StrictPendingTool {
+    fn spec(&self) -> ToolSpec {
+        StrictTool(Arc::new(std::sync::Mutex::new(None))).spec()
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        Some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Require,
+        })
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    fn recovery_identity(&self) -> Option<String> {
+        Some("strict-pending-backend-v1".into())
+    }
+    async fn invoke(&self, arguments: Value, _: ToolContext) -> Outcome {
+        assert_eq!(arguments, json!({"path":"authorized"}));
+        Outcome::Pending {
+            reference: "job".into(),
+        }
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        assert_eq!(reference, "job");
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Some(Outcome::Succeeded("ok".into()))
+    }
+}
+struct StrictPendingExtension(Arc<AtomicUsize>);
+impl Extension for StrictPendingExtension {
+    fn id(&self) -> &str {
+        "strict-pending"
+    }
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![Arc::new(StrictPendingTool(self.0.clone()))]
+    }
+}
+struct AuthorizeAndObserve(Arc<std::sync::Mutex<Option<Value>>>);
+#[async_trait::async_trait]
+impl Extension for AuthorizeAndObserve {
+    fn id(&self) -> &str {
+        "authorize"
+    }
+    fn handles_tool_call(&self) -> bool {
+        true
+    }
+    async fn tool_call(
+        &self,
+        _: &str,
+        args: &mut Value,
+        _: &ToolContext,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::Decision> {
+        assert_eq!(*args, json!({"path":"file"}));
+        args["path"] = json!("authorized");
+        Ok(pi_rs_core::Decision::Allow)
+    }
+    async fn before_tool(
+        &self,
+        _: &str,
+        args: &Value,
+        _: &ToolContext,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::Decision> {
+        *self.0.lock().unwrap() = Some(args.clone());
+        Ok(pi_rs_core::Decision::Allow)
+    }
+}
+
+#[tokio::test]
+async fn strict_pending_poll_uses_post_hook_authorized_arguments() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(StrictPendingExtension(polls.clone())))
+        .unwrap();
+    registry
+        .register(Arc::new(AuthorizeAndObserve(observed.clone())))
+        .unwrap();
+    let mut session = SessionBuilder::new(
+        Arc::new(StrictModel(Arc::new(AtomicUsize::new(0)))),
+        "fixture",
+    )
+    .registry(registry)
+    .in_memory()
+    .unwrap();
+    assert_eq!(session.prompt("read").await.unwrap(), "done");
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(json!({"path":"authorized"}))
+    );
+}
+
+struct RestartTool {
+    polls: AtomicUsize,
+    preparations: AtomicUsize,
+    started: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl Tool for RestartTool {
+    fn spec(&self) -> ToolSpec {
+        StrictTool(Arc::new(std::sync::Mutex::new(None))).spec()
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        Some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Require,
+        })
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    fn recovery_identity(&self) -> Option<String> {
+        Some("restart-backend-v1".into())
+    }
+    async fn prepare_arguments(&self, args: Value) -> ExtensionResult<Value> {
+        self.preparations.fetch_add(1, Ordering::SeqCst);
+        Ok(args)
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        assert_eq!(args, json!({"path":"authorized"}));
+        Outcome::Pending {
+            reference: "job".into(),
+        }
+    }
+    async fn poll(&self, _: &str, context: ToolContext) -> Option<Outcome> {
+        if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+            context.cancellation.cancelled().await;
+            None
+        } else {
+            Some(Outcome::Succeeded("ok".into()))
+        }
+    }
+}
+struct RestartExtension(Arc<RestartTool>);
+impl Extension for RestartExtension {
+    fn id(&self) -> &str {
+        "restart"
+    }
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![self.0.clone()]
+    }
+}
+
+#[tokio::test]
+async fn strict_pending_reopens_with_original_authorized_arguments() {
+    let tool = Arc::new(RestartTool {
+        polls: AtomicUsize::new(0),
+        preparations: AtomicUsize::new(0),
+        started: tokio::sync::Notify::new(),
+    });
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let model = Arc::new(StrictModel(Arc::new(AtomicUsize::new(0))));
+    let make_registry = || {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(RestartExtension(tool.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(AuthorizeAndObserve(observed.clone())))
+            .unwrap();
+        registry
+    };
+    let mut session = SessionBuilder::new(model.clone(), "fixture")
+        .registry(make_registry())
+        .in_memory()
+        .unwrap();
+    let control = session.controls();
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(session.prompt("read"), async {
+            tool.started.notified().await;
+            control.abort();
+        })
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(pi_rs_core::Error::Cancelled)));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("strict-pending.jsonl");
+    session.export_jsonl(&path).unwrap();
+    session.close().await.unwrap();
+    drop(session);
+    *observed.lock().unwrap() = None;
+    let mut session = SessionBuilder::new(model, "fixture")
+        .registry(make_registry())
+        .open(path)
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), session.resume())
+            .await
+            .unwrap()
+            .unwrap(),
+        "done"
+    );
+    assert_eq!(tool.preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.polls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(json!({"path":"authorized"}))
+    );
+}

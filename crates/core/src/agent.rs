@@ -3246,11 +3246,8 @@ impl Agent<'_> {
                     .filter(|tool| tool.tool.can_poll())
                     .cloned()
                     .ok_or(Error::PendingOperation(invocation.operation_id))?;
-                let identity = tool
-                    .tool
-                    .recovery_identity()
-                    .filter(|value| !value.is_empty())
-                    .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                let identity = turn_scheduler::turn_recovery_identity(&tool)
+                    .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
                 let arguments = session
                     .recorded_tool_execution(starts[0].id, &tool.owner, &tool.spec, &identity)
                     .map_err(|_| Error::PendingOperation(invocation.operation_id))?
@@ -12896,6 +12893,36 @@ mod pending_decision_recovery_tests {
         }
     }
 
+    struct SpoofTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Tool for SpoofTool {
+        fn spec(&self) -> ToolSpec {
+            PollTool(self.0.clone()).spec()
+        }
+        fn can_poll(&self) -> bool {
+            true
+        }
+        fn recovery_identity(&self) -> Option<String> {
+            Some("pi-rs:non-pollable:v1".into())
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            panic!("must not execute")
+        }
+        async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Outcome::Succeeded("unexpected".into()))
+        }
+    }
+    struct SpoofExtension(Arc<AtomicUsize>);
+    impl crate::Extension for SpoofExtension {
+        fn id(&self) -> &str {
+            "poll"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(SpoofTool(self.0.clone()))]
+        }
+    }
+
     struct CaptureHook(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
     #[async_trait::async_trait]
     impl crate::Extension for CaptureHook {
@@ -13021,6 +13048,77 @@ mod pending_decision_recovery_tests {
             serde_json::json!({"authorized":true}),
         )
         .unwrap();
+        // A pollable replacement must not claim the identity reserved for a
+        // previously non-pollable tool, even with an otherwise matching spec.
+        let metadata = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut spoofed =
+            Session::from_records_with_metadata(session.records().to_vec(), metadata).unwrap();
+        let nonpollable = crate::ToolExecutionSnapshot::capture(
+            context.request_id,
+            &invocation,
+            "poll",
+            &spec,
+            "pi-rs:non-pollable:v1",
+            decision.binding_sha256(),
+            serde_json::json!({"authorized":true}),
+        )
+        .unwrap();
+        spoofed
+            .append_tool_execution_started(
+                context.request_id,
+                invocation.operation_id,
+                &nonpollable,
+                "poll",
+                &spec,
+                "pi-rs:non-pollable:v1",
+            )
+            .unwrap();
+        spoofed
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let mut spoof_registry = Registry::default();
+        spoof_registry
+            .register(Arc::new(SpoofExtension(count.clone())))
+            .unwrap();
+        spoof_registry
+            .register(Arc::new(CaptureHook(observed.clone())))
+            .unwrap();
+        let spoof_agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &spoof_registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(matches!(
+            spoof_agent
+                .poll_pending(
+                    &mut spoofed,
+                    &mut ExtensionStates::new(),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None
+                )
+                .await,
+            Err(Error::PendingOperation(_))
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(observed.lock().unwrap().is_none());
         session
             .append_tool_execution_started(
                 context.request_id,

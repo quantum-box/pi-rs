@@ -252,12 +252,6 @@ fn turn_is_strict(decision: &crate::ToolDecisionSnapshot, spec: &ToolSpec) -> Re
 
 fn turn_strict_tool_preflight(tool: &RegisteredTool) -> Result<()> {
     turn_recovery_identity(tool)?;
-    // Remove only when both pending recovery paths consume the durable snapshot.
-    if tool.tool.can_poll() {
-        return Err(Error::Session(
-            "strict pollable tools require snapshot-aware recovery".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -727,13 +721,12 @@ mod strict_argument_tests {
     }
 
     #[tokio::test]
-    async fn pollable_tool_waits_for_snapshot_aware_recovery() {
+    async fn pollable_tool_with_identity_records_start() {
         let (result, session, invocation, tool) =
             run_fixture(true, Some("backend:v1"), true, false).await;
-        assert!(result.is_err());
-        assert!(tool.seen.lock().unwrap().is_empty());
-        assert!(tool.callbacks.lock().unwrap().is_empty());
-        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id)));
+        result.unwrap();
+        assert!(!tool.seen.lock().unwrap().is_empty());
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::ToolStarted { operation_id, tool_execution: Some(_) } if *operation_id == invocation.operation_id)));
     }
 
     #[tokio::test]

@@ -3811,9 +3811,9 @@ actual request limits, and updated configuration in a real terminal picker.
 The core exposes strict tool-schema conversion and a tool declaration type
 matching the current Pi schema subset. The native agent records the actual
 strict-or-fallback decision before dispatch, normalizes a copy of strict tool
-arguments, and records authorized arguments before executing non-pollable tools.
-Strict pollable tools are temporarily rejected until both pending recovery paths
-are fully verified; grammar tool execution remains unsupported. The OpenAI
+arguments, and records authorized arguments before executing tools. Pending
+strict calls are polled using those recorded arguments and require a stable
+backend recovery identity. Grammar tool execution remains unsupported. The OpenAI
 Responses SDK can send explicitly supplied tool
 declarations with JSON Schema constraints when its caller supplies the model's
 strict capability, including through the declaration-aware detailed model
