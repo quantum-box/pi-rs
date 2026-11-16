@@ -41,8 +41,16 @@ completing successfully. Busy workers consume no slot; candidates rotate so
 repeatedly blocked conversations cannot monopolize admission. Each cleanup step
 has a 30-second timeout. Callback failures and timeouts are exposed by
 `conversation_cleanup_failures`, and the affected conversation stays marked while
-other graphs continue. A timed-out callback may have made an external effect;
-reconcile it before reopening and retrying. Storage failures, worker panics,
+other graphs continue. Before each standalone cleanup step, the runtime commits an attempt marker
+fenced by the conversation version. Timeout, cancellation, crash, callback
+failure, or a crash after the callback succeeds can leave the marker and block
+all subsequent abort cleanup for that conversation, including after reopen.
+The host must determine whether external effects occurred, make retry safe, then
+call `reconcile_owned_cleanup` on the task scheduler or harness. Reconciliation
+requires the cleanup worker to be stopped; it does not itself inspect or reverse
+external effects. Even a crash before dispatch can require reconciliation. An
+unrelated missing owned conversation or invalid abort mark is skipped during
+candidate discovery; the affected graph requires separate repair. Storage failures, worker panics,
 cancelled or dropped cleanup ticks poison the scheduler and require reopening.
 Dropping the scheduler cancels its cleanup jobs; their attachments remain held
 until the jobs actually stop. Timeouts require callbacks to yield to the async

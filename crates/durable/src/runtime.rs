@@ -101,6 +101,10 @@ pub enum Error {
     Invalid(String),
 }
 
+fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
+    format!("runtime/owned-cleanup-attempt/{id}").into_bytes()
+}
+
 // Bound synchronous retries so unrelated sustained writes cannot block a caller forever.
 const FORK_DOCUMENT_ATTEMPTS: usize = 8;
 
@@ -13009,6 +13013,40 @@ impl Harness {
         }
         Ok(())
     }
+    /// Acknowledge that the host has reconciled any external effects of an
+    /// interrupted standalone cleanup. This permits a fresh cleanup attempt.
+    /// The caller must establish the external outcome before calling.
+    pub fn reconcile_owned_cleanup(&mut self, id: Uuid) -> Result<(), Error> {
+        let owner = self.owner.clone();
+        let control = owner.conversation_controls().get(id);
+        let _worker = control
+            .worker
+            .try_lock()
+            .map_err(|_| Error::Invalid("cleanup is still running".into()))?;
+        let store = self.subagent_store()?;
+        let key = owned_cleanup_key(id);
+        let marker = store
+            .get(&key)?
+            .ok_or_else(|| Error::Invalid("no uncertain cleanup to reconcile".into()))?;
+        let _: Uuid = serde_json::from_slice(&marker.value)?;
+        let root = Self::key(id);
+        let current = store.get(&root)?.ok_or(Error::NotFound)?;
+        store.commit(
+            &[
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Version(marker.version),
+                },
+                Check {
+                    key: root,
+                    expected: Expected::Version(current.version),
+                },
+            ],
+            &[Mutation::Delete { key }],
+        )?;
+        Ok(())
+    }
+
     // Discover marked owned conversations independently of task state: a child
     // may be aborted while its owner is successfully completing, or after an
     // anchor has terminated. Standalone root conversations have no task edge.
@@ -13024,20 +13062,21 @@ impl Harness {
                 .map_err(|error| Error::Invalid(format!("ownership edges: {error}")))?
             {
                 if edge.edge.task_owner != *anchor.task.owner() {
-                    return Err(Error::Invalid("ownership edge owner mismatch".into()));
+                    continue;
                 }
                 let key = format!("runtime/conversation/{}", edge.edge.child);
-                let entry = self
-                    .owner
-                    .store()
-                    .get(key.as_bytes())?
-                    .ok_or(Error::NotFound)?;
-                let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+                let Some(entry) = self.owner.store().get(key.as_bytes())? else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+                    continue;
+                };
                 let marked = match value.get("abort_requested") {
                     None => false,
-                    Some(value) => value
-                        .as_bool()
-                        .ok_or_else(|| Error::Invalid("invalid abort mark".into()))?,
+                    Some(value) => match value.as_bool() {
+                        Some(value) => value,
+                        None => continue,
+                    },
                 };
                 if marked {
                     candidates.insert(edge.edge.child);
@@ -13062,11 +13101,56 @@ impl Harness {
         let mut worker = self.worker();
         worker.execution_gate = Some(control.gate.clone());
         let (conversation, version) = worker.load(id)?;
-        if conversation.abort_requested {
-            worker.settle_abort(conversation, version, cancel).await
-        } else {
-            Ok(false)
+        if !conversation.abort_requested {
+            return Ok(false);
         }
+        let store = self.owner.store();
+        let key = owned_cleanup_key(id);
+        let attempt = Uuid::new_v4();
+        if store.get(&key)?.is_some() {
+            return Err(Error::Invalid(
+                "standalone cleanup outcome uncertain; reconcile before retry".into(),
+            ));
+        }
+        match store.commit(
+            &[
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: Self::key(id),
+                    expected: Expected::Version(version),
+                },
+            ],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&attempt)?,
+            }],
+        ) {
+            Ok(()) => (),
+            Err(durable_store::Error::Conflict { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let result = worker
+            .settle_abort(conversation, version, cancel, Some(attempt))
+            .await;
+        if result.is_ok() {
+            let marker = store
+                .get(&key)?
+                .ok_or_else(|| Error::Invalid("cleanup marker missing".into()))?;
+            if serde_json::from_slice::<Uuid>(&marker.value)? != attempt {
+                return Err(Error::Invalid("cleanup marker changed".into()));
+            }
+            store.commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(marker.version),
+                }],
+                &[Mutation::Delete { key }],
+            )?;
+        }
+        result
     }
 
     fn task_tool_result(
@@ -13133,7 +13217,22 @@ impl Harness {
         mut c: Conversation,
         version: u64,
         cancel: &CancellationToken,
+        cleanup_attempt: Option<Uuid>,
     ) -> Result<bool, Error> {
+        let marker = self.owner.store().get(&owned_cleanup_key(c.id))?;
+        match (marker, cleanup_attempt) {
+            (None, None) => (),
+            (Some(marker), Some(attempt))
+                if serde_json::from_slice::<Uuid>(&marker.value)? == attempt =>
+            {
+                ()
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "standalone cleanup outcome uncertain; reconcile before retry".into(),
+                ));
+            }
+        }
         // Keep the conversation marked until all owned cleanup has finished.
         let summaries = crate::summary_store::SummaryStore::new(self.owner.store())
             .list()
@@ -13803,7 +13902,7 @@ impl Harness {
             }
             self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
-                if self.settle_abort(c, version, cancel).await? {
+                if self.settle_abort(c, version, cancel, None).await? {
                     continue;
                 }
                 return Ok(());
@@ -26398,7 +26497,7 @@ mod scheduler_tests {
             h.request_abort(id).unwrap();
             let (c, version) = h.load(id).unwrap();
             assert!(
-                h.settle_abort(c, version, &CancellationToken::new())
+                h.settle_abort(c, version, &CancellationToken::new(), None)
                     .await
                     .unwrap()
             );

@@ -3247,6 +3247,17 @@ impl Scheduler {
         &self.cleanup_failures
     }
 
+    /// Acknowledge an externally reconciled interrupted cleanup and permit retry.
+    pub fn reconcile_owned_cleanup(&mut self, id: Uuid) -> Result<(), Error> {
+        self.validator
+            .as_mut()
+            .ok_or_else(|| Error::Handler("conversation runtime is not attached".into()))?
+            .reconcile_owned_cleanup(id)
+            .map_err(|error| Error::Handler(error.to_string()))?;
+        self.cleanup_failures.remove(&id);
+        Ok(())
+    }
+
     /// Drive one task step and schedule bounded, independent conversation cleanup.
     /// Retained queued inputs are never executed by these cleanup workers.
     pub async fn tick_with_conversation_cleanup(
@@ -15641,6 +15652,271 @@ mod standalone_foreground_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn cleanup_crash_worker() {
+        let Ok(path) = std::env::var("PI_CLEANUP_CRASH_DB") else {
+            return;
+        };
+        struct CrashModel(std::path::PathBuf);
+        #[async_trait]
+        impl Model for CrashModel {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                std::fs::write(&self.0, b"effect started").unwrap();
+                std::future::pending().await
+            }
+        }
+        let mut opts = options();
+        opts.model = Arc::new(CrashModel(
+            std::env::var("PI_CLEANUP_CRASH_READY").unwrap().into(),
+        ));
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(path, registry(), opts).unwrap();
+        loop {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn killed_cleanup_requires_reconciliation_before_reopen_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountModel(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for CountModel {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let ready = dir.path().join("effect-started");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let db = Store::open(&path).unwrap();
+        let parent = task(1, TaskOwner::Conversation(owner), "parent");
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        let batch = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.succeed(json!(null))
+            })
+            .unwrap();
+        h.request_abort(child).unwrap();
+        let key = format!("runtime/conversation/{child}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["phase"] =
+            json!({"ModelRunning": {"turns":0, "request_id":Uuid::new_v4(), "restarts":0}});
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        drop(h);
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_scheduler::standalone_foreground_cleanup_tests::cleanup_crash_worker",
+                "--nocapture",
+            ])
+            .env("PI_CLEANUP_CRASH_DB", &path)
+            .env("PI_CLEANUP_CRASH_READY", &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        process.kill().unwrap();
+        process.wait().unwrap();
+        observed.expect("child did not enter external usage settlement");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(CountModel(calls.clone()));
+        let mut direct = Harness::open_paused(&path, opts.clone()).unwrap();
+        assert!(
+            direct
+                .resume_conversation(child, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(direct);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), opts).unwrap();
+        for _ in 0..5 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(child)
+                .unwrap()
+                .abort_requested
+        );
+        scheduler.reconcile_owned_cleanup(child).unwrap();
+        for _ in 0..20 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(child)
+                .unwrap()
+                .abort_requested
+            {
+                break;
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(child)
+                .unwrap()
+                .abort_requested
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_and_invalid_unrelated_candidates_do_not_block_valid_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = h.create_conversation(cfg.clone()).unwrap();
+        let children: Vec<_> = (0..3)
+            .map(|_| h.create_conversation(cfg.clone()).unwrap())
+            .collect();
+        let db = Store::open(&path).unwrap();
+        for (i, child) in children.iter().enumerate() {
+            let parent = task((i + 1) as u128, TaskOwner::Conversation(owner), "parent");
+            let tasks = TaskStore::new(&db);
+            tasks.save(&[Save::Create(&parent)]).unwrap();
+            let batch = EdgeStore::new(&db)
+                .prepare_create(&Edge {
+                    task: parent.id(),
+                    task_owner: parent.owner().clone(),
+                    child: *child,
+                    mode: Mode::Foreground,
+                })
+                .unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            tasks
+                .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                    task.start()?;
+                    task.succeed(json!(null))
+                })
+                .unwrap();
+        }
+        h.request_abort(children[2]).unwrap();
+        drop(h);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        let missing = format!("runtime/conversation/{}", children[0]).into_bytes();
+        let entry = db.get(&missing).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: missing.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Delete { key: missing }],
+        )
+        .unwrap();
+        let invalid = format!("runtime/conversation/{}", children[1]).into_bytes();
+        let entry = db.get(&invalid).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["abort_requested"] = json!("invalid");
+        db.commit(
+            &[durable_store::Check {
+                key: invalid.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: invalid,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        for _ in 0..30 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(children[2])
+                .unwrap()
+                .abort_requested
+            {
+                return;
+            }
+        }
+        panic!("unrelated invalid candidates blocked cleanup");
+    }
+
+    #[tokio::test]
     async fn timed_out_cleanup_slots_release_for_an_unrelated_graph() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Stalled(Arc<AtomicUsize>);
@@ -15763,6 +16039,30 @@ mod standalone_foreground_cleanup_tests {
         drop(scheduler);
         let mut reopened =
             Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while reopened.conversation_cleanup_failures().len() < 8 {
+                reopened
+                    .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reopened attempts did not remain blocked");
+        assert_eq!(entered.load(Ordering::SeqCst), 8);
+        for id in &children[..8] {
+            assert!(
+                reopened
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(*id)
+                    .unwrap()
+                    .abort_requested
+            );
+            reopened.reconcile_owned_cleanup(*id).unwrap();
+        }
         for _ in 0..50 {
             reopened
                 .tick_with_conversation_cleanup(0, &CancellationToken::new())
