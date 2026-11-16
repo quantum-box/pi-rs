@@ -9,6 +9,7 @@ use std::{
 };
 
 /// Open the stable, per-OS-account gate without consulting HOME or PI_RS_HOME.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn open() -> io::Result<File> {
     let profile = account_profile()?;
     open_in_profile(&profile)
@@ -53,6 +54,15 @@ pub async fn acquire_config_guard(
 ) -> pi_rs::Result<ConfigGuard> {
     let account = acquire(credential).await?;
     account_guard_with(account, paths, credential, readonly).await
+}
+
+/// Read a synchronous snapshot while the configuration guard is held.
+pub async fn with_config_guard<T>(
+    gate: impl std::future::Future<Output = pi_rs::Result<ConfigGuard>>,
+    read: impl FnOnce() -> pi_rs::Result<T>,
+) -> pi_rs::Result<T> {
+    let _guard = gate.await?;
+    read()
 }
 
 async fn account_guard_with(
@@ -291,7 +301,7 @@ pub(crate) async fn acquire(_credential: Option<&File>) -> io::Result<AccountGua
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn account_profile() -> io::Result<PathBuf> {
     use std::{
         ffi::{CStr, OsString},
@@ -337,65 +347,6 @@ fn account_profile() -> io::Result<PathBuf> {
         }
         return Ok(path);
     }
-}
-
-#[cfg(windows)]
-fn account_profile() -> io::Result<PathBuf> {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt, ptr::null_mut};
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER},
-        Security::TOKEN_QUERY,
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-        UI::Shell::GetUserProfileDirectoryW,
-    };
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    struct Token(windows_sys::Win32::Foundation::HANDLE);
-    impl Drop for Token {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-    let token = Token(token);
-    let mut len = 0u32;
-    if unsafe { GetUserProfileDirectoryW(token.0, null_mut(), &mut len) } != 0
-        || io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-        || len == 0
-        || len > 32768
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "account profile unavailable",
-        ));
-    }
-    let mut buffer = vec![0u16; len as usize];
-    if unsafe { GetUserProfileDirectoryW(token.0, buffer.as_mut_ptr(), &mut len) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let end = buffer
-        .iter()
-        .position(|&c| c == 0)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid profile path"))?;
-    let path = PathBuf::from(OsString::from_wide(&buffer[..end]));
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "account profile must be absolute",
-        ));
-    }
-    Ok(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn account_profile() -> io::Result<PathBuf> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "account profile unavailable",
-    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -446,7 +397,7 @@ fn open_in_profile(profile: &Path) -> io::Result<File> {
     if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
         return Err(invalid("unsafe account profile ownership or permissions"));
     }
-    check_no_acl(&root)?;
+    check_no_acl(&root).map_err(|e| io::Error::new(e.kind(), format!("account profile: {e}")))?;
     let dirname = c".pi-rs-shared";
     let rc = unsafe { libc::mkdirat(root.as_raw_fd(), dirname.as_ptr(), 0o700) };
     if rc != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
@@ -462,7 +413,7 @@ fn open_in_profile(profile: &Path) -> io::Result<File> {
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o700 {
         return Err(invalid("unsafe shared gate directory"));
     }
-    check_no_acl(&dir)?;
+    check_no_acl(&dir).map_err(|e| io::Error::new(e.kind(), format!("gate directory: {e}")))?;
     let file = openat(
         dir.as_raw_fd(),
         c"mcp-config-gate.lock",
@@ -477,7 +428,7 @@ fn open_in_profile(profile: &Path) -> io::Result<File> {
     {
         return Err(invalid("unsafe shared gate file"));
     }
-    check_no_acl(&file)?;
+    check_no_acl(&file).map_err(|e| io::Error::new(e.kind(), format!("gate file: {e}")))?;
     Ok(file)
 }
 
@@ -505,29 +456,220 @@ fn check_no_acl(file: &File) -> io::Result<()> {
 fn check_no_acl(file: &File) -> io::Result<()> {
     use std::{ffi::c_void, os::fd::AsRawFd};
     unsafe extern "C" {
-        fn acl_get_fd_np(fd: i32, kind: i32) -> *mut c_void;
+        fn filesec_init() -> *mut c_void;
+        fn filesec_free(fsec: *mut c_void);
+        fn filesec_query_property(fsec: *mut c_void, property: i32, valid: *mut i32) -> i32;
+        fn filesec_get_property(fsec: *mut c_void, property: i32, value: *mut c_void) -> i32;
+        #[cfg_attr(target_arch = "x86_64", link_name = "fstatx_np$INODE64")]
+        fn fstatx_np(fd: i32, stat: *mut libc::stat, fsec: *mut c_void) -> i32;
         fn acl_free(acl: *mut c_void) -> i32;
+        fn acl_valid(acl: *mut c_void) -> i32;
+        fn acl_get_entry(acl: *mut c_void, id: i32, entry: *mut *mut c_void) -> i32;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut i32) -> i32;
+        fn acl_size(acl: *mut c_void) -> isize;
+        fn acl_copy_ext(buf: *mut c_void, acl: *mut c_void, size: isize) -> isize;
     }
-    // ACL_TYPE_EXTENDED, from macOS <sys/acl.h>.
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), 0x00000100) };
-    if !acl.is_null() {
-        unsafe {
-            acl_free(acl);
+    struct FileSec(*mut c_void);
+    impl Drop for FileSec {
+        fn drop(&mut self) {
+            unsafe { filesec_free(self.0) };
         }
+    }
+    let fsec = unsafe { filesec_init() };
+    if fsec.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let fsec = FileSec(fsec);
+    let present = macos_acl_property_present(
+        || {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { fstatx_np(file.as_raw_fd(), stat.as_mut_ptr(), fsec.0) } != 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        |property| {
+            let mut present = 0;
+            if unsafe { filesec_query_property(fsec.0, property, &mut present) } != 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(present != 0)
+            }
+        },
+    )?;
+    if !present {
+        // WIP limitation: Darwin Libc may also omit the property for an empty
+        // ACL, hiding its flags. Do not claim that unknown/deferred flags are
+        // fully rejected until raw ACL absence can be distinguished safely.
+        return Ok(());
+    }
+    // FILESEC_ACL = 5. A successful property retrieval returns an owned copy.
+    let acl = macos_acl_property_value(|| {
+        let mut acl: *mut c_void = std::ptr::null_mut();
+        if unsafe { filesec_get_property(fsec.0, 5, (&mut acl as *mut *mut c_void).cast()) } != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(acl)
+        }
+    })?;
+    struct Acl(*mut c_void);
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            unsafe { acl_free(self.0) };
+        }
+    }
+    let acl = Acl(acl);
+    if unsafe { acl_valid(acl.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Darwin's public kauth_filesec external layout and Libc acl_copy_ext
+    // encode the entry count and flags in big endian. This is a Darwin-specific
+    // format, not the opaque acl_t layout or a portable ACL representation.
+    let size = unsafe { acl_size(acl.0) };
+    let size = macos_acl_size_result(size, io::Error::last_os_error)?;
+    if !(44..=44 + 128 * 24).contains(&size) {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "shared gate has an ACL",
+            io::ErrorKind::InvalidData,
+            "invalid shared gate ACL size",
         ));
     }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ENOENT) {
-        Ok(())
+    // The C implementation writes a kauth_filesec struct, so provide a
+    // suitably aligned allocation rather than relying on Vec<u8> alignment.
+    let mut storage = vec![0u64; (size as usize).div_ceil(8)];
+    let written = unsafe { acl_copy_ext(storage.as_mut_ptr().cast(), acl.0, size) };
+    macos_acl_copy_result(written, size, io::Error::last_os_error)?;
+    let encoded =
+        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), size as usize) };
+    check_macos_acl_encoding(encoded, |id| {
+        let mut entry = std::ptr::null_mut();
+        // The exported count is authoritative for this private snapshot. Any
+        // failure, including EINVAL at a valid index, is an error, not EOF.
+        if unsafe { acl_get_entry(acl.0, id, &mut entry) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if entry.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid ACL entry",
+            ));
+        }
+        let mut tag = 0;
+        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(tag)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_property_present(
+    stat: impl FnOnce() -> io::Result<()>,
+    mut query: impl FnMut(i32) -> io::Result<bool>,
+) -> io::Result<bool> {
+    stat()?;
+    // Darwin statx1 may return success after an ACL-buffer realloc failure,
+    // without populating any properties. Never interpret that as no ACL.
+    for property in [1, 2, 4] {
+        // FILESEC_OWNER, FILESEC_GROUP, FILESEC_MODE
+        if !query(property)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete shared gate security snapshot",
+            ));
+        }
+    }
+    query(5) // FILESEC_ACL
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_property_value(
+    get: impl FnOnce() -> io::Result<*mut std::ffi::c_void>,
+) -> io::Result<*mut std::ffi::c_void> {
+    let acl = get()?;
+    if acl.is_null() || acl as usize == 1 {
+        // _FILESEC_REMOVE_ACL
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid shared gate ACL property",
+        ));
+    }
+    Ok(acl)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_size_result(size: isize, error: impl FnOnce() -> io::Error) -> io::Result<isize> {
+    if size < 0 { Err(error()) } else { Ok(size) }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_copy_result(
+    written: isize,
+    expected: isize,
+    error: impl FnOnce() -> io::Error,
+) -> io::Result<()> {
+    if written < 0 {
+        Err(error())
+    } else if written != expected {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid shared gate ACL export length",
+        ))
     } else {
-        Err(error)
+        Ok(())
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "macos")]
+fn check_macos_acl_encoding(
+    encoded: &[u8],
+    mut get_tag: impl FnMut(i32) -> io::Result<i32>,
+) -> io::Result<()> {
+    fn word(bytes: &[u8]) -> u32 {
+        u32::from_be_bytes(bytes.try_into().expect("fixed ACL field"))
+    }
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid shared gate ACL encoding",
+        )
+    };
+    if encoded.len() < 44 || word(&encoded[..4]) != 0x012c_c16d {
+        return Err(invalid());
+    }
+    let count = word(&encoded[36..40]) as usize;
+    if count > 128 || encoded.len() != 44 + count * 24 {
+        return Err(invalid());
+    }
+    // Only KAUTH_ACL_NO_INHERIT is understood and safe. In particular,
+    // KAUTH_ACL_DEFER_INHERIT and all private/unknown flags fail closed.
+    if word(&encoded[40..44]) & !(1 << 17) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe shared gate ACL flags",
+        ));
+    }
+    for i in 0..count {
+        let flags = word(&encoded[44 + i * 24 + 16..44 + i * 24 + 20]);
+        let rights = word(&encoded[44 + i * 24 + 20..44 + i * 24 + 24]);
+        // KAUTH_ACE_DENY plus the five documented inheritance flags only.
+        // Rights: Darwin ACL bits 1..13, synchronize, and the documented
+        // KAUTH generic bits. Unknown rights remain fail-closed.
+        if flags & 0xf != 2
+            || flags & !(0xf | 0x1f0) != 0
+            || rights & !(0x3ffe | (1 << 20) | (0xf << 21)) != 0
+            || get_tag(i as i32)? != 2
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "shared gate ACL contains an allow or unknown entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
 fn open_in_profile(_profile: &Path) -> io::Result<File> {
     // Windows must retain non-delete-sharing handles to the profile and gate
     // directory for as long as the gate file is in use. Returning only File
@@ -546,6 +688,301 @@ fn open_in_profile(_profile: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_gate_accepts_deny_only_and_rejects_allow_at_each_layer() {
+        fn chmod(path: &Path, args: &[&str]) {
+            let output = std::process::Command::new("/bin/chmod")
+                .args(args)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "chmod {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for layer in ["profile", "directory", "file"] {
+            let root = tempfile::tempdir().unwrap();
+            let profile = root.path().join("profile");
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+            drop(open_in_profile(&profile).expect("ACL-free baseline"));
+            let target = match layer {
+                "profile" => profile.clone(),
+                "directory" => profile.join(".pi-rs-shared"),
+                _ => profile.join(".pi-rs-shared/mcp-config-gate.lock"),
+            };
+            // Deny a nonessential right so the current user can still open
+            // the object and remove the fixture ACL during cleanup.
+            chmod(&target, &["+a", "everyone deny readextattr"]);
+            assert!(
+                open_in_profile(&profile).is_ok(),
+                "deny-only rejected at {layer}"
+            );
+            // A mixed ACL ensures the iterator cannot stop after the first deny.
+            chmod(&target, &["+a", "everyone allow read"]);
+            let error = open_in_profile(&profile).expect_err("allow must be rejected");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{layer}: {error}"
+            );
+            assert!(error.to_string().contains("ACL"), "{layer}: {error}");
+            let expected = match layer {
+                "profile" => "account profile:",
+                "directory" => "gate directory:",
+                _ => "gate file:",
+            };
+            assert!(error.to_string().starts_with(expected), "{layer}: {error}");
+            chmod(&target, &["-N"]);
+            assert!(open_in_profile(&profile).is_ok(), "ACL removal at {layer}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_acl_encoding_rejects_unknown_flags_and_index_errors() {
+        fn encoding(global: u32, entries: &[u32]) -> Vec<u8> {
+            let mut bytes = vec![0; 44 + 24 * entries.len()];
+            bytes[..4].copy_from_slice(&0x012c_c16du32.to_be_bytes());
+            bytes[36..40].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+            bytes[40..44].copy_from_slice(&global.to_be_bytes());
+            for (i, flags) in entries.iter().enumerate() {
+                bytes[60 + i * 24..64 + i * 24].copy_from_slice(&flags.to_be_bytes());
+            }
+            bytes
+        }
+        assert!(check_macos_acl_encoding(&encoding(0, &[]), |_| panic!("no entries")).is_ok());
+        assert!(check_macos_acl_encoding(&encoding(1 << 17, &[2 | (1 << 4)]), |_| Ok(2)).is_ok());
+        for flags in [1 << 16, 1, 1 << 31] {
+            assert!(check_macos_acl_encoding(&encoding(flags, &[]), |_| Ok(2)).is_err());
+        }
+        for flags in [1, 3, 2 | (1 << 9), 2 | (1 << 31)] {
+            assert!(check_macos_acl_encoding(&encoding(0, &[flags]), |_| Ok(2)).is_err());
+        }
+        assert!(check_macos_acl_encoding(&encoding(0, &[2]), |_| Ok(99)).is_err());
+        let error = check_macos_acl_encoding(&encoding(0, &[2]), |_| {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        let mut truncated = encoding(0, &[2]);
+        truncated.pop();
+        assert!(check_macos_acl_encoding(&truncated, |_| Ok(2)).is_err());
+        let mut unknown_right = encoding(0, &[2]);
+        unknown_right[64..68].copy_from_slice(&(1u32 << 31).to_be_bytes());
+        assert!(check_macos_acl_encoding(&unknown_right, |_| Ok(2)).is_err());
+        let mut known_rights = encoding(0, &[2]);
+        known_rights[64..68].copy_from_slice(&((1u32 << 13) | (1 << 20)).to_be_bytes());
+        assert!(check_macos_acl_encoding(&known_rights, |_| Ok(2)).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_acl_errors_are_distinct_from_absent_property() {
+        let noent = || io::Error::from_raw_os_error(libc::ENOENT);
+        let error = macos_acl_property_present(
+            || Err(noent()),
+            |_| panic!("must not query after failed stat"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert!(!macos_acl_property_present(|| Ok(()), |property| Ok(property != 5)).unwrap());
+        for missing in [1, 2, 4] {
+            assert_eq!(
+                macos_acl_property_present(
+                    || Ok(()),
+                    |property| Ok(property != missing && property != 5)
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert_eq!(
+            macos_acl_property_present(|| Ok(()), |_| Err(noent()))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            macos_acl_property_value(|| Err(noent()))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            macos_acl_property_value(|| Ok(std::ptr::null_mut()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            macos_acl_property_value(|| Ok(std::ptr::without_provenance_mut::<std::ffi::c_void>(
+                1
+            )))
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut object = 0u8;
+        let ptr = (&mut object as *mut u8).cast();
+        assert_eq!(macos_acl_property_value(|| Ok(ptr)).unwrap(), ptr);
+        assert_eq!(
+            macos_acl_size_result(-1, noent).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            macos_acl_copy_result(-1, 44, noent)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            macos_acl_copy_result(43, 44, noent).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    async fn config_guard_in_profile(profile: &Path, config: &Path) -> pi_rs::Result<ConfigGuard> {
+        let account = acquire_for_test(profile, None).await?;
+        account_guard_with(account, &[config.to_path_buf()], None, true).await
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_actual_config_guard_and_releases_it() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.path().join("mcp.json");
+        std::fs::write(&config, "intermediate").unwrap();
+        let held = config_guard_in_profile(&profile, &config).await.unwrap();
+        let mut snapshot = Box::pin(with_config_guard(
+            config_guard_in_profile(&profile, &config),
+            || {
+                let account_contender = open_in_profile(&profile)?;
+                let config_contender = File::open(config.with_extension("lock"))?;
+                assert!(matches!(
+                    account_contender.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                assert!(matches!(
+                    config_contender.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                Ok(std::fs::read_to_string(&config)?)
+            },
+        ));
+        // The injected opener and first try_lock run in this poll. Pending is
+        // observed while another real ConfigGuard owns the account gate.
+        assert!(futures_util::poll!(snapshot.as_mut()).is_pending());
+        std::fs::write(&config, "final").unwrap();
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), snapshot)
+                .await
+                .unwrap()
+                .unwrap(),
+            "final"
+        );
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            config_guard_in_profile(&profile, &config),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(next);
+        let result = with_config_guard(config_guard_in_profile(&profile, &config), || {
+            Err::<(), _>(pi_rs::Error::Config("fixture".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            config_guard_in_profile(&profile, &config),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_cancel_and_timeout_do_not_run_after_guard_release() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.path().join("mcp.json");
+        let held = config_guard_in_profile(&profile, &config).await.unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut cancelled = Box::pin(with_config_guard(
+            config_guard_in_profile(&profile, &config),
+            || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+
+        let mut timed = Box::pin(with_config_guard(
+            config_guard_in_profile(&profile, &config),
+            || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        assert!(futures_util::poll!(timed.as_mut()).is_pending());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), timed)
+                .await
+                .is_err()
+        );
+        let task_profile = profile.clone();
+        let task_config = config.clone();
+        let observed = ran.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut snapshot = Box::pin(with_config_guard(
+                config_guard_in_profile(&task_profile, &task_config),
+                || {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            ));
+            assert!(futures_util::poll!(snapshot.as_mut()).is_pending());
+            let _ = ready_tx.send(());
+            snapshot.await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            config_guard_in_profile(&profile, &config),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(next);
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::SeqCst));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
@@ -802,16 +1239,55 @@ mod tests {
     }
     #[test]
     fn gate_handles_contend_and_reopen() {
+        const CHILD: &str = "PI_RS_TEST_GATE_HANDLE_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let first = open_in_profile(&root).unwrap();
+            let second = open_in_profile(&root).unwrap();
+            first.try_lock().unwrap();
+            assert!(matches!(
+                second.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            drop(first);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match second.try_lock() {
+                    Ok(()) => {
+                        std::fs::write(root.join("handle-test-complete"), b"ok").unwrap();
+                        return;
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        assert!(std::time::Instant::now() < until, "gate was not released");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("gate lock failed: {error:?}"),
+                }
+            }
+        }
         let root = TestDir::new();
-        let first = open_in_profile(&root.0).unwrap();
-        let second = open_in_profile(&root.0).unwrap();
-        first.try_lock().unwrap();
-        assert!(matches!(
-            second.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        drop(first);
-        second.try_lock().unwrap();
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp_shared_gate::tests::gate_handles_contend_and_reopen",
+                ])
+                .env(CHILD, &root.0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "gate child failed: {status}");
+                assert!(root.0.join("handle-test-complete").exists());
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "gate child did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     #[test]
     fn account_profile_does_not_follow_agent_or_home_environment() {
@@ -1225,12 +1701,6 @@ pub(crate) mod windows_mutex {
         pub(crate) abandoned: bool,
         recovered: bool,
     }
-    impl Guard {
-        /// Call only after persistent state has been checked and repaired.
-        pub(crate) fn mark_recovered(&mut self) {
-            self.recovered = true;
-        }
-    }
     impl Drop for Guard {
         fn drop(&mut self) {
             if let Some(release) = self.release.take() {
@@ -1398,6 +1868,89 @@ pub(crate) mod windows_mutex {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    async fn config_guard_named(
+        name: String,
+        config: &Path,
+        hooks: Option<windows_mutex::WorkerHooks>,
+    ) -> pi_rs::Result<ConfigGuard> {
+        let mutex = windows_mutex::acquire_named_for_test(name, hooks).await?;
+        if mutex.abandoned {
+            return Err(io::Error::other("abandoned MCP gate requires recovery").into());
+        }
+        account_guard_with(
+            AccountGuard { _mutex: mutex },
+            &[config.to_path_buf()],
+            None,
+            true,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn snapshot_cancel_releases_named_mutex_worker() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("mcp.json");
+        let name = format!("Global\\pi-rs-mcp-snapshot-test-{}", uuid::Uuid::new_v4());
+        let held = tokio::time::timeout(
+            Duration::from_secs(10),
+            config_guard_named(name.clone(), &config, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let waiter_name = name.clone();
+        let waiter_config = config.clone();
+        let task = tokio::spawn(async move {
+            with_config_guard(
+                config_guard_named(
+                    waiter_name,
+                    &waiter_config,
+                    Some(windows_mutex::WorkerHooks {
+                        wait_started: started_tx,
+                        exited: exited_tx,
+                    }),
+                ),
+                || {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), exited_rx)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        drop(held);
+        let next = tokio::time::timeout(
+            Duration::from_secs(10),
+            config_guard_named(name, &config, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(next);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn unsupported_gate_does_not_create_a_directory_or_use_account_profile() {

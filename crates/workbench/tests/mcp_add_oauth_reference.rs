@@ -172,25 +172,26 @@ async fn run_reference_login(project_scope: bool, change_during_login: bool, loc
         std::fs::write(&global_path, json!({"mcpServers":{"fixture":{"url":"https://global.example/mcp","auth":{"provider":"fixture"}}}}).to_string()).unwrap();
         project_path
     } else {
-        global_path
+        global_path.clone()
     };
+    let global_before = std::fs::read(&global_path).unwrap();
     let before = std::fs::read(&config_path).unwrap();
     let config: Value = serde_json::from_slice(&before).unwrap();
     assert_eq!(
         config["mcpServers"]["fixture"]["oauth"]["clientSecret"],
         REFERENCE
     );
-    let credential_path = if change_during_login {
+    let credential_path = {
         use sha2::{Digest, Sha256};
         let digest =
             Sha256::digest(serde_json::to_vec(&("fixture", format!("{base}/mcp"))).unwrap());
         let directory = root.path().join("mcp-auth");
-        std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("{digest:x}.json"));
-        std::fs::write(&path, "old credentials").unwrap();
-        Some(path)
-    } else {
-        None
+        if change_during_login {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(&path, "old credentials").unwrap();
+        }
+        path
     };
     let callback_browser_url = browser_url.clone();
     let callback_config_path = config_path.clone();
@@ -254,11 +255,31 @@ async fn run_reference_login(project_scope: bool, change_during_login: bool, loc
         "unexpected login result: {}",
         String::from_utf8_lossy(&login.stderr).replace(SECRET, "[redacted]")
     );
-    if let Some(path) = credential_path {
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "old credentials");
+    if change_during_login {
+        assert_eq!(
+            std::fs::read_to_string(&credential_path).unwrap(),
+            "old credentials"
+        );
+    } else {
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+        assert_eq!(
+            saved.pointer("/credentials/token_response/access_token"),
+            Some(&json!("fixture-access-token"))
+        );
+    }
+    if !change_during_login {
+        // Reading and finalizing a trusted project may create its lock file,
+        // but an already-enabled OAuth configuration must not be rewritten.
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+    } else {
+        let mut expected: Value = serde_json::from_slice(&before).unwrap();
+        expected["mcpServers"]["fixture"]["url"] = json!("https://changed.example/mcp");
+        let actual: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(actual, expected);
     }
     if project_scope {
-        assert!(!config_path.with_extension("lock").exists());
+        assert_eq!(std::fs::read(&global_path).unwrap(), global_before);
     }
     timeout_at(deadline, browser_task).await.unwrap().unwrap();
     let token_body = timeout_at(deadline, server).await.unwrap().unwrap();

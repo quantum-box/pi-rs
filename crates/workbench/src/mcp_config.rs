@@ -127,15 +127,14 @@ async fn configurations_with_project_scope(
     }
     // Do not observe a configuration between OAuth enablement and credential
     // persistence. Release the gate before connecting or acquiring credentials.
-    with_config_gate(mcp_read_guard(args), || read_configurations(args, strict)).await
+    with_mcp_snapshot(mcp_read_guard(args), || read_configurations(args, strict)).await
 }
 
-async fn with_config_gate<T, G>(
-    gate: impl std::future::Future<Output = Result<G>>,
+async fn with_mcp_snapshot<T>(
+    gate: impl std::future::Future<Output = Result<pi_rs_workbench::mcp_shared_gate::ConfigGuard>>,
     read: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let _guard = gate.await?;
-    read()
+    pi_rs_workbench::mcp_shared_gate::with_config_guard(gate, read).await
 }
 
 fn read_configurations(args: &Cli, strict: bool) -> Result<ScopedConfigurations> {
@@ -667,20 +666,22 @@ fn valid_inherited_oauth(value: &Value) -> bool {
 }
 
 pub async fn auto_enable_codemode(args: &Cli) -> Result<bool> {
-    let _guard = mcp_read_guard(args).await?;
-    let mut value = true;
-    let mut paths = vec![config::agent_dir().join("mcp.json")];
-    if args.trusted {
-        paths.push(args.workspace.join(".pi/mcp.json"));
-    }
-    for path in paths {
-        if let Some(setting) = config::read_object(&path)?.get("autoEnableCodemode") {
-            value = setting
-                .as_bool()
-                .ok_or_else(|| Error::Config("autoEnableCodemode must be a boolean".into()))?;
+    with_mcp_snapshot(mcp_read_guard(args), || {
+        let mut value = true;
+        let mut paths = vec![config::agent_dir().join("mcp.json")];
+        if args.trusted {
+            paths.push(args.workspace.join(".pi/mcp.json"));
         }
-    }
-    Ok(value)
+        for path in paths {
+            if let Some(setting) = config::read_object(&path)?.get("autoEnableCodemode") {
+                value = setting
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("autoEnableCodemode must be a boolean".into()))?;
+            }
+        }
+        Ok(value)
+    })
+    .await
 }
 
 pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtension>>> {
@@ -1236,12 +1237,11 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             let snapshot = tokio::select! {
                 biased;
                 _ = args.mcp_login_cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout_at(deadline, async {
-                    let _guard = mcp_read_guard(args).await?;
+                result = tokio::time::timeout_at(deadline, with_mcp_snapshot(mcp_read_guard(args), || {
                     let user = config::read_object(&path(args, false))?;
                     let project = if args.trusted { Some(config::read_object(&path(args, true))?) } else { None };
                     login_snapshot(&user, project.as_ref(), &name, local)
-                }) => result.map_err(|_| Error::Config("MCP login timed out".into()))??,
+                })) => result.map_err(|_| Error::Config("MCP login timed out".into()))??,
             };
             let server = &snapshot.server;
             if let Some(auth) = &server.auth {
@@ -1428,6 +1428,30 @@ fn path(args: &Cli, local: bool) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Legacy lock-helper tests do not exercise the production ConfigGuard.
+    async fn with_legacy_test_gate<T>(
+        gate: impl std::future::Future<Output = Result<McpWriteGuard>>,
+        read: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _guard = gate.await?;
+        read()
+    }
+
+    #[tokio::test]
+    async fn snapshot_adapter_propagates_gate_error_without_reading() {
+        let mut read = false;
+        let result = with_mcp_snapshot(
+            async { Err(Error::Config("gate fixture error".into())) },
+            || {
+                read = true;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Config(message)) if message == "gate fixture error"));
+        assert!(!read);
+    }
 
     #[test]
     fn login_resolution_uses_trusted_definition_and_oauth_override() {
@@ -1653,7 +1677,7 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let mut reader = tokio::spawn(async move {
             started_tx.send(()).unwrap();
-            with_config_gate(mcp_write_guard_at(&gate_for_reader, None, None), || {
+            with_legacy_test_gate(mcp_write_guard_at(&gate_for_reader, None, None), || {
                 Ok(std::fs::read_to_string(config_for_reader)?)
             })
             .await
@@ -1685,7 +1709,7 @@ mod tests {
     async fn failed_snapshot_releases_the_configuration_gate() {
         let root = tempfile::tempdir().unwrap();
         let gate = root.path().join("gate.lock");
-        let result = with_config_gate(mcp_write_guard_at(&gate, None, None), || {
+        let result = with_legacy_test_gate(mcp_write_guard_at(&gate, None, None), || {
             Err::<(), _>(Error::Config("invalid fixture configuration".into()))
         })
         .await;
@@ -1724,7 +1748,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let _drop_notification = NotifyDrop(Some(dropped_tx));
             started_tx.send(()).unwrap();
-            with_config_gate(mcp_write_guard_at(&task_gate, None, None), || {
+            with_legacy_test_gate(mcp_write_guard_at(&task_gate, None, None), || {
                 observed.store(true, Ordering::SeqCst);
                 Ok(())
             })
