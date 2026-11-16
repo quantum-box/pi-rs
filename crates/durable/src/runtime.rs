@@ -7995,6 +7995,7 @@ impl Harness {
         });
         state.input_modes.insert(sid, options.mode);
         if place_now {
+            state.run_failure = None;
             state.active = Some(sid);
             let binding = state
                 .submissions
@@ -8397,6 +8398,7 @@ impl Harness {
             });
             c.input_modes.insert(sid, options.mode);
             if place_now {
+                c.run_failure = None;
                 c.active = Some(sid);
                 c.messages.push(Message::User {
                     content: content.clone(),
@@ -8536,6 +8538,7 @@ impl Harness {
                 input_blocks: None,
                 status: Status::Running,
             });
+            c.run_failure = None;
             c.active = Some(sid);
             c.auto_compaction_attempted = false;
             c.retry_state = RetryState::default();
@@ -10966,7 +10969,9 @@ impl Harness {
                             place_reset(&mut c, marker);
                         }
                         if c.pending_resets.is_empty() {
+                            let failure = c.run_failure.clone();
                             place_queued(&mut c, true);
+                            c.run_failure = failure;
                             if c.active.is_some() {
                                 c.phase = Phase::ModelReady { turns: 0 };
                             }
@@ -16043,6 +16048,7 @@ fn append_tool(
 }
 // Final boundaries select each mode independently; post-tool boundaries select only steers.
 fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
+    let starting_run = c.active.is_none();
     let mut steer = false;
     let mut follow = false;
     let mut placed = false;
@@ -16082,6 +16088,9 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
             }
         }
     }
+    if placed && starting_run {
+        c.run_failure = None;
+    }
     placed
 }
 
@@ -16120,7 +16129,8 @@ fn finish_abort(c: &mut Conversation) {
     }
 }
 fn finish_failure(c: &mut Conversation, reason: String) {
-    let inputs: Vec<_> = c.submissions
+    let inputs: Vec<_> = c
+        .submissions
         .iter()
         .filter(|s| s.status == Status::Running)
         .map(|s| s.id)
@@ -16169,7 +16179,9 @@ mod scheduler_tests {
                 reason: "model failed".into(),
             })
         );
-        assert!(matches!(&restored.submissions[0].status, Status::Unanswered { reason } if reason == "model failed"));
+        assert!(
+            matches!(&restored.submissions[0].status, Status::Unanswered { reason } if reason == "model failed")
+        );
     }
 
     #[test]

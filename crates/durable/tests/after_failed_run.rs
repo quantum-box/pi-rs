@@ -76,6 +76,11 @@ async fn policies_survive_reopen_and_preserve_request_identity() {
             c.submissions.iter().find(|s| s.id == first).unwrap().status,
             Status::Unanswered { .. }
         ));
+        if policy == AfterFailedRun::Continue {
+            assert!(c.run_failure.is_none());
+        } else {
+            assert!(c.run_failure.is_some());
+        }
         let status = &c
             .submissions
             .iter()
@@ -234,4 +239,131 @@ async fn provider_error_named_aborted_is_still_a_failed_run() {
             reason: "run_failed".into()
         }
     );
+}
+
+#[tokio::test]
+async fn failure_clears_when_later_scheduler_run_starts_after_reopen() {
+    use pi_rs_durable::runtime::Scheduler;
+    for continue_run in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(FailOnce(AtomicUsize::new(0)));
+        let mut scheduler = Scheduler::open(&path, options(model.clone())).unwrap();
+        let id = scheduler
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let first = scheduler.submit(id, None, "first".into()).unwrap();
+        scheduler.wait(id).await.unwrap();
+        assert_eq!(
+            scheduler
+                .conversation(id)
+                .unwrap()
+                .run_failure
+                .unwrap()
+                .inputs,
+            vec![first]
+        );
+        scheduler.shutdown().await.unwrap();
+        let mut scheduler = Scheduler::open(&path, options(model.clone())).unwrap();
+        scheduler
+            .set_after_failed_run(id, AfterFailedRun::Keep)
+            .unwrap();
+        assert!(scheduler.conversation(id).unwrap().run_failure.is_some());
+        if continue_run {
+            scheduler.submit_continue(id, None).unwrap();
+        } else {
+            scheduler.submit(id, None, "later".into()).unwrap();
+        }
+        scheduler.wait(id).await.unwrap();
+        assert!(scheduler.conversation(id).unwrap().run_failure.is_none());
+        scheduler.shutdown().await.unwrap();
+        let scheduler = Scheduler::open(&path, options(model)).unwrap();
+        assert!(scheduler.conversation(id).unwrap().run_failure.is_none());
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+struct GatedOnce {
+    calls: AtomicUsize,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl Model for GatedOnce {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream, Error> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            return Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                calls: vec![pi_rs_core::ToolCall {
+                    id: "call".into(),
+                    name: "missing".into(),
+                    arguments: "{}".into(),
+                }],
+                usage: None,
+            })])
+            .boxed());
+        }
+        Ok(stream::iter(vec![
+            Ok(ModelEvent::Text("answer".into())),
+            Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            }),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn reset_start_in_failure_commit_preserves_failure_after_reopen() {
+    use pi_rs_durable::runtime::Scheduler;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(GatedOnce {
+        calls: AtomicUsize::new(0),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let opts = || Options {
+        model: model.clone(),
+        tools: vec![],
+        restart_limit: 3,
+        max_turns: 5,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut s = Scheduler::open(&path, opts()).unwrap();
+    let id = s
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let first = s.submit(id, None, "first".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), model.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    s.reset(id, Some("reset".into())).unwrap();
+    s.submit(id, None, "next".into()).unwrap();
+    model.release.add_permits(1);
+    s.wait(id).await.unwrap();
+    assert_eq!(
+        s.conversation(id).unwrap().run_failure.unwrap().inputs,
+        vec![first]
+    );
+    s.shutdown().await.unwrap();
+    let s = Scheduler::open(&path, opts()).unwrap();
+    assert_eq!(
+        s.conversation(id).unwrap().run_failure.unwrap().inputs,
+        vec![first]
+    );
+    s.shutdown().await.unwrap();
 }

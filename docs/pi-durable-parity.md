@@ -1,4 +1,4 @@
-**Run failure increment:** A run ending without an answer records its running submission IDs and existing reason string in `Conversation.run_failure`, persisted with settlement and exposed in conversation views. Clearing, upstream reason/detail mapping, run task IDs and `first` lineage remain unsupported.
+**Run failure increment:** A run ending without an answer records its running submission IDs and existing reason string in `Conversation.run_failure`, persisted with settlement and exposed in conversation views. A later run start clears it; a reset starting a run in the failure commit retains it. Upstream reason/detail mapping, run task IDs and `first` lineage remain unsupported.
 
 **Nested pending identity gap:** Existing pending nested jobs persist a tool name, replay policy and opaque reference, but no implementation or tenant identity. A host must restore the original child configuration and tenant before polling; a same-named tool pointed at a different backend can otherwise associate the wrong remote result with the recorded operation. Reconciliation is required when that identity cannot be established.
 
