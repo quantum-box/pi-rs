@@ -55,6 +55,32 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+struct BoundedProcess {
+    child: Child,
+    master: Option<File>,
+}
+impl Drop for BoundedProcess {
+    fn drop(&mut self) {
+        drop(self.master.take());
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    if !std::thread::panicking() {
+                        panic!("terminal child did not exit after kill: {result:?}");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
     output_until_with_timeout(master, Duration::from_secs(10), predicate);
 }
@@ -184,31 +210,33 @@ fn initial_appearance_report_keeps_late_color_replies() {
             Ok(())
         });
     }
-    let _process = Process(
-        command
-            .current_dir(root.path())
-            .env("PI_RS_HOME", root.path().join("home"))
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor")
-            .env_remove("NO_COLOR")
-            .args([
-                "--no-trust",
-                "--no-mcp",
-                "--offline",
-                "--use-theme",
-                "system",
-            ])
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave))
-            .spawn()
-            .unwrap(),
-    );
+    let child = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR")
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--offline",
+            "--use-theme",
+            "system",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
     // The command retains copies of the slave descriptors. Drop them and let
     // the PTY master close before the child guard waits, including on panic.
     drop(command);
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
-    output_until_with_timeout(&mut master, Duration::from_secs(30), |text| {
+    let mut process = BoundedProcess {
+        child,
+        master: Some(unsafe { File::from_raw_fd(master_fd) }),
+    };
+    let master = process.master.as_mut().unwrap();
+    output_until_with_timeout(master, Duration::from_secs(30), |text| {
         assert!(!text.contains("\x1b[38;2;"));
         text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
     });
@@ -234,7 +262,25 @@ fn initial_appearance_report_keeps_late_color_replies() {
         .unwrap();
     // Pi applies the accumulated late result when its query reaches DA1.
     master.write_all(b"\x1b[?1;2c").unwrap();
-    output_until(&mut master, |text| text.contains("\x1b[38;2;"));
+    output_until(master, |text| text.contains("\x1b[38;2;"));
+    master.write_all(b"\x04").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut drain = [0; 8192];
+        let _ = master.read(&mut drain);
+        if let Some(status) = process.child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "terminal child exited unsuccessfully: {status}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child failed to exit after Ctrl-D"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -409,31 +455,6 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
 #[test]
 fn delayed_color_reply_does_not_type_tail_or_open_editor() {
     use std::os::unix::fs::PermissionsExt;
-    struct BoundedProcess {
-        child: Child,
-        master: Option<File>,
-    }
-    impl Drop for BoundedProcess {
-        fn drop(&mut self) {
-            drop(self.master.take());
-            let _ = self.child.kill();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    result => {
-                        if !std::thread::panicking() {
-                            panic!("terminal child did not exit after kill: {result:?}");
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-    }
     fn wait_for(master: &mut File, expected: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         let mut bytes = Vec::new();
