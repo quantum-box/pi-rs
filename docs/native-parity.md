@@ -3811,6 +3811,19 @@ Provider errors are returned until a safe decision-bound fallback is available.
 Root combinators fall back for preferred constraints or fail when required,
 since dropping them from a strict schema would change its meaning.
 There is no claim of native agent end-to-end constrained sampling or recovery.
+
+The Chat Completions adapter also resolves explicitly supplied JSON Schema
+constraints for declaration-aware and prepared dispatch. It enables strict mode
+only when `supportsStrictMode` is explicitly true, preserves `strict: false`
+for unconstrained or preferred fallback tools when supported, and omits the
+field otherwise. Required constraints fail before dispatch when unsupported
+or unsafe to normalize. Prepared session and summary dispatch bind decisions
+and budget estimates to the transformed wire schemas; callers must normalize
+strict arguments before validation. The native agent is not wired to this
+prepared path. Grammar declarations in Chat Completions currently fall back to
+ordinary function tools; custom grammar tools and their streaming/replay remain
+unsupported. No provider-side strict-limit retry is implemented on this path.
+
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier

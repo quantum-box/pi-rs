@@ -47,6 +47,53 @@ pub struct Ollama {
     reasoning: Option<ReasoningObserver>,
 }
 
+/// A prepared Chat Completions request with immutable wire tool decisions.
+pub struct PreparedChatRequest {
+    client: Ollama,
+    request: ModelRequest,
+    reservation_request: ModelRequest,
+    wire_tools: Vec<Value>,
+    effective_tools: Vec<pi_rs_core::EffectiveToolDeclaration>,
+}
+
+impl PreparedChatRequest {
+    /// Decisions for the exact tool schemas that will be sent.
+    pub fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.effective_tools
+    }
+}
+
+struct PreparedChatDispatch {
+    request: PreparedChatRequest,
+    snapshot: pi_rs_core::ToolDecisionSnapshot,
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedChatDispatch {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.request.effective_tools
+    }
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request.request
+    }
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.request.reservation_request
+    }
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        let stream = self
+            .request
+            .client
+            .stream_with_wire_tools(self.request.request, Some(self.request.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| {
+            event.map(|event| pi_rs_core::EnrichedModelEvent::Legacy(event).into())
+        })))
+    }
+}
+
 /// Capabilities reported by the native Ollama service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +135,50 @@ fn report_progress(
 }
 
 impl Ollama {
+    /// Resolve constraints once, using the configured compatibility capability.
+    pub fn prepare_tool_request(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<PreparedChatRequest> {
+        let (wire_tools, effective_tools) = resolved_constrained_tools(
+            &request,
+            declarations,
+            self.compatibility.supports_strict_mode == Some(true),
+        )?;
+        let mut reservation_request = request.clone();
+        for (spec, wire) in reservation_request.tools.iter_mut().zip(&wire_tools) {
+            spec.parameters = wire["function"]["parameters"].clone();
+        }
+        Ok(PreparedChatRequest {
+            client: self.clone(),
+            request,
+            reservation_request,
+            wire_tools,
+            effective_tools,
+        })
+    }
+
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        let prepared = self.prepare_tool_request(request.clone(), declarations)?;
+        let snapshot = pi_rs_core::ToolDecisionSnapshot::capture(
+            context,
+            request,
+            declarations,
+            &prepared.effective_tools,
+        )
+        .map_err(|error| Error::Config(error.to_string()))?;
+        Ok(Box::new(PreparedChatDispatch {
+            request: prepared,
+            snapshot,
+        }))
+    }
+
     /// Accept a loopback HTTP service or a TLS-protected relay, without redirects or proxy discovery.
     pub fn new(endpoint: &str, token: Option<String>) -> Result<Self> {
         let openai_endpoint = endpoint.contains("api.openai.com");
@@ -700,6 +791,54 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        _external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_tool_request(request, declarations)?;
+        let stream = prepared
+            .client
+            .stream_with_wire_tools(prepared.request, Some(prepared.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| {
+            event.map(|event| pi_rs_core::EnrichedModelEvent::Legacy(event).into())
+        })))
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_tool_request(request, declarations)?;
+        let stream = prepared
+            .client
+            .stream_with_wire_tools(prepared.request, Some(prepared.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| {
+            event.map(|event| pi_rs_core::EnrichedModelEvent::Legacy(event).into())
+        })))
+    }
+
     fn context_identity(&self) -> Option<String> {
         if !self.http_proxies.is_empty() {
             return None;
@@ -853,6 +992,16 @@ impl Model for Ollama {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        self.stream_with_wire_tools(request, None).await
+    }
+}
+
+impl Ollama {
+    async fn stream_with_wire_tools(
+        &self,
+        request: ModelRequest,
+        wire_tools: Option<Vec<Value>>,
+    ) -> Result<ModelStream> {
         if self.has_ambiguous_legacy_replay(&request) {
             return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
         }
@@ -877,17 +1026,19 @@ impl Model for Ollama {
             .into_iter()
             .flat_map(|message| self.compatible_message(message, &identity))
             .collect();
-        let tools: Vec<_> = request
-            .tools
-            .into_iter()
-            .map(|function| {
-                let mut function = json!(function);
-                if self.compatibility.supports_strict_mode == Some(true) {
-                    function["strict"] = json!(false);
-                }
-                json!({"type": "function", "function": function})
-            })
-            .collect();
+        let tools: Vec<_> = wire_tools.unwrap_or_else(|| {
+            request
+                .tools
+                .into_iter()
+                .map(|function| {
+                    let mut function = json!(function);
+                    if self.compatibility.supports_strict_mode == Some(true) {
+                        function["strict"] = json!(false);
+                    }
+                    json!({"type": "function", "function": function})
+                })
+                .collect()
+        });
         let mut body = json!({"model":request.model,"messages":messages,"stream":true});
         self.compatibility
             .request_options(&mut body, request.max_output_tokens, !tools.is_empty());
@@ -1157,6 +1308,63 @@ impl Model for Ollama {
             Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
         }))
     }
+}
+
+fn resolved_constrained_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supports_strict: bool,
+) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
+    let mut names = std::collections::BTreeSet::new();
+    if request.tools.len() != declarations.len()
+        || request
+            .tools
+            .iter()
+            .zip(declarations)
+            .any(|(spec, declaration)| spec != &declaration.spec || !names.insert(&spec.name))
+    {
+        return Err(Error::Config(
+            "tool declarations do not match the effective request".into(),
+        ));
+    }
+    let mut wire = Vec::with_capacity(declarations.len());
+    let mut effective = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let spec = &declaration.spec;
+        let strict = match &declaration.constrained_sampling {
+            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+                pi_rs_core::resolve_strict_tool_schema(
+                    &spec.name,
+                    &spec.parameters,
+                    *strict,
+                    supports_strict,
+                    |_, _| false,
+                )
+                .map_err(|error| Error::Config(error.to_string()))?
+            }
+            _ => None,
+        };
+        let mut function = json!({"name":spec.name,"description":spec.description,"parameters":strict.as_ref().unwrap_or(&spec.parameters)});
+        if supports_strict {
+            function["strict"] = json!(strict.is_some());
+        }
+        let sampling = if strict.is_some() {
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+            }
+        } else {
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        };
+        wire.push(json!({"type":"function", "function":function}));
+        effective.push(pi_rs_core::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling,
+        });
+    }
+    pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    Ok((wire, effective))
 }
 
 fn apply_anthropic_cache(body: &mut Value, control: &Value) {
@@ -2409,5 +2617,166 @@ mod content_tests {
             messages[0]["content"][1]["image_url"]["url"],
             "data:image/png;base64,aW1hZ2U="
         );
+    }
+}
+
+#[cfg(test)]
+mod constrained_chat_tests {
+    use super::*;
+    use pi_rs_core::{
+        EffectiveToolSampling, StrictToolPolicy, ToolConstraint, ToolDeclaration,
+        ToolDispatchContext, ToolSpec,
+    };
+
+    fn fixture(policy: StrictToolPolicy, schema: Value) -> (ModelRequest, ToolDeclaration) {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "Read".into(),
+            parameters: schema,
+        };
+        (
+            ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![spec.clone()],
+                max_output_tokens: 16,
+            },
+            ToolDeclaration {
+                spec,
+                constrained_sampling: Some(ToolConstraint::JsonSchema { strict: policy }),
+            },
+        )
+    }
+
+    fn model(support: Option<bool>, endpoint: &str) -> Ollama {
+        let mut model = Ollama::new(endpoint, None).unwrap();
+        model.compatibility.supports_strict_mode = support;
+        model
+    }
+
+    #[test]
+    fn constrained_chat_resolution_preserves_defaults_and_fails_closed() {
+        let schema = json!({"type":"object", "properties":{"path":{"type":"string"},"limit":{"type":"integer"}}, "required":["path"]});
+        let (request, preferred) = fixture(StrictToolPolicy::Prefer, schema.clone());
+        for support in [None, Some(false), Some(true)] {
+            let (wire, decisions) = resolved_constrained_tools(
+                &request,
+                std::slice::from_ref(&preferred),
+                support == Some(true),
+            )
+            .unwrap();
+            if support == Some(true) {
+                assert_eq!(wire[0]["function"]["strict"], true);
+                assert_eq!(
+                    wire[0]["function"]["parameters"]["required"],
+                    json!(["path", "limit"])
+                );
+                assert_eq!(
+                    wire[0]["function"]["parameters"]["properties"]["limit"],
+                    json!({"anyOf":[{"type":"integer"},{"type":"null"}]})
+                );
+                assert!(matches!(
+                    decisions[0].sampling,
+                    EffectiveToolSampling::StrictJsonSchema { .. }
+                ));
+            } else {
+                assert!(wire[0]["function"].get("strict").is_none());
+                assert_eq!(wire[0]["function"]["parameters"], schema);
+                assert!(matches!(
+                    decisions[0].sampling,
+                    EffectiveToolSampling::Unconstrained
+                ));
+            }
+        }
+        let (request, required) = fixture(StrictToolPolicy::Require, schema);
+        assert!(resolved_constrained_tools(&request, &[required], false).is_err());
+        let (request, preferred) = fixture(
+            StrictToolPolicy::Prefer,
+            json!({"type":"object","$ref":"#/x"}),
+        );
+        let (wire, decisions) = resolved_constrained_tools(&request, &[preferred], true).unwrap();
+        assert_eq!(wire[0]["function"]["strict"], false);
+        assert!(matches!(
+            decisions[0].sampling,
+            EffectiveToolSampling::Unconstrained
+        ));
+        let (request, required) = fixture(
+            StrictToolPolicy::Require,
+            json!({"type":"object","$ref":"#/x"}),
+        );
+        assert!(resolved_constrained_tools(&request, &[required], true).is_err());
+        let (_, mismatch) = fixture(StrictToolPolicy::Prefer, json!({"type":"object"}));
+        assert!(resolved_constrained_tools(&request, &[mismatch], true).is_err());
+    }
+
+    #[tokio::test]
+    async fn constrained_chat_prepared_wire_matches_decision_in_session_and_summary() {
+        use std::io::{Read, Write};
+        for summary in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let (start, length) = loop {
+                    let count = socket.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..pos]);
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|s| s.parse().ok())
+                            })
+                            .unwrap();
+                        break (pos + 4, length);
+                    }
+                };
+                while bytes.len() < start + length {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[start..start + length]).unwrap();
+                let response = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                body
+            });
+            let client = model(Some(true), &format!("http://{address}"));
+            let (request, declaration) = fixture(
+                StrictToolPolicy::Require,
+                json!({"type":"object", "properties":{"optional":{"type":"string"}}}),
+            );
+            let context = ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session".into(),
+                summary,
+            };
+            let prepared = client
+                .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .unwrap();
+            pi_rs_core::validate_prepared_tool_dispatch(
+                &*prepared,
+                &context,
+                &request,
+                &[declaration],
+            )
+            .unwrap();
+            let expected = prepared.reservation_request().tools[0].parameters.clone();
+            assert!(matches!(
+                prepared.effective_tools()[0].sampling,
+                EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+            let events = prepared.dispatch().await.unwrap().collect::<Vec<_>>().await;
+            assert!(events.into_iter().all(|event| event.is_ok()));
+            let body = worker.join().unwrap();
+            assert_eq!(body["tools"][0]["function"]["parameters"], expected);
+            assert_eq!(body["tools"][0]["function"]["strict"], true);
+        }
     }
 }
