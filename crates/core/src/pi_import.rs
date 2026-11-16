@@ -228,10 +228,12 @@ fn conversion_equal(
 
 /// Incremental verifier for append-only projection streams. The generated-ID
 /// mapping and persistent branch snapshots are retained across entries.
-#[derive(Default)]
 pub struct StreamVerifier {
     processed: usize,
     nearest: Vec<Option<u64>>,
+    completed: Vec<bool>,
+    source_ids: BTreeMap<String, u64>,
+    unresolved_parents: std::collections::BTreeSet<String>,
     states: BTreeMap<u64, Branch>,
     branches: BTreeMap<String, Branch>,
     names: Vec<Option<String>>,
@@ -253,12 +255,33 @@ struct StagedConversion {
     events: Vec<Event>,
 }
 
+impl Default for StreamVerifier {
+    fn default() -> Self {
+        Self {
+            processed: 0,
+            nearest: vec![None],
+            completed: vec![false],
+            source_ids: Default::default(),
+            unresolved_parents: Default::default(),
+            states: Default::default(),
+            branches: Default::default(),
+            names: Default::default(),
+            ids: Default::default(),
+            reverse: Default::default(),
+            legacy: false,
+            counts: Default::default(),
+            new_counts: Default::default(),
+            checked_sources: 0,
+            pending: None,
+            authoritative_source_count: None,
+            legacy_candidates: Default::default(),
+        }
+    }
+}
+
 impl StreamVerifier {
     pub fn new() -> Self {
-        Self {
-            nearest: vec![None],
-            ..Self::default()
-        }
+        Self::default()
     }
     pub fn counts(&self) -> &BTreeMap<u64, u64> {
         &self.counts
@@ -312,11 +335,15 @@ impl StreamVerifier {
                 .and_then(|parent| self.nearest.get(parent as usize).copied().flatten());
             let Event::SourceEntry { format, entry } = &record.event else {
                 self.nearest.push(parent_source);
+                self.completed
+                    .push(record.parent.is_some_and(|id| self.completed[id as usize]));
                 self.processed += 1;
                 continue;
             };
             if format != "pi" {
                 self.nearest.push(parent_source);
+                self.completed
+                    .push(record.parent.is_some_and(|id| self.completed[id as usize]));
                 self.processed += 1;
                 continue;
             }
@@ -324,6 +351,8 @@ impl StreamVerifier {
                 self.legacy = entry["version"].as_u64().unwrap_or(1) == 1;
                 self.names.push(None);
                 self.nearest.push(parent_source);
+                self.completed
+                    .push(record.parent.is_some_and(|id| self.completed[id as usize]));
                 self.processed += 1;
                 continue;
             }
@@ -338,6 +367,47 @@ impl StreamVerifier {
                     .ok_or_else(|| {
                         Error::Session("missing or invalid imported Pi source ID".into())
                     })?;
+                if self.unresolved_parents.contains(&name) {
+                    return Err(Error::Session(
+                        "imported Pi parent is a forward reference".into(),
+                    ));
+                }
+                if !self.legacy {
+                    match entry.get("parentId") {
+                        None | Some(Value::Null) => {
+                            if parent_source.is_some() {
+                                return Err(Error::Session(
+                                    "imported Pi root has a physical source parent".into(),
+                                ));
+                            }
+                        }
+                        Some(Value::String(parent)) if parent == &name => {
+                            return Err(Error::Session(
+                                "imported Pi source is its own parent".into(),
+                            ));
+                        }
+                        Some(Value::String(parent)) => {
+                            if let Some(id) = self.source_ids.get(parent) {
+                                if parent_source != Some(*id) {
+                                    return Err(Error::Session(
+                                        "imported Pi source parent does not match its branch"
+                                            .into(),
+                                    ));
+                                }
+                            } else {
+                                self.unresolved_parents.insert(parent.clone());
+                            }
+                        }
+                        _ => return Err(Error::Session("invalid imported Pi parent ID".into())),
+                    }
+                }
+                if parent_source.is_some()
+                    && record.parent.is_none_or(|id| !self.completed[id as usize])
+                {
+                    return Err(Error::Session(
+                        "imported Pi source follows a partial conversion".into(),
+                    ));
+                }
                 if self.branches.contains_key(&name) {
                     return Err(Error::Session(
                         "ambiguous duplicate imported Pi source ID".into(),
@@ -477,9 +547,12 @@ impl StreamVerifier {
             self.ids = ids;
             self.reverse = reverse;
             self.nearest.push(Some(record.id));
-            for _ in 0..count {
+            self.completed.push(count == 0);
+            for offset in 0..count {
                 self.nearest.push(Some(record.id));
+                self.completed.push(offset + 1 == count);
             }
+            self.source_ids.insert(name.clone(), record.id);
             branch.entry_start = record.id + u64::from(count != 0);
             branch.context_target = context_target;
             branch.head = end;
@@ -603,6 +676,35 @@ pub(crate) fn validate_conversions(
             nearest[record.id as usize] = Some(record.id);
         }
     }
+    // Precompute ancestry intervals for checking that a source's physical
+    // parent contains the complete conversion of its preceding source.
+    let mut entered = vec![0usize; records.len() + 1];
+    let mut exited = vec![0usize; records.len() + 1];
+    let mut tick = 0usize;
+    let mut stack = Vec::new();
+    for root in records
+        .iter()
+        .filter(|record| record.parent.is_none())
+        .rev()
+    {
+        stack.push((root.id, false));
+    }
+    while let Some((id, leaving)) = stack.pop() {
+        if leaving {
+            exited[id as usize] = tick;
+        } else {
+            tick += 1;
+            entered[id as usize] = tick;
+            stack.push((id, true));
+            if let Some(children) = direct_children.get(&id) {
+                stack.extend(children.iter().rev().map(|child| (*child, false)));
+            }
+        }
+    }
+    let is_ancestor = |ancestor: u64, child: u64| {
+        entered[ancestor as usize] <= entered[child as usize]
+            && exited[child as usize] <= exited[ancestor as usize]
+    };
     // Only source ancestors and source IDs actually referenced by relevant
     // entries are needed to reconstruct the relevant branch states.
     let mut by_name = BTreeMap::<&str, Vec<u64>>::new();
@@ -695,6 +797,52 @@ pub(crate) fn validate_conversions(
         }
         if !needed.contains(&record.id) {
             continue;
+        }
+        if !legacy {
+            let name = source_names.get(&record.id).expect("validated source name");
+            match entry.get("parentId") {
+                None | Some(Value::Null) => {
+                    if parent_source.is_some() {
+                        return Err(Error::Session(
+                            "imported Pi root has a physical source parent".into(),
+                        ));
+                    }
+                }
+                Some(Value::String(parent)) if parent == name => {
+                    return Err(Error::Session(
+                        "imported Pi source is its own parent".into(),
+                    ));
+                }
+                Some(Value::String(parent)) => {
+                    if let Some(candidates) = by_name.get(parent.as_str()) {
+                        if candidates.len() != 1 || parent_source != Some(candidates[0]) {
+                            return Err(Error::Session(
+                                "imported Pi source parent does not match its branch".into(),
+                            ));
+                        }
+                    }
+                    // An absent parent may be an original orphan or a label
+                    // removed by an existing fork; neither can be distinguished
+                    // using the retained source records alone.
+                }
+                _ => return Err(Error::Session("invalid imported Pi parent ID".into())),
+            }
+        }
+        if let Some(parent) = parent_source {
+            let tail = states
+                .get(&parent)
+                .ok_or_else(|| {
+                    Error::Session("cannot reconstruct imported Pi branch state".into())
+                })?
+                .head;
+            if record
+                .parent
+                .is_none_or(|physical| !is_ancestor(tail, physical))
+            {
+                return Err(Error::Session(
+                    "imported Pi source follows a partial conversion".into(),
+                ));
+            }
         }
         let mut branch = if let Some(parent) = parent_source {
             let remaining = children.get_mut(&parent).expect("source child count");
