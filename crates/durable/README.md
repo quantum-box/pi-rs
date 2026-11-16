@@ -185,7 +185,9 @@ counts while the invocation runs. Returning `StreamedReply::Success` with
 `output: None` uses the retained window. Explicit replies keep their ordinary
 meaning. When a successful tool selects its retained stream, the runtime adds a
 `truncated` warning after result hooks if the retained output was not replaced.
-Explicit output does not acquire the stream's warning, even if its text matches.
+The warning appears in both result metadata and a model-visible `<harness>`
+text section. Interrupted recovery does the same; warnings are not duplicated
+on reopen. Other diagnostic classes remain metadata only. Explicit output does not acquire the stream's warning, even if its text matches.
 Structured and block hook outputs are compared by value, since their Rust API
 does not expose upstream's output-object identity. Explicit output is not
 automatically bounded. Sidecars written before selection markers cannot prove

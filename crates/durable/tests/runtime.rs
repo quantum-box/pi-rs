@@ -50,6 +50,22 @@ impl Model for FakeModel {
         Ok(stream::iter(events).boxed())
     }
 }
+struct RecordingModel {
+    inner: FakeModel,
+    observed_tools: Arc<std::sync::Mutex<Vec<String>>>,
+}
+#[async_trait]
+impl Model for RecordingModel {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+        for message in &request.messages {
+            if let Message::Tool { content, .. } = message {
+                self.observed_tools.lock().unwrap().push(content.clone());
+            }
+        }
+        self.inner.stream(request).await
+    }
+}
+
 struct FakeTool {
     calls: AtomicUsize,
     interrupt: bool,
@@ -2285,7 +2301,7 @@ async fn bounded_stream_adapter_retains_and_checkpoints_tail() {
         conversation
             .messages
             .iter()
-            .any(|m| matches!(m, Message::Tool { content, .. } if content == "🙂\n"))
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "🙂\n<harness>\n[warn] Output truncated to its end: 1 lines, 4 bytes dropped\n</harness>"))
     );
     let attempt = harness
         .tool_attempts(
@@ -2303,7 +2319,7 @@ async fn bounded_stream_adapter_retains_and_checkpoints_tail() {
             .unwrap()
             .messages
             .iter()
-            .any(|m| matches!(m, Message::Tool { content, .. } if content == "🙂\n"))
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "🙂\n<harness>\n[warn] Output truncated to its end: 1 lines, 4 bytes dropped\n</harness>"))
     );
 }
 
@@ -2378,7 +2394,7 @@ async fn interrupted_bounded_stream_recovers_committed_tail_without_replay() {
         .unwrap()
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(scheduler.conversation(id).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last\ntool interrupted and may have partially run")));
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last\ntool interrupted and may have partially run\n<harness>\n[warn] Output truncated: 1 lines, 4 bytes dropped\n</harness>")));
     scheduler.shutdown().await.unwrap();
 }
 
@@ -2435,10 +2451,14 @@ async fn interrupted_bounded_stream_restores_partial_utf8_and_truncation_diagnos
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(tokio::sync::Semaphore::new(0));
     let saved = Arc::new(std::sync::Mutex::new(None));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let options = || Options {
-        model: Arc::new(FakeModel {
-            calls: AtomicUsize::new(0),
-            fail_first: false,
+        model: Arc::new(RecordingModel {
+            inner: FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            },
+            observed_tools: observed.clone(),
         }),
         tools: vec![
             Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
@@ -2505,7 +2525,7 @@ async fn interrupted_bounded_stream_restores_partial_utf8_and_truncation_diagnos
         .unwrap()
         .unwrap();
     let conversation = scheduler.conversation(id).unwrap();
-    assert!(conversation.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last�\ntool interrupted and may have partially run")));
+    assert!(conversation.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last�\ntool interrupted and may have partially run\n<harness>\n[warn] Output truncated: 3 lines, 12 bytes dropped\n</harness>")));
     assert!(
         conversation
             .tool_results
@@ -2516,7 +2536,23 @@ async fn interrupted_bounded_stream_restores_partial_utf8_and_truncation_diagnos
                 && d.message == "Output truncated: 3 lines, 12 bytes dropped")
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let messages = observed.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].matches("Output truncated:").count(), 1);
+    assert!(messages[0].contains("[warn] Output truncated: 3 lines, 12 bytes dropped"));
     scheduler.shutdown().await.unwrap();
+    let reopened = Scheduler::open(&path, options()).unwrap();
+    let recovered = reopened.conversation(id).unwrap();
+    let message = recovered
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            Message::Tool { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(message.matches("Output truncated:").count(), 1);
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2641,10 +2677,14 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let seen = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let options = || Options {
-            model: Arc::new(FakeModel {
-                calls: AtomicUsize::new(0),
-                fail_first: false,
+            model: Arc::new(RecordingModel {
+                inner: FakeModel {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                },
+                observed_tools: observed.clone(),
             }),
             tools: vec![
                 Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
@@ -2708,18 +2748,31 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
                 )
             );
         }
-        let content = if kind.ends_with("replace") {
+        let base = if kind.ends_with("replace") {
             "replacement"
         } else if retain == Retain::Head {
             "old\n"
         } else {
             "new\n"
         };
+        let mut content = base.to_owned();
+        if expected {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!("<harness>\n[warn] Output truncated to its {}: 1 lines, 4 bytes dropped\n</harness>", if retain == Retain::Head { "beginning" } else { "end" }));
+        }
+        let actual_model = observed.lock().unwrap().clone();
+        assert_eq!(actual_model, vec![content.clone()]);
+        assert_eq!(
+            actual_model[0].matches("Output truncated").count(),
+            usize::from(expected)
+        );
         assert!(
             conversation
                 .messages
                 .iter()
-                .any(|m| matches!(m, Message::Tool { content: actual, .. } if actual == content))
+                .any(|m| matches!(m, Message::Tool { content: actual, .. } if actual == &content))
         );
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         drop(harness);
@@ -2837,4 +2890,149 @@ async fn bounded_success_abort_before_hook_does_not_publish_truncation() {
     }));
     assert!(conversation.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "tool result unavailable after abort before hooks")));
     scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_stream_hook_replacement_controls_model_warning_after_reopen() {
+    use pi_rs_durable::extension::{Context, Extension, Hook, ToolCall as HookCall, ToolResult};
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    use pi_rs_durable::runtime::Scheduler;
+    struct Interrupted(Arc<tokio::sync::Semaphore>);
+    #[async_trait]
+    impl BoundedStreamedTool for Interrupted {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            output.append("old\nlast").await.unwrap();
+            self.0.add_permits(1);
+            std::future::pending().await
+        }
+    }
+    struct Rewrite(bool);
+    #[async_trait]
+    impl Hook for Rewrite {
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            value: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            assert!(
+                !value
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_deref() == Some("truncated"))
+            );
+            if self.0 {
+                let mut value = value.clone();
+                value.output = "replaced".into();
+                Ok(Some(value))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = || Options {
+            model: Arc::new(RecordingModel {
+                inner: FakeModel {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                },
+                observed_tools: observed.clone(),
+            }),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                    tool: Interrupted(started.clone()),
+                    limits: OutputLimits {
+                        max_bytes: 32,
+                        max_lines: 1,
+                        retain: Retain::Tail,
+                    },
+                }))
+                .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let extension = || Extension {
+            name: "rewrite".into(),
+            hooks: vec![Arc::new(Rewrite(replace))],
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::open(&path, options()).unwrap();
+        scheduler.install_extension(extension()).unwrap();
+        let id = scheduler.create_conversation(config()).unwrap();
+        scheduler
+            .select_extensions(id, vec!["rewrite".into()])
+            .unwrap();
+        scheduler.submit(id, None, "work".into()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        scheduler.shutdown().await.unwrap();
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        harness.install_extension(extension()).unwrap();
+        harness.resume(&CancellationToken::new()).await.unwrap();
+        let messages = observed.lock().unwrap().clone();
+        assert_eq!(messages.len(), 1);
+        if replace {
+            assert_eq!(messages[0], "replaced");
+            assert!(
+                harness
+                    .conversation(id)
+                    .unwrap()
+                    .tool_results
+                    .iter()
+                    .all(|m| m
+                        .diagnostics
+                        .iter()
+                        .all(|d| d.code.as_deref() != Some("truncated")))
+            );
+        } else {
+            assert_eq!(
+                messages[0],
+                "last\ntool interrupted and may have partially run\n<harness>\n[warn] Output truncated: 1 lines, 4 bytes dropped\n</harness>"
+            );
+            assert_eq!(messages[0].matches("Output truncated:").count(), 1);
+        }
+        drop(harness);
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        let conversation = reopened.conversation(id).unwrap();
+        let result = conversation
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Tool { content, .. } => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            result.matches("Output truncated:").count(),
+            usize::from(!replace)
+        );
+    }
 }

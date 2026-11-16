@@ -850,7 +850,8 @@ pub struct Conversation {
     phase: Phase,
 }
 
-/// A diagnostic associated with a tool result, not part of model output.
+/// A diagnostic associated with a tool result. Truncation warnings are also
+/// projected into model-visible tool content; other diagnostics remain metadata.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolDiagnostic {
     pub severity: DiagnosticSeverity,
@@ -1137,6 +1138,63 @@ fn bounded_success_diagnostic(
             checkpoint.current.dropped_lines, checkpoint.current.dropped_bytes
         ),
     }))
+}
+
+fn interrupted_truncation_diagnostic(
+    owner: &OwnedStore,
+    conversation: &Conversation,
+    operation_id: Uuid,
+    metadata: Option<&ToolResultMetadata>,
+) -> Result<Option<ToolDiagnostic>, Error> {
+    let Some(metadata) = metadata.filter(|metadata| metadata.is_error) else {
+        return Ok(None);
+    };
+    let Some(attempt) = conversation
+        .tool_attempt()
+        .filter(|attempt| attempt.operation_id == operation_id)
+    else {
+        return Ok(None);
+    };
+    let checkpoint = crate::streamed_output::load_checkpoint(owner.store(), attempt.attempt_id)
+        .map_err(|error| Error::Invalid(format!("bounded stream checkpoint: {error}")))?;
+    let Some(checkpoint) = checkpoint.filter(|checkpoint| checkpoint.finished.dropped_bytes > 0)
+    else {
+        return Ok(None);
+    };
+    let message = format!(
+        "Output truncated: {} lines, {} bytes dropped",
+        checkpoint.finished.dropped_lines, checkpoint.finished.dropped_bytes
+    );
+    Ok(metadata
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code.as_deref() == Some("truncated")
+                && d.severity == DiagnosticSeverity::Warn
+                && d.message == message
+        })
+        .cloned())
+}
+
+// Metadata is kept separately for hosts. Only truncation warnings are projected
+// here; rendering other diagnostic classes remains a separate parity gap.
+fn render_truncation_diagnostics(metadata: &ToolResultMetadata) -> Option<String> {
+    let lines: Vec<_> = metadata
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.code.as_deref() == Some("truncated") && d.severity == DiagnosticSeverity::Warn
+        })
+        .map(|d| format!("[warn] {}", d.message))
+        .collect();
+    (!lines.is_empty()).then(|| format!("<harness>\n{}\n</harness>", lines.join("\n")))
+}
+
+fn append_diagnostic_text(content: &mut String, diagnostic: &str) {
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(diagnostic);
 }
 
 fn append_harness_diagnostic(metadata: &mut ToolResultMetadata, diagnostic: ToolDiagnostic) {
@@ -10225,6 +10283,9 @@ impl Harness {
                             "tool result metadata withheld because after-tool hooks did not complete",
                         );
                     }
+                    if let Some(diagnostic) = render_truncation_diagnostics(&metadata) {
+                        append_diagnostic_text(&mut content, &diagnostic);
+                    }
                     c.tool_results.push(metadata);
                 }
                 // The effect already committed; retain its result even if an
@@ -13162,15 +13223,19 @@ impl Harness {
                     arguments,
                     content,
                 } => {
-                    let original_success = c
-                        .pending_tool_result
-                        .as_ref()
-                        .or_else(|| {
-                            c.tool_results
-                                .iter()
-                                .find(|metadata| metadata.operation_id == operation_id)
-                        })
-                        .is_some_and(|metadata| !metadata.is_error);
+                    let original_metadata = c.pending_tool_result.as_ref().or_else(|| {
+                        c.tool_results
+                            .iter()
+                            .find(|metadata| metadata.operation_id == operation_id)
+                    });
+                    let original_success =
+                        original_metadata.is_some_and(|metadata| !metadata.is_error);
+                    let interrupted_truncation = interrupted_truncation_diagnostic(
+                        &self.owner,
+                        &c,
+                        operation_id,
+                        original_metadata,
+                    )?;
                     let truncation = if original_success {
                         bounded_success_diagnostic(&self.owner, &c, operation_id, &content)?
                     } else {
@@ -13227,6 +13292,14 @@ impl Harness {
                             .cloned()
                     });
                     if let Some(mut metadata) = metadata {
+                        if let Some(diagnostic) = &interrupted_truncation
+                            && let Some(index) = metadata
+                                .diagnostics
+                                .iter()
+                                .rposition(|item| item == diagnostic)
+                        {
+                            metadata.diagnostics.remove(index);
+                        }
                         if replaced {
                             redact_tool_metadata(
                                 &mut metadata,
@@ -13307,7 +13380,7 @@ impl Harness {
                         extra,
                     };
                     let original_block_result = block_result.clone();
-                    let (block_result, reports) = fenced_poll(
+                    let (mut block_result, reports) = fenced_poll(
                         selected.runtime_after_tool_blocks(
                             &hook_call,
                             block_result,
@@ -13370,14 +13443,33 @@ impl Harness {
                     }
                     retained_output_unchanged &=
                         block_result.output == original_block_result.output;
-                    if retained_output_unchanged
-                        && let Some(diagnostic) = truncation
-                        && let Some(metadata) = c
-                            .tool_results
-                            .iter_mut()
-                            .find(|metadata| metadata.operation_id == operation_id)
+                    if let Some(metadata) = c
+                        .tool_results
+                        .iter_mut()
+                        .find(|metadata| metadata.operation_id == operation_id)
                     {
-                        append_harness_diagnostic(metadata, diagnostic);
+                        if retained_output_unchanged
+                            && let Some(diagnostic) = truncation.or(interrupted_truncation)
+                        {
+                            append_harness_diagnostic(metadata, diagnostic);
+                        }
+                        if let Some(diagnostic) = render_truncation_diagnostics(metadata) {
+                            if block_result.output.len() == 1
+                                && block_result.output[0]
+                                    .as_object()
+                                    .is_some_and(|o| o.len() == 2)
+                                && block_result.output[0]["type"] == "text"
+                                && let Some(text) = block_result.output[0]["text"].as_str()
+                            {
+                                let mut text = text.to_owned();
+                                append_diagnostic_text(&mut text, &diagnostic);
+                                block_result.output[0]["text"] = serde_json::Value::String(text);
+                            } else {
+                                block_result
+                                    .output
+                                    .push(serde_json::json!({"type": "text", "text": diagnostic}));
+                            }
+                        }
                     }
                     let simple = block_result.output.len() == 1
                         && block_result.output[0]
