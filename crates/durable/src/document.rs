@@ -1346,6 +1346,46 @@ impl Transaction {
         self.mutations.extend(batch.mutations);
         Ok(())
     }
+    pub(crate) fn mutations(&self) -> &[Mutation] {
+        &self.mutations
+    }
+
+    pub(crate) fn assemble_submission_notifications(
+        self,
+        store: &Store,
+        settlements: Vec<crate::runtime::SettlementNotification>,
+        now: i64,
+    ) -> Result<Self, Error> {
+        if settlements.is_empty() {
+            return Ok(self);
+        }
+        let mut host = HostTransaction::new(store);
+        host.append_runtime_candidate(OwnedBatch {
+            checks: self.checks,
+            mutations: self.mutations,
+        })?;
+        let token = crate::runtime::submission_settled_signal();
+        for (notify, value, settlement) in settlements {
+            if host.signal_submission_at(
+                notify.task_id,
+                &token,
+                &notify.key,
+                value,
+                now,
+                settlement,
+            )? == crate::task_store::SignalResult::Invalid
+            {
+                return Err(Error::InvalidSessionAdmission(
+                    "invalid submission notification".into(),
+                ));
+            }
+        }
+        let mut transaction = Transaction::new();
+        transaction.append(host.into_batch()?)?;
+        transaction.acquisitions = self.acquisitions;
+        Ok(transaction)
+    }
+
     pub(crate) fn into_owned_batch(self) -> Result<OwnedBatch, Error> {
         if !self.acquisitions.is_empty() {
             return Err(Error::InvalidBatch);
@@ -1983,7 +2023,21 @@ pub(crate) struct TaskInputIntent {
     pub conversation: uuid::Uuid,
     pub version: u64,
     pub request_id: String,
-    pub content: String,
+    pub draft: TaskSubmissionDraft,
+    pub notify: Option<crate::runtime::SubmissionNotify>,
+    pub notification_binding: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub(crate) enum TaskSubmissionDraft {
+    Input {
+        content: String,
+        options: crate::state::AdmissionOptions,
+    },
+    Write {
+        kind: String,
+        data: Option<Value>,
+    },
 }
 
 /// Checked document operations at one invocation-wide immutable revision.
@@ -2294,11 +2348,47 @@ impl<'a> TaskDocuments<'a> {
     pub(crate) fn set_input_validator(&mut self, validator: Option<&'a crate::runtime::Harness>) {
         self.input_validator = validator;
     }
-    /// Stage an idle input for the task's directly owning conversation.
-    /// The request ID is required for recovery; the result is provisional until
-    /// the task transition commits. At most one admission is allowed per step.
+    /// Stage a text input in the directly owning conversation. The request ID
+    /// is required; all effects remain provisional until the task step commits.
     pub fn submit_input(&mut self, request_id: String, content: String) -> Result<(), Error> {
-        self.submit_input_inner(request_id, content, || {})
+        self.submit_input_with_options(
+            request_id,
+            content,
+            crate::state::AdmissionOptions::default(),
+            None,
+        )
+    }
+
+    /// Stage an input with busy/idle policy and an optional settlement destination.
+    pub fn submit_input_with_options(
+        &mut self,
+        request_id: String,
+        content: String,
+        options: crate::state::AdmissionOptions,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_submission(
+            request_id,
+            TaskSubmissionDraft::Input { content, options },
+            notify,
+            || {},
+        )
+    }
+
+    /// Stage a display-only write, including its optional settlement notification.
+    pub fn submit_write(
+        &mut self,
+        request_id: String,
+        kind: String,
+        data: Option<Value>,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_submission(
+            request_id,
+            TaskSubmissionDraft::Write { kind, data },
+            notify,
+            || {},
+        )
     }
 
     #[cfg(test)]
@@ -2308,13 +2398,22 @@ impl<'a> TaskDocuments<'a> {
         content: String,
         hook: impl FnOnce(),
     ) -> Result<(), Error> {
-        self.submit_input_inner(request_id, content, hook)
+        self.stage_submission(
+            request_id,
+            TaskSubmissionDraft::Input {
+                content,
+                options: crate::state::AdmissionOptions::default(),
+            },
+            None,
+            hook,
+        )
     }
 
-    fn submit_input_inner(
+    fn stage_submission(
         &mut self,
         request_id: String,
-        content: String,
+        draft: TaskSubmissionDraft,
+        notify: Option<crate::runtime::SubmissionNotify>,
         after_snapshot: impl FnOnce(),
     ) -> Result<(), Error> {
         if self.task_input.is_some()
@@ -2338,17 +2437,40 @@ impl<'a> TaskDocuments<'a> {
             .get(&key)?
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
         after_snapshot();
-        crate::runtime::validate_task_input(self.store, &record.value, &request_id, &content)?;
-        self.input_validator
-            .ok_or_else(|| {
-                Error::InvalidSessionAdmission("task input requires an attached harness".into())
-            })?
-            .validate_task_input_context(*conversation, &record.value)?;
+        let is_new = crate::runtime::validate_task_submission(
+            self.store,
+            &record.value,
+            &request_id,
+            &draft,
+            &notify,
+        )?;
+        if matches!(draft, TaskSubmissionDraft::Input { .. }) {
+            self.input_validator
+                .ok_or_else(|| {
+                    Error::InvalidSessionAdmission(
+                        "task submission requires an attached harness".into(),
+                    )
+                })?
+                .validate_task_input_context(*conversation, &record.value)?;
+        } else if self.input_validator.is_none() {
+            return Err(Error::InvalidSessionAdmission(
+                "task submission requires an attached harness".into(),
+            ));
+        }
+        let notification_binding = if is_new {
+            notify
+                .as_ref()
+                .map(crate::owned_subagent::notification_binding_key)
+        } else {
+            None
+        };
         self.task_input = Some(TaskInputIntent {
             conversation: *conversation,
             version: record.version,
             request_id,
-            content,
+            draft,
+            notify,
+            notification_binding,
         });
         Ok(())
     }

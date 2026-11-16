@@ -3929,6 +3929,7 @@ impl Scheduler {
             }
             Err(error) => return Err(error.into()),
         };
+        let has_task_submission = prepared_documents.task_input.is_some();
         let mut transaction = prepared_documents.transaction;
         let mut document_batch = prepared_documents.document_batch;
         // Checks observed at reservation are equivalent to the reloaded task.
@@ -3975,6 +3976,39 @@ impl Scheduler {
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
+        if has_task_submission && let Some(harness) = &self.validator {
+            let settlements =
+                crate::runtime::submission_settlements(owner.store(), transaction.mutations())
+                    .map_err(|error| {
+                        crate::document::Error::InvalidSessionAdmission(error.to_string())
+                    })?;
+            transaction = match transaction.assemble_submission_notifications(
+                owner.store(),
+                settlements,
+                harness.task_submission_clock(),
+            ) {
+                Ok(transaction) => transaction,
+                Err(
+                    error @ (crate::document::Error::Signal(
+                        task_store::Error::SignalKeyMismatch
+                        | task_store::Error::SignalMismatch
+                        | task_store::Error::SignalKeyConsumed
+                        | task_store::Error::InvalidSignalPayload,
+                    )
+                    | crate::document::Error::InvalidSessionAdmission(_)),
+                ) => {
+                    return self.finish_running_failure(
+                        &running,
+                        error.to_string(),
+                        &owner,
+                        _gate,
+                        nonblocking_abort,
+                        deferred,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            };
+        }
         let _ = wait_graph_fence;
         let mut prepared = PreparedSettlement {
             attachment: self.attachment.clone(),

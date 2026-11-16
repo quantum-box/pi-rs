@@ -3221,7 +3221,7 @@ impl PreparedConversationSave {
 /// Collect newly settled submissions from the complete candidate batch.
 /// The caller must assemble deliveries against the same task and signal
 /// candidates before committing, so a notification cannot overwrite them.
-type SettlementNotification = (SubmissionNotify, serde_json::Value, (Uuid, Uuid));
+pub(crate) type SettlementNotification = (SubmissionNotify, serde_json::Value, (Uuid, Uuid));
 
 pub(crate) fn submission_settlements(
     store: &durable_store::Store,
@@ -3930,26 +3930,36 @@ fn task_input_wake_key(id: Uuid) -> Vec<u8> {
     format!("runtime/task-input-wake/{id}").into_bytes()
 }
 
-pub(crate) fn validate_task_input(
+fn admit_task_draft(
+    tx: &mut crate::session_transaction::SessionTransaction<'_>,
+    request_id: &str,
+    draft: &crate::document::TaskSubmissionDraft,
+    notify: &Option<SubmissionNotify>,
+) -> Result<Uuid, crate::document::Error> {
+    match draft {
+        crate::document::TaskSubmissionDraft::Input { content, options } => tx.submit_input(
+            Some(request_id.to_owned()),
+            content.clone(),
+            *options,
+            notify.clone(),
+        ),
+        crate::document::TaskSubmissionDraft::Write { kind, data } => tx.submit_write(
+            Some(request_id.to_owned()),
+            kind.clone(),
+            data.clone(),
+            notify.clone(),
+        ),
+    }
+}
+
+pub(crate) fn validate_task_submission(
     store: &durable_store::Store,
     bytes: &[u8],
     request_id: &str,
-    content: &str,
-) -> Result<(), crate::document::Error> {
+    draft: &crate::document::TaskSubmissionDraft,
+    notify: &Option<SubmissionNotify>,
+) -> Result<bool, crate::document::Error> {
     let state: Conversation = serde_json::from_slice(bytes)?;
-    let idle = !state.abort_requested
-        && matches!(state.phase, Phase::Idle)
-        && state.active.is_none()
-        && state.pending_resets.is_empty()
-        && state.pending_independent_summary.is_none()
-        && !state
-            .application_writes
-            .iter()
-            .any(|w| !w.placed && !w.withdrawn)
-        && !state
-            .submissions
-            .iter()
-            .any(|s| matches!(s.status, Status::Queued | Status::Running));
     let mut tx = crate::session_transaction::SessionTransaction::new(
         store,
         state,
@@ -3959,21 +3969,39 @@ pub(crate) fn validate_task_input(
         None,
         Arc::new(|| 0),
     )?;
-    tx.submit_input(
-        Some(request_id.to_owned()),
-        content.to_owned(),
-        AdmissionOptions::default(),
-        None,
-    )?;
-    if tx.table_written && !idle {
-        return Err(crate::document::Error::InvalidSessionAdmission(
-            "conversation is not idle".into(),
-        ));
+    admit_task_draft(&mut tx, request_id, draft, notify)?;
+    if tx.table_written
+        && let Some(notify) = notify
+    {
+        let binding = crate::owned_subagent::notification_binding_key(notify);
+        if store.get(&binding)?.is_some() {
+            return Err(crate::document::Error::InvalidSessionAdmission(
+                "submission notification key is reserved".into(),
+            ));
+        }
+    }
+    Ok(tx.table_written)
+}
+
+fn check_task_notification_binding(
+    store: &durable_store::Store,
+    intent: &crate::document::TaskInputIntent,
+) -> Result<(), crate::document::Error> {
+    if let Some(binding) = &intent.notification_binding
+        && store.get(binding)?.is_some()
+    {
+        return Err(durable_store::Error::Conflict {
+            key: binding.clone(),
+        }
+        .into());
     }
     Ok(())
 }
 
 impl Harness {
+    pub(crate) fn task_submission_clock(&self) -> i64 {
+        (self.clock)()
+    }
     pub(crate) fn validate_task_input_context(
         &self,
         id: Uuid,
@@ -4019,12 +4047,17 @@ impl Harness {
         if record.version != version {
             return Err(durable_store::Error::Conflict { key }.into());
         }
-        validate_task_input(
+        check_task_notification_binding(self.owner.store(), intent)?;
+        if let Err(error) = validate_task_submission(
             self.owner.store(),
             &record.value,
             &intent.request_id,
-            &intent.content,
-        )?;
+            &intent.draft,
+            &intent.notify,
+        ) {
+            check_task_notification_binding(self.owner.store(), intent)?;
+            return Err(error);
+        }
         let supports = self.supports_context_blocks(&state);
         let mut tx = crate::session_transaction::SessionTransaction::new(
             self.owner.store(),
@@ -4035,12 +4068,7 @@ impl Harness {
             self.provider_adapter.clone(),
             self.clock.clone(),
         )?;
-        tx.submit_input(
-            Some(intent.request_id.clone()),
-            intent.content.clone(),
-            AdmissionOptions::default(),
-            None,
-        )?;
+        admit_task_draft(&mut tx, &intent.request_id, &intent.draft, &intent.notify)?;
         let (state, batch, changed, tasks, children) = tx.into_parts()?;
         if !tasks.is_empty()
             || !children.is_empty()
@@ -4060,9 +4088,13 @@ impl Harness {
                 mutations: vec![],
             });
         }
-        let prepared = self
-            .prepare_save(&state, Expected::Version(version))
-            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        let prepared = match self.prepare_save(&state, Expected::Version(version)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                check_task_notification_binding(self.owner.store(), intent)?;
+                return Err(DError::InvalidSessionAdmission(error.to_string()));
+            }
+        };
         let wake_key = task_input_wake_key(intent.conversation);
         let wake = self.owner.store().get(&wake_key)?;
         let mut checks = prepared.checks;
