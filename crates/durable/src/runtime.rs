@@ -222,6 +222,37 @@ pub struct Submission {
     pub input_blocks: Option<crate::transcript::MessageContentBlocks>,
     pub status: Status,
 }
+
+/// A durable task destination for the settlement of an input or continuation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionNotify {
+    pub task_id: Uuid,
+    pub key: String,
+}
+
+/// Signal delivered in the transaction that settles a notified submission.
+/// Its value uses pi-rs UUIDs and answer text; see the parity documentation.
+pub fn submission_settled_signal() -> crate::task_store::SignalToken {
+    crate::task_store::SignalToken::with_schema("pi.submission-settled", 1, serde_json::json!({
+        "type": "object",
+        "required": ["id", "conversationId", "type", "status"],
+        "properties": {
+            "id": {"type": "string"}, "conversationId": {"type": "string"},
+            "type": {"enum": ["input", "continue", "write"]},
+            "status": {"enum": ["done", "unanswered"]},
+            "answer": {"type": "string"}, "answerId": {"type": "string"}, "entry": {"type": "string"},
+            "reason": {"type": "string"}, "requestId": {"type": "string"},
+            "notify": {"type": "object", "required": ["taskId", "key"],
+                "properties": {"taskId": {"type": "string"}, "key": {"type": "string", "minLength": 1}}}
+        },
+        "allOf": [
+            {"if": {"properties": {"status": {"const": "done"}, "type": {"enum": ["input", "continue"]}}}, "then": {"required": ["answer"]}},
+            {"if": {"properties": {"status": {"const": "done"}, "type": {"const": "write"}}}, "then": {"required": ["entry"]}},
+            {"if": {"properties": {"status": {"const": "unanswered"}}}, "then": {"required": ["reason"]}}
+        ]
+    })).expect("static submission settlement schema")
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct FittedResetReceipt {
     reset: Uuid,
@@ -746,6 +777,8 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<crate::transcript::Cursor>,
     pub submissions: Vec<Submission>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    submission_notifications: HashMap<Uuid, SubmissionNotify>,
     #[serde(default)]
     pub manual_compactions: Vec<ManualCompaction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1324,6 +1357,10 @@ pub fn conversation_wake(
 }
 
 impl Conversation {
+    /// The persisted destination, if this submission was admitted with one.
+    pub fn submission_notification(&self, id: Uuid) -> Option<&SubmissionNotify> {
+        self.submission_notifications.get(&id)
+    }
     /// Whether a keyed tool durably suspended on pending nested jobs.
     /// An abort keeps the suspension visible until reconciled.
     pub fn nested_suspended(&self) -> bool {
@@ -3999,6 +4036,16 @@ impl Harness {
                         }
                         state.application_writes.push(write);
                     }
+                    for (id, notify) in &latest.submission_notifications {
+                        if !base.submission_notifications.contains_key(id)
+                            && state
+                                .submission_notifications
+                                .insert(*id, notify.clone())
+                                .is_some()
+                        {
+                            return Err(Error::Invalid("duplicate submission notification".into()));
+                        }
+                    }
                     for submission in latest.submissions {
                         if let Some(existing) =
                             state.submissions.iter_mut().find(|s| s.id == submission.id)
@@ -4907,6 +4954,15 @@ impl Harness {
         batch: PreparedConversationSave,
         prefix_fence: Option<u64>,
     ) -> Result<(), Error> {
+        self.commit_conversation_save_with_hook(batch, prefix_fence, |_| {})
+    }
+
+    fn commit_conversation_save_with_hook(
+        &mut self,
+        batch: PreparedConversationSave,
+        prefix_fence: Option<u64>,
+        mut before_commit: impl FnMut(usize),
+    ) -> Result<(), Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -4919,14 +4975,146 @@ impl Harness {
             ));
         }
         let store = self.owner.store();
-        let result = match prefix_fence {
-            Some(boundary) => store.commit_with_prefix_put_fence(
-                &batch.checks,
-                &batch.mutations,
-                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
-                boundary,
-            ),
-            None => store.commit(&batch.checks, &batch.mutations),
+        // Assemble notification deliveries only after every conversation and
+        // graph participant has staged its candidate writes. The original
+        // checks still fence the observations used by this assembly.
+        let mut settling = Vec::new();
+        for mutation in &batch.mutations {
+            let Mutation::Put { key, value } = mutation else {
+                continue;
+            };
+            let Some(suffix) = key.strip_prefix(b"runtime/conversation/") else {
+                continue;
+            };
+            if std::str::from_utf8(suffix)
+                .ok()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .is_none()
+            {
+                continue;
+            }
+            let candidate: Conversation = serde_json::from_slice(value)?;
+            if candidate.submission_notifications.is_empty() {
+                continue;
+            }
+            let previous: Option<Conversation> = store
+                .get(key)?
+                .map(|entry| serde_json::from_slice(&entry.value))
+                .transpose()?;
+            for submission in &candidate.submissions {
+                let Some(notify) = candidate.submission_notifications.get(&submission.id) else {
+                    continue;
+                };
+                if !matches!(
+                    submission.status,
+                    Status::Done { .. } | Status::Unanswered { .. }
+                ) || previous.as_ref().is_some_and(|old| {
+                    old.submissions.iter().any(|prior| {
+                        prior.id == submission.id
+                            && matches!(
+                                prior.status,
+                                Status::Done { .. } | Status::Unanswered { .. }
+                            )
+                    })
+                }) {
+                    continue;
+                }
+                let (status, answer, reason) = match &submission.status {
+                    Status::Done { answer } => ("done", Some(answer), None),
+                    Status::Unanswered { reason } => ("unanswered", None, Some(reason)),
+                    _ => unreachable!(),
+                };
+                let mut record = serde_json::json!({
+                    "id": submission.id, "conversationId": candidate.id,
+                    "type": submission.kind, "status": status, "notify": notify,
+                });
+                if let Some(request_id) = &submission.request_id {
+                    record["requestId"] = serde_json::json!(request_id);
+                }
+                if let Some(answer) = answer {
+                    record["answer"] = serde_json::json!(answer);
+                }
+                if let Some(answer_id) = candidate.answer_ids.get(&submission.id) {
+                    record["answerId"] = serde_json::json!(answer_id);
+                }
+                if let Some(reason) = reason {
+                    record["reason"] = serde_json::json!(reason);
+                }
+                settling.push((notify.clone(), record));
+            }
+            for write in &candidate.application_writes {
+                let Some(notify) = candidate.submission_notifications.get(&write.id) else {
+                    continue;
+                };
+                if !(write.placed || write.withdrawn)
+                    || previous.as_ref().is_some_and(|old| {
+                        old.application_writes
+                            .iter()
+                            .any(|prior| prior.id == write.id && (prior.placed || prior.withdrawn))
+                    })
+                {
+                    continue;
+                }
+                let mut record = serde_json::json!({
+                    "id": write.id, "conversationId": candidate.id, "type": "write",
+                    "status": if write.withdrawn { "unanswered" } else { "done" }, "notify": notify,
+                });
+                if let Some(request_id) = &write.request_id {
+                    record["requestId"] = serde_json::json!(request_id);
+                }
+                if write.withdrawn {
+                    record["reason"] = serde_json::json!("aborted");
+                } else {
+                    record["entry"] = serde_json::json!(write.id);
+                }
+                settling.push((notify.clone(), record));
+            }
+        }
+        // Retry only observations added by notification assembly. The
+        // original conversation, document, graph and prefix fences never move.
+        let mut attempts = 0;
+        let result = loop {
+            let mut assembled = crate::task_store::OwnedBatch {
+                checks: batch.checks.clone(),
+                mutations: batch.mutations.clone(),
+            };
+            if !settling.is_empty() {
+                let mut host = crate::document::HostTransaction::new(store);
+                host.append_runtime_candidate(assembled)?;
+                let token = submission_settled_signal();
+                for (notify, value) in &settling {
+                    if host.signal_at(
+                        notify.task_id,
+                        &token,
+                        &notify.key,
+                        value.clone(),
+                        (self.clock)(),
+                    )? == crate::task_store::SignalResult::Invalid
+                    {
+                        return Err(Error::Invalid("invalid submission notification".into()));
+                    }
+                }
+                assembled = host.into_batch()?;
+            }
+            before_commit(attempts);
+            let result = match prefix_fence {
+                Some(boundary) => store.commit_with_prefix_put_fence(
+                    &assembled.checks,
+                    &assembled.mutations,
+                    &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                    boundary,
+                ),
+                None => store.commit(&assembled.checks, &assembled.mutations),
+            };
+            if let Err(durable_store::Error::Conflict { key }) = &result
+                && attempts < 3
+                && assembled.checks.iter().any(|check| check.key == *key)
+                && !batch.checks.iter().any(|check| check.key == *key)
+            {
+                attempts += 1;
+                continue;
+            }
+            break result;
         };
         match result {
             Ok(()) => Ok(()),
@@ -5004,6 +5192,7 @@ impl Harness {
             occurrence_epoch_proven: true,
             transcript: None,
             submissions: vec![],
+            submission_notifications: HashMap::new(),
             manual_compactions: vec![],
             active_manual_compaction: None,
             aborted_generations: vec![],
@@ -5064,6 +5253,7 @@ impl Harness {
             .retain(|name| !name.starts_with(crate::subagent_management::EXTENSION_PREFIX));
         state.config = config;
         state.submissions.clear();
+        state.submission_notifications.clear();
         state.manual_compactions.clear();
         state.active_manual_compaction = None;
         state.application_writes.retain(|write| write.placed);
@@ -5136,6 +5326,7 @@ impl Harness {
         state.active = None;
         state.abort_requested = false;
         state.submissions.clear();
+        state.submission_notifications.clear();
         state.manual_compactions.clear();
         state.active_manual_compaction = None;
         state.application_writes.retain(|write| write.placed);
@@ -5306,6 +5497,7 @@ impl Harness {
                 transcript
             },
             submissions: vec![],
+            submission_notifications: HashMap::new(),
             manual_compactions: vec![],
             active_manual_compaction: None,
             aborted_generations: vec![],
@@ -7866,6 +8058,27 @@ impl Harness {
         kind: String,
         data: Option<serde_json::Value>,
     ) -> Result<Uuid, Error> {
+        self.submit_write_inner(id, request_id, kind, data, None)
+    }
+    /// Admit an application write with a task settlement notification.
+    pub fn submit_write_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        kind: String,
+        data: Option<serde_json::Value>,
+        notify: SubmissionNotify,
+    ) -> Result<Uuid, Error> {
+        self.submit_write_inner(id, request_id, kind, data, Some(notify))
+    }
+    fn submit_write_inner(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        kind: String,
+        data: Option<serde_json::Value>,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, Error> {
         loop {
             let (mut c, version) = self.load(id)?;
             if let Some(key) = request_id.as_ref() {
@@ -7890,6 +8103,9 @@ impl Harness {
                     "application entry kind must be nonempty and outside pi.".into(),
                 ));
             }
+            if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
+                return Err(Error::Invalid("empty submission notification key".into()));
+            }
             let after_reset = c
                 .pending_resets
                 .last()
@@ -7911,6 +8127,9 @@ impl Harness {
             };
             let write_id = write.id;
             c.application_writes.push(write);
+            if let Some(notify) = &notify {
+                c.submission_notifications.insert(write_id, notify.clone());
+            }
             let merge = self.merge_admissions;
             self.merge_admissions = false;
             let result = self.save(&c, Expected::Version(version));
@@ -8361,7 +8580,42 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal_with_options(id, request_id, content, options, &mut |_| Ok(()), None)
+        self.submit_internal_with_options(
+            id,
+            request_id,
+            content,
+            options,
+            &mut |_| Ok(()),
+            None,
+            None,
+        )
+    }
+    /// Admit an input whose eventual settlement signals a durable task.
+    pub fn submit_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: SubmissionNotify,
+    ) -> Result<Uuid, Error> {
+        if request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
+        {
+            return Err(Error::Invalid(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
+        self.submit_internal_with_options(
+            id,
+            request_id,
+            content,
+            options,
+            &mut |_| Ok(()),
+            None,
+            Some(notify),
+        )
     }
     /// Atomically admit a new input with checked documents and registered tasks.
     /// The callback may run again after a conflict and must have no external
@@ -8384,7 +8638,7 @@ impl Harness {
                 "reserved subagent reporter request ID".into(),
             ));
         }
-        self.submit_internal_with_options(id, request_id, content, options, &mut change, None)
+        self.submit_internal_with_options(id, request_id, content, options, &mut change, None, None)
     }
     pub(crate) fn submit_reporter_input(
         &mut self,
@@ -8405,6 +8659,37 @@ impl Harness {
             },
             &mut |_| Ok(()),
             Some((parent, generation)),
+            None,
+        )
+    }
+    /// Atomically admit an input, checked documents and a settlement notification.
+    pub fn submit_with_documents_and_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: SubmissionNotify,
+        mut change: impl FnMut(
+            &mut crate::document::AdmissionDocuments<'_>,
+        ) -> Result<(), crate::document::Error>,
+    ) -> Result<Uuid, Error> {
+        if request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
+        {
+            return Err(Error::Invalid(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
+        self.submit_internal_with_options(
+            id,
+            request_id,
+            content,
+            options,
+            &mut change,
+            None,
+            Some(notify),
         )
     }
     fn submit_internal_with_options(
@@ -8417,6 +8702,7 @@ impl Harness {
             &mut crate::document::AdmissionDocuments<'_>,
         ) -> Result<(), crate::document::Error>,
         fence: Option<(Uuid, u64)>,
+        notify: Option<SubmissionNotify>,
     ) -> Result<Uuid, Error> {
         loop {
             let fence_check = if let Some((parent, generation)) = fence {
@@ -8465,6 +8751,9 @@ impl Harness {
             if content.trim().is_empty() {
                 return Err(Error::Invalid("empty input".into()));
             }
+            if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
+                return Err(Error::Invalid("empty submission notification key".into()));
+            }
             let busy = c.active.is_some()
                 || matches!(
                     c.phase,
@@ -8502,6 +8791,9 @@ impl Harness {
                     Status::Queued
                 },
             });
+            if let Some(notify) = &notify {
+                c.submission_notifications.insert(sid, notify.clone());
+            }
             c.input_modes.insert(sid, options.mode);
             if place_now {
                 c.active = Some(sid);
@@ -8572,6 +8864,23 @@ impl Harness {
     }
     /// Start a run from the current context without appending user input.
     pub fn submit_continue(&mut self, id: Uuid, request_id: Option<String>) -> Result<Uuid, Error> {
+        self.submit_continue_inner(id, request_id, None)
+    }
+    /// Admit a continuation whose eventual settlement signals a durable task.
+    pub fn submit_continue_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        notify: SubmissionNotify,
+    ) -> Result<Uuid, Error> {
+        self.submit_continue_inner(id, request_id, Some(notify))
+    }
+    fn submit_continue_inner(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, Error> {
         if request_id
             .as_deref()
             .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
@@ -8608,6 +8917,9 @@ impl Harness {
             if !self.supports_context_blocks(&c) {
                 return Err(crate::transcript::Error::UnsupportedContentBlocks.into());
             }
+            if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
+                return Err(Error::Invalid("empty submission notification key".into()));
+            }
             if c.active.is_some()
                 || c.pending_independent_summary.is_some()
                 || c.application_writes
@@ -8643,6 +8955,9 @@ impl Harness {
                 input_blocks: None,
                 status: Status::Running,
             });
+            if let Some(notify) = &notify {
+                c.submission_notifications.insert(sid, notify.clone());
+            }
             c.active = Some(sid);
             c.auto_compaction_attempted = false;
             c.retry_state = RetryState::default();
@@ -14364,6 +14679,21 @@ impl Scheduler {
         self.schedule(id);
         Ok(write)
     }
+    /// Admit a write with a task settlement notification and schedule it.
+    pub fn submit_write_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        kind: String,
+        data: Option<serde_json::Value>,
+        notify: SubmissionNotify,
+    ) -> Result<Uuid, Error> {
+        let write = self
+            .harness
+            .submit_write_with_notification(id, request_id, kind, data, notify)?;
+        self.schedule(id);
+        Ok(write)
+    }
     pub async fn watch_history(
         &self,
         id: Uuid,
@@ -14684,6 +15014,21 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Admit an input with a task settlement notification and schedule it.
+    pub fn submit_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: SubmissionNotify,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_with_notification(id, request_id, content, options, notify)?;
+        self.schedule(id);
+        Ok(submission)
+    }
     /// Atomically admit input and document changes, then schedule the run.
     pub fn submit_with_documents(
         &mut self,
@@ -14701,9 +15046,40 @@ impl Scheduler {
         self.schedule(id);
         Ok(submission)
     }
+    /// Admit an input with checked documents and schedule its run.
+    pub fn submit_with_documents_and_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: SubmissionNotify,
+        change: impl FnMut(
+            &mut crate::document::AdmissionDocuments<'_>,
+        ) -> Result<(), crate::document::Error>,
+    ) -> Result<Uuid, Error> {
+        let submission = self.harness.submit_with_documents_and_notification(
+            id, request_id, content, options, notify, change,
+        )?;
+        self.schedule(id);
+        Ok(submission)
+    }
     /// Admit a continuation and schedule its persisted run.
     pub fn submit_continue(&mut self, id: Uuid, request_id: Option<String>) -> Result<Uuid, Error> {
         let submission = self.harness.submit_continue(id, request_id)?;
+        self.schedule(id);
+        Ok(submission)
+    }
+    /// Admit a continuation with a task settlement notification and schedule it.
+    pub fn submit_continue_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        notify: SubmissionNotify,
+    ) -> Result<Uuid, Error> {
+        let submission = self
+            .harness
+            .submit_continue_with_notification(id, request_id, notify)?;
         self.schedule(id);
         Ok(submission)
     }
@@ -16674,6 +17050,27 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
     let mut old = serde_json::to_value(base)?;
     let mut new = serde_json::to_value(latest)?;
     old.as_object_mut()
+        .and_then(|v| v.remove("submission_notifications"));
+    new.as_object_mut()
+        .and_then(|v| v.remove("submission_notifications"));
+    let notifications_unchanged = base
+        .submission_notifications
+        .iter()
+        .all(|(id, notify)| latest.submission_notifications.get(id) == Some(notify))
+        && latest.submission_notifications.keys().all(|id| {
+            base.submission_notifications.contains_key(id)
+                || latest
+                    .submissions
+                    .iter()
+                    .skip(base.submissions.len())
+                    .any(|s| s.id == *id)
+                || latest
+                    .application_writes
+                    .iter()
+                    .skip(base.application_writes.len())
+                    .any(|w| w.id == *id)
+        });
+    old.as_object_mut()
         .and_then(|v| v.remove("after_failed_run"));
     new.as_object_mut()
         .and_then(|v| v.remove("after_failed_run"));
@@ -16773,6 +17170,7 @@ fn admission_only(base: &Conversation, latest: &Conversation) -> Result<bool, Er
         return Err(Error::Invalid("invalid submissions".into()));
     };
     Ok(old == new
+        && notifications_unchanged
         && pending_ok
         && modes_unchanged
         && resets_unchanged
@@ -17165,6 +17563,1111 @@ mod scheduler_tests {
             model: "test".into(),
             system_prompt: "".into(),
             max_output_tokens: 10,
+        }
+    }
+
+    #[test]
+    fn submission_notify_withdrawal_commits_and_reopens() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, SignalToken, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        h.submit(conversation, None, "first".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                Some("repeat".into()),
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "done".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            h.submit_with_notification(
+                conversation,
+                Some("repeat".into()),
+                "ignored".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: Uuid::new_v4(),
+                    key: "different".into()
+                }
+            )
+            .unwrap(),
+            id
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        assert_eq!(
+            h.conversation(conversation)
+                .unwrap()
+                .submission_notification(id),
+            Some(&SubmissionNotify {
+                task_id: task.id(),
+                key: "done".into()
+            })
+        );
+        assert_eq!(
+            h.withdraw_submission(conversation, id).unwrap(),
+            WithdrawResult::Aborted
+        );
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let token = SignalToken::new("pi.submission-settled", 1).unwrap();
+        let record = TaskStore::new(h.owner.store())
+            .read_typed_signal(task.id(), &token, "done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record["id"], serde_json::json!(id));
+        assert_eq!(record["status"], "unanswered");
+        assert_eq!(record["reason"], "aborted");
+    }
+
+    #[test]
+    fn submission_notify_conflicting_settlement_rolls_back() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, SignalToken, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        h.submit(conversation, None, "first".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "done".into(),
+                },
+            )
+            .unwrap();
+        let (mut candidate, version) = h.load(conversation).unwrap();
+        candidate
+            .submissions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .status = Status::Unanswered {
+            reason: "aborted".into(),
+        };
+        let stale = h
+            .prepare_save(&candidate, Expected::Version(version))
+            .unwrap();
+        h.set_queue_modes(conversation, QueueModes::default())
+            .unwrap();
+        assert!(matches!(
+            h.commit_conversation_save(stale),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let token = SignalToken::new("pi.submission-settled", 1).unwrap();
+        assert!(
+            TaskStore::new(h.owner.store())
+                .read_typed_signal(task.id(), &token, "done")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            h.conversation(conversation)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+    }
+
+    #[test]
+    fn submission_notify_observes_signal_already_in_runtime_batch() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, SignalResult, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "same".into(),
+                },
+            )
+            .unwrap();
+        let (mut c, version) = h.load(conversation).unwrap();
+        c.submissions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .status = Status::Unanswered {
+            reason: "aborted".into(),
+        };
+        let mut batch = h.prepare_save(&c, Expected::Version(version)).unwrap();
+        let first = serde_json::json!({"id":Uuid::new_v4(), "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"prior"});
+        let (result, staged) = TaskStore::new(h.owner.store())
+            .prepare_signal_at(
+                task.id(),
+                &submission_settled_signal(),
+                "same",
+                first.clone(),
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(result, SignalResult::Delivered);
+        batch.checks.extend(staged.checks);
+        batch.mutations.extend(staged.mutations);
+        h.commit_conversation_save(batch).unwrap();
+        assert_eq!(
+            TaskStore::new(h.owner.store())
+                .read_typed_signal(task.id(), &submission_settled_signal(), "same")
+                .unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn submission_notify_retries_target_and_receipt_conflicts() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, SignalResult, TaskStore};
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h =
+                Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+            let conversation = h.create_conversation(config()).unwrap();
+            let task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::json!(null),
+                },
+                3,
+            )
+            .unwrap();
+            TaskStore::new(h.owner.store())
+                .save(&[Save::Create(&task)])
+                .unwrap();
+            h.submit(conversation, None, "active".into()).unwrap();
+            let id = h
+                .submit_with_notification(
+                    conversation,
+                    None,
+                    "queued".into(),
+                    AdmissionOptions::default(),
+                    SubmissionNotify {
+                        task_id: task.id(),
+                        key: "same".into(),
+                    },
+                )
+                .unwrap();
+            let (mut c, version) = h.load(conversation).unwrap();
+            c.submissions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status = Status::Unanswered {
+                reason: "aborted".into(),
+            };
+            let batch = h.prepare_save(&c, Expected::Version(version)).unwrap();
+            let owner = h.owner.clone();
+            let first = serde_json::json!({"id":Uuid::new_v4(), "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"rival"});
+            let mut calls = 0;
+            h.commit_conversation_save_with_hook(batch, None, |attempt| {
+                calls += 1;
+                if attempt != 0 {
+                    return;
+                }
+                let ts = TaskStore::new(owner.store());
+                if cancel {
+                    let snapshot = ts.load(task.id()).unwrap().unwrap();
+                    ts.update(&snapshot, |t| t.cancel()).unwrap();
+                } else {
+                    assert_eq!(
+                        ts.deliver_signal_at(
+                            task.id(),
+                            &submission_settled_signal(),
+                            "same",
+                            first.clone(),
+                            0
+                        )
+                        .unwrap(),
+                        SignalResult::Delivered
+                    );
+                }
+            })
+            .unwrap();
+            assert_eq!(calls, 2);
+            let value = TaskStore::new(h.owner.store())
+                .read_typed_signal(task.id(), &submission_settled_signal(), "same")
+                .unwrap();
+            assert_eq!(value, if cancel { None } else { Some(first) });
+            assert!(matches!(
+                h.conversation(conversation)
+                    .unwrap()
+                    .submissions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .status,
+                Status::Unanswered { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn submission_notify_persistent_target_conflicts_roll_back() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "conflict".into(),
+                },
+            )
+            .unwrap();
+        let (mut c, version) = h.load(conversation).unwrap();
+        c.submissions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .status = Status::Unanswered {
+            reason: "aborted".into(),
+        };
+        let batch = h.prepare_save(&c, Expected::Version(version)).unwrap();
+        let owner = h.owner.clone();
+        let mut calls = 0;
+        assert!(matches!(
+            h.commit_conversation_save_with_hook(batch, None, |_| {
+                calls += 1;
+                let ts = TaskStore::new(owner.store());
+                ts.update(&ts.load(task.id()).unwrap().unwrap(), |_| Ok(()))
+                    .unwrap();
+            }),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(calls, 4);
+        assert!(
+            TaskStore::new(h.owner.store())
+                .read_typed_signal(task.id(), &submission_settled_signal(), "conflict")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            h.conversation(conversation)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+    }
+
+    #[test]
+    fn submission_notify_immediate_write_duplicate_and_missing_target() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let destination = SubmissionNotify {
+            task_id: task.id(),
+            key: "written".into(),
+        };
+        let write = h
+            .submit_write_with_notification(
+                conversation,
+                Some("request".into()),
+                "note".into(),
+                None,
+                destination.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            h.submit_write_with_notification(
+                conversation,
+                Some("request".into()),
+                "different".into(),
+                None,
+                SubmissionNotify {
+                    task_id: Uuid::new_v4(),
+                    key: "other".into()
+                }
+            )
+            .unwrap(),
+            write
+        );
+        h.submit_write_with_notification(conversation, None, "note".into(), None, destination)
+            .unwrap();
+        h.submit_write_with_notification(
+            conversation,
+            None,
+            "note".into(),
+            None,
+            SubmissionNotify {
+                task_id: Uuid::new_v4(),
+                key: "missing".into(),
+            },
+        )
+        .unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let value = TaskStore::new(h.owner.store())
+            .read_typed_signal(task.id(), &submission_settled_signal(), "written")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["id"], serde_json::json!(write));
+        assert_eq!(value["type"], "write");
+        assert_eq!(value["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn submission_notify_queued_write_placement_and_withdrawal() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        for withdraw in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let model = placement_model();
+            let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+            let (conversation, _) = prepare_manual_placement(&mut h);
+            let other = h.create_conversation(config()).unwrap();
+            let task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(other),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::json!(null),
+                },
+                3,
+            )
+            .unwrap();
+            TaskStore::new(h.owner.store())
+                .save(&[Save::Create(&task)])
+                .unwrap();
+            h.reset(conversation, Some("reset".into())).unwrap();
+            let id = h
+                .submit_write_with_notification(
+                    conversation,
+                    None,
+                    "note".into(),
+                    None,
+                    SubmissionNotify {
+                        task_id: task.id(),
+                        key: "write".into(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                TaskStore::new(h.owner.store())
+                    .read_typed_signal(task.id(), &submission_settled_signal(), "write")
+                    .unwrap()
+                    .is_none()
+            );
+            if withdraw {
+                assert_eq!(
+                    h.withdraw_submission(conversation, id).unwrap(),
+                    WithdrawResult::Aborted
+                );
+            } else {
+                h.resume(&CancellationToken::new()).await.unwrap();
+            }
+            drop(h);
+            let h = Harness::open_paused(&path, options(model)).unwrap();
+            let value = TaskStore::new(h.owner.store())
+                .read_typed_signal(task.id(), &submission_settled_signal(), "write")
+                .unwrap()
+                .unwrap();
+            assert_eq!(value["id"], serde_json::json!(id));
+            assert_eq!(
+                value["status"],
+                if withdraw { "unanswered" } else { "done" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_notify_wakes_task_driver() {
+        use crate::task::{Checkpoint, Task, TaskOwner, TaskState, WaitFor};
+        use crate::task_scheduler::{Registry, Step};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("notification-test".into(), true);
+        let ts = TaskStore::new(h.owner.store());
+        ts.save(&[Save::Create(&task)]).unwrap();
+        ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+        ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+            task.wait(WaitFor::TypedSignal(
+                submission_settled_signal().key("wake").unwrap(),
+            ))
+        })
+        .unwrap();
+        let mut registry = Registry::default();
+        registry.register("notification-test", true, |task: &Task| {
+            assert!(task.delivered_signal().is_some());
+            Ok(Step::Succeed(serde_json::json!("done")))
+        });
+        let driver = h.start_tasks(registry).unwrap();
+        h.submit_write_with_notification(
+            conversation,
+            None,
+            "note".into(),
+            None,
+            SubmissionNotify {
+                task_id: task.id(),
+                key: "wake".into(),
+            },
+        )
+        .unwrap();
+        let settled = tokio::time::timeout(
+            Duration::from_secs(30),
+            driver.wait_for_task(task.id(), &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            settled.state(),
+            &TaskState::Succeeded(serde_json::json!("done"))
+        );
+        driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn submission_notify_abort_composes_multiple_and_closed_candidates() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let other = h.create_conversation(config()).unwrap();
+        let make = |owner| {
+            Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(owner),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::json!(null),
+                },
+                3,
+            )
+            .unwrap()
+        };
+        let live = make(other);
+        let closing = make(conversation);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&live), Save::Create(&closing)])
+            .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        for (target, key) in [
+            (live.id(), "a"),
+            (live.id(), "b"),
+            (live.id(), "a"),
+            (closing.id(), "closed"),
+            (Uuid::new_v4(), "missing"),
+        ] {
+            h.submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: target,
+                    key: key.into(),
+                },
+            )
+            .unwrap();
+        }
+        h.request_abort(conversation).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        for key in ["a", "b"] {
+            let value = ts
+                .read_typed_signal(live.id(), &submission_settled_signal(), key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(value["reason"], "aborted");
+        }
+        assert!(
+            ts.read_typed_signal(closing.id(), &submission_settled_signal(), "closed")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn submission_notify_multi_conversation_batch_is_atomic() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let a = h.create_conversation(config()).unwrap();
+        let b = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(a),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let mut pending = Vec::new();
+        for (conversation, key) in [(a, "a"), (b, "b")] {
+            h.submit(conversation, None, "active".into()).unwrap();
+            let id = h
+                .submit_with_notification(
+                    conversation,
+                    None,
+                    "queued".into(),
+                    AdmissionOptions::default(),
+                    SubmissionNotify {
+                        task_id: task.id(),
+                        key: key.into(),
+                    },
+                )
+                .unwrap();
+            let (mut state, version) = h.load(conversation).unwrap();
+            state
+                .submissions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status = Status::Unanswered {
+                reason: "aborted".into(),
+            };
+            pending.push((state, version));
+        }
+        let batch = h
+            .prepare_saves(&[
+                (&pending[0].0, Expected::Version(pending[0].1)),
+                (&pending[1].0, Expected::Version(pending[1].1)),
+            ])
+            .unwrap();
+        h.commit_conversation_save(batch).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        for key in ["a", "b"] {
+            assert_eq!(
+                TaskStore::new(h.owner.store())
+                    .read_typed_signal(task.id(), &submission_settled_signal(), key)
+                    .unwrap()
+                    .unwrap()["reason"],
+                "aborted"
+            );
+        }
+    }
+
+    #[test]
+    fn submission_notify_checked_admission_documents_and_fork() {
+        use crate::document::{Address, Documents};
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let addr = Address {
+            scope: "admission".into(),
+            name: "note".into(),
+            key: "".into(),
+        };
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_documents_and_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "doc".into(),
+                },
+                |docs| {
+                    assert!(docs.get(&addr)?.is_none());
+                    docs.put(
+                        &addr,
+                        serde_json::json!({"saved":true})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    )
+                },
+            )
+            .unwrap();
+        h.withdraw_submission(conversation, id).unwrap();
+        assert_eq!(
+            Documents::new(h.owner.store())
+                .get(&addr)
+                .unwrap()
+                .unwrap()
+                .value["saved"],
+            true
+        );
+        // A settled fork carries history, but no notification destinations.
+        let (mut c, version) = h.load(conversation).unwrap();
+        c.submissions
+            .iter_mut()
+            .find(|s| s.status == Status::Running)
+            .unwrap()
+            .status = Status::Done {
+            answer: "ok".into(),
+        };
+        c.active = None;
+        c.phase = Phase::Idle;
+        h.save(&c, Expected::Version(version)).unwrap();
+        let fork = h.fork(conversation).unwrap();
+        assert!(h.load(fork).unwrap().0.submission_notifications.is_empty());
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        assert_eq!(
+            TaskStore::new(h.owner.store())
+                .read_typed_signal(task.id(), &submission_settled_signal(), "doc")
+                .unwrap()
+                .unwrap()["reason"],
+            "aborted"
+        );
+    }
+
+    #[test]
+    fn submission_notify_deadline_closes_at_boundary() {
+        use crate::task::{Checkpoint, Task, TaskOwner, WaitFor};
+        use crate::task_store::{Save, TaskStore};
+        for now in [0, 60_000, 60_001] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h =
+                Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+            let conversation = h.create_conversation(config()).unwrap();
+            let task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::json!(null),
+                },
+                3,
+            )
+            .unwrap();
+            let ts = TaskStore::new(h.owner.store());
+            ts.save(&[Save::Create(&task)]).unwrap();
+            ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+            ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+                task.wait(WaitFor::TypedSleep {
+                    until_millis: Some(60_000),
+                    signals: vec![submission_settled_signal().key("done").unwrap()],
+                })
+            })
+            .unwrap();
+            h.set_signal_clock(Arc::new(move || now));
+            h.submit_write_with_notification(
+                conversation,
+                None,
+                "note".into(),
+                None,
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "done".into(),
+                },
+            )
+            .unwrap();
+            let value = TaskStore::new(h.owner.store())
+                .read_typed_signal_state(task.id(), &submission_settled_signal(), "done")
+                .unwrap();
+            if now == 0 {
+                assert!(matches!(
+                    value,
+                    Some(crate::task_store::SignalState::Value(_))
+                ));
+            } else {
+                assert_eq!(value, Some(crate::task_store::SignalState::Expired));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_notify_normal_input_and_continue_survive_reopen() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        model.release.add_permits(2);
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "input".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "input".into(),
+                },
+            )
+            .unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        let value = TaskStore::new(h.owner.store())
+            .read_typed_signal(task.id(), &submission_settled_signal(), "input")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["id"], serde_json::json!(id));
+        assert_eq!(value["status"], "done");
+        let continued = h
+            .submit_continue_with_notification(
+                conversation,
+                None,
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "continue".into(),
+                },
+            )
+            .unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let value = TaskStore::new(h.owner.store())
+            .read_typed_signal(task.id(), &submission_settled_signal(), "continue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["id"], serde_json::json!(continued));
+        assert_eq!(value["type"], "continue");
+        assert!(value["status"] == "done" || value["status"] == "unanswered");
+    }
+
+    #[tokio::test]
+    async fn submission_notify_failure_does_not_block_other_conversation() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            model: Arc::new(FailingModel),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let mut scheduler = Scheduler::open(dir.path().join("db"), opts).unwrap();
+        let failed = scheduler.create_conversation(config()).unwrap();
+        let other = scheduler.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(other),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(scheduler.harness.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        let id = scheduler
+            .submit_with_notification(
+                failed,
+                None,
+                "fail".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "failed".into(),
+                },
+            )
+            .unwrap();
+        scheduler.submit(other, None, "ok".into()).unwrap();
+        scheduler.wait(failed).await.unwrap();
+        scheduler.wait(other).await.unwrap();
+        let value = TaskStore::new(scheduler.harness.owner.store())
+            .read_typed_signal(task.id(), &submission_settled_signal(), "failed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["id"], serde_json::json!(id));
+        assert_eq!(value["status"], "unanswered");
+        assert!(matches!(
+            scheduler.conversation(other).unwrap().submissions[0].status,
+            Status::Done { .. }
+        ));
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submission_notify_kill_fixture() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        use std::io::Write;
+        let Ok(path) = std::env::var("PI_SUBMISSION_NOTIFY_KILL_DB") else {
+            return;
+        };
+        let mut h = Harness::open_paused(path, options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::from_u128(4242),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "kill".into(),
+                },
+            )
+            .unwrap();
+        if std::env::var_os("PI_SUBMISSION_NOTIFY_BEFORE_COMMIT").is_some() {
+            let (mut candidate, version) = h.load(conversation).unwrap();
+            candidate
+                .submissions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status = Status::Unanswered {
+                reason: "aborted".into(),
+            };
+            let batch = h
+                .prepare_save(&candidate, Expected::Version(version))
+                .unwrap();
+            h.commit_conversation_save_with_hook(batch, None, |_| {
+                println!("NOTIFICATION_PREPARED");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    std::thread::park();
+                }
+            })
+            .unwrap();
+        }
+        h.withdraw_submission(conversation, id).unwrap();
+        println!("NOTIFICATION_COMMITTED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submission_notify_process_kill_reopens() {
+        use std::{
+            io::{BufRead, BufReader},
+            process::{Child, Command, Stdio},
+            sync::mpsc,
+        };
+        struct KillOnDrop(Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for before in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::scheduler_tests::submission_notify_kill_fixture",
+                    "--nocapture",
+                ])
+                .env("PI_SUBMISSION_NOTIFY_KILL_DB", &path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            if before {
+                command.env("PI_SUBMISSION_NOTIFY_BEFORE_COMMIT", "1");
+            }
+            let mut child = KillOnDrop(command.spawn().unwrap());
+            let output = child.0.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    if line.unwrap().contains(if before {
+                        "NOTIFICATION_PREPARED"
+                    } else {
+                        "NOTIFICATION_COMMITTED"
+                    }) {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("notification did not commit");
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            let h = Harness::open_paused(&path, options(placement_model())).unwrap();
+            let value = crate::task_store::TaskStore::new(h.owner.store())
+                .read_typed_signal(Uuid::from_u128(4242), &submission_settled_signal(), "kill")
+                .unwrap();
+            if before {
+                assert!(value.is_none());
+                let conversation = h.conversations().unwrap()[0];
+                assert_eq!(
+                    h.conversation(conversation).unwrap().submissions[1].status,
+                    Status::Queued
+                );
+            } else {
+                let value = value.unwrap();
+                assert_eq!(value["status"], "unanswered");
+                assert_eq!(value["reason"], "aborted");
+            }
         }
     }
 
@@ -20512,6 +22015,7 @@ mod scheduler_tests {
             occurrence_epoch_proven: true,
             transcript: None,
             submissions: vec![],
+            submission_notifications: HashMap::new(),
             manual_compactions: vec![],
             active_manual_compaction: None,
             aborted_generations: vec![],

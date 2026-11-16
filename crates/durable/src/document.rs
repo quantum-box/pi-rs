@@ -1437,6 +1437,41 @@ impl<'a> HostTransaction<'a> {
         }
         self.transaction.append(batch)
     }
+    /// Import an already prepared runtime batch before assembling deliveries.
+    /// Signal writes remain private to this host transaction and are visible
+    /// to later deliveries; public callers cannot inject raw signal records.
+    pub(crate) fn append_runtime_candidate(&mut self, batch: OwnedBatch) -> Result<(), Error> {
+        if !self.transaction.checks.is_empty() || !self.signals.batch.checks.is_empty() {
+            return Err(Error::InvalidBatch);
+        }
+        let mut validated = Transaction::new();
+        validated.append(batch)?;
+        let is_signal = |key: &[u8]| {
+            key.starts_with(b"durable/signal/") || key.starts_with(b"durable/signal-revision/")
+        };
+        let mut ordinary = OwnedBatch {
+            checks: Vec::new(),
+            mutations: Vec::new(),
+        };
+        for check in validated.checks {
+            if is_signal(&check.key) {
+                self.signals.batch.checks.push(check);
+            } else {
+                ordinary.checks.push(check);
+            }
+        }
+        for mutation in validated.mutations {
+            let key = match &mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+            };
+            if is_signal(key) {
+                self.signals.batch.mutations.push(mutation);
+            } else {
+                ordinary.mutations.push(mutation);
+            }
+        }
+        self.transaction.append(ordinary)
+    }
     /// Stage typed deliveries after candidate task and signal writes. Results
     /// remain provisional until commit; later target writes are rejected.
     pub fn signal_at(
@@ -1524,7 +1559,10 @@ impl<'a> HostTransaction<'a> {
     pub fn wake_with_staged_signal(&mut self, task_id: uuid::Uuid) -> Result<(), Error> {
         self.wake_with_signal(task_id)
     }
-    pub fn commit(mut self) -> Result<(), Error> {
+    pub(crate) fn into_batch(mut self) -> Result<OwnedBatch, Error> {
+        if !self.transaction.acquisitions.is_empty() {
+            return Err(Error::InvalidBatch);
+        }
         let mut existing = OwnedBatch {
             checks: std::mem::take(&mut self.transaction.checks),
             mutations: Vec::new(),
@@ -1540,7 +1578,16 @@ impl<'a> HostTransaction<'a> {
         });
         self.transaction.checks = existing.checks;
         self.transaction.append(self.signals.batch)?;
-        self.transaction.commit(self.store)
+        Ok(OwnedBatch {
+            checks: self.transaction.checks,
+            mutations: self.transaction.mutations,
+        })
+    }
+    pub fn commit(self) -> Result<(), Error> {
+        let store = self.store;
+        let batch = self.into_batch()?;
+        store.commit_with_task_documents(&batch.checks, &batch.mutations, &[])?;
+        Ok(())
     }
 }
 
@@ -2463,16 +2510,25 @@ mod nested_entry_tests {
             .unwrap();
         assert_eq!(status, SignalResult::Delivered);
         let mut host = HostTransaction::new(&db);
-        host.signals.batch = prepared;
+        host.append_runtime_candidate(prepared).unwrap();
         assert_eq!(
             host.signal_at(target.id(), &token, "a", json!(2), 0)
                 .unwrap(),
             SignalResult::Duplicate
         );
+        assert_eq!(
+            host.signal_at(target.id(), &token, "b", json!(3), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
         host.commit().unwrap();
         assert_eq!(
             ts.read_typed_signal(target.id(), &token, "a").unwrap(),
             Some(json!(1))
+        );
+        assert_eq!(
+            ts.read_typed_signal(target.id(), &token, "b").unwrap(),
+            Some(json!(3))
         );
     }
 
