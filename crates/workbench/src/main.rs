@@ -1145,10 +1145,13 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
+        /// Use Anthropic's headless copy-code authorization.
+        #[arg(long, conflicts_with = "device_code")]
+        copy_code: bool,
         /// Register a different ChatGPT account or workspace.
         #[arg(long, conflicts_with_all = ["account", "list_accounts"])]
         new_account: bool,
@@ -1161,7 +1164,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1719,6 +1722,7 @@ async fn execute(
         Some(Command::Login {
             provider,
             device_code,
+            copy_code,
             new_account,
             account,
             list_accounts,
@@ -1741,8 +1745,30 @@ async fn execute(
                     "--new-account and --account require openai-chatgpt".into(),
                 ));
             }
+            if *copy_code && provider != "anthropic" {
+                return Err(Error::Config("--copy-code requires anthropic".into()));
+            }
             let login = async {
-                if provider == "openai-chatgpt" {
+                if provider == "anthropic" {
+                    if *device_code {
+                        return Err(Error::Config(
+                            "Anthropic uses browser or copy-code authorization".into(),
+                        ));
+                    }
+                    let method = if *copy_code {
+                        anthropic_auth::LoginMethod::CopyCode
+                    } else {
+                        anthropic_auth::LoginMethod::Browser
+                    };
+                    anthropic_auth::login(&args.settings, method, meta_auth::LoginControl::default(), |url, sender| {
+                        eprintln!("Continue in your browser: {url}");
+                        eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                        std::thread::spawn(move || {
+                            let mut line = String::new();
+                            if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) { let _ = sender.send(line); }
+                        });
+                    }).await
+                } else if provider == "openai-chatgpt" {
                     if *device_code {
                         return Err(Error::Config("ChatGPT uses browser authorization".into()));
                     }
@@ -1801,7 +1827,7 @@ async fn execute(
                 xai_auth::logout().await?
             } else if provider == "kimi-coding" {
                 kimi_auth::logout().await?
-            } else if provider == "openrouter" {
+            } else if provider == "openrouter" || provider == "anthropic" {
                 model_auth::remove(
                     &Provider::named(provider).expect("built-in OpenRouter provider"),
                 )?
@@ -1845,10 +1871,9 @@ async fn execute(
     if let Some(source) = &args.fork_session {
         let source = sessions::resolve_reference(source, &directory)?;
         let source_session = session_import::read(&source)?;
-        sessions::fork(
+        sessions::fork_full_history_when_inert(
             &source_session,
             &source,
-            source_session.head(),
             &args.session,
             &args.workspace,
         )?;
@@ -2125,21 +2150,20 @@ async fn execute(
     let mut runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
-    runtime
-        .session_lifecycle(
+    let result = async {
+    runtime.session_lifecycle_owned(
             &args,
-            &session,
+            &mut session,
             pi_rs::LifecycleEvent::SessionStart {
                 reason: pi_rs::SessionStartReason::Startup,
                 previous_session_file: None,
             },
         )
-        .await;
+        .await?;
     runtime
         .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
         .await?;
     run_pending_custom_trigger(&args, &runtime, &mut session).await?;
-    let result = async {
         if let Command::Extension { extension_id, command: extension_command, arguments } = &command {
             if let Some(run_id) = args.run_id
                 && session.records().iter().any(|record| record.run_id == Some(run_id))
@@ -2284,7 +2308,9 @@ async fn execute(
                 event => {
                     let event = reasoning_event_json(event);
                     if let Some(stream) = &mut stream {
-                        for output_event in stream.observe(&event, &args) { output(output_event); }
+                        let mut rpc_event = event.clone();
+                        attach_redacted_reasoning(&mut rpc_event);
+                        for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
                     }
                     if args.trace { output(trace_agent_event_json(event)); }
                 }
@@ -2383,18 +2409,29 @@ async fn execute(
     }
     Ok(())
     }.await;
-    runtime
-        .session_lifecycle(
+    finish_session_run(
+        result,
+        runtime.session_lifecycle_owned(
             &args,
-            &session,
+            &mut session,
             pi_rs::LifecycleEvent::SessionShutdown {
                 reason: pi_rs::SessionShutdownReason::Quit,
                 target_session_file: None,
             },
-        )
-        .await;
-    let cleanup = runtime.close().await;
-    result.and(cleanup)
+        ),
+        runtime.close(),
+    )
+    .await
+}
+
+async fn finish_session_run(
+    result: Result<()>,
+    lifecycle: impl std::future::Future<Output = Result<()>>,
+    cleanup: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let lifecycle = lifecycle.await;
+    let cleanup = cleanup.await;
+    result.and(lifecycle).and(cleanup)
 }
 
 fn trace_tool_progress(
@@ -2428,6 +2465,12 @@ fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
         pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+    }
+}
+
+fn attach_redacted_reasoning(event: &mut serde_json::Value) {
+    if event["type"] == "reasoning_item_start" && pi_rs::redacted_reasoning_start() {
+        event["redacted"] = json!(true);
     }
 }
 
@@ -2793,6 +2836,106 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
 #[cfg(test)]
 mod cli_timeout_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_entry_failure_still_runs_shutdown_and_cleanup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct FailingStore(pi_rs::MemoryStore);
+        impl pi_rs::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<pi_rs::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &pi_rs::Record) -> Result<()> {
+                if matches!(record.event, pi_rs::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("startup write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        struct Hook(Arc<AtomicBool>, Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl pi_rs::Extension for Hook {
+            fn id(&self) -> &str {
+                "lifecycle-fixture"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &pi_rs::LifecycleEvent,
+                _: Option<&pi_rs::ExtensionState>,
+                host: Arc<dyn pi_rs::ToolHost>,
+            ) -> pi_rs::ExtensionResult<()> {
+                match event {
+                    pi_rs::LifecycleEvent::SessionStart { .. } => {
+                        host.append_entry(pi_rs::CustomEntry {
+                            custom_type: "failure".into(),
+                            data: None,
+                        })
+                        .await
+                    }
+                    pi_rs::LifecycleEvent::SessionShutdown { .. } => {
+                        self.0.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+            async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+                self.1.store(true, Ordering::SeqCst);
+                Err("cleanup failed".into())
+            }
+        }
+        let shutdown_seen = Arc::new(AtomicBool::new(false));
+        let cleanup_seen = Arc::new(AtomicBool::new(false));
+        let mut registry = pi_rs::Registry::default();
+        registry
+            .register(Arc::new(Hook(shutdown_seen.clone(), cleanup_seen.clone())))
+            .unwrap();
+        let mut session =
+            pi_rs::Session::with_store(FailingStore(pi_rs::MemoryStore::default())).unwrap();
+        let start = pi_rs::notify_extension_lifecycle_in_session(
+            &registry,
+            &mut session,
+            pi_rs::LifecycleEvent::SessionStart {
+                reason: pi_rs::SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await;
+        let shutdown = async {
+            pi_rs::notify_extension_lifecycle_in_session(
+                &registry,
+                &mut session,
+                pi_rs::LifecycleEvent::SessionShutdown {
+                    reason: pi_rs::SessionShutdownReason::Quit,
+                    target_session_file: None,
+                },
+                Duration::from_secs(2),
+                &mut |_| {},
+            )
+            .await?;
+            Err(Error::Session("shutdown failed".into()))
+        };
+        let result = finish_session_run(start, shutdown, registry.shutdown()).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("startup write failed")
+        );
+        assert!(shutdown_seen.load(Ordering::SeqCst));
+        assert!(cleanup_seen.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn session_names_reject_empty_input_and_trim_surrounding_whitespace() {

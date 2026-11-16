@@ -8,3 +8,10 @@ classes that contain other matchable characters continue to work.
 
 This checkpoint covers local grep; injected remote grep delegates matching to
 its backend.
+
+Unrestricted local grep accepts numeric match limits like Pi: the effective
+limit is at least 1, and a fractional limit stops at the next whole match.
+Notices and details retain the effective JavaScript Number value; large JSON
+numbers are rounded to binary64. Scoped and injected remote grep retain their
+own limit validation. Context matches continue to spool to temporary files to
+bound memory usage.
