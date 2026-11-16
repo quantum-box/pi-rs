@@ -383,6 +383,7 @@ pub struct AbortedGeneration {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // Keep persisted phase values directly inspectable.
 enum Phase {
     Idle,
     /// A failed run retains its queued inputs until a new input arrives.
