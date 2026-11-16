@@ -318,6 +318,63 @@ pub(crate) enum Error {
     Invalid,
 }
 
+/// Untrusted locations used only to find evidence for independent replay.
+/// These values must never be used as an expected binding without first
+/// authenticating the predecessor, transcript chain and derived reset states.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReplayHints {
+    pub(crate) predecessor_observation: u64,
+    pub(crate) predecessor_root_version: u64,
+    pub(crate) cuts: Vec<ReplayCutHint>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReplayCutHint {
+    pub(crate) reset_id: Uuid,
+    pub(crate) context_generation: Uuid,
+    pub(crate) write_limit: u64,
+    pub(crate) cursor: ManifestCursor,
+}
+
+impl RawCandidate {
+    /// Parse bounded, structurally valid hints. This is not authentication:
+    /// callers must construct an independent binding and call `decode`.
+    pub(crate) fn replay_hints(&self) -> Result<ReplayHints, Error> {
+        if self.bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::TooLarge);
+        }
+        let raw: RawResetManifest =
+            serde_json::from_slice(&self.bytes).map_err(|_| Error::Encoding)?;
+        let manifest = ResetManifest::from(raw);
+        let structural_binding = ExpectedBinding {
+            conversation_id: manifest.conversation_id,
+            predecessor_observation: manifest.predecessor_observation,
+            predecessor_root_version: manifest.predecessor_root_version,
+            anchor_observation: manifest.anchor_observation,
+            document_revision: manifest.document_revision,
+            predecessor_context_generation: manifest.predecessor_context_generation,
+            predecessor_cursor: manifest.predecessor_cursor.clone(),
+            anchor_cursor: manifest.anchor_cursor.clone(),
+            cuts: manifest.cuts.clone(),
+        };
+        manifest.validate(&structural_binding)?;
+        Ok(ReplayHints {
+            predecessor_observation: manifest.predecessor_observation,
+            predecessor_root_version: manifest.predecessor_root_version,
+            cuts: manifest
+                .cuts
+                .into_iter()
+                .map(|cut| ReplayCutHint {
+                    reset_id: cut.reset_id,
+                    context_generation: cut.context_generation,
+                    write_limit: cut.write_limit,
+                    cursor: cut.cursor,
+                })
+                .collect(),
+        })
+    }
+}
+
 impl ResetManifest {
     pub(crate) fn encode(&self, expected: &ExpectedBinding) -> Result<Vec<u8>, Error> {
         self.validate(expected)?;
@@ -911,6 +968,42 @@ mod tests {
         binding.anchor_cursor = manifest.anchor_cursor.clone();
         binding.cuts = manifest.cuts.clone();
         assert!(matches!(manifest.encode(&binding), Err(Error::Invalid)));
+    }
+
+    #[test]
+    fn replay_hints_are_bounded_structural_and_do_not_authorize_a_binding() {
+        let (manifest, binding) = fixture();
+        let bytes = manifest.encode(&binding).unwrap();
+        let candidate = RawCandidate {
+            bytes: bytes.clone(),
+            checks: vec![],
+        };
+        let hints = candidate.replay_hints().unwrap();
+        assert_eq!(
+            hints.predecessor_observation,
+            binding.predecessor_observation
+        );
+        assert_eq!(hints.cuts.len(), binding.cuts.len());
+        assert_eq!(hints.cuts[0].cursor, binding.cuts[0].cursor);
+        let mut wrong = binding.clone();
+        wrong.document_revision += 1;
+        assert!(matches!(
+            ResetManifest::decode(&bytes, &wrong),
+            Err(Error::Binding)
+        ));
+
+        let mut malformed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        malformed["cuts"][1]["reset_id"] = malformed["cuts"][0]["reset_id"].clone();
+        let candidate = RawCandidate {
+            bytes: serde_json::to_vec(&malformed).unwrap(),
+            checks: vec![],
+        };
+        assert!(matches!(candidate.replay_hints(), Err(Error::Invalid)));
+        let candidate = RawCandidate {
+            bytes: vec![b' '; MAX_MANIFEST_BYTES + 1],
+            checks: vec![],
+        };
+        assert!(matches!(candidate.replay_hints(), Err(Error::TooLarge)));
     }
 
     #[test]
