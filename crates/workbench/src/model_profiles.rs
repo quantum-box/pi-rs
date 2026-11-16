@@ -1403,6 +1403,10 @@ impl Profiles {
             })
     }
 
+    pub(super) fn has_model_definition(&self, provider: &Provider, id: &str) -> bool {
+        self.definition(provider, id).is_some()
+    }
+
     pub fn model_adapter(&self, provider: &Provider, model: &str) -> Adapter {
         self.definition(provider, model)
             .and_then(|model| model.api.as_deref())

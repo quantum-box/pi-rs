@@ -376,6 +376,13 @@ impl Ollama {
         self
     }
 
+    /// Set endpoint-wide strict tool support; callers must ensure it applies to
+    /// every model dispatched through this client.
+    pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
+        self.compatibility.supports_strict_mode = Some(supported);
+        self
+    }
+
     /// Scope replay to the configured provider, even on shared gateways.
     pub fn with_provider(mut self, provider: &str) -> Self {
         self.provider = provider.to_owned();

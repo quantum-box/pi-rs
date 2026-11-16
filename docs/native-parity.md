@@ -3905,7 +3905,12 @@ WorkbenchModel for both Chat Completions and Responses, but reject strict
 decisions and direct callers to prepared dispatch. Session dispatch applies the
 configured prompt-cache policy and external session key; summary dispatch suppresses automatic cache controls,
 prompt-cache keys, and retention. Callers must normalize strict arguments
-before validation. Grammar declarations in Chat Completions currently fall back to
+before validation. Workbench resolves strict support for the final request model
+after request hooks, using its provider and model overlays; an unknown rewritten
+model on the same route is treated as unsupported, and a different adapter or
+endpoint is rejected. A prepared context is bound to its request model. Direct
+SDK capability settings apply to the client endpoint and must be valid for every
+model the caller dispatches through it. Grammar declarations in Chat Completions currently fall back to
 ordinary function tools; custom grammar tools and their streaming/replay remain
 unsupported. No provider-side strict-limit retry is implemented on this path.
 

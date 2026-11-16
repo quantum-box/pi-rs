@@ -454,6 +454,23 @@ impl Deferred {
 }
 
 impl Client {
+    pub(super) async fn with_final_strict_support(self, supported: bool) -> Result<Self> {
+        Ok(match self {
+            Self::Ollama(client) => Self::Ollama(client.with_strict_tool_support(supported)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_strict_tool_support(supported)),
+            Self::Deferred(client)
+                if matches!(
+                    client.adapter,
+                    Adapter::OpenAiResponses | Adapter::ChatCompletions
+                ) =>
+            {
+                return Box::pin(client.resolve().await?.with_final_strict_support(supported))
+                    .await;
+            }
+            other => other,
+        })
+    }
+
     pub fn supports_prepared_tool_dispatch(&self) -> bool {
         match self {
             Self::OpenAi(_) | Self::Ollama(_) | Self::Google(_) | Self::Anthropic(_) => true,
@@ -1697,6 +1714,7 @@ mod contention_tests {
         assert!(legacy.context_identity().is_some());
         assert_eq!(current.context_identity(), legacy.context_identity());
         let wrap = |client| super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
             client,
             block_images: false,
             supports_images: None,
@@ -1842,6 +1860,7 @@ mod contention_tests {
                 .with_model_options(&args, false)
                 .unwrap();
                 let model = super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
                     client,
                     block_images: false,
                     supports_images: None,
@@ -2036,6 +2055,7 @@ mod contention_tests {
             .with_model_options(&args, false)
             .unwrap();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client: client.clone(),
                 block_images: true,
                 supports_images: None,
@@ -2192,6 +2212,7 @@ mod contention_tests {
                     .unwrap()
                     .with_context_probes(false);
                     let model = super::super::image_policy::WorkbenchModel {
+                        strict_policy: None,
                         client,
                         block_images: false,
                         supports_images: None,
@@ -2337,6 +2358,7 @@ mod contention_tests {
                 .unwrap()
                 .with_context_probes(false);
                 let model = super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
                     client,
                     block_images: false,
                     supports_images: None,
@@ -2581,6 +2603,7 @@ mod contention_tests {
             .unwrap();
             let direct_client = client.clone();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: true,
                 supports_images: None,
@@ -2756,6 +2779,7 @@ mod contention_tests {
             .unwrap();
             let direct_client = client.clone();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: true,
                 supports_images: None,
@@ -2943,6 +2967,7 @@ mod contention_tests {
             .unwrap();
             let direct_client = client.clone();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: true,
                 supports_images: None,
@@ -3166,6 +3191,7 @@ mod contention_tests {
             .unwrap();
             let direct_client = client.clone();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: true,
                 supports_images: None,
@@ -3324,6 +3350,7 @@ mod contention_tests {
                 .is_none()
         );
         let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
             client,
             block_images: false,
             supports_images: None,
@@ -3917,6 +3944,7 @@ mod estimation_tests {
             .with_model_options(&args, false)
             .unwrap();
             let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
                 client,
                 block_images: false,
                 supports_images: None,
@@ -4371,6 +4399,7 @@ mod estimation_tests {
             };
             let model = MeasuredFixture {
                 wrapped: super::super::image_policy::WorkbenchModel {
+                    strict_policy: None,
                     client,
                     block_images: false,
                     supports_images: Some(true),
@@ -4511,6 +4540,7 @@ mod estimation_tests {
                 .with_headers(headers),
         );
         let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
             client,
             block_images: false,
             supports_images: Some(true),
@@ -4652,6 +4682,7 @@ mod estimation_tests {
         )
         .with_context_probes(false);
         let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: None,
             client,
             block_images: false,
             supports_images: Some(true),
@@ -5123,5 +5154,592 @@ mod bedrock_tests {
             requests[18]["additionalModelRequestFields"]["thinking"]["budget_tokens"],
             3456
         );
+    }
+}
+
+#[cfg(test)]
+mod final_model_strict_tests {
+    use super::*;
+    use clap::Parser;
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+    };
+
+    #[tokio::test]
+    async fn final_model_drives_strict_decision_for_resolved_and_deferred_clients() {
+        for api in ["openai-responses", "openai-completions"] {
+            for deferred in [false, true] {
+                for selected in ["yes", "no"] {
+                    for target in ["yes", "no", "unknown"] {
+                        for require in [false, true] {
+                            for prepared_context in [false, true] {
+                                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                                let endpoint = format!(
+                                    "http://{}/v1/{}",
+                                    listener.local_addr().unwrap(),
+                                    if api == "openai-responses" {
+                                        "responses"
+                                    } else {
+                                        "chat/completions"
+                                    }
+                                );
+                                let mut args = super::super::Cli::parse_from(["pi"]);
+                                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                                    "api":api,"baseUrl":endpoint,"compat":{"supportsStrictMode":true},
+                                    "models":[{"id":"yes","compat":{"supportsStrictMode":true}},{"id":"no","compat":{"supportsStrictMode":false}}]
+                                }}})).unwrap();
+                                args.provider = args.model_profiles.provider("fixture").unwrap();
+                                args.model = selected.into();
+                                let adapter = if api == "openai-responses" {
+                                    Adapter::OpenAiResponses
+                                } else {
+                                    Adapter::ChatCompletions
+                                };
+                                let client = if deferred {
+                                    Client::deferred(
+                                        args.provider.clone(),
+                                        adapter,
+                                        &endpoint,
+                                        Some(Credential::Literal("fixture".into())),
+                                        RequestHeaders::default(),
+                                    )
+                                } else if api == "openai-responses" {
+                                    Client::OpenAi(
+                                        pi_rs::openai::OpenAiResponses::new_api(
+                                            &endpoint,
+                                            "fixture".into(),
+                                        )
+                                        .unwrap(),
+                                    )
+                                } else {
+                                    Client::Ollama(
+                                        pi_rs::ollama::Ollama::new(
+                                            &endpoint,
+                                            Some("fixture".into()),
+                                        )
+                                        .unwrap()
+                                        .with_native_probes(false),
+                                    )
+                                }
+                                .with_model_options(&args, false)
+                                .unwrap();
+                                let model = super::super::image_policy::WorkbenchModel {
+                                    strict_policy: Some(Arc::new(
+                                        super::super::image_policy::FinalStrictPolicy {
+                                            profiles: args.model_profiles.clone(),
+                                            provider: args.provider.clone(),
+                                            selected_model: selected.into(),
+                                            explicit_endpoint: false,
+                                            bound_support: None,
+                                        },
+                                    )),
+                                    client,
+                                    block_images: false,
+                                    supports_images: None,
+                                    session_affinity: &[],
+                                    price: None,
+                                };
+                                let spec = pi_rs::ToolSpec {
+                                    name: "read".into(),
+                                    description: String::new(),
+                                    parameters: json!({"type":"object","properties":{"x":{"type":"string"}}}),
+                                };
+                                let req = ModelRequest {
+                                    model: target.into(),
+                                    messages: vec![pi_rs::Message::User {
+                                        content: "test".into(),
+                                    }],
+                                    tools: vec![spec.clone()],
+                                    max_output_tokens: 10,
+                                };
+                                let declaration = pi_rs::ToolDeclaration {
+                                    spec,
+                                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                                        strict: if require {
+                                            pi_rs::StrictToolPolicy::Require
+                                        } else {
+                                            pi_rs::StrictToolPolicy::Prefer
+                                        },
+                                    }),
+                                };
+                                let context = pi_rs::ToolDispatchContext {
+                                    request_id: uuid::Uuid::new_v4(),
+                                    session_id: uuid::Uuid::new_v4(),
+                                    external_id: "fixture".into(),
+                                    summary: false,
+                                };
+                                let prepared_model = if prepared_context {
+                                    model.prepare_context(&req).await.unwrap()
+                                } else {
+                                    None
+                                };
+                                if prepared_context && selected == "yes" && target == "no" {
+                                    let mut other = req.clone();
+                                    other.model = "yes".into();
+                                    let yes = model.prepare_context(&other).await.unwrap().unwrap();
+                                    assert_ne!(
+                                        yes.context_identity(),
+                                        prepared_model.as_ref().unwrap().context_identity()
+                                    );
+                                }
+                                let active: &dyn Model =
+                                    prepared_model.as_deref().unwrap_or(&model);
+                                let result = active
+                                    .prepare_tool_dispatch(
+                                        &req,
+                                        std::slice::from_ref(&declaration),
+                                        &context,
+                                    )
+                                    .await;
+                                let supported = target == "yes";
+                                if require && !supported {
+                                    assert!(
+                                        result.is_err(),
+                                        "{api} {deferred} {selected}->{target}"
+                                    );
+                                    continue;
+                                }
+                                let dispatch = result.unwrap().unwrap();
+                                assert_eq!(
+                                    matches!(
+                                        dispatch.effective_tools()[0].sampling,
+                                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                    ),
+                                    supported
+                                );
+                                let reservation =
+                                    &dispatch.reservation_request().tools[0].parameters;
+                                if supported {
+                                    assert_eq!(reservation["additionalProperties"], false);
+                                } else {
+                                    assert_eq!(*reservation, declaration.spec.parameters);
+                                }
+                                let server = std::thread::spawn(move || {
+                                    let (mut stream, _) = listener.accept().unwrap();
+                                    stream
+                                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                                        .unwrap();
+                                    let mut data = Vec::new();
+                                    let (offset, length) = loop {
+                                        let mut buf = [0; 4096];
+                                        let n = stream.read(&mut buf).unwrap();
+                                        assert!(n > 0);
+                                        data.extend_from_slice(&buf[..n]);
+                                        if let Some(pos) =
+                                            data.windows(4).position(|v| v == b"\r\n\r\n")
+                                        {
+                                            let header = String::from_utf8_lossy(&data[..pos]);
+                                            let length = header
+                                                .lines()
+                                                .find_map(|line| {
+                                                    line.to_ascii_lowercase()
+                                                        .strip_prefix("content-length:")
+                                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                                })
+                                                .unwrap();
+                                            break (pos + 4, length);
+                                        }
+                                    };
+                                    while data.len() < offset + length {
+                                        let mut buf = [0; 4096];
+                                        let n = stream.read(&mut buf).unwrap();
+                                        assert!(n > 0);
+                                        data.extend_from_slice(&buf[..n]);
+                                    }
+                                    let body: serde_json::Value =
+                                        serde_json::from_slice(&data[offset..offset + length])
+                                            .unwrap();
+                                    stream.write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                                    body
+                                });
+                                let _ = dispatch.dispatch().await;
+                                let body = server.join().unwrap();
+                                assert_eq!(body["model"], target);
+                                let tool = if api == "openai-responses" {
+                                    &body["tools"][0]
+                                } else {
+                                    &body["tools"][0]["function"]
+                                };
+                                assert_eq!(
+                                    tool.get("strict").and_then(serde_json::Value::as_bool),
+                                    supported.then_some(true)
+                                );
+                                if supported {
+                                    assert_eq!(tool["parameters"]["additionalProperties"], false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod final_model_hook_tests {
+    use super::*;
+    use clap::Parser;
+    use std::sync::Arc;
+
+    struct RequiredTool;
+    #[async_trait::async_trait]
+    impl pi_rs::Tool for RequiredTool {
+        fn spec(&self) -> pi_rs::ToolSpec {
+            pi_rs::ToolSpec {
+                name: "required".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn constrained_sampling(&self) -> Option<pi_rs::ToolConstraint> {
+            Some(pi_rs::ToolConstraint::JsonSchema {
+                strict: pi_rs::StrictToolPolicy::Require,
+            })
+        }
+        async fn invoke(&self, _: serde_json::Value, _: pi_rs::ToolContext) -> pi_rs::Outcome {
+            panic!("must not dispatch")
+        }
+    }
+    struct Rewrite;
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for Rewrite {
+        fn id(&self) -> &str {
+            "rewrite"
+        }
+        fn tools(&self) -> Vec<Arc<dyn pi_rs::Tool>> {
+            vec![Arc::new(RequiredTool)]
+        }
+        async fn before_request(
+            &self,
+            request: &mut pi_rs::ContextRequest<'_>,
+            _: pi_rs::RequestPurpose,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
+            request.model = "no".into();
+            Ok(pi_rs::ContextChange::Changed)
+        }
+    }
+    struct RewriteTurnOnly {
+        calls: Arc<std::sync::Mutex<Vec<(pi_rs::RequestPurpose, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for RewriteTurnOnly {
+        fn id(&self) -> &str {
+            "rewrite-turn-only"
+        }
+        fn tools(&self) -> Vec<Arc<dyn pi_rs::Tool>> {
+            vec![Arc::new(RequiredTool)]
+        }
+        async fn before_request(
+            &self,
+            request: &mut pi_rs::ContextRequest<'_>,
+            purpose: pi_rs::RequestPurpose,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((purpose, request.model.clone()));
+            if purpose == pi_rs::RequestPurpose::Turn {
+                request.model = "b".into();
+                Ok(pi_rs::ContextChange::Changed)
+            } else {
+                Ok(pi_rs::ContextChange::Unchanged)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_model_hook_compaction_summary_uses_selected_model_then_resumes_turn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for text in ["old conversation summary", "turn answer"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (end, size) = loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let size = std::str::from_utf8(&bytes[..end])
+                            .unwrap()
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, size);
+                    }
+                };
+                while bytes.len() < end + size {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                bodies.push(
+                    serde_json::from_slice::<serde_json::Value>(&bytes[end..end + size]).unwrap(),
+                );
+                let events = [
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":text}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":text}]}}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":1}}}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":endpoint,
+            "models":[{"id":"a","compat":{"supportsStrictMode":false}}, {"id":"b","compat":{"supportsStrictMode":true}}]
+        }}})).unwrap();
+        args.provider = args.model_profiles.provider("fixture").unwrap();
+        args.model = "a".into();
+        let client = Client::OpenAi(
+            pi_rs::openai::OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap(),
+        )
+        .with_model_options(&args, false)
+        .unwrap();
+        let model = super::super::image_policy::WorkbenchModel {
+            strict_policy: Some(Arc::new(super::super::image_policy::FinalStrictPolicy {
+                profiles: args.model_profiles.clone(),
+                provider: args.provider.clone(),
+                selected_model: "a".into(),
+                explicit_endpoint: false,
+                bound_support: None,
+            })),
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &[],
+            price: None,
+        };
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = pi_rs::Registry::default();
+        registry
+            .register(Arc::new(RewriteTurnOnly {
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        let agent = pi_rs::Agent {
+            model: &model,
+            model_name: "a",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits {
+                context_window: Some(4096),
+                output_tokens_per_request: 64,
+                compaction_tokens: Some(pi_rs::CompactionTokens {
+                    reserve_tokens: Some(4096),
+                    keep_recent_tokens: None,
+                }),
+                model_timeout: std::time::Duration::from_secs(5),
+                ..pi_rs::Limits::default()
+            },
+        };
+        let mut seed = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        seed.append_user_with_images("earlier question".into(), vec![], None)
+            .unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records.last().unwrap().version,
+            id: records.len() as u64 + 1,
+            parent: Some(seed.head()),
+            event: pi_rs::Event::Assistant {
+                content: "earlier answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            },
+        });
+        let mut session = pi_rs::Session::from_records(records).unwrap();
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run(
+                &mut session,
+                Some("new question".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .expect("agent timed out")
+        .unwrap();
+        assert_eq!(answer, "turn answer");
+        let bodies = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("loopback timed out")
+            .unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["model"], "a");
+        assert!(
+            bodies[0]
+                .get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(
+            bodies[0]
+                .to_string()
+                .contains("Summarize only this older conversation")
+        );
+        assert_eq!(bodies[1]["model"], "b");
+        assert_eq!(bodies[1]["tools"][0]["name"], "required");
+        assert_eq!(bodies[1]["tools"][0]["strict"], true);
+        assert_eq!(
+            bodies[1]["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+        let seen = calls.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(purpose, model)| *purpose == pi_rs::RequestPurpose::Turn && model == "a")
+        );
+        assert!(
+            seen.iter()
+                .any(|(purpose, model)| *purpose == pi_rs::RequestPurpose::Summary && model == "a")
+        );
+        drop(seen);
+        assert!(session.records().iter().any(|record| matches!(&record.event, pi_rs::Event::Compacted { summary, .. } if summary == "old conversation summary")));
+        let requests: Vec<_> = session
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::ModelRequested {
+                    model,
+                    request_id: Some(id),
+                    ..
+                } => Some((record.id, model.as_str(), *id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].1, "a");
+        assert_eq!(requests[1].1, "b");
+        for (index, (record, model, id)) in requests.iter().enumerate() {
+            let resolved = session
+                .records()
+                .iter()
+                .find_map(|entry| match &entry.event {
+                    pi_rs::Event::ModelFinished {
+                        request_id,
+                        metadata,
+                        ..
+                    } if request_id == id => metadata.resolved_model.as_ref(),
+                    _ => None,
+                })
+                .expect("missing resolved model identity");
+            assert_eq!(resolved.model, *model);
+            let decision = session.recorded_tool_decision(*record).unwrap();
+            if index == 0 {
+                assert!(matches!(decision, pi_rs::RecordedToolDecision::Legacy));
+                continue;
+            }
+            let pi_rs::RecordedToolDecision::Current(snapshot) = decision else {
+                panic!("missing current decision")
+            };
+            assert_eq!(snapshot.context().request_id, *id);
+            assert_eq!(snapshot.context().session_id, session.session_id());
+            assert_eq!(snapshot.context().summary, index == 0);
+            let value = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(
+                value["effective"][0]["sampling"]["type"],
+                "strict_json_schema"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_model_hook_rejects_required_downgrade_before_journaling() {
+        for api in ["openai-responses", "openai-completions"] {
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{"api":api,"baseUrl":"http://127.0.0.1:9/v1","models":[{"id":"yes","compat":{"supportsStrictMode":true}},{"id":"no","compat":{"supportsStrictMode":false}}]}}})).unwrap();
+            args.provider = args.model_profiles.provider("fixture").unwrap();
+            args.model = "yes".into();
+            let client = if api == "openai-responses" {
+                Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(
+                        "http://127.0.0.1:9/v1/responses",
+                        "fixture".into(),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(
+                        "http://127.0.0.1:9/v1/chat/completions",
+                        Some("fixture".into()),
+                    )
+                    .unwrap()
+                    .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let model = super::super::image_policy::WorkbenchModel {
+                strict_policy: Some(Arc::new(super::super::image_policy::FinalStrictPolicy {
+                    profiles: args.model_profiles.clone(),
+                    provider: args.provider.clone(),
+                    selected_model: "yes".into(),
+                    explicit_endpoint: false,
+                    bound_support: None,
+                })),
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: &[],
+                price: None,
+            };
+            let mut registry = pi_rs::Registry::default();
+            registry.register(Arc::new(Rewrite)).unwrap();
+            let agent = pi_rs::Agent {
+                model: &model,
+                model_name: "yes",
+                registry: &registry,
+                system_prompt: "",
+                limits: pi_rs::Limits::default(),
+            };
+            let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let (_, mut input) = tokio::sync::mpsc::channel::<String>(1);
+            let error = agent
+                .run(
+                    &mut session,
+                    Some("hi".into()),
+                    &mut input,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("requires JSON-schema"),
+                "{error}"
+            );
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, pi_rs::Event::ModelRequested { .. }))
+            );
+        }
     }
 }

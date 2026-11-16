@@ -294,7 +294,8 @@ impl OpenAiResponses {
         self
     }
 
-    /// Set whether the selected model supports strict JSON Schema tools.
+    /// Set endpoint-wide strict JSON Schema tool support for this client.
+    /// Callers routing different models must ensure the setting applies to each.
     pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
         self.strict_tool_support = supported;
         self

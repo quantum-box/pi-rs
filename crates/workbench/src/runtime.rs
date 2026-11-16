@@ -866,7 +866,17 @@ pub(super) fn model_client(
         .connect_provider(&args.provider, Some(&args.model))?
         .with_context_probes(args.allow_model_probes())
         .with_model_options(args, reported)?;
+    let strict_policy = client.supports_prepared_tool_dispatch().then(|| {
+        Arc::new(super::image_policy::FinalStrictPolicy {
+            profiles: args.model_profiles.clone(),
+            provider: args.provider.clone(),
+            selected_model: args.model.clone(),
+            explicit_endpoint: args.explicit_endpoint_for(&args.provider).is_some(),
+            bound_support: None,
+        })
+    });
     Ok(super::image_policy::WorkbenchModel {
+        strict_policy,
         client: if observe { client.observe() } else { client },
         block_images: args.settings.block_model_images(),
         supports_images: args
