@@ -32,6 +32,8 @@ pub mod progress;
 pub mod recovery;
 pub mod report;
 pub mod reset;
+#[allow(dead_code)] // Private manifest format; no writer or fork authorization yet.
+mod reset_manifest;
 pub mod retry_policy;
 pub mod runtime;
 pub mod state;
