@@ -1479,6 +1479,9 @@ does not start a driver or repair blocked work, and can remain pending for work
 that needs host intervention. This is an observation, not a barrier against new
 admissions: concurrent changes can immediately make an idle result stale. Each
 check reads conversations, tasks, and ownership edges in one database snapshot.
+`Scheduler::wait_for_all_idle(&cancel)` applies the same traversal to every
+ownerless conversation, corresponding to upstream's harness-wide idle wait.
+Owned conversations behind background tasks are excluded.
 Unlike upstream, this polls storage rather than using scheduler notifications;
 there is no background-inclusive idle option. Shutdown consumes the scheduler,
 so a borrowed idle wait must be cancelled or dropped before shutdown; upstream

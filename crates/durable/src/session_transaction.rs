@@ -467,28 +467,27 @@ impl<'a> SessionTransaction<'a> {
                 "child cannot own itself".into(),
             ));
         }
-        if let Some(key) = key {
-            if let Some(existing) = self
+        if let Some(key) = key
+            && let Some(existing) = self
                 .children
                 .iter()
                 .find(|item| item.parent.task.id() == parent_id && item.key.as_deref() == Some(key))
+        {
+            let old = &existing.child;
+            if old.owner() == child.owner()
+                && old.kind() == child.kind()
+                && old.input() == child.input()
+                && old.replay_safe() == child.replay_safe()
+                && old.definition_version() == child.definition_version()
+                && old.checkpoint() == child.checkpoint()
+                && old.restart_limit() == child.restart_limit()
+                && old.is_task_tool() == child.is_task_tool()
             {
-                let old = &existing.child;
-                if old.owner() == child.owner()
-                    && old.kind() == child.kind()
-                    && old.input() == child.input()
-                    && old.replay_safe() == child.replay_safe()
-                    && old.definition_version() == child.definition_version()
-                    && old.checkpoint() == child.checkpoint()
-                    && old.restart_limit() == child.restart_limit()
-                    && old.is_task_tool() == child.is_task_tool()
-                {
-                    return Ok(existing.result_id);
-                }
-                return Err(Error::InvalidSessionAdmission(
-                    "key already belongs to a different child identity".into(),
-                ));
+                return Ok(existing.result_id);
             }
+            return Err(Error::InvalidSessionAdmission(
+                "key already belongs to a different child identity".into(),
+            ));
         }
         if self.tasks.iter().any(|item| item.id() == child.id())
             || self

@@ -71,6 +71,7 @@ async fn waits_for_foreground_and_cancellation_does_not_abort() {
     let dir = tempfile::tempdir().unwrap();
     let mut scheduler = Scheduler::open(dir.path().join("db"), options()).unwrap();
     let id = scheduler.create_conversation(config()).unwrap();
+    let other = scheduler.create_conversation(config()).unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let release_rx = Mutex::new(release_rx);
@@ -87,6 +88,13 @@ async fn waits_for_foreground_and_cancellation_does_not_abort() {
     let cancel = CancellationToken::new();
     let mut wait = Box::pin(scheduler.wait_for_idle(id, &cancel));
     assert!(matches!(poll!(&mut wait), Poll::Pending));
+    scheduler.wait_for_idle(other, &CancellationToken::new()).await.unwrap();
+    let all_cancel = CancellationToken::new();
+    let mut all = Box::pin(scheduler.wait_for_all_idle(&all_cancel));
+    assert!(matches!(poll!(&mut all), Poll::Pending));
+    all_cancel.cancel();
+    assert!(matches!((&mut all).await, Err(Error::WaitCancelled)));
+    drop(all);
     cancel.cancel();
     assert!(matches!((&mut wait).await, Err(Error::WaitCancelled)));
     drop(wait);
@@ -99,6 +107,7 @@ async fn waits_for_foreground_and_cancellation_does_not_abort() {
     .await
     .unwrap()
     .unwrap();
+    scheduler.wait_for_all_idle(&CancellationToken::new()).await.unwrap();
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }
@@ -124,6 +133,7 @@ async fn background_is_ignored_and_unknown_conversation_errors() {
         .wait_for_idle(id, &CancellationToken::new())
         .await
         .unwrap();
+    scheduler.wait_for_all_idle(&CancellationToken::new()).await.unwrap();
     assert!(matches!(
         scheduler
             .wait_for_idle(Uuid::new_v4(), &CancellationToken::new())

@@ -15503,7 +15503,32 @@ impl Scheduler {
             if cancel.is_cancelled() {
                 return Err(Error::WaitCancelled);
             }
-            let (busy, tasks_pending) = self.foreground_busy(id)?;
+            let (busy, tasks_pending) = self.foreground_busy(Some(id))?;
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            if tasks_pending {
+                self.check_idle_task_driver()?;
+            }
+            if !busy {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::WaitCancelled),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
+
+    /// Wait for the foreground work of every ownerless conversation to settle.
+    /// Background task subtrees are excluded. The graph is read as one snapshot.
+    pub async fn wait_for_all_idle(&self, cancel: &CancellationToken) -> Result<(), Error> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::WaitCancelled);
+            }
+            let (busy, tasks_pending) = self.foreground_busy(None)?;
             if cancel.is_cancelled() {
                 return Err(Error::WaitCancelled);
             }
@@ -15535,7 +15560,7 @@ impl Scheduler {
         driver.check_running_and_wake()
     }
 
-    fn foreground_busy(&self, root: Uuid) -> Result<(bool, bool), Error> {
+    fn foreground_busy(&self, root: Option<Uuid>) -> Result<(bool, bool), Error> {
         use crate::ownership_edge::Mode;
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet, VecDeque};
@@ -15578,7 +15603,21 @@ impl Scheduler {
             }
         }
         let by_id: HashMap<_, _> = records.iter().map(|r| (r.task.id(), r)).collect();
-        let mut conversations = VecDeque::from([root]);
+        let mut conversations = VecDeque::new();
+        if let Some(root) = root {
+            conversations.push_back(root);
+        } else {
+            let owned: HashSet<_> = edges.iter().map(|edge| edge.edge.child).collect();
+            for (key, entry) in &snapshots {
+                let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+                if *key != Harness::key(conversation.id) {
+                    return Err(Error::Invalid("conversation identity mismatch".into()));
+                }
+                if !owned.contains(&conversation.id) {
+                    conversations.push_back(conversation.id);
+                }
+            }
+        }
         let mut tasks = VecDeque::new();
         let mut seen_conversations = HashSet::new();
         let mut seen_tasks = HashSet::new();
