@@ -232,7 +232,7 @@ pub struct Submission {
     pub status: Status,
 }
 
-/// A durable task destination for the settlement of an input or continuation.
+/// A durable task destination for a submission settlement.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionNotify {
@@ -243,17 +243,19 @@ pub struct SubmissionNotify {
 /// Signal delivered in the transaction that settles a notified submission.
 /// Its value uses pi-rs UUIDs and answer text; see the parity documentation.
 pub fn submission_settled_signal() -> crate::task_store::SignalToken {
+    let uuid_pattern =
+        "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
     crate::task_store::SignalToken::with_schema("pi.submission-settled", 1, serde_json::json!({
         "type": "object",
         "required": ["id", "conversationId", "type", "status"],
         "properties": {
-            "id": {"type": "string"}, "conversationId": {"type": "string"},
+            "id": {"type": "string", "pattern": uuid_pattern}, "conversationId": {"type": "string", "pattern": uuid_pattern},
             "type": {"enum": ["input", "continue", "write"]},
             "status": {"enum": ["done", "unanswered"]},
-            "answer": {"type": "string"}, "answerId": {"type": "string"}, "entry": {"type": "string"},
+            "answer": {"type": "string"}, "answerId": {"type": "string", "pattern": uuid_pattern}, "entry": {"type": "string", "pattern": uuid_pattern},
             "reason": {"type": "string"}, "requestId": {"type": "string"},
             "notify": {"type": "object", "required": ["taskId", "key"],
-                "properties": {"taskId": {"type": "string"}, "key": {"type": "string", "minLength": 1}}}
+                "properties": {"taskId": {"type": "string", "pattern": uuid_pattern}, "key": {"type": "string", "minLength": 1}}}
         },
         "allOf": [
             {"if": {"properties": {"status": {"const": "done"}, "type": {"enum": ["input", "continue"]}}}, "then": {"required": ["answer"]}},
@@ -18152,6 +18154,153 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn submission_notify_rejects_incompatible_existing_receipt() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, SignalResult, SignalToken, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        ts.save(&[Save::Create(&task)]).unwrap();
+        assert_eq!(
+            ts.deliver_signal_at(
+                task.id(),
+                &SignalToken::new("pi.submission-settled", 1).unwrap(),
+                "bad",
+                serde_json::json!({"id":"invalid", "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"prior"}),
+                0
+            )
+            .unwrap(),
+            SignalResult::Delivered
+        );
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "bad".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            h.withdraw_submission(conversation, id),
+            Err(Error::Document(crate::document::Error::Signal(
+                crate::task_store::Error::InvalidSignalPayload
+            )))
+        ));
+        assert_eq!(
+            h.conversation(conversation)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+    }
+
+    #[test]
+    fn submission_notify_rejects_ambiguous_existing_receipts() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, Signal, TaskStore};
+        for malformed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h =
+                Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+            let conversation = h.create_conversation(config()).unwrap();
+            let task = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::json!(null),
+                },
+                3,
+            )
+            .unwrap();
+            TaskStore::new(h.owner.store())
+                .save(&[Save::Create(&task)])
+                .unwrap();
+            let value = serde_json::json!({"id":Uuid::new_v4(), "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"prior"});
+            let mut mutations = Vec::new();
+            for _ in 0..if malformed { 1 } else { 2 } {
+                let signal = Signal::new_typed(
+                    Uuid::new_v4(),
+                    task.id(),
+                    &submission_settled_signal(),
+                    "same",
+                    value.clone(),
+                )
+                .unwrap();
+                let mut key = b"durable/signal/".to_vec();
+                key.extend_from_slice(task.id().as_bytes());
+                let encoded_id = if malformed { Uuid::nil() } else { signal.id };
+                key.extend_from_slice(encoded_id.as_bytes());
+                mutations.push(Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&signal).unwrap(),
+                });
+            }
+            h.owner.store().commit(&[], &mutations).unwrap();
+            h.submit(conversation, None, "active".into()).unwrap();
+            let id = h
+                .submit_with_notification(
+                    conversation,
+                    None,
+                    "queued".into(),
+                    AdmissionOptions::default(),
+                    SubmissionNotify {
+                        task_id: task.id(),
+                        key: "same".into(),
+                    },
+                )
+                .unwrap();
+            let result = h.withdraw_submission(conversation, id);
+            if malformed {
+                assert!(matches!(
+                    result,
+                    Err(Error::Document(crate::document::Error::Signal(
+                        crate::task_store::Error::InvalidKey
+                    )))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Document(crate::document::Error::Signal(
+                        crate::task_store::Error::SignalKeyMismatch
+                    )))
+                ));
+            }
+            assert_eq!(
+                h.conversation(conversation)
+                    .unwrap()
+                    .submissions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .status,
+                Status::Queued
+            );
+        }
+    }
+
+    #[test]
     fn submission_notify_retries_target_and_receipt_conflicts() {
         use crate::task::{Checkpoint, Task, TaskOwner};
         use crate::task_store::{Save, SignalResult, TaskStore};
@@ -18903,6 +19052,78 @@ mod scheduler_tests {
             Status::Done { .. }
         ));
         scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submission_notify_failure_policy_settles_active_and_queued_together() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let opts = || Options {
+            model: Arc::new(FailingModel),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let mut h = Harness::open_paused(&path, opts()).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&task)])
+            .unwrap();
+        h.set_after_failed_run(conversation, AfterFailedRun::Withdraw)
+            .unwrap();
+        let active = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "fail".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "active".into(),
+                },
+            )
+            .unwrap();
+        let queued = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "queued".into(),
+                },
+            )
+            .unwrap();
+        h.resume(&CancellationToken::new()).await.unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, opts()).unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        let first = ts
+            .read_typed_signal(task.id(), &submission_settled_signal(), "active")
+            .unwrap()
+            .unwrap();
+        let second = ts
+            .read_typed_signal(task.id(), &submission_settled_signal(), "queued")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["id"], serde_json::json!(active));
+        assert_eq!(second["id"], serde_json::json!(queued));
+        assert_eq!(first["status"], "unanswered");
+        assert_eq!(second["reason"], "run_failed");
     }
 
     #[cfg(unix)]

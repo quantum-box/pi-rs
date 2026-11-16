@@ -845,8 +845,30 @@ impl<'a> TaskStore<'a> {
                 _ => (),
             }
         }
+        if token.name() == "pi.submission-settled" {
+            for (receipt_key, receipt) in &receipts {
+                if receipt.task_id != task_id || *receipt_key != signal_key(task_id, receipt.id) {
+                    return Err(Error::InvalidKey);
+                }
+            }
+        }
+        if token.name() == "pi.submission-settled"
+            && receipts
+                .values()
+                .filter(|old| old.typed_key() == signal.typed_key())
+                .count()
+                > 1
+        {
+            return Err(Error::SignalKeyMismatch);
+        }
         for old in receipts.values() {
             if old.typed_key() == signal.typed_key() {
+                // A legacy unconstrained token can have written this reserved
+                // built-in key. Do not let an incompatible value silently
+                // impersonate a settled submission during notification.
+                if token.name() == "pi.submission-settled" && !old.expired {
+                    token.read_value(old.payload.clone(), old.typed.as_ref().unwrap().version)?;
+                }
                 return Ok((
                     if old.expired {
                         SignalResult::Closed
