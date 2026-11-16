@@ -768,7 +768,7 @@ impl Scheduler {
                 if matches!(record.task.state(), TaskState::CompletingFailed(_))
                     && !record.task.is_task_tool()
                     && !record.task.abort_requested()
-                    && has_live_owned(self.owner().store(), record.task.id(), &records)?
+                    && has_owned_work(self.owner().store(), record.task.id(), &records, true)?
                 {
                     pending_roots.push(record.task.id());
                 }
@@ -969,6 +969,10 @@ impl Scheduler {
                 continue;
             }
             let live = has_live_owned(owner.store(), snapshot.task.id(), &held_tasks)?;
+            let needs_cascade = matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
+                && !snapshot.task.is_task_tool()
+                && !snapshot.task.abort_requested()
+                && (live || has_owned_work(owner.store(), snapshot.task.id(), &held_tasks, true)?);
             if snapshot.task.is_task_tool() && has_unmarked_nested(snapshot.task.id(), &held_tasks)
             {
                 if let Some(harness) = self.validator.as_mut() {
@@ -982,11 +986,7 @@ impl Scheduler {
                 }
                 return Ok(true);
             }
-            if live
-                && !snapshot.task.is_task_tool()
-                && matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
-                && !snapshot.task.abort_requested()
-            {
+            if needs_cascade {
                 // A held failure is cancellation intent. Persist the mark and
                 // cascade before letting any descendant execute again.
                 if let Some(harness) = self.validator.as_mut() {
@@ -1883,7 +1883,12 @@ impl Scheduler {
                 return Err(Error::PendingAbort(root));
             }
             let records = store.list()?;
-            let live = has_live_owned(store.store(), parent.task.id(), &records)?;
+            let live = has_owned_work(
+                store.store(),
+                parent.task.id(),
+                &records,
+                !parent.task.is_task_tool(),
+            )?;
             let mut next = parent.clone();
             if live {
                 next.task
@@ -2147,6 +2152,17 @@ fn has_live_owned(
     root: Uuid,
     tasks: &[task_store::StoredTask],
 ) -> Result<bool, Error> {
+    has_owned_work(store, root, tasks, false)
+}
+
+// Before a failure is marked, queued abortable inputs require a cascade even
+// when their conversation has no runnable work. Kept inputs never hold drain.
+fn has_owned_work(
+    store: &durable_store::Store,
+    root: Uuid,
+    tasks: &[task_store::StoredTask],
+    include_abortable: bool,
+) -> Result<bool, Error> {
     let edges = crate::ownership_edge::EdgeStore::new(store);
     let mut pending = vec![root];
     let mut seen = HashSet::new();
@@ -2188,7 +2204,10 @@ fn has_live_owned(
             if conversation.id != edge.edge.child {
                 return Err(Error::Ownership);
             }
-            if conversation.abort_requested || conversation.is_working() {
+            if conversation.abort_requested
+                || conversation.is_idle_wait_busy()
+                || (include_abortable && conversation.has_abortable_queued_inputs())
+            {
                 return Ok(true);
             }
             for child in tasks.iter().filter(|item| {
