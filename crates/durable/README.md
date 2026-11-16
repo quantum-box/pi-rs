@@ -144,6 +144,30 @@ Callbacks are fenced by the conversation phase and attempt identity, and progres
 is sealed atomically with the corresponding transition. Legacy running attempts
 without an identity do not report durable progress until replay creates one.
 
+For a complete, already available UTF-8 tool result, `output::bound_output` is
+an opt-in helper matching upstream's `boundOutput` slice rules. Set independent
+byte and line limits and choose `Retain::Head` or `Retain::Tail`; the result
+borrows the retained slice and reports retained bytes plus dropped bytes and
+lines. It prefers complete lines, preserves trailing newlines, and cuts a
+single oversized line at a UTF-8 character boundary. For example:
+
+```rust
+use pi_rs_core::Outcome;
+use pi_rs_durable::output::{bound_output, OutputLimits, Retain};
+
+let result = bound_output("old\nnew\n", OutputLimits {
+    max_bytes: 1024, max_lines: 1, retain: Retain::Tail,
+});
+assert_eq!((result.text, result.dropped_bytes, result.dropped_lines), ("new\n", 4, 1));
+let reply = Outcome::Succeeded(result.text.to_owned());
+```
+
+Tools must call the helper explicitly and choose how to expose dropped counts;
+the runtime does not append a truncation diagnostic automatically. It processes
+materialized valid UTF-8 text, does not sanitize terminal escapes, and does not
+provide upstream's bounded incremental `OutputBuffer` or byte-chunk decoding.
+In particular it does not change the streaming adapter's strict cap below.
+
 For model-issued calls, `KeyedToolAdapter::new(StreamedToolAdapter(tool))`
 provides a separate, opt-in `StreamedTool` contract. Register the adapter as
 usual with an explicit replay policy. `StreamOutput::append` appends UTF-8 text

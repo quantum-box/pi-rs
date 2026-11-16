@@ -91,6 +91,90 @@ fn config() -> Config {
 }
 
 #[tokio::test]
+async fn bounded_tool_output_reaches_transcript_and_survives_reopen() {
+    use pi_rs_durable::output::{OutputLimits, Retain, bound_output};
+
+    struct BoundedTool;
+    #[async_trait]
+    impl Tool for BoundedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            let output = bound_output(
+                "old\nnew\n",
+                OutputLimits {
+                    max_lines: 1,
+                    max_bytes: 100,
+                    retain: Retain::Tail,
+                },
+            );
+            assert_eq!((output.dropped_bytes, output.dropped_lines), (4, 1));
+            Outcome::Succeeded(output.text.to_owned())
+        }
+    }
+    struct CheckingModel(FakeModel, Arc<AtomicUsize>);
+    #[async_trait]
+    impl Model for CheckingModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. }))
+            {
+                assert!(request.messages.iter().any(
+                    |message| matches!(message, Message::Tool { content, .. } if content == "new\n")
+                ));
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+            self.0.stream(request).await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let seen = Arc::new(AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(CheckingModel(
+            FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            },
+            seen.clone(),
+        )),
+        tools: vec![RegisteredTool {
+            tool: Arc::new(BoundedTool),
+            replay: ReplayPolicy::Unsafe,
+        }],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let cancel = CancellationToken::new();
+    let mut harness = Harness::open(&path, options(), &cancel).await.unwrap();
+    let id = harness.create_conversation(config()).unwrap();
+    harness
+        .submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let has_result = |h: &Harness| {
+        h.conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "new\n"))
+    };
+    assert!(has_result(&harness));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    drop(harness);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    assert!(has_result(&reopened));
+}
+
+#[tokio::test]
 async fn view_pages_stay_on_captured_transcript_and_show_submission_state() {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(FakeModel {
