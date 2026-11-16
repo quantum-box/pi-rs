@@ -4062,3 +4062,250 @@ fn cross_session_actions_reject_foreign_notification_destination() {
         driver.shutdown().unwrap();
     }
 }
+
+#[tokio::test]
+async fn cross_session_actions_scheduler_drives_wake_and_notification() {
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut scheduler = pi_rs_durable::runtime::Scheduler::open(&path, options()).unwrap();
+        let config = || Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        };
+        let owner = scheduler.create_conversation(config()).unwrap();
+        let target = scheduler.create_conversation(config()).unwrap();
+        let store = Store::open(&path).unwrap();
+        let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+        let session = membership.create().unwrap();
+        membership.enroll(session, owner).unwrap();
+        membership.enroll(session, target).unwrap();
+        let mut registry = Registry::default();
+        registry.register("action", true, cross_action(target, write));
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let child = task(owner, "action");
+        driver.submit(&child).unwrap();
+        let wake = format!("runtime/task-input-wake/{target}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let state = scheduler.conversation(target).unwrap();
+                let settled = if write {
+                    state.application_writes.len() == 1 && state.application_writes[0].placed
+                } else {
+                    state.submissions.len() == 1
+                        && matches!(
+                            state.submissions[0].status,
+                            Status::Done { .. } | Status::Unanswered { .. }
+                        )
+                };
+                let task_done = TaskStore::new(&store)
+                    .load(child.id())
+                    .unwrap()
+                    .is_some_and(|item| matches!(item.task.state(), TaskState::Succeeded(_)));
+                if settled && task_done && store.get(wake.as_bytes()).unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("scheduler did not drive target wake and task notification");
+        let state = scheduler.conversation(target).unwrap();
+        let receipt = TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), "action-settled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt["conversationId"], target.to_string());
+        assert_eq!(receipt["type"], if write { "write" } else { "continue" });
+        if write {
+            assert_eq!(receipt["entry"], state.application_writes[0].id.to_string());
+            assert!(state.submissions.is_empty());
+        } else {
+            assert_eq!(receipt["id"], state.submissions[0].id.to_string());
+            assert!(state.application_writes.is_empty());
+        }
+        assert!(
+            scheduler
+                .conversation(owner)
+                .unwrap()
+                .submissions
+                .is_empty()
+        );
+        tokio::task::spawn_blocking(move || driver.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_session_committed_action_wake_kill_worker() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("CROSS_ACTION_WAKE_DB") else {
+        return;
+    };
+    let owner: Uuid = std::env::var("CROSS_ACTION_WAKE_OWNER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let target: Uuid = std::env::var("CROSS_ACTION_WAKE_TARGET")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let write = std::env::var("CROSS_ACTION_WAKE_WRITE").unwrap() == "1";
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("action", true, cross_action(target, write));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = Task::new(
+        Uuid::from_u128(10019),
+        TaskOwner::Conversation(owner),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("action".into(), true);
+    driver.submit(&child).unwrap();
+    wait_task(std::path::Path::new(&path), child.id(), |state| {
+        matches!(state, TaskState::Waiting(_))
+    });
+    let store = Store::open(&path).unwrap();
+    assert!(
+        store
+            .get(format!("runtime/task-input-wake/{target}").as_bytes())
+            .unwrap()
+            .is_some()
+    );
+    println!("CROSS_ACTION_WAKE_COMMITTED");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reopen() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, owner, target, _) = cross_setup(&path);
+        let last_reset = if write {
+            h.submit(target, None, "initial".into()).unwrap();
+            h.reset(target, None).unwrap();
+            Some(h.reset(target, None).unwrap())
+        } else {
+            None
+        };
+        drop(h);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cross_session_committed_action_wake_kill_worker",
+                "--nocapture",
+            ])
+            .env("CROSS_ACTION_WAKE_DB", &path)
+            .env("CROSS_ACTION_WAKE_OWNER", owner.to_string())
+            .env("CROSS_ACTION_WAKE_TARGET", target.to_string())
+            .env("CROSS_ACTION_WAKE_WRITE", if write { "1" } else { "0" })
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("CROSS_ACTION_WAKE_COMMITTED") {
+                    let _ = sent.send(());
+                    break;
+                }
+            }
+        });
+        let reached = received.recv_timeout(Duration::from_secs(20));
+        let _ = child.kill();
+        let _ = child.wait();
+        reached.expect("child did not commit action and wake");
+        let store = Store::open(&path).unwrap();
+        let wake = format!("runtime/task-input-wake/{target}");
+        assert!(store.get(wake.as_bytes()).unwrap().is_some());
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(
+                    Uuid::from_u128(10019),
+                    &submission_settled_signal(),
+                    "action-settled"
+                )
+                .unwrap()
+                .is_none()
+        );
+        let scheduler = pi_rs_durable::runtime::Scheduler::open(&path, options()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("action", true, cross_action(target, write));
+        let driver = scheduler.start_tasks(registry).unwrap();
+        let task_id = Uuid::from_u128(10019);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let state = scheduler.conversation(target).unwrap();
+                let settled = if write {
+                    state.application_writes.len() == 1 && state.application_writes[0].placed
+                } else {
+                    state.submissions.len() == 1
+                        && matches!(
+                            state.submissions[0].status,
+                            Status::Done { .. } | Status::Unanswered { .. }
+                        )
+                };
+                let task_done = TaskStore::new(&store)
+                    .load(task_id)
+                    .unwrap()
+                    .is_some_and(|item| matches!(item.task.state(), TaskState::Succeeded(_)));
+                if settled && task_done && store.get(wake.as_bytes()).unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("reopened scheduler did not drive committed target wake");
+        let state = scheduler.conversation(target).unwrap();
+        let receipt = TaskStore::new(&store)
+            .read_typed_signal(task_id, &submission_settled_signal(), "action-settled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt["conversationId"], target.to_string());
+        assert_eq!(receipt["type"], if write { "write" } else { "continue" });
+        if write {
+            assert_eq!(state.application_writes.len(), 1);
+            assert_eq!(receipt["entry"], state.application_writes[0].id.to_string());
+            assert_eq!(state.application_writes[0].after_reset, last_reset);
+            assert_eq!(state.resets.last().map(|reset| reset.id), last_reset);
+            assert_eq!(state.submissions.len(), 1);
+        } else {
+            assert_eq!(state.submissions.len(), 1);
+            assert_eq!(receipt["id"], state.submissions[0].id.to_string());
+            assert!(state.application_writes.is_empty());
+        }
+        assert!(
+            scheduler
+                .conversation(owner)
+                .unwrap()
+                .submissions
+                .is_empty()
+        );
+        tokio::task::spawn_blocking(move || driver.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
+    }
+}
