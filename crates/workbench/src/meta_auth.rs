@@ -368,7 +368,8 @@ async fn access_at(
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
-        let _barrier = super::process::refresh_barrier()?;
+        let barrier = super::process::refresh_barrier()?;
+        let guard = super::process::guard_refresh_auth(barrier, guard);
         let access = runtime.block_on(service.mint(&value.refresh))?;
         let expires = now().saturating_add(KEY_LIFETIME_MS);
         super::config::update_object_locked(&path, Some(&guard), |data| {

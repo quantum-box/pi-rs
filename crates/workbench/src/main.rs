@@ -677,8 +677,9 @@ impl Cli {
     }
 
     fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
+        let has_context = rpc_entries::Entries::new(session).has_session_context()?;
         session.record_request_identity(self.provider.id(), &self.model)?;
-        if !rpc_entries::Entries::new(session).has_session_context() {
+        if !has_context {
             return self.record_model_selection(session);
         }
         if !self.model_explicit
@@ -832,10 +833,10 @@ impl Cli {
         }
     }
 
-    fn restore_session_model(&mut self, session: &Session) {
+    fn restore_session_model(&mut self, session: &Session) -> Result<()> {
         // Pi treats a journal with no projected messages as a new session,
         // even if it already contains model or thinking bookkeeping.
-        if !rpc_entries::Entries::new(session).has_session_context() {
+        if !rpc_entries::Entries::new(session).has_session_context()? {
             if !self.model_explicit
                 && let Some(initial) = &self.initial_selection
             {
@@ -854,7 +855,7 @@ impl Cli {
                     self.default_branch_thinking()
                 });
             }
-            return;
+            return Ok(());
         }
         // Extension-registered Pi virtual models are absent from this catalog.
         // Pi treats absent catalog entries as nonvirtual.
@@ -893,6 +894,7 @@ impl Cli {
                     .to_owned()
             }));
         }
+        Ok(())
     }
 
     fn remember_initial_selection(&mut self) {
@@ -1318,7 +1320,42 @@ async fn run_cli() -> i32 {
         }
     });
     tokio::task::yield_now().await;
-    let argv: Vec<_> = std::env::args_os().collect();
+    let mut argv: Vec<_> = std::env::args_os().collect();
+    let export_plan = cli_compat::export_plan(&argv);
+    if let Some(plan) = &export_plan {
+        argv = plan.validation_args.clone();
+    }
+    let mut literal_export = None;
+    if let Some(metadata) = cli_compat::metadata(&argv) {
+        for (error, message) in &metadata.diagnostics {
+            eprintln!("{}: {message}", if *error { "Error" } else { "Warning" });
+        }
+        if metadata.diagnostics.iter().any(|(error, _)| *error) {
+            return 1;
+        }
+        if (metadata.export || export_plan.is_some()) && !metadata.version {
+            literal_export = metadata.literal_export;
+            argv = metadata.args_without_help;
+        } else {
+            let flag = if metadata.version {
+                "--version"
+            } else if metadata.short_help {
+                "-h"
+            } else {
+                "--help"
+            };
+            if let Err(error) = cli_compat::parse([std::ffi::OsString::from("pi"), flag.into()]) {
+                let _ = error.print();
+            }
+            if !metadata.version
+                && let Some(help) =
+                    cli_compat::extension_help_from_args(&metadata.args_without_help)
+            {
+                print!("{help}");
+            }
+            return 0;
+        }
+    }
     let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
         Ok(parsed) => parsed,
         Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
@@ -1335,10 +1372,21 @@ async fn run_cli() -> i32 {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        if let Some(plan) = export_plan {
+            if plan.input.as_os_str().is_empty() {
+                return Err(Error::Config("export input is required".into()));
+            }
+            let mut paths = vec![plan.input];
+            paths.extend(plan.output);
+            return export_from_file(&paths, &plan.inputs);
+        }
+        if let Some(paths) = literal_export {
+            return export_from_file(&paths, &paths[..1]);
+        }
         args.mcp_login_cancel = mcp_login_cancel;
         args.extension_flags = extension_flags;
         if let Some(paths) = &args.export_session {
-            return export_from_file(paths);
+            return export_from_file(paths, &paths[..1]);
         }
         if let Some(flag) = args.extension_flags.keys().next()
             && !matches!(
@@ -1508,7 +1556,7 @@ async fn run_cli() -> i32 {
     cli_exit_code
 }
 
-fn export_from_file(paths: &[PathBuf]) -> Result<()> {
+fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<()> {
     let normalize = |path: &Path| {
         path.to_str()
             .map_or_else(|| Ok(path.to_path_buf()), pi_rs_workbench::normalize_path)
@@ -1527,6 +1575,32 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
             input.display()
         )));
     }
+    // `persist` replaces an existing destination. Protect every supplied input,
+    // including those superseded by a later --export, before writing anything.
+    let resolved_output = match output_path.canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(output) = resolved_output {
+        for path in protected_inputs {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let path = std::path::absolute(normalize(path)?)?;
+            match path.canonicalize() {
+                Ok(input) => {
+                    if same_export_file(&input, &output)? {
+                        return Err(Error::Config(
+                            "Cannot export HTML over an input session file".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     let session = session_import::read(&input)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
@@ -1540,6 +1614,21 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
         output_path.display()
     );
     Ok(())
+}
+
+fn same_export_file(input: &Path, output: &Path) -> std::io::Result<bool> {
+    if input == output {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let input = input.metadata()?;
+        let output = output.metadata()?;
+        Ok(input.dev() == output.dev() && input.ino() == output.ino())
+    }
+    #[cfg(not(unix))]
+    Ok(false)
 }
 
 async fn read_piped_stdin() -> Result<Vec<u8>> {
@@ -2130,7 +2219,7 @@ async fn execute(
         }
         _ => {}
     }
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     if !args.model.is_empty() {
         thinking::adjust(&mut args);
         args.record_automatic_model_selection(&mut session)?;

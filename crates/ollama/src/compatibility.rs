@@ -203,6 +203,11 @@ enum ThinkingFormat {
 }
 
 impl ChatCompatibility {
+    /// Whether the configured model accepts the developer instruction role.
+    pub fn supports_developer_role(&self) -> Option<bool> {
+        self.supports_developer_role
+    }
+
     /// Model-specific values override the provider defaults field by field.
     pub fn overlay(self, model: Self) -> Self {
         let chat_template_args = match (self.chat_template_args, model.chat_template_args) {

@@ -331,7 +331,8 @@ where
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
         let service = service()?;
-        let _barrier = super::process::refresh_barrier()?;
+        let barrier = super::process::refresh_barrier()?;
+        let guard = super::process::guard_refresh_auth(barrier, guard);
         let value = runtime.block_on(service.refresh(&value))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let current = data
@@ -372,6 +373,22 @@ pub(super) async fn access(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn share_barrier_refresh_fixture() {
+        let Some(path) = std::env::var_os("PI_RS_TEST_SHARE_BARRIER_AUTH") else {
+            return;
+        };
+        let url = std::env::var("PI_RS_TEST_SHARE_BARRIER_URL").unwrap();
+        let service = Service {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            url: reqwest::Url::parse(&url).unwrap(),
+        };
+        access_at(path.into(), move || Ok(service), None, false)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
 
     async fn token_request(socket: &mut tokio::net::TcpStream) -> Value {
         let mut request = Vec::new();

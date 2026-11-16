@@ -1872,7 +1872,9 @@ mod tests {
             })
             .unwrap()
             .id;
-        let mut records = imported.fork_records(source).unwrap();
+        // Model a historical record-only snapshot ending at the source. The
+        // current fork now completes a verified imported conversion.
+        let mut records = imported.records()[..source as usize].to_vec();
         let parent = records.last().unwrap().id;
         // Simulate an old native append without the new associated source marker.
         records.push(pi_rs::Record {
