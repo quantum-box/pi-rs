@@ -17782,6 +17782,112 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn submission_notify_mixed_graph_and_signal_candidates() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, SignalResult, TaskStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let create = || {
+            Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::json!(null),
+                },
+                3,
+            )
+            .unwrap()
+        };
+        let live = create();
+        let closing = create();
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&live), Save::Create(&closing)])
+            .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        let mut ids = Vec::new();
+        for (task_id, key) in [
+            (live.id(), "same"),
+            (live.id(), "second"),
+            (closing.id(), "closed"),
+        ] {
+            ids.push(
+                h.submit_with_notification(
+                    conversation,
+                    None,
+                    "queued".into(),
+                    AdmissionOptions::default(),
+                    SubmissionNotify {
+                        task_id,
+                        key: key.into(),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let (mut candidate, version) = h.load(conversation).unwrap();
+        for submission in &mut candidate.submissions {
+            if ids.contains(&submission.id) {
+                submission.status = Status::Unanswered {
+                    reason: "aborted".into(),
+                };
+            }
+        }
+        let mut batch = h
+            .prepare_save(&candidate, Expected::Version(version))
+            .unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        let mut abort = ts.load(closing.id()).unwrap().unwrap();
+        abort.task.request_abort().unwrap();
+        let graph = ts.prepare_save(&[Save::Update(&abort)]).unwrap();
+        batch.checks.extend(graph.checks);
+        batch.mutations.extend(graph.mutations);
+        let first = serde_json::json!({"id":Uuid::new_v4(), "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"earlier"});
+        let (result, staged) = ts
+            .prepare_signal_at(
+                live.id(),
+                &submission_settled_signal(),
+                "same",
+                first.clone(),
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(result, SignalResult::Delivered);
+        batch.checks.extend(staged.checks);
+        batch.mutations.extend(staged.mutations);
+        h.commit_conversation_save(batch).unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        assert!(
+            ts.load(closing.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        assert!(
+            ts.read_typed_signal(closing.id(), &submission_settled_signal(), "closed")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            ts.read_typed_signal(live.id(), &submission_settled_signal(), "same")
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            ts.read_typed_signal(live.id(), &submission_settled_signal(), "second")
+                .unwrap()
+                .unwrap()["reason"],
+            "aborted"
+        );
+    }
+
+    #[test]
     fn submission_notify_retries_target_and_receipt_conflicts() {
         use crate::task::{Checkpoint, Task, TaskOwner};
         use crate::task_store::{Save, SignalResult, TaskStore};
