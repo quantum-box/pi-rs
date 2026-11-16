@@ -2735,18 +2735,6 @@ impl Agent<'_> {
                     &request,
                     &declarations,
                 )?;
-                // Until the scheduler and pending-operation recovery consume
-                // the recorded decision, strict execution must fail closed.
-                if prepared.effective_tools().iter().any(|tool| {
-                    matches!(
-                        tool.sampling,
-                        crate::EffectiveToolSampling::StrictJsonSchema { .. }
-                    )
-                }) {
-                    return Err(Error::Config(
-                        "strict tool execution is not yet available".into(),
-                    ));
-                }
             } else {
                 crate::validate_legacy_tool_declarations(&request, &declarations)?;
             }

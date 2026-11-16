@@ -3809,27 +3809,27 @@ actual request limits, and updated configuration in a real terminal picker.
 ### Compatible model sampling
 
 The core exposes strict tool-schema conversion and a tool declaration type
-matching the current Pi schema subset. Tool-level constrained sampling and
-its provider request, fallback, and grammar paths are not yet wired through
-the native agent. The OpenAI Responses SDK can send explicitly supplied tool
+matching the current Pi schema subset. The native agent records the actual
+strict-or-fallback decision before dispatch, normalizes a copy of strict tool
+arguments, and records authorized arguments before executing non-pollable tools.
+Strict pollable tools are temporarily rejected until both pending recovery paths
+are fully verified; grammar tool execution remains unsupported. The OpenAI
+Responses SDK can send explicitly supplied tool
 declarations with JSON Schema constraints when its caller supplies the model's
 strict capability, including through the declaration-aware detailed model
 stream; callers must normalize returned arguments before validation. Legacy
 model implementations reject required constraints and can fall back for
 preferred constraints.
 Native tools can declare a constraint when registered; the registry retains
-that declaration alongside the registered tool definition. Until the native
-agent records effective decisions for recovery, it rejects required JSON Schema
-constraints before model dispatch and permits preferred constraints to fall
-back. As in Pi, the native `read`, `write`, `edit`, and `bash` tools request
-preferred JSON Schema constraints, including with injected backends; these
-declarations currently fall back until native dispatch is connected.
+that declaration alongside the registered tool definition. As in Pi, the
+native `read`, `write`, `edit`, and `bash` tools request preferred JSON Schema
+constraints, including with injected backends. Required constraints fail when
+the provider cannot apply them, while preferred constraints can fall back.
 The Responses SDK can also prepare a request once and inspect the effective
 strict-or-fallback decision bound to its wire tools before dispatch.
 Workbench and AIP prepared-dispatch wrappers preserve that decision, routing,
-and budget the transformed tool schemas. A versioned snapshot can bind the
-decision to a request and context, but the native agent does not yet use this
-path or persist the decision for recovery.
+and budget the transformed tool schemas. Versioned snapshots bind the decision
+to its request and authorized tool arguments to their operation for recovery.
 The Anthropic SDK also supports explicitly prepared JSON Schema tool declarations
 when the caller enables `with_strict_tool_support(true)` for the selected model.
 Unknown capability defaults to unsupported; required constraints fail, while
@@ -3845,7 +3845,7 @@ non-strict; this prepared path does not implement that session memoization.
 Provider errors are returned until a safe decision-bound fallback is available.
 Root combinators fall back for preferred constraints or fail when required,
 since dropping them from a strict schema would change its meaning.
-There is no claim of native agent end-to-end constrained sampling or recovery.
+Native Anthropic capability selection remains unwired.
 
 The Chat Completions adapter also resolves explicitly supplied JSON Schema
 constraints for declaration-aware and prepared dispatch. It enables strict mode
@@ -3857,8 +3857,7 @@ Workbench clients, bind decisions and budget estimates to the transformed wire
 schemas. Session dispatch applies the configured prompt-cache policy and
 external session key; summary dispatch suppresses automatic cache controls,
 prompt-cache keys, and retention. Callers must normalize strict arguments
-before validation. The native agent is not wired to this
-prepared path. Grammar declarations in Chat Completions currently fall back to
+before validation. Grammar declarations in Chat Completions currently fall back to
 ordinary function tools; custom grammar tools and their streaming/replay remain
 unsupported. No provider-side strict-limit retry is implemented on this path.
 
