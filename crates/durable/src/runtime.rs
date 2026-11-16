@@ -558,7 +558,7 @@ enum Phase {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum DispatchIdentity {
     Other,
-    Task(crate::task_tool::Identity),
+    Task(Box<crate::task_tool::Identity>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NestedResumeDecision {
@@ -601,7 +601,7 @@ fn dispatch_identity(tool: &Arc<dyn pi_rs_core::Tool>) -> Result<DispatchIdentit
     match crate::task_tool::lookup(tool) {
         Some(adapter) => adapter
             .identity()
-            .map(DispatchIdentity::Task)
+            .map(|identity| DispatchIdentity::Task(Box::new(identity)))
             .ok_or_else(|| {
                 Error::Invalid(
                     "task adapter requires a nonempty kind and nonzero definition version".into(),
@@ -17966,10 +17966,10 @@ impl Scheduler {
                 }
             }
         }
-        if let Some(worker) = self.foreground_worker.take() {
-            if let Err(e) = worker.await {
-                error.get_or_insert(Error::Invalid(format!("foreground scheduler task: {e}")));
-            }
+        if let Some(worker) = self.foreground_worker.take()
+            && let Err(e) = worker.await
+        {
+            error.get_or_insert(Error::Invalid(format!("foreground scheduler task: {e}")));
         }
         if let Some(reporter) = self.reporter.take()
             && let Err(e) = reporter.await
@@ -25708,7 +25708,9 @@ mod scheduler_tests {
                 dispatch_identity: if legacy {
                     None
                 } else {
-                    Some(DispatchIdentity::Task(original.identity().unwrap()))
+                    Some(DispatchIdentity::Task(Box::new(
+                        original.identity().unwrap(),
+                    )))
                 },
             };
             h.save(&c, Expected::Version(version)).unwrap();
