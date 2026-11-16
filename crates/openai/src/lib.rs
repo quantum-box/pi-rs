@@ -2239,7 +2239,10 @@ mod tests {
                 .unwrap();
             body
         });
-        let req = request();
+        let mut req = request();
+        req.messages = vec![Message::System {
+            content: "rules".into(),
+        }];
         let declaration = pi_rs_core::ToolDeclaration {
             spec: req.tools[0].clone(),
             constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
@@ -2250,6 +2253,7 @@ mod tests {
             OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
                 .unwrap()
                 .with_strict_tool_support(true)
+                .with_developer_role(true)
                 .with_session_cache_key("prior-session");
         let prepared = model.prepare_tool_request(req, &[declaration]).unwrap();
         assert!(matches!(
@@ -2259,6 +2263,7 @@ mod tests {
         let _ = prepared.stream_for_summary().await;
         let body = server.join().unwrap();
         assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["input"][0]["role"], "developer");
         assert!(body.get("prompt_cache_key").is_none());
     }
 
@@ -2327,6 +2332,9 @@ mod tests {
             body
         });
         let mut req = request();
+        req.messages = vec![Message::System {
+            content: "rules".into(),
+        }];
         req.tools[0].parameters = json!({"type":"object","properties":{"path":{"type":"string"}}});
         let declaration = pi_rs_core::ToolDeclaration {
             spec: req.tools[0].clone(),
@@ -2361,6 +2369,7 @@ mod tests {
         assert_eq!(calls.unwrap()[0].arguments, r#"{"path":"hello"}"#);
         let body = server.join().unwrap();
         assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["input"][0]["role"], "system");
         assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
         assert_eq!(body["prompt_cache_key"], "strict-session");
     }
