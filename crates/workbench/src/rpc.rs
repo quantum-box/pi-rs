@@ -77,6 +77,9 @@ pub(super) fn run(
     let mut pending_compact: Option<Value> = None;
     let mut pending_queries: Vec<Value> = Vec::new();
     let mut pending_inputs: Vec<Value> = Vec::new();
+    let mut pending_modes: Vec<PendingMode> = Vec::new();
+    let mut shutdown_waiting = false;
+    let mut mode_worker_pid = None;
     let mut model_queries: Vec<(Value, mpsc::Receiver<Result<Value>>)> = Vec::new();
     let mut transition: Option<(Value, mpsc::Receiver<Result<Cli>>)> = None;
     let mut deferred = std::collections::VecDeque::<Value>::new();
@@ -101,13 +104,7 @@ pub(super) fn run(
                 };
                 if matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
                     let (pending, _) = transition.take().expect("pending transition");
-                    response(&pending, Ok(Some(json!({"cancelled":true}))))?;
-                    for queued in deferred.drain(..) {
-                        response(
-                            &queued,
-                            Err(Error::Config("session transition cancelled".into())),
-                        )?;
-                    }
+                    cancel_transition(&pending, &mut deferred, &mut shutdown_waiting, response)?;
                     if request["type"] == "shutdown" {
                         drop(worker.take());
                         response(&request, Ok(None))?;
@@ -172,7 +169,20 @@ pub(super) fn run(
             }
         }
         if let Some(active) = &mut worker {
-            for event in active.drain_events() {
+            if mode_worker_pid != Some(active.child.id()) {
+                if let Ok(session) = Session::snapshot(&args.session) {
+                    reconcile_worker_queue_modes(
+                        &session,
+                        &mut active.steering_mode,
+                        &mut active.follow_up_mode,
+                    );
+                }
+                mode_worker_pid = Some(active.child.id());
+            }
+            for mut event in active.drain_events() {
+                if mode_event(&mut pending_modes, active, &mut event) {
+                    continue;
+                }
                 acknowledge(&mut pending_queries, &event);
                 acknowledge(&mut pending_inputs, &event);
                 match event["type"].as_str() {
@@ -196,7 +206,10 @@ pub(super) fn run(
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
-                for event in finished.drain_events() {
+                for mut event in finished.drain_events() {
+                    if mode_event(&mut pending_modes, &mut finished, &mut event) {
+                        continue;
+                    }
                     acknowledge(&mut pending_queries, &event);
                     acknowledge(&mut pending_inputs, &event);
                     forward_event(
@@ -207,6 +220,14 @@ pub(super) fn run(
                         &mut pending_compact,
                         &mut stream,
                         &args,
+                    )?;
+                }
+                for pending in pending_modes.drain(..) {
+                    response(
+                        &pending.request,
+                        Err(Error::Config(
+                            "mode worker exited before acknowledging the request".into(),
+                        )),
                     )?;
                 }
                 for request in pending_queries.drain(..) {
@@ -261,14 +282,24 @@ pub(super) fn run(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        let request = if transition.is_none() && !deferred.is_empty() {
+        let from_deferred = transition.is_none()
+            && !pending_modes.iter().any(|pending| !pending.applied)
+            && (pending_modes.is_empty()
+                || !deferred
+                    .front()
+                    .is_some_and(|request| mode_waits_for_settings(request, &worker)))
+            && !deferred.is_empty();
+        let request = if from_deferred {
             deferred.pop_front().expect("deferred request")
         } else {
             let line = match receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(line) => line?,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected)
-                    if model_queries.is_empty() && transition.is_none() && deferred.is_empty() =>
+                    if model_queries.is_empty()
+                        && transition.is_none()
+                        && deferred.is_empty()
+                        && pending_modes.is_empty() =>
                 {
                     break;
                 }
@@ -287,15 +318,46 @@ pub(super) fn run(
                 }
             }
         };
+        if shutdown_waiting
+            && !from_deferred
+            && !matches!(
+                request["type"].as_str(),
+                Some("abort" | "abort_bash" | "abort_retry" | "extension_ui_response")
+            )
+        {
+            response(
+                &request,
+                Err(Error::Config("worker is shutting down".into())),
+            )?;
+            continue;
+        }
+        if transition.is_none()
+            && (pending_modes.iter().any(|pending| !pending.applied)
+                || (mode_waits_for_settings(&request, &worker) && !pending_modes.is_empty())
+                || (!from_deferred && !deferred.is_empty()))
+            && !matches!(
+                request["type"].as_str(),
+                Some("abort" | "abort_bash" | "abort_retry" | "extension_ui_response")
+            )
+        {
+            if deferred.len() >= 256 {
+                response(
+                    &request,
+                    Err(Error::Config(
+                        "too many commands waiting for mode application".into(),
+                    )),
+                )?;
+            } else {
+                if request["type"] == "shutdown" {
+                    shutdown_waiting = true;
+                }
+                deferred.push_back(request);
+            }
+            continue;
+        }
         if transition.is_some() && matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
             let (pending, _) = transition.take().expect("pending transition");
-            response(&pending, Ok(Some(json!({"cancelled":true}))))?;
-            for queued in deferred.drain(..) {
-                response(
-                    &queued,
-                    Err(Error::Config("session transition cancelled".into())),
-                )?;
-            }
+            cancel_transition(&pending, &mut deferred, &mut shutdown_waiting, response)?;
             if request["type"] == "shutdown" {
                 drop(worker.take());
                 response(&request, Ok(None))?;
@@ -338,7 +400,7 @@ pub(super) fn run(
         }
         if request["type"] == "switch_session" || request["type"] == "new_session" {
             let prepared = (|| {
-                if !pending_inputs.is_empty() || busy(&worker) {
+                if !pending_inputs.is_empty() || !pending_modes.is_empty() || busy(&worker) {
                     return Err(Error::Config(
                         "wait for the current operation before switching sessions".into(),
                     ));
@@ -424,7 +486,8 @@ pub(super) fn run(
             }
             continue;
         }
-        if !pending_inputs.is_empty() && requires_idle(request["type"].as_str().unwrap_or_default())
+        if (!pending_inputs.is_empty() || !pending_modes.is_empty())
+            && requires_idle(request["type"].as_str().unwrap_or_default())
         {
             response(
                 &request,
@@ -465,18 +528,17 @@ pub(super) fn run(
                     } else {
                         pi_rs::InputKind::FollowUp
                     };
-                    json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":request.get("id")})
+                    let token = uuid::Uuid::new_v4().to_string();
+                    let control = json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":{"_rpc_mode_token":token}});
+                    Worker::control(&mut worker, &args, control)?;
+                    pending_modes.push(PendingMode {
+                        token,
+                        request: request.clone(),
+                        applied: false,
+                    });
+                    return Ok::<_, Error>(());
                 };
                 Worker::control(&mut worker, &args, control)?;
-                if command != "clear_queue" {
-                    let mode: pi_rs::QueueMode = serde_json::from_value(request["mode"].clone())?;
-                    let active = worker.as_mut().expect("control worker");
-                    if command == "set_steering_mode" {
-                        active.steering_mode = mode;
-                    } else {
-                        active.follow_up_mode = mode;
-                    }
-                }
                 Ok::<_, Error>(())
             })();
             if let Err(error) = result {
@@ -665,6 +727,94 @@ pub(super) fn run(
     }
     drop(worker);
     Ok(())
+}
+
+struct PendingMode {
+    token: String,
+    request: Value,
+    applied: bool,
+}
+
+fn cancel_transition(
+    pending: &Value,
+    deferred: &mut std::collections::VecDeque<Value>,
+    shutdown_waiting: &mut bool,
+    mut respond: impl FnMut(&Value, Result<Option<Value>>) -> Result<()>,
+) -> Result<()> {
+    respond(pending, Ok(Some(json!({"cancelled":true}))))?;
+    for queued in deferred.drain(..) {
+        respond(
+            &queued,
+            Err(Error::Config("session transition cancelled".into())),
+        )?;
+    }
+    *shutdown_waiting = false;
+    Ok(())
+}
+
+// A fresh or legacy session may have no mode record for one or both kinds.
+// In that case Worker::start already resolved the configured fallback.
+fn reconcile_worker_queue_modes(
+    session: &Session,
+    steering: &mut pi_rs::QueueMode,
+    follow_up: &mut pi_rs::QueueMode,
+) {
+    for record in session.branch() {
+        if let pi_rs::Event::QueueModeSelected { kind, mode } = &record.event {
+            match kind {
+                pi_rs::InputKind::Steer => *steering = *mode,
+                pi_rs::InputKind::FollowUp => *follow_up = *mode,
+            }
+        }
+    }
+}
+
+fn mode_waits_for_settings(request: &Value, worker: &Option<Worker>) -> bool {
+    let command = request["type"].as_str().unwrap_or_default();
+    (requires_idle(command) && !(command == "set_session_name" && busy(worker)))
+        || matches!(
+            command,
+            "shutdown" | "set_auto_retry" | "set_auto_compaction"
+        )
+}
+
+// Worker identifiers are private and unique even when RPC ids are missing or repeated.
+fn mode_event(pending: &mut Vec<PendingMode>, worker: &mut Worker, event: &mut Value) -> bool {
+    let Some(token) = event
+        .get("id")
+        .and_then(|id| id.get("_rpc_mode_token"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(index) = pending.iter().position(|item| item.token == token) else {
+        return event["type"] == "internal_queue_mode_applied";
+    };
+    if event["type"] == "internal_queue_mode_applied" {
+        if let Ok(mode) = serde_json::from_value::<pi_rs::QueueMode>(event["mode"].clone()) {
+            if event["kind"] == "steer" {
+                worker.steering_mode = mode;
+            } else {
+                worker.follow_up_mode = mode;
+            }
+            pending[index].applied = true;
+        }
+        return true;
+    }
+    if event["type"] == "response"
+        && matches!(
+            event["command"].as_str(),
+            Some("set_steering_mode" | "set_follow_up_mode")
+        )
+    {
+        let request = pending.remove(index).request;
+        if let Some(id) = request.get("id") {
+            event["id"] = id.clone();
+        } else if let Some(object) = event.as_object_mut() {
+            object.remove("id");
+        }
+    }
+    false
 }
 
 fn acknowledge(pending: &mut Vec<Value>, event: &Value) {
@@ -1855,8 +2005,15 @@ pub(super) fn snapshot_response(
     match request["type"].as_str().unwrap_or_default() {
         "get_state" => {
             let pending = pending_request();
-            state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
-            state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
+            for record in session.branch() {
+                if let pi_rs::Event::QueueModeSelected { kind, mode } = &record.event {
+                    let key = match kind {
+                        pi_rs::InputKind::Steer => "steeringMode",
+                        pi_rs::InputKind::FollowUp => "followUpMode",
+                    };
+                    state[key] = json!(mode);
+                }
+            }
             state["sessionId"] = json!(session.external_session_id());
             if let Some(name) = session.name() {
                 state["sessionName"] = json!(name);
@@ -2572,6 +2729,10 @@ fn forward_event(
 }
 
 fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
+    emit(response_value(request, result))
+}
+
+fn response_value(request: &Value, result: Result<Option<Value>>) -> Value {
     let mut value = json!({"type":"response","success":result.is_ok()});
     if let Some(command) = request.get("type") {
         value["command"] = command.clone();
@@ -2585,7 +2746,7 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
         Err(error) => value["error"] = json!(error.to_string()),
         _ => {}
     }
-    emit(value)
+    value
 }
 
 // The worker sends split UTF-16 units separately because JSON Value and Rust
@@ -2692,6 +2853,91 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn snapshot_state_uses_selected_modes_and_preserves_other_fallbacks() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let state = json!({"steeringMode":"all", "followUpMode":"one-at-a-time"});
+        let request = json!({"type":"get_state"});
+        let path = std::path::Path::new("session.jsonl");
+        let result = snapshot_response(&request, &session, path, None, state.clone()).unwrap();
+        assert_eq!(result["steeringMode"], "all");
+        assert_eq!(result["followUpMode"], "one-at-a-time");
+        session
+            .set_queue_mode(pi_rs::InputKind::Steer, pi_rs::QueueMode::OneAtATime)
+            .unwrap();
+        let result = snapshot_response(&request, &session, path, None, state).unwrap();
+        assert_eq!(result["steeringMode"], "one-at-a-time");
+        assert_eq!(result["followUpMode"], "one-at-a-time");
+    }
+
+    #[test]
+    fn cancelling_transition_responds_in_order_and_clears_deferred_shutdown() {
+        let pending = json!({"type":"new_session", "id":"new"});
+        let mut deferred = std::collections::VecDeque::from([
+            json!({"type":"get_state", "id":"state"}),
+            json!({"type":"shutdown", "id":"stop"}),
+            json!({"type":"prompt", "id":"prompt"}),
+        ]);
+        let mut shutdown_waiting = true;
+        let mut responses = Vec::new();
+        cancel_transition(
+            &pending,
+            &mut deferred,
+            &mut shutdown_waiting,
+            |request, result| {
+                responses.push(response_value(request, result));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            responses,
+            vec![
+                json!({"type":"response", "command":"new_session", "id":"new", "success":true, "data":{"cancelled":true}}),
+                json!({"type":"response", "command":"get_state", "id":"state", "success":false, "error":"session transition cancelled"}),
+                json!({"type":"response", "command":"shutdown", "id":"stop", "success":false, "error":"session transition cancelled"}),
+                json!({"type":"response", "command":"prompt", "id":"prompt", "success":false, "error":"session transition cancelled"}),
+            ]
+        );
+        assert!(deferred.is_empty());
+        assert!(!shutdown_waiting);
+    }
+
+    #[test]
+    fn worker_queue_mode_reconciliation_preserves_unselected_fallbacks() {
+        use pi_rs::{InputKind, QueueMode};
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut steering = QueueMode::OneAtATime;
+        let mut follow_up = QueueMode::OneAtATime;
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::OneAtATime, QueueMode::OneAtATime)
+        );
+
+        session
+            .set_queue_mode(InputKind::Steer, QueueMode::All)
+            .unwrap();
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::All, QueueMode::OneAtATime)
+        );
+
+        session
+            .set_queue_mode(InputKind::Steer, QueueMode::OneAtATime)
+            .unwrap();
+        session
+            .set_queue_mode(InputKind::FollowUp, QueueMode::All)
+            .unwrap();
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::OneAtATime, QueueMode::All)
+        );
+    }
 
     #[test]
     fn session_name_type_errors_match_pi() {
