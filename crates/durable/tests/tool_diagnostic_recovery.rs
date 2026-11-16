@@ -1284,3 +1284,142 @@ async fn nested_schema_failure_includes_error_diagnostic() {
     );
     assert_eq!(result.diagnostics[0].severity, DiagnosticSeverity::Error);
 }
+
+#[tokio::test]
+async fn nested_block_redaction_rewrites_failure_outcome_and_fallback_after_reopen() {
+    use pi_rs_durable::extension::{ToolBlockResult, ToolCall as HookCall};
+    use std::sync::Mutex;
+    struct ModelCapture(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for ModelCapture {
+        async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            self.0.lock().unwrap().push(request.clone());
+            FakeModel("parent").stream(request).await
+        }
+    }
+    struct Child(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl KeyedTool for Child {
+        fn spec(&self) -> ToolSpec {
+            spec("child")
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Failed("child secret".into()).into()
+        }
+    }
+    struct Parent;
+    #[async_trait::async_trait]
+    impl KeyedTool for Parent {
+        fn spec(&self) -> ToolSpec {
+            spec("parent")
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            for _ in 0..2 {
+                let child = host.call_keyed_with_blocks("key", "child", json!({})).await;
+                assert_eq!(child.outcome, Outcome::Failed("redacted".into()));
+                assert_eq!(
+                    child.output_blocks,
+                    Some(vec![json!({"type":"text","text":"redacted"})])
+                );
+                assert_eq!(child.diagnostics.len(), 1);
+                assert_eq!(child.diagnostics[0].message, "redacted");
+                assert_eq!(child.diagnostics[0].code.as_deref(), Some("tool_error"));
+            }
+            let child = host.call_keyed_with_blocks("key", "child", json!({})).await;
+            for diagnostic in child.diagnostics {
+                host.diagnostic(diagnostic).unwrap();
+            }
+            child.outcome.into()
+        }
+    }
+    struct Redact;
+    #[async_trait::async_trait]
+    impl Hook for Redact {
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            true
+        }
+        async fn after_tool_blocks(
+            &self,
+            call: &HookCall,
+            result: &ToolBlockResult,
+            nested: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            if !nested || call.name != "child" {
+                return Ok(None);
+            }
+            let mut value = result.clone();
+            value.output = vec![json!({"type":"text","text":"redacted"})];
+            Ok(Some(value))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(ModelCapture(requests.clone())),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(Parent)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(Child(calls.clone()))).register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(Extension {
+        name: "redact".into(),
+        hooks: vec![Arc::new(Redact)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["redact".into()]).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let requests = requests.lock().unwrap();
+    let actual = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .find_map(|m| match m {
+            Message::Tool { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert!(actual.contains("redacted"));
+    assert!(!actual.contains("child secret"));
+    drop(requests);
+    let before = h.conversation(id).unwrap();
+    assert!(!format!("{before:?}").contains("child secret"));
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().messages, before.messages);
+    assert!(!format!("{:?}", h.conversation(id).unwrap()).contains("child secret"));
+    drop(h);
+    let store = durable_store::Store::open(&path).unwrap();
+    for prefix in [b"runtime/".as_slice(), b"nested/".as_slice()] {
+        let entries = store.list(prefix).unwrap();
+        if prefix == b"nested/" {
+            assert!(!entries.is_empty());
+        }
+        for (_, entry) in entries {
+            assert!(!String::from_utf8_lossy(&entry.value).contains("child secret"));
+        }
+    }
+}

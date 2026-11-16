@@ -112,6 +112,28 @@ pub(crate) struct PendingPoll {
     record: Record,
 }
 
+// A block-aware child exposes both channels, so the outcome's text must be
+// derived from the final blocks. Non-text blocks have no plain-text projection.
+fn outcome_from_blocks(outcome: Outcome, blocks: &[Value]) -> Outcome {
+    let text: String = blocks
+        .iter()
+        .filter_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect();
+    match outcome {
+        Outcome::Failed(_) => Outcome::Failed(text),
+        Outcome::Skipped(_) => Outcome::Skipped(text),
+        Outcome::SucceededWithDetails { details, .. } => Outcome::SucceededWithDetails {
+            output: text,
+            details,
+        },
+        _ => Outcome::Succeeded(text),
+    }
+}
+
 fn durable_tool_identity(tool: &std::sync::Arc<dyn pi_rs_core::Tool>) -> Option<String> {
     crate::nested_identity::current(tool)
 }
@@ -1012,7 +1034,7 @@ impl NestedHost {
         arguments: Value,
         poll: bool,
     ) -> KeyedResult {
-        let outcome = if valid_key(key) {
+        let mut outcome = if valid_key(key) {
             self.call_inner_raw(Some(key), name, arguments.clone(), false, poll)
                 .await
         } else {
@@ -1089,6 +1111,19 @@ impl NestedHost {
         } else {
             Vec::new()
         };
+        // Older records may have retained their pre-hook outcome alongside
+        // rewritten blocks. Project it before any fallback diagnostic is made.
+        if let Some(blocks) = &output_blocks {
+            if let Outcome::Failed(reason) | Outcome::Skipped(reason) = &outcome {
+                diagnostics.retain(|diagnostic| {
+                    !matches!(
+                        diagnostic.code.as_deref(),
+                        Some("tool_failed" | "tool_skipped" | "tool_error")
+                    ) || diagnostic.message != *reason
+                });
+            }
+            outcome = outcome_from_blocks(outcome, blocks);
+        }
         if let Outcome::Failed(reason) = &outcome
             && !diagnostics
                 .iter()
@@ -2089,6 +2124,15 @@ impl NestedHost {
         if blocks != original_blocks && !bounded {
             return self.fail("nested block result exceeds limits");
         }
+        // The block-aware projection is authoritative. Never keep the earlier
+        // text-bearing outcome alongside a rewritten block result: callers can
+        // observe both, and the diagnostic fallback also reads that outcome.
+        let blocks_changed = blocks.output != original_blocks.output;
+        let outcome = if blocks_changed {
+            outcome_from_blocks(outcome, &blocks.output)
+        } else {
+            outcome
+        };
         let entry = match self.shared.owner.store().get(key) {
             Ok(Some(entry)) => entry,
             _ => return self.fail("nested staged result missing"),
@@ -2106,7 +2150,7 @@ impl NestedHost {
         record = current;
         record.staged_outcome = None;
         record.outcome = Some(outcome.clone());
-        record.output_blocks = (blocks.output != original_blocks.output).then_some(blocks.output);
+        record.output_blocks = blocks_changed.then_some(blocks.output);
         record.diagnostics = blocks.diagnostics;
         record.diagnostic_keys.clear();
         let value = match serde_json::to_vec(&record) {
