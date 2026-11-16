@@ -3998,6 +3998,38 @@ fn check_task_notification_binding(
     Ok(())
 }
 
+fn reset_manifest_lookup_error(error: crate::reset_manifest::LookupError) -> Error {
+    match error {
+        crate::reset_manifest::LookupError::Store(
+            error @ durable_store::Error::Conflict { .. },
+        )
+        | crate::reset_manifest::LookupError::Transcript(crate::transcript::Error::Store(
+            error @ durable_store::Error::Conflict { .. },
+        )) => Error::Storage(error),
+        _ => Error::Fork(crate::fork::Error::InvalidSnapshot),
+    }
+}
+
+fn task_input_admission_error(error: Error) -> crate::document::Error {
+    use crate::document::Error as DError;
+    match error {
+        Error::Storage(error @ durable_store::Error::Conflict { .. })
+        | Error::Transcript(crate::transcript::Error::Store(
+            error @ durable_store::Error::Conflict { .. },
+        ))
+        | Error::Observer(crate::observer::Error::Store(
+            error @ durable_store::Error::Conflict { .. },
+        ))
+        | Error::Fork(crate::fork::Error::Observer(crate::observer::Error::Store(
+            error @ durable_store::Error::Conflict { .. },
+        )))
+        | Error::Document(DError::Store(error @ durable_store::Error::Conflict { .. })) => {
+            DError::Store(error)
+        }
+        other => DError::InvalidSessionAdmission(other.to_string()),
+    }
+}
+
 impl Harness {
     pub(crate) fn task_submission_clock(&self) -> i64 {
         (self.clock)()
@@ -4015,7 +4047,7 @@ impl Harness {
             ));
         }
         self.hydrate(&mut state)
-            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+            .map_err(task_input_admission_error)?;
         if !self.supports_context_blocks(&state) {
             return Err(DError::InvalidSessionAdmission(
                 "unsupported context blocks".into(),
@@ -4034,7 +4066,7 @@ impl Harness {
         let key = Self::key(intent.conversation);
         let (state, version) = self
             .load(intent.conversation)
-            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+            .map_err(task_input_admission_error)?;
         if version != intent.version {
             return Err(durable_store::Error::Conflict { key }.into());
         }
@@ -4092,7 +4124,7 @@ impl Harness {
             Ok(prepared) => prepared,
             Err(error) => {
                 check_task_notification_binding(self.owner.store(), intent)?;
-                return Err(DError::InvalidSessionAdmission(error.to_string()));
+                return Err(task_input_admission_error(error));
             }
         };
         let wake_key = task_input_wake_key(intent.conversation);
@@ -9098,7 +9130,7 @@ impl Harness {
         let revision = store.document_cut(&anchor_key)?.ok_or_else(invalid)?;
         let candidate =
             crate::reset_manifest::lookup_candidate(store, id, target, observation, revision)
-                .map_err(|_| invalid())?
+                .map_err(reset_manifest_lookup_error)?
                 .ok_or_else(invalid)?;
         let hints = candidate.replay_hints().map_err(|_| invalid())?;
         let (mut baseline, _) =
@@ -9240,7 +9272,7 @@ impl Harness {
                     let evidence = crate::reset_manifest::lookup_candidate(
                         store, origin, &original, commit, revision,
                     )
-                    .map_err(|_| invalid())?
+                    .map_err(reset_manifest_lookup_error)?
                     .ok_or_else(invalid)?;
                     checks.extend(evidence.checks);
                 }

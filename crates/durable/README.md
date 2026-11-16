@@ -2046,7 +2046,9 @@ matching key and rejects identity changes, including definition version, replay
 policy, initial checkpoint and restart limit as well as kind and input. These
 extra identity checks are a pi-rs extension. The driver validates the exact parent
 reservation, registry and pending abort under the admission gate, and fences the
-ownership graph through commit. Multiple parents and children, including
+ownership graph through commit. Duplicate lookup also checks the existing child;
+if the child or parent changes, the host can retry in a new transaction using a
+fresh parent snapshot for the same running attempt. Multiple parents and children, including
 children of tasks staged earlier in the transaction, may be combined with
 root-task creation. A generic child can execute while its TaskTool parent is
 running, provided the attached driver still owns the parent invocation. The

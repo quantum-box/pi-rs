@@ -59,6 +59,9 @@ fn task(owner: TaskOwner, kind: &str, input: i32) -> Task {
     .registered_versioned(kind.into(), true, 1, json!({"n":input}))
     .unwrap()
 }
+fn attempt_id(task: &Task) -> serde_json::Value {
+    serde_json::to_value(task).unwrap()["attempt_id"].clone()
+}
 fn driver(
     h: &Harness,
 ) -> (
@@ -317,13 +320,49 @@ fn keyed_child_survives_kill_and_new_parent_attempt() {
         let (driver, started, release) = driver(&h);
         started.recv_timeout(Duration::from_secs(10)).unwrap();
         let store = Store::open(&path).unwrap();
-        let snapshot = TaskStore::new(&store).load(ids[1]).unwrap().unwrap();
+        let tasks = TaskStore::new(&store);
+        let attempt = attempt_id(&tasks.load(ids[1]).unwrap().unwrap().task);
+        assert!(!attempt.is_null());
         let candidate = task(TaskOwner::Task(ids[1]), "child", 1);
-        let found = h
-            .session_transaction(ids[0], |tx| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let found = loop {
+            let snapshot = tasks.load(ids[1]).unwrap().unwrap();
+            assert_eq!(attempt_id(&snapshot.task), attempt);
+            let result = h.session_transaction(ids[0], |tx| {
                 tx.create_keyed_child(&snapshot, "restart", candidate.clone())
-            })
-            .unwrap();
+            });
+            match result {
+                Ok(id) => break id,
+                Err(error) => {
+                    let fresh = tasks.load(ids[1]).unwrap().unwrap();
+                    let parent_changed = fresh.version != snapshot.version
+                        && attempt_id(&fresh.task) == attempt
+                        && fresh.task.state() == &pi_rs_durable::task::TaskState::Running
+                        && !fresh.task.abort_requested();
+                    let checked_task_conflict = matches!(&error,
+                        pi_rs_durable::runtime::Error::Storage(durable_store::Error::Conflict { key })
+                            if key == &{ let mut k = b"durable/task/".to_vec(); k.extend_from_slice(ids[1].as_bytes()); k }
+                                || key == &{ let mut k = b"durable/task/".to_vec(); k.extend_from_slice(ids[2].as_bytes()); k });
+                    let stale_parent = parent_changed
+                        && matches!(
+                            &error,
+                            pi_rs_durable::runtime::Error::Invalid(_)
+                                | pi_rs_durable::runtime::Error::Document(
+                                    DError::InvalidSessionAdmission(_)
+                                )
+                        );
+                    assert!(
+                        checked_task_conflict || stale_parent,
+                        "unexpected admission error: {error:?}"
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "admission did not settle: {error:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
         assert_eq!(found, ids[2]);
         assert!(
             TaskStore::new(&store)
@@ -1754,4 +1793,61 @@ fn succeeded_multilevel_owners_allow_admission_after_reopen() {
     let reopened = Harness::open_paused(&path, options()).unwrap();
     assert!(reopened.conversation(conversation).is_ok());
     assert!(tasks.load(child.id()).unwrap().is_some());
+}
+
+#[test]
+fn duplicate_key_child_version_change_requires_fresh_transaction() {
+    use durable_store::{Check, Expected, Mutation};
+    use pi_rs_durable::runtime::Error;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let parent = task(TaskOwner::Conversation(c), "parent", 0);
+    driver.submit(&parent).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+    let child = task(TaskOwner::Task(parent.id()), "child", 1);
+    let id = h
+        .session_transaction(c, |tx| {
+            tx.create_keyed_child(&snapshot, "restart", child.clone())
+        })
+        .unwrap();
+    let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+    let candidate = task(TaskOwner::Task(parent.id()), "child", 1);
+    let mut key = b"durable/task/".to_vec();
+    key.extend_from_slice(id.as_bytes());
+    let result = h.session_transaction(c, |tx| {
+        assert_eq!(
+            tx.create_keyed_child(&snapshot, "restart", candidate.clone())?,
+            id
+        );
+        let old = store.get(&key)?.unwrap();
+        store.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(old.version),
+            }],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: old.value,
+            }],
+        )?;
+        Ok(())
+    });
+    assert!(
+        matches!(result, Err(Error::Storage(durable_store::Error::Conflict { key: ref conflict })) if *conflict == key)
+    );
+    let fresh = tasks.load(parent.id()).unwrap().unwrap();
+    assert_eq!(attempt_id(&fresh.task), attempt_id(&snapshot.task));
+    assert_eq!(
+        h.session_transaction(c, |tx| tx.create_keyed_child(&fresh, "restart", candidate))
+            .unwrap(),
+        id
+    );
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
 }

@@ -34,6 +34,11 @@ pub(crate) enum LookupError {
     Invalid,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_CANDIDATE_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn candidate_prefix(id: Uuid, entry: Uuid, sequence: u64) -> Vec<u8> {
     format!("runtime/reset-manifest/{id}/{entry}/{sequence:020}/").into_bytes()
 }
@@ -179,6 +184,12 @@ pub(crate) fn lookup_candidate(
     checks.push(Check {
         key: prefix,
         expected: Expected::PrefixUnchangedSince(boundary),
+    });
+    #[cfg(test)]
+    BEFORE_CANDIDATE_CHECK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
     });
     store.commit(&checks, &[])?;
     Ok(Some(RawCandidate {

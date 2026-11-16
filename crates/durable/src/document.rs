@@ -2062,6 +2062,7 @@ pub struct TaskDocuments<'a> {
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
     task_input: Option<TaskInputIntent>,
+    pub(crate) task_input_conflict: Option<Vec<u8>>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -2086,6 +2087,7 @@ pub struct DetachedTaskDocuments {
     runtime_cut: Option<usize>,
     runtime_config: Option<crate::runtime::Config>,
     task_input: Option<TaskInputIntent>,
+    pub(crate) task_input_conflict: Option<Vec<u8>>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
@@ -2203,6 +2205,11 @@ impl DetachedTaskDocuments {
                 key: crate::task_store::key(self.reservation.task.id()),
             }));
         }
+        if let Some(key) = &self.task_input_conflict {
+            return Err(Error::Store(durable_store::Error::Conflict {
+                key: key.clone(),
+            }));
+        }
         let Self {
             owner,
             reservation,
@@ -2215,6 +2222,7 @@ impl DetachedTaskDocuments {
             runtime_cut,
             runtime_config,
             task_input,
+            task_input_conflict,
             signals,
             child_reads,
             mut keyed_children,
@@ -2233,6 +2241,7 @@ impl DetachedTaskDocuments {
             runtime_cut,
             runtime_config,
             task_input: None,
+            task_input_conflict,
             signals,
             child_reads,
             keyed_children: Vec::new(),
@@ -2304,6 +2313,7 @@ impl<'a> TaskDocuments<'a> {
             runtime_cut,
             runtime_config,
             task_input,
+            task_input_conflict,
             signals,
             child_reads,
             keyed_children,
@@ -2321,6 +2331,7 @@ impl<'a> TaskDocuments<'a> {
             runtime_cut,
             runtime_config,
             task_input,
+            task_input_conflict,
             signals,
             child_reads,
             keyed_children,
@@ -2342,6 +2353,7 @@ impl<'a> TaskDocuments<'a> {
             runtime_cut: None,
             runtime_config: None,
             task_input: None,
+            task_input_conflict: None,
             signals: StagedSignals::new(),
             child_reads: HashMap::new(),
             keyed_children: Vec::new(),
@@ -2443,26 +2455,33 @@ impl<'a> TaskDocuments<'a> {
             .get(&key)?
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
         after_snapshot();
-        let is_new = crate::runtime::validate_task_submission(
-            self.store,
-            &record.value,
-            &request_id,
-            &draft,
-            &notify,
-        )?;
-        if matches!(draft, TaskSubmissionDraft::Input { .. }) {
-            self.input_validator
-                .ok_or_else(|| {
-                    Error::InvalidSessionAdmission(
-                        "task submission requires an attached harness".into(),
-                    )
-                })?
-                .validate_task_input_context(*conversation, &record.value)?;
-        } else if self.input_validator.is_none() {
-            return Err(Error::InvalidSessionAdmission(
-                "task submission requires an attached harness".into(),
-            ));
+        let validation = (|| {
+            let is_new = crate::runtime::validate_task_submission(
+                self.store,
+                &record.value,
+                &request_id,
+                &draft,
+                &notify,
+            )?;
+            if matches!(draft, TaskSubmissionDraft::Input { .. }) {
+                self.input_validator
+                    .ok_or_else(|| {
+                        Error::InvalidSessionAdmission(
+                            "task submission requires an attached harness".into(),
+                        )
+                    })?
+                    .validate_task_input_context(*conversation, &record.value)?;
+            } else if self.input_validator.is_none() {
+                return Err(Error::InvalidSessionAdmission(
+                    "task submission requires an attached harness".into(),
+                ));
+            }
+            Ok(is_new)
+        })();
+        if let Err(Error::Store(durable_store::Error::Conflict { key })) = &validation {
+            self.task_input_conflict = Some(key.clone());
         }
+        let is_new = validation?;
         let notification_binding = if is_new {
             notify
                 .as_ref()
@@ -4152,6 +4171,7 @@ mod detached_task_documents_tests {
             runtime_cut: docs.runtime_cut,
             runtime_config: docs.runtime_config.clone(),
             task_input: docs.task_input.clone(),
+            task_input_conflict: docs.task_input_conflict.clone(),
             signals: StagedSignals {
                 batch: OwnedBatch {
                     checks: docs.signals.batch.checks.clone(),

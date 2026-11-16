@@ -2171,3 +2171,185 @@ fn task_input_on_reset_fork_fences_original_proof() {
         ));
     }
 }
+
+#[test]
+fn task_input_retries_origin_advance_during_fork_proof() {
+    use crate::document::{Address, Documents, TaskDocuments};
+    use crate::task::scheduler::{Handler, Registry, Step};
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn race(owner: Arc<durable_store::owner::OwnedStore>, origin: Uuid) {
+        crate::reset_manifest::BEFORE_CANDIDATE_CHECK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let key = Harness::key(origin);
+                let record = owner.store().get(&key).unwrap().unwrap();
+                owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: key.clone(),
+                            expected: Expected::Version(record.version),
+                        }],
+                        &[Mutation::Put {
+                            key,
+                            value: record.value,
+                        }],
+                    )
+                    .unwrap();
+            }));
+        });
+    }
+    struct Submit {
+        calls: Arc<AtomicUsize>,
+        owner: Arc<durable_store::owner::OwnedStore>,
+        origin: Uuid,
+        during_prepare: bool,
+    }
+    impl Handler for Submit {
+        fn run(&self, _: &Task) -> Result<Step, String> {
+            unreachable!()
+        }
+        fn run_with_documents(
+            &self,
+            _: &Task,
+            docs: &mut TaskDocuments<'_>,
+        ) -> Result<Step, String> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            docs.submit_input("race".into(), "hello".into())
+                .map_err(|e| e.to_string())?;
+            if first && self.during_prepare {
+                race(self.owner.clone(), self.origin);
+            }
+            let address = Address {
+                scope: "test".into(),
+                name: "proof-retry".into(),
+                key: "".into(),
+            };
+            docs.get(&address).map_err(|e| e.to_string())?;
+            docs.put(
+                &address,
+                serde_json::json!({"ok":true}).as_object().unwrap().clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Step::Succeed(serde_json::json!(null)))
+        }
+    }
+    for (replay_safe, during_prepare) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, origin, _, steps) = setup_with_adapter(&path, true);
+        h.set_after_failed_run(origin, AfterFailedRun::Continue)
+            .unwrap();
+        h.submit(origin, None, "replacement".into()).unwrap();
+        let (mut checkpoint, version) = h.load(origin).unwrap();
+        let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+        checkpoint.phase = Phase::FailedModel {
+            turns: 0,
+            request_id: Uuid::new_v4(),
+            reason: "error".into(),
+            decision: ModelFailureDecision::Stop,
+        };
+        h.save(&checkpoint, Expected::Version(version)).unwrap();
+        let (mut failure, version) = h.load(origin).unwrap();
+        finish_failure(&mut failure, "error".into(), FailureCause::ModelError);
+        h.save(&failure, Expected::Version(version)).unwrap();
+        let fork = h.fork_by_entry_id(origin, occurrence).unwrap();
+        let (mut state, version) = h.load(fork).unwrap();
+        state.messages.push(Message::User {
+            content: "one".into(),
+        });
+        state.messages.push(Message::User {
+            content: "two".into(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        let state = h.conversation(fork).unwrap();
+        let child = h
+            .fork_at_position(
+                fork,
+                ViewCursor {
+                    cursor: state.transcript.unwrap(),
+                    remaining: Some(1),
+                },
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "submit",
+            replay_safe,
+            Submit {
+                calls: calls.clone(),
+                owner: h.owner.clone(),
+                origin,
+                during_prepare,
+            },
+        );
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("submit".into(), replay_safe);
+        scheduler.submit(&task).unwrap();
+        if !during_prepare {
+            race(h.owner.clone(), origin);
+        }
+        if during_prepare {
+            assert!(scheduler.tick(0).unwrap());
+        } else {
+            let crate::task_scheduler::TickReservation::Invocation(invocation) =
+                scheduler.reserve_tick(0).unwrap()
+            else {
+                panic!("expected task invocation");
+            };
+            let completed = invocation.execute().unwrap();
+            let publication = scheduler.failure_publication();
+            let admission = publication.admission().unwrap();
+            assert_eq!(
+                admission.permits_admission(&h.owner, child, Some(&task)),
+                replay_safe
+            );
+            drop(admission);
+            assert!(scheduler.settle_invocation(completed).unwrap());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let store = durable_store::Store::open(&path).unwrap();
+        let tasks = crate::task_store::TaskStore::new(&store);
+        if replay_safe {
+            assert_eq!(
+                tasks.load(task.id()).unwrap().unwrap().task.state(),
+                &TaskState::Ready
+            );
+        } else {
+            assert!(
+                matches!(tasks.load(task.id()).unwrap().unwrap().task.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+            );
+        }
+        assert!(h.conversation(child).unwrap().submissions.is_empty());
+        let address = Address {
+            scope: "test".into(),
+            name: "proof-retry".into(),
+            key: "".into(),
+        };
+        assert!(Documents::new(&store).get(&address).unwrap().is_none());
+        if replay_safe {
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(matches!(
+                tasks.load(task.id()).unwrap().unwrap().task.state(),
+                TaskState::Succeeded(_)
+            ));
+            assert_eq!(h.conversation(child).unwrap().submissions.len(), 1);
+            assert!(Documents::new(&store).get(&address).unwrap().is_some());
+        }
+    }
+}

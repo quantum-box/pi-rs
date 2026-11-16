@@ -1043,6 +1043,13 @@ impl DetachedInvocation {
                 }
             };
             let documents = documents.detach(owner.clone(), &running)?;
+            // A checked input proof invalidates the entire attempt even when
+            // a handler stringifies or ignores the document error.
+            let result = if documents.task_input_conflict.is_some() {
+                Ok(Step::Continue(running.task.checkpoint().clone()))
+            } else {
+                result
+            };
             if result.is_err() && !running.task.is_task_tool() {
                 let _fence = lease.failure_fence.lock().map_err(|_| Error::Poisoned)?;
                 let mut state = lease.state.lock().map_err(|_| Error::Poisoned)?;
@@ -1058,6 +1065,13 @@ impl DetachedInvocation {
             let mut state = lease.state.lock().map_err(|_| Error::Poisoned)?;
             let abort_intent = match &result {
                 InvocationResult::Abort(_) => true,
+                // A non-replay-safe input conflict will settle as an owned
+                // failure, so publish its fence before dependent work can run.
+                InvocationResult::Handler(_, documents)
+                    if documents.task_input_conflict.is_some() && !running.task.replay_safe() =>
+                {
+                    true
+                }
                 InvocationResult::Handler(Err(_), _) => true,
                 InvocationResult::Handler(Ok(Step::Fail(_)), _) => true,
                 InvocationResult::Handler(Ok(Step::Succeed(_)), _) => running.task.is_task_tool(),
@@ -3673,6 +3687,23 @@ impl Scheduler {
                 return Err(Error::PendingAbort(root));
             }
             self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
+            self.poisoned
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Ok(true);
+        }
+        if documents.task_input_conflict.is_some() {
+            if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                self.ts().update(&current, |task| task.yield_ready())?;
+            } else {
+                return self.finish_running_conflict(
+                    &current,
+                    "document conflict: execution outcome requires reconciliation".into(),
+                    &owner,
+                    _gate,
+                    nonblocking_abort,
+                    deferred,
+                );
+            }
             self.poisoned
                 .store(false, std::sync::atomic::Ordering::Release);
             return Ok(true);
