@@ -436,6 +436,8 @@ async fn listen_for_tool_changes(service: &RunningService<RoleClient, NativeClie
 pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
+    server_tool_names: Vec<String>,
+    has_resources: bool,
     deferred: BTreeSet<String>,
     has_codemode: bool,
     has_deferred: bool,
@@ -816,6 +818,13 @@ impl McpExtension {
         } else {
             Vec::new()
         };
+        let server_tool_names = definitions
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let has_resources = info
+            .as_ref()
+            .is_some_and(|info| info.capabilities.resources.is_some());
         drop(service);
         let catalog = CatalogSnapshot {
             signal,
@@ -850,9 +859,9 @@ impl McpExtension {
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
             if is_deferred(&config, &definition.name) {
-                has_deferred |= exposure(&config, &definition.name) == "deferred";
+                has_deferred |= tool_exposure(&config, &definition.name) == "deferred";
                 has_codemode |= matches!(
-                    exposure(&config, &definition.name),
+                    tool_exposure(&config, &definition.name),
                     "codemode" | "codemode-deferred"
                 );
                 deferred.insert(spec.name.clone());
@@ -908,9 +917,11 @@ impl McpExtension {
                     exposed.push_str("_resource");
                 }
                 if is_deferred(&config, policy) {
-                    has_deferred |= exposure(&config, policy) == "deferred";
-                    has_codemode |=
-                        matches!(exposure(&config, policy), "codemode" | "codemode-deferred");
+                    has_deferred |= tool_exposure(&config, policy) == "deferred";
+                    has_codemode |= matches!(
+                        tool_exposure(&config, policy),
+                        "codemode" | "codemode-deferred"
+                    );
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -949,9 +960,11 @@ impl McpExtension {
                     exposed.push_str("_prompt");
                 }
                 if is_deferred(&config, name) {
-                    has_deferred |= exposure(&config, name) == "deferred";
-                    has_codemode |=
-                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
+                    has_deferred |= tool_exposure(&config, name) == "deferred";
+                    has_codemode |= matches!(
+                        tool_exposure(&config, name),
+                        "codemode" | "codemode-deferred"
+                    );
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -983,6 +996,8 @@ impl McpExtension {
         Ok(Self {
             id: format!("mcp-{}", normalize(&name)),
             tools,
+            server_tool_names,
+            has_resources,
             deferred,
             has_codemode,
             has_deferred,
@@ -992,6 +1007,16 @@ impl McpExtension {
             catalog,
         })
     }
+    /// Original server tool names from this discovery snapshot, including hidden tools.
+    pub fn remote_tool_names(&self) -> &[String] {
+        &self.server_tool_names
+    }
+
+    /// Whether the server advertised the resources capability at discovery.
+    pub fn offers_resources(&self) -> bool {
+        self.has_resources
+    }
+
     pub fn has_deferred(&self) -> bool {
         self.has_deferred
     }
@@ -1641,7 +1666,8 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
     Ok(identity)
 }
 
-fn exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
+/// Returns the effective configured exposure for a remote tool name.
+pub fn tool_exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
     config
         .tool_exposure
         .get(name)
@@ -1664,11 +1690,11 @@ fn exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
         .unwrap_or("codemode")
 }
 fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
-    !matches!(exposure(config, name), "hidden" | "off")
+    !matches!(tool_exposure(config, name), "hidden" | "off")
 }
 fn is_deferred(config: &ServerConfig, name: &str) -> bool {
     matches!(
-        exposure(config, name),
+        tool_exposure(config, name),
         "deferred" | "codemode" | "codemode-deferred"
     )
 }
@@ -2418,6 +2444,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(extension.remote_tool_names().is_empty());
+        assert!(!extension.offers_resources());
         extension
             .connection
             .service
@@ -2434,7 +2462,7 @@ mod tests {
     #[test]
     fn exact_exposure_overrides_wildcard_selection() {
         let config: ServerConfig = serde_json::from_value(json!({"url":"http://127.0.0.1/mcp","exposure":"hidden","toolExposure":{"read*":"deferred","read_one":"direct"}})).unwrap();
-        assert_eq!(exposure(&config, "read_one"), "direct");
+        assert_eq!(tool_exposure(&config, "read_one"), "direct");
         assert!(is_deferred(&config, "read_many"));
         assert!(!tool_enabled(&config, "write"));
     }

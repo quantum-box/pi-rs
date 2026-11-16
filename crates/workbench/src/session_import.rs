@@ -3,59 +3,10 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
-use base64::Engine;
-use pi_rs::{Error, Event, Invocation, Outcome, Record, Result, Session, ToolCall, Usage};
+use pi_rs::pi_import::{Branch, convert, required};
+use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::Value;
 use uuid::Uuid;
-
-fn imported_cost(value: &Value) -> Option<serde_json::Number> {
-    match &value["cost"]["total"] {
-        Value::Number(number)
-            if number
-                .as_f64()
-                .is_some_and(|value| value >= 0.0 && value.is_finite()) =>
-        {
-            Some(number.clone())
-        }
-        _ => None,
-    }
-}
-
-fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage> {
-    value.as_object()?;
-    let cache_read = value["cacheRead"].as_u64().unwrap_or(0);
-    let cache_write = value["cacheWrite"].as_u64().unwrap_or(0);
-    let usage = Usage {
-        input_tokens: value["input"]
-            .as_u64()
-            .unwrap_or(0)
-            .saturating_add(cache_read)
-            .saturating_add(cache_write),
-        output_tokens: value["output"].as_u64().unwrap_or(0),
-    };
-    events.push(Event::ModelFinished {
-        request_id: Uuid::new_v4(),
-        metadata: pi_rs::ModelMetadata {
-            cost_usd: imported_cost(value),
-            cost_breakdown: pi_rs::UsageCostBreakdown::from_value(&value["cost"]),
-            cost_from_provider: value["cost"]["totalFromProvider"].as_bool(),
-            cache_write_1h_tokens: value["cacheWrite1h"].as_u64(),
-            cached_input_tokens: Some(cache_read),
-            cache_creation_input_tokens: Some(cache_write),
-            ..Default::default()
-        },
-        usage: pi_rs::UsageReport::Measured { usage },
-        failure: None,
-        partial: String::new(),
-        reply: None,
-    });
-    Some(usage)
-}
-
-fn summary_usage_metadata(events: &[Event]) -> Option<Box<pi_rs::SummaryUsageMetadata>> {
-    let (_, metadata) = pi_rs::SummaryUsageMetadata::from_completion(events.last()?)?;
-    Some(Box::new(metadata))
-}
 
 pub fn read(path: &Path) -> Result<Session> {
     let mut text = String::new();
@@ -88,18 +39,47 @@ pub fn read(path: &Path) -> Result<Session> {
     }
 }
 
-#[derive(Clone, Default)]
-struct Branch {
-    head: u64,
-    entry_start: u64,
-    context_target: Option<u64>,
-    calls: BTreeMap<String, Uuid>,
-    missing_ancestors: bool,
-    model: String,
-    provider: Option<String>,
-    thinking: Option<String>,
-    store: BTreeMap<String, Value>,
+// Source entries form an append-only forest. Binary lifting lets repeated
+// compactions validate their retained boundary without scanning the branch.
+struct SourceAncestry {
+    nodes: Vec<(usize, Vec<usize>)>,
 }
+impl Default for SourceAncestry {
+    fn default() -> Self {
+        Self {
+            nodes: vec![(0, Vec::new())],
+        }
+    }
+}
+impl SourceAncestry {
+    fn add(&mut self, parent: usize) -> usize {
+        let mut jumps = vec![parent];
+        while let Some(next) = self.nodes[*jumps.last().unwrap()].1.get(jumps.len() - 1) {
+            jumps.push(*next);
+        }
+        let index = self.nodes.len();
+        self.nodes.push((self.nodes[parent].0 + 1, jumps));
+        index
+    }
+
+    fn is_ancestor(&self, ancestor: usize, mut node: usize) -> bool {
+        let (ancestor_depth, node_depth) = (self.nodes[ancestor].0, self.nodes[node].0);
+        if ancestor_depth > node_depth {
+            return false;
+        }
+        let mut difference = node_depth - ancestor_depth;
+        let mut bit = 0;
+        while difference != 0 {
+            if difference & 1 != 0 {
+                node = self.nodes[node].1[bit];
+            }
+            difference >>= 1;
+            bit += 1;
+        }
+        node == ancestor
+    }
+}
+
 struct Importer {
     records: Vec<Record>,
     timestamp: Option<String>,
@@ -208,7 +188,7 @@ pub(super) fn branch_selection(
                 if let Some(change) = change && let (Some(provider), Some(model)) = (change["provider"].as_str(), change["modelId"].as_str()) && catalog(provider, model) == Some(true) {
                     return selected(&change["provider"], &change["modelId"], thinking);
                 }
-                if let Some(message) = projection.raw_message(session.records(), record) {
+                if let Some(message) = projection.raw_message(session.records(), record, None) {
                     return selected(&message["provider"], &message["model"], thinking);
                 }
             }
@@ -387,6 +367,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
         importer.append(&mut root, Event::ParentSession { path: path.into() });
     }
     let mut branches = BTreeMap::<String, Branch>::new();
+    let mut ancestry = SourceAncestry::default();
     let mut previous = None;
     let mut legacy_ids: Vec<String> = Vec::new();
     let entry_count = entries.len();
@@ -458,9 +439,10 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 converted_entry = Some(migrated);
             }
         }
-        if entry["type"] == "compaction"
+        let converted = converted_entry.as_ref().unwrap_or(&entry);
+        if converted["type"] == "compaction"
             && (branch.missing_ancestors
-                || entry["firstKeptEntryId"]
+                || converted["firstKeptEntryId"]
                     .as_str()
                     .and_then(|target| branches.get(target))
                     .is_some_and(|target| target.missing_ancestors))
@@ -469,11 +451,17 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 "cannot import compaction involving an orphaned branch".into(),
             ));
         }
-        let events = convert(
-            converted_entry.as_ref().unwrap_or(&entry),
-            &mut branch,
-            &branches,
-        )?;
+        if converted["type"] == "compaction"
+            && let Some(target) = converted["firstKeptEntryId"].as_str()
+            && let Some(target_branch) = branches.get(target)
+            && !ancestry.is_ancestor(target_branch.ancestry_index, branch.ancestry_index)
+        {
+            return Err(Error::Session(format!(
+                "imported compaction target {target} is outside its branch"
+            )));
+        }
+        let parent_ancestry = branch.ancestry_index;
+        let events = convert(converted, &mut branch, &branches)?;
         let extra_compaction_metadata = (entry["type"] == "compaction"
             && (entry.get("details").is_some() || entry["fromHook"] == true))
             .then(|| {
@@ -483,12 +471,20 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 }
                 metadata
             });
-        importer.append(
+        let source_id = importer.append(
             &mut branch,
             Event::SourceEntry {
                 format: "pi".into(),
                 entry,
             },
+        );
+        // Persist the number of native records produced by this Pi entry.
+        // A zero is meaningful: later native children are not conversions.
+        compaction_metadata.insert(
+            source_id,
+            serde_json::json!({
+                "pi_rs_import_conversion_count_v1": events.len()
+            }),
         );
         branch.entry_start = branch.head + u64::from(!events.is_empty());
         branch.context_target = None;
@@ -502,6 +498,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                     | Event::Assistant { .. }
                     | Event::ToolFinished { .. }
                     | Event::ToolReconciled { .. }
+                    | Event::ImportedUnattributedToolResult { .. }
             );
             let id = importer.append(&mut branch, event);
             if is_compaction && let Some(metadata) = &extra_compaction_metadata {
@@ -511,614 +508,965 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 branch.context_target = Some(id);
             }
         }
+        branch.ancestry_index = ancestry.add(parent_ancestry);
         branches.insert(id.clone(), branch);
         legacy_ids.push(id.clone());
         previous = Some(id);
     }
     Session::from_records_with_metadata(importer.records, compaction_metadata)
 }
-fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-    value[field]
-        .as_str()
-        .ok_or_else(|| Error::Session(format!("imported entry is missing {field}")))
-}
-fn content(value: &Value) -> Result<String> {
-    if value.is_null() {
-        return Ok(String::new());
-    }
-    if let Some(text) = value.as_str() {
-        return Ok(text.into());
-    }
-    let blocks = value
-        .as_array()
-        .ok_or_else(|| Error::Session("invalid imported message content".into()))?;
-    let mut text = String::new();
-    for block in blocks {
-        match block["type"].as_str() {
-            Some("text") => text.push_str(required(block, "text")?),
-            Some("thinking" | "toolCall") => {}
-            _ => {
-                return Err(Error::Session(
-                    "this imported message content requires multimodal support".into(),
-                ));
-            }
-        }
-    }
-    Ok(text)
-}
-fn user_content(value: &Value) -> Result<(String, Vec<pi_rs::ImageContent>)> {
-    let Some(blocks) = value.as_array() else {
-        return Ok((content(value)?, Vec::new()));
-    };
-    let mut text = String::new();
-    let mut images = Vec::new();
-    for block in blocks {
-        if block["type"] == "image" {
-            let mime = required(block, "mimeType")?;
-            let data = required(block, "data")?;
-            if !matches!(
-                mime,
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            ) || base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .is_err()
-            {
-                return Err(Error::Session("invalid imported image".into()));
-            }
-            images.push(pi_rs::ImageContent {
-                data: data.into(),
-                mime_type: mime.into(),
-            });
-        } else {
-            text.push_str(&content(&Value::Array(vec![block.clone()]))?);
-        }
-    }
-    Ok((text, images))
-}
-fn push_user(events: &mut Vec<Event>, value: &Value) -> Result<()> {
-    let (content, images) = user_content(value)?;
-    events.push(Event::User {
-        content,
-        input_id: None,
-    });
-    if !images.is_empty() {
-        events.push(Event::UserImages { images });
-    }
-    Ok(())
-}
-pub(super) fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
-    let value = entry.get("content");
-    let content = if !legacy && value.is_none_or(Value::is_null) {
-        // Pi projects missing or null custom_message content as empty blocks.
-        pi_rs::ContextContent::Blocks(Vec::new())
-    } else if let Some(text) = value.and_then(Value::as_str) {
-        pi_rs::ContextContent::Text(text.into())
-    } else {
-        let blocks = value
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::Session("invalid imported custom message content".into()))?;
-        let mut result = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            match block["type"].as_str() {
-                Some("text") => result.push(pi_rs::ContentBlock::Text {
-                    text: required(block, "text")?.into(),
-                    text_signature: block["textSignature"].as_str().map(str::to_owned),
-                }),
-                Some("image") => {
-                    let (_, images) = user_content(&Value::Array(vec![block.clone()]))?;
-                    let image = &images[0];
-                    result.push(pi_rs::ContentBlock::Image {
-                        data: image.data.clone(),
-                        mime_type: image.mime_type.clone(),
-                    });
-                }
-                _ => {
-                    return Err(Error::Session(
-                        "invalid imported custom message block".into(),
-                    ));
-                }
-            }
-        }
-        pi_rs::ContextContent::Blocks(result)
-    };
-    Ok(pi_rs::CustomMessage {
-        custom_type: if legacy {
-            entry["customType"].as_str().unwrap_or_default()
-        } else {
-            required(entry, "customType")?
-        }
-        .into(),
-        content,
-        display: if legacy {
-            entry["display"].as_bool().unwrap_or(false)
-        } else {
-            entry["display"].as_bool().ok_or_else(|| {
-                Error::Session("imported custom message is missing display".into())
-            })?
-        },
-        details: entry.get("details").cloned(),
-    })
-}
-
-fn anthropic_replay(message: &Value) -> Option<Box<pi_rs::ProviderReplay>> {
-    if message["provider"] != "anthropic" || message["api"] != "anthropic-messages" {
-        return None;
-    }
-    let model = message["model"].as_str()?;
-    let mut signed = false;
-    let mut replay = Vec::new();
-    for block in message["content"].as_array()? {
-        let raw = match block["type"].as_str()? {
-            "text" => serde_json::json!({"type":"text","text":block["text"].as_str()?}),
-            "toolCall" => serde_json::json!({
-                "type":"tool_use", "id":block["id"].as_str()?, "name":block["name"].as_str()?,
-                "input":block["arguments"].as_object()?,
-            }),
-            "thinking" => {
-                let Some(signature) = block["thinkingSignature"]
-                    .as_str()
-                    .filter(|value| !value.trim().is_empty())
-                else {
-                    continue;
-                };
-                signed = true;
-                if block["redacted"] == true {
-                    serde_json::json!({"type":"redacted_thinking","data":signature})
-                } else {
-                    serde_json::json!({"type":"thinking","thinking":block["thinking"].as_str()?,"signature":signature})
-                }
-            }
-            _ => return None,
-        };
-        replay.push(raw);
-    }
-    signed.then(|| {
-        Box::new(pi_rs::ProviderReplay {
-            identity: pi_rs::ResolvedModelIdentity {
-                provider: "anthropic".into(),
-                model: model.into(),
-            },
-            blocks: replay,
-        })
-    })
-}
-
-fn google_replay(message: &Value) -> Option<Box<pi_rs::ProviderReplay>> {
-    if message["provider"] != "google" || message["api"] != "google-generative-ai" {
-        return None;
-    }
-    let model = message["model"].as_str()?;
-    let mut signed = false;
-    let mut parts = Vec::new();
-    for block in message["content"].as_array()? {
-        let (mut part, signature) = match block["type"].as_str()? {
-            "text" => (
-                serde_json::json!({"text":block["text"].as_str()?}),
-                &block["textSignature"],
-            ),
-            "thinking" => (
-                serde_json::json!({"thought":true,"text":block["thinking"].as_str()?}),
-                &block["thinkingSignature"],
-            ),
-            "toolCall" => {
-                let mut call = serde_json::json!({
-                    "name":block["name"].as_str()?,"args":block["arguments"].as_object()?,
-                });
-                if pi_rs::google::uses_tool_call_ids(model) {
-                    call["id"] = serde_json::json!(block["id"].as_str()?);
-                }
-                (
-                    serde_json::json!({"functionCall":call}),
-                    &block["thoughtSignature"],
-                )
-            }
-            _ => return None,
-        };
-        if let Some(signature) = signature.as_str().filter(|signature| !signature.is_empty()) {
-            signed = true;
-            part["thoughtSignature"] = serde_json::json!(signature);
-        }
-        parts.push(part);
-    }
-    signed.then(|| {
-        Box::new(pi_rs::ProviderReplay {
-            identity: pi_rs::ResolvedModelIdentity {
-                provider: "google".into(),
-                model: model.strip_prefix("models/").unwrap_or(model).into(),
-            },
-            blocks: parts,
-        })
-    })
-}
-
-fn convert(
-    entry: &Value,
-    branch: &mut Branch,
-    branches: &BTreeMap<String, Branch>,
-) -> Result<Vec<Event>> {
-    let mut events = Vec::new();
-    match required(entry, "type")? {
-        "message" => {
-            let message = &entry["message"];
-            match required(message, "role")? {
-                "user" => push_user(&mut events, &message["content"])?,
-                "assistant" => {
-                    let failure = match message["stopReason"].as_str() {
-                        Some("error") => Some(pi_rs::ModelFailure::Failed),
-                        Some("aborted") => Some(pi_rs::ModelFailure::Cancelled),
-                        _ => None,
-                    };
-                    let mut invocations = Vec::new();
-                    if failure.is_none()
-                        && let Some(blocks) = message["content"].as_array()
-                    {
-                        for block in blocks.iter().filter(|block| block["type"] == "toolCall") {
-                            let id = required(block, "id")?.to_owned();
-                            let operation_id = Uuid::new_v4();
-                            if branch.calls.insert(id.clone(), operation_id).is_some() {
-                                return Err(Error::Session(format!(
-                                    "duplicate unfinished imported tool call {id}"
-                                )));
-                            }
-                            invocations.push(Invocation {
-                                operation_id,
-                                call: ToolCall {
-                                    id,
-                                    name: required(block, "name")?.into(),
-                                    arguments: block["arguments"].to_string(),
-                                },
-                            });
-                        }
-                    }
-                    let started: Vec<_> = invocations
-                        .iter()
-                        .map(|invocation| Event::ToolStarted {
-                            operation_id: invocation.operation_id,
-                        })
-                        .collect();
-                    let usage = message.get("usage").map(|usage| Usage {
-                        input_tokens: usage["input"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            .saturating_add(usage["cacheRead"].as_u64().unwrap_or(0))
-                            .saturating_add(usage["cacheWrite"].as_u64().unwrap_or(0)),
-                        output_tokens: usage["output"].as_u64().unwrap_or(0),
-                    });
-                    let request_id = Uuid::new_v4();
-                    let reasoning = message["content"]
-                        .as_array()
-                        .map(|blocks| {
-                            blocks
-                                .iter()
-                                .filter(|block| block["type"] == "thinking")
-                                .filter_map(|block| block["thinking"].as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .filter(|text| !text.is_empty());
-                    events.push(Event::ModelFinished {
-                        request_id,
-                        metadata: pi_rs::ModelMetadata {
-                            cost_usd: imported_cost(&message["usage"]),
-                            cost_breakdown: pi_rs::UsageCostBreakdown::from_value(
-                                &message["usage"]["cost"],
-                            ),
-                            cost_from_provider: message["usage"]["cost"]["totalFromProvider"]
-                                .as_bool(),
-                            cache_write_1h_tokens: message["usage"]["cacheWrite1h"].as_u64(),
-                            cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
-                            cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
-                            provider_api: message["api"].as_str().and_then(pi_rs::ModelApi::named),
-                            finish_reason: message["stopReason"].as_str().map(str::to_owned),
-                            reasoning,
-                            diagnostics: pi_rs::AssistantDiagnostic::from_pi_diagnostics(
-                                &message["diagnostics"],
-                            ),
-                            replay: anthropic_replay(message).or_else(|| google_replay(message)),
-                            resolved_model: message["model"].as_str().map(|model| {
-                                pi_rs::ResolvedModelIdentity {
-                                    provider: message["provider"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .into(),
-                                    model: if message["api"] == "google-generative-ai" {
-                                        model.strip_prefix("models/").unwrap_or(model)
-                                    } else {
-                                        model
-                                    }
-                                    .into(),
-                                }
-                            }),
-                            ..Default::default()
-                        },
-                        usage: usage
-                            .map(|usage| pi_rs::UsageReport::Measured { usage })
-                            .unwrap_or(pi_rs::UsageReport::Unconfirmed),
-                        failure,
-                        partial: String::new(),
-                        reply: None,
-                    });
-                    events.push(Event::Assistant {
-                        content: content(&message["content"])?,
-                        invocations,
-                        usage,
-                        request_id: Some(request_id),
-                    });
-                    events.extend(started);
-                }
-                "toolResult" => {
-                    append_imported_usage(&mut events, &message["usage"]);
-                    let id = required(message, "toolCallId")?;
-                    let operation_id = branch.calls.remove(id).ok_or_else(|| {
-                        Error::Session(format!("imported tool result has no call {id}"))
-                    })?;
-                    let (text, images) = user_content(&message["content"])?;
-                    let outcome = if !images.is_empty() {
-                        let data = serde_json::json!({"content":message["content"],"isError":message["isError"] == true});
-                        if let Some(details) =
-                            message.get("details").filter(|details| !details.is_null())
-                        {
-                            Outcome::StructuredWithDetails {
-                                data,
-                                attachments: Vec::new(),
-                                details: details.clone(),
-                            }
-                        } else {
-                            Outcome::Structured {
-                                data,
-                                attachments: Vec::new(),
-                            }
-                        }
-                    } else if message["isError"] == true {
-                        Outcome::TextResult {
-                            output: text,
-                            details: message.get("details").cloned(),
-                            is_error: true,
-                        }
-                    } else if let Some(details) =
-                        message.get("details").filter(|details| !details.is_null())
-                    {
-                        Outcome::SucceededWithDetails {
-                            output: text,
-                            details: details.clone(),
-                        }
-                    } else {
-                        Outcome::Succeeded(text)
-                    };
-                    events.push(Event::ToolFinished {
-                        operation_id,
-                        outcome,
-                        states: Default::default(),
-                    });
-                }
-                "custom" | "hookMessage" => events.push(Event::CustomMessage {
-                    message: imported_custom_message(message, true)?,
-                }),
-                "bashExecution" => events.push(Event::BashExecution {
-                    execution: serde_json::from_value(message.clone())?,
-                }),
-                "branchSummary" => events.push(Event::BranchSummary {
-                    fallback_model: None,
-                    summary: required(message, "summary")?.into(),
-                    extension_summary: None,
-                    from: message["fromId"]
-                        .as_str()
-                        .and_then(|id| branches.get(id))
-                        .map(|branch| branch.head),
-                    target: None,
-                    usage: None,
-                    usage_metadata: None,
-                    read_files: Vec::new(),
-                    modified_files: Vec::new(),
-                }),
-                "compactionSummary" => events.push(Event::CompactionSummaryMessage {
-                    summary: required(message, "summary")?.into(),
-                    tokens_before: message["tokensBefore"].as_u64().unwrap_or(0),
-                }),
-                "system" => {
-                    let pi_rs::CompactedSystemPrompt {
-                        content,
-                        sections,
-                        tools: tools_added,
-                    } = pi_rs::CompactedSystemPrompt::from_pi(message)?;
-                    let tools_removed = message
-                        .get("toolsRemoved")
-                        .map(|value| {
-                            value
-                                .as_array()
-                                .ok_or_else(|| Error::Session("invalid removed tools".into()))?
-                                .iter()
-                                .map(|tool| required(tool, "name").map(str::to_owned))
-                                .collect::<Result<Vec<_>>>()
-                        })
-                        .transpose()?
-                        .unwrap_or_default();
-                    events.push(Event::SystemCheckpoint {
-                        content,
-                        sections,
-                        tools_added,
-                        tools_removed,
-                    });
-                }
-                role => {
-                    return Err(Error::Session(format!(
-                        "unsupported imported message role {role}"
-                    )));
-                }
-            }
-        }
-        "model_change" => {
-            branch.model = required(entry, "modelId")?.into();
-            branch.provider = entry["provider"].as_str().map(str::to_owned);
-            events.push(Event::ModelSelected {
-                model: branch.model.clone(),
-                thinking: branch.thinking.clone(),
-                provider: branch.provider.clone(),
-            });
-        }
-        "thinking_level_change" => {
-            branch.thinking = Some(required(entry, "thinkingLevel")?.into());
-            if !branch.model.is_empty() {
-                events.push(Event::ModelSelected {
-                    model: branch.model.clone(),
-                    thinking: branch.thinking.clone(),
-                    provider: branch.provider.clone(),
-                });
-            }
-        }
-        "session_info" => events.push(Event::SessionInfo {
-            name: entry["name"].as_str().map(str::to_owned),
-            cwd: None,
-        }),
-        "label" => {
-            let target = required(entry, "targetId")?;
-            let target = branches
-                .get(target)
-                .ok_or_else(|| Error::Session(format!("missing imported label target {target}")))?
-                .entry_start;
-            events.push(Event::Label {
-                target,
-                label: entry["label"].as_str().map(str::to_owned),
-            });
-        }
-        "compaction" => {
-            let target = required(entry, "firstKeptEntryId")?;
-            let retain_from = if Some(target) == entry["id"].as_str() {
-                None
-            } else {
-                Some(
-                    branches
-                        .get(target)
-                        .ok_or_else(|| {
-                            Error::Session(format!("missing imported compaction target {target}"))
-                        })?
-                        .entry_start,
-                )
-            };
-            let usage = append_imported_usage(&mut events, &entry["usage"]);
-            let usage_metadata = summary_usage_metadata(&events);
-            events.push(Event::Compacted {
-                summary: required(entry, "summary")?.into(),
-                system_prompt: entry
-                    .get("systemMessage")
-                    .filter(|message| !message.is_null())
-                    .map(pi_rs::CompactedSystemPrompt::from_pi)
-                    .transpose()?
-                    .map(Box::new),
-                retain_from,
-                tokens_before: entry["tokensBefore"].as_u64(),
-                states: Default::default(),
-                usage,
-                usage_metadata,
-            });
-        }
-        "branch_summary" => {
-            let usage = append_imported_usage(&mut events, &entry["usage"]);
-            let usage_metadata = summary_usage_metadata(&events);
-            let files = |key: &str| {
-                entry["details"][key]
-                    .as_array()
-                    .filter(|_| entry["fromHook"] != true)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            };
-            events.push(Event::BranchSummary {
-                fallback_model: None,
-                summary: required(entry, "summary")?.into(),
-                extension_summary: (entry["fromHook"] == true).then(|| {
-                    pi_rs::ExtensionTreeSummary {
-                        details: entry.get("details").cloned(),
-                    }
-                }),
-                from: entry["fromId"]
-                    .as_str()
-                    .and_then(|id| branches.get(id))
-                    .map(|branch| branch.head),
-                target: None,
-                usage,
-                usage_metadata,
-                read_files: files("readFiles"),
-                modified_files: files("modifiedFiles"),
-            });
-        }
-        "custom_message" => events.push(Event::CustomMessage {
-            message: imported_custom_message(entry, false)?,
-        }),
-        "custom" => {
-            events.push(Event::CustomEntry {
-                entry: pi_rs::CustomEntry {
-                    custom_type: required(entry, "customType")?.into(),
-                    data: entry.get("data").cloned(),
-                },
-            });
-            if entry["customType"] == "codemode-store"
-                && let (Some(set), Some(deleted)) = (
-                    entry["data"]["set"].as_object(),
-                    entry["data"]["delete"].as_array(),
-                )
-                && deleted.iter().all(Value::is_string)
-            {
-                for key in deleted.iter().filter_map(Value::as_str) {
-                    branch.store.remove(key);
-                }
-                branch
-                    .store
-                    .extend(set.iter().map(|(key, value)| (key.clone(), value.clone())));
-                let data = serde_json::to_value(&branch.store)?;
-                if data.to_string().len() > 4 * 1024 * 1024 {
-                    return Err(Error::Session(
-                        "imported codemode store exceeds size limit".into(),
-                    ));
-                }
-                events.push(Event::ExtensionStates {
-                    states: [(
-                        "codemode".into(),
-                        pi_rs::ExtensionState { version: 1, data },
-                    )]
-                    .into(),
-                });
-            }
-        }
-        "usage" => {
-            append_imported_usage(&mut events, &entry["usage"]);
-        }
-        "context_edit" => {
-            let source = required(entry, "targetId")?;
-            let target = branches
-                .get(source)
-                .and_then(|branch| branch.context_target)
-                .ok_or_else(|| {
-                    Error::Session(format!("invalid imported context edit target {source}"))
-                })?;
-            let replacement = if entry["replacement"].is_null() {
-                None
-            } else {
-                Some(serde_json::from_value(
-                    entry["replacement"]["content"].clone(),
-                )?)
-            };
-            events.push(Event::ContextEdited {
-                target,
-                replacement,
-            });
-        }
-        kind => {
-            return Err(Error::Session(format!(
-                "unsupported imported entry type {kind}"
-            )));
-        }
-    }
-    Ok(events)
-}
+pub(super) use pi_rs::pi_import::imported_custom_message;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_rs::Message;
+    use pi_rs::{Message, Outcome};
     use serde_json::json;
+
+    #[test]
+    fn shared_import_google_tool_id_rule_matches_provider() {
+        // The core importer cannot depend on the Google adapter. Keep this
+        // parity check when either model-family rule changes.
+        for model in [
+            "gemini-2.5-pro",
+            "gemini-3-pro",
+            "Gemini-03-flash",
+            "models/gemini-live-3-preview",
+            "gemini-unknown",
+            "claude-test",
+            "gpt-oss-20b",
+            "other",
+        ] {
+            assert_eq!(
+                pi_rs::pi_import::google_uses_tool_call_ids(model),
+                pi_rs::google::uses_tool_call_ids(model),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_v1_uses_later_global_label_state_after_reopen() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":1}),
+            json!({"type":"message","message":{"role":"user","content":"first"}}),
+            json!({"type":"label","targetId":"legacy-1","label":"later","timestamp":"2024-01-03T00:00:00Z"}),
+        ]).unwrap();
+        let target = session
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, Event::User { content, .. } if content == "first"))
+            .unwrap()
+            .id;
+        let fork = session.fork_session(target).unwrap();
+        let check = |fork: &Session| {
+            assert!(fork.labels().values().any(|label| label == "later"));
+            assert!(
+                fork.label_timestamps()
+                    .values()
+                    .any(|time| time == "2024-01-03T00:00:00Z")
+            );
+        };
+        check(&fork);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        fork.export_jsonl(&path).unwrap();
+        check(&read(&path).unwrap());
+    }
+
+    #[test]
+    fn fork_imported_labels_resolve_globally_and_remap_compaction() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"user","content":"second"}}),
+            json!({"type":"label","id":"l","parentId":"b","targetId":"a","label":"stale","timestamp":"2024-01-01T00:00:00Z"}),
+            json!({"type":"compaction","id":"c","parentId":"l","firstKeptEntryId":"l","summary":"summary","tokensBefore":42,"fromHook":true,"details":{"source":"extension"}}),
+            json!({"type":"label","id":"clear","parentId":"b","targetId":"a","timestamp":"2024-01-02T00:00:00Z"}),
+            json!({"type":"label","id":"set","parentId":"clear","targetId":"b","label":"current","timestamp":"2024-01-03T00:00:00Z"}),
+        ]).unwrap();
+        let compact_id = session
+            .records()
+            .iter()
+            .find(|r| matches!(r.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let fork = session.fork_session(compact_id).unwrap();
+        let entries = super::super::rpc_entries::Entries::new(&fork)
+            .after(None)
+            .unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        let labels: Vec<_> = entries.iter().filter(|e| e["type"] == "label").collect();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0]["label"], "current");
+        assert_eq!(labels[0]["timestamp"], "2024-01-03T00:00:00Z");
+        let second = entries
+            .iter()
+            .find(|e| e["type"] == "message" && e["message"]["content"] == "second")
+            .unwrap();
+        assert_eq!(labels[0]["targetId"], second["id"]);
+        let compact = entries.iter().find(|e| e["type"] == "compaction").unwrap();
+        assert_eq!(compact["firstKeptEntryId"], compact["id"]);
+        let native = fork
+            .records()
+            .iter()
+            .find(|r| matches!(r.event, Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            fork.record_metadata(native.id),
+            Some(&json!({"fromExtension":true,"details":{"source":"extension"}}))
+        );
+        let messages = fork.current_messages();
+        assert!(!messages.iter().any(
+            |m| matches!(m, Message::User { content } if content == "first" || content == "second")
+        ));
+    }
+
+    #[test]
+    fn fork_imported_sources_and_compaction_survive_reopen() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"retained"}}),
+            json!({"type":"custom","id":"x","parentId":"u","customType":"fixture","data":{"k":1}}),
+            json!({"type":"compaction","id":"c","parentId":"x","firstKeptEntryId":"u","summary":"summary","tokensBefore":10}),
+        ]).unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        fork.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        for session in [&fork, &reopened] {
+            let projection = super::super::rpc_entries::Entries::new(session)
+                .after(None)
+                .unwrap();
+            let entries = projection["entries"].as_array().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e["type"] == "message" && e["message"]["content"] == "retained")
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e["type"] == "custom" && e["customType"] == "fixture")
+            );
+            assert!(entries.iter().any(|e| e["type"] == "compaction"));
+            assert!(
+                session
+                    .current_messages()
+                    .iter()
+                    .any(|m| matches!(m, Message::User { content } if content == "retained"))
+            );
+        }
+    }
+
+    #[test]
+    fn fork_imported_label_and_native_clear_share_target_identity() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"label","id":"l","parentId":"u","targetId":"u","label":"stale"}),
+        ]).unwrap();
+        let target = session.head();
+        let source = session
+            .records()
+            .iter()
+            .find(|r| {
+                matches!(&r.event,
+            Event::SourceEntry { format, entry } if format == "pi" && entry["id"] == "u")
+            })
+            .unwrap()
+            .id;
+        session.set_label(source, None).unwrap();
+        let fork = session.fork_session(target).unwrap();
+        assert!(fork.labels().is_empty());
+    }
+
+    #[test]
+    fn fork_imported_multirecord_targets_and_native_clear_share_identity() {
+        for entry in [
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop","usage":{"input":1,"output":1}}}),
+            json!({"type":"compaction","id":"a","parentId":"u","firstKeptEntryId":"u","summary":"summary","tokensBefore":10,"usage":{"input":1,"output":1}}),
+        ] {
+            let mut session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+                entry,
+                json!({"type":"label","id":"l","parentId":"a","targetId":"a","label":"stale"}),
+            ]).unwrap();
+            let target = session.head();
+            let source = session
+                .records()
+                .iter()
+                .find(|r| {
+                    matches!(&r.event,
+                Event::SourceEntry { format, entry } if format == "pi" && entry["id"] == "a")
+                })
+                .unwrap()
+                .id;
+            assert!(matches!(
+                session.records()[source as usize].event,
+                Event::ModelFinished { .. }
+            ));
+            session.set_label(source, None).unwrap();
+            assert!(session.fork_session(target).unwrap().labels().is_empty());
+        }
+    }
+
+    #[test]
+    fn fork_completes_partial_imported_user_and_assistant_conversions() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}}),
+        ]).unwrap();
+        let user_source = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let assistant_source = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let assistant_first = assistant_source + 1;
+        assert!(matches!(
+            session.records()[assistant_source as usize].event,
+            Event::ModelFinished { .. }
+        ));
+        let user = session.fork_session(user_source).unwrap();
+        assert!(
+            user.current_messages()
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "hello"))
+        );
+        for target in [assistant_source, assistant_first] {
+            let fork = session.fork_session(target).unwrap();
+            assert!(
+                fork.records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::Assistant { .. }))
+            );
+        }
+        assert!(session.fork_session(session.head()).is_ok());
+    }
+
+    #[test]
+    fn fork_rejects_forged_zero_conversion_for_imported_user() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|record| {
+                imported
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        metadata.insert(source, json!({"pi_rs_import_conversion_count_v1":0}));
+        let forged =
+            Session::from_records_with_metadata(imported.records().to_vec(), metadata).unwrap();
+        assert!(forged.fork_session(forged.head()).is_err());
+    }
+
+    #[test]
+    fn invalid_projection_does_not_restore_or_record_model_selection() {
+        use clap::Parser;
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|r| imported.record_metadata(r.id).map(|m| (r.id, m.clone())))
+            .collect();
+        metadata.insert(source, json!({"pi_rs_import_conversion_count_v1":0}));
+        let mut session =
+            Session::from_records_with_metadata(imported.records().to_vec(), metadata).unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        let before = session.records().len();
+        assert!(args.restore_session_model(&session).is_err());
+        assert!(args.record_automatic_model_selection(&mut session).is_err());
+        assert_eq!(session.records().len(), before);
+    }
+
+    #[test]
+    fn fork_rejects_forged_zero_conversion_for_imported_compaction() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"summary","tokensBefore":10}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "c")).unwrap().id;
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|record| {
+                imported
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        metadata.insert(source, json!({"pi_rs_import_conversion_count_v1":0}));
+        let forged =
+            Session::from_records_with_metadata(imported.records().to_vec(), metadata).unwrap();
+        assert!(forged.fork_session(forged.head()).is_err());
+    }
+
+    #[test]
+    fn fork_rejects_forged_assistant_conversion_counts() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        for count in [0, 3] {
+            let mut records = imported.records().to_vec();
+            if count == 3 {
+                let mut child = records.last().unwrap().clone();
+                child.id += 1;
+                child.parent = Some(child.id - 1);
+                child.event = Event::SessionInfo {
+                    name: Some("native".into()),
+                    cwd: None,
+                };
+                records.push(child);
+            }
+            let mut metadata: BTreeMap<_, _> = imported
+                .records()
+                .iter()
+                .filter_map(|record| {
+                    imported
+                        .record_metadata(record.id)
+                        .map(|value| (record.id, value.clone()))
+                })
+                .collect();
+            metadata.insert(source, json!({"pi_rs_import_conversion_count_v1":count}));
+            let forged = Session::from_records_with_metadata(records, metadata).unwrap();
+            assert!(
+                forged.fork_session(forged.head()).is_err(),
+                "accepted forged assistant count {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_rejects_imported_assistant_with_mismatched_request_identity() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}}),
+        ]).unwrap();
+        let mut records = imported.records().to_vec();
+        let assistant = records
+            .iter_mut()
+            .find(|record| matches!(record.event, Event::Assistant { .. }))
+            .unwrap();
+        if let Event::Assistant { request_id, .. } = &mut assistant.event {
+            *request_id = Some(Uuid::new_v4());
+        }
+        let metadata = imported
+            .records()
+            .iter()
+            .filter_map(|record| {
+                imported
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        let forged = Session::from_records_with_metadata(records, metadata).unwrap();
+        assert!(forged.fork_session(forged.head()).is_err());
+    }
+
+    #[test]
+    fn fork_verifies_legacy_call_before_marked_tool_result() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"r","parentId":"a","message":{"role":"toolResult","toolCallId":"call","toolName":"read","content":[{"type":"text","text":"done"}],"isError":false}}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|record| {
+                imported
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        metadata.remove(&source);
+        let mixed =
+            Session::from_records_with_metadata(imported.records().to_vec(), metadata.clone())
+                .unwrap();
+        assert!(mixed.fork_session(mixed.head()).is_ok());
+        let mut broken = imported.records().to_vec();
+        let result = broken
+            .iter_mut()
+            .find(|record| matches!(record.event, Event::ToolFinished { .. }))
+            .unwrap();
+        if let Event::ToolFinished { operation_id, .. } = &mut result.event {
+            *operation_id = Uuid::new_v4();
+        }
+        let broken = Session::from_records_with_metadata(broken, metadata).unwrap();
+        assert!(broken.fork_session(broken.head()).is_err());
+    }
+
+    #[test]
+    fn stream_rejects_invalid_unmarked_source_before_descendants() {
+        let base = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = base.records().to_vec();
+        let mut invalid = records[0].clone();
+        invalid.id = 2;
+        invalid.parent = Some(1);
+        invalid.timestamp = None;
+        invalid.event = Event::SourceEntry {
+            format: "pi".into(),
+            entry: json!({"type":"message","id":"r","parentId":null,"message":{"role":"toolResult","toolCallId":"missing","content":"bad"}}),
+        };
+        records.push(invalid.clone());
+        let mut descendant = invalid;
+        descendant.id = 3;
+        descendant.parent = Some(2);
+        descendant.event = Event::SourceEntry {
+            format: "pi".into(),
+            entry: json!({"type":"message","id":"u","parentId":"r","message":{"role":"user","content":"later"}}),
+        };
+        records.push(descendant.clone());
+        descendant.id = 4;
+        descendant.parent = Some(3);
+        descendant.event = Event::User {
+            content: "later".into(),
+            input_id: None,
+        };
+        records.push(descendant);
+        let session = Session::from_records(records).unwrap();
+        let mut replay = pi_rs::pi_import::StreamVerifier::new();
+        assert!(
+            replay
+                .advance(session.records(), &BTreeMap::new(), true)
+                .is_err()
+        );
+        assert_eq!(replay.processed(), 1);
+        assert!(replay.counts().is_empty());
+        assert!(
+            replay
+                .advance(session.records(), &BTreeMap::new(), true)
+                .is_err()
+        );
+        assert_eq!(replay.processed(), 1);
+    }
+
+    #[test]
+    fn fork_rejects_forged_positive_compaction_conversion_count() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"summary","tokensBefore":10}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "c")).unwrap().id;
+        let mut records = imported.records().to_vec();
+        let mut child = records.last().unwrap().clone();
+        child.id += 1;
+        child.parent = Some(child.id - 1);
+        child.event = Event::SessionInfo {
+            name: Some("native".into()),
+            cwd: None,
+        };
+        records.push(child);
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|record| {
+                imported
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        metadata.insert(source, json!({"pi_rs_import_conversion_count_v1":2}));
+        let forged = Session::from_records_with_metadata(records, metadata).unwrap();
+        assert!(forged.fork_session(forged.head()).is_err());
+    }
+
+    #[test]
+    fn fork_rejects_forged_conversion_claiming_native_model_child() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"t","parentId":null,"thinkingLevel":"high"}),
+        ])
+        .unwrap();
+        let source = imported.head();
+        let mut records = imported.records().to_vec();
+        let mut child = records.last().unwrap().clone();
+        child.id += 1;
+        child.parent = Some(source);
+        child.event = Event::ModelSelected {
+            model: "native".into(),
+            provider: None,
+            thinking: Some("high".into()),
+        };
+        records.push(child);
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|record| {
+                imported
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        metadata.insert(source, json!({"pi_rs_import_conversion_count_v1":1}));
+        let forged = Session::from_records_with_metadata(records, metadata).unwrap();
+        assert!(forged.fork_session(forged.head()).is_err());
+    }
+
+    #[test]
+    fn fork_ignores_unrelated_sibling_bad_conversion_metadata() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"one"}}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"two"}}),
+        ]).unwrap();
+        let first = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, Event::User { content, .. } if content == "one"))
+            .unwrap()
+            .id;
+        let other = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == "b"))
+            .unwrap()
+            .id;
+        let mut metadata: BTreeMap<_, _> = imported
+            .records()
+            .iter()
+            .filter_map(|r| imported.record_metadata(r.id).map(|m| (r.id, m.clone())))
+            .collect();
+        metadata.insert(other, json!({"pi_rs_import_conversion_count_v1":u64::MAX}));
+        let session =
+            Session::from_records_with_metadata(imported.records().to_vec(), metadata).unwrap();
+        assert!(session.fork_session(first).is_ok());
+    }
+
+    #[test]
+    fn fork_rejects_relevant_duplicate_source_ids_including_v1_synthetic() {
+        for version in [1, 3] {
+            let entries = if version == 1 {
+                vec![
+                    json!({"type":"session","version":1}),
+                    json!({"type":"message","message":{"role":"user","content":"one"}}),
+                    json!({"type":"message","id":"legacy-2","message":{"role":"user","content":"two"}}),
+                ]
+            } else {
+                vec![
+                    json!({"type":"session","version":3}),
+                    json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"one"}}),
+                    json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"two"}}),
+                ]
+            };
+            let imported = import_pi(entries).unwrap();
+            let target = imported
+                .records()
+                .iter()
+                .find(|r| matches!(&r.event, Event::User { content, .. } if content == "one"))
+                .unwrap()
+                .id;
+            let mut records = imported.records().to_vec();
+            let source = records.iter_mut().find(|r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == if version == 1 { "legacy-2" } else { "b" })).unwrap();
+            if let Event::SourceEntry { entry, .. } = &mut source.event {
+                entry["id"] = json!(if version == 1 { "legacy-1" } else { "a" });
+            }
+            let metadata = imported
+                .records()
+                .iter()
+                .filter_map(|r| imported.record_metadata(r.id).map(|m| (r.id, m.clone())))
+                .collect();
+            let session = Session::from_records_with_metadata(records, metadata).unwrap();
+            assert!(
+                session
+                    .fork_session(target)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("duplicate")
+            );
+        }
+    }
+
+    #[test]
+    fn fork_allows_header_id_equal_to_entry_id() {
+        for entries in [
+            vec![
+                json!({"type":"session","version":3,"id":"a"}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hello"}}),
+            ],
+            vec![
+                json!({"type":"session","version":1,"id":"legacy-1"}),
+                json!({"type":"message","message":{"role":"user","content":"hello"}}),
+            ],
+        ] {
+            let session = import_pi(entries).unwrap();
+            assert!(session.fork_session(session.head()).is_ok());
+        }
+    }
+
+    #[test]
+    fn fork_rejects_missing_nonstring_or_empty_relevant_source_id() {
+        for version in [2, 3] {
+            for value in [None, Some(json!(17)), Some(json!(""))] {
+                let imported = import_pi(vec![
+                    json!({"type":"session","version":version}),
+                    json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hello"}}),
+                ]).unwrap();
+                let mut records = imported.records().to_vec();
+                let source = records.iter_mut().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap();
+                if let Event::SourceEntry { entry, .. } = &mut source.event {
+                    if let Some(value) = value {
+                        entry["id"] = value;
+                    } else {
+                        entry.as_object_mut().unwrap().remove("id");
+                    }
+                }
+                let metadata = imported
+                    .records()
+                    .iter()
+                    .filter_map(|r| imported.record_metadata(r.id).map(|m| (r.id, m.clone())))
+                    .collect();
+                let session = Session::from_records_with_metadata(records, metadata).unwrap();
+                assert!(
+                    session
+                        .fork_session(session.head())
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("source ID")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fork_replays_many_linear_codemode_updates_with_bounded_branch_copies() {
+        let mut entries = vec![json!({"type":"session","version":3})];
+        let mut parent = Value::Null;
+        for index in 0..400 {
+            let id = format!("e{index}");
+            entries.push(json!({"type":"custom","id":id,"parentId":parent,"customType":"codemode-store", "data":{"set":{(format!("key{index}")):"x".repeat(100)},"delete":[]}}));
+            parent = json!(id);
+        }
+        let session = import_pi(entries).unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        assert_eq!(
+            fork.records()
+                .iter()
+                .filter(|record| matches!(record.event, Event::ExtensionStates { .. }))
+                .count(),
+            400
+        );
+    }
+
+    #[test]
+    fn fork_replays_large_inherited_store_across_many_relevant_siblings() {
+        let mut entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"custom","id":"seed","parentId":null,"customType":"codemode-store","data":{"set":{"large":"x".repeat(1024 * 1024)},"delete":[]}}),
+        ];
+        for index in 0..160 {
+            entries.push(json!({"type":"label","id":format!("l{index}"),"parentId":"seed","targetId":"seed","label":format!("label{index}")}));
+        }
+        let session = import_pi(entries).unwrap();
+        let target = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::ExtensionStates { .. }))
+            .unwrap()
+            .id;
+        let fork = session.fork_session(target).unwrap();
+        assert!(fork.labels().values().any(|label| label == "label159"));
+    }
+
+    #[test]
+    fn fork_ignores_unreferenced_duplicate_sibling_source_ids() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"one"}}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"two"}}),
+            json!({"type":"message","id":"c","parentId":null,"message":{"role":"user","content":"three"}}),
+        ]).unwrap();
+        let target = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, Event::User { content, .. } if content == "one"))
+            .unwrap()
+            .id;
+        let mut records = imported.records().to_vec();
+        let source = records
+            .iter_mut()
+            .find(|r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == "c"))
+            .unwrap();
+        if let Event::SourceEntry { entry, .. } = &mut source.event {
+            entry["id"] = json!("b");
+        }
+        let metadata = imported
+            .records()
+            .iter()
+            .filter_map(|r| imported.record_metadata(r.id).map(|m| (r.id, m.clone())))
+            .collect();
+        let session = Session::from_records_with_metadata(records, metadata).unwrap();
+        assert!(session.fork_session(target).is_ok());
+    }
+
+    #[test]
+    fn fork_imported_sibling_does_not_require_other_branch_conversions() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"one"}}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"two"}}),
+        ]).unwrap();
+        let first = imported
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, Event::User { content, .. } if content == "one"))
+            .unwrap()
+            .id;
+        let fork = imported.fork_session(first).unwrap();
+        assert!(
+            fork.current_messages()
+                .iter()
+                .any(|message| matches!(message, Message::User { content } if content == "one"))
+        );
+        assert!(
+            !fork
+                .current_messages()
+                .iter()
+                .any(|message| matches!(message, Message::User { content } if content == "two"))
+        );
+    }
+
+    #[test]
+    fn fork_does_not_treat_native_child_of_zero_conversion_as_imported() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"t","parentId":null,"thinkingLevel":"high"}),
+        ])
+        .unwrap();
+        let source = session.head();
+        let mut records = session.records().to_vec();
+        let mut native = records.last().unwrap().clone();
+        native.id += 1;
+        native.parent = Some(source);
+        native.event = Event::ModelSelected {
+            model: "native".into(),
+            provider: None,
+            thinking: Some("high".into()),
+        };
+        records.push(native);
+        let metadata = session
+            .records()
+            .iter()
+            .filter_map(|r| session.record_metadata(r.id).map(|m| (r.id, m.clone())))
+            .collect();
+        let mut session = Session::from_records_with_metadata(records, metadata).unwrap();
+        let native = session.head();
+        let changes = super::super::rpc_entries::changes(&session, (native - 1) as usize).unwrap();
+        assert!(changes.iter().any(|entry| entry["type"] == "model_change"));
+        let mut cursor = super::super::rpc_entries::Cursor::default();
+        cursor.set_verified_counts(&session.validated_pi_conversion_counts().unwrap());
+        cursor.advance(&session.records()[..(native - 1) as usize]);
+        let live = cursor.appended(session.records(), None, &Default::default());
+        assert_eq!(changes, live);
+        session.set_label(source, Some("source".into())).unwrap();
+        session.set_label(native, Some("native".into())).unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        assert_eq!(fork.labels().len(), 2);
+        let projection = super::super::rpc_entries::Entries::new(&fork)
+            .after(None)
+            .unwrap();
+        let labels: Vec<_> = projection["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "label")
+            .collect();
+        assert_eq!(labels.len(), 2);
+        assert_ne!(labels[0]["targetId"], labels[1]["targetId"]);
+    }
+
+    #[test]
+    fn fork_resolves_verified_legacy_import_label_target() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"label","id":"l","parentId":"u","targetId":"u","label":"saved"}),
+        ]).unwrap();
+        let mut legacy = Session::from_records(imported.records().to_vec()).unwrap();
+        let target = legacy.head();
+        assert!(legacy.fork_session(target).is_ok());
+        let source = legacy
+            .records()
+            .iter()
+            .find(|r| {
+                matches!(&r.event,
+            Event::SourceEntry { entry, .. } if entry["id"] == "u")
+            })
+            .unwrap()
+            .id;
+        legacy.set_label(source, None).unwrap();
+        assert!(legacy.fork_session(target).unwrap().labels().is_empty());
+    }
+
+    #[test]
+    fn fork_records_can_be_reconstructed_and_forked_again() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"label","id":"l","parentId":"u","targetId":"u","label":"saved"}),
+        ]).unwrap();
+        let records = imported.fork_records(imported.head()).unwrap();
+        let restored = Session::from_records(records).unwrap();
+        let fork = restored.fork_session(restored.head()).unwrap();
+        assert!(fork.labels().values().any(|label| label == "saved"));
+    }
+
+    #[test]
+    fn fork_normalizes_unmarked_legacy_partial_conversions() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}}),
+        ]).unwrap();
+        let session = Session::from_records(imported.records().to_vec()).unwrap();
+        let user = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let assistant = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let fork = session.fork_session(user).unwrap();
+        assert!(
+            fork.current_messages()
+                .iter()
+                .any(|message| matches!(message, Message::User { content } if content == "hello"))
+        );
+        let fork = session.fork_session(assistant + 1).unwrap();
+        assert!(
+            fork.records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Assistant { .. }))
+        );
+    }
+
+    #[test]
+    fn fork_rejects_competing_unmarked_legacy_conversions() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+        ]).unwrap();
+        let source = imported.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let mut records = imported.records().to_vec();
+        let mut checkout = records.last().unwrap().clone();
+        checkout.id = records.len() as u64 + 1;
+        checkout.parent = Some(checkout.id - 1);
+        checkout.event = Event::Checkout { target: source };
+        records.push(checkout);
+        let mut duplicate = records[source as usize].clone();
+        duplicate.id = records.len() as u64 + 1;
+        duplicate.parent = Some(source);
+        records.push(duplicate);
+        let legacy = Session::from_records(records).unwrap();
+        let mut replay = pi_rs::pi_import::StreamVerifier::new();
+        assert!(
+            replay
+                .advance(
+                    &legacy.records()[..source as usize + 1],
+                    &BTreeMap::new(),
+                    false
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            replay
+                .advance(legacy.records(), &BTreeMap::new(), false)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(
+            legacy
+                .validated_pi_conversion_counts()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(
+            legacy
+                .fork_session(source)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn fork_resolves_verified_legacy_multirecord_alias() {
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other"}}),
+        ]).unwrap();
+        let mut legacy = Session::from_records(imported.records().to_vec()).unwrap();
+        let source = legacy
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"))
+            .unwrap()
+            .id;
+        let assistant = legacy
+            .records()
+            .iter()
+            .find(|r| matches!(r.event, Event::Assistant { .. }))
+            .unwrap()
+            .id;
+        let other = legacy
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, Event::User { content, .. } if content == "other"))
+            .unwrap()
+            .id;
+        legacy.set_label(assistant, Some("saved".into())).unwrap();
+        legacy.set_label(source, None).unwrap();
+        assert!(legacy.fork_session(assistant).unwrap().labels().is_empty());
+        assert!(legacy.fork_session(other).is_ok());
+    }
+
+    #[test]
+    fn fork_v1_compaction_rewrites_removed_label_boundary() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":1}),
+            json!({"type":"message","message":{"role":"user","content":"old"}}),
+            json!({"type":"label","targetId":"legacy-1","label":"bookmark"}),
+            json!({"type":"compaction","firstKeptEntryIndex":2,"summary":"summary","tokensBefore":10}),
+        ]).unwrap();
+        let fork = session.fork_session(session.head()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork.jsonl");
+        fork.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        for session in [&fork, &reopened] {
+            let projection = super::super::rpc_entries::Entries::new(session)
+                .after(None)
+                .unwrap();
+            let entries = projection["entries"].as_array().unwrap();
+            let compact = entries.iter().find(|e| e["type"] == "compaction").unwrap();
+            assert_eq!(compact["firstKeptEntryId"], compact["id"]);
+            assert!(
+                !session
+                    .current_messages()
+                    .iter()
+                    .any(|m| matches!(m, Message::User { content } if content == "old"))
+            );
+        }
+    }
 
     #[test]
     fn imported_compaction_metadata_survives_native_export_and_reload() {
@@ -1341,7 +1689,11 @@ mod tests {
             ];
             let session = import_pi(entries.clone()).unwrap();
             assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
-            assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+            assert!(
+                super::super::rpc_entries::Entries::new(&session)
+                    .has_session_context()
+                    .unwrap()
+            );
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.model = "alpha".into();
             args.model_scope
@@ -1351,20 +1703,28 @@ mod tests {
                     thinking: Some("high".into()),
                 });
             args.remember_initial_selection();
-            args.restore_session_model(&session);
+            args.restore_session_model(&session).unwrap();
             assert_eq!(args.thinking.as_deref(), Some("low"));
 
             let mut omitted = entries.clone();
             omitted.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":null}));
             let omitted = import_pi(omitted).unwrap();
-            assert!(!super::super::rpc_entries::Entries::new(&omitted).has_session_context());
-            args.restore_session_model(&omitted);
+            assert!(
+                !super::super::rpc_entries::Entries::new(&omitted)
+                    .has_session_context()
+                    .unwrap()
+            );
+            args.restore_session_model(&omitted).unwrap();
             assert_eq!(args.thinking.as_deref(), Some("high"));
 
             let mut replaced = entries;
             replaced.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":{"content":[]}}));
             let replaced = import_pi(replaced).unwrap();
-            assert!(super::super::rpc_entries::Entries::new(&replaced).has_session_context());
+            assert!(
+                super::super::rpc_entries::Entries::new(&replaced)
+                    .has_session_context()
+                    .unwrap()
+            );
         }
     }
 
@@ -1377,7 +1737,11 @@ mod tests {
             json!({"type":"context_edit","id":"e","parentId":"r","targetId":"a","replacement":null}),
         ]).unwrap();
         assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
-        assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+        assert!(
+            super::super::rpc_entries::Entries::new(&session)
+                .has_session_context()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1430,7 +1794,11 @@ mod tests {
         let mut session = Session::from_records(records).unwrap();
         session.edit_context(user, None).unwrap();
         assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
-        assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+        assert!(
+            super::super::rpc_entries::Entries::new(&session)
+                .has_session_context()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1442,10 +1810,18 @@ mod tests {
             json!({"type":"context_edit","id":"restore","parentId":"omit","targetId":"u","replacement":{"content":"restored"}}),
             json!({"type":"custom","id":"other","parentId":"omit","customType":"metadata"}),
         ]).unwrap();
-        assert!(!super::super::rpc_entries::Entries::new(&session).has_session_context());
+        assert!(
+            !super::super::rpc_entries::Entries::new(&session)
+                .has_session_context()
+                .unwrap()
+        );
         let restored = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "restore")).unwrap().id;
         session.checkout(restored).unwrap();
-        assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+        assert!(
+            super::super::rpc_entries::Entries::new(&session)
+                .has_session_context()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1454,17 +1830,29 @@ mod tests {
             json!({"type":"session","version":3}),
             json!({"type":"message","id":"s","parentId":null,"message":{"role":"system","content":""}}),
         ]).unwrap();
-        assert!(super::super::rpc_entries::Entries::new(&system).has_session_context());
+        assert!(
+            super::super::rpc_entries::Entries::new(&system)
+                .has_session_context()
+                .unwrap()
+        );
         let compacted = import_pi(vec![
             json!({"type":"session","version":3}),
             json!({"type":"compaction","id":"c","parentId":null,"firstKeptEntryId":"c","summary":"","tokensBefore":0}),
         ]).unwrap();
-        assert!(super::super::rpc_entries::Entries::new(&compacted).has_session_context());
+        assert!(
+            super::super::rpc_entries::Entries::new(&compacted)
+                .has_session_context()
+                .unwrap()
+        );
         let summary = import_pi(vec![
             json!({"type":"session","version":3}),
             json!({"type":"branch_summary","id":"s","parentId":null,"fromId":"unused","summary":""}),
         ]).unwrap();
-        assert!(!super::super::rpc_entries::Entries::new(&summary).has_session_context());
+        assert!(
+            !super::super::rpc_entries::Entries::new(&summary)
+                .has_session_context()
+                .unwrap()
+        );
     }
 
     fn native_completion(mut session: Session, provider: &str, model: &str) -> Session {
@@ -1544,7 +1932,7 @@ mod tests {
         let mut args = super::super::Cli::parse_from(["pi"]);
         args.model = "changed-default".into();
         args.remember_initial_selection();
-        args.restore_session_model(&reopened);
+        args.restore_session_model(&reopened).unwrap();
         assert_eq!(args.model, "actual");
     }
 
@@ -1594,7 +1982,7 @@ mod tests {
         let mut args = super::super::Cli::parse_from(["pi"]);
         args.model = "initial".into();
         args.remember_initial_selection();
-        args.restore_session_model(&reopened);
+        args.restore_session_model(&reopened).unwrap();
         assert_eq!(args.provider.id(), "ollama");
         assert_eq!(args.model, "virtual");
     }
@@ -1729,6 +2117,188 @@ mod tests {
     }
 
     #[test]
+    fn imported_tool_call_ids_can_be_reused_after_a_new_turn() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"same","name":"read","arguments":{"path":"old"}}]}}),
+            json!({"type":"message","id":"u","parentId":"a","message":{"role":"user","content":"retry"}}),
+            json!({"type":"message","id":"b","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","id":"same","name":"read","arguments":{"path":"new"}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"same","content":[{"type":"text","text":"new result"}],"isError":false}}),
+        ]).unwrap();
+        let starts: Vec<_> = session
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolStarted { operation_id } => Some(*operation_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert!(!session.records().iter().any(|r| matches!(&r.event,
+            Event::ToolFinished { operation_id, .. } if *operation_id == starts[1])));
+        assert!(session.records().iter().any(|r| matches!(&r.event,
+            Event::SourceEntry { entry, .. } if entry["id"] == "r")));
+        assert!(!session.records().iter().any(|r| matches!(&r.event,
+            Event::ToolFinished { operation_id, .. } if *operation_id == starts[0])));
+    }
+
+    #[test]
+    fn imported_assistant_can_reuse_call_id_but_duplicate_in_one_message_fails() {
+        let assistant = |id: &str, parent: Value, calls: Value| json!({"type":"message","id":id,"parentId":parent,"message":{"role":"assistant","content":calls}});
+        let call = json!({"type":"toolCall","id":"same","name":"read","arguments":{}});
+        let header = json!({"type":"session","version":3});
+        assert!(
+            import_pi(vec![
+                header.clone(),
+                assistant("a", Value::Null, json!([call.clone()])),
+                assistant("b", json!("a"), json!([call.clone()])),
+            ])
+            .is_ok()
+        );
+        assert!(
+            import_pi(vec![
+                header,
+                assistant("a", Value::Null, json!([call.clone(), call])),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reused_unfinished_ids_leave_all_ambiguous_results_unresolved() {
+        for second_name in ["write", "read"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+                json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":second_name,"arguments":{}}]}}),
+                json!({"type":"message","id":"r1","parentId":"b","message":{"role":"toolResult","toolCallId":"x","toolName":"write","content":[{"type":"text","text":"first"}]}}),
+                json!({"type":"message","id":"r2","parentId":"r1","message":{"role":"toolResult","toolCallId":"x","toolName":second_name,"content":[{"type":"text","text":"second"}]}}),
+            ]).unwrap();
+            assert_eq!(
+                session
+                    .records()
+                    .iter()
+                    .filter(|r| matches!(r.event, Event::ToolStarted { .. }))
+                    .count(),
+                2
+            );
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+            );
+            for id in ["r1", "r2"] {
+                assert!(session.records().iter().any(
+                    |r| matches!(&r.event, Event::SourceEntry { entry, .. } if entry["id"] == id)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_tool_result_is_visible_and_editable_without_settling_calls() {
+        let base = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"x","toolName":"write","content":[{"type":"text","text":"original result"}],"isError":true}}),
+        ];
+        let session = import_pi(base.clone()).unwrap();
+        assert!(super::super::sessions::html(&session).contains("original result"));
+        assert!(super::super::sessions::html(&session).contains("Unattributed tool result"));
+        let (visible, _) = super::super::rpc_messages::snapshot(&session);
+        assert!(visible.iter().any(|v| v["role"] == "user"
+            && v["nativeUnattributed"] == true
+            && v["content"].to_string().contains("original result")
+            && v["content"].to_string().contains(", error)")));
+        assert!(!visible.iter().any(|v| v["role"] == "toolResult"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopened.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(super::super::sessions::html(&reopened).contains("original result"));
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+        );
+        let mut reconciled = import_pi(base.clone()).unwrap();
+        let operation_ids: Vec<_> = reconciled
+            .operations()
+            .into_iter()
+            .map(|(invocation, _)| invocation.operation_id)
+            .collect();
+        for operation_id in operation_ids {
+            reconciled
+                .reconcile(
+                    operation_id,
+                    pi_rs::Outcome::Succeeded("confirmed separately".into()),
+                )
+                .unwrap();
+        }
+        assert!(reconciled.conversation_at(reconciled.head()).unwrap().iter().any(
+            |m| matches!(m, pi_rs::Message::User { content } if content.contains("original result") && content.contains(", error)"))
+        ));
+        let mut success = base.clone();
+        success[3]["message"]["isError"] = json!(false);
+        let success = import_pi(success).unwrap();
+        assert!(success.current_messages().iter().any(
+            |m| matches!(m, pi_rs::Message::User { content } if content.contains(", success)"))
+        ));
+        let mut edited = base.clone();
+        edited.push(json!({"type":"context_edit","id":"e","parentId":"r","targetId":"r","replacement":{"content":[{"type":"text","text":"replacement"}]}}));
+        let edited = import_pi(edited).unwrap();
+        let (edited_visible, _) = super::super::rpc_messages::snapshot(&edited);
+        assert!(edited_visible.iter().any(|v| v["role"] == "user"
+            && v["nativeUnattributed"] == true
+            && v["content"].to_string().contains("replacement")
+            && v["content"].to_string().contains(", error)")));
+        assert!(!edited_visible.iter().any(|v| v["role"] == "toolResult"));
+        assert!(edited.current_messages().iter().any(|m| matches!(m, pi_rs::Message::User { content } if content.contains("Historical unattributed") && content.contains("replacement"))));
+        let mut omitted = base;
+        omitted.push(json!({"type":"context_edit","id":"e","parentId":"r","targetId":"r","replacement":null}));
+        let omitted = import_pi(omitted).unwrap();
+        assert!(!omitted.current_messages().iter().any(|m| matches!(m, pi_rs::Message::User { content } if content.contains("Historical unattributed"))));
+    }
+
+    #[test]
+    fn large_unattributed_result_survives_native_export_and_reopen() {
+        let large = "x".repeat(7 * 1024 * 1024);
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"write","arguments":{}}]}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","id":"x","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"r","parentId":"b","message":{"role":"toolResult","toolCallId":"x","content":[{"type":"text","text":large}]}}),
+        ]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(reopened.records().iter().any(|r| matches!(&r.event,
+            Event::ImportedUnattributedToolResult { content: pi_rs::ContextContent::Blocks(blocks), .. }
+                if matches!(&blocks[0], pi_rs::ContentBlock::Text { text, .. } if text.len() == 7 * 1024 * 1024))));
+    }
+
+    #[test]
+    fn imported_late_tool_result_still_matches_without_reuse() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"u","parentId":"a","message":{"role":"user","content":"interrupt"}}),
+            json!({"type":"message","id":"r","parentId":"u","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"late"}],"isError":false}}),
+        ]).unwrap();
+        assert!(
+            session
+                .records()
+                .iter()
+                .any(|r| matches!(r.event, Event::ToolFinished { .. }))
+        );
+    }
+
+    #[test]
     fn missing_parent_import_preserves_orphan_branch_and_source() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
@@ -1776,6 +2346,103 @@ mod tests {
         let path = directory.path().join("reopened.jsonl");
         session.export_jsonl(&path).unwrap();
         check(&read(&path).unwrap());
+    }
+
+    #[test]
+    fn compaction_rejects_boundary_from_another_complete_branch() {
+        let header = json!({"type":"session","version":3});
+        let first = json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"first"}});
+        let second = json!({"type":"message","id":"b","parentId":null,"message":{"role":"user","content":"other branch"}});
+        let compact = json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":"a","summary":"summary","tokensBefore":100});
+        let error = match import_pi(vec![header, first, second, compact]) {
+            Ok(_) => panic!("cross-branch compaction was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("outside its branch"));
+    }
+
+    #[test]
+    fn compaction_ancestor_and_self_boundaries_keep_rpc_identity_after_reopen() {
+        for target in ["a", "b", "c"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"before"}}),
+                json!({"type":"thinking_level_change","id":"b","parentId":"a","thinkingLevel":"off"}),
+                json!({"type":"compaction","id":"c","parentId":"b","firstKeptEntryId":target,"summary":"summary","tokensBefore":100}),
+            ]).unwrap();
+            let check = |session: &pi_rs::Session| {
+                let target_record = session
+                    .records()
+                    .iter()
+                    .find(|record| {
+                        matches!(&record.event,
+                    Event::SourceEntry { entry, .. } if entry["id"] == target)
+                    })
+                    .unwrap();
+                let projected = super::super::rpc_entries::Entries::new(session)
+                    .after(None)
+                    .unwrap();
+                let compaction = projected["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["type"] == "compaction")
+                    .unwrap();
+                assert_eq!(compaction["firstKeptEntryId"], target_record.id.to_string());
+                let messages = session.current_messages();
+                assert!(messages.iter().any(|message| matches!(message, pi_rs::Message::User { content } if content.contains("summary"))));
+                assert_eq!(messages.iter().any(|message| matches!(message, pi_rs::Message::User { content } if content == "before")), target == "a");
+            };
+            check(&session);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            session.export_jsonl(&path).unwrap();
+            check(&read(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn source_ancestry_matches_parent_walk_for_branched_forest() {
+        let mut index = SourceAncestry::default();
+        let mut parents = vec![0];
+        for child in 1..512 {
+            let parent = (child * 97 + 31) % child;
+            assert_eq!(index.add(parent), child);
+            parents.push(parent);
+        }
+        for node in 0..512 {
+            let mut expected = std::collections::BTreeSet::new();
+            let mut current = node;
+            loop {
+                expected.insert(current);
+                if current == 0 {
+                    break;
+                }
+                current = parents[current];
+            }
+            for ancestor in 0..512 {
+                assert_eq!(
+                    index.is_ancestor(ancestor, node),
+                    expected.contains(&ancestor)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_ancestry_handles_deep_and_divergent_branches() {
+        let mut ancestry = SourceAncestry::default();
+        let first = ancestry.add(0);
+        let mut leaf = first;
+        for _ in 0..8192 {
+            leaf = ancestry.add(leaf);
+        }
+        let sibling = ancestry.add(first);
+        assert!(ancestry.is_ancestor(first, leaf));
+        assert!(ancestry.is_ancestor(leaf, leaf));
+        assert!(!ancestry.is_ancestor(sibling, leaf));
+        assert!(!ancestry.is_ancestor(leaf, sibling));
+        assert!(ancestry.nodes[leaf].1.len() <= 15);
     }
 
     #[test]
@@ -1829,7 +2496,7 @@ mod tests {
             args.remember_initial_selection();
             args.model = "previous-session".into();
             args.provider = super::super::Provider::Ollama;
-            args.restore_session_model(&session);
+            args.restore_session_model(&session).unwrap();
             assert_eq!(args.provider.id(), "google");
             assert_eq!(args.model, "initial");
         }
@@ -2050,7 +2717,7 @@ mod tests {
                 json!({"type":"session","version":3}),
                 json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"ollama","model":model,"content":[]}}),
             ]).unwrap();
-            args.restore_session_model(&session);
+            args.restore_session_model(&session).unwrap();
             assert_eq!(args.model, expected);
             assert_eq!(args.thinking.as_deref(), Some("low"));
         }
@@ -2061,7 +2728,7 @@ mod tests {
                 thinking: Some("high".into()),
             });
         let scoped = import_pi(vec![json!({"type":"session","version":3}), json!({"type":"message","id":"m","parentId":null,"message":{"role":"assistant","provider":"ollama","model":"known","content":[]}})]).unwrap();
-        args.restore_session_model(&scoped);
+        args.restore_session_model(&scoped).unwrap();
         assert_eq!(args.thinking.as_deref(), Some("low"));
         args.model_scope.clear();
         let mut native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
@@ -2074,14 +2741,14 @@ mod tests {
         let native_path = directory.path().join("saved-native.jsonl");
         native.export_jsonl(&native_path).unwrap();
         let reopened = read(&native_path).unwrap();
-        args.restore_session_model(&reopened);
+        args.restore_session_model(&reopened).unwrap();
         assert_eq!(args.model, "saved-dynamic");
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
             json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"anthropic","model":"nonexistent-model-id","content":[]}}),
         ]).unwrap();
         args.model = "previous-branch".into();
-        args.restore_session_model(&session);
+        args.restore_session_model(&session).unwrap();
         assert_eq!(args.model, "initial");
         assert_eq!(args.thinking.as_deref(), Some("low"));
         args.complete_catalogs.push((
@@ -2093,7 +2760,7 @@ mod tests {
             json!({"type":"session","version":3}),
             json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"ollama","model":"missing-from-complete-catalog","content":[]}}),
         ]).unwrap();
-        args.restore_session_model(&unknown_dynamic);
+        args.restore_session_model(&unknown_dynamic).unwrap();
         assert_eq!(args.model, "initial");
     }
 
@@ -2285,7 +2952,7 @@ mod tests {
                 Some((super::super::Provider::Google, "invalid endpoint".into()));
             args.endpoint_explicit = true;
             args.discovered_models.push(("google".into(), "b".into()));
-            args.restore_session_model(&session);
+            args.restore_session_model(&session).unwrap();
             assert_eq!(args.provider.id(), "ollama");
             assert_eq!(args.model, "initial");
             assert_eq!(args.thinking.as_deref(), Some("high"));

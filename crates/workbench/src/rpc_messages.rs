@@ -1,5 +1,6 @@
 //! Project the native session transcript into the Pi RPC message format.
-use std::collections::{HashMap, HashSet};
+mod anthropic;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pi_rs::{
     Event, Invocation, Message, ModelMetadata, ModelRequest, Record, Session, Usage, UsageReport,
@@ -8,6 +9,21 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::Provider;
+
+#[derive(Clone, Copy)]
+pub(super) enum MetadataSource<'a> {
+    Session(&'a Session),
+    Snapshot(&'a BTreeMap<u64, Value>),
+}
+
+impl<'a> MetadataSource<'a> {
+    fn get(self, id: u64) -> Option<&'a Value> {
+        match self {
+            Self::Session(session) => session.record_metadata(id),
+            Self::Snapshot(metadata) => metadata.get(&id),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ModelIdentity<'a> {
@@ -19,6 +35,8 @@ struct ModelIdentity<'a> {
 struct Finished<'a> {
     metadata: &'a ModelMetadata,
     usage: Option<Usage>,
+    successful: bool,
+    record_id: u64,
 }
 
 pub(super) fn pending_request(session: &Session) -> Option<Uuid> {
@@ -57,10 +75,70 @@ fn display_only(record: &Record, compaction: Option<&Record>) -> bool {
     }
 }
 
+// Markers are written only for cancelled turn requests, never summaries.
+// Older journals without a marker keep their previous projection.
+fn aborted_partial_records(branch: &[&Record], compaction: Option<&Record>) -> HashSet<u64> {
+    let retain_from = compaction.and_then(|entry| match entry.event {
+        Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(entry.id)),
+        _ => None,
+    });
+    let assistants: HashSet<Uuid> = branch
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::Assistant {
+                request_id: Some(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    branch
+        .windows(2)
+        .filter_map(|pair| {
+            let Event::SourceEntry { format, entry } = &pair[0].event else {
+                return None;
+            };
+            let Event::ModelFinished {
+                request_id,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial,
+                ..
+            } = &pair[1].event
+            else {
+                return None;
+            };
+            (format == "pi-rs:aborted-turn-partial"
+                && entry["requestId"].as_str() == Some(request_id.to_string().as_str())
+                && !partial.is_empty()
+                && !assistants.contains(request_id)
+                && retain_from.is_none_or(|retain| pair[1].id >= retain))
+            .then_some(pair[1].id)
+        })
+        .collect()
+}
+
 pub(super) fn count(session: &Session) -> usize {
     let branch = session.branch();
     let compaction = latest_compaction(&branch);
+    let aborted = aborted_partial_records(&branch, compaction);
+    let deleted: HashSet<u64> = branch
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ContextEdited {
+                target,
+                replacement,
+            } if aborted.contains(target) => Some((*target, replacement.is_none())),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut latest, (target, deleted)| {
+            latest.insert(target, deleted);
+            latest
+        })
+        .into_iter()
+        .filter_map(|(target, deleted)| deleted.then_some(target))
+        .collect();
     session.current_message_entries().len()
+        + aborted.difference(&deleted).count()
         + branch
             .iter()
             .filter(|record| display_only(record, compaction))
@@ -101,7 +179,9 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let mut imported_entries = HashMap::new();
     let mut import = None;
     let mut edited = HashSet::new();
+    let mut partial_edits = HashMap::new();
     let compaction = latest_compaction(&branch);
+    let aborted = aborted_partial_records(&branch, compaction);
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
@@ -113,15 +193,35 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
             import = None;
         }
-        if let Event::ContextEdited { target, .. } = &record.event {
+        if let Event::ContextEdited {
+            target,
+            replacement,
+        } = &record.event
+        {
             edited.insert(*target);
+            partial_edits.insert(*target, replacement);
         }
     }
     let mut extra_messages = branch
         .into_iter()
-        .filter(|record| display_only(record, compaction))
+        .filter(|record| display_only(record, compaction) || aborted.contains(&record.id))
         .filter_map(|record| {
             let value = match &record.event {
+                Event::ModelFinished { .. } if aborted.contains(&record.id) => {
+                    let mut value = projection.aborted_partial(session.records(), record)?;
+                    if let Some(replacement) = partial_edits.get(&record.id) {
+                        match replacement {
+                            None => return None,
+                            Some(pi_rs::ContextContent::Text(text)) => {
+                                value["content"] = json!([{"type":"text", "text":text}])
+                            }
+                            Some(pi_rs::ContextContent::Blocks(blocks)) => {
+                                value["content"] = json!(blocks)
+                            }
+                        }
+                    }
+                    value
+                }
                 Event::SystemCheckpoint {
                     content,
                     sections,
@@ -181,13 +281,23 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
             json!({"role":"compactionSummary","summary":summary,"tokensBefore":compaction_tokens(session, record),"timestamp":timestamp})
         } else {
-            projection.message(session.records(), record, &message, edited.contains(&id))
+            projection.message(
+                session.records(),
+                record,
+                &message,
+                edited.contains(&id),
+                Some(MetadataSource::Session(session)),
+            )
         };
         let value = imported_entries
             .get(&id)
             .filter(|source| source["type"] != "compaction")
             .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
             .unwrap_or(value);
+        let mut value = value;
+        if matches!(record.event, Event::ImportedUnattributedToolResult { .. }) {
+            value["nativeUnattributed"] = json!(true);
+        }
         visible.push(value);
         native.push(message);
     }
@@ -207,7 +317,7 @@ fn normalize_system_message(message: &Value, record: &Record) -> Value {
     value
 }
 
-fn system_value(
+pub(super) fn system_value(
     record: &Record,
     content: &str,
     sections: &[(String, Option<String>)],
@@ -371,7 +481,10 @@ impl Projection {
     fn finished<'a>(&self, records: &'a [Record], id: Uuid) -> Option<Finished<'a>> {
         let request = self.finished.get(&id)?;
         let Event::ModelFinished {
-            metadata, usage, ..
+            metadata,
+            usage,
+            failure,
+            ..
         } = &records[*request as usize - 1].event
         else {
             return None;
@@ -380,7 +493,12 @@ impl Projection {
             UsageReport::Measured { usage } => Some(*usage),
             _ => None,
         };
-        Some(Finished { metadata, usage })
+        Some(Finished {
+            metadata,
+            usage,
+            successful: failure.is_none(),
+            record_id: *request,
+        })
     }
 
     fn invocation<'a>(&self, records: &'a [Record], id: &Uuid) -> Option<&'a Invocation> {
@@ -391,7 +509,41 @@ impl Projection {
         invocations.get(*index)
     }
 
-    pub(super) fn raw_message(&self, records: &[Record], record: &Record) -> Option<Value> {
+    pub(super) fn aborted_partial(&self, records: &[Record], record: &Record) -> Option<Value> {
+        if !pi_rs::is_aborted_turn_partial(records, record) {
+            return None;
+        }
+        let Event::ModelFinished {
+            request_id,
+            partial,
+            ..
+        } = &record.event
+        else {
+            return None;
+        };
+        let mut assistant_record = record.clone();
+        assistant_record.event = Event::Assistant {
+            content: partial.clone(),
+            invocations: Vec::new(),
+            usage: None,
+            request_id: Some(*request_id),
+        };
+        let message = Message::Assistant {
+            content: partial.clone(),
+            calls: Vec::new(),
+            replay: None,
+        };
+        let mut value = self.message(records, &assistant_record, &message, false, None);
+        value["stopReason"] = json!("aborted");
+        Some(value)
+    }
+
+    pub(super) fn raw_message(
+        &self,
+        records: &[Record],
+        record: &Record,
+        metadata: Option<MetadataSource<'_>>,
+    ) -> Option<Value> {
         let message = match &record.event {
             Event::User { content, .. } => Message::User {
                 content: content.clone(),
@@ -437,7 +589,7 @@ impl Projection {
             },
             _ => return None,
         };
-        Some(self.message(records, record, &message, false))
+        Some(self.message(records, record, &message, false, metadata))
     }
 
     fn message(
@@ -446,6 +598,7 @@ impl Projection {
         record: &Record,
         message: &Message,
         edited: bool,
+        metadata: Option<MetadataSource<'_>>,
     ) -> Value {
         let timestamp = record.timestamp_millis().unwrap_or_default();
         if let Event::CustomMessage { message: custom }
@@ -490,19 +643,12 @@ impl Projection {
                 } => {
                     json!({"role":"compactionSummary","summary":summary,"tokensBefore":tokens_before,"timestamp":timestamp})
                 }
-                _ => json!({"role":"user","content":content,"timestamp":timestamp}),
+                _ => {
+                    json!({"role":"user","content":super::rpc_events::user_content(content, &[]),"timestamp":timestamp})
+                }
             },
             Message::UserWithImages { content, images } => {
-                let mut blocks = Vec::new();
-                if !content.is_empty() {
-                    blocks.push(json!({"type":"text","text":content}));
-                }
-                blocks.extend(images.iter().map(|image| {
-                    json!({
-                        "type":"image","mimeType":image.mime_type,"data":image.data
-                    })
-                }));
-                json!({"role":"user","content":blocks,"timestamp":timestamp})
+                json!({"role":"user","content":super::rpc_events::user_content(content, images),"timestamp":timestamp})
             }
             Message::Assistant {
                 content,
@@ -594,6 +740,30 @@ impl Projection {
                     blocks.push(json!({"type":"text","text":content}));
                 }
                 blocks.extend(calls.iter().map(super::rpc_events::tool_call_value));
+                if !edited
+                    && api == "anthropic-messages"
+                    && let Some(projected) = replay.as_deref().and_then(|replay| {
+                        anthropic::blocks(
+                            replay,
+                            content,
+                            finalized.and_then(|entry| entry.metadata.reasoning.as_deref()),
+                            calls,
+                        )
+                    })
+                {
+                    blocks = projected;
+                }
+                if !edited
+                    && api == "anthropic-messages"
+                    && let Some(projected) = finalized
+                        .filter(|entry| entry.successful)
+                        .and_then(|entry| {
+                            metadata.and_then(|metadata| metadata.get(entry.record_id))
+                        })
+                        .and_then(|metadata| anthropic::display_blocks(metadata, content, calls))
+                {
+                    blocks = projected;
+                }
                 let stop = if finalized
                     .is_some_and(|entry| entry.metadata.finish_reason.as_deref() == Some("length"))
                 {
@@ -714,7 +884,9 @@ fn imported_message(
     };
     if edited {
         message["content"] = projected["content"].clone();
-        if message["role"] == "assistant" {
+        if message["role"] == "assistant"
+            && !matches!(message["stopReason"].as_str(), Some("aborted" | "error"))
+        {
             message["stopReason"] = projected["stopReason"].clone();
         }
     }
@@ -777,6 +949,170 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn cancelled_turn_partial_is_display_only_and_not_duplicated() {
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let mut records = initial.records().to_vec();
+        let mut append = |event| {
+            let parent = records.last().unwrap();
+            records.push(Record {
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                version: parent.version,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        };
+        append(Event::ModelRequested {
+            model: "fixture".into(),
+            messages: 1,
+            tools: 0,
+            max_output_tokens: 64,
+            request_id: Some(request_id),
+            context_head: None,
+            context_sha256: None,
+            context_transformed: None,
+            context_configuration_sha256: None,
+        });
+        append(Event::SourceEntry {
+            format: "pi-rs:aborted-turn-partial".into(),
+            entry: json!({"requestId":request_id}),
+        });
+        append(Event::ModelFinished {
+            request_id,
+            metadata: ModelMetadata::default(),
+            usage: UsageReport::Unconfirmed,
+            failure: Some(pi_rs::ModelFailure::Cancelled),
+            partial: "partial answer".into(),
+            reply: None,
+        });
+        let session = Session::from_records(records.clone()).unwrap();
+        let (visible, native) = snapshot(&session);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(count(&session), visible.len());
+        assert_eq!(
+            visible[1]["content"],
+            json!([{"type":"text","text":"partial answer"}])
+        );
+        assert_eq!(visible[1]["stopReason"], "aborted");
+        assert_eq!(native.len(), 1);
+        let mut reopened = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(snapshot(&reopened).0, visible);
+        let target = reopened.head();
+        reopened
+            .edit_context(target, Some(pi_rs::ContextContent::Text("changed".into())))
+            .unwrap();
+        assert_eq!(snapshot(&reopened).0[1]["content"][0]["text"], "changed");
+        assert_eq!(reopened.current_messages().len(), 1);
+        let mut reopened = Session::from_records(reopened.records().to_vec()).unwrap();
+        assert_eq!(snapshot(&reopened).0[1]["content"][0]["text"], "changed");
+        reopened.edit_context(target, None).unwrap();
+        assert_eq!(snapshot(&reopened).0.len(), 1);
+        assert_eq!(count(&reopened), 1);
+        let reopened = Session::from_records(reopened.records().to_vec()).unwrap();
+        assert_eq!(snapshot(&reopened).0.len(), 1);
+        let parent = records.last().unwrap();
+        records.push(Record {
+            id: parent.id + 1,
+            parent: Some(parent.id),
+            version: parent.version,
+            timestamp: None,
+            run_id: None,
+            event: Event::Assistant {
+                content: "partial answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let (visible, _) = snapshot(&session);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(count(&session), visible.len());
+    }
+
+    #[test]
+    fn unmarked_cancelled_summary_is_not_visible() {
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let mut records = initial.records().to_vec();
+        let parent = records.last().unwrap();
+        records.push(Record {
+            id: parent.id + 1,
+            parent: Some(parent.id),
+            version: parent.version,
+            timestamp: None,
+            run_id: None,
+            event: Event::ModelFinished {
+                request_id: Uuid::new_v4(),
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial: "private summary".into(),
+                reply: None,
+            },
+        });
+        let mut session = Session::from_records(records).unwrap();
+        let (visible, _) = snapshot(&session);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(count(&session), 1);
+        let target = session.head();
+        assert!(session.edit_context(target, None).is_err());
+        assert!(
+            session
+                .edit_context(target, Some(pi_rs::ContextContent::Text("exposed".into())))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_user_history_uses_blocks_and_pi_imports_keep_original_content() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), vec![], None)
+            .unwrap();
+        session
+            .append_user_with_images(
+                "".into(),
+                vec![pi_rs::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                None,
+            )
+            .unwrap();
+        let (visible, native) = snapshot(&session);
+        assert_eq!(
+            visible[0]["content"],
+            json!([{ "type":"text", "text":"hello" }])
+        );
+        assert_eq!(
+            visible[1]["content"],
+            json!([{ "type":"text", "text":"" }, { "type":"image", "data":"aW1hZ2U=", "mimeType":"image/png" }])
+        );
+        assert!(matches!(&native[0], Message::User { content } if content == "hello"));
+
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        let imported = [
+            json!({"role":"user", "content":"original string", "timestamp":1}),
+            json!({"role":"user", "content":[{"type":"image", "data":"aW1hZ2U=", "mimeType":"image/png"}, {"type":"text", "text":"after"}], "timestamp":2}),
+        ];
+        writeln!(fixture, "{}", json!({"type":"session", "version":3})).unwrap();
+        for (index, message) in imported.iter().enumerate() {
+            writeln!(fixture, "{}", json!({"type":"message", "id":format!("u{index}"), "parentId": if index == 0 { None } else { Some("u0") }, "message":message})).unwrap();
+        }
+        let imported_session = super::super::session_import::read(fixture.path()).unwrap();
+        let (visible, _) = snapshot(&imported_session);
+        assert_eq!(visible, imported);
+    }
+
+    #[test]
     fn reconstructed_native_tool_message_preserves_multimodal_order() {
         let blocks = json!([
             {"type":"text","text":"before"},
@@ -806,8 +1142,13 @@ mod tests {
             is_error: false,
             is_structured: Some(true),
         };
-        let value =
-            Projection::default().message(std::slice::from_ref(&record), &record, &message, false);
+        let value = Projection::default().message(
+            std::slice::from_ref(&record),
+            &record,
+            &message,
+            false,
+            None,
+        );
         assert_eq!(value["content"], blocks);
         assert_eq!(value["nativeData"]["duration"], 3);
         assert_eq!(value["structuredContent"], json!({"answer":42}));

@@ -12,6 +12,27 @@ pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+const MAX_SETTINGS_BOOTSTRAP: usize = 16 * 1024 * 1024;
+
+pub(super) fn read_settings_bootstrap() -> Result<super::config::Settings> {
+    read_settings_frame(&mut std::io::stdin().lock())
+}
+
+fn read_settings_frame(input: &mut impl std::io::Read) -> Result<super::config::Settings> {
+    let mut length = [0_u8; 8];
+    input.read_exact(&mut length)?;
+    let length = usize::try_from(u64::from_be_bytes(length))
+        .map_err(|_| Error::Config("invalid worker settings length".into()))?;
+    if length > MAX_SETTINGS_BOOTSTRAP {
+        return Err(Error::Config(
+            "worker settings snapshot is too large".into(),
+        ));
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Config("invalid worker settings snapshot".into()))
+}
 
 pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -28,6 +49,31 @@ static IN_FLIGHT_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(super) struct RefreshBarrier {
     _process: std::sync::MutexGuard<'static, ()>,
     _worker: Option<std::fs::File>,
+}
+
+/// The auth lock must be released before the worker barrier: once the barrier
+/// becomes available, a supervisor may immediately kill the worker.
+pub(super) struct RefreshAuthGuard {
+    auth: super::auth_lock::Guard,
+    _barrier: RefreshBarrier,
+}
+
+impl std::ops::Deref for RefreshAuthGuard {
+    type Target = super::auth_lock::Guard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.auth
+    }
+}
+
+pub(super) fn guard_refresh_auth(
+    barrier: RefreshBarrier,
+    auth: super::auth_lock::Guard,
+) -> RefreshAuthGuard {
+    RefreshAuthGuard {
+        auth,
+        _barrier: barrier,
+    }
 }
 
 pub(super) fn stop_new_refreshes() -> std::sync::MutexGuard<'static, ()> {
@@ -127,20 +173,53 @@ pub(super) struct Worker {
     events: Receiver<Value>,
     pending_events: Vec<Value>,
     extension_sources: std::collections::BTreeMap<String, Value>,
+    settings_snapshot: super::config::Settings,
+    workspace: std::path::PathBuf,
+    trusted: bool,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
+fn retain_warning_on_start_error(error: Error, pending: &[Value]) -> Error {
+    let warnings: Vec<_> = pending
+        .iter()
+        .filter(|event| event["type"] == "warning")
+        .filter_map(|event| event["message"].as_str())
+        .collect();
+    if warnings.is_empty() {
+        error
+    } else {
+        Error::Config(format!("{}\n{}", warnings.join("\n"), error))
+    }
+}
 impl Worker {
+    pub(super) fn settings_for<'a>(
+        slot: &'a Option<Self>,
+        args: &Cli,
+    ) -> Option<&'a super::config::Settings> {
+        let worker = slot.as_ref()?;
+        let same_workspace = worker.workspace == args.workspace
+            || matches!((worker.workspace.canonicalize(), args.workspace.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        (same_workspace && worker.trusted == args.trusted).then_some(&worker.settings_snapshot)
+    }
     pub(super) fn start(args: &Cli, operation: &[&str]) -> Result<Self> {
-        Self::start_with_transition(args, operation, None)
+        Self::start_with_transition(args, operation, None, None)
     }
 
     fn start_with_transition(
         args: &Cli,
         operation: &[&str],
         transition: Option<(SessionStartReason, Option<std::path::PathBuf>)>,
+        fallback: Option<&super::config::Settings>,
     ) -> Result<Self> {
-        let steering_mode = session_queue_mode(args, pi_rs::InputKind::Steer)?;
-        let follow_up_mode = session_queue_mode(args, pi_rs::InputKind::FollowUp)?;
+        let history = args.settings.worker_fallback(&args.workspace, args.trusted);
+        let settings = args.settings.reload_with_fallback(
+            &args.workspace,
+            args.trusted,
+            history.as_ref().or(fallback).unwrap_or(&args.settings),
+        )?;
+        let mut snapshot_args = args.clone();
+        snapshot_args.settings = settings.clone();
+        let steering_mode = session_queue_mode(&snapshot_args, pi_rs::InputKind::Steer)?;
+        let follow_up_mode = session_queue_mode(&snapshot_args, pi_rs::InputKind::FollowUp)?;
         let refresh_barrier = tempfile::NamedTempFile::new()?;
         let mut command = Command::new(std::env::current_exe()?);
         command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
@@ -162,6 +241,26 @@ impl Worker {
             command.env("PI_RS_MODEL_TOKEN", token);
         }
 
+        let mut startup_warnings = Vec::new();
+        let bootstrap = if operation.first() == Some(&"serve") {
+            startup_warnings.extend(
+                settings
+                    .diagnostics()
+                    .iter()
+                    .filter(|warning| !args.settings.diagnostics().contains(warning))
+                    .map(|warning| json!({"type":"warning", "message":warning})),
+            );
+            let bytes = serde_json::to_vec(&settings)?;
+            if bytes.len() > MAX_SETTINGS_BOOTSTRAP {
+                return Err(Error::Config(
+                    "worker settings snapshot is too large".into(),
+                ));
+            }
+            command.arg("--worker-settings-stdin");
+            Some(bytes)
+        } else {
+            None
+        };
         command
             .arg("--session")
             .arg(&args.session)
@@ -286,7 +385,18 @@ impl Worker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take();
+        if let Some(bytes) = bootstrap {
+            let input = stdin.as_mut().expect("piped stdin");
+            let sent = input
+                .write_all(&(bytes.len() as u64).to_be_bytes())
+                .and_then(|()| input.write_all(&bytes));
+            if let Err(error) = sent {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        }
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let (sender, events) = mpsc::channel();
@@ -308,6 +418,10 @@ impl Worker {
             }),
         ];
         let persistent = operation.first() == Some(&"serve");
+        if persistent {
+            args.settings
+                .remember_worker_snapshot(&args.workspace, args.trusted, &settings);
+        }
         Ok(Self {
             compacting: operation.first() == Some(&"compact"),
             retrying: false,
@@ -324,15 +438,13 @@ impl Worker {
             stdin,
             refresh_barrier,
             events,
-            pending_events: Vec::new(),
+            pending_events: startup_warnings,
             extension_sources: Default::default(),
+            settings_snapshot: settings,
+            workspace: args.workspace.clone(),
+            trusted: args.trusted,
             readers,
         })
-    }
-    pub(super) fn start_request(args: &Cli, request: Value) -> Result<Self> {
-        let mut worker = Self::start(args, &["serve"])?;
-        worker.request(args, request)?;
-        Ok(worker)
     }
     pub(super) fn submit(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
         if let Some(active) = slot.as_mut().filter(|worker| worker.matches(args)) {
@@ -346,8 +458,17 @@ impl Worker {
                     "cannot change the worker while a shell command is running".into(),
                 ));
             }
-            slot.take();
-            *slot = Some(Self::start_request(args, request)?);
+            let previous = Self::settings_for(slot, args).cloned();
+            let pending = slot
+                .take()
+                .map(|mut worker| std::mem::take(&mut worker.pending_events))
+                .unwrap_or_default();
+            let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
+                .map_err(|error| retain_warning_on_start_error(error, &pending))?;
+            next.pending_events.splice(0..0, pending);
+            next.request(args, request)
+                .map_err(|error| retain_warning_on_start_error(error, &next.pending_events))?;
+            *slot = Some(next);
             Ok(())
         }
     }
@@ -365,8 +486,15 @@ impl Worker {
                     "cannot redirect controls for an active session".into(),
                 ));
             }
-            slot.take();
-            *slot = Some(Self::start(args, &["serve"])?);
+            let previous = Self::settings_for(slot, args).cloned();
+            let pending = slot
+                .take()
+                .map(|mut worker| std::mem::take(&mut worker.pending_events))
+                .unwrap_or_default();
+            let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
+                .map_err(|error| retain_warning_on_start_error(error, &pending))?;
+            next.pending_events.splice(0..0, pending);
+            *slot = Some(next);
         }
         slot.as_mut().expect("queue worker").send(request)
     }
@@ -434,6 +562,21 @@ impl Worker {
                 Some(event)
             })
             .collect()
+    }
+
+    pub(super) fn take_pending_warnings(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        self.pending_events.retain(|event| {
+            if event["type"] == "warning" {
+                if let Some(message) = event["message"].as_str() {
+                    warnings.push(message.to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        warnings
     }
 
     pub(super) fn interrupt_shutdown(&mut self) {
@@ -521,14 +664,22 @@ impl Worker {
     }
 
     pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
+        let mut previous = None;
+        let mut pending = Vec::new();
         if slot
             .as_ref()
             .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
         {
-            slot.take();
+            previous = Self::settings_for(slot, args).cloned();
+            if let Some(mut worker) = slot.take() {
+                pending = std::mem::take(&mut worker.pending_events);
+            }
         }
         if slot.is_none() {
-            *slot = Some(Self::start(args, &["serve"])?);
+            let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
+                .map_err(|error| retain_warning_on_start_error(error, &pending))?;
+            next.pending_events.splice(0..0, pending);
+            *slot = Some(next);
         }
         let worker = slot.as_mut().expect("share worker");
         if worker.session != args.session || !worker.persistent {
@@ -634,10 +785,18 @@ impl Worker {
             shutdown_reason(reason),
             replacing_session.then(|| args.session.clone()),
         ));
-        let pending_events = std::mem::take(&mut active.pending_events);
+        let mut pending_events = std::mem::take(&mut active.pending_events);
         let extension_sources = std::mem::take(&mut active.extension_sources);
+        let fallback = Self::settings_for(slot, args).cloned();
         drop(slot.take());
-        let mut next = Self::start_with_transition(args, &["serve"], Some((reason, previous)))?;
+        let mut next = Self::start_with_transition(
+            args,
+            &["serve"],
+            Some((reason, previous)),
+            fallback.as_ref(),
+        )
+        .map_err(|error| retain_warning_on_start_error(error, &pending_events))?;
+        pending_events.append(&mut next.pending_events);
         next.pending_events = pending_events;
         next.extension_sources = extension_sources;
         *slot = Some(next);
@@ -787,6 +946,26 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_bootstrap_frame_preserves_following_input_and_rejects_invalid_lengths() {
+        use std::io::Read;
+        let settings = super::super::config::Settings::default();
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        let mut wire = (bytes.len() as u64).to_be_bytes().to_vec();
+        wire.extend_from_slice(&bytes);
+        wire.extend_from_slice(b"next-control-line\n");
+        let mut input = std::io::Cursor::new(wire);
+        super::read_settings_frame(&mut input).unwrap();
+        let mut rest = String::new();
+        input.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "next-control-line\n");
+        assert!(
+            super::read_settings_frame(&mut std::io::Cursor::new(u64::MAX.to_be_bytes())).is_err()
+        );
+        assert!(
+            super::read_settings_frame(&mut std::io::Cursor::new(100_u64.to_be_bytes())).is_err()
+        );
+    }
     use clap::Parser;
     #[cfg(unix)]
     #[test]
@@ -826,6 +1005,9 @@ mod tests {
             events,
             pending_events: Vec::new(),
             extension_sources: Default::default(),
+            settings_snapshot: args.settings.clone(),
+            workspace: args.workspace.clone(),
+            trusted: args.trusted,
             readers: Vec::new(),
             refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
         };
@@ -904,6 +1086,141 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         waiter.join().unwrap();
     }
+
+    #[tokio::test]
+    async fn worker_teardown_waits_for_child_anthropic_refresh_to_persist() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, serde_json::json!({"anthropic":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "anthropic_auth::tests::share_barrier_refresh_fixture",
+                "--nocapture",
+            ])
+            .env("PI_RS_TEST_SHARE_BARRIER_AUTH", &path)
+            .env(
+                "PI_RS_TEST_SHARE_BARRIER_URL",
+                format!("http://{}/v1/oauth/token", listener.local_addr().unwrap()),
+            )
+            .env(super::REFRESH_BARRIER_ENV, barrier.path())
+            .env("PI_RS_TEST_PAUSE_AUTH_UNLOCK", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut release = child.stdin.take().unwrap();
+        let mut child = Reap(child);
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|value| value.parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break bytes[end + 4..].to_vec();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(request["refresh_token"], "old-refresh");
+        let body = r#"{"access_token":"new-access","refresh_token":"rotated","expires_in":3600}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dir.path().join("unlock-entered").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(barrier.path())
+            .unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "worker barrier was released before auth unlock"
+        );
+        let mut termination = tokio::task::spawn_blocking(move || {
+            super::terminate_after_grace(
+                &mut child.0,
+                barrier.as_file(),
+                std::time::Instant::now(),
+            );
+            child.0.wait().unwrap()
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut termination)
+                .await
+                .is_err(),
+            "worker terminated before releasing the auth lock"
+        );
+        std::io::Write::write_all(&mut release, b"x").unwrap();
+        drop(release);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), termination)
+            .await
+            .unwrap()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+        #[cfg(windows)]
+        assert_eq!(status.code(), Some(1));
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::super::auth_lock::acquire_async(&path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let stored = super::super::config::read_object_unlocked(&path).unwrap();
+        assert_eq!(stored["anthropic"]["access"], "new-access");
+        assert_eq!(stored["anthropic"]["refresh"], "rotated");
+        drop(guard);
+    }
+
     #[test]
     fn queue_mode_uses_current_branch_even_when_session_is_locked() {
         let root = tempfile::tempdir().unwrap();

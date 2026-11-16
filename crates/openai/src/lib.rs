@@ -54,10 +54,20 @@ fn recognized_response_event(kind: &str) -> bool {
     )
 }
 
+/// Routing headers used by an API-key Responses endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAffinityFormat {
+    OpenAi,
+    OpenAiNoSession,
+    OpenRouter,
+    Disabled,
+}
+
 #[derive(Clone)]
 pub struct OpenAiResponses {
     client: Client,
     endpoint: Url,
+    endpoint_source: String,
     token: String,
     thinking: Option<String>,
     provider: String,
@@ -67,6 +77,9 @@ pub struct OpenAiResponses {
     cache_retention: CacheRetention,
     explicit_cache_mode: bool,
     session_cache_key: Option<String>,
+    session_affinity_format: Option<SessionAffinityFormat>,
+    prompt_cache_key_enabled: bool,
+    use_developer_role: bool,
 }
 
 impl OpenAiResponses {
@@ -110,6 +123,7 @@ impl OpenAiResponses {
     }
 
     fn create(endpoint: &str, token: String, plan: bool) -> Result<Self> {
+        let endpoint_source = endpoint.to_owned();
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("invalid OpenAI Responses endpoint".into()))?;
         let secure = endpoint.as_str() == DEFAULT_ENDPOINT
@@ -139,6 +153,7 @@ impl OpenAiResponses {
         Ok(Self {
             client,
             endpoint,
+            endpoint_source,
             token,
             thinking: None,
             identity_safe_transport: true,
@@ -148,6 +163,9 @@ impl OpenAiResponses {
             cache_retention: CacheRetention::Short,
             explicit_cache_mode: false,
             session_cache_key: None,
+            session_affinity_format: None,
+            prompt_cache_key_enabled: true,
+            use_developer_role: false,
         })
     }
 
@@ -163,10 +181,74 @@ impl OpenAiResponses {
         self
     }
 
+    /// Select whether model instructions use the developer role. Defaults to
+    /// the system role when model reasoning capability is not supplied.
+    pub fn with_developer_role(mut self, enabled: bool) -> Self {
+        self.use_developer_role = enabled;
+        self
+    }
+
     /// Set the Pi session identity used for prompt cache affinity.
     pub fn with_session_cache_key(mut self, session_id: &str) -> Self {
         self.session_cache_key =
             (!session_id.is_empty()).then(|| session_id.chars().take(64).collect());
+        self
+    }
+
+    /// Override the automatically detected API-key session routing format.
+    pub fn with_session_affinity_format(mut self, format: SessionAffinityFormat) -> Self {
+        self.session_affinity_format = Some(format);
+        self
+    }
+
+    fn with_session_routing(mut self, session_id: &str) -> Result<Self> {
+        if session_id.is_empty()
+            || self.provider == "openai-chatgpt"
+            || self.cache_retention == CacheRetention::None
+        {
+            return Ok(self);
+        }
+        let format = self.session_affinity_format.unwrap_or_else(|| {
+            if self.provider == "openrouter" || self.endpoint_source.contains("openrouter.ai") {
+                SessionAffinityFormat::OpenRouter
+            } else {
+                SessionAffinityFormat::OpenAi
+            }
+        });
+        let names: &[&str] = match format {
+            SessionAffinityFormat::OpenAi => &["session-id", "x-client-request-id"],
+            SessionAffinityFormat::OpenAiNoSession => &["x-client-request-id"],
+            SessionAffinityFormat::OpenRouter => &["x-session-id"],
+            SessionAffinityFormat::Disabled => &[],
+        };
+        if names.iter().all(|name| self.headers.contains_key(*name)) {
+            return Ok(self);
+        }
+        let bytes = session_id
+            .chars()
+            .map(|ch| u8::try_from(u32::from(ch)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Config("Invalid session affinity ID".into()))?;
+        let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+        let start = bytes
+            .iter()
+            .position(|byte| !whitespace(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !whitespace(byte))
+            .map_or(start, |index| index + 1);
+        let value = reqwest::header::HeaderValue::from_bytes(&bytes[start..end])
+            .map_err(|_| Error::Config("Invalid session affinity ID".into()))?;
+        for name in names {
+            self.headers.entry(*name).or_insert_with(|| value.clone());
+        }
+        Ok(self)
+    }
+
+    /// Enable or disable the automatic session-derived prompt cache key.
+    pub fn with_prompt_cache_key_enabled(mut self, enabled: bool) -> Self {
+        self.prompt_cache_key_enabled = enabled;
         self
     }
 
@@ -186,6 +268,16 @@ impl OpenAiResponses {
         self
     }
 
+    /// Add automatic headers without replacing explicitly configured values.
+    pub fn with_default_headers(mut self, headers: &reqwest::header::HeaderMap) -> Self {
+        for (name, value) in headers {
+            self.headers
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        self
+    }
+
     /// Set request body defaults from the selected model's sampling parameters.
     pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
         validate_sampling(&sampling)?;
@@ -194,7 +286,8 @@ impl OpenAiResponses {
     }
 
     fn apply_cache(&self, body: &mut Value) {
-        if self.cache_retention != CacheRetention::None
+        if self.prompt_cache_key_enabled
+            && self.cache_retention != CacheRetention::None
             && let Some(key) = &self.session_cache_key
         {
             body.as_object_mut()
@@ -346,12 +439,17 @@ pub fn thinking_levels(model: &str) -> Vec<String> {
     levels.iter().map(|level| (*level).into()).collect()
 }
 
-fn payload(request: &ModelRequest, provider: &str, edited_scope: &str) -> Value {
+fn payload(
+    request: &ModelRequest,
+    provider: &str,
+    edited_scope: &str,
+    instruction_role: &str,
+) -> Value {
     let mut input = Vec::new();
     for message in &request.messages {
         match message {
             Message::System { content } => {
-                input.push(json!({"role":"developer", "content": content}))
+                input.push(json!({"role":instruction_role, "content": content}))
             }
             Message::User { content } => input.push(json!({"role":"user", "content": content})),
             Message::UserWithImages { content, images } => {
@@ -482,32 +580,68 @@ impl Model for OpenAiResponses {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
-        if self.cache_retention == CacheRetention::Short || self.provider == "openai-chatgpt" {
-            return pi_rs_core::protected_model_fingerprint(&(
-                headers,
-                "openai-responses-v1",
-                self.endpoint.as_str(),
-                &self.provider,
-                &self.token,
-                &self.thinking,
-                &self.sampling,
-            ));
+        let base =
+            if self.cache_retention == CacheRetention::Short || self.provider == "openai-chatgpt" {
+                pi_rs_core::protected_model_fingerprint(&(
+                    headers,
+                    "openai-responses-v1",
+                    self.endpoint.as_str(),
+                    &self.provider,
+                    &self.token,
+                    &self.thinking,
+                    &self.sampling,
+                ))
+            } else {
+                pi_rs_core::protected_model_fingerprint(&(
+                    headers,
+                    "openai-responses-v1",
+                    self.endpoint.as_str(),
+                    &self.provider,
+                    &self.token,
+                    &self.thinking,
+                    &self.sampling,
+                    match self.cache_retention {
+                        CacheRetention::None => "none",
+                        CacheRetention::Short => "short",
+                        CacheRetention::Long => "long",
+                    },
+                    self.explicit_cache_mode,
+                ))
+            };
+        let base = if self.session_affinity_format.is_none()
+            && self.provider != "openrouter"
+            && self.endpoint_source.contains("openrouter.ai")
+                != self.endpoint.as_str().contains("openrouter.ai")
+        {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    self.endpoint_source.contains("openrouter.ai"),
+                ))
+            })
+        } else {
+            base
+        };
+        let base = match self.session_affinity_format {
+            None => base,
+            Some(format) => base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
+            }),
+        };
+        let base = if self.prompt_cache_key_enabled {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "prompt-cache-key-disabled"))
+            })
+        };
+        if self.use_developer_role {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
+            })
         }
-        pi_rs_core::protected_model_fingerprint(&(
-            headers,
-            "openai-responses-v1",
-            self.endpoint.as_str(),
-            &self.provider,
-            &self.token,
-            &self.thinking,
-            &self.sampling,
-            match self.cache_retention {
-                CacheRetention::None => "none",
-                CacheRetention::Short => "short",
-                CacheRetention::Long => "long",
-            },
-            self.explicit_cache_mode,
-        ))
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -539,6 +673,7 @@ impl Model for OpenAiResponses {
     ) -> Result<ModelStream> {
         self.clone()
             .with_session_cache_key(&session_id.to_string())
+            .with_session_routing(&session_id.to_string())?
             .stream(request)
             .await
     }
@@ -552,6 +687,7 @@ impl Model for OpenAiResponses {
     ) -> Result<ModelStream> {
         self.clone()
             .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
             .stream(request)
             .await
     }
@@ -591,6 +727,7 @@ impl Model for OpenAiResponses {
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         self.clone()
             .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
             .stream_enriched(request)
             .await
     }
@@ -613,7 +750,16 @@ impl OpenAiResponses {
         let model = request.model.clone();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
-        let mut body = payload(&request, &self.provider, &edited_scope);
+        let mut body = payload(
+            &request,
+            &self.provider,
+            &edited_scope,
+            if self.use_developer_role {
+                "developer"
+            } else {
+                "system"
+            },
+        );
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
@@ -1448,11 +1594,11 @@ mod tests {
             max_output_tokens: 16,
         };
         assert_eq!(
-            payload(&request, "shared", &scope_a)["input"][0]["type"],
+            payload(&request, "shared", &scope_a, "developer")["input"][0]["type"],
             "reasoning"
         );
         assert!(
-            !payload(&request, "shared", &scope_b)
+            !payload(&request, "shared", &scope_b, "developer")
                 .to_string()
                 .contains("encrypted_content")
         );
@@ -1588,7 +1734,7 @@ mod tests {
 
     #[test]
     fn plan_payload_uses_stateless_stream_and_namespaced_tools() {
-        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt");
+        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt", "developer");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "developer");
@@ -1610,7 +1756,7 @@ mod tests {
             }],
             replay: None,
         });
-        let body = payload(&request, "openai", "openai");
+        let body = payload(&request, "openai", "openai", "developer");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "read");
         assert!(body["input"][2].get("namespace").is_none());
@@ -1624,7 +1770,7 @@ mod tests {
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
         request.messages.push(Message::Tool { is_structured: Some(true), is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
-        let body = payload(&request, "openai-chatgpt", "openai-chatgpt");
+        let body = payload(&request, "openai-chatgpt", "openai-chatgpt", "developer");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");
         assert!(!output[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
@@ -1645,12 +1791,12 @@ mod tests {
             is_structured: Some(false),
         });
         assert_eq!(
-            payload(&request, "openai", "openai")["input"][2]["output"],
+            payload(&request, "openai", "openai", "developer")["input"][2]["output"],
             text
         );
         request.messages[2] =
             serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
-        let output = &payload(&request, "openai", "openai")["input"][2]["output"];
+        let output = &payload(&request, "openai", "openai", "developer")["input"][2]["output"];
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
     }
@@ -1728,11 +1874,291 @@ mod tests {
         assert_eq!(body, json!({}));
     }
 
+    #[tokio::test]
+    async fn sdk_instruction_role_defaults_to_system_and_can_enable_developer() {
+        use std::io::{Read, Write};
+        for (developer, expected) in [
+            (None, "system"),
+            (Some(true), "developer"),
+            (Some(false), "system"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            let model = if let Some(enabled) = developer {
+                model.with_developer_role(enabled)
+            } else {
+                model
+            };
+            let mut req = request();
+            req.messages = vec![Message::System {
+                content: "rules".into(),
+            }];
+            let _ = model.stream(req).await;
+            assert_eq!(server.join().unwrap()["input"][0]["role"], expected);
+        }
+    }
+
+    #[test]
+    fn instruction_role_is_applied_and_changes_recovery_identity() {
+        let model =
+            OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
+        assert_ne!(
+            model.context_identity(),
+            model.clone().with_developer_role(true).context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_developer_role(true)
+                .with_developer_role(false)
+                .context_identity()
+        );
+        let mut req = request();
+        req.messages = vec![
+            Message::System {
+                content: "rules".into(),
+            },
+            Message::User {
+                content: "hello".into(),
+            },
+        ];
+        let body = payload(&req, "openai", "openai", "system");
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["input"][1]["role"], "user");
+    }
+
+    #[test]
+    fn sdk_session_routing_formats_preserve_explicit_headers() {
+        let model = OpenAiResponses::new_api_provider(
+            "https://openrouter.ai/api/v1/responses",
+            "fixture".into(),
+            "openrouter",
+        )
+        .unwrap();
+        let router = model.clone().with_session_routing("session-one").unwrap();
+        assert_eq!(router.headers["x-session-id"], "session-one");
+        let openai = model
+            .clone()
+            .with_session_affinity_format(SessionAffinityFormat::OpenAi)
+            .with_session_routing("session-one")
+            .unwrap();
+        assert_eq!(openai.headers["session-id"], "session-one");
+        assert_eq!(openai.headers["x-client-request-id"], "session-one");
+        let nosession = model
+            .clone()
+            .with_session_affinity_format(SessionAffinityFormat::OpenAiNoSession)
+            .with_session_routing("session-one")
+            .unwrap();
+        assert!(!nosession.headers.contains_key("session-id"));
+        assert_eq!(nosession.headers["x-client-request-id"], "session-one");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-session-id", "explicit".parse().unwrap());
+        let overridden = model
+            .clone()
+            .with_headers(headers)
+            .with_session_routing("日本")
+            .unwrap();
+        assert_eq!(overridden.headers["x-session-id"], "explicit");
+        assert!(model.clone().with_session_routing("日本").is_err());
+        let disabled_cache = model
+            .clone()
+            .without_cache()
+            .with_session_routing("日本")
+            .unwrap();
+        assert!(disabled_cache.headers.is_empty());
+        let subdomain = OpenAiResponses::new_api_provider(
+            "https://edge.openrouter.ai/v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(subdomain.headers["x-session-id"], "id");
+        let uppercase = OpenAiResponses::new_api_provider(
+            "https://OPENROUTER.AI/v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(uppercase.headers["session-id"], "id");
+        let path = OpenAiResponses::new_api_provider(
+            "https://example.com/openrouter.ai/../v1/responses",
+            "fixture".into(),
+            "proxy",
+        )
+        .unwrap()
+        .with_session_routing("id")
+        .unwrap();
+        assert_eq!(path.headers["x-session-id"], "id");
+        assert!(
+            model
+                .clone()
+                .with_session_routing("")
+                .unwrap()
+                .headers
+                .is_empty()
+        );
+        assert!(
+            model
+                .with_session_affinity_format(SessionAffinityFormat::Disabled)
+                .with_session_routing("日本")
+                .unwrap()
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_session_routing_sends_headers_and_summary_omits_them() {
+        use std::io::{Read, Write};
+        for (summary, enriched) in [(false, false), (true, false), (false, true), (true, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                while !data.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 2048];
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&chunk[..n]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                String::from_utf8(data).unwrap().to_ascii_lowercase()
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            match (summary, enriched) {
+                (true, true) => {
+                    let _ = model
+                        .stream_enriched_for_summary(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            request(),
+                        )
+                        .await;
+                }
+                (true, false) => {
+                    let _ = model
+                        .stream_for_summary(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), request())
+                        .await;
+                }
+                (false, true) => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            "session-one",
+                            request(),
+                        )
+                        .await;
+                }
+                (false, false) => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4(),
+                            "session-one",
+                            request(),
+                        )
+                        .await;
+                }
+            }
+            let sent = server.join().unwrap();
+            assert_eq!(sent.contains("session-id: session-one\r\n"), !summary);
+            assert_eq!(
+                sent.contains("x-client-request-id: session-one\r\n"),
+                !summary
+            );
+        }
+    }
+
     #[test]
     fn session_cache_keys_are_clamped_and_respect_explicit_keys() {
         let model =
             OpenAiResponses::new_api("http://localhost/responses", "fixture".into()).unwrap();
         let identity = format!("{}tail", "猫".repeat(64));
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .context_identity()
+        );
+        assert_eq!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_key_enabled(false)
+                .with_prompt_cache_key_enabled(true)
+                .context_identity()
+        );
         let mut body = json!({});
         model
             .clone()
@@ -1748,6 +2174,20 @@ mod tests {
         let mut body = json!({});
         model
             .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert!(body.get("prompt_cache_key").is_none());
+        let mut body = json!({"prompt_cache_key":"explicit"});
+        model
+            .clone()
+            .with_prompt_cache_key_enabled(false)
+            .with_session_cache_key(&identity)
+            .apply_cache(&mut body);
+        assert_eq!(body["prompt_cache_key"], "explicit");
+        let mut body = json!({});
+        model
+            .clone()
             .with_session_cache_key("")
             .apply_cache(&mut body);
         assert!(body.get("prompt_cache_key").is_none());
@@ -1757,6 +2197,61 @@ mod tests {
             .without_cache()
             .apply_cache(&mut body);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_prompt_cache_key_is_omitted_from_sdk_session_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut block = [0; 4096];
+            let end = loop {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let size: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + size {
+                let n = socket.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_prompt_cache_key_enabled(false);
+        let _ = model
+            .stream_enriched_in_session_with_identity(
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                "external-session",
+                request(),
+            )
+            .await;
+        assert!(server.join().unwrap().get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]

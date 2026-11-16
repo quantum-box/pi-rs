@@ -141,7 +141,14 @@ async fn resolve(
         if wanted.is_some_and(|wanted| wanted != kind) {
             return Ok(None);
         }
-        let value = if matches!(credential, super::model_auth::Credential::ChatGpt) {
+        let value = if matches!(credential, super::model_auth::Credential::AnthropicOAuth) {
+            super::anthropic_auth::access(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
+        } else if matches!(credential, super::model_auth::Credential::ChatGpt) {
             super::chatgpt_auth::access_options(
                 &args.settings,
                 (wanted == Some(AuthType::OAuth)).then_some(minimum),
@@ -236,6 +243,9 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     };
     args.trusted = super::config::project_trust(&args.workspace, explicit)?.unwrap_or(false);
     args.settings = super::config::Settings::load(&args.workspace, args.trusted)?;
+    for warning in args.settings.diagnostics() {
+        eprintln!("{warning}");
+    }
     if args.api_key.is_some() {
         return Err(Error::Config(
             "omit --api-key when resolving configured credentials".into(),

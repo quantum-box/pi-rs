@@ -6,9 +6,14 @@ mod context;
 mod context_fingerprint;
 mod context_replay;
 mod extension;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod host_auth;
 mod journal;
 mod lifecycle;
 mod model_catalog;
+mod persistent_map;
+#[doc(hidden)]
+pub mod pi_import;
 mod resource;
 mod retry;
 mod runtime;
@@ -24,12 +29,15 @@ pub use context::*;
 pub use context_fingerprint::protected_model_fingerprint;
 pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use host_auth::*;
 pub use journal::*;
 pub use lifecycle::{
     BeforeSessionTransition, CompactionReason, ExtensionTreeSummary, ForkPosition, LifecycleEvent,
     LifecycleMessage, ModelSelectSource, SessionShutdownReason, SessionStartReason,
     SessionSwitchReason, TreeDecision, TreePreparation, TreeSummary,
     notify as notify_extension_lifecycle,
+    notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use model_catalog::*;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};

@@ -102,7 +102,7 @@ impl Stream {
             {
                 if let Some(index) = event["index"].as_u64() {
                     if event["type"] == "reasoning_item_start" {
-                        self.reasoning_item_index(index, &mut events);
+                        self.reasoning_item_start(index, event["redacted"] == true, &mut events);
                     } else if event["type"] == "reasoning_item_delta" {
                         if let Some(delta) = event["delta"].as_str() {
                             self.reasoning_item_delta(index, delta, &mut events);
@@ -194,6 +194,11 @@ impl Stream {
         let mut events = Vec::new();
         if !self.assistant.is_null() && !self.ended {
             self.assistant["stopReason"] = json!(if self.aborted { "aborted" } else { "error" });
+            self.assistant["errorMessage"] = json!(if self.aborted {
+                "Model request cancelled"
+            } else {
+                "Model request failed"
+            });
             self.finish_message(None, &mut events);
         }
         self.finish_turn(&mut events);
@@ -203,19 +208,12 @@ impl Stream {
     fn record(&mut self, event: Event, args: &Cli, events: &mut Vec<Value>) {
         match event {
             Event::User { content, .. } => {
-                self.user(json!(content), events);
+                self.user(user_content(&content, &[]), events);
             }
             Event::UserWithImages {
                 content, images, ..
             } => {
-                let mut blocks = Vec::new();
-                if !content.is_empty() {
-                    blocks.push(json!({"type":"text","text":content}));
-                }
-                blocks.extend(images.into_iter().map(
-                    |image| json!({"type":"image","data":image.data,"mimeType":image.mime_type}),
-                ));
-                self.user(json!(blocks), events);
+                self.user(user_content(&content, &images), events);
             }
             Event::ModelRequested { .. } if self.summary => {}
             Event::ModelRequested {
@@ -252,6 +250,11 @@ impl Stream {
                     self.aborted |= failure == ModelFailure::Cancelled;
                     self.assistant["stopReason"] =
                         json!(if self.aborted { "aborted" } else { "error" });
+                    self.assistant["errorMessage"] = json!(match failure {
+                        ModelFailure::Cancelled => "Model request cancelled",
+                        ModelFailure::Retryable => "Model request failed temporarily",
+                        ModelFailure::Failed => "Model request failed",
+                    });
                     self.finish_message(None, events);
                     self.finish_turn(events);
                 } else if let UsageReport::Measured { usage } = usage
@@ -503,6 +506,13 @@ impl Stream {
     }
 
     fn update(&self, mut update: Value, events: &mut Vec<Value>) {
+        if update["type"] == "toolcall_start"
+            && let Some(index) = update["contentIndex"].as_u64()
+            && let Some(call) = self.assistant["content"].get(index as usize)
+        {
+            update["id"] = call["id"].clone();
+            update["toolName"] = call["name"].clone();
+        }
         update["partial"] = self.assistant.clone();
         events.push(json!({"type":"message_update","message":self.assistant,"assistantMessageEvent":update}));
     }
@@ -536,6 +546,15 @@ impl Stream {
     }
 
     fn reasoning_item_index(&mut self, output_index: u64, events: &mut Vec<Value>) -> usize {
+        self.reasoning_item_start(output_index, false, events)
+    }
+
+    fn reasoning_item_start(
+        &mut self,
+        output_index: u64,
+        redacted: bool,
+        events: &mut Vec<Value>,
+    ) -> usize {
         if let Some(&(index, _)) = self.reasoning_items.get(&output_index) {
             return index;
         }
@@ -545,7 +564,11 @@ impl Stream {
             .as_array_mut()
             .expect("assistant blocks");
         let index = blocks.len();
-        blocks.push(json!({"type":"thinking","thinking":""}));
+        blocks.push(if redacted {
+            json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
+        } else {
+            json!({"type":"thinking","thinking":""})
+        });
         self.reasoning_items.insert(output_index, (index, false));
         self.update(
             json!({"type":"thinking_start","contentIndex":index}),
@@ -556,7 +579,9 @@ impl Stream {
 
     fn reasoning_item_delta(&mut self, output_index: u64, delta: &str, events: &mut Vec<Value>) {
         let index = self.reasoning_item_index(output_index, events);
-        if self.reasoning_items[&output_index].1 {
+        if self.reasoning_items[&output_index].1
+            || self.assistant["content"][index]["redacted"] == true
+        {
             return;
         }
         if let Value::String(content) = &mut self.assistant["content"][index]["thinking"] {
@@ -579,6 +604,11 @@ impl Stream {
             return;
         }
         *ended = true;
+        let content = if self.assistant["content"][index]["redacted"] == true {
+            "[Reasoning redacted]"
+        } else {
+            content
+        };
         self.assistant["content"][index]["thinking"] = json!(content);
         self.update(
             json!({"type":"thinking_end","contentIndex":index,"content":content}),
@@ -726,6 +756,16 @@ pub(super) fn tool_call_value(call: &ToolCall) -> Value {
         value["argumentsError"] = json!(error);
     }
     value
+}
+
+pub(super) fn user_content(content: &str, images: &[pi_rs::ImageContent]) -> Value {
+    let mut blocks = vec![json!({"type":"text", "text":content})];
+    blocks.extend(
+        images
+            .iter()
+            .map(|image| json!({"type":"image", "data":image.data, "mimeType":image.mime_type})),
+    );
+    json!(blocks)
 }
 
 pub(super) fn tool_failed(outcome: &Outcome) -> bool {
@@ -883,6 +923,192 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn failed_model_attempts_expose_classification_without_provider_text() {
+        let args = Cli::parse_from(["pi"]);
+        for (failure, reason, message) in [
+            (ModelFailure::Failed, "error", "Model request failed"),
+            (
+                ModelFailure::Retryable,
+                "error",
+                "Model request failed temporarily",
+            ),
+            (
+                ModelFailure::Cancelled,
+                "aborted",
+                "Model request cancelled",
+            ),
+        ] {
+            let mut stream = Stream {
+                assistant: json!({"role":"assistant","content":[]}),
+                ..Stream::default()
+            };
+            let mut events = Vec::new();
+            stream.begin_turn(&mut events);
+            stream.record(
+                Event::ModelFinished {
+                    request_id: Uuid::new_v4(),
+                    metadata: ModelMetadata::default(),
+                    usage: UsageReport::Unconfirmed,
+                    failure: Some(failure),
+                    partial: String::new(),
+                    reply: None,
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "message_end")
+                .unwrap();
+            assert_eq!(end["message"]["stopReason"], reason);
+            assert_eq!(end["message"]["errorMessage"], message);
+            assert_eq!(stream.messages[0], end["message"]);
+            let turn = events
+                .iter()
+                .find(|event| event["type"] == "turn_end")
+                .unwrap();
+            assert_eq!(turn["message"], end["message"]);
+        }
+    }
+
+    #[test]
+    fn redacted_reasoning_starts_with_complete_block_without_delta() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = stream.observe(
+            &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
+            &args,
+        );
+        events.extend(stream.observe(
+            &json!({"type":"reasoning_item_end", "index":4, "content":"[Reasoning redacted]"}),
+            &args,
+        ));
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thinking_start", "thinking_end"]
+        );
+        for update in updates {
+            assert_eq!(
+                update["partial"]["content"][0],
+                json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
+            );
+        }
+    }
+
+    #[test]
+    fn user_events_preserve_text_block_for_text_and_image_only_inputs() {
+        let image = pi_rs::ImageContent {
+            data: "aW1hZ2U=".into(),
+            mime_type: "image/png".into(),
+        };
+        let cases = [
+            (
+                Event::User {
+                    content: "hello".into(),
+                    input_id: None,
+                },
+                json!([{ "type":"text", "text":"hello" }]),
+            ),
+            (
+                Event::UserWithImages {
+                    content: "".into(),
+                    images: vec![image],
+                    input_id: None,
+                },
+                json!([{ "type":"text", "text":"" }, { "type":"image", "data":"aW1hZ2U=", "mimeType":"image/png" }]),
+            ),
+        ];
+        for (event, expected) in cases {
+            let mut stream = Stream::default();
+            let mut events = Vec::new();
+            stream.record(event, &Cli::parse_from(["pi"]), &mut events);
+            for kind in ["message_start", "message_end"] {
+                let message = events.iter().find(|event| event["type"] == kind).unwrap();
+                assert_eq!(message["message"]["content"], expected);
+            }
+            assert_eq!(stream.messages[0]["content"], expected);
+        }
+    }
+
+    #[test]
+    fn redacted_end_keeps_placeholder_after_reasoning_budget_is_exhausted() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let large = "x".repeat(1024 * 1024);
+        stream.observe(&json!({"type":"reasoning_item_start", "index":0}), &args);
+        stream.observe(
+            &json!({"type":"reasoning_item_delta", "index":0, "delta":large}),
+            &args,
+        );
+        stream.observe(
+            &json!({"type":"reasoning_item_end", "index":0, "content":large}),
+            &args,
+        );
+        stream.observe(
+            &json!({"type":"reasoning_item_start", "index":1, "redacted":true}),
+            &args,
+        );
+        // Core's bounded fallback is empty after its delta budget is exhausted.
+        let events = stream.observe(
+            &json!({"type":"reasoning_item_end", "index":1, "content":""}),
+            &args,
+        );
+        let end = events
+            .iter()
+            .find_map(|event| event.get("assistantMessageEvent"))
+            .unwrap();
+        assert_eq!(end["type"], "thinking_end");
+        assert_eq!(end["content"], "[Reasoning redacted]");
+        assert_eq!(
+            end["partial"]["content"][1],
+            json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
+        );
+        assert_eq!(stream.assistant["content"][1], end["partial"]["content"][1]);
+    }
+
+    #[test]
+    fn cancelled_redacted_block_closes_with_placeholder() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        stream.observe(
+            &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
+            &args,
+        );
+        let events = stream.settle(true);
+        let end = events
+            .iter()
+            .filter_map(|event| event.get("assistantMessageEvent"))
+            .find(|event| event["type"] == "thinking_end")
+            .unwrap();
+        assert_eq!(end["content"], "[Reasoning redacted]");
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(message["message"]["stopReason"], "aborted");
+        assert_eq!(
+            message["message"]["content"][0],
+            json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
+        );
+    }
 
     #[test]
     fn summary_model_finished_record_is_not_forwarded() {
@@ -1575,6 +1801,12 @@ mod streaming_tool_tests {
             arguments: arguments.into(),
         };
         stream.tool_delta(delta(0, "call-a", "read", "{\"path\":\"fo"), &mut events);
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-a");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "read");
         assert_eq!(
             stream.assistant["content"][0]["arguments"],
             json!({"path":"fo"})
@@ -1587,6 +1819,12 @@ mod streaming_tool_tests {
             delta(1, "call-b", "write", "{\"content\":\"xy"),
             &mut events,
         );
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .collect();
+        assert_eq!(starts[1]["assistantMessageEvent"]["id"], "call-b");
+        assert_eq!(starts[1]["assistantMessageEvent"]["toolName"], "write");
         stream.tool_delta(delta(0, "", "", "o.txt\"}"), &mut events);
         assert_eq!(
             stream.assistant["content"][0]["arguments"],
@@ -1603,5 +1841,69 @@ mod streaming_tool_tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn toolcall_start_reports_identity_available_at_that_event() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        stream.tool_delta(
+            ToolCallDelta {
+                index: 0,
+                id: "call-".into(),
+                name: "re".into(),
+                arguments: String::new(),
+            },
+            &mut events,
+        );
+        stream.tool_delta(
+            ToolCallDelta {
+                index: 0,
+                id: "a".into(),
+                name: "ad".into(),
+                arguments: "{}".into(),
+            },
+            &mut events,
+        );
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "re");
+        assert_eq!(stream.assistant["content"][0]["id"], "call-a");
+        assert_eq!(stream.assistant["content"][0]["name"], "read");
+
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        stream.record(
+            Event::Assistant {
+                content: String::new(),
+                invocations: vec![Invocation {
+                    operation_id: Uuid::new_v4(),
+                    call: ToolCall {
+                        id: "call-final".into(),
+                        name: "write".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-final");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "write");
     }
 }

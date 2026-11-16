@@ -31,6 +31,9 @@ pub struct Ollama {
     token: Option<String>,
     headers: HeaderMap,
     cache_retention: CacheRetention,
+    prompt_cache_key_enabled: bool,
+    prompt_cache_long: bool,
+    session_cache_key: Option<String>,
     reasoning_effort: Option<String>,
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
@@ -87,6 +90,7 @@ fn report_progress(
 impl Ollama {
     /// Accept a loopback HTTP service or a TLS-protected relay, without redirects or proxy discovery.
     pub fn new(endpoint: &str, token: Option<String>) -> Result<Self> {
+        let openai_endpoint = endpoint.contains("api.openai.com");
         let endpoint =
             Url::parse(endpoint).map_err(|_| Error::Config("invalid model endpoint".into()))?;
         let loopback = matches!(
@@ -116,6 +120,10 @@ impl Ollama {
             token,
             headers: HeaderMap::new(),
             cache_retention: CacheRetention::None,
+            prompt_cache_key_enabled: openai_endpoint,
+            prompt_cache_long: openai_endpoint
+                && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
+            session_cache_key: None,
             reasoning_effort: None,
             thinking_budget_level: None,
             thinking_budgets: None,
@@ -235,6 +243,29 @@ impl Ollama {
         self
     }
 
+    /// Configure session cache keys and the OpenAI-compatible long retention field.
+    pub fn with_prompt_cache_policy(mut self, key_enabled: bool, long: bool) -> Self {
+        self.prompt_cache_key_enabled = key_enabled;
+        self.prompt_cache_long = long;
+        self
+    }
+
+    /// Attach the current external session identity for prompt cache affinity.
+    pub fn with_session_cache_key(mut self, session_id: &str) -> Self {
+        self.session_cache_key =
+            (!session_id.is_empty()).then(|| session_id.chars().take(64).collect());
+        self
+    }
+
+    /// Disable automatic prompt caching for summary requests.
+    pub fn without_cache(mut self) -> Self {
+        self.cache_retention = CacheRetention::None;
+        self.prompt_cache_key_enabled = false;
+        self.prompt_cache_long = false;
+        self.session_cache_key = None;
+        self
+    }
+
     pub fn with_chat_compatibility(
         mut self,
         compatibility: ChatCompatibility,
@@ -324,10 +355,30 @@ impl Ollama {
                 .requires_reasoning_content_on_assistant_messages
                 == Some(true)
         {
-            first["reasoning_content"] = json!(reasoning.unwrap_or_default());
+            first["reasoning_content"] = json!(if self.compatibility.requires_thinking_as_text
+                == Some(true)
+            {
+                ""
+            } else {
+                reasoning.as_deref().unwrap_or_default()
+            });
         }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
+        }
+        if edited_reasoning.is_empty()
+            && self.supports_reasoning != Some(false)
+            && self.compatibility.requires_thinking_as_text == Some(true)
+            && let Some(text) = reasoning.as_deref().filter(|text| !text.trim().is_empty())
+        {
+            let mut parts = vec![json!({"type":"text","text":text})];
+            if let Some(content) = first["content"]
+                .as_str()
+                .filter(|content| !content.is_empty())
+            {
+                parts.push(json!({"type":"text","text":content}));
+            }
+            first["content"] = json!(parts);
         }
         if !edited_reasoning.is_empty() && self.supports_reasoning != Some(false) {
             let text = edited_reasoning
@@ -659,7 +710,7 @@ impl Model for Ollama {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
-        pi_rs_core::protected_model_fingerprint(&(
+        let base = pi_rs_core::protected_model_fingerprint(&(
             headers,
             "chat-completions-v1",
             self.endpoint.as_str(),
@@ -674,7 +725,18 @@ impl Model for Ollama {
             &self.thinking_budgets,
             &self.sampling,
             self.cache_retention.anthropic_control(),
-        ))
+        ));
+        if self.prompt_cache_key_enabled || self.prompt_cache_long {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    self.prompt_cache_key_enabled,
+                    self.prompt_cache_long,
+                ))
+            })
+        } else {
+            base
+        }
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -698,7 +760,9 @@ impl Model for Ollama {
                     )))
                 })
             });
-            let visible_extra = if self.compatibility.requires_thinking_as_text == Some(true) {
+            let visible_extra = if self.supports_reasoning != Some(false)
+                && self.compatibility.requires_thinking_as_text == Some(true)
+            {
                 if let Message::Assistant {
                     replay: Some(replay),
                     ..
@@ -707,16 +771,33 @@ impl Model for Ollama {
                     if replay.identity == self.replay_identity(&request.model)
                         && replay.supports_api(ModelApi::OpenaiCompletions)
                     {
-                        replay
+                        if replay
                             .blocks
                             .iter()
-                            .filter(|b| b["type"] == "context_edit_reasoning")
-                            .filter_map(|b| b["text"].as_str())
-                            .fold(0u64, |sum, text| {
-                                sum.saturating_add(pi_rs_core::estimate_replay_tokens(&[json!(
-                                    text
-                                )]))
-                            })
+                            .any(|b| b["type"] == "context_edit_reasoning")
+                        {
+                            replay
+                                .blocks
+                                .iter()
+                                .filter(|b| b["type"] == "context_edit_reasoning")
+                                .filter_map(|b| b["text"].as_str())
+                                .fold(0u64, |sum, text| {
+                                    sum.saturating_add(pi_rs_core::estimate_replay_tokens(&[
+                                        json!(text),
+                                    ]))
+                                })
+                        } else {
+                            replay
+                                .blocks
+                                .iter()
+                                .rev()
+                                .find(|b| b["type"] == "reasoning_content")
+                                .and_then(|b| b["text"].as_str())
+                                .filter(|text| !text.trim().is_empty())
+                                .map_or(0, |text| {
+                                    pi_rs_core::estimate_replay_tokens(&[json!(text)])
+                                })
+                        }
                     } else {
                         0
                     }
@@ -737,6 +818,40 @@ impl Model for Ollama {
         running_context_window(&value, model)
     }
 
+    async fn stream_in_session(
+        &self,
+        _request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone()
+            .with_session_cache_key(&session_id.to_string())
+            .stream(request)
+            .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone()
+            .with_session_cache_key(external_id)
+            .stream(request)
+            .await
+    }
+
+    async fn stream_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone().without_cache().stream(request).await
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         if self.has_ambiguous_legacy_replay(&request) {
             return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
@@ -746,10 +861,11 @@ impl Model for Ollama {
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
         let preserve_details = self.compatibility.preserves_reasoning_details();
         let preserve_reasoning = self.supports_reasoning != Some(false)
-            && self
+            && (self
                 .compatibility
                 .requires_reasoning_content_on_assistant_messages
-                == Some(true);
+                == Some(true)
+                || self.compatibility.requires_thinking_as_text == Some(true));
         let mut last_progress = None;
         report_progress(
             &self.progress,
@@ -775,6 +891,14 @@ impl Model for Ollama {
         let mut body = json!({"model":request.model,"messages":messages,"stream":true});
         self.compatibility
             .request_options(&mut body, request.max_output_tokens, !tools.is_empty());
+        if self.prompt_cache_key_enabled
+            && let Some(key) = &self.session_cache_key
+        {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if self.prompt_cache_long {
+            body["prompt_cache_retention"] = json!("24h");
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
@@ -1206,6 +1330,101 @@ struct CallDelta {
 #[cfg(test)]
 mod content_tests {
     #[tokio::test]
+    async fn thinking_as_text_replays_streamed_reasoning() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}]}),
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model = Ollama::new(&format!("http://{address}"), None)
+            .unwrap()
+            .with_chat_compatibility(
+                serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+                Some(true),
+                true,
+                true,
+            );
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let events = model
+            .stream(request.clone())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let replay = events
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.unwrap() {
+                ModelEvent::Metadata(metadata) => metadata.replay,
+                _ => None,
+            })
+            .expect("reasoning replay");
+        let message = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: Some(replay.clone()),
+        };
+        let encoded = model.compatible_message(message, &model.replay_identity("m"));
+        assert_eq!(
+            encoded[0]["content"],
+            json!([{"type":"text","text":"internal"},{"type":"text","text":"answer"}])
+        );
+        assert_eq!(encoded[0]["tool_calls"][0]["id"], "call");
+        let thinking_only = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: Some(replay),
+        };
+        assert_eq!(
+            model.compatible_message(thinking_only.clone(), &model.replay_identity("m"))[0]["content"],
+            json!([{"type":"text","text":"internal"}])
+        );
+        let mut long = thinking_only.clone();
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut long
+        {
+            replay.blocks[0]["text"] = json!("x".repeat(5000));
+        }
+        assert!(model.estimate_message_tokens(&request, &long) > 1000);
+        let no_reasoning = model.clone().with_chat_compatibility(
+            serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+            Some(false),
+            true,
+            true,
+        );
+        assert_eq!(
+            no_reasoning.estimate_message_tokens(&request, &long),
+            pi_rs_core::estimate_message_tokens(&long)
+        );
+        assert!(
+            model
+                .compatible_message(thinking_only, &model.replay_identity("other"))
+                .is_empty()
+        );
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn configured_thinking_budget_is_sent_on_wire() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1514,6 +1733,129 @@ mod content_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn chat_prompt_cache_policy_is_part_of_recovery_identity() {
+        let model = Ollama::new("http://localhost:11434/v1/chat/completions", None).unwrap();
+        let unchanged = model.clone().with_prompt_cache_policy(false, false);
+        assert_eq!(model.context_identity(), unchanged.context_identity());
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_policy(true, false)
+                .context_identity()
+        );
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_prompt_cache_policy(false, true)
+                .context_identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_prompt_cache_policy_reaches_session_requests_and_skips_summaries() {
+        use std::io::{Read, Write};
+        for (key_enabled, long, summary, explicit) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (false, true, false, false),
+            (true, true, true, false),
+            (true, false, false, true),
+            (true, true, true, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let mut model = Ollama::new(&format!("http://{address}/v1/chat/completions"), None)
+                .unwrap()
+                .with_native_probes(false)
+                .with_prompt_cache_policy(key_enabled, long);
+            if explicit {
+                model = model
+                    .with_sampling(BTreeMap::from([(
+                        "prompt_cache_key".into(),
+                        json!("configured"),
+                    )]))
+                    .unwrap();
+            }
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 10,
+            };
+            if summary {
+                let _ = model
+                    .stream_for_summary(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), request)
+                    .await;
+            } else {
+                let _ = model
+                    .stream_in_session_with_identity(
+                        uuid::Uuid::new_v4(),
+                        uuid::Uuid::new_v4(),
+                        &format!("{}tail", "猫".repeat(64)),
+                        request,
+                    )
+                    .await;
+            }
+            let body = worker.join().unwrap();
+            let expected = if explicit {
+                Some("configured".to_owned())
+            } else if key_enabled && !summary {
+                Some("猫".repeat(64))
+            } else {
+                None
+            };
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                expected.as_deref()
+            );
+            assert_eq!(
+                body.get("prompt_cache_retention").and_then(Value::as_str),
+                (long && !summary).then_some("24h")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn cerebras_bodyless_400_is_overflow_without_reclassifying_other_errors() {

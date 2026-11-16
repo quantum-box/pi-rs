@@ -511,6 +511,25 @@ impl Runtime {
             .await;
         }
     }
+
+    pub async fn session_lifecycle_owned(
+        &self,
+        args: &Cli,
+        session: &mut Session,
+        event: pi_rs::LifecycleEvent,
+    ) -> Result<()> {
+        if self.registry.has_session_lifecycle_hooks() && session.host_binding().is_none() {
+            pi_rs::notify_extension_lifecycle_in_session(
+                &self.registry,
+                session,
+                event,
+                args.tool_timeout(),
+                &mut |notification| super::observe(notification, args.trace),
+            )
+            .await?;
+        }
+        Ok(())
+    }
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
     }

@@ -132,6 +132,34 @@ impl Model for BudgetedModel<'_> {
             .await
     }
 
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.budget
+            .reserve(self.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.budget
+            .reserve(self.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_detailed_for_summary(request_id, session_id, request)
+            .await
+    }
+
     async fn stream_enriched_for_summary(
         &self,
         request_id: Uuid,
@@ -267,6 +295,36 @@ impl Model for PreparedBudgetedModel<'_, '_> {
             .await?;
         self.inner
             .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_detailed_for_summary(request_id, session_id, request)
             .await
     }
 
@@ -461,6 +519,35 @@ mod external_identity_tests {
                 Ok(pi_rs_core::EnrichedModelEvent::ReasoningStart { index: 8 })
             })))
         }
+        async fn stream_detailed_in_session_with_identity(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            external_id: &str,
+            _: ModelRequest,
+        ) -> Result<pi_rs_core::DetailedModelStream> {
+            self.enriched
+                .lock()
+                .unwrap()
+                .push((request_id, session_id, external_id.into()));
+            Ok(Box::pin(futures_util::stream::once(async {
+                Ok(pi_rs_core::DetailedModelEvent::redacted_start(7))
+            })))
+        }
+        async fn stream_detailed_for_summary(
+            &self,
+            request_id: Uuid,
+            session_id: Uuid,
+            _: ModelRequest,
+        ) -> Result<pi_rs_core::DetailedModelStream> {
+            self.enriched
+                .lock()
+                .unwrap()
+                .push((request_id, session_id, "summary".into()));
+            Ok(Box::pin(futures_util::stream::once(async {
+                Ok(pi_rs_core::DetailedModelEvent::redacted_start(8))
+            })))
+        }
         async fn record_usage_with_metadata(
             &self,
             request_id: Uuid,
@@ -596,6 +683,20 @@ mod external_identity_tests {
                 stream.next().await.unwrap().unwrap(),
                 pi_rs_core::EnrichedModelEvent::ReasoningStart { index: 8 }
             ));
+            expected.push((id, session, "summary".to_string()));
+            let id = Uuid::new_v4();
+            let mut stream = model
+                .stream_detailed_in_session_with_identity(id, session, "external", request.clone())
+                .await
+                .unwrap();
+            assert!(stream.next().await.unwrap().unwrap().is_redacted_start());
+            expected.push((id, session, "external".to_string()));
+            let id = Uuid::new_v4();
+            let mut stream = model
+                .stream_detailed_for_summary(id, session, request.clone())
+                .await
+                .unwrap();
+            assert!(stream.next().await.unwrap().unwrap().is_redacted_start());
             expected.push((id, session, "summary".to_string()));
         }
         assert_eq!(

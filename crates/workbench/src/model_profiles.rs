@@ -25,6 +25,7 @@ pub(super) struct Profiles {
 struct Profile {
     provider: Provider,
     endpoint: String,
+    base_url: Option<String>,
     provider_endpoints: BTreeSet<String>,
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
@@ -187,6 +188,14 @@ enum CacheControlFormat {
     Anthropic,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PromptCacheKeyMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelCompatibility {
@@ -196,6 +205,7 @@ struct ModelCompatibility {
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
+    prompt_cache_key_mode: Option<PromptCacheKeyMode>,
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
@@ -216,6 +226,7 @@ impl ModelCompatibility {
             session_affinity_format: newer
                 .session_affinity_format
                 .or(self.session_affinity_format),
+            prompt_cache_key_mode: newer.prompt_cache_key_mode.or(self.prompt_cache_key_mode),
             supports_long_cache_retention: newer
                 .supports_long_cache_retention
                 .or(self.supports_long_cache_retention),
@@ -600,6 +611,9 @@ impl ModelMetadata {
         if let Some(cost) = &self.cost {
             model["cost"] = cost.value();
         }
+        if !self.thinking_level_map.is_empty() {
+            model["thinkingLevelMap"] = serde_json::json!(self.thinking_level_map);
+        }
     }
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {
@@ -878,6 +892,7 @@ impl Profiles {
                     Profile {
                         provider,
                         endpoint,
+                        base_url: profile.base_url,
                         provider_endpoints,
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
@@ -1096,6 +1111,79 @@ impl Profiles {
         )
     }
 
+    pub fn responses_prompt_cache_key_enabled(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        !matches!(
+            self.cache_compatibility(provider, model)
+                .prompt_cache_key_mode,
+            Some(PromptCacheKeyMode::Disabled)
+        )
+    }
+
+    pub fn chat_prompt_cache_policy(
+        &self,
+        provider: &Provider,
+        model_id: &str,
+        model: Option<&ModelMetadata>,
+        endpoint: &str,
+        long_requested: bool,
+    ) -> (bool, bool) {
+        let compat = self.cache_compatibility(provider, model);
+        let raw = self
+            .entries
+            .get(provider.id())
+            .and_then(|profile| {
+                let selected = profile
+                    .model_endpoints
+                    .get(model_id)
+                    .map_or(profile.endpoint.as_str(), String::as_str);
+                if selected != endpoint {
+                    return None;
+                }
+                profile
+                    .models
+                    .iter()
+                    .find(|item| item.id == model_id)
+                    .and_then(|item| item.base_url.as_deref())
+                    .or(profile.base_url.as_deref())
+            })
+            .unwrap_or(endpoint);
+        let long_supported = compat.supports_long_cache_retention.unwrap_or_else(|| {
+            provider != &Provider::Ollama
+                && !matches!(
+                    provider.id(),
+                    "together"
+                        | "cloudflare-workers-ai"
+                        | "cloudflare-ai-gateway"
+                        | "nvidia"
+                        | "ant-ling"
+                )
+                && ![
+                    "api.together.ai",
+                    "api.together.xyz",
+                    "api.cloudflare.com",
+                    "gateway.ai.cloudflare.com",
+                    "integrate.api.nvidia.com",
+                    "api.ant-ling.com",
+                ]
+                .iter()
+                .any(|needle| raw.contains(needle))
+        });
+        let long = long_requested && long_supported;
+        let key_enabled = match compat
+            .prompt_cache_key_mode
+            .unwrap_or(PromptCacheKeyMode::Auto)
+        {
+            PromptCacheKeyMode::Disabled => false,
+            PromptCacheKeyMode::Enabled => true,
+            PromptCacheKeyMode::Auto => raw.contains("api.openai.com") || long,
+        };
+        (key_enabled, long)
+    }
+
     pub fn chat_cache_support(
         &self,
         provider: &Provider,
@@ -1126,27 +1214,50 @@ impl Profiles {
         endpoint: &str,
     ) -> &'static [&'static str] {
         let adapter = self.model_adapter(provider, model);
-        if !matches!(adapter, Adapter::Anthropic | Adapter::ChatCompletions) {
+        if !matches!(
+            adapter,
+            Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
+        ) || provider.id() == "openai-chatgpt"
+        {
             return &[];
         }
         let profile = self
             .entries
             .get(provider.id())
             .map(|profile| &profile.compat);
-        let model = self.model(provider, model);
-        let model = model.as_ref().map(|model| &model.compat);
+        let metadata = self.model(provider, model);
+        let model_compat = metadata.as_ref().map(|model| &model.compat);
         let openrouter = provider.id() == "openrouter"
-            || reqwest::Url::parse(endpoint)
-                .ok()
-                .is_some_and(|url| url.host_str() == Some("openrouter.ai"));
-        let send = model
+            || if adapter == Adapter::OpenAiResponses {
+                let raw = self.entries.get(provider.id()).and_then(|profile| {
+                    let selected = profile
+                        .model_endpoints
+                        .get(model)
+                        .map_or(profile.endpoint.as_str(), String::as_str);
+                    if selected != endpoint {
+                        return None;
+                    }
+                    profile
+                        .models
+                        .iter()
+                        .find(|item| item.id == model)
+                        .and_then(|item| item.base_url.as_deref())
+                        .or(profile.base_url.as_deref())
+                });
+                raw.unwrap_or(endpoint).contains("openrouter.ai")
+            } else {
+                reqwest::Url::parse(endpoint)
+                    .ok()
+                    .is_some_and(|url| url.host_str() == Some("openrouter.ai"))
+            };
+        let send = model_compat
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
-            .unwrap_or(openrouter);
+            .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
         if !send {
             return &[];
         }
-        let format = model
+        let format = model_compat
             .and_then(|compat| compat.session_affinity_format)
             .or_else(|| profile.and_then(|compat| compat.session_affinity_format))
             .unwrap_or(if openrouter {
@@ -1156,6 +1267,10 @@ impl Profiles {
             });
         match (adapter, format) {
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
+            (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
+                &["session-id", "x-client-request-id"]
+            }
+            (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) => &["x-client-request-id"],
             (Adapter::Anthropic, _) => &["x-session-affinity"],
             (_, AffinityFormat::Openai) => {
                 &["session_id", "x-client-request-id", "x-session-affinity"]
@@ -1209,9 +1324,16 @@ impl Profiles {
 
     pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
         let profile = self.entries.get(provider.id());
-        let model = self
+        let mut model = self
             .definition(provider, id)
             .map(|model| model.metadata.clone().with_model_defaults());
+        // Pi applies provider compatibility over bundled model defaults, while
+        // explicitly configured models and modelOverrides take precedence.
+        if let (Some(profile), Some(model)) = (profile, &mut model)
+            && !profile.models.iter().any(|configured| configured.id == id)
+        {
+            model.compat = model.compat.clone().overlay(profile.compat.clone());
+        }
         match profile.and_then(|profile| profile.overrides.get(id)) {
             Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
             None => model,
@@ -1608,6 +1730,133 @@ mod tests {
     }
 
     #[test]
+    fn chat_prompt_cache_policy_matches_modes_and_long_retention_support() {
+        let profiles = Profiles::parse(&json!({"providers":{
+            "test":{"api":"openai-completions", "baseUrl":"https://example.test/v1", "models":[
+                {"id":"auto"}, {"id":"enabled", "compat":{"promptCacheKeyMode":"enabled"}},
+                {"id":"disabled", "compat":{"promptCacheKeyMode":"disabled"}},
+                {"id":"no-long", "compat":{"supportsLongCacheRetention":false}}
+            ]}
+        }}))
+        .unwrap();
+        let provider = profiles.provider("test").unwrap();
+        for (id, endpoint, request_long, expected) in [
+            ("auto", "https://example.test/v1", false, (false, false)),
+            ("auto", "https://example.test/v1", true, (true, true)),
+            ("auto", "https://api.openai.com/v1", false, (true, false)),
+            ("enabled", "https://example.test/v1", false, (true, false)),
+            ("disabled", "https://example.test/v1", true, (false, true)),
+            ("no-long", "https://example.test/v1", true, (false, false)),
+            ("auto", "https://api.together.ai/v1", true, (false, false)),
+        ] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(
+                profiles.chat_prompt_cache_policy(
+                    &provider,
+                    id,
+                    Some(&model),
+                    endpoint,
+                    request_long
+                ),
+                expected
+            );
+        }
+        let ollama = profiles.provider("ollama").unwrap();
+        assert_eq!(
+            profiles.chat_prompt_cache_policy(
+                &ollama,
+                "m",
+                None,
+                "http://localhost:11434/v1",
+                true
+            ),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn responses_session_affinity_uses_api_specific_headers_and_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{
+            "custom":{"baseUrl":"https://example.test/v1", "api":"openai-responses", "models":[
+                {"id":"default"}, {"id":"router", "compat":{"sessionAffinityFormat":"openrouter"}},
+                {"id":"nosession", "compat":{"sessionAffinityFormat":"openai-nosession"}},
+                {"id":"disabled", "compat":{"sendSessionAffinityHeaders":false}}
+            ]}
+        }}))
+        .unwrap();
+        let provider = profiles.provider("custom").unwrap();
+        assert_eq!(
+            profiles.session_affinity(&provider, "default", "https://example.test"),
+            ["session-id", "x-client-request-id"]
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "router", "https://example.test"),
+            ["x-session-id"]
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "nosession", "https://example.test"),
+            ["x-client-request-id"]
+        );
+        assert!(
+            profiles
+                .session_affinity(&provider, "disabled", "https://example.test")
+                .is_empty()
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "default", "https://openrouter.ai/api/v1"),
+            ["x-session-id"]
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, "default", "https://edge.openrouter.ai/api/v1"),
+            ["x-session-id"]
+        );
+        for (base, expected) in [
+            (
+                "https://OPENROUTER.AI/v1",
+                &["session-id", "x-client-request-id"][..],
+            ),
+            (
+                "https://example.com/openrouter.ai/../v1",
+                &["x-session-id"][..],
+            ),
+        ] {
+            let configured = Profiles::parse(&json!({"providers":{"proxy":{
+                "api":"openai-responses", "baseUrl":base, "models":[{"id":"m"}]
+            }}}))
+            .unwrap();
+            let selected = configured.provider("proxy").unwrap();
+            assert_eq!(
+                configured.session_affinity(&selected, "m", configured.endpoint(&selected)),
+                expected
+            );
+        }
+        let chatgpt = profiles.provider("openai-chatgpt").unwrap();
+        assert!(
+            profiles
+                .session_affinity(&chatgpt, "gpt", "https://example.test")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn responses_prompt_cache_key_mode_inherits_and_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"example":{
+            "baseUrl":"https://example.com/v1", "api":"openai-responses",
+            "compat":{"promptCacheKeyMode":"disabled"},
+            "models":[{"id":"inherited"},{"id":"auto","compat":{"promptCacheKeyMode":"auto"}},{"id":"enabled","compat":{"promptCacheKeyMode":"enabled"}}]
+        }}})).unwrap();
+        let provider = profiles.provider("example").unwrap();
+        for (id, expected) in [("inherited", false), ("auto", true), ("enabled", true)] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(
+                profiles.responses_prompt_cache_key_enabled(&provider, Some(&model)),
+                expected
+            );
+        }
+        assert!(Profiles::parse(&json!({"providers":{"example":{"baseUrl":"https://example.com/v1", "api":"openai-responses", "compat":{"promptCacheKeyMode":"unknown"}}}})).is_err());
+    }
+
+    #[test]
     fn responses_cache_compatibility_merges_provider_and_model() {
         let profiles = Profiles::parse(&json!({"providers":{"example":{
             "baseUrl":"https://example.com/v1", "api":"openai-responses",
@@ -1630,6 +1879,37 @@ mod tests {
         assert_eq!(
             profiles.responses_cache_support(&openai, Some(&model)),
             (true, true)
+        );
+    }
+
+    #[test]
+    fn builtin_provider_compatibility_precedes_catalog_but_not_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+            "compat":{"supportsLongCacheRetention":false},
+            "modelOverrides":{"gpt-6-sol":{"compat":{"supportsLongCacheRetention":true}}},
+            "models":[{"id":"custom","compat":{"supportsLongCacheRetention":true}}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("openai").unwrap();
+        let builtin = profiles.model(&provider, "gpt-6-sol").unwrap();
+        assert!(
+            profiles
+                .responses_cache_support(&provider, Some(&builtin))
+                .0
+        );
+        let custom = profiles.model(&provider, "custom").unwrap();
+        assert!(profiles.responses_cache_support(&provider, Some(&custom)).0);
+
+        let without_override = Profiles::parse(&json!({"providers":{"openai":{
+            "compat":{"supportsLongCacheRetention":false}
+        }}}))
+        .unwrap();
+        let provider = without_override.provider("openai").unwrap();
+        let builtin = without_override.model(&provider, "gpt-6-sol").unwrap();
+        assert!(
+            !without_override
+                .responses_cache_support(&provider, Some(&builtin))
+                .0
         );
     }
 

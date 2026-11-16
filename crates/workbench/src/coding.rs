@@ -1328,6 +1328,47 @@ pub trait EditOperations: Send + Sync {
 /// Local Pi-style edit operations; the default local tool retains atomic writes.
 pub struct LocalEditOperations;
 
+#[cfg(unix)]
+fn local_edit_access(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unix_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.raw_os_error() {
+        Some(libc::EACCES) => "EACCES",
+        Some(libc::ENOENT) => "ENOENT",
+        Some(libc::ENOTDIR) => "ENOTDIR",
+        Some(libc::ELOOP) => "ELOOP",
+        Some(libc::EROFS) => "EROFS",
+        Some(libc::EPERM) => "EPERM",
+        Some(libc::ENAMETOOLONG) => "ENAMETOOLONG",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
+#[cfg(windows)]
+fn windows_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
 fn open_local_edit_file(path: &Path) -> Result<std::fs::File> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(Error::Config("expected a regular file".into()));
@@ -1613,6 +1654,20 @@ struct LocalBashOperations {
     shell: ShellConfig,
 }
 
+async fn check_local_shell_cwd(
+    cwd: &Path,
+    shell_name: &str,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = tokio::fs::metadata(cwd) => result.map(|_| ()).map_err(|_| {
+            Error::Config(format!("Working directory does not exist: {}\nCannot execute {shell_name} commands.", cwd.display()))
+        }),
+    }
+}
+
 const SHELL_POST_EXIT_IDLE: Duration = Duration::from_millis(100);
 // Bound completion even when a descendant writes continuously without a timeout.
 const SHELL_POST_EXIT_MAX: Duration = Duration::from_secs(2);
@@ -1639,6 +1694,7 @@ impl BashOperations for LocalBashOperations {
         } = self
             .shell
             .launch(&context.cwd, false, true, &context.command, false)?;
+        check_local_shell_cwd(&cwd, "bash", &cancellation).await?;
         command
             .current_dir(cwd)
             .env_clear()
@@ -1797,7 +1853,11 @@ impl RemoteShellTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<RemoteShellResult> {
         if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
+            return if self.operations.is_local() {
+                Err(Error::Config("Command aborted".into()))
+            } else {
+                Err(Error::Cancelled)
+            };
         }
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
@@ -1891,7 +1951,19 @@ impl RemoteShellTool {
             )));
         }
         let code = code
-            .map_err(|error| Error::Config(shell_status(&output.display, &error.to_string())))?
+            .map_err(|error| {
+                let message = match error {
+                    Error::Config(message)
+                        if self.operations.is_local()
+                            && message.starts_with("Working directory does not exist: ") =>
+                    {
+                        message
+                    }
+                    Error::Cancelled if self.operations.is_local() => "Command aborted".into(),
+                    error => error.to_string(),
+                };
+                Error::Config(shell_status(&output.display, &message))
+            })?
             .ok_or_else(|| {
                 Error::Config(shell_status(
                     &output.result_display(),
@@ -2055,7 +2127,7 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::Find => (
@@ -2160,7 +2232,11 @@ impl Tool for CodingTool {
                     && matches!(self.kind, Kind::Read { .. })
                     && (message.starts_with("ENOENT: no such file or directory, access '")
                         || message.starts_with("ENOTDIR: not a directory, access '")
-                        || message.starts_with("EACCES: permission denied, access '")) =>
+                        || message.starts_with("EACCES: permission denied, access '")
+                        || message == "EISDIR: illegal operation on a directory, read"
+                        || (message.starts_with("Offset ")
+                            && message.contains(" is beyond end of file (")
+                            && message.ends_with(" lines total)"))) =>
             {
                 Outcome::Failed(message)
             }
@@ -2289,6 +2365,57 @@ fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
         .into_iter()
         .find_map(&mut get)
         .unwrap_or_default()
+}
+
+fn is_ecmascript_whitespace(character: char) -> bool {
+    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+// Pi consumes fd's stdout with readline, trims each line, then relativizes
+// absolute lines against the search root. File names may themselves contain
+// line breaks, so a single fd result can become several displayed results.
+fn find_pi_lines(root: &Path, path: &Path, is_directory: bool) -> Vec<String> {
+    let mut raw = path.to_string_lossy().into_owned();
+    if is_directory {
+        raw.push(std::path::MAIN_SEPARATOR);
+    }
+    raw.split(['\r', '\n'])
+        .map(|line| line.trim_matches(is_ecmascript_whitespace))
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = Path::new(line);
+            if !path.is_absolute() {
+                return line.replace(std::path::MAIN_SEPARATOR, "/");
+            }
+            let trailing = line.ends_with(std::path::MAIN_SEPARATOR);
+            let target = crate::coding_paths::resolve(root, path);
+            let root_parts: Vec<_> = root.components().collect();
+            let target_parts: Vec<_> = target.components().collect();
+            let common = root_parts
+                .iter()
+                .zip(&target_parts)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let mut relative = PathBuf::new();
+            if common == 0 {
+                relative.push(&target);
+            } else {
+                for _ in common..root_parts.len() {
+                    relative.push("..");
+                }
+                for component in &target_parts[common..] {
+                    relative.push(component.as_os_str());
+                }
+            }
+            let mut relative = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if trailing && !relative.ends_with('/') {
+                relative.push('/');
+            }
+            relative
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -2617,6 +2744,11 @@ impl CodingTool {
                 }
                 return Err(error.into());
             }
+            if path.is_dir() {
+                return Err(Error::Config(
+                    "EISDIR: illegal operation on a directory, read".into(),
+                ));
+            }
         }
         if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
             if self.unrestricted
@@ -2718,6 +2850,10 @@ impl CodingTool {
         check_mutation_cancelled(cancellation)?;
         let display_path = string(args, "path")?;
         let path = self.path(display_path).map_err(|error| match error {
+            #[cfg(unix)]
+            Error::Io(cause) if self.unrestricted => unix_edit_access_error(cause, display_path),
+            #[cfg(windows)]
+            Error::Io(cause) if self.unrestricted => windows_edit_access_error(cause, display_path),
             Error::Io(ref cause)
                 if self.unrestricted && cause.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -2729,6 +2865,21 @@ impl CodingTool {
         })?;
         let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
+        #[cfg(unix)]
+        if self.unrestricted {
+            local_edit_access(&path)
+                .map_err(|error| unix_edit_access_error(error, display_path))?;
+        }
+        #[cfg(windows)]
+        if self.unrestricted {
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| windows_edit_access_error(error, display_path))?;
+            if metadata.permissions().readonly() {
+                return Err(Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: EPERM."
+                )));
+            }
+        }
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
         if !self.unrestricted && output.len() as u64 > MAX_FILE_BYTES {
@@ -2836,8 +2987,13 @@ impl CodingTool {
         };
         let limit = args["limit"]
             .as_u64()
-            .unwrap_or(if is_find { 1000 } else { 100 })
-            .min(100_000) as usize;
+            .unwrap_or(if is_find { 1000 } else { 100 });
+        let limit = if is_find || !self.unrestricted {
+            limit.min(100_000)
+        } else {
+            limit
+        };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
@@ -2878,6 +3034,11 @@ impl CodingTool {
                 }
                 error => error,
             })?;
+            let grep = if self.unrestricted {
+                grep.with_numeric_limit(args["limit"].as_f64().unwrap_or(100.0))
+            } else {
+                grep
+            };
             Some(if base.is_file() {
                 grep.with_explicit_file()
             } else {
@@ -2885,6 +3046,8 @@ impl CodingTool {
             })
         };
         let mut results = Vec::new();
+        let mut find_count = 0usize;
+        let mut find_paths = Vec::new();
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -2974,20 +3137,35 @@ impl CodingTool {
                     break;
                 }
             } else {
-                let mut path = relative
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                    path.push('/');
+                let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+                if self.unrestricted {
+                    find_paths.push((entry.path().to_owned(), is_directory));
+                } else {
+                    let mut path = relative
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    if is_directory {
+                        path.push('/');
+                    }
+                    results.push(path);
                 }
-                results.push(path);
-                if results.len() >= limit {
+                find_count += 1;
+                if find_count >= limit {
                     break;
                 }
             }
         }
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+        if is_find && self.unrestricted {
+            find_paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (path, is_directory) in find_paths {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                results.extend(find_pi_lines(&base, &path, is_directory));
+            }
         }
         Ok(match grep {
             Some(grep) => grep.finish(),
@@ -2998,7 +3176,9 @@ impl CodingTool {
                     }
                     return Ok(Outcome::Succeeded("No files found matching pattern".into()));
                 }
-                results.sort();
+                if !self.unrestricted {
+                    results.sort();
+                }
                 let mut details = Map::new();
                 let mut notices = Vec::new();
                 if results.len() >= limit {
@@ -3055,7 +3235,11 @@ impl CodingTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
+            return if self.unrestricted {
+                Err(Error::Config("Command aborted".into()))
+            } else {
+                Err(Error::Cancelled)
+            };
         }
         let result = self
             .shell_stream(args, cancellation, &mut |_| {}, false, host)
@@ -3096,6 +3280,19 @@ impl CodingTool {
             string(args, "command")?,
             !sanitize_user_output,
         )?;
+        if self.unrestricted && !sanitize_user_output {
+            let shell_name = if matches!(self.kind, Kind::PowerShell) {
+                "PowerShell"
+            } else {
+                "bash"
+            };
+            check_local_shell_cwd(&cwd, shell_name, cancellation)
+                .await
+                .map_err(|error| match error {
+                    Error::Cancelled => Error::Config("Command aborted".into()),
+                    error => error,
+                })?;
+        }
         command
             .current_dir(cwd)
             .stdin(if input.is_some() {
@@ -4524,6 +4721,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unrestricted_grep_accepts_more_than_one_hundred_thousand_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let count = 100_001usize;
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(count)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({"pattern":"needle", "limit":200_000, "context":1});
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+        match tool
+            .search(&args, &pi_rs::CancellationToken::new())
+            .unwrap()
+        {
+            Outcome::SucceededWithDetails { details, .. } => {
+                assert!(details.get("matchLimitReached").is_none());
+                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+            }
+            other => panic!("expected truncated result with details, got {other:?}"),
+        }
+        tool.unrestricted = false;
+        assert!(
+            !jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_numeric_limits_through_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(4)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        for (limit, count, notice, effective) in [
+            (
+                json!(0),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(-3),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(2.0),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+            (
+                json!(2.5),
+                3,
+                "2.5 matches limit reached. Use limit=5",
+                json!(2.5),
+            ),
+        ] {
+            let args = json!({"pattern":"needle", "limit":limit, "context":1});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            match outcome {
+                Outcome::SucceededWithDetails { output, details } => {
+                    assert_eq!(
+                        output
+                            .lines()
+                            .filter(|line| line.contains(": needle"))
+                            .count(),
+                        count
+                    );
+                    assert!(output.contains(notice), "{output}");
+                    assert_eq!(details["matchLimitReached"], effective);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        for limit in [json!(1e100), json!(18446744073709551615u64)] {
+            let args = json!({"pattern":"needle", "limit":limit});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert_eq!(outcome.tool_content().lines().count(), 4);
+        }
+        tool.unrestricted = false;
+        let scoped = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        assert!(!scoped.is_valid(&json!({"pattern":"needle", "limit":2.5})));
+    }
+
     #[tokio::test]
     async fn local_file_queries_report_missing_paths_and_cancellation() {
         let directory = tempfile::tempdir().unwrap();
@@ -4774,6 +5088,153 @@ mod tests {
         } else {
             assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_rejects_read_only_file_even_with_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let probe = local_edit_access(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
+            );
+            assert_eq!(content, "before\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        std::fs::create_dir(&parent).unwrap();
+        let file = parent.join("file");
+        std::fs::write(&file, "before").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = local_edit_access(&file);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: private/file. Error code: EACCES.")
+            );
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_formats_unix_access_codes() {
+        for (errno, code) in [
+            (libc::EROFS, "EROFS"),
+            (libc::ENOTDIR, "ENOTDIR"),
+            (libc::ELOOP, "ELOOP"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+        ] {
+            assert!(
+                matches!(unix_edit_access_error(std::io::Error::from_raw_os_error(errno), "name"),
+                Error::Config(message) if message == format!("Could not edit file: name. Error code: {code}."))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_oversized_path_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = "a".repeat(4096);
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":name,"edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == format!("Could not edit file: {name}. Error code: ENAMETOOLONG."))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn edit_rejects_windows_readonly_file_before_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before").unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"missing","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EPERM.")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
     }
 
     #[cfg(unix)]
@@ -6043,6 +6504,109 @@ mod tests {
         assert!(grep_error.is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn find_fd_lines_trim_then_relativize_and_split() {
+        let root = Path::new("/tmp/find-root");
+        assert_eq!(find_pi_lines(root, &root.join(". "), false), [""]);
+        assert_eq!(find_pi_lines(root, &root.join("sub/.. "), false), [""]);
+        assert_eq!(
+            find_pi_lines(root, &root.join("foo\n bar "), false),
+            ["foo", "bar"]
+        );
+        assert_eq!(
+            find_pi_lines(root, &root.join("foo\r\n bar "), false),
+            ["foo", "bar"]
+        );
+        assert_eq!(find_pi_lines(root, &root.join("dir "), true), ["dir /"]);
+        assert_eq!(
+            find_pi_lines(root, &root.join("nel\u{85}"), false),
+            ["nel\u{85}"]
+        );
+    }
+
+    #[test]
+    fn find_orders_fd_paths_before_expanding_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("a").join("x"), "").unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let output = tool
+            .search(&json!({"pattern":"*"}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "a/\na/x\na.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_newline_filename_counts_displayed_lines_for_limit_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("foo\n bar "), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        for limit in [1, 2] {
+            let output = tool
+                .search(
+                    &json!({"pattern":"*","limit":limit}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .unwrap()
+                .tool_content();
+            assert_eq!(
+                output,
+                format!(
+                    "foo\nbar\n\n[{limit} results limit reached. Use limit={} for more, or refine pattern]",
+                    limit * 2
+                )
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_trims_upstream_line_whitespace_only_for_unrestricted_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for name in ["space ", "bom\u{feff}", "nel\u{85}"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        std::fs::create_dir(root.join("dir ")).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let output = tool
+            .search(&json!({"pattern":"*"}), &cancellation)
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "bom\ndir /\nnel\u{85}\nspace");
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let output = scoped
+            .search(&json!({"pattern":"*"}), &cancellation)
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "bom\u{feff}\ndir /\nnel\u{85}\nspace ");
+    }
+
     #[test]
     fn find_matches_directories_smart_case_and_path_globs() {
         let root = tempfile::tempdir().unwrap();
@@ -6487,6 +7051,93 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn local_bash_reports_missing_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let direct = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let factory = create_bash_tool(
+            &root,
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let expected = format!(
+            "Working directory does not exist: {}\nCannot execute bash commands.",
+            root.display()
+        );
+        for result in [
+            direct.invoke(json!({"command":"true"}), context()).await,
+            factory.invoke(json!({"command":"true"}), context()).await,
+        ] {
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == &expected),
+                "{result:?}"
+            );
+        }
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let result = direct
+            .shell_stream(
+                &json!({"command":"true"}),
+                &cancellation,
+                &mut |_| {},
+                false,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Config(message)) if message == "Command aborted"));
+        let result = direct
+            .invoke(
+                json!({"command":"true"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Failed(message) if message == "Command aborted"));
+        let result = factory
+            .invoke(
+                json!({"command":"true"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation,
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Failed(message) if message == "Command aborted"));
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_check_preserves_powershell_wording_and_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let token = pi_rs::CancellationToken::new();
+        let result = check_local_shell_cwd(&missing, "PowerShell", &token).await;
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message == format!(
+                "Working directory does not exist: {}\nCannot execute PowerShell commands.", missing.display()
+            ))
+        );
+        token.cancel();
+        assert!(matches!(
+            check_local_shell_cwd(&missing, "PowerShell", &token).await,
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn shell_keeps_draining_active_descendants_after_exit() {
         if !std::process::Command::new("python3")
             .arg("--version")
@@ -6830,5 +7481,67 @@ mod tests {
             "timed-out descendant must terminate"
         );
         assert!(!leaked.exists(), "timed-out descendant must not continue");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_read_reports_pi_paging_and_directory_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file"), "first\nsecond").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let result = tool
+            .invoke(json!({"path":"file","offset":2}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Succeeded(text) if text == "second"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(json!({"path":"file","offset":3}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message == "Offset 3 is beyond end of file (2 lines total)"),
+            "{result:?}"
+        );
+        std::fs::write(tool.root.join("empty"), "").unwrap();
+        let result = tool
+            .invoke(json!({"path":"empty","offset":2}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message == "Offset 2 is beyond end of file (1 lines total)"),
+            "{result:?}"
+        );
+        #[cfg(unix)]
+        {
+            let result = tool.invoke(json!({"path":"."}), context()).await;
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == "EISDIR: illegal operation on a directory, read"),
+                "{result:?}"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(json!({"path":"file","offset":4}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: Offset 4 is beyond end of file")),
+            "{result:?}"
+        );
     }
 }
