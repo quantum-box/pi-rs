@@ -51,8 +51,12 @@ struct Record {
     hook_snapshot: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_blocks: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projected_structured: Option<Outcome>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    derived_diagnostics: Vec<crate::runtime::ToolDiagnostic>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     diagnostic_keys: std::collections::BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1498,7 +1502,10 @@ impl NestedHost {
                 if poll && matches!(outcome, Outcome::Pending { .. }) && reg.tool.can_poll() {
                     return self.poll_pending(&key, record, entry.version, reg).await;
                 }
-                return validate_nested_output(&self.shared.output_schemas, name, outcome.clone());
+                return match replay_finalized(&self.shared.output_schemas, name, &record) {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.fail(error),
+                };
             }
             if record.staged_outcome.is_some() {
                 return self.finish_staged(&key, record).await;
@@ -1559,7 +1566,9 @@ impl NestedHost {
                     .as_ref()
                     .map(|hooks| hooks.snapshot.clone()),
                 output_blocks: None,
+                projected_structured: None,
                 diagnostics: Vec::new(),
+                derived_diagnostics: Vec::new(),
                 diagnostic_keys: Default::default(),
                 resolution: None,
             };
@@ -1928,11 +1937,13 @@ impl NestedHost {
         record.before_pending = false;
         record.before_gate = None;
         if let Some((code, message)) = rejection {
-            record.diagnostics.push(crate::runtime::ToolDiagnostic {
+            let diagnostic = crate::runtime::ToolDiagnostic {
                 severity: crate::runtime::DiagnosticSeverity::Error,
                 code: Some(code.into()),
                 message: message.clone(),
-            });
+            };
+            record.derived_diagnostics.push(diagnostic.clone());
+            record.diagnostics.push(diagnostic);
             record.staged_outcome = Some(Outcome::Failed(message));
         }
         let entry = match self.shared.owner.store().get(key) {
@@ -1990,6 +2001,19 @@ impl NestedHost {
             memo: &memo,
         };
         let output = original.tool_content();
+        let mut derived = record.derived_diagnostics.clone();
+        // Legacy records predate explicit provenance. A matching error reason
+        // is conservatively treated as derived during redaction.
+        if let Outcome::Failed(reason) | Outcome::Skipped(reason) = &original {
+            for diagnostic in &record.diagnostics {
+                if diagnostic.severity == crate::runtime::DiagnosticSeverity::Error
+                    && diagnostic.message == *reason
+                    && !derived.contains(diagnostic)
+                {
+                    derived.push(diagnostic.clone());
+                }
+            }
+        }
         let (legacy, reports) = hooks
             .selected
             .after_tool(&call, Value::String(output.clone()), &context)
@@ -2027,9 +2051,9 @@ impl NestedHost {
                 message: "tool metadata withheld after output replacement".into(),
             }];
         }
-        let (result, rich_rewritten, reports) = hooks
+        let (result, rich_rewritten, _, reports) = hooks
             .selected
-            .after_tool_result(&call, result, &context)
+            .after_tool_result_with_derived(&call, result, &context, &derived)
             .await;
         if let Err(error) =
             self.record_hook_reports(hooks, record.operation_id, "after_tool_result", reports)
@@ -2085,9 +2109,9 @@ impl NestedHost {
             extra,
         };
         let original_blocks = block_result.clone();
-        let (blocks, reports) = match hooks
+        let (blocks, _, reports) = match hooks
             .selected
-            .runtime_after_tool_blocks(&call, block_result, true, &context)
+            .runtime_after_tool_blocks_with_derived(&call, block_result, true, &context, &derived)
             .await
         {
             Ok(value) => value,
@@ -2128,6 +2152,12 @@ impl NestedHost {
         // text-bearing outcome alongside a rewritten block result: callers can
         // observe both, and the diagnostic fallback also reads that outcome.
         let blocks_changed = blocks.output != original_blocks.output;
+        let projected_structured =
+            if blocks_changed && matches!(outcome, Outcome::Structured { .. }) {
+                Some(outcome.clone())
+            } else {
+                None
+            };
         let outcome = if blocks_changed {
             outcome_from_blocks(outcome, &blocks.output)
         } else {
@@ -2150,8 +2180,10 @@ impl NestedHost {
         record = current;
         record.staged_outcome = None;
         record.outcome = Some(outcome.clone());
+        record.projected_structured = projected_structured;
         record.output_blocks = blocks_changed.then_some(blocks.output);
         record.diagnostics = blocks.diagnostics;
+        record.derived_diagnostics.clear();
         record.diagnostic_keys.clear();
         let value = match serde_json::to_vec(&record) {
             Ok(value) => value,
@@ -2314,6 +2346,32 @@ impl NestedHost {
         }
     }
 }
+fn replay_finalized(
+    schemas: &std::collections::BTreeMap<String, Value>,
+    name: &str,
+    record: &Record,
+) -> Result<Outcome, &'static str> {
+    let outcome = record.outcome.as_ref().ok_or("nested outcome missing")?;
+    if let Some(original) = &record.projected_structured {
+        let blocks = record
+            .output_blocks
+            .as_ref()
+            .ok_or("nested structured projection missing blocks")?;
+        if !matches!(original, Outcome::Structured { .. })
+            || outcome_from_blocks(original.clone(), blocks) != *outcome
+        {
+            return Err("invalid nested structured projection");
+        }
+        let checked = validate_nested_output(schemas, name, original.clone());
+        return Ok(if checked == *original {
+            outcome.clone()
+        } else {
+            checked
+        });
+    }
+    Ok(validate_nested_output(schemas, name, outcome.clone()))
+}
+
 fn validate_nested_output(
     schemas: &std::collections::BTreeMap<String, Value>,
     name: &str,
@@ -2395,7 +2453,9 @@ mod tests {
             hooks_required: true,
             hook_snapshot: None,
             output_blocks: None,
+            projected_structured: None,
             diagnostics: Vec::new(),
+            derived_diagnostics: Vec::new(),
             diagnostic_keys: Default::default(),
             resolution: None,
         };
@@ -2486,7 +2546,9 @@ mod tests {
             hooks_required: false,
             hook_snapshot: None,
             output_blocks: None,
+            projected_structured: None,
             diagnostics: Vec::new(),
+            derived_diagnostics: Vec::new(),
             diagnostic_keys: Default::default(),
             resolution: None,
         };
@@ -3434,5 +3496,64 @@ mod tests {
         ));
         assert_eq!(store.get(&key).unwrap().unwrap().value, b"original");
         assert!(h.seal_and_inspect().is_err());
+    }
+    #[test]
+    fn structured_projection_revalidates_after_store_reopen_and_rejects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let record = Record {
+            name: "child".into(),
+            arguments: json!({}),
+            prepared: json!({}),
+            before_pending: false,
+            before_gate: None,
+            policy: ReplayPolicy::Unsafe,
+            durable_identity: None,
+            operation_id: Uuid::new_v4(),
+            outcome: Some(Outcome::Succeeded("safe".into())),
+            staged_outcome: None,
+            hooks_required: true,
+            hook_snapshot: None,
+            output_blocks: Some(vec![json!({"type":"text","text":"safe"})]),
+            projected_structured: Some(Outcome::Structured {
+                data: json!({"n":7}),
+                attachments: vec![],
+            }),
+            diagnostics: vec![],
+            derived_diagnostics: vec![],
+            diagnostic_keys: Default::default(),
+            resolution: None,
+        };
+        let schema =
+            json!({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]});
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert("child".to_owned(), schema);
+        let store = durable_store::Store::open(&path).unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"record".to_vec(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(store);
+        let store = durable_store::Store::open(&path).unwrap();
+        let mut restored: Record =
+            serde_json::from_slice(&store.get(b"record").unwrap().unwrap().value).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                replay_finalized(&schemas, "child", &restored).unwrap(),
+                Outcome::Succeeded("safe".into())
+            );
+        }
+        restored.output_blocks = Some(vec![json!({"type":"text","text":"tampered"})]);
+        assert!(replay_finalized(&schemas, "child", &restored).is_err());
+        restored.output_blocks = record.output_blocks;
+        schemas.insert("child".into(), json!({"type":"string"}));
+        assert!(
+            matches!(replay_finalized(&schemas, "child", &restored).unwrap(), Outcome::Failed(reason) if reason.starts_with("invalid_structured_output:"))
+        );
     }
 }

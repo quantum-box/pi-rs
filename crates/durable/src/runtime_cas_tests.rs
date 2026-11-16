@@ -5785,3 +5785,94 @@ fn bounded_tool_blocks_preserve_nontext_order_and_bound_combined_text() {
         "Output truncated to its end: 0 lines, 2 bytes dropped"
     );
 }
+
+#[tokio::test]
+async fn legacy_finished_abort_with_hooks_redacts_published_metadata_and_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    let operation = Uuid::new_v4();
+    let calls = vec![ToolCall {
+        id: "call".into(),
+        name: "tool".into(),
+        arguments: "{}".into(),
+    }];
+    record_tool_result(
+        &mut state,
+        &calls,
+        0,
+        operation,
+        &Outcome::Failed("private reason".into()),
+        vec![],
+    )
+    .unwrap();
+    state.extensions = vec!["selected".into()];
+    state.phase = Phase::ToolFinished {
+        turns: 0,
+        calls,
+        index: 0,
+        operation_id: operation,
+        arguments: serde_json::json!({}),
+        content: "private output".into(),
+    };
+    state.abort_requested = true;
+    h.owner
+        .store()
+        .commit(
+            &[Check {
+                key: Harness::key(id),
+                expected: Expected::Version(version),
+            }],
+            &[Mutation::Put {
+                key: Harness::key(id),
+                value: serde_json::to_vec(&state).unwrap(),
+            }],
+        )
+        .unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let (state, version) = h.load(id).unwrap();
+    assert!(state.pending_tool_result.is_none());
+    assert_eq!(state.tool_results.len(), 1);
+    h.settle_abort(state, version, &CancellationToken::new())
+        .await
+        .unwrap();
+    let result = h.conversation(id).unwrap();
+    assert!(!format!("{result:?}").contains("private"));
+    assert!(result.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content.contains("tool result unavailable after abort before hooks") && !content.contains("private"))));
+    drop(h);
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for Capture {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream, pi_rs_core::Error> {
+            self.0.lock().unwrap().push(request);
+            Ok(stream::iter(vec![Ok(ModelEvent::Complete {
+                calls: vec![],
+                usage: None,
+            })])
+            .boxed())
+        }
+    }
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut opts = options();
+    opts.model = std::sync::Arc::new(Capture(requests.clone()));
+    let mut h = Harness::open_paused(&path, opts).unwrap();
+    let result = h.conversation(id).unwrap();
+    assert!(!format!("{result:?}").contains("private"));
+    assert!(result.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content.contains("tool result unavailable after abort before hooks"))));
+    h.select_extensions(id, vec![]).unwrap();
+    h.submit_and_run(id, None, "follow up".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = requests.lock().unwrap();
+    assert!(requests.iter().flat_map(|request| &request.messages).any(|message| matches!(message, Message::Tool { content, .. } if content.contains("tool result unavailable after abort before hooks"))));
+    assert!(!format!("{requests:?}").contains("private"));
+}

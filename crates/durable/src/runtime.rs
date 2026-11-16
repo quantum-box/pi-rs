@@ -11136,6 +11136,21 @@ impl Harness {
                         content = blocks[0]["text"].as_str().unwrap_or_default().to_owned();
                     }
                     c.tool_results.push(metadata);
+                } else if !c.extensions.is_empty() {
+                    // Older ToolFinished records published metadata in the
+                    // conversation before the private pending sidecar existed.
+                    content = "tool result unavailable after abort before hooks".into();
+                    if let Some(metadata) = c
+                        .tool_results
+                        .iter_mut()
+                        .find(|metadata| metadata.operation_id == operation_id)
+                    {
+                        redact_tool_metadata(
+                            metadata,
+                            "hook_not_completed",
+                            "tool result metadata withheld because after-tool hooks did not complete",
+                        );
+                    }
                 }
                 // The effect already committed; retain its result even if an
                 // after-tool hook was interrupted by the abort.
@@ -14141,7 +14156,19 @@ impl Harness {
                             .find(|metadata| metadata.operation_id == operation_id)
                             .cloned()
                     });
+                    let mut derived = Vec::new();
                     if let Some(mut metadata) = metadata {
+                        for diagnostic in &metadata.diagnostics {
+                            if diagnostic.severity == DiagnosticSeverity::Error
+                                && (content == diagnostic.message
+                                    || content.strip_prefix("Tool failed: ")
+                                        == Some(diagnostic.message.as_str())
+                                    || content.strip_prefix("Tool skipped: ")
+                                        == Some(diagnostic.message.as_str()))
+                            {
+                                derived.push(diagnostic.clone());
+                            }
+                        }
                         if let Some(diagnostic) = &interrupted_truncation
                             && let Some(index) = metadata
                                 .diagnostics
@@ -14179,7 +14206,9 @@ impl Harness {
                             diagnostics: metadata.diagnostics.clone(),
                         };
                         let (value, result_changed, explicitly_replaced, reports) = fenced_poll(
-                            selected.after_tool_result_with_provenance(&hook_call, value, &context),
+                            selected.after_tool_result_with_derived(
+                                &hook_call, value, &context, &derived,
+                            ),
                             self.execution_gate.as_ref(),
                             cancel,
                         )
@@ -14244,11 +14273,12 @@ impl Harness {
                     };
                     let original_block_result = block_result.clone();
                     let (mut block_result, blocks_replaced, reports) = fenced_poll(
-                        selected.runtime_after_tool_blocks_with_replacement(
+                        selected.runtime_after_tool_blocks_with_derived(
                             &hook_call,
                             block_result,
                             false,
                             &context,
+                            &derived,
                         ),
                         self.execution_gate.as_ref(),
                         cancel,

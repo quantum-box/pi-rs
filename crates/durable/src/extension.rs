@@ -205,12 +205,15 @@ fn output_replaced<T: PartialEq>(before: &T, after: &T, provenance: OutputProven
 fn remove_cloned_derived_diagnostics(
     before: &[crate::runtime::ToolDiagnostic],
     after: &mut Vec<crate::runtime::ToolDiagnostic>,
+    derived: &[crate::runtime::ToolDiagnostic],
 ) {
     after.retain(|diagnostic| {
-        !matches!(
-            diagnostic.code.as_deref(),
-            Some("tool_failed" | "tool_skipped")
-        ) || !before.contains(diagnostic)
+        !(derived.contains(diagnostic)
+            || matches!(
+                diagnostic.code.as_deref(),
+                Some("tool_failed" | "tool_skipped")
+            ))
+            || !before.contains(diagnostic)
     });
 }
 
@@ -780,8 +783,18 @@ impl Resolved {
     pub(crate) async fn after_tool_result_with_provenance(
         &self,
         call: &ToolCall,
+        result: ToolResult,
+        ctx: &Context<'_>,
+    ) -> (ToolResult, bool, bool, Vec<Report>) {
+        self.after_tool_result_with_derived(call, result, ctx, &[])
+            .await
+    }
+    pub(crate) async fn after_tool_result_with_derived(
+        &self,
+        call: &ToolCall,
         mut result: ToolResult,
         ctx: &Context<'_>,
+        derived: &[crate::runtime::ToolDiagnostic],
     ) -> (ToolResult, bool, bool, Vec<Report>) {
         let mut reports = Vec::new();
         let mut replaced = false;
@@ -801,6 +814,7 @@ impl Resolved {
                             remove_cloned_derived_diagnostics(
                                 &result.diagnostics,
                                 &mut value.diagnostics,
+                                derived,
                             );
                         }
                         let valid_diagnostics = value.diagnostics.len() <= 32
@@ -867,24 +881,13 @@ impl Resolved {
         }
         Ok((result, reports))
     }
-    pub(crate) async fn runtime_after_tool_blocks(
-        &self,
-        call: &ToolCall,
-        result: ToolBlockResult,
-        nested: bool,
-        ctx: &Context<'_>,
-    ) -> Result<(ToolBlockResult, Vec<Report>), String> {
-        let (result, _, reports) = self
-            .runtime_after_tool_blocks_with_replacement(call, result, nested, ctx)
-            .await?;
-        Ok((result, reports))
-    }
-    pub(crate) async fn runtime_after_tool_blocks_with_replacement(
+    pub(crate) async fn runtime_after_tool_blocks_with_derived(
         &self,
         call: &ToolCall,
         mut result: ToolBlockResult,
         nested: bool,
         ctx: &Context<'_>,
+        derived: &[crate::runtime::ToolDiagnostic],
     ) -> Result<(ToolBlockResult, bool, Vec<Report>), String> {
         if !result.valid() {
             return Err("invalid tool output blocks".into());
@@ -912,6 +915,7 @@ impl Resolved {
                             remove_cloned_derived_diagnostics(
                                 &result.diagnostics,
                                 &mut value.diagnostics,
+                                derived,
                             );
                         }
                         result = value;
