@@ -119,6 +119,15 @@ pub struct Driver {
     cleanup: Option<JoinHandle<()>>,
 }
 impl Driver {
+    #[cfg(test)]
+    pub(crate) fn has_pending_task(&self, id: Uuid) -> bool {
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.task_id() == id)
+    }
     /// Take outcomes retained when a driver was dropped without shutdown.
     /// The corresponding store attachments remain held until these values drop.
     pub fn take_abandoned_pending() -> Vec<task_scheduler::PendingSettlement> {

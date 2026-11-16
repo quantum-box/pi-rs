@@ -13029,11 +13029,13 @@ impl Harness {
             };
             let task = if let Some(running) = pending_running {
                 let ts = crate::task_store::TaskStore::new(store);
-                match crate::task_scheduler::pending_abort_root_for_running(&ts, running, false)
-                    .map_err(|e| Error::Invalid(format!("pending task abort: {e}")))?
-                {
-                    Some(root) => Some(root),
-                    None => return Ok(None),
+                match crate::task_scheduler::pending_abort_root_for_running(&ts, running, false) {
+                    Err(crate::task_scheduler::Error::Busy) => {
+                        return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+                    }
+                    Err(e) => return Err(Error::Invalid(format!("pending task abort: {e}"))),
+                    Ok(Some(root)) => Some(root),
+                    Ok(None) => return Ok(None),
                 }
             } else {
                 fixed_task

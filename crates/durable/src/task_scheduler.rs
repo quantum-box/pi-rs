@@ -772,6 +772,7 @@ impl PendingSettlement {
             }
             match harness.abort_pending_task_graph(lease.id) {
                 Ok(affected) => Ok(affected.unwrap_or_default()),
+                Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
                 Err(error) => {
                     lease.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
                     Err(Error::Handler(format!("checked pending abort: {error}")))
@@ -1845,6 +1846,11 @@ impl Scheduler {
         drop(guard);
         let pending = match pending {
             Ok(pending) => pending,
+            Err(Error::Busy) => {
+                return Err(SettlementError::Pending {
+                    completed: Box::new(completed),
+                });
+            }
             Err(error) => {
                 return Err(SettlementError::Rejected {
                     error,
@@ -1877,6 +1883,7 @@ impl Scheduler {
                 }
                 match worker.abort_pending_task_graph(running) {
                     Ok(affected) => Ok(affected.unwrap_or_default()),
+                    Err(crate::runtime::Error::TaskScheduler(Error::Busy)) => Err(Error::Busy),
                     Err(error) => {
                         state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
                         Err(Error::Handler(format!("checked pending abort: {error}")))
@@ -3091,6 +3098,16 @@ impl Scheduler {
             }
             let pending = !pending_roots.is_empty();
             if pending {
+                let graph = crate::ownership_edge::CleanupGraph::load(self.owner().store())
+                    .map_err(|e| Error::Handler(format!("ownership graph: {e}")))?;
+                // Valid edges enumerate known descendants. For damaged graphs,
+                // also retain every interrupted task whose ancestry cannot
+                // prove it lies outside the pending root.
+                let uncertain: Vec<_> = pending_roots
+                    .iter()
+                    .copied()
+                    .filter(|id| graph.uncertain_task(*id))
+                    .collect();
                 let mut task_ids = HashSet::new();
                 let mut conversations = HashSet::new();
                 while let Some(id) = pending_roots.pop() {
@@ -3102,27 +3119,32 @@ impl Scheduler {
                             pending_roots.push(record.task.id());
                         }
                     }
-                    for edge in crate::ownership_edge::EdgeStore::new(self.owner().store())
-                        .children(id)
-                        .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
-                    {
-                        if edge.edge.mode == crate::ownership_edge::Mode::Foreground
-                            && conversations.insert(edge.edge.child)
+                    for edge in graph.task_edges(id) {
+                        if edge.mode == crate::ownership_edge::Mode::Foreground
+                            && conversations.insert(edge.child)
                         {
                             for record in &records {
-                                if record.task.owner() == &TaskOwner::Conversation(edge.edge.child)
-                                {
+                                if record.task.owner() == &TaskOwner::Conversation(edge.child) {
                                     pending_roots.push(record.task.id());
                                 }
                             }
                         }
                     }
                 }
+                let owner = self.owner();
                 self.deferred_recovery
                     .extend(records.iter().filter_map(|item| {
                         (item.task.state() == &TaskState::Running
                             && !live.contains(&item.task.id())
-                            && task_ids.contains(&item.task.id()))
+                            && (task_ids.contains(&item.task.id())
+                                || uncertain.iter().any(|root| {
+                                    !task_ancestors_available(
+                                        owner.store(),
+                                        &item.task,
+                                        &records,
+                                        |parent| parent.id() == *root,
+                                    )
+                                })))
                         .then_some(item.task.id())
                     }));
             }
@@ -3638,8 +3660,12 @@ impl Scheduler {
             }
         }
         if !self.deferred_recovery.is_empty() {
+            let before = self.deferred_recovery.clone();
             self.reconcile()?;
-            return Ok(TickReservation::Progress(true));
+            // A graph that remains uncertain must not starve independent work.
+            if self.deferred_recovery != before {
+                return Ok(TickReservation::Progress(true));
+            }
         }
         for snapshot in self.ts().list()? {
             if !snapshot.task.abort_requested()
@@ -3901,9 +3927,22 @@ impl Scheduler {
         let original_version = running.version;
         let original_running = running.clone();
         let running = current.clone();
-        if let Some(root) =
-            pending_abort_root_for_running(&self.ts(), running.task.id(), self.validator.is_none())?
-        {
+        let pending_root = match pending_abort_root_for_running(
+            &self.ts(),
+            running.task.id(),
+            self.validator.is_none(),
+        ) {
+            Err(Error::Busy) if nonblocking_abort => {
+                *deferred = Some(DeferredSettlement::Unprepared(
+                    original_running,
+                    result,
+                    documents,
+                ));
+                return Err(Error::Busy);
+            }
+            other => other?,
+        };
+        if let Some(root) = pending_root {
             if nonblocking_abort && self.validator.is_some() {
                 *deferred = Some(DeferredSettlement::Unprepared(
                     original_running,
@@ -17418,7 +17457,7 @@ mod standalone_foreground_cleanup_tests {
             seen.fetch_add(1, Ordering::SeqCst);
             Ok(Step::Succeed(json!(null)))
         });
-        let mut scheduler = h.attach_tasks(registry).unwrap();
+        let scheduler = h.attach_tasks(registry).unwrap();
         tasks
             .reserve(&tasks.load(descendant.id()).unwrap().unwrap())
             .unwrap();
@@ -17441,6 +17480,22 @@ mod standalone_foreground_cleanup_tests {
             pending_abort_root_for_running(&tasks, descendant.id(), false),
             Err(Error::Busy)
         ));
+        drop(scheduler);
+        drop(h);
+        let h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let seen = calls.clone();
+        let mut registry = Registry::default();
+        registry.register("work", true, move |_: &Task| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(json!(null)))
+        });
+        let mut scheduler = h
+            .attach_tasks(registry)
+            .expect("unrelated damaged edge must not block attachment");
+        assert_eq!(
+            scheduler.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
         // A deferred failure selected before corruption must revalidate too.
         assert!(
             resolve_maintenance(&tasks, MaintenanceIntent::Failed(broken.id()))
@@ -17458,6 +17513,153 @@ mod standalone_foreground_cleanup_tests {
         assert!(matches!(state.state(), TaskState::CompletingFailed(_)));
         assert!(!state.abort_requested());
         assert!(scheduler.get(good.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn in_flight_result_waits_for_uncertain_failed_graph_without_stopping_driver() {
+        use std::{
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                mpsc,
+            },
+            time::Duration,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let parent = task(1, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.wait(WaitFor::Signal("hold".into()))
+            })
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(
+                parent.id(),
+                parent.owner().clone(),
+                "child",
+                cfg.clone(),
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let damaged = h
+            .ensure_task_owned_subagent(
+                parent.id(),
+                parent.owner().clone(),
+                "damaged",
+                cfg.clone(),
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let independent_root = h.create_conversation(cfg).unwrap();
+        let descendant = task(2, TaskOwner::Conversation(child), "blocked");
+        tasks.save(&[Save::Create(&descendant)]).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| panic!("waiting parent ran"));
+        registry.register("blocked", true, move |_: &Task| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(Step::Succeed(json!("must be discarded")))
+        });
+        registry.register("work", true, |_: &Task| {
+            Ok(Step::Succeed(json!("independent")))
+        });
+        let scheduler = h.attach_tasks(registry).unwrap();
+        let owner = scheduler.owner();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let gate = owner.task_gate().lock().unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.wake()?;
+                task.start()?;
+                task.hold_failure("failed".into())
+            })
+            .unwrap();
+        let key = crate::ownership_edge::edge_key(damaged);
+        let entry = db.get(&key).unwrap().unwrap();
+        let original = entry.value.clone();
+        let mut edge: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        edge["mode"] = json!("corrupt");
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&edge).unwrap(),
+            }],
+        )
+        .unwrap();
+        drop(gate);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !driver.has_pending_task(descendant.id()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed invocation was not retained");
+        let good = task(3, TaskOwner::Conversation(independent_root), "work");
+        driver.submit(&good).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if driver.get(good.id()).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unrelated work did not complete");
+        assert_eq!(
+            driver.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Running
+        );
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: original,
+            }],
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while driver.has_pending_task(descendant.id()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("repaired graph did not settle pending outcome");
+        assert_ne!(
+            driver.get(descendant.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("must be discarded"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        driver.shutdown().unwrap();
     }
 
     #[test]
