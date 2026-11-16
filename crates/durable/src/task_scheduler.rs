@@ -18550,4 +18550,163 @@ mod standalone_foreground_cleanup_tests {
             );
         }
     }
+
+    #[test]
+    fn cross_notification_reservation_fences_signal_at_commit() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{
+            Config, Harness, Options, SubmissionNotify,
+            submission_settled_signal,
+        };
+        use crate::task_store::{Signal, TaskStore};
+        use async_trait::async_trait;
+        use pi_rs_core::{
+            Error as ModelError, Model, ModelRequest, ModelStream,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(
+                &self,
+                _: ModelRequest,
+            ) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Writer {
+            target: Uuid,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Writer {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+                let result = docs.submit_write_to_session_conversation_without_request_id(
+                    self.target, "app.reservation".into(), None,
+                    Some(SubmissionNotify { task_id: task.id(), key: "collision".into() }),
+                );
+                if attempt > 0 {
+                    assert!(result.is_err());
+                    return Ok(Step::Succeed(json!(null)));
+                }
+                result.map_err(|e| e.to_string())?;
+                let address = Address {
+                    scope: "test".into(),
+                    name: "reservation-fence".into(),
+                    key: "".into(),
+                };
+                docs.get(&address).map_err(|e| e.to_string())?;
+                docs.put(
+                    &address,
+                    json!({"effect":true}).as_object().unwrap().clone(),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(Step::Continue(Checkpoint {
+                    phase: "next".into(),
+                    data: json!(null),
+                }))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(
+            &path,
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy:
+                    crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let config = || Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = harness.create_conversation(config()).unwrap();
+        let target = harness.create_conversation(config()).unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let sessions =
+            crate::session_membership::SessionMembership::new(&store);
+        let session = sessions.create().unwrap();
+        sessions.enroll(session, owner).unwrap();
+        sessions.enroll(session, target).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "reservation-fence",
+            true,
+            Writer {
+                target,
+                calls: calls.clone(),
+            },
+        );
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let writer = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(owner),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("reservation-fence".into(), true);
+        scheduler.submit(&writer).unwrap();
+        let once = Arc::new(AtomicBool::new(false));
+        let writer_id = writer.id();
+        scheduler.set_result_commit_hook(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                let id = Uuid::new_v4();
+                let value = json!({"id":id,"conversationId":owner,"type":"write","status":"done","entry":id});
+                let signal = Signal::new_typed(Uuid::new_v4(), writer_id, &submission_settled_signal(), "collision", value).unwrap();
+                TaskStore::new(store).send_signal(&signal).unwrap();
+            }
+        }));
+        for _ in 0..8 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(writer.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            scheduler.get(writer.id()).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+        assert!(
+            harness
+                .conversation(target)
+                .unwrap()
+                .application_writes
+                .is_empty()
+        );
+        let address = Address {
+            scope: "test".into(),
+            name: "reservation-fence".into(),
+            key: "".into(),
+        };
+        assert!(Documents::new(&store).get(&address).unwrap().is_none());
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(
+                    writer.id(),
+                    &submission_settled_signal(),
+                    "collision"
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
 }

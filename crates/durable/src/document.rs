@@ -2670,11 +2670,14 @@ impl<'a> TaskDocuments<'a> {
             return Err(Error::ReadAfterWrite);
         }
         if request_id.as_ref().is_some_and(String::is_empty) {
-            return Err(Error::InvalidSessionAdmission("request ID required".into()));
+            return Err(Error::InvalidSessionAdmission(
+                "request ID required".into(),
+            ));
         }
         if let Some(intent) = &self.task_input {
             if target.is_some() != intent.cross_conversation
-                || target.is_some_and(|target| target != intent.conversation)
+                || target
+                    .is_some_and(|target| target != intent.conversation)
             {
                 return Err(Error::InvalidSessionAdmission(
                     "all admissions in a step must use the same conversation".into(),
@@ -2686,6 +2689,23 @@ impl<'a> TaskDocuments<'a> {
                 ));
             }
             let mut admissions = intent.admissions.clone();
+            let prior = crate::runtime::validate_task_submissions(
+                self.store,
+                &intent.snapshot,
+                &mut admissions,
+                intent.cross_conversation,
+            );
+            if let Err(error) = prior {
+                let error = match error {
+                    Error::InvalidSessionAdmission(_) => {
+                        Error::Store(durable_store::Error::Conflict {
+                            key: b"runtime/conversation/".to_vec(),
+                        })
+                    }
+                    error => error,
+                };
+                return Err(self.remember_task_input_error(error));
+            }
             admissions.push(TaskAdmission {
                 request_id,
                 draft,
@@ -2700,22 +2720,40 @@ impl<'a> TaskDocuments<'a> {
                 &mut admissions,
                 intent.cross_conversation,
             );
-            result.map_err(|error| self.remember_task_input_error(error))?;
+            if let Err(mut error) = result {
+                let mut prior = admissions[..admissions.len() - 1].to_vec();
+                match crate::runtime::validate_task_submissions(
+                    self.store, &snapshot, &mut prior, intent.cross_conversation,
+                ) {
+                    Err(Error::InvalidSessionAdmission(_)) => {
+                        error = Error::Store(durable_store::Error::Conflict {
+                            key: b"runtime/conversation/".to_vec(),
+                        });
+                    }
+                    Err(other) => error = other,
+                    Ok(()) => {}
+                }
+                return Err(self.remember_task_input_error(error));
+            }
             if admissions.iter().any(|item| {
                 matches!(
                     item.draft,
-                    TaskSubmissionDraft::Input { .. } | TaskSubmissionDraft::Continue
+                    TaskSubmissionDraft::Input { .. }
+                        | TaskSubmissionDraft::Continue
                 )
             }) {
                 let validation = self
                     .input_validator
                     .ok_or_else(|| {
                         Error::InvalidSessionAdmission(
-                            "task submission requires an attached harness".into(),
+                            "task submission requires an attached harness"
+                                .into(),
                         )
                     })?
                     .validate_task_input_context(conversation, &snapshot);
-                validation.map_err(|error| self.remember_task_input_error(error))?;
+                validation.map_err(|error| {
+                    self.remember_task_input_error(error)
+                })?;
             }
             self.task_input.as_mut().unwrap().admissions = admissions;
             return Ok(());
@@ -2736,12 +2774,22 @@ impl<'a> TaskDocuments<'a> {
                     let record = self
                         .store
                         .get(&key)
-                        .map_err(|error| self.remember_task_input_error(Error::Store(error)))?
+                        .map_err(|error| {
+                            self.remember_task_input_error(Error::Store(
+                                error,
+                            ))
+                        })?
                         .ok_or_else(|| {
-                            Error::InvalidSessionAdmission("task ancestor missing".into())
+                            Error::InvalidSessionAdmission(
+                                "task ancestor missing".into(),
+                            )
                         })?;
-                    let ancestor: crate::task::Task = serde_json::from_slice(&record.value)?;
-                    if ancestor.id() != id || ancestor.is_terminal() || ancestor.abort_requested() {
+                    let ancestor: crate::task::Task =
+                        serde_json::from_slice(&record.value)?;
+                    if ancestor.id() != id
+                        || ancestor.is_terminal()
+                        || ancestor.abort_requested()
+                    {
                         return Err(Error::InvalidSessionAdmission(
                             "task ancestor is inactive".into(),
                         ));
@@ -3083,6 +3131,19 @@ impl<'a> TaskDocuments<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
+        if token.name()
+            == crate::runtime::submission_settled_signal().name()
+            && self.task_input.as_ref().is_some_and(|intent| {
+                intent.cross_conversation && intent.admissions.iter().any(|item| {
+                    item.notification_binding.is_some()
+                        && item.notify.as_ref().is_some_and(|notify| {
+                            notify.task_id == task_id && notify.key == key
+                        })
+                })
+            })
+        {
+            return Err(Error::SignalComposition);
+        }
         self.signals.signal_at(
             self.store,
             task_id,
@@ -3097,7 +3158,11 @@ impl<'a> TaskDocuments<'a> {
     /// Stage an immutable application record with this task as its author.
     /// The root conversation and every task ancestor must exist and not be aborting. The returned ID is
     /// provisional until the step commits and can change on replay.
-    pub fn append_entry(&mut self, kind: &str, data: Value) -> Result<uuid::Uuid, Error> {
+    pub fn append_entry(
+        &mut self,
+        kind: &str,
+        data: Value,
+    ) -> Result<uuid::Uuid, Error> {
         self.append_entry_inner(None, kind, data)
     }
 
