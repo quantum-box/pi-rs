@@ -15692,6 +15692,31 @@ impl Scheduler {
                     return Err(Error::Invalid("invalid ownership edge".into()));
                 }
             }
+            // An orphaned background task remains outside ordinary idle, but
+            // a cyclic ownership chain is not evidence of a valid boundary.
+            for record in records.iter().filter(|record| record.task.is_background()) {
+                let mut current = TaskOwner::Task(record.task.id());
+                let mut chain = Vec::new();
+                loop {
+                    if chain.contains(&current) {
+                        return Err(Error::Invalid("cyclic ownership graph".into()));
+                    }
+                    chain.push(current.clone());
+                    match current {
+                        TaskOwner::Task(id) => match by_id.get(&id) {
+                            Some(parent) => current = parent.task.owner().clone(),
+                            None => break,
+                        },
+                        TaskOwner::Conversation(id) => {
+                            match edges.iter().find(|edge| edge.edge.child == id) {
+                                Some(edge) => current = TaskOwner::Task(edge.edge.task),
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                background_tasks.push_back(record.task.id());
+            }
             let mut background_seen_tasks = HashSet::new();
             let mut background_seen_conversations = HashSet::new();
             while !background_tasks.is_empty() || !background_conversations.is_empty() {

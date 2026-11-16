@@ -175,6 +175,38 @@ async fn all_idle_rejects_unreachable_foreground_task() {
 }
 
 #[tokio::test]
+async fn all_idle_ignores_orphan_background_task_and_its_child() {
+    use durable_store::Store;
+    use pi_rs_durable::task_store::{Save, TaskStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    {
+        let db = Store::open(&path).unwrap();
+        let background = task(Uuid::new_v4(), true);
+        let child = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Task(background.id()),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            5,
+        )
+        .unwrap();
+        TaskStore::new(&db)
+            .save(&[Save::Create(&background), Save::Create(&child)])
+            .unwrap();
+    }
+    let scheduler = Scheduler::open(&path, options()).unwrap();
+    scheduler
+        .wait_for_all_idle(&CancellationToken::new())
+        .await
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn recovered_live_task_requires_driver_then_settles() {
     use pi_rs_durable::task_scheduler;
     let dir = tempfile::tempdir().unwrap();
