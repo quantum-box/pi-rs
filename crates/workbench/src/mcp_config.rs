@@ -448,10 +448,6 @@ async fn account_guard_with(
     credential: Option<&std::fs::File>,
     readonly: bool,
 ) -> Result<McpWriteGuard> {
-    let account_id = account
-        .file()
-        .map(|file| same_file::Handle::from_file(file.try_clone()?))
-        .transpose()?;
     let credential_id = credential
         .map(|file| same_file::Handle::from_file(file.try_clone()?))
         .transpose()?;
@@ -481,7 +477,7 @@ async fn account_guard_with(
             Err(error) => return Err(error),
         };
         let id = same_file::Handle::from_file(lock.try_clone()?)?;
-        if account_id.as_ref() == Some(&id) || credential_id.as_ref() == Some(&id) {
+        if account.aliases_file(&lock)? || credential_id.as_ref() == Some(&id) {
             return Err(Error::Config("MCP locks refer to the same file".into()));
         }
         if opened.iter().any(|(other, _, _)| other == &id) {
@@ -1624,6 +1620,31 @@ mod tests {
         )
         .await;
         assert!(result.expect("credential alias must not deadlock").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn injected_gate_rejects_account_lock_alias_before_waiting() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let account = super::super::mcp_shared_gate::acquire_for_test(&profile, None)
+            .await
+            .unwrap();
+        let config = root.path().join("mcp.json");
+        std::fs::hard_link(
+            profile.join(".pi-rs-shared/mcp-config-gate.lock"),
+            config.with_extension("lock"),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            account_guard_with(account, &[config], None, false),
+        )
+        .await;
+        assert!(result.expect("account alias must not deadlock").is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

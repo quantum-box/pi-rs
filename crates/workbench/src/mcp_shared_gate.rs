@@ -26,12 +26,13 @@ pub(crate) struct AccountGuard {
 
 impl AccountGuard {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn file(&self) -> Option<&File> {
-        Some(&self.file)
+    pub(crate) fn aliases_file(&self, other: &File) -> io::Result<bool> {
+        Ok(same_file::Handle::from_file(self.file.try_clone()?)?
+            == same_file::Handle::from_file(other.try_clone()?)?)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn file(&self) -> Option<&File> {
-        None
+    pub(crate) fn aliases_file(&self, _other: &File) -> io::Result<bool> {
+        Ok(false)
     }
 }
 
