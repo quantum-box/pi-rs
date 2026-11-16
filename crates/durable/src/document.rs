@@ -1755,7 +1755,7 @@ pub struct TaskDocuments<'a> {
 /// validate children and commit the parent transition with the prepared batch.
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) struct DetachedTaskDocuments {
+pub struct DetachedTaskDocuments {
     owner: std::sync::Arc<durable_store::owner::OwnedStore>,
     reservation: crate::task_store::StoredTask,
     revision: u64,
@@ -1771,6 +1771,84 @@ pub(crate) struct DetachedTaskDocuments {
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
     pub(crate) keyed_child_handlers:
         HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
+}
+
+/// Read-only inspection of a staged keyed child and its original checks.
+pub struct StagedKeyedChild<'a> {
+    pub key: &'a str,
+    pub task: &'a crate::task::Task,
+    pub tool: &'a str,
+    pub arguments: &'a Value,
+    pub parent_version: u64,
+    pub checks: &'a [Check],
+    pub mutations: &'a [Mutation],
+    pub handler_bound: bool,
+}
+
+/// Read-only inspection of staged application entries and their checks.
+pub struct StagedApplicationEntries<'a> {
+    pub conversation: uuid::Uuid,
+    pub version: Option<u64>,
+    pub entries: &'a [crate::application_entry::ApplicationEntry],
+    pub checks: &'a [Check],
+    pub dirty: bool,
+    pub initial_len: usize,
+    pub runtime_cut: Option<usize>,
+    pub runtime_config: Option<&'a crate::runtime::Config>,
+}
+
+impl DetachedTaskDocuments {
+    pub fn reservation(&self) -> &crate::task_store::StoredTask {
+        &self.reservation
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn reads(&self) -> &HashMap<Address, Option<Document>> {
+        &self.reads
+    }
+    pub fn writes(&self) -> &HashMap<Address, Option<Map<String, Value>>> {
+        &self.writes
+    }
+    pub fn acquisitions(&self) -> &HashSet<Address> {
+        &self.acquired
+    }
+    pub fn signal_batch(&self) -> &OwnedBatch {
+        &self.signals.batch
+    }
+    pub fn child_reads(&self) -> &HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>> {
+        &self.child_reads
+    }
+    pub fn keyed_children(&self) -> impl Iterator<Item = StagedKeyedChild<'_>> {
+        self.keyed_children
+            .iter()
+            .map(|(key, task, prepared)| StagedKeyedChild {
+                key,
+                task,
+                tool: prepared.tool(),
+                arguments: prepared.arguments(),
+                parent_version: prepared.parent_version,
+                checks: &prepared.checks,
+                mutations: &prepared.mutations,
+                handler_bound: self.keyed_child_handlers.contains_key(key),
+            })
+    }
+    pub fn application_entries(&self) -> Option<StagedApplicationEntries<'_>> {
+        self.entries
+            .as_ref()
+            .map(
+                |(conversation, version, entries, checks, dirty)| StagedApplicationEntries {
+                    conversation: *conversation,
+                    version: *version,
+                    entries,
+                    checks,
+                    dirty: *dirty,
+                    initial_len: self.entry_initial_len,
+                    runtime_cut: self.runtime_cut,
+                    runtime_config: self.runtime_config.as_ref(),
+                },
+            )
+    }
 }
 
 /// Prepared effects remain bound to the same owner and reservation. The caller

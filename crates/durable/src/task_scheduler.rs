@@ -523,6 +523,14 @@ impl std::fmt::Debug for PendingSettlement {
 }
 
 impl PendingSettlement {
+    /// Borrow the original completed invocation without releasing its lease.
+    pub fn completed(&self) -> Option<&CompletedInvocation> {
+        match self {
+            Self::Unprepared(completed) => Some(completed),
+            _ => None,
+        }
+    }
+
     /// The task whose result and exclusive lease remain owned here.
     pub fn task_id(&self) -> Uuid {
         self.lease().id
@@ -536,6 +544,22 @@ impl PendingSettlement {
             Self::PreparationConflict { conflict, .. } => conflict.running.task.attempt_id(),
             Self::Failure { settlement, .. } => settlement.running.task.attempt_id(),
         }
+    }
+
+    /// Read the durable task while this outcome still holds its attachment.
+    /// This is an observation, not authorization to retry an uncertain commit.
+    pub fn observed_task(&self) -> Result<Option<Task>, Error> {
+        Ok(TaskStore::new(self.lease().attachment.owner.store())
+            .load(self.task_id())?
+            .map(|stored| stored.task))
+    }
+
+    /// Read a durable key for reconciliation without releasing the lease.
+    pub fn read_durable(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<durable_store::Entry>, durable_store::Error> {
+        self.lease().attachment.owner.store().get(key)
     }
 
     /// The preserved reason for an owned failure settlement, if present.
@@ -773,8 +797,8 @@ pub enum SettlementError {
         completed: Box<CompletedInvocation>,
     },
     Handler(Error),
-    /// A prepared transaction may have committed. Retain it for external
-    /// reconciliation; it must not be blindly retried.
+    /// A settlement transition may have committed. Retain the prepared
+    /// candidate for reconciliation; do not blindly retry it.
     IndeterminatePrepared {
         error: Error,
         pending: Box<PendingSettlement>,
@@ -789,6 +813,27 @@ pub enum SettlementError {
 }
 
 impl CompletedInvocation {
+    /// Inspect the original handler result without invoking or releasing it.
+    pub fn handler_result(&self) -> Option<&Result<Step, String>> {
+        match &self.result {
+            InvocationResult::Handler(result, _) => Some(result),
+            _ => None,
+        }
+    }
+    /// Inspect the original staged effects without preparing or committing them.
+    pub fn staged_documents(&self) -> Option<&crate::document::DetachedTaskDocuments> {
+        match &self.result {
+            InvocationResult::Handler(_, documents) => Some(documents),
+            _ => None,
+        }
+    }
+    /// Inspect an abort-handler result; `None` means this was not an abort handler.
+    pub fn abort_outcome(&self) -> Option<Option<&str>> {
+        match &self.result {
+            InvocationResult::Abort(outcome) => Some(outcome.as_deref()),
+            _ => None,
+        }
+    }
     pub fn task_id(&self) -> Uuid {
         self.running.task.id()
     }
@@ -1064,6 +1109,8 @@ pub struct Scheduler {
     inject_failure_commit_error: u8,
     #[cfg(test)]
     inject_abort_commit_error: u8,
+    #[cfg(test)]
+    inject_aborted_yield_error: u8,
     #[cfg(test)]
     yield_before_preparation: bool,
     #[cfg(test)]
@@ -1630,7 +1677,7 @@ impl Scheduler {
                 ),
                 PreparedRevalidation::PendingAbort(root) => Err(Error::PendingAbort(root)),
                 PreparedRevalidation::Aborted(latest) => {
-                    self.ts().update(&latest, |task| task.yield_ready())?;
+                    self.yield_aborted_running(&latest)?;
                     self.poisoned
                         .store(false, std::sync::atomic::Ordering::Release);
                     Ok(true)
@@ -1708,6 +1755,12 @@ impl Scheduler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .poisoned = true;
+            let error = result.expect_err("indeterminate settlement must have an error");
+            drop(guard);
+            return Err(SettlementError::IndeterminateOwned {
+                error,
+                pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+            });
         } else {
             let mut state = self
                 .live_invocations
@@ -2093,6 +2146,8 @@ impl Scheduler {
             #[cfg(test)]
             inject_abort_commit_error: 0,
             #[cfg(test)]
+            inject_aborted_yield_error: 0,
+            #[cfg(test)]
             yield_before_preparation: false,
             #[cfg(test)]
             yield_after_graph_conflict: false,
@@ -2105,6 +2160,10 @@ impl Scheduler {
     }
     fn ts(&self) -> TaskStore<'_> {
         TaskStore::new(self.attachment.owner.store())
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_unknown_post_commit(&mut self) {
+        self.inject_post_commit_error = true;
     }
     pub(crate) fn failure_publication(&self) -> FailurePublication {
         FailurePublication {
@@ -2133,6 +2192,19 @@ impl Scheduler {
         } else {
             Ok(state.attempts.is_empty())
         }
+    }
+
+    fn yield_aborted_running(&self, latest: &task_store::StoredTask) -> Result<(), Error> {
+        #[cfg(test)]
+        if self.inject_aborted_yield_error == 1 {
+            return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+        }
+        self.ts().update(latest, |task| task.yield_ready())?;
+        #[cfg(test)]
+        if self.inject_aborted_yield_error == 2 {
+            return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+        }
+        Ok(())
     }
 
     fn abort_failed_running(
@@ -3322,13 +3394,13 @@ impl Scheduler {
             }
             return result;
         }
-        if nonblocking_abort && result.is_err() && prepared.commit_uncertain && deferred.is_none() {
-            *deferred = Some(DeferredSettlement::IndeterminatePrepared(prepared));
-            return result;
-        }
         #[cfg(test)]
         if matches!(result, Err(Error::TestYield)) {
             self.yielded_prepared = Some(prepared);
+            return result;
+        }
+        if nonblocking_abort && result.is_err() && deferred.is_none() {
+            *deferred = Some(DeferredSettlement::IndeterminatePrepared(prepared));
         }
         result
     }
@@ -3380,7 +3452,7 @@ impl Scheduler {
                     return Ok(true);
                 }
                 PreparedRevalidation::Aborted(latest) => {
-                    self.ts().update(&latest, |task| task.yield_ready())?;
+                    self.yield_aborted_running(&latest)?;
                     self.poisoned
                         .store(false, std::sync::atomic::Ordering::Release);
                     return Ok(true);
@@ -3416,7 +3488,7 @@ impl Scheduler {
                     .ok_or(Error::Ownership)?;
                 if current.version != prepared.running.version {
                     if current.task.abort_requested() {
-                        self.ts().update(&current, |task| task.yield_ready())?;
+                        self.yield_aborted_running(&current)?;
                     } else {
                         return Err(crate::document::Error::Store(
                             durable_store::Error::Conflict { key },
@@ -3473,7 +3545,7 @@ impl Scheduler {
             }
             PreparedRevalidation::PendingAbort(root) => Err(Error::PendingAbort(root)),
             PreparedRevalidation::Aborted(latest) => {
-                self.ts().update(&latest, |task| task.yield_ready())?;
+                self.yield_aborted_running(&latest)?;
                 self.poisoned
                     .store(false, std::sync::atomic::Ordering::Release);
                 Ok(true)
@@ -5658,6 +5730,154 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_aborted_yield_retains_prepared_transaction_and_lease() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Staged(Address);
+        impl Handler for Staged {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.get(&self.0).unwrap();
+                docs.put(
+                    &self.0,
+                    json!({"value": "held"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("held")))
+            }
+        }
+        for resumed in [false, true] {
+            for injection in [1, 2] {
+                let dir = tempfile::tempdir().unwrap();
+                let address = Address {
+                    scope: "abort-yield".into(),
+                    name: "doc".into(),
+                    key: "".into(),
+                };
+                let mut registry = Registry::default();
+                registry.register("work", false, Staged(address.clone()));
+                let mut scheduler =
+                    Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+                let owner = scheduler.owner();
+                scheduler
+                    .ts()
+                    .save(&[
+                        Save::Create(&task(
+                            1,
+                            TaskOwner::Conversation(Uuid::from_u128(9)),
+                            "work",
+                            false,
+                            3,
+                        )),
+                        Save::Create(&task(
+                            2,
+                            TaskOwner::Conversation(Uuid::from_u128(10)),
+                            "missing",
+                            false,
+                            3,
+                        )),
+                    ])
+                    .unwrap();
+                let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap()
+                else {
+                    panic!("reservation")
+                };
+                let completed = invocation.execute().unwrap();
+                let attempt = completed.running.task.attempt_id();
+                let once = Arc::new(AtomicBool::new(false));
+                scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+                    if !once.swap(true, Ordering::SeqCst) {
+                        let tasks = TaskStore::new(store);
+                        let id = Uuid::from_u128(if resumed { 2 } else { 1 });
+                        let current = tasks.load(id).unwrap().unwrap();
+                        tasks
+                            .update(&current, |task| {
+                                if resumed {
+                                    Ok(())
+                                } else {
+                                    task.request_abort()
+                                }
+                            })
+                            .unwrap();
+                    }
+                }));
+                scheduler.yield_after_graph_conflict = resumed;
+                scheduler.inject_aborted_yield_error = injection;
+                let result = if resumed {
+                    let pending = match scheduler.try_settle_invocation(completed) {
+                        Err(SettlementError::Yielded { pending }) => pending,
+                        result => panic!("expected prepared yield: {result:?}"),
+                    };
+                    scheduler.result_commit_hook = None;
+                    scheduler.yield_after_graph_conflict = false;
+                    let current = scheduler.ts().load(Uuid::from_u128(1)).unwrap().unwrap();
+                    scheduler
+                        .ts()
+                        .update(&current, |task| task.request_abort())
+                        .unwrap();
+                    scheduler.try_resume_pending(*pending)
+                } else {
+                    scheduler.try_settle_invocation(completed)
+                };
+                let pending = match result {
+                    Err(
+                        SettlementError::IndeterminatePrepared { pending, .. }
+                        | SettlementError::IndeterminateOwned { pending, .. },
+                    ) => pending,
+                    result => panic!("prepared candidate must be retained: {result:?}"),
+                };
+                assert!(matches!(&*pending, PendingSettlement::Prepared { .. }));
+                assert_eq!(pending.attempt_id(), attempt);
+                assert_eq!(
+                    pending.candidate_task().unwrap().state(),
+                    &TaskState::Succeeded(json!("held"))
+                );
+                assert!(
+                    Documents::new(owner.store())
+                        .get(&address)
+                        .unwrap()
+                        .is_none()
+                );
+                let stored = scheduler
+                    .ts()
+                    .load(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .task;
+                assert!(stored.abort_requested());
+                assert_eq!(
+                    stored.state(),
+                    if injection == 1 {
+                        &TaskState::Running
+                    } else {
+                        &TaskState::Ready
+                    }
+                );
+                let retained = match scheduler.try_resume_pending(*pending) {
+                    Err(SettlementError::RejectedPrepared {
+                        error: Error::Poisoned,
+                        pending,
+                    }) => pending,
+                    result => panic!("blind retry must be fenced: {result:?}"),
+                };
+                drop(scheduler);
+                assert!(matches!(
+                    Scheduler::attach(owner.clone(), registry.clone()),
+                    Err(Error::AlreadyAttached)
+                ));
+                drop(retained);
+                assert!(Scheduler::attach(owner.clone(), registry).is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn uncertain_document_preparation_retains_original_staged_input() {
         use crate::document::{Address, Documents, TaskDocuments};
         use crate::task_store::{SignalResult, SignalToken};
@@ -5735,6 +5955,22 @@ mod tests {
                 result => panic!("expected retained input: {result:?}"),
             };
             assert_eq!(pending.task_id(), Uuid::from_u128(1));
+            if injection != 3 {
+                let completed = pending.completed().expect("original invocation");
+                assert!(
+                    matches!(completed.handler_result(), Some(Ok(Step::Succeed(value))) if *value == json!("result"))
+                );
+                let docs = completed.staged_documents().unwrap();
+                assert_eq!(
+                    docs.writes().get(&address).unwrap().as_ref().unwrap()["value"],
+                    json!("retained")
+                );
+                assert!(docs.signal_batch().mutations.iter().any(|mutation| matches!(mutation, durable_store::Mutation::Put { key, .. } if key.starts_with(b"durable/signal/"))));
+                let child = docs.keyed_children().next().unwrap();
+                assert_eq!(child.key, "child");
+                assert_eq!(child.tool, "tool");
+                assert_eq!(child.task.id(), Uuid::from_u128(3));
+            }
             match &*pending {
                 PendingSettlement::Unprepared(completed) => {
                     assert_eq!(completed.running.task.attempt_id(), attempt);

@@ -65,6 +65,12 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
+    pub(crate) fn tool(&self) -> &str {
+        &self.identity.tool
+    }
+    pub(crate) fn arguments(&self) -> &Value {
+        &self.identity.arguments
+    }
     pub(crate) fn same_identity(&self, other: &Self) -> bool {
         self.identity == other.identity
     }

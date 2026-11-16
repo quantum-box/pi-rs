@@ -26,6 +26,8 @@ pub enum Error {
     Poisoned,
     #[error("task driver stopped: {0}")]
     Stopped(String),
+    #[error("task driver stopped with unresolved owned outcomes")]
+    Unresolved(Box<ShutdownReport>),
     #[error("task {0} does not exist")]
     UnknownTask(Uuid),
     #[error("task wait cancelled")]
@@ -40,11 +42,29 @@ pub(crate) struct Shared {
     wake_reader: task_scheduler::WakeReader,
     owner: Arc<OwnedStore>,
     state: Mutex<State>,
+    pending: Mutex<Vec<task_scheduler::PendingSettlement>>,
     wake: Condvar,
     harness: Option<Mutex<crate::runtime::Harness>>,
     cleanup_stop: pi_rs_core::CancellationToken,
     notifications: Mutex<Option<SyncSender<()>>>,
     subscription: Mutex<Option<Receiver<()>>>,
+}
+
+// A dropped Driver has no return channel. Keep its unresolved leases available
+// for explicit recovery rather than discarding replay-unsafe outcomes.
+static ABANDONED_PENDING: std::sync::OnceLock<Mutex<Vec<task_scheduler::PendingSettlement>>> =
+    std::sync::OnceLock::new();
+impl Drop for Shared {
+    fn drop(&mut self) {
+        let pending = self.pending.get_mut().unwrap_or_else(|e| e.into_inner());
+        if !pending.is_empty() {
+            ABANDONED_PENDING
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append(pending);
+        }
+    }
 }
 
 #[allow(dead_code)] // Private handoff foundation; no tool dispatch is connected.
@@ -68,6 +88,26 @@ struct State {
     policies: HashMap<String, (bool, u32)>,
     definitions: HashMap<String, (bool, Arc<dyn task_scheduler::Handler>)>,
 }
+/// Shutdown status and outcomes that could not safely be settled.
+/// Keeping this value keeps the original store attachment and attempts alive.
+#[must_use]
+#[derive(Debug)]
+pub struct ShutdownReport {
+    failure: Option<String>,
+    pending: Vec<task_scheduler::PendingSettlement>,
+}
+impl ShutdownReport {
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+    pub fn pending(&self) -> &[task_scheduler::PendingSettlement] {
+        &self.pending
+    }
+    pub fn into_pending(self) -> Vec<task_scheduler::PendingSettlement> {
+        self.pending
+    }
+}
+
 /// Drop asks the thread to stop; `shutdown` additionally waits for it. The
 /// thread retains storage ownership until its current handler returns.
 pub struct Driver {
@@ -76,6 +116,16 @@ pub struct Driver {
     cleanup: Option<JoinHandle<()>>,
 }
 impl Driver {
+    /// Take outcomes retained when a driver was dropped without shutdown.
+    /// The corresponding store attachments remain held until these values drop.
+    pub fn take_abandoned_pending() -> Vec<task_scheduler::PendingSettlement> {
+        std::mem::take(
+            &mut *ABANDONED_PENDING
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
     pub fn start(scheduler: task_scheduler::Scheduler) -> Self {
         Self::start_inner(scheduler, None)
     }
@@ -108,6 +158,7 @@ impl Driver {
                 definitions,
                 ..State::default()
             }),
+            pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             harness: harness.map(Mutex::new),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -134,7 +185,44 @@ impl Driver {
             }
             let _close = CloseOnExit(task_shared.clone());
             loop {
-                if task_shared.state.lock().map_or(true, |s| s.stop) {
+                let (stopped, failed) = match task_shared.state.lock() {
+                    Ok(state) => (state.stop, state.failure.is_some()),
+                    Err(_) => break,
+                };
+                if failed {
+                    break;
+                }
+                if !task_shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+                {
+                    match task_shared.retry_pending() {
+                        Ok(true) => {
+                            task_shared.notify_host();
+                            continue;
+                        }
+                        Ok(false) => {
+                            let Ok(state) = task_shared.state.lock() else {
+                                break;
+                            };
+                            let _ = task_shared
+                                .wake
+                                .wait_timeout(state, Duration::from_millis(100));
+                            continue;
+                        }
+                        Err(error) => {
+                            if let Ok(mut state) = task_shared.state.lock() {
+                                state.failure.get_or_insert(error);
+                                state.stop = true;
+                            }
+                            task_shared.close_notifications();
+                            break;
+                        }
+                    }
+                }
+                if stopped {
                     break;
                 }
                 let now = SystemTime::now()
@@ -151,7 +239,7 @@ impl Driver {
                     Ok(false) => {}
                     Err(error) => {
                         if let Ok(mut state) = task_shared.state.lock() {
-                            state.failure = Some(error);
+                            state.failure.get_or_insert(error);
                             state.stop = true;
                         }
                         task_shared.close_notifications();
@@ -162,7 +250,8 @@ impl Driver {
                     break;
                 };
                 if state.stop {
-                    break;
+                    drop(state);
+                    continue;
                 }
                 let _ = task_shared
                     .wake
@@ -407,7 +496,9 @@ impl Driver {
             }
         }
     }
-    pub fn shutdown(mut self) -> Result<(), Error> {
+    /// Stop and join the driver, returning any outcomes that require external
+    /// reconciliation. Dropping a returned outcome explicitly abandons its lease.
+    pub fn shutdown_with_pending(mut self) -> Result<ShutdownReport, Error> {
         self.stop_worker();
         let worker_panicked = self
             .worker
@@ -418,14 +509,33 @@ impl Driver {
             .cleanup
             .take()
             .is_some_and(|worker| worker.join().is_err());
-        if worker_panicked || cleanup_panicked {
-            return Err(Error::Stopped(format!(
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let failure = if worker_panicked || cleanup_panicked {
+            Some(format!(
                 "worker panicked: {worker_panicked}; cleanup worker panicked: {cleanup_panicked}"
-            )));
+            ))
+        } else {
+            state.failure.clone()
+        };
+        drop(state);
+        let pending = std::mem::take(
+            &mut *self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        Ok(ShutdownReport { failure, pending })
+    }
+    /// Preserve the existing successful shutdown result. Unresolved outcomes
+    /// travel in the error rather than being silently discarded.
+    pub fn shutdown(self) -> Result<(), Error> {
+        let report = self.shutdown_with_pending()?;
+        if !report.pending.is_empty() {
+            return Err(Error::Unresolved(Box::new(report)));
         }
-        let state = self.shared.state.lock().map_err(|_| Error::Poisoned)?;
-        if let Some(error) = &state.failure {
-            return Err(Error::Stopped(error.clone()));
+        if let Some(error) = report.failure {
+            return Err(Error::Stopped(error));
         }
         Ok(())
     }
@@ -593,22 +703,113 @@ impl Shared {
         Ok(snapshot)
     }
 
-    // Publish a failed tick before releasing the scheduler mutex. Otherwise a
-    // quiescent commit can slip between an unpoisoned tick error and stop.
+    // The serial driver owns every completed invocation until settlement or
+    // transfer to the pending queue. Scheduler operations remain serialized.
     fn tick_and_record_failure(&self, now: i64) -> Result<bool, String> {
         let mut scheduler = self
             .scheduler
             .lock()
             .map_err(|_| "task scheduler lock poisoned".to_string())?;
-        let result = scheduler.tick(now).map_err(|e| e.to_string());
+        if self.state.lock().map_or(true, |state| state.stop) {
+            return Ok(false);
+        }
+        let result = (|| -> Result<bool, String> {
+            let reservation = scheduler.reserve_tick(now).map_err(|e| e.to_string())?;
+            match reservation {
+                task_scheduler::TickReservation::Progress(progress) => Ok(progress),
+                task_scheduler::TickReservation::Maintenance(_) => {
+                    unreachable!("serial reservation")
+                }
+                task_scheduler::TickReservation::Invocation(invocation) => {
+                    let completed = invocation.execute().map_err(|e| e.to_string())?;
+                    self.record_settlement(scheduler.try_settle_invocation(completed))
+                }
+            }
+        })();
         if let Err(error) = &result {
             if let Ok(mut state) = self.state.lock() {
-                state.failure = Some(error.clone());
+                state.failure.get_or_insert_with(|| error.clone());
                 state.stop = true;
             }
             self.activity.notify();
         }
         result
+    }
+
+    fn record_settlement(
+        &self,
+        result: Result<bool, task_scheduler::SettlementError>,
+    ) -> Result<bool, String> {
+        use task_scheduler::{PendingSettlement, SettlementError};
+        let (pending, failure) = match result {
+            Ok(progress) => return Ok(progress),
+            Err(SettlementError::Pending { completed }) => {
+                (PendingSettlement::Unprepared(*completed), None)
+            }
+            Err(SettlementError::PendingPrepared { pending }) => (*pending, None),
+            Err(SettlementError::Rejected { error, completed }) => (
+                PendingSettlement::Unprepared(*completed),
+                Some(error.to_string()),
+            ),
+            Err(SettlementError::RejectedPrepared { error, pending })
+            | Err(SettlementError::IndeterminatePrepared { error, pending })
+            | Err(SettlementError::IndeterminateOwned { error, pending }) => {
+                (*pending, Some(error.to_string()))
+            }
+            Err(SettlementError::Handler(error) | SettlementError::Indeterminate(error)) => {
+                return Err(error.to_string());
+            }
+            #[cfg(test)]
+            Err(SettlementError::Yielded { pending }) => (*pending, None),
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pending);
+        if let Some(error) = failure {
+            Err(error)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn retry_pending(&self) -> Result<bool, String> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .expect("pending checked by coordinator");
+        let result = match self.scheduler.lock() {
+            Ok(mut scheduler) => scheduler.try_resume_pending(pending),
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(pending);
+                return Err("task scheduler lock poisoned".into());
+            }
+        };
+        if self.record_settlement(result)? {
+            return Ok(true);
+        }
+        let Some(harness) = &self.harness else {
+            return Ok(false);
+        };
+        let mut worker = match harness.try_lock() {
+            Ok(harness) => harness.worker(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err("harness lock poisoned".into()),
+        };
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match pending
+            .last()
+            .expect("pending retained")
+            .try_cleanup(&mut worker)
+        {
+            Ok(progress) => Ok(progress),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Commit only while the driver owns no executing scheduler handler. The
@@ -803,6 +1004,400 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn shutdown_transfers_uncertain_outcome_and_keeps_attachment() {
+        for legacy_shutdown in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("work", false, move |_: &Task| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(task_scheduler::Step::Succeed(json!("result")))
+            });
+            let mut scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+            let owner = scheduler.owner();
+            let task = Task::new(
+                Uuid::from_u128(1),
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), false);
+            scheduler.submit(&task).unwrap();
+            scheduler.inject_unknown_post_commit();
+            let driver = Driver::start(scheduler);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !driver.shared.state.lock().unwrap().stop {
+                assert!(std::time::Instant::now() < deadline, "worker did not stop");
+                thread::yield_now();
+            }
+            let report = if legacy_shutdown {
+                match driver.shutdown() {
+                    Err(Error::Unresolved(report)) => *report,
+                    other => panic!("expected owned shutdown error: {other:?}"),
+                }
+            } else {
+                driver.shutdown_with_pending().unwrap()
+            };
+            assert!(report.failure().is_some());
+            assert_eq!(report.pending().len(), 1);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let pending = &report.pending()[0];
+            assert_eq!(pending.task_id(), task.id());
+            assert!(pending.attempt_id().is_some());
+            assert_eq!(
+                pending.observed_task().unwrap().unwrap().state(),
+                &TaskState::Succeeded(json!("result"))
+            );
+            assert_eq!(
+                pending.candidate_task().unwrap().state(),
+                &TaskState::Succeeded(json!("result"))
+            );
+            assert_eq!(
+                TaskStore::new(owner.store())
+                    .load(task.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                &TaskState::Succeeded(json!("result"))
+            );
+            assert!(matches!(
+                task_scheduler::Scheduler::attach(owner.clone(), registry.clone()),
+                Err(task_scheduler::Error::AlreadyAttached)
+            ));
+            let retained = report.into_pending();
+            assert!(matches!(
+                task_scheduler::Scheduler::attach(owner.clone(), registry.clone()),
+                Err(task_scheduler::Error::AlreadyAttached)
+            ));
+            drop(retained);
+            assert!(task_scheduler::Scheduler::attach(owner.clone(), registry).is_ok());
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_during_handler_returns_unsettled_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", false, move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("retained")))
+        });
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+        let owner = scheduler.owner();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+        let driver = Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let attempt = TaskStore::new(owner.store())
+            .load(task.id())
+            .unwrap()
+            .unwrap()
+            .task
+            .attempt_id();
+        fail_cleanup(&driver.shared, "cleanup commit uncertain".into());
+        release_tx.send(()).unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert_eq!(report.pending().len(), 1);
+        assert_eq!(report.pending()[0].task_id(), task.id());
+        assert_eq!(report.pending()[0].attempt_id(), attempt);
+        assert!(matches!(
+            &report.pending()[0],
+            task_scheduler::PendingSettlement::Unprepared(_)
+        ));
+        let completed = report.pending()[0].completed().unwrap();
+        assert!(
+            matches!(completed.handler_result(), Some(Ok(task_scheduler::Step::Succeed(value))) if *value == json!("retained"))
+        );
+        assert!(completed.staged_documents().is_some());
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Running
+        );
+        assert!(matches!(
+            task_scheduler::Scheduler::attach(owner.clone(), registry.clone()),
+            Err(task_scheduler::Error::AlreadyAttached)
+        ));
+        drop(report);
+        assert!(task_scheduler::Scheduler::attach(owner.clone(), registry).is_ok());
+    }
+
+    #[test]
+    fn shutdown_waits_for_known_pending_abort_cleanup() {
+        use crate::runtime::{Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let harness = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("parent", false, |_: &Task| {
+            Ok(task_scheduler::Step::Succeed(json!(null)))
+        });
+        registry.register("child", false, move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("discard")))
+        });
+        let scheduler = harness.attach_tasks(registry).unwrap();
+        let owner = scheduler.owner();
+        let checkpoint = Checkpoint {
+            phase: "start".into(),
+            data: json!({}),
+        };
+        let mut parent = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), false);
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(parent.id()),
+            checkpoint.clone(),
+            3,
+        )
+        .unwrap()
+        .registered("child".into(), false);
+        let sibling = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Task(parent.id()),
+            checkpoint,
+            3,
+        )
+        .unwrap()
+        .registered("missing".into(), false);
+        TaskStore::new(owner.store())
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&child),
+                Save::Create(&sibling),
+            ])
+            .unwrap();
+        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let poll = control.gate.lock().unwrap();
+        let driver = Driver::start_with_harness(scheduler, harness.worker());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let tasks = TaskStore::new(owner.store());
+        let sibling = tasks.load(sibling.id()).unwrap().unwrap();
+        tasks
+            .update(&sibling, |task| {
+                task.start()?;
+                task.fail("failed".into())
+            })
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while driver.shared.pending.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || done_tx.send(driver.shutdown_with_pending()).unwrap());
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(poll);
+        let report = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        shutdown.join().unwrap();
+        assert!(report.failure().is_none());
+        assert!(report.pending().is_empty());
+        let child = tasks.load(child.id()).unwrap().unwrap().task;
+        assert!(child.abort_requested());
+        assert_eq!(child.state(), &TaskState::Ready);
+    }
+
+    #[test]
+    fn dropped_driver_keeps_unresolved_outcomes_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", false, move |_: &Task| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("held")))
+        });
+        let scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+        let owner = scheduler.owner();
+        let task = Task::new(
+            Uuid::from_u128(1234567),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+        let driver = Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        fail_cleanup(&driver.shared, "uncertain cleanup".into());
+        let weak = Arc::downgrade(&driver.shared);
+        drop(driver);
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while weak.upgrade().is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let mut outcomes = Driver::take_abandoned_pending();
+        let index = outcomes
+            .iter()
+            .position(|pending| pending.task_id() == task.id())
+            .expect("abandoned outcome retained");
+        let pending = outcomes.swap_remove(index);
+        assert!(matches!(
+            task_scheduler::Scheduler::attach(owner.clone(), registry.clone()),
+            Err(task_scheduler::Error::AlreadyAttached)
+        ));
+        drop(pending);
+        assert!(task_scheduler::Scheduler::attach(owner.clone(), registry).is_ok());
+    }
+
+    #[test]
+    fn shutdown_joins_reserved_handler_and_settles_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", false, move |_: &Task| {
+            count.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        let task = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+        let driver = Driver::start(scheduler);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let running = TaskStore::new(owner.store())
+            .load(task.id())
+            .unwrap()
+            .unwrap()
+            .task;
+        assert_eq!(running.state(), &TaskState::Running);
+        let attempt = running.attempt_id();
+        let shared = driver.shared.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || done_tx.send(driver.shutdown_with_pending()).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !shared.state.lock().unwrap().stop {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .attempt_id(),
+            attempt
+        );
+        release_tx.send(()).unwrap();
+        let report = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        shutdown.join().unwrap();
+        assert!(report.failure().is_none());
+        assert!(report.pending().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            TaskStore::new(owner.store())
+                .load(task.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+    }
+
+    #[test]
     fn cleanup_failure_and_task_commit_are_serialized_in_both_orders() {
         for failure_first in [true, false] {
             let dir = tempfile::tempdir().unwrap();
@@ -838,6 +1433,7 @@ mod tests {
                 activity: scheduler.worker_activity(),
                 failure_publication: scheduler.failure_publication(),
                 scheduler: Mutex::new(scheduler),
+                pending: Mutex::new(Vec::new()),
                 wake: Condvar::new(),
                 harness: None,
                 cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -1002,6 +1598,7 @@ mod tests {
             activity: scheduler.worker_activity(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
+            pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -1221,6 +1818,7 @@ mod tests {
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             state: Mutex::new(State::default()),
+            pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -1319,6 +1917,7 @@ mod tests {
             activity: scheduler.worker_activity(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
+            pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -1393,6 +1992,7 @@ mod tests {
             activity: scheduler.worker_activity(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
+            pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             harness: None,
             cleanup_stop: pi_rs_core::CancellationToken::new(),
@@ -1675,6 +2275,7 @@ mod tests {
             activity: scheduler.worker_activity(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
+            pending: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             harness: Some(Mutex::new(harness.worker())),
             cleanup_stop: pi_rs_core::CancellationToken::new(),
