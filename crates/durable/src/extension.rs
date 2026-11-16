@@ -686,20 +686,33 @@ impl Resolved {
     pub async fn after_tool(
         &self,
         call: &ToolCall,
-        mut result: Value,
+        result: Value,
         ctx: &Context<'_>,
     ) -> (Value, Vec<Report>) {
+        let (result, _, reports) = self.after_tool_with_replacement(call, result, ctx).await;
+        (result, reports)
+    }
+    pub(crate) async fn after_tool_with_replacement(
+        &self,
+        call: &ToolCall,
+        mut result: Value,
+        ctx: &Context<'_>,
+    ) -> (Value, bool, Vec<Report>) {
         let mut reports = vec![];
+        let mut replaced = false;
         for e in &self.extensions {
             for h in &e.hooks {
                 match protect(async { h.after_tool(call, &result, ctx).await }).await {
-                    Ok(Some(value)) => result = value,
+                    Ok(Some(value)) => {
+                        replaced |= value.is_string();
+                        result = value;
+                    }
                     Ok(None) => (),
                     Err(err) => reports.push(failure(&e.name, "after_tool", err)),
                 }
             }
         }
-        (result, reports)
+        (result, replaced, reports)
     }
     pub async fn after_tool_result(
         &self,

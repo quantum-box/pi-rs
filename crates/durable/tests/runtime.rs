@@ -2518,3 +2518,323 @@ async fn interrupted_bounded_stream_restores_partial_utf8_and_truncation_diagnos
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     scheduler.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
+    use pi_rs_durable::extension::{
+        Context, Extension, Hook, ToolBlockResult, ToolCall as HookCall, ToolResult,
+    };
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    struct Bounded {
+        explicit: bool,
+        retain: Retain,
+        no_drop: bool,
+    }
+    #[async_trait]
+    impl BoundedStreamedTool for Bounded {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            output
+                .append(if self.no_drop { "new\n" } else { "old\nnew\n" })
+                .await
+                .unwrap();
+            StreamedReply::Success {
+                output: self.explicit.then(|| {
+                    match self.retain {
+                        Retain::Head => "old\n",
+                        Retain::Tail => "new\n",
+                    }
+                    .into()
+                }),
+                state: None,
+            }
+        }
+    }
+    struct OutputHook {
+        kind: &'static str,
+        seen: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Hook for OutputHook {
+        async fn after_tool(
+            &self,
+            _: &HookCall,
+            result: &serde_json::Value,
+            _: &Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if self.kind == "legacy-same" {
+                return Ok(Some(result.clone()));
+            }
+            Ok((self.kind == "legacy-replace").then(|| json!("replacement")))
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            self.kind == "blocks-replace"
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            result: &ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            let mut replacement = result.clone();
+            replacement.output = vec![json!({"type":"text", "text":"replacement"})];
+            Ok(Some(replacement))
+        }
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            assert!(
+                !result
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_deref() == Some("truncated"))
+            );
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            if self.kind == "metadata-only" {
+                return Ok(Some(result.clone()));
+            }
+            if self.kind == "flag-only" {
+                let mut r = result.clone();
+                r.is_error = true;
+                return Ok(Some(r));
+            }
+            if self.kind == "result-replace" {
+                let mut r = result.clone();
+                r.output = "replacement".into();
+                return Ok(Some(r));
+            }
+            Ok(None)
+        }
+    }
+    for (retain, explicit, kind, expected) in [
+        (Retain::Head, false, "none", true),
+        (Retain::Tail, false, "metadata-only", true),
+        (Retain::Tail, false, "flag-only", true),
+        (Retain::Tail, false, "legacy-replace", false),
+        (Retain::Tail, false, "legacy-same", false),
+        (Retain::Tail, false, "blocks-replace", false),
+        (Retain::Tail, false, "result-replace", false),
+        (Retain::Tail, true, "none", false),
+        (Retain::Tail, false, "no-drop", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let options = || Options {
+            model: Arc::new(FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            }),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                    tool: Bounded {
+                        explicit,
+                        retain,
+                        no_drop: kind == "no-drop",
+                    },
+                    limits: OutputLimits {
+                        max_bytes: 32,
+                        max_lines: 1,
+                        retain,
+                    },
+                }))
+                .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let cancel = CancellationToken::new();
+        let mut harness = Harness::open(&path, options(), &cancel).await.unwrap();
+        harness
+            .install_extension(Extension {
+                name: "check".into(),
+                hooks: vec![Arc::new(OutputHook {
+                    kind,
+                    seen: seen.clone(),
+                })],
+                ..Default::default()
+            })
+            .unwrap();
+        let id = harness.create_conversation(config()).unwrap();
+        harness.select_extensions(id, vec!["check".into()]).unwrap();
+        harness
+            .submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        let conversation = harness.conversation(id).unwrap();
+        let metadata = conversation.tool_results.last().unwrap();
+        let diagnostics: Vec<_> = metadata
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_deref() == Some("truncated"))
+            .collect();
+        assert_eq!(
+            diagnostics.len(),
+            usize::from(expected),
+            "{retain:?} {explicit} {kind}"
+        );
+        if expected {
+            assert_eq!(
+                diagnostics[0].message,
+                format!(
+                    "Output truncated to its {}: 1 lines, 4 bytes dropped",
+                    if retain == Retain::Head {
+                        "beginning"
+                    } else {
+                        "end"
+                    }
+                )
+            );
+        }
+        let content = if kind.ends_with("replace") {
+            "replacement"
+        } else if retain == Retain::Head {
+            "old\n"
+        } else {
+            "new\n"
+        };
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content: actual, .. } if actual == content))
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        drop(harness);
+        let reopened = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            reopened
+                .conversation(id)
+                .unwrap()
+                .tool_results
+                .last()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.as_deref() == Some("truncated"))
+                .count(),
+            usize::from(expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_success_abort_before_hook_does_not_publish_truncation() {
+    use pi_rs_durable::extension::{Context, Extension, Hook, ToolCall as HookCall};
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    use pi_rs_durable::runtime::Scheduler;
+    struct Bounded;
+    #[async_trait]
+    impl BoundedStreamedTool for Bounded {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            output.append("old\nnew\n").await.unwrap();
+            StreamedReply::Success {
+                output: None,
+                state: None,
+            }
+        }
+    }
+    struct Park(Arc<tokio::sync::Semaphore>);
+    #[async_trait]
+    impl Hook for Park {
+        async fn after_tool(
+            &self,
+            _: &HookCall,
+            _: &serde_json::Value,
+            _: &Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            self.0.add_permits(1);
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let opts = Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: Bounded,
+                limits: OutputLimits {
+                    max_bytes: 32,
+                    max_lines: 1,
+                    retain: Retain::Tail,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), opts).unwrap();
+    scheduler
+        .install_extension(Extension {
+            name: "park".into(),
+            hooks: vec![Arc::new(Park(entered.clone()))],
+            ..Default::default()
+        })
+        .unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler
+        .select_extensions(id, vec!["park".into()])
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.abort_and_wait(id).await.unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(conversation.tool_results.iter().all(|result| {
+        result
+            .diagnostics
+            .iter()
+            .all(|d| d.code.as_deref() != Some("truncated"))
+    }));
+    assert!(conversation.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "tool result unavailable after abort before hooks")));
+    scheduler.shutdown().await.unwrap();
+}

@@ -1101,6 +1101,69 @@ fn hide_pending_tool_output(state: &mut Conversation) {
     }
 }
 
+fn bounded_success_diagnostic(
+    owner: &OwnedStore,
+    conversation: &Conversation,
+    operation_id: Uuid,
+    content: &str,
+) -> Result<Option<ToolDiagnostic>, Error> {
+    let Some(attempt) = conversation
+        .tool_attempt()
+        .filter(|attempt| attempt.operation_id == operation_id)
+    else {
+        return Ok(None);
+    };
+    let checkpoint =
+        crate::streamed_output::load_selected_checkpoint(owner.store(), attempt.attempt_id)
+            .map_err(|error| Error::Invalid(format!("bounded stream checkpoint: {error}")))?;
+    let Some((checkpoint, retain)) = checkpoint else {
+        return Ok(None);
+    };
+    if !checkpoint.pending_utf8.is_empty()
+        || checkpoint.current.text != content
+        || checkpoint.current.dropped_bytes == 0
+    {
+        return Ok(None);
+    }
+    let end = match retain {
+        crate::output::Retain::Head => "beginning",
+        crate::output::Retain::Tail => "end",
+    };
+    Ok(Some(ToolDiagnostic {
+        severity: DiagnosticSeverity::Warn,
+        code: Some("truncated".into()),
+        message: format!(
+            "Output truncated to its {end}: {} lines, {} bytes dropped",
+            checkpoint.current.dropped_lines, checkpoint.current.dropped_bytes
+        ),
+    }))
+}
+
+fn append_harness_diagnostic(metadata: &mut ToolResultMetadata, diagnostic: ToolDiagnostic) {
+    metadata.diagnostics.push(diagnostic.clone());
+    if serde_json::to_vec(&(
+        &metadata.details,
+        &metadata.structured_output,
+        &metadata.attachments,
+        &metadata.diagnostics,
+    ))
+    .map_or(true, |bytes| bytes.len() > 65_536)
+    {
+        metadata.details = None;
+        metadata.structured_output = None;
+        metadata.attachments.clear();
+        metadata.metadata_truncated = true;
+        metadata.diagnostics = vec![
+            ToolDiagnostic {
+                severity: DiagnosticSeverity::Warn,
+                code: Some("metadata_truncated".into()),
+                message: "tool result metadata exceeded 65536 bytes".into(),
+            },
+            diagnostic,
+        ];
+    }
+}
+
 fn redact_tool_metadata(metadata: &mut ToolResultMetadata, code: &str, message: &str) {
     metadata.details = None;
     metadata.structured_output = None;
@@ -1693,14 +1756,22 @@ struct RuntimeStreamOutput {
 #[async_trait::async_trait]
 impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
     async fn record(&self, text: &str) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, None)
+        self.record_inner(text, None, None)
     }
     async fn record_bounded(
         &self,
         text: &str,
         checkpoint: &crate::output::OutputCheckpoint,
     ) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, Some(checkpoint))
+        self.record_inner(text, Some(checkpoint), None)
+    }
+    async fn record_bounded_selected(
+        &self,
+        text: &str,
+        checkpoint: &crate::output::OutputCheckpoint,
+        retain: crate::output::Retain,
+    ) -> pi_rs_core::ExtensionResult<()> {
+        self.record_inner(text, Some(checkpoint), Some(retain))
     }
 }
 impl RuntimeStreamOutput {
@@ -1708,6 +1779,7 @@ impl RuntimeStreamOutput {
         &self,
         text: &str,
         checkpoint: Option<&crate::output::OutputCheckpoint>,
+        selected: Option<crate::output::Retain>,
     ) -> pi_rs_core::ExtensionResult<()> {
         let _lease = self
             .source
@@ -1770,7 +1842,7 @@ impl RuntimeStreamOutput {
                     });
                     mutations.push(Mutation::Put {
                         key: checkpoint_key,
-                        value: serde_json::to_vec(checkpoint)?,
+                        value: crate::streamed_output::encode_checkpoint(checkpoint, selected)?,
                     });
                 }
                 match store.commit(&checks, &mutations) {
@@ -10134,7 +10206,17 @@ impl Harness {
                 mut content,
                 ..
             } => {
+                let truncation = if c.extensions.is_empty() {
+                    bounded_success_diagnostic(&self.owner, &c, operation_id, &content)?
+                } else {
+                    None
+                };
                 if let Some(mut metadata) = c.pending_tool_result.take() {
+                    if !metadata.is_error
+                        && let Some(diagnostic) = truncation
+                    {
+                        append_harness_diagnostic(&mut metadata, diagnostic);
+                    }
                     if !c.extensions.is_empty() {
                         content = "tool result unavailable after abort before hooks".into();
                         redact_tool_metadata(
@@ -13080,6 +13162,20 @@ impl Harness {
                     arguments,
                     content,
                 } => {
+                    let original_success = c
+                        .pending_tool_result
+                        .as_ref()
+                        .or_else(|| {
+                            c.tool_results
+                                .iter()
+                                .find(|metadata| metadata.operation_id == operation_id)
+                        })
+                        .is_some_and(|metadata| !metadata.is_error);
+                    let truncation = if original_success {
+                        bounded_success_diagnostic(&self.owner, &c, operation_id, &content)?
+                    } else {
+                        None
+                    };
                     let selected = self.selected_extensions(&c)?;
                     let mut snapshot = serde_json::to_value(&c)?;
                     if let Some(profile) = self
@@ -13102,8 +13198,8 @@ impl Harness {
                         name: call.name.clone(),
                         arguments,
                     };
-                    let (result, reports) = fenced_poll(
-                        selected.after_tool(
+                    let (result, output_replaced, reports) = fenced_poll(
+                        selected.after_tool_with_replacement(
                             &hook_call,
                             serde_json::Value::String(content.clone()),
                             &context,
@@ -13120,6 +13216,7 @@ impl Harness {
                     }
                     self.record_extension_reports(c.id, operation_id, "after_tool", reports)?;
                     let replaced = result.as_str().is_some_and(|value| value != content);
+                    let mut retained_output_unchanged = !output_replaced;
                     let mut content = result.as_str().unwrap_or(&content).to_owned();
                     let pending = c.pending_tool_result.take();
                     let is_pending = pending.is_some();
@@ -13164,6 +13261,7 @@ impl Harness {
                             reports,
                         )?;
                         if explicitly_replaced {
+                            retained_output_unchanged &= value.output == content;
                             content = value.output;
                             metadata.is_error = value.is_error;
                             metadata.details = value.details;
@@ -13269,6 +13367,17 @@ impl Harness {
                             ));
                         }
                         metadata.diagnostics = block_result.diagnostics;
+                    }
+                    retained_output_unchanged &=
+                        block_result.output == original_block_result.output;
+                    if retained_output_unchanged
+                        && let Some(diagnostic) = truncation
+                        && let Some(metadata) = c
+                            .tool_results
+                            .iter_mut()
+                            .find(|metadata| metadata.operation_id == operation_id)
+                    {
+                        append_harness_diagnostic(metadata, diagnostic);
                     }
                     let simple = block_result.output.len() == 1
                         && block_result.output[0]

@@ -63,3 +63,34 @@ pub(crate) fn decode_checkpoint(
     }
     Ok(checkpoint)
 }
+
+// Additional optional fields leave the public checkpoint schema and old
+// sidecars unchanged. The marker is written with the final stream checkpoint.
+pub(crate) fn encode_checkpoint(
+    checkpoint: &crate::output::OutputCheckpoint,
+    selected: Option<crate::output::Retain>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut value = serde_json::to_value(checkpoint)?;
+    if let Some(retain) = selected {
+        value["selected_retention"] = serde_json::to_value(retain)?;
+    }
+    serde_json::to_vec(&value)
+}
+
+pub(crate) fn load_selected_checkpoint(
+    store: &Store,
+    attempt: Uuid,
+) -> Result<
+    Option<(crate::output::OutputCheckpoint, crate::output::Retain)>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let Some(entry) = store.get(&checkpoint_key(attempt))? else {
+        return Ok(None);
+    };
+    let checkpoint = decode_checkpoint(entry.clone())?;
+    let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+    let Some(retain) = value.get("selected_retention") else {
+        return Ok(None);
+    };
+    Ok(Some((checkpoint, serde_json::from_value(retain.clone())?)))
+}

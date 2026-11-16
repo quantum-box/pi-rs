@@ -183,8 +183,15 @@ stream's byte limit must be at most 64 KiB. `append` and `append_bytes` commit
 the sanitized retained window before returning; `snapshot` exposes dropped
 counts while the invocation runs. Returning `StreamedReply::Success` with
 `output: None` uses the retained window. Explicit replies keep their ordinary
-meaning. A versioned sidecar checkpoints dropped counts and pending UTF-8 bytes atomically
-with retained text. On interruption, recovery flushes an incomplete byte
+meaning. When a successful tool selects its retained stream, the runtime adds a
+`truncated` warning after result hooks if the retained output was not replaced.
+Explicit output does not acquire the stream's warning, even if its text matches.
+Structured and block hook outputs are compared by value, since their Rust API
+does not expose upstream's output-object identity. Explicit output is not
+automatically bounded. Sidecars written before selection markers cannot prove
+whether an already-finished result used the stream, so they do not gain a
+success warning on upgrade. A versioned sidecar checkpoints dropped counts and
+pending UTF-8 bytes atomically with retained text. On interruption, recovery flushes an incomplete byte
 sequence as U+FFFD and adds a `truncated` warning when bytes were dropped. The
 existing text record remains readable, and older streams without a sidecar retain
 their prior recovery behavior. The sidecar stores the recovery projection, not
