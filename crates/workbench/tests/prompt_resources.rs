@@ -398,3 +398,95 @@ fn worktree_shadow_preserves_global_role_with_identical_path() {
             .is_err()
     );
 }
+
+#[test]
+fn explicit_prompt_files_require_grants_and_preserve_snapshots() {
+    use pi_rs_workbench::prompt_resources::{
+        ExplicitPromptResourceFactory, PromptInput, PromptReadGrants,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let system = root.path().join("system.md");
+    let appendix = root.path().join("append.md");
+    std::fs::write(&system, "\u{feff}system").unwrap();
+    std::fs::write(&appendix, "appendix").unwrap();
+    let factory = ExplicitPromptResourceFactory {
+        system: Some(PromptInput::File(system.clone())),
+        append: Some(vec![
+            PromptInput::Literal("literal".into()),
+            PromptInput::File(appendix.clone()),
+        ]),
+    };
+    let grants = PromptReadGrants::default();
+    assert!(
+        factory
+            .load(&grants, std::slice::from_ref(&system))
+            .is_err()
+    );
+    let files = vec![system.clone(), appendix.clone()];
+    let snapshot = factory.load(&grants, &files).unwrap();
+    assert_eq!(snapshot.system.as_ref().unwrap().text, "system");
+    assert_eq!(
+        snapshot.system.as_ref().unwrap().source.as_ref(),
+        Some(&system)
+    );
+    assert_eq!(
+        snapshot
+            .append
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        ["literal", "appendix"]
+    );
+    assert_eq!(snapshot.append[1].source.as_ref(), Some(&appendix));
+    std::fs::remove_file(&appendix).unwrap();
+    assert!(factory.load(&grants, &files).is_err());
+    assert_eq!(snapshot.append[1].text, "appendix");
+    std::fs::write(&appendix, [0xff]).unwrap();
+    assert!(factory.load(&grants, &files).is_err());
+    std::fs::write(&appendix, vec![b'a'; 256 * 1024 + 1]).unwrap();
+    assert!(factory.load(&grants, &files).is_err());
+    let relative = ExplicitPromptResourceFactory {
+        system: Some(PromptInput::File("relative.md".into())),
+        append: None,
+    };
+    assert!(relative.load(&grants, &["relative.md".into()]).is_err());
+    let traversal = root.path().join("../system.md");
+    let invalid = ExplicitPromptResourceFactory {
+        system: Some(PromptInput::File(traversal.clone())),
+        append: None,
+    };
+    assert!(invalid.load(&grants, &[traversal]).is_err());
+}
+
+#[test]
+fn explicit_prompt_inputs_enforce_aggregate_limits() {
+    use pi_rs_workbench::prompt_resources::{
+        ExplicitPromptResourceFactory, PromptInput, PromptReadGrants,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.md");
+    std::fs::write(&path, vec![b'a'; 256 * 1024]).unwrap();
+    let mut factory = ExplicitPromptResourceFactory {
+        system: None,
+        append: Some(vec![PromptInput::File(path.clone()); 16]),
+    };
+    let grants = PromptReadGrants::default();
+    let files = [path.clone()];
+    assert_eq!(factory.load(&grants, &files).unwrap().append.len(), 16);
+    factory
+        .append
+        .as_mut()
+        .unwrap()
+        .push(PromptInput::File(path));
+    assert!(factory.load(&grants, &files).is_err());
+    factory.append = Some(vec![PromptInput::Literal("a".repeat(4 * 1024 * 1024 + 1))]);
+    assert!(factory.load(&grants, &[]).is_err());
+    factory.append = Some(vec![PromptInput::Literal(String::new()); 128]);
+    assert_eq!(factory.load(&grants, &[]).unwrap().append.len(), 128);
+    factory
+        .append
+        .as_mut()
+        .unwrap()
+        .push(PromptInput::Literal(String::new()));
+    assert!(factory.load(&grants, &[]).is_err());
+}

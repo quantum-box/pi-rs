@@ -27,6 +27,95 @@ pub struct PromptResourceFactory {
     pub append: Option<Vec<String>>,
 }
 
+/// An explicit literal or a host-granted prompt file. File inputs must be
+/// absolute paths without parent components and must appear in the current
+/// `file_grants` passed to `ExplicitPromptResourceFactory::load`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptInput {
+    Literal(String),
+    File(PathBuf),
+}
+
+/// An alternative factory with unambiguous literal and file inputs.
+/// `None` retains the normal granted-directory discovery for that category.
+#[derive(Clone, Debug, Default)]
+pub struct ExplicitPromptResourceFactory {
+    pub system: Option<PromptInput>,
+    pub append: Option<Vec<PromptInput>>,
+}
+
+impl ExplicitPromptResourceFactory {
+    /// Resolve a fresh snapshot using only current grants. File grants authorize
+    /// reads through symlinks and are not a sandbox. Any error fails the snapshot.
+    pub fn load(
+        &self,
+        grants: &PromptReadGrants,
+        file_grants: &[PathBuf],
+    ) -> Result<PromptResources> {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let mut resolve = |input: &PromptInput| -> Result<PromptResource> {
+            count += 1;
+            if count > 128 {
+                return Err(Error::Config("too many explicit prompt inputs".into()));
+            }
+            if matches!(input, PromptInput::Literal(text) if text.len() > 4 * 1024 * 1024 - bytes) {
+                return Err(Error::Config("explicit prompts exceed size limit".into()));
+            }
+            let resource = resolve_input(input, file_grants)?;
+            bytes = bytes
+                .checked_add(resource.text.len())
+                .ok_or_else(|| Error::Config("explicit prompts exceed size limit".into()))?;
+            if bytes > 4 * 1024 * 1024 {
+                return Err(Error::Config("explicit prompts exceed size limit".into()));
+            }
+            Ok(resource)
+        };
+        let system = match &self.system {
+            Some(input) => Some(resolve(input)?),
+            None => discover(grants, "SYSTEM.md")?,
+        };
+        let append = match &self.append {
+            Some(inputs) => inputs
+                .iter()
+                .map(&mut resolve)
+                .collect::<Result<Vec<_>>>()?,
+            None => discover(grants, "APPEND_SYSTEM.md")?.into_iter().collect(),
+        };
+        Ok(PromptResources { system, append })
+    }
+}
+
+fn resolve_input(input: &PromptInput, grants: &[PathBuf]) -> Result<PromptResource> {
+    match input {
+        PromptInput::Literal(text) => Ok(literal(text)),
+        PromptInput::File(path) => {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(Error::Config(
+                    "prompt file path must be absolute without parent components".into(),
+                ));
+            }
+            if !grants.iter().any(|grant| grant == path) {
+                return Err(Error::Config(format!(
+                    "prompt file is not granted: {}",
+                    path.display()
+                )));
+            }
+            let text = read_optional(path)?.ok_or_else(|| {
+                Error::Config(format!("prompt file is missing: {}", path.display()))
+            })?;
+            Ok(PromptResource {
+                text,
+                source: Some(path.clone()),
+            })
+        }
+    }
+}
+
 /// A resolved prompt and, for discovered files, the path used to read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptResource {

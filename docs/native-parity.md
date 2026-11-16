@@ -5103,7 +5103,12 @@ the corresponding global files. Nothing is read without a grant. As in the
 project files take precedence independently for each category, and explicit
 system or append values replace discovery. File values have a UTF-8 BOM removed
 and carry their source path. An empty system prompt uses the host default; an
-explicit empty append list suppresses discovery.
+explicit empty append list suppresses discovery. `ExplicitPromptResourceFactory`
+also accepts unambiguous literal and file inputs for each category. File inputs
+require a matching current grant for the absolute path, reject parent components,
+retain their source path, and fail atomically on missing or unreadable files.
+Explicit inputs are limited to 128 entries and 4 MiB of resolved text per
+snapshot. File grants follow symlinks and are not a sandbox.
 
 The host must obtain and reevaluate its own permissions and choose the paths;
 grants permit ordinary filesystem reads including symlink targets and are not a
@@ -5115,7 +5120,8 @@ content. A failed load returns an error without modifying an earlier snapshot.
 
 This is a focused native API, not a complete Pi resource loader. It does not
 load skills, prompt templates, extensions, context files, themes, or settings;
-it does not interpret an explicit string as a filename. Unlike Pi's fallback
+it does not interpret an explicit string as a filename; hosts opt into file
+inputs explicitly. Unlike Pi's fallback
 for unreadable prompt files, invalid UTF-8, oversized files, and read failures
 are errors. Unix file opens are nonblocking and validate the opened handle before
 reading, so a FIFO is rejected. The host supplies the default prompt and any Pi-specific context
