@@ -74,6 +74,57 @@ fn checked(key: Vec<u8>, version: u64) -> Check {
     }
 }
 
+/// Resolve authority from the owner's membership, never from a caller-supplied
+/// session identifier. Every record used here is retained as a commit check.
+pub(crate) fn task_pair(
+    store: &Store,
+    owner: Uuid,
+    target: Uuid,
+) -> Result<Vec<Check>, crate::document::Error> {
+    let key = member_key(owner);
+    let entry = store.get(&key)?.ok_or_else(|| {
+        crate::document::Error::InvalidSessionAdmission("owner is not session scoped".into())
+    })?;
+    let member: Membership = serde_json::from_slice(&entry.value)?;
+    if member.version != 1 || member.conversation != owner || member.session.is_nil() {
+        return Err(crate::document::Error::InvalidSessionAdmission(
+            "invalid owner session membership".into(),
+        ));
+    }
+    let directory = SessionMembership::new(store);
+    let proof = match directory.authorize_pair(member.session, owner, target) {
+        Ok(proof) => proof,
+        Err(error @ Error::Store(_)) | Err(error @ Error::Json(_)) => {
+            return Err(match error {
+                Error::Store(error) => crate::document::Error::Store(error),
+                Error::Json(error) => crate::document::Error::Json(error),
+                _ => unreachable!(),
+            });
+        }
+        Err(_) => {
+            if store.get(&key)?.map(|current| current.version) != Some(entry.version) {
+                return Err(durable_store::Error::Conflict { key }.into());
+            }
+            return Err(crate::document::Error::InvalidSessionAdmission(
+                "conversations are not active members of the same session".into(),
+            ));
+        }
+    };
+    let observed_owner = proof.checks.iter().find(|check| check.key == key);
+    if observed_owner != Some(&checked(key.clone(), entry.version)) {
+        return Err(durable_store::Error::Conflict { key }.into());
+    }
+    // The admission captures and checks its own target snapshot. Retaining a
+    // second independently read version would turn a race into InvalidBatch
+    // rather than the scheduler's normal replay-safe conflict.
+    let target_key = crate::runtime::Harness::key(target);
+    Ok(proof
+        .checks
+        .into_iter()
+        .filter(|check| check.key != target_key)
+        .collect())
+}
+
 /// Host authority over membership in a single store. Creating this object is
 /// not authorization for an untrusted caller: access to the store is privileged.
 pub struct SessionMembership<'a> {
