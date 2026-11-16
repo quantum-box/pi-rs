@@ -3677,6 +3677,7 @@ impl Harness {
         }
         if let Some(object) = value.as_object_mut() {
             object.remove("_reset_baseline");
+            object.remove("_reset_baseline_sha256");
         }
         Ok(())
     }
@@ -4469,7 +4470,16 @@ impl Harness {
         let mut persisted = state.clone();
         persisted.messages.clear();
         let value = serde_json::to_vec(&persisted)?;
-        let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes, "tool_results": state.tool_results});
+        let mut event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes, "tool_results": state.tool_results});
+        let reset_baseline: Option<serde_json::Value> = if state.pending_reset_blocks.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_slice(&value)?)
+        };
+        if let Some(baseline) = &reset_baseline {
+            event["_reset_baseline_sha256"] =
+                serde_json::Value::String(reset_baseline_digest(baseline)?);
+        }
         append.set_value(&event)?;
         let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
         let fork_snapshot = crate::fork::Snapshot {
@@ -4533,8 +4543,8 @@ impl Harness {
         fork_value["_transcript"] = serde_json::to_value(&state.transcript)?;
         // Retain the exact serialized root while block resets are pending so
         // a later same-commit proof can replay the committed predecessor.
-        if !state.pending_reset_blocks.is_empty() {
-            fork_value["_reset_baseline"] = serde_json::from_slice(&value)?;
+        if let Some(baseline) = reset_baseline {
+            fork_value["_reset_baseline"] = baseline;
         }
         let mut checks = vec![Check {
             key: key.clone(),
@@ -6571,7 +6581,17 @@ impl Harness {
         {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
-        if snapshot.get("_reset_baseline").is_some() {
+        let previous = observation
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let events = crate::observer::Observer::new(store, id).read(
+            crate::observer::Cursor(previous),
+            std::num::NonZeroUsize::MIN,
+        )?;
+        let has_digest = events.records.first().is_some_and(|event| {
+            event.cursor.0 == observation && event.value.get("_reset_baseline_sha256").is_some()
+        });
+        if snapshot.get("_reset_baseline").is_some() && has_digest {
             let (historical, _) = self.authenticated_reset_baseline(id, observation)?;
             if serde_json::to_value(&historical)? != serde_json::to_value(&baseline)?
                 || historical.messages != baseline.messages
@@ -6605,6 +6625,25 @@ impl Harness {
             .get("_reset_baseline")
             .cloned()
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let after = observation
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let page = crate::observer::Observer::new(store, id)
+            .read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+        let event = page
+            .records
+            .first()
+            .filter(|r| r.cursor.0 == observation)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if event
+            .value
+            .get("_reset_baseline_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(reset_baseline_digest(&value)?.as_str())
+            || event.value.get("_transcript") != snapshot.get("_transcript")
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         let mut baseline: Conversation = serde_json::from_value(value)?;
         // Pending tool-result metadata lives at a separately mutable key and
         // cannot be reconstructed historically by this baseline format.
@@ -16193,6 +16232,11 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+fn reset_baseline_digest(value: &serde_json::Value) -> Result<String, Error> {
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
 // Derive reset cuts from a caller-authenticated baseline without writing storage.

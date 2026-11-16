@@ -5828,3 +5828,147 @@ fn authenticated_reset_baseline_survives_process_kill_and_reopen() {
     let cuts = derive_ordered_reset_states(&baseline, &steps).unwrap();
     assert_eq!(cuts[0].content_blocks[&1].message_id, occurrence);
 }
+
+#[test]
+fn reset_baseline_digest_rejects_forged_same_commit_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    h.reset_with_blocks(
+        id,
+        None,
+        vec![vec![serde_json::json!({"type":"text", "text":"one"})]],
+    )
+    .unwrap();
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    h.authenticated_reset_baseline(id, head.0).unwrap();
+    let root = Harness::key(id);
+    let fork = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let mut event = b"durable/observer/".to_vec();
+    event.extend_from_slice(id.as_bytes());
+    event.extend_from_slice(b"/r");
+    event.extend_from_slice(&head.0.to_be_bytes());
+    let root_value = h.owner.store().get(&root).unwrap().unwrap().value;
+    let fork_value = h.owner.store().get(&fork).unwrap().unwrap().value;
+    let mut event_value: serde_json::Value =
+        serde_json::from_slice(&h.owner.store().get(&event).unwrap().unwrap().value).unwrap();
+    event_value["_reset_baseline_sha256"] = serde_json::json!("forged");
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root,
+                    value: root_value,
+                },
+                Mutation::Put {
+                    key: fork,
+                    value: fork_value,
+                },
+                Mutation::Put {
+                    key: event,
+                    value: serde_json::to_vec(&event_value).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    h.authenticate_fork_anchor(id, head.0).unwrap();
+    assert!(h.authenticated_reset_baseline(id, head.0).is_err());
+}
+
+#[test]
+fn legacy_undigested_baseline_is_only_usable_at_current_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let (reset, _) = h
+        .reset_with_blocks(
+            id,
+            None,
+            vec![vec![serde_json::json!({"type":"text", "text":"one"})]],
+        )
+        .unwrap();
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    let root = Harness::key(id);
+    let fork = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let mut event = b"durable/observer/".to_vec();
+    event.extend_from_slice(id.as_bytes());
+    event.extend_from_slice(b"/r");
+    event.extend_from_slice(&head.0.to_be_bytes());
+    let root_value = h.owner.store().get(&root).unwrap().unwrap().value;
+    let fork_value = h.owner.store().get(&fork).unwrap().unwrap().value;
+    let mut event_value: serde_json::Value =
+        serde_json::from_slice(&h.owner.store().get(&event).unwrap().unwrap().value).unwrap();
+    event_value
+        .as_object_mut()
+        .unwrap()
+        .remove("_reset_baseline_sha256");
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root,
+                    value: root_value,
+                },
+                Mutation::Put {
+                    key: fork,
+                    value: fork_value,
+                },
+                Mutation::Put {
+                    key: event,
+                    value: serde_json::to_vec(&event_value).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    let (_, version) = h.load(id).unwrap();
+    let steps = [ResetDerivationStep {
+        reset_id: reset,
+        context_generation: Uuid::new_v4(),
+        write_limit: usize::MAX,
+    }];
+    assert_eq!(
+        h.derive_anchored_reset_states(id, version, &steps)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(h.authenticated_reset_baseline(id, head.0).is_err());
+}
