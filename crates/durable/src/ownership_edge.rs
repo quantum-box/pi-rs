@@ -183,6 +183,10 @@ impl<'a> EdgeStore<'a> {
                 key: key.clone(),
                 expected: Expected::Missing,
             },
+            Check {
+                key: crate::runtime::owned_cleanup_key(edge.child),
+                expected: Expected::Missing,
+            },
         ]);
         Ok(PreparedEdge {
             checks,
@@ -224,6 +228,7 @@ impl CleanupGraph {
         let mut tasks = HashMap::new();
         let mut edges = Vec::new();
         let mut invalid_tasks = HashSet::new();
+        let mut malformed_edges = Vec::new();
         let mut opaque_edge = false;
         let mut invalid_conversations = HashSet::new();
         let mut conversations = HashSet::new();
@@ -238,9 +243,21 @@ impl CleanupGraph {
             } else if key.starts_with(PREFIX) {
                 match decode(&key, entry.clone()) {
                     Ok(edge) => edges.push(edge.edge),
-                    // An undecodable edge cannot authenticate its owner. Keep
-                    // task settlement fenced rather than trusting partial JSON.
-                    Err(_) => opaque_edge = true,
+                    Err(_) => {
+                        // Only a structurally valid child key and owner tuple can
+                        // scope a damaged edge. Otherwise no task can be ruled out.
+                        #[derive(serde::Deserialize)]
+                        struct PartialEdge {
+                            task: Uuid,
+                            task_owner: TaskOwner,
+                            child: Uuid,
+                        }
+                        match serde_json::from_slice::<PartialEdge>(&entry.value) {
+                            Ok(partial) if edge_key(partial.child) == key => malformed_edges
+                                .push((partial.task, partial.task_owner, partial.child)),
+                            _ => opaque_edge = true,
+                        }
+                    }
                 }
             } else {
                 let id = std::str::from_utf8(&key[b"runtime/conversation/".len()..])
@@ -271,6 +288,36 @@ impl CleanupGraph {
                 .entry(parent)
                 .or_default()
                 .push(CleanupNode::Task(task.id()));
+        }
+        for (task, claimed_owner, child) in malformed_edges {
+            // A damaged edge alone cannot prove its owner. A permanent owned
+            // subagent reservation, when present, independently binds the
+            // same task, parent and child. Legacy edges without it remain opaque.
+            let prefix = format!("durable/owned-subagent/{task}/");
+            let mut matches = 0;
+            for (_, entry) in store.list(prefix.as_bytes())? {
+                let Ok(admission) =
+                    serde_json::from_slice::<crate::owned_subagent::Admission>(&entry.value)
+                else {
+                    opaque_edge = true;
+                    continue;
+                };
+                if admission.child == child
+                    && admission.task == task
+                    && admission.task_owner == claimed_owner
+                {
+                    matches += 1;
+                }
+            }
+            if matches == 1
+                && tasks
+                    .get(&task)
+                    .is_some_and(|owner| *owner.owner() == claimed_owner)
+            {
+                invalid_tasks.insert(task);
+            } else {
+                opaque_edge = true;
+            }
         }
         let mut valid_edges: HashMap<Uuid, Vec<Edge>> = HashMap::new();
         for edge in edges {

@@ -3310,7 +3310,7 @@ impl Scheduler {
     }
 
     /// Failures of individual conversation cleanup callbacks, keyed by conversation.
-    /// The corresponding durable abort remains marked until this scheduler is reopened.
+    /// A durable uncertain attempt remains marked until explicitly reconciled.
     pub fn conversation_cleanup_failures(&self) -> &HashMap<Uuid, String> {
         &self.cleanup_failures
     }
@@ -5248,7 +5248,8 @@ fn has_owned_work(
     tasks: &[task_store::StoredTask],
     include_abortable: bool,
 ) -> Result<bool, Error> {
-    let edges = crate::ownership_edge::EdgeStore::new(store);
+    let graph = crate::ownership_edge::CleanupGraph::load(store)
+        .map_err(|e| Error::Handler(format!("ownership graph: {e}")))?;
     let failure_cleanup = tasks.iter().any(|record| {
         record.task.id() == root && matches!(record.task.state(), TaskState::CompletingFailed(_))
     });
@@ -5267,30 +5268,30 @@ fn has_owned_work(
             }
             pending.push(child.task.id());
         }
-        for edge in edges
-            .children(id)
-            .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
-        {
+        if graph.uncertain_task(id) {
+            return Ok(true);
+        }
+        for edge in graph.task_edges(id) {
             let parent = tasks
                 .iter()
                 .find(|item| item.task.id() == id)
                 .ok_or(Error::Ownership)?;
-            if edge.edge.task_owner != *parent.task.owner() {
+            if edge.task_owner != *parent.task.owner() {
                 return Err(Error::Ownership);
             }
-            if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+            if edge.mode != crate::ownership_edge::Mode::Foreground {
                 continue;
             }
             // An aborting conversation is still being drained by the harness.
-            let key = format!("runtime/conversation/{}", edge.edge.child);
-            let record = store
-                .get(key.as_bytes())
-                .map_err(task_store::Error::from)?
-                .ok_or(Error::Ownership)?;
-            let conversation: crate::runtime::Conversation =
-                serde_json::from_slice(&record.value).map_err(task_store::Error::from)?;
-            if conversation.id != edge.edge.child {
-                return Err(Error::Ownership);
+            let key = format!("runtime/conversation/{}", edge.child);
+            let record = store.get(key.as_bytes()).map_err(task_store::Error::from)?;
+            let Some(conversation) = record.and_then(|entry| {
+                serde_json::from_slice::<crate::runtime::Conversation>(&entry.value).ok()
+            }) else {
+                return Ok(true);
+            };
+            if conversation.id != edge.child {
+                return Ok(true);
             }
             if conversation.abort_requested
                 || if failure_cleanup {
@@ -5303,7 +5304,7 @@ fn has_owned_work(
                 return Ok(true);
             }
             for child in tasks.iter().filter(|item| {
-                item.task.owner() == &TaskOwner::Conversation(edge.edge.child)
+                item.task.owner() == &TaskOwner::Conversation(edge.child)
                     && !item.task.is_background()
             }) {
                 if !child.task.is_terminal() {
@@ -16639,7 +16640,32 @@ mod standalone_foreground_cleanup_tests {
         ));
         let mut scheduler =
             Scheduler::open_with_conversation_runtime(path, registry(), opts).unwrap();
-        if std::env::var_os("PI_CLEANUP_CRASH_DRIVER").is_some() {
+        if let Ok(mode) = std::env::var("PI_CLEANUP_CRASH_DRIVER") {
+            if mode == "competing" {
+                let mut direct = scheduler.validator.as_ref().unwrap().worker();
+                let conversation =
+                    Uuid::parse_str(&std::env::var("PI_CLEANUP_CRASH_CHILD").unwrap()).unwrap();
+                tokio::spawn(async move {
+                    let _ = direct
+                        .resume_conversation(conversation, &CancellationToken::new())
+                        .await;
+                });
+                let ready =
+                    std::path::PathBuf::from(std::env::var("PI_CLEANUP_CRASH_READY").unwrap());
+                while !ready.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                crate::runtime::driver_cleanup_hooks()
+                    .lock()
+                    .unwrap()
+                    .insert(conversation, entered.clone());
+                let _driver = crate::task_driver::Driver::start(scheduler);
+                entered.acquire().await.unwrap().forget();
+                std::fs::write(ready.with_extension("driver"), b"started").unwrap();
+                std::future::pending::<()>().await;
+                return;
+            }
             let _driver = crate::task_driver::Driver::start(scheduler);
             std::future::pending::<()>().await;
             return;
@@ -16930,6 +16956,136 @@ mod standalone_foreground_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn competing_direct_and_driver_cleanup_crash_requires_reconciliation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountModel(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for CountModel {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let ready = dir.path().join("effect-started");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let db = Store::open(&path).unwrap();
+        let parent = task(1, TaskOwner::Conversation(owner), "parent");
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        let batch = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.succeed(json!(null))
+            })
+            .unwrap();
+        h.request_abort(child).unwrap();
+        let key = format!("runtime/conversation/{child}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["phase"] =
+            json!({"ModelRunning": {"turns":0, "request_id":Uuid::new_v4(), "restarts":0}});
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        drop(h);
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_scheduler::standalone_foreground_cleanup_tests::cleanup_crash_worker",
+                "--nocapture",
+            ])
+            .env("PI_CLEANUP_CRASH_DB", &path)
+            .env("PI_CLEANUP_CRASH_READY", &ready)
+            .env("PI_CLEANUP_CRASH_DRIVER", "competing")
+            .env("PI_CLEANUP_CRASH_CHILD", child.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !ready.with_extension("driver").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        process.kill().unwrap();
+        process.wait().unwrap();
+        observed.expect("child did not enter external usage settlement");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(CountModel(calls.clone()));
+        let scheduler = Scheduler::open_with_conversation_runtime(&path, registry(), opts).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if driver
+                    .conversation_cleanup_failures()
+                    .unwrap()
+                    .contains_key(&child)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver did not report uncertain cleanup");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        driver.reconcile_owned_cleanup(child).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let entry = db
+                    .get(format!("runtime/conversation/{child}").as_bytes())
+                    .unwrap()
+                    .unwrap();
+                let state: crate::runtime::Conversation =
+                    serde_json::from_slice(&entry.value).unwrap();
+                if !state.abort_requested {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver did not retry after reconciliation");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        driver.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn dangling_and_invalid_unrelated_candidates_do_not_block_valid_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -17128,6 +17284,116 @@ mod standalone_foreground_cleanup_tests {
         assert!(task.abort_requested());
         assert!(!task.is_terminal());
         driver.shutdown().unwrap();
+    }
+
+    #[test]
+    fn ownership_edge_cannot_race_an_ownerless_cleanup_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let parent = task(1, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&parent)]).unwrap();
+        let batch = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        let key = crate::runtime::owned_cleanup_key(child);
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&Uuid::new_v4()).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(EdgeStore::new(&db).get(child).unwrap().is_none());
+    }
+
+    #[test]
+    fn completing_task_isolates_corrupt_reserved_edge_and_fences_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let broken = task(1, TaskOwner::Conversation(root), "parent");
+        let good = task(2, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks
+            .save(&[Save::Create(&broken), Save::Create(&good)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(
+                broken.id(),
+                broken.owner().clone(),
+                "child",
+                cfg,
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        for task in [&broken, &good] {
+            tasks
+                .update(&tasks.load(task.id()).unwrap().unwrap(), |task| {
+                    task.start()?;
+                    task.hold_success(json!("done"))
+                })
+                .unwrap();
+        }
+        let mut scheduler = h.attach_tasks(registry()).unwrap();
+        let key = crate::ownership_edge::edge_key(child);
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut edge: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        edge["mode"] = json!("corrupt");
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&edge).unwrap(),
+            }],
+        )
+        .unwrap();
+        for _ in 0..5 {
+            scheduler.tick(0).unwrap();
+            if scheduler.get(good.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert!(matches!(
+            scheduler.get(good.id()).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+        assert!(matches!(
+            scheduler.get(broken.id()).unwrap().unwrap().state(),
+            TaskState::Completing(_)
+        ));
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ use uuid::Uuid;
 pub struct Control {
     pub gate: Arc<Mutex<()>>,
     pub worker: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes abort cleanup across direct and scheduled workers.
+    pub abort_execution: Arc<tokio::sync::Mutex<()>>,
     /// Serializes summary execution with standalone cleanup marker creation.
     pub summary_execution: Arc<tokio::sync::RwLock<()>>,
     /// Serializes autonomous nested polling without holding the conversation worker.
@@ -60,6 +62,7 @@ impl ConversationControls {
             .or_insert_with(|| Control {
                 gate: Arc::new(Mutex::new(())),
                 worker: Arc::new(tokio::sync::Mutex::new(())),
+                abort_execution: Arc::new(tokio::sync::Mutex::new(())),
                 summary_execution: Arc::new(tokio::sync::RwLock::new(())),
                 nested_poll: Arc::new(tokio::sync::Mutex::new(())),
                 next_poll: Arc::new(Mutex::new(None)),

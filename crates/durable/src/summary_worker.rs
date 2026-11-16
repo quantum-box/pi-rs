@@ -96,7 +96,7 @@ pub(crate) async fn run_for_cleanup(
         match (marker, cleanup_attempt) {
             (None, None) => (),
             (Some(marker), Some(attempt))
-                if serde_json::from_slice::<Uuid>(&marker.value).ok() == Some(attempt) => {}
+                if crate::runtime::cleanup_attempt_id(&marker.value) == Some(attempt) => {}
             _ => return Err(Error::CleanupUncertain),
         }
         if !provider.valid() || snap.operation.provider() != Some(&provider) {

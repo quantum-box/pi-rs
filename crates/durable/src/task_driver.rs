@@ -713,18 +713,36 @@ fn cleanup_loop(shared: Arc<Shared>) {
                     let Some(edge_entry) = entries.get(&edge_key) else {
                         continue;
                     };
-                    let Ok(edge) = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
-                    else {
-                        continue;
+                    let report = |reason: String| {
+                        shared
+                            .owner
+                            .conversation_controls()
+                            .worker_errors()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(child.id, reason);
+                    };
+                    let edge = match crate::ownership_edge::decode(&edge_key, edge_entry.clone()) {
+                        Ok(edge) => edge,
+                        Err(error) => {
+                            report(format!("invalid ownership edge: {error}"));
+                            continue;
+                        }
                     };
                     let task_key = crate::task_store::key(edge.edge.task);
                     let Some(task_entry) = entries.get(&task_key) else {
+                        report("ownership task missing".into());
                         continue;
                     };
-                    let Ok(task) = crate::task_store::decode(&task_key, task_entry.clone()) else {
-                        continue;
+                    let task = match crate::task_store::decode(&task_key, task_entry.clone()) {
+                        Ok(task) => task,
+                        Err(error) => {
+                            report(format!("invalid ownership task: {error}"));
+                            continue;
+                        }
                     };
                     if edge.edge.task_owner != *task.task.owner() {
+                        report("ownership edge owner mismatch".into());
                         continue;
                     }
                     // A child can be aborted independently of its live owner,

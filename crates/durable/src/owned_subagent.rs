@@ -3340,11 +3340,8 @@ mod tests {
         let driver = h.start_tasks(Default::default()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
-            if let Err(error) = driver.get(task) {
-                assert!(
-                    error.to_string().contains("ownership edge owner mismatch"),
-                    "{error}"
-                );
+            if let Some(error) = driver.conversation_cleanup_failures().unwrap().get(&child) {
+                assert!(error.contains("ownership edge owner mismatch"), "{error}");
                 break;
             }
             assert!(
@@ -3353,8 +3350,9 @@ mod tests {
             );
             std::thread::yield_now();
         }
+        assert!(driver.get(task).is_ok());
         assert!(h.conversation(child).unwrap().abort_requested);
-        assert!(driver.shutdown().is_err());
+        driver.shutdown().unwrap();
         drop(h);
         let reopened = Harness::open_paused(&path, options()).unwrap();
         assert!(reopened.conversation(child).unwrap().abort_requested);

@@ -41,7 +41,11 @@ completing successfully. Busy workers consume no slot; candidates rotate so
 repeatedly blocked conversations cannot monopolize admission. Each cleanup step
 has a 30-second timeout. Callback failures and timeouts are exposed by
 `conversation_cleanup_failures`, and the affected conversation stays marked while
-other graphs continue. Before each standalone cleanup step, the runtime waits for active summaries to
+other graphs continue. All owned-conversation abort workers, including direct resume and the attached
+driver, serialize through the same attempt fence. An ownerless abort uses a
+temporary marker to fence concurrent ownership attachment; after interruption,
+ownerless retry can clear that marker and retains its existing retry behavior.
+Before each standalone cleanup step, the runtime waits for active summaries to
 leave their shared execution fence, then commits an attempt marker fenced by the
 conversation version. A timeout while waiting for that fence starts no cleanup
 attempt and creates no marker; it is retryable by a later tick without reopening
@@ -57,7 +61,8 @@ requires the cleanup worker to be stopped; it does not itself inspect or reverse
 external effects. Even a crash before dispatch can require reconciliation. An
 unrelated missing owned conversation, malformed edge, or invalid abort mark is skipped during
 candidate discovery; the affected graph requires separate repair. Task abort
-settlement also isolates edges whose affected task can be identified; a missing
+settlement and held completion also isolate damaged edges when an immutable owned
+subagent reservation independently identifies the affected task; a missing
 background child does not hold its owner's abort. If an edge
 is too malformed to identify its owner, all task abort settlements remain parked
 until repair because the runtime cannot prove which task owns it; independent
