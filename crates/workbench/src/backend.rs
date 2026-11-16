@@ -1266,6 +1266,7 @@ async fn run_worker(
                     require_command,
                     ..
                 } => {
+                    let mut prompt_acknowledged = false;
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
                     }
@@ -1278,6 +1279,10 @@ async fn run_worker(
                     {
                         if !trigger {
                             return Ok(());
+                        }
+                        if let Some(id) = prompt_response.take() {
+                            control_response("prompt", id, Ok(json!({"disposition":"handled"})));
+                            prompt_acknowledged = true;
                         }
                         content = None;
                         images.clear();
@@ -1327,8 +1332,11 @@ async fn run_worker(
                         return Err(Error::Cancelled);
                     }
                     if let Some(id) = prompt_response.take() {
-                        started = true;
                         control_response("prompt", id, Ok(json!({"disposition":"started"})));
+                        prompt_acknowledged = true;
+                    }
+                    if prompt_acknowledged {
+                        started = true;
                         output(json!({"type":"agent_started"}));
                     }
                     let run_id = Uuid::new_v4();
