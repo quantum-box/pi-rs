@@ -462,6 +462,7 @@ pub struct PreparedSettlement {
     conflict_keys: HashSet<Vec<u8>>,
     graph_version: u64,
     attempts: usize,
+    commit_uncertain: bool,
 }
 
 /// Owned settlement state at an invocation or prepared transaction boundary.
@@ -496,6 +497,7 @@ enum DeferredSettlement {
         crate::document::DetachedTaskDocuments,
     ),
     Prepared(PreparedSettlement),
+    IndeterminatePrepared(PreparedSettlement),
     PreparationConflict(PreparationConflict),
     Failure(FailureSettlement),
 }
@@ -518,6 +520,11 @@ impl std::fmt::Debug for PendingSettlement {
 }
 
 impl PendingSettlement {
+    /// The task whose result and exclusive lease remain owned here.
+    pub fn task_id(&self) -> Uuid {
+        self.lease().id
+    }
+
     fn lease(&self) -> &InvocationLease {
         match self {
             Self::Unprepared(completed) => &completed.lease,
@@ -702,10 +709,10 @@ impl std::fmt::Debug for CompletedInvocation {
 }
 
 /// An invocation rejected before settlement remains owned by the caller.
-/// Other errors consume the attempt and require recovery. `Handler` means the
-/// handler returned an error, not that its external effects were rolled back.
-/// `Indeterminate` conservatively includes all other settlement errors and must
-/// not be interpreted as proof that a storage commit failed.
+/// `Handler` means the handler returned an error, not that its external effects
+/// were rolled back. Indeterminate errors do not prove a commit failed; where
+/// available, `IndeterminatePrepared` retains the exact candidate and lease for
+/// reconciliation. Other indeterminate paths still consume their input.
 #[derive(Debug)]
 pub enum SettlementError {
     #[cfg(test)]
@@ -732,6 +739,12 @@ pub enum SettlementError {
         completed: Box<CompletedInvocation>,
     },
     Handler(Error),
+    /// A prepared transaction may have committed. Retain it for external
+    /// reconciliation; it must not be blindly retried.
+    IndeterminatePrepared {
+        error: Error,
+        pending: Box<PendingSettlement>,
+    },
     Indeterminate(Error),
 }
 
@@ -1193,6 +1206,12 @@ impl Scheduler {
             }
         };
         if let Some(deferred) = deferred {
+            if matches!(deferred, DeferredSettlement::IndeterminatePrepared(_)) {
+                self.live_invocations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .poisoned = true;
+            }
             drop(guard);
             return Err(match deferred {
                 DeferredSettlement::Unprepared(running, result, documents) => {
@@ -1207,6 +1226,12 @@ impl Scheduler {
                 DeferredSettlement::Prepared(settlement) => SettlementError::PendingPrepared {
                     pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
                 },
+                DeferredSettlement::IndeterminatePrepared(settlement) => {
+                    SettlementError::IndeterminatePrepared {
+                        error: result.expect_err("indeterminate commit must have an error"),
+                        pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+                    }
+                }
                 DeferredSettlement::PreparationConflict(conflict) => {
                     SettlementError::PendingPrepared {
                         pending: Box::new(PendingSettlement::PreparationConflict {
@@ -1557,6 +1582,18 @@ impl Scheduler {
             let error = result.expect_err("revalidation rejection must contain an error");
             drop(guard);
             return Err(SettlementError::RejectedPrepared {
+                error,
+                pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+            });
+        }
+        if result.is_err() && settlement.commit_uncertain {
+            self.live_invocations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poisoned = true;
+            let error = result.expect_err("indeterminate commit must have an error");
+            drop(guard);
+            return Err(SettlementError::IndeterminatePrepared {
                 error,
                 pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
             });
@@ -2424,7 +2461,8 @@ impl Scheduler {
                     | SettlementError::Indeterminate(error) => error,
                     SettlementError::Pending { .. }
                     | SettlementError::PendingPrepared { .. }
-                    | SettlementError::RejectedPrepared { .. } => {
+                    | SettlementError::RejectedPrepared { .. }
+                    | SettlementError::IndeterminatePrepared { .. } => {
                         unreachable!("serial settlement does not return pending")
                     }
                     #[cfg(test)]
@@ -3143,6 +3181,7 @@ impl Scheduler {
             conflict_keys: document_keys,
             graph_version: success_graph_version,
             attempts: 0,
+            commit_uncertain: false,
         };
         let result = self.commit_prepared_settlement(
             &mut prepared,
@@ -3155,6 +3194,10 @@ impl Scheduler {
             if deferred.is_none() {
                 *deferred = Some(DeferredSettlement::Prepared(prepared));
             }
+            return result;
+        }
+        if nonblocking_abort && result.is_err() && prepared.commit_uncertain && deferred.is_none() {
+            *deferred = Some(DeferredSettlement::IndeterminatePrepared(prepared));
             return result;
         }
         #[cfg(test)]
@@ -3184,8 +3227,10 @@ impl Scheduler {
             let Err(crate::document::Error::Store(durable_store::Error::Conflict { ref key })) =
                 result
             else {
+                prepared.commit_uncertain = result.is_err();
                 break result;
             };
+            prepared.commit_uncertain = false;
             if !(key == task_store::PREFIX
                 || key == crate::ownership_edge::PREFIX
                 || key == b"runtime/conversation/")
@@ -3220,6 +3265,7 @@ impl Scheduler {
         };
         #[cfg(test)]
         if committed.is_ok() && self.inject_post_commit_error {
+            prepared.commit_uncertain = true;
             return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
         }
         match committed {
@@ -5406,6 +5452,7 @@ mod tests {
             conflict_keys: HashSet::new(),
             graph_version: 0,
             attempts: 0,
+            commit_uncertain: false,
         };
         let pending = PendingSettlement::Prepared { lease, settlement };
         assert!(matches!(
@@ -5468,6 +5515,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn uncertain_prepared_commit_returns_owned_candidate_and_keeps_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.register("work", false, |_: &Task| Ok(Step::Succeed(json!("done"))));
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+        let owner = scheduler.owner();
+        scheduler
+            .submit(&task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "work",
+                false,
+                3,
+            ))
+            .unwrap();
+        let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("reservation")
+        };
+        let completed = invocation.execute().unwrap();
+        let attempt = completed.running.task.attempt_id();
+        scheduler.inject_post_commit_error = true;
+        let pending = match scheduler.try_settle_invocation(completed) {
+            Err(SettlementError::IndeterminatePrepared {
+                error: Error::Store(_),
+                pending,
+            }) => pending,
+            result => panic!("expected owned indeterminate candidate: {result:?}"),
+        };
+        assert_eq!(pending.task_id(), Uuid::from_u128(1));
+        match &*pending {
+            PendingSettlement::Prepared { settlement, .. } => {
+                assert!(settlement.commit_uncertain);
+                assert_eq!(settlement.running.task.attempt_id(), attempt);
+                assert_eq!(
+                    settlement.candidate.task.state(),
+                    &TaskState::Succeeded(json!("done"))
+                );
+            }
+            _ => panic!("prepared result required"),
+        }
+        assert_eq!(
+            scheduler
+                .ts()
+                .load(Uuid::from_u128(1))
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+        assert!(
+            matches!(scheduler.try_resume_pending(*pending), Err(SettlementError::RejectedPrepared { error: Error::Poisoned, pending }) if {
+                assert_eq!(pending.task_id(), Uuid::from_u128(1));
+                drop(scheduler);
+                assert!(matches!(Scheduler::attach(owner.clone(), registry), Err(Error::AlreadyAttached)));
+                true
+            })
+        );
     }
 
     #[test]
@@ -9552,6 +9660,7 @@ mod tests {
                 conflict_keys: HashSet::from([address.storage_key().unwrap()]),
                 graph_version: boundary,
                 attempts: 0,
+                commit_uncertain: false,
             };
             let child = task(2, TaskOwner::Task(root.id()), "child", false, 3);
             scheduler.ts().save(&[Save::Create(&child)]).unwrap();
@@ -9686,6 +9795,7 @@ mod tests {
             conflict_keys: HashSet::new(),
             graph_version: owner.store().put_version().unwrap(),
             attempts: 0,
+            commit_uncertain: false,
         };
         assert!(
             matches!(prepared.revalidate(&scheduler, &owner, &gate).unwrap(), PreparedRevalidation::PendingAbort(id) if id == child.id())
