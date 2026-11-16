@@ -3002,6 +3002,274 @@ pub(crate) fn default_subagent_tools(options: &Options) -> Vec<String> {
     allowed
 }
 
+impl crate::session_transaction::SessionTransaction<'_> {
+    // Admission reads the submission table even on duplicate/no-op paths.
+    fn admission_duplicate(
+        &self,
+        request_id: Option<&str>,
+        kind: Option<SubmissionKind>,
+    ) -> Result<Option<Uuid>, crate::document::Error> {
+        use crate::document::Error as DError;
+        if self.table_written {
+            return Err(DError::ReadAfterWrite);
+        }
+        if self.state.abort_requested {
+            return Err(DError::InvalidSessionAdmission("abort in progress".into()));
+        }
+        let Some(request_id) = request_id else {
+            return Ok(None);
+        };
+        if kind.is_some() && request_id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX) {
+            return Err(DError::InvalidSessionAdmission(
+                "reserved subagent reporter request ID".into(),
+            ));
+        }
+        if let Some(submission) = self
+            .state
+            .submissions
+            .iter()
+            .find(|s| s.request_id.as_deref() == Some(request_id))
+        {
+            return if Some(submission.kind) == kind {
+                Ok(Some(submission.id))
+            } else {
+                Err(DError::InvalidSessionAdmission(
+                    "request ID identifies a different submission type".into(),
+                ))
+            };
+        }
+        if let Some(write) = self
+            .state
+            .application_writes
+            .iter()
+            .find(|w| w.request_id.as_deref() == Some(request_id))
+        {
+            return if kind.is_none() {
+                Ok(Some(write.id))
+            } else {
+                Err(DError::InvalidSessionAdmission(
+                    "request ID identifies a different submission type".into(),
+                ))
+            };
+        }
+        Ok(None)
+    }
+
+    fn validate_admission_notify(
+        notify: &Option<SubmissionNotify>,
+    ) -> Result<(), crate::document::Error> {
+        if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
+            return Err(crate::document::Error::InvalidSessionAdmission(
+                "empty submission notification key".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn update_entry_boundary(&mut self) {
+        self.after_reset = self.state.resets.last().map(|reset| reset.id);
+        self.entries_allowed = self.state.pending_resets.is_empty()
+            && self.state.pending_independent_summary.is_none()
+            && !self
+                .state
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn);
+    }
+
+    /// Admit one input before the transaction's first table write.
+    pub fn submit_input(
+        &mut self,
+        request_id: Option<String>,
+        content: String,
+        options: AdmissionOptions,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, crate::document::Error> {
+        use crate::document::Error as DError;
+        if let Some(id) =
+            self.admission_duplicate(request_id.as_deref(), Some(SubmissionKind::Input))?
+        {
+            return Ok(id);
+        }
+        if !self.supports_context {
+            return Err(DError::InvalidSessionAdmission(
+                "unsupported context blocks".into(),
+            ));
+        }
+        if content.trim().is_empty() {
+            return Err(DError::InvalidSessionAdmission("empty input".into()));
+        }
+        Self::validate_admission_notify(&notify)?;
+        let c = &mut self.state;
+        let busy = c.active.is_some()
+            || pending_failure_continuation(c)
+            || matches!(
+                c.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            );
+        if busy && options.reject_when_busy {
+            return Err(AdmissionError::Busy.into());
+        }
+        if !busy && options.reject_when_idle {
+            return Err(AdmissionError::Idle.into());
+        }
+        let id = Uuid::new_v4();
+        let place_now = matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+            && c.active.is_none()
+            && c.pending_independent_summary.is_none()
+            && !c
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+            && c.pending_resets.is_empty()
+            && !c.submissions.iter().any(|s| s.status == Status::Queued);
+        c.submissions.push(Submission {
+            kind: SubmissionKind::Input,
+            id,
+            request_id,
+            content: content.clone(),
+            image_notes: Vec::new(),
+            input_blocks: None,
+            status: if place_now {
+                Status::Running
+            } else {
+                Status::Queued
+            },
+        });
+        if let Some(notify) = notify {
+            c.submission_notifications.insert(id, notify);
+        }
+        c.input_modes.insert(id, options.mode);
+        if place_now {
+            c.run_failure = None;
+            c.failure_continuation_inputs.clear();
+            c.active = Some(id);
+            c.messages.push(Message::User { content });
+            c.auto_compaction_attempted = false;
+            c.retry_state = RetryState::default();
+            c.overflow_compaction_attempted = false;
+            c.phase = Phase::ModelReady { turns: 0 };
+        } else if matches!(c.phase, Phase::FailedIdle) {
+            c.phase = Phase::Idle;
+        }
+        self.table_written = true;
+        self.update_entry_boundary();
+        Ok(id)
+    }
+
+    /// Admit one continuation before the transaction's first table write.
+    pub fn submit_continue(
+        &mut self,
+        request_id: Option<String>,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, crate::document::Error> {
+        use crate::document::Error as DError;
+        if let Some(id) =
+            self.admission_duplicate(request_id.as_deref(), Some(SubmissionKind::Continue))?
+        {
+            return Ok(id);
+        }
+        if !self.supports_context {
+            return Err(DError::InvalidSessionAdmission(
+                "unsupported context blocks".into(),
+            ));
+        }
+        Self::validate_admission_notify(&notify)?;
+        let c = &mut self.state;
+        if c.active.is_some()
+            || c.abort_requested
+            || pending_failure_continuation(c)
+            || c.pending_independent_summary.is_some()
+            || c.application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+            || !matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+        {
+            return Err(AdmissionError::Busy.into());
+        }
+        if !c.pending_reset_blocks.is_empty() && c.pending_resets.len() > 1 {
+            return Err(DError::InvalidSessionAdmission(
+                "multiple block resets require separate commits".into(),
+            ));
+        }
+        for marker in std::mem::take(&mut c.pending_resets) {
+            place_reset(c, marker);
+        }
+        place_queued(c, true);
+        let id = Uuid::new_v4();
+        c.submissions.push(Submission {
+            kind: SubmissionKind::Continue,
+            id,
+            request_id,
+            content: String::new(),
+            image_notes: Vec::new(),
+            input_blocks: None,
+            status: Status::Running,
+        });
+        if let Some(notify) = notify {
+            c.submission_notifications.insert(id, notify);
+        }
+        c.run_failure = None;
+        c.failure_continuation_inputs.clear();
+        c.active = Some(id);
+        c.auto_compaction_attempted = false;
+        c.retry_state = RetryState::default();
+        c.overflow_compaction_attempted = false;
+        c.phase = Phase::ModelReady { turns: 0 };
+        self.table_written = true;
+        self.update_entry_boundary();
+        Ok(id)
+    }
+
+    /// Admit one display-only write before the transaction's first table write.
+    pub fn submit_write(
+        &mut self,
+        request_id: Option<String>,
+        kind: String,
+        data: Option<serde_json::Value>,
+        notify: Option<SubmissionNotify>,
+    ) -> Result<Uuid, crate::document::Error> {
+        use crate::document::Error as DError;
+        if let Some(id) = self.admission_duplicate(request_id.as_deref(), None)? {
+            return Ok(id);
+        }
+        if kind.is_empty() || kind.starts_with("pi.") {
+            return Err(DError::InvalidSessionAdmission(
+                "application entry kind must be nonempty and outside pi.".into(),
+            ));
+        }
+        Self::validate_admission_notify(&notify)?;
+        let c = &mut self.state;
+        let id = Uuid::new_v4();
+        let after_reset = c
+            .pending_resets
+            .last()
+            .map(|r| r.id)
+            .or_else(|| c.resets.last().map(|r| r.id));
+        let placed = c.pending_resets.is_empty()
+            && c.pending_independent_summary.is_none()
+            && !c
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn);
+        c.application_writes.push(ApplicationWrite {
+            id,
+            request_id,
+            kind,
+            data,
+            placed,
+            withdrawn: false,
+            after_reset,
+        });
+        if let Some(notify) = notify {
+            c.submission_notifications.insert(id, notify);
+        }
+        self.table_written = true;
+        self.update_entry_boundary();
+        Ok(id)
+    }
+}
+
 impl Harness {
     /// Read committed extension error batches. Batches remain available after reopening.
     pub fn extension_reports(&self) -> Result<Vec<ExtensionReportBatch>, Error> {
@@ -8267,7 +8535,7 @@ impl Harness {
             &mut crate::session_transaction::SessionTransaction<'_>,
         ) -> Result<T, crate::document::Error>,
     ) -> Result<T, Error> {
-        let (mut state, version) = self.load(id)?;
+        let (state, version) = self.load(id)?;
         if state.abort_requested {
             return Err(Error::Invalid("abort in progress".into()));
         }
@@ -8277,15 +8545,18 @@ impl Harness {
                 .application_writes
                 .iter()
                 .any(|write| !write.placed && !write.withdrawn);
+        let supports_context = self.supports_context_blocks(&state);
+        let after_reset = state.resets.last().map(|reset| reset.id);
         let owner = self.owner.clone();
         let mut transaction = crate::session_transaction::SessionTransaction::new(
             owner.store(),
-            state.application_writes.clone(),
-            state.resets.last().map(|reset| reset.id),
+            state,
+            after_reset,
             entries_allowed,
+            supports_context,
         )?;
         let result = change(&mut transaction)?;
-        let (entries, mut documents, changed) = transaction.into_parts()?;
+        let (state, mut documents, changed) = transaction.into_parts()?;
         if !changed {
             documents.checks.push(Check {
                 key: Self::key(id),
@@ -8294,7 +8565,6 @@ impl Harness {
             owner.store().commit(&documents.checks, &[])?;
             return Ok(result);
         }
-        state.application_writes = entries;
         // Do not merge concurrent admissions into a callback's observed state:
         // preserve its exact conversation and document checks on conflict.
         let merge = self.merge_admissions;

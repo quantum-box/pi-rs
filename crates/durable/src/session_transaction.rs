@@ -4,7 +4,7 @@
 //! commits. The callback is never replayed after a conflict.
 use crate::{
     document::{Address, Documents, Error},
-    runtime::ApplicationWrite,
+    runtime::{ApplicationWrite, Conversation},
     task_store::OwnedBatch,
 };
 use durable_store::{Check, Expected, Mutation, Store};
@@ -16,10 +16,11 @@ use uuid::Uuid;
 pub struct SessionTransaction<'a> {
     store: &'a Store,
     revision: u64,
-    entries: Vec<ApplicationWrite>,
-    original_entries: usize,
-    after_reset: Option<Uuid>,
-    entries_allowed: bool,
+    pub(crate) state: Conversation,
+    pub(crate) table_written: bool,
+    pub(crate) supports_context: bool,
+    pub(crate) after_reset: Option<Uuid>,
+    pub(crate) entries_allowed: bool,
     reads: HashMap<Address, Option<Map<String, Value>>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
 }
@@ -27,15 +28,17 @@ pub struct SessionTransaction<'a> {
 impl<'a> SessionTransaction<'a> {
     pub(crate) fn new(
         store: &'a Store,
-        entries: Vec<ApplicationWrite>,
+        state: Conversation,
         after_reset: Option<Uuid>,
         entries_allowed: bool,
+        supports_context: bool,
     ) -> Result<Self, Error> {
         Ok(Self {
             store,
             revision: store.document_snapshot()?,
-            original_entries: entries.len(),
-            entries,
+            state,
+            table_written: false,
+            supports_context,
             after_reset,
             entries_allowed,
             reads: HashMap::new(),
@@ -78,7 +81,8 @@ impl<'a> SessionTransaction<'a> {
 
     /// Return placed application writes, including entries staged by this transaction.
     pub fn entries(&self) -> Vec<ApplicationWrite> {
-        self.entries
+        self.state
+            .application_writes
             .iter()
             .filter(|entry| entry.placed && !entry.withdrawn)
             .cloned()
@@ -94,10 +98,15 @@ impl<'a> SessionTransaction<'a> {
             return Err(Error::SessionEntryBlocked);
         }
         let mut id = Uuid::new_v4();
-        while self.entries.iter().any(|entry| entry.id == id) {
+        while self
+            .state
+            .application_writes
+            .iter()
+            .any(|entry| entry.id == id)
+        {
             id = Uuid::new_v4();
         }
-        self.entries.push(ApplicationWrite {
+        self.state.application_writes.push(ApplicationWrite {
             id,
             request_id: None,
             kind: kind.into(),
@@ -106,11 +115,12 @@ impl<'a> SessionTransaction<'a> {
             withdrawn: false,
             after_reset: self.after_reset,
         });
+        self.table_written = true;
         Ok(id)
     }
 
-    pub(crate) fn into_parts(self) -> Result<(Vec<ApplicationWrite>, OwnedBatch, bool), Error> {
-        let changed = self.entries.len() != self.original_entries || !self.writes.is_empty();
+    pub(crate) fn into_parts(self) -> Result<(Conversation, OwnedBatch, bool), Error> {
+        let changed = self.table_written || !self.writes.is_empty();
         let mut batch = OwnedBatch {
             checks: Vec::new(),
             mutations: Vec::new(),
@@ -131,6 +141,6 @@ impl<'a> SessionTransaction<'a> {
                 });
             }
         }
-        Ok((self.entries, batch, changed))
+        Ok((self.state, batch, changed))
     }
 }

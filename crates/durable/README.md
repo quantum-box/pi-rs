@@ -1427,7 +1427,7 @@ child checks still apply. The reservation is a separate durable commit,
 so a crash can leave the old checkpoint running. External effects require their
 own idempotency or reconciliation. Unlike upstream's transaction callback,
 this synchronous task callback supports conversation-owned application entries
-(described below), but has no general session transaction or arbitrary task creation. It uses optimistic checks rather than the upstream
+(described below), but does not expose arbitrary task creation or the complete upstream session transaction API. It uses optimistic checks rather than the upstream
 Session mutation line and does not expose mutable Chord drafts. Upstream commits writes
 through `runtime.commit()` and documents replay-safe tool recovery on restart;
 this scheduler additionally gates whole-handler conflict retries on its recorded
@@ -1906,3 +1906,22 @@ old records and tasks and migrates the supplied set atomically. Old byte keys
 remain ordinary untouched keys: they are ambiguous with arbitrary user data and
 are never auto-migrated. Without this explicit migration those old records do
 not enforce ownership. Do not use old writers after migration.
+
+### Host session admission transactions
+
+`Harness::session_transaction` and `Scheduler::session_transaction` can stage
+JSON-object document changes and conversation entries with one input, continue,
+or display-write admission. Call `tx.submit_input`, `tx.submit_continue`, or
+`tx.submit_write` before the first entry or admission write; an optional
+`SubmissionNotify` is persisted with the admission. A placed display write and
+its settlement signal commit with the entries and documents. Other submissions
+notify on their subsequent settlement. Document reads see staged writes;
+`entries()` also exposes locally staged placed application writes. Duplicate
+request IDs return the existing submission without replacing its notification.
+The callback runs once, and conflict, abort races, or callback errors leave its
+candidate changes unpublished. Returned IDs are provisional until commit.
+
+This is a subset of upstream session transactions: fitted/block input, arbitrary
+table/signal operations, entry trees and mutable Chord drafts are not exposed.
+Transactional continue rejects multiple pending block resets when they need
+separate commits. See [the parity notes](../../docs/pi-durable-parity.md).

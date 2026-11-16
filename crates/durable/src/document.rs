@@ -44,6 +44,10 @@ pub enum Error {
     InvalidSessionEntry,
     #[error("session entries cannot pass a pending reset, summary, or write")]
     SessionEntryBlocked,
+    #[error(transparent)]
+    SessionAdmission(#[from] crate::state::AdmissionError),
+    #[error("invalid session admission: {0}")]
+    InvalidSessionAdmission(String),
 }
 
 /// An application-defined address. Components are encoded unambiguously;
