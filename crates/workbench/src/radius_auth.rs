@@ -354,7 +354,8 @@ impl Gateway {
         tokio::task::spawn_blocking(move || {
             let _radius_guard = radius_guard;
             before_barrier();
-            let _barrier = RefreshCancellation::enter(&state)?;
+            let barrier = RefreshCancellation::enter(&state)?;
+            let guard = super::process::guard_refresh_auth(barrier, guard);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

@@ -3185,7 +3185,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
-            args.restore_session_model(&Session::open(&args.session)?);
+            args.restore_session_model(&Session::open(&args.session)?)?;
             view.restore(args)?;
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
@@ -3785,7 +3785,7 @@ fn slash(
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
             let mut session = Session::open(&args.session)?;
             session.checkout(id)?;
-            args.restore_session_model(&session);
+            args.restore_session_model(&session)?;
             drop(session);
             view.restore(args)?;
         }
@@ -7782,7 +7782,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     super::thinking::adjust(args);
     args.record_automatic_model_selection(&mut session)?;
     Ok(())
@@ -7812,7 +7812,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     args.trust_pending = decision.is_none();
     args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
     args.refresh_workspace_selection();
-    args.restore_session_model(&session);
+    args.restore_session_model(&session)?;
     drop(session);
     super::thinking::adjust(args);
     Ok(())

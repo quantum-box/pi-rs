@@ -98,6 +98,13 @@ impl Guard {
 }
 impl Drop for Guard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(directory) = std::env::var_os("PI_RS_TEST_PAUSE_AUTH_UNLOCK") {
+            let directory = PathBuf::from(directory);
+            let _ = std::fs::write(directory.join("unlock-entered"), b"");
+            use std::io::Read;
+            let _ = std::io::stdin().read(&mut [0]);
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }

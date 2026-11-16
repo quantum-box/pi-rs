@@ -248,7 +248,7 @@ async fn send_model_request(
     unreachable!("retry loop returns on its last attempt")
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ImageInput {
     Assets,
@@ -256,10 +256,12 @@ enum ImageInput {
     Images,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Compat {
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_input: Option<ImageInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     send_image_opt_in_header: Option<bool>,
 }
 
@@ -293,6 +295,7 @@ struct Configured {
     base_url: Option<String>,
     input: Option<Vec<String>>,
     output: Option<Vec<String>>,
+    input_limits: Option<Value>,
     context_window: Option<u32>,
     #[serde(default)]
     cost: Cost,
@@ -754,6 +757,14 @@ impl Entry {
         if let Some(window) = self.model.context_window {
             value["contextWindow"] = json!(window);
         }
+        if let Some(limits) = &self.model.input_limits {
+            value["inputLimits"] = limits.clone();
+        }
+        if self.model.compat.image_input.is_some()
+            || self.model.compat.send_image_opt_in_header.is_some()
+        {
+            value["compat"] = json!(self.model.compat);
+        }
         if self.api.kind() == Kind::Image {
             value["output"] = json!(
                 self.model
@@ -961,9 +972,15 @@ impl Tool for Operations {
                 Outcome::Failed(message)
             };
         }
-        let keys = match Keys::load_async().await {
-            Ok(keys) => keys,
-            Err(error) => return Outcome::Failed(error.to_string()),
+        // Unfiltered catalogue lookups do not consult credentials in Pi.
+        // Preserve discovery even when auth.json is unreadable or malformed.
+        let keys = if args["action"] == "list" && args["available"] != true {
+            Keys::default()
+        } else {
+            match Keys::load_async().await {
+                Ok(keys) => keys,
+                Err(error) => return Outcome::Failed(error.to_string()),
+            }
         };
         if args["action"] == "list" {
             let kind = serde_json::from_value::<Kind>(args["type"].clone()).unwrap_or(Kind::Chat);
@@ -1098,9 +1115,16 @@ impl Operations {
                     "id":id,
                     "name":metadata.as_ref().and_then(|metadata| metadata.name.as_deref()).unwrap_or(&id),
                     "api":adapter.api(),
-                    "input":if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] },
+                    "input":metadata.as_ref().and_then(|model| model.input_modalities())
+                        .unwrap_or_else(|| if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] }),
                 });
                 if let Some(metadata) = metadata {
+                    if let Some(reasoning) = metadata.reasoning {
+                        model["reasoning"] = json!(reasoning);
+                    }
+                    if let Some(max_tokens) = metadata.max_tokens {
+                        model["maxTokens"] = json!(max_tokens);
+                    }
                     metadata.apply_catalog_metadata(&mut model);
                 }
                 if let Some(window) = detail.context_window {
@@ -1207,6 +1231,66 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unfiltered_catalogue_does_not_read_auth_file() {
+        use clap::Parser;
+        const CHILD: &str = "PI_RS_CATALOG_AUTH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("auth.json"), "{").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::unfiltered_catalogue_does_not_read_auth_file",
+                ])
+                .env(CHILD, "1")
+                .env("PI_RS_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{}})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = || ToolContext {
+            operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            cancellation: Default::default(),
+        };
+        let args =
+            json!({"action":"list","type":"classifier","provider":"typesafe","available":false});
+        let Outcome::Structured { data, .. } = operation.invoke(args, context()).await else {
+            panic!("unfiltered discovery should succeed")
+        };
+        assert!(
+            data.as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == "jev-latest")
+        );
+        let chat = json!({"action":"list","type":"chat","provider":"openai","available":false});
+        let Outcome::Structured { data, .. } = operation.invoke(chat, context()).await else {
+            panic!("unfiltered chat discovery should succeed")
+        };
+        assert!(!data.as_array().unwrap().is_empty());
+        let args =
+            json!({"action":"list","type":"classifier","provider":"typesafe","available":true});
+        assert!(matches!(
+            operation.invoke(args, context()).await,
+            Outcome::Failed(_)
+        ));
+    }
 
     #[test]
     fn opencode_classifier_catalogue_uses_endpoint_bound_credentials() {
@@ -1869,6 +1953,53 @@ mod tests {
             panic!("chat model accepted")
         };
         assert!(wrong_type.contains("is a chat model, not an image model"));
+    }
+
+    #[test]
+    fn chat_catalogue_preserves_declared_capabilities() {
+        use clap::Parser;
+        let config = json!({"providers":{"relay":{"baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "models":[
+            {"id":"fixture", "name":"Fixture", "reasoning":true, "input":["image"], "contextWindow":4096, "maxTokens":1024, "thinkingLevelMap":{"low":"lite","high":"deep","xhigh":null}},
+            {"id":"plain", "reasoning":false, "input":["text"], "contextWindow":2048, "maxTokens":512}
+        ]}}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let fixture = operation
+            .chat_models(Some("relay"), Some("fixture"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(fixture["input"], json!(["image"]));
+        assert_eq!(fixture["reasoning"], true);
+        assert_eq!(fixture["maxTokens"], 1024);
+        assert_eq!(fixture["contextWindow"], 4096);
+        assert_eq!(
+            fixture["thinkingLevelMap"],
+            json!({"low":"lite","high":"deep","xhigh":null})
+        );
+        let plain = operation
+            .chat_models(Some("relay"), Some("plain"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(plain["input"], json!(["text"]));
+        assert_eq!(plain["reasoning"], false);
+        assert_eq!(plain["maxTokens"], 512);
+        let built_in = operation
+            .chat_models(Some("openai"), Some("chat-latest"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(built_in["input"], json!(["text", "image"]));
+        assert_eq!(built_in["reasoning"], true);
+        assert_eq!(built_in["maxTokens"], 128000);
+        let mapped = operation
+            .chat_models(Some("openai"), Some("gpt-5"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(mapped["thinkingLevelMap"]["high"], "high");
+        assert!(mapped["thinkingLevelMap"]["xhigh"].is_null());
     }
 
     #[tokio::test]
@@ -2644,6 +2775,61 @@ mod tests {
         let (body, opt_in) = classifier_payload(entry, &without_image).unwrap();
         assert_eq!(body["input"]["state"], json!({"text":"test"}));
         assert!(!opt_in);
+    }
+
+    #[test]
+    fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
+        let catalog = Catalogue::parse(&Map::new()).unwrap();
+        let images: Vec<_> = catalog
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "openrouter" && entry.api.kind() == Kind::Image)
+            .collect();
+        assert_eq!(
+            images
+                .iter()
+                .filter(|entry| entry.descriptor().get("inputLimits").is_some())
+                .count(),
+            63
+        );
+        let flux = images
+            .iter()
+            .find(|entry| entry.model.id == "black-forest-labs/flux-3-image")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            flux["inputLimits"]["images"]["resize"],
+            json!({"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80})
+        );
+        assert!(flux.get("headers").is_none());
+        assert!(flux.get("baseUrl").is_none());
+        let recraft = images
+            .iter()
+            .find(|entry| entry.model.id == "recraft/recraft-v4.1-flash")
+            .unwrap()
+            .descriptor();
+        assert!(recraft.get("inputLimits").is_none());
+        let classifier = catalog
+            .0
+            .iter()
+            .find(|entry| entry.provider == "openrouter" && entry.model.id == "~liquid/d1-latest")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            classifier["compat"],
+            json!({"imageInput":"state-image-urls","sendImageOptInHeader":false})
+        );
+        let configured = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"type":"image","id":"custom","api":"openrouter-images","headers":{"x-secret":"hidden"},"inputLimits":{"images":{"maxPerRequest":2}}}]}});
+        let custom = Catalogue::parse(configured.as_object().unwrap()).unwrap();
+        let value = custom
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap()
+            .descriptor();
+        assert_eq!(value["inputLimits"]["images"]["maxPerRequest"], 2);
+        assert!(value.get("headers").is_none());
+        assert!(value.get("baseUrl").is_none());
     }
 
     #[test]

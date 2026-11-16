@@ -58,10 +58,70 @@ fn display_only(record: &Record, compaction: Option<&Record>) -> bool {
     }
 }
 
+// Markers are written only for cancelled turn requests, never summaries.
+// Older journals without a marker keep their previous projection.
+fn aborted_partial_records(branch: &[&Record], compaction: Option<&Record>) -> HashSet<u64> {
+    let retain_from = compaction.and_then(|entry| match entry.event {
+        Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(entry.id)),
+        _ => None,
+    });
+    let assistants: HashSet<Uuid> = branch
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::Assistant {
+                request_id: Some(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    branch
+        .windows(2)
+        .filter_map(|pair| {
+            let Event::SourceEntry { format, entry } = &pair[0].event else {
+                return None;
+            };
+            let Event::ModelFinished {
+                request_id,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial,
+                ..
+            } = &pair[1].event
+            else {
+                return None;
+            };
+            (format == "pi-rs:aborted-turn-partial"
+                && entry["requestId"].as_str() == Some(request_id.to_string().as_str())
+                && !partial.is_empty()
+                && !assistants.contains(request_id)
+                && retain_from.is_none_or(|retain| pair[1].id >= retain))
+            .then_some(pair[1].id)
+        })
+        .collect()
+}
+
 pub(super) fn count(session: &Session) -> usize {
     let branch = session.branch();
     let compaction = latest_compaction(&branch);
+    let aborted = aborted_partial_records(&branch, compaction);
+    let deleted: HashSet<u64> = branch
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ContextEdited {
+                target,
+                replacement,
+            } if aborted.contains(target) => Some((*target, replacement.is_none())),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut latest, (target, deleted)| {
+            latest.insert(target, deleted);
+            latest
+        })
+        .into_iter()
+        .filter_map(|(target, deleted)| deleted.then_some(target))
+        .collect();
     session.current_message_entries().len()
+        + aborted.difference(&deleted).count()
         + branch
             .iter()
             .filter(|record| display_only(record, compaction))
@@ -102,7 +162,9 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let mut imported_entries = HashMap::new();
     let mut import = None;
     let mut edited = HashSet::new();
+    let mut partial_edits = HashMap::new();
     let compaction = latest_compaction(&branch);
+    let aborted = aborted_partial_records(&branch, compaction);
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
@@ -114,15 +176,35 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
             import = None;
         }
-        if let Event::ContextEdited { target, .. } = &record.event {
+        if let Event::ContextEdited {
+            target,
+            replacement,
+        } = &record.event
+        {
             edited.insert(*target);
+            partial_edits.insert(*target, replacement);
         }
     }
     let mut extra_messages = branch
         .into_iter()
-        .filter(|record| display_only(record, compaction))
+        .filter(|record| display_only(record, compaction) || aborted.contains(&record.id))
         .filter_map(|record| {
             let value = match &record.event {
+                Event::ModelFinished { .. } if aborted.contains(&record.id) => {
+                    let mut value = projection.aborted_partial(session.records(), record)?;
+                    if let Some(replacement) = partial_edits.get(&record.id) {
+                        match replacement {
+                            None => return None,
+                            Some(pi_rs::ContextContent::Text(text)) => {
+                                value["content"] = json!([{"type":"text", "text":text}])
+                            }
+                            Some(pi_rs::ContextContent::Blocks(blocks)) => {
+                                value["content"] = json!(blocks)
+                            }
+                        }
+                    }
+                    value
+                }
                 Event::SystemCheckpoint {
                     content,
                     sections,
@@ -394,6 +476,35 @@ impl Projection {
             return None;
         };
         invocations.get(*index)
+    }
+
+    pub(super) fn aborted_partial(&self, records: &[Record], record: &Record) -> Option<Value> {
+        if !pi_rs::is_aborted_turn_partial(records, record) {
+            return None;
+        }
+        let Event::ModelFinished {
+            request_id,
+            partial,
+            ..
+        } = &record.event
+        else {
+            return None;
+        };
+        let mut assistant_record = record.clone();
+        assistant_record.event = Event::Assistant {
+            content: partial.clone(),
+            invocations: Vec::new(),
+            usage: None,
+            request_id: Some(*request_id),
+        };
+        let message = Message::Assistant {
+            content: partial.clone(),
+            calls: Vec::new(),
+            replay: None,
+        };
+        let mut value = self.message(records, &assistant_record, &message, false);
+        value["stopReason"] = json!("aborted");
+        Some(value)
     }
 
     pub(super) fn raw_message(&self, records: &[Record], record: &Record) -> Option<Value> {
@@ -732,7 +843,9 @@ fn imported_message(
     };
     if edited {
         message["content"] = projected["content"].clone();
-        if message["role"] == "assistant" {
+        if message["role"] == "assistant"
+            && !matches!(message["stopReason"].as_str(), Some("aborted" | "error"))
+        {
             message["stopReason"] = projected["stopReason"].clone();
         }
     }
@@ -793,6 +906,129 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cancelled_turn_partial_is_display_only_and_not_duplicated() {
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let mut records = initial.records().to_vec();
+        let mut append = |event| {
+            let parent = records.last().unwrap();
+            records.push(Record {
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                version: parent.version,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        };
+        append(Event::ModelRequested {
+            model: "fixture".into(),
+            messages: 1,
+            tools: 0,
+            max_output_tokens: 64,
+            request_id: Some(request_id),
+            context_head: None,
+            context_sha256: None,
+            context_transformed: None,
+            context_configuration_sha256: None,
+        });
+        append(Event::SourceEntry {
+            format: "pi-rs:aborted-turn-partial".into(),
+            entry: json!({"requestId":request_id}),
+        });
+        append(Event::ModelFinished {
+            request_id,
+            metadata: ModelMetadata::default(),
+            usage: UsageReport::Unconfirmed,
+            failure: Some(pi_rs::ModelFailure::Cancelled),
+            partial: "partial answer".into(),
+            reply: None,
+        });
+        let session = Session::from_records(records.clone()).unwrap();
+        let (visible, native) = snapshot(&session);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(count(&session), visible.len());
+        assert_eq!(
+            visible[1]["content"],
+            json!([{"type":"text","text":"partial answer"}])
+        );
+        assert_eq!(visible[1]["stopReason"], "aborted");
+        assert_eq!(native.len(), 1);
+        let mut reopened = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(snapshot(&reopened).0, visible);
+        let target = reopened.head();
+        reopened
+            .edit_context(target, Some(pi_rs::ContextContent::Text("changed".into())))
+            .unwrap();
+        assert_eq!(snapshot(&reopened).0[1]["content"][0]["text"], "changed");
+        assert_eq!(reopened.current_messages().len(), 1);
+        let mut reopened = Session::from_records(reopened.records().to_vec()).unwrap();
+        assert_eq!(snapshot(&reopened).0[1]["content"][0]["text"], "changed");
+        reopened.edit_context(target, None).unwrap();
+        assert_eq!(snapshot(&reopened).0.len(), 1);
+        assert_eq!(count(&reopened), 1);
+        let reopened = Session::from_records(reopened.records().to_vec()).unwrap();
+        assert_eq!(snapshot(&reopened).0.len(), 1);
+        let parent = records.last().unwrap();
+        records.push(Record {
+            id: parent.id + 1,
+            parent: Some(parent.id),
+            version: parent.version,
+            timestamp: None,
+            run_id: None,
+            event: Event::Assistant {
+                content: "partial answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let (visible, _) = snapshot(&session);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(count(&session), visible.len());
+    }
+
+    #[test]
+    fn unmarked_cancelled_summary_is_not_visible() {
+        let mut initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        initial
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let mut records = initial.records().to_vec();
+        let parent = records.last().unwrap();
+        records.push(Record {
+            id: parent.id + 1,
+            parent: Some(parent.id),
+            version: parent.version,
+            timestamp: None,
+            run_id: None,
+            event: Event::ModelFinished {
+                request_id: Uuid::new_v4(),
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(pi_rs::ModelFailure::Cancelled),
+                partial: "private summary".into(),
+                reply: None,
+            },
+        });
+        let mut session = Session::from_records(records).unwrap();
+        let (visible, _) = snapshot(&session);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(count(&session), 1);
+        let target = session.head();
+        assert!(session.edit_context(target, None).is_err());
+        assert!(
+            session
+                .edit_context(target, Some(pi_rs::ContextContent::Text("exposed".into())))
+                .is_err()
+        );
+    }
 
     #[test]
     fn reconstructed_native_tool_message_preserves_multimodal_order() {

@@ -6001,6 +6001,58 @@ else:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn executable_scoped_sdk_start_reads_and_appends_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        struct UnusedModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for UnusedModel {
+            async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                Err(pi_rs_core::Error::Config("unexpected model request".into()))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request=json.load(sys.stdin)
+    result={'id':'startup-hook','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    if frame['request']['event']['type']=='session_start':
+        assert frame['has_custom_entries'] and frame['has_custom_entry_read']
+        print(json.dumps({'type':'list_custom_entries','custom_type':'startup'}),flush=True)
+        assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'before':True}
+        print(json.dumps({'type':'append_entry','entry':{'customType':'startup','data':{'after':True}}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(UnusedModel), "fixture")
+            .extension(Arc::new(extension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::json!({"before":true})),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "startup" && entry.data == Some(serde_json::json!({"after":true}))
+        )));
+        session.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn executable_input_request_and_tool_hooks_use_message_channel() {
         use std::os::unix::fs::PermissionsExt;
         struct Host(std::sync::atomic::AtomicUsize);

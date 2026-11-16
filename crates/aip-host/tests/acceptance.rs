@@ -865,3 +865,135 @@ async fn prepared_model_keeps_aip_budget_and_usage_settlement() {
         assert_eq!(platform.usage.lock().unwrap().len(), usize::from(!large));
     }
 }
+
+#[tokio::test]
+async fn hosted_review_excludes_failed_assistant_original_and_replacement() {
+    struct CaptureReview(Mutex<Vec<ModelRequest>>);
+    #[async_trait::async_trait]
+    impl Model for CaptureReview {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("review done".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    }),
+                }),
+            ])))
+        }
+    }
+    for edit in [false, true] {
+        let platform = Arc::new(Platform::default());
+        let parent_scope = RunScope {
+            parent_run: None,
+            ..scope()
+        };
+        let child_scope = RunScope {
+            journal_run_id: Uuid::new_v4(),
+            aip_run: "safe-review".into(),
+            parent_run: Some(parent_scope.aip_run.clone()),
+            audit_id: "review-audit".into(),
+            ..parent_scope.clone()
+        };
+        let parent_profile = HostRegistry::discover(
+            &parent_scope,
+            platform.clone(),
+            BTreeSet::new(),
+            vec![Arc::new(pi_rs_review::ReviewContext)],
+        )
+        .await
+        .unwrap();
+        let child_profile =
+            HostRegistry::discover(&child_scope, platform.clone(), BTreeSet::new(), vec![])
+                .await
+                .unwrap();
+        let parent_model = ModelFixture(Mutex::new(VecDeque::new()));
+        let child_model = CaptureReview(Mutex::new(Vec::new()));
+        let parent_turn = HostTurn {
+            scope: &parent_scope,
+            budget: platform.as_ref(),
+            model: &parent_model,
+            model_name: "fixture",
+            registry: &parent_profile,
+            system_prompt: "parent",
+            limits: Limits::default(),
+        };
+        let child_turn = HostTurn {
+            scope: &child_scope,
+            budget: platform.as_ref(),
+            model: &child_model,
+            model_name: "fixture",
+            registry: &child_profile,
+            system_prompt: "review",
+            limits: Limits::default(),
+        };
+        let mut initial = Session::with_store(MemoryStore::default()).unwrap();
+        parent_scope.bind(&mut initial).unwrap();
+        initial
+            .append_user_with_images("retained question".into(), vec![], None)
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let mut records = initial.records().to_vec();
+        for event in [
+            Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                content: "partial sentinel".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            },
+        ] {
+            let parent = records.last().unwrap();
+            records.push(Record {
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                version: parent.version,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        }
+        let mut parent = Session::from_records(records).unwrap();
+        if edit {
+            let target = parent.head();
+            parent
+                .edit_context(target, Some(ContextContent::Text("edited sentinel".into())))
+                .unwrap();
+        }
+        let from_record = parent.head();
+        let mut child = Session::with_store(MemoryStore::default()).unwrap();
+        let review = ManagedReview {
+            parent: &parent_turn,
+            child: &child_turn,
+            from_record,
+            task: "review",
+            resume: false,
+        };
+        assert_eq!(
+            review
+                .run(
+                    &mut parent,
+                    &mut child,
+                    &CancellationToken::new(),
+                    &mut ignore
+                )
+                .await
+                .unwrap(),
+            "review done"
+        );
+        let request = serde_json::to_string(&child_model.0.lock().unwrap()[0]).unwrap();
+        assert!(request.contains("retained question"));
+        assert!(!request.contains("partial sentinel"));
+        assert!(!request.contains("edited sentinel"));
+    }
+}

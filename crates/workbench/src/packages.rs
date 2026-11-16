@@ -13,6 +13,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{Cli, config, output};
 
+#[path = "package_diagnostic.rs"]
+mod package_diagnostic;
+
 #[derive(Clone, Subcommand)]
 pub enum PackageCommand {
     Install {
@@ -151,22 +154,14 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
         }
         PackageCommand::List => {
             let index = index()?;
-            let mut configured = declarations(args)?;
-            // Pi lists user packages before project packages, while resource
-            // resolution gives project packages precedence.
-            configured.sort_by_key(|entry| match entry.scope_order {
-                1 => 0,
-                0 => 1,
-                _ => 2,
-            });
-            for declaration in configured {
+            for (declaration, filtered) in configured_packages(args)? {
                 let installed = index
                     .get(&key(&declaration.source))
                     .cloned()
                     .map(serde_json::from_value::<Installed>)
                     .transpose()?;
                 output(
-                    json!({"type":"package","source":display_source(&declaration.source),"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
+                    json!({"type":"package","source":display_source(&declaration.source),"scope":if declaration.scope_order == 1 { "user" } else { "project" },"filtered":filtered,"installed":installed.is_some(),"version":installed.as_ref().and_then(|package| package.version.as_ref()),"root":installed.map(|package| package.root)}),
                 );
             }
         }
@@ -280,6 +275,8 @@ fn resolve_package_resources(
         // Single-file native sources retain their existing handling; Pi loads
         // such files directly and does not apply directory package filters.
         let legacy = local && Path::new(&declaration.source).is_file();
+        let pi_package =
+            !legacy && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
         let identity = source_identity(&declaration.source);
         for (name, paths, target) in [
             ("extensions", &package.resources.extensions, &mut extensions),
@@ -287,10 +284,51 @@ fn resolve_package_resources(
             ("prompts", &package.resources.prompts, &mut prompts),
             ("themes", &package.resources.themes, &mut themes),
         ] {
+            if startup && name != "themes" && paths.is_empty() && !pi_package {
+                continue;
+            }
+            let requested = declaration.value.get(name).and_then(Value::as_array);
+            let autoload = declaration.value["autoload"] != false;
+            let diagnostic = if pi_package
+                && name != "themes"
+                && (autoload || requested.is_some_and(|patterns| !patterns.is_empty()))
+            {
+                let kind = match name {
+                    "extensions" => package_diagnostic::Kind::Extension,
+                    "skills" => package_diagnostic::Kind::Skill,
+                    "prompts" => package_diagnostic::Kind::Prompt,
+                    _ => unreachable!(),
+                };
+                match package_diagnostic::candidates(&package.root, kind) {
+                    Ok(candidates) => candidates,
+                    Err(_) if local => break,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            if name != "themes"
+                && paths.is_empty()
+                && (diagnostic.as_ref().is_some_and(Vec::is_empty)
+                    || (startup && diagnostic.is_none()))
+            {
+                continue;
+            }
+            let filter = match ResourceFilter::new(&declaration.value, name) {
+                Ok(filter) => filter,
+                Err(_) if local && pi_package => break,
+                Err(error) => return Err(error),
+            };
+            if let Some(candidates) = diagnostic {
+                match filter.states(&candidates, &package.root, false) {
+                    Ok(_) => {}
+                    Err(_) if local => break,
+                    Err(error) => return Err(error),
+                }
+            }
             if startup && name != "themes" && paths.is_empty() {
                 continue;
             }
-            let filter = ResourceFilter::new(&declaration.value, name)?;
             let states = match filter.states(paths, &package.root, legacy) {
                 Ok(states) => states,
                 Err(_) if local => break,
@@ -946,15 +984,19 @@ fn filter_home_dir() -> Option<PathBuf> {
 }
 
 fn normalize_filter_home(home: &Path, suffix: &str) -> PathBuf {
-    use std::path::Component;
     // Node's path.join does not let a later absolute component replace home.
     let joined = if home.as_os_str().is_empty() {
         suffix.to_owned()
     } else {
         format!("{}/{suffix}", home.to_string_lossy())
     };
+    normalize_filter_path(Path::new(&joined))
+}
+
+fn normalize_filter_path(path: &Path) -> PathBuf {
+    use std::path::Component;
     let mut result = PathBuf::new();
-    for component in Path::new(&joined).components() {
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -1126,6 +1168,45 @@ fn update_sources_with_settings(
     }
     Ok(sources)
 }
+fn configured_packages(args: &Cli) -> Result<Vec<(Declaration, bool)>> {
+    let mut files = vec![(
+        config::agent_dir().join("settings.json"),
+        config::agent_dir(),
+        1,
+    )];
+    if args.trusted {
+        files.push((
+            args.workspace.join(".pi/settings.json"),
+            args.workspace.join(".pi"),
+            0,
+        ));
+    }
+    let mut result = Vec::new();
+    for (file, base, scope_order) in files {
+        let document = config::read_object(&file)?;
+        if let Some(packages) = document.get("packages") {
+            for value in packages
+                .as_array()
+                .ok_or_else(|| Error::Config("packages must be an array".into()))?
+            {
+                let source = source_field(value)
+                    .ok_or_else(|| Error::Config("package needs a source".into()))?;
+                result.push((
+                    Declaration {
+                        source: normalize(source, &base)?,
+                        value: value.clone(),
+                        inherited: None,
+                        transient: false,
+                        scope_order,
+                    },
+                    value.is_object(),
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
     let mut global = BTreeMap::new();
@@ -2537,6 +2618,109 @@ mod tests {
         assert_eq!(resources.themes.len(), 1);
         assert!(resources.themes[0].starts_with(&sources[1]));
         assert_eq!(startup_themes(&args, false).unwrap(), themes);
+        // Pi-only prompts affect diagnostics without becoming native resources.
+        std::fs::write(
+            directory.join("first/package.json"),
+            json!({"pi":{
+                "prompts":["./prompts/*.md"], "themes":["themes"]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.prompts.len(), 1);
+        assert_eq!(resources.themes.len(), 1);
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::remove_file(agent.join("packages/index.json")).unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(index.clone()).to_string(),
+        )
+        .unwrap();
+        // Empty Pi candidates do not evaluate an unrelated invalid settings glob.
+        std::fs::remove_file(directory.join("first/prompts/demo.md")).unwrap();
+        std::fs::write(
+            directory.join("first/package.json"),
+            json!({"pi":{"prompts":[],"themes":["themes"]}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[
+                {"source":sources[0],"prompts":["["]}, {"source":sources[1]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 2);
+        let empty_remote = "git:https://example.com/empty/pkg#rev";
+        let mut empty_index = index.clone();
+        let mut empty_package: Installed =
+            serde_json::from_value(empty_index[&key(&sources[0])].clone()).unwrap();
+        empty_package.source = empty_remote.into();
+        empty_index.insert(
+            key(empty_remote),
+            serde_json::to_value(empty_package).unwrap(),
+        );
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(empty_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":empty_remote,"prompts":["["]}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
+        std::fs::write(directory.join("first/prompts/demo.md"), "prompt").unwrap();
+        // Manifest overrides are evaluated before settings filters. Remote
+        // errors propagate, while local package errors stop only that package.
+        std::fs::write(
+            directory.join("first/package.json"),
+            json!({"pi":{
+                "prompts":["prompts/demo.md","!**","+file:///bad%2Fpath"], "themes":["themes"]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let remote = "git:https://example.com/diagnostic/pkg#rev";
+        let mut remote_index = index.clone();
+        let mut remote_package: Installed =
+            serde_json::from_value(remote_index[&key(&sources[0])].clone()).unwrap();
+        remote_package.source = remote.into();
+        remote_index.insert(key(remote), serde_json::to_value(remote_package).unwrap());
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(remote_index).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":remote,"prompts":["["]}]}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            resources_for(&args, false)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("encoded")
+        );
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"packages":[{"source":sources[0],"prompts":["["]}, {"source":sources[1]}]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(index.clone()).to_string(),
+        )
+        .unwrap();
         std::fs::remove_file(directory.join("first/package.json")).unwrap();
         // An error while evaluating themes preserves earlier prompt resources.
         let settings = json!({"packages": [
