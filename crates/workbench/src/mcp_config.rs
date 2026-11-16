@@ -1693,6 +1693,56 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn cancelled_snapshot_does_not_run_after_gate_is_released() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The current gate waits directly in this future. If it ever starts a
+        // detached worker, the test must also wait for that worker to exit.
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().join("gate.lock");
+        let held = mcp_write_guard_at(&gate, None, None).await.unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let task_gate = gate.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_notification = NotifyDrop(Some(dropped_tx));
+            started_tx.send(()).unwrap();
+            with_config_gate(mcp_write_guard_at(&task_gate, None, None), || {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        dropped_rx
+            .await
+            .expect("cancelled gate future was not dropped");
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mcp_write_guard_at(&gate, None, None),
+        )
+        .await
+        .expect("cancelled waiter retained the gate")
+        .unwrap();
+        drop(next);
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn login_finish_refuses_authentication_or_scope_changes() {
         for change in ["url", "oauth", "authorization", "definition"] {
