@@ -3115,10 +3115,12 @@ impl PreparedConversationSave {
 /// Collect newly settled submissions from the complete candidate batch.
 /// The caller must assemble deliveries against the same task and signal
 /// candidates before committing, so a notification cannot overwrite them.
+type SettlementNotification = (SubmissionNotify, serde_json::Value, (Uuid, Uuid));
+
 pub(crate) fn submission_settlements(
     store: &durable_store::Store,
     mutations: &[Mutation],
-) -> Result<Vec<(SubmissionNotify, serde_json::Value, (Uuid, Uuid))>, Error> {
+) -> Result<Vec<SettlementNotification>, Error> {
     let mut settling = Vec::new();
     for mutation in mutations {
         let Mutation::Put { key, value } = mutation else {
@@ -3869,15 +3871,17 @@ impl Harness {
     pub(crate) fn validate_task_input_context(
         &self,
         id: Uuid,
-        version: u64,
+        snapshot: &[u8],
     ) -> Result<(), crate::document::Error> {
         use crate::document::Error as DError;
-        let (state, current) = self
-            .load(id)
-            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
-        if current != version {
-            return Err(durable_store::Error::Conflict { key: Self::key(id) }.into());
+        let mut state: Conversation = serde_json::from_slice(snapshot)?;
+        if state.id != id {
+            return Err(DError::InvalidSessionAdmission(
+                "conversation identity mismatch".into(),
+            ));
         }
+        self.hydrate(&mut state)
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
         if !self.supports_context_blocks(&state) {
             return Err(DError::InvalidSessionAdmission(
                 "unsupported context blocks".into(),

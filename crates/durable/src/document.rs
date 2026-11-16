@@ -2298,6 +2298,25 @@ impl<'a> TaskDocuments<'a> {
     /// The request ID is required for recovery; the result is provisional until
     /// the task transition commits. At most one admission is allowed per step.
     pub fn submit_input(&mut self, request_id: String, content: String) -> Result<(), Error> {
+        self.submit_input_inner(request_id, content, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_input_with_snapshot_hook(
+        &mut self,
+        request_id: String,
+        content: String,
+        hook: impl FnOnce(),
+    ) -> Result<(), Error> {
+        self.submit_input_inner(request_id, content, hook)
+    }
+
+    fn submit_input_inner(
+        &mut self,
+        request_id: String,
+        content: String,
+        after_snapshot: impl FnOnce(),
+    ) -> Result<(), Error> {
         if self.task_input.is_some()
             || !self.keyed_children.is_empty()
             || self.entries.as_ref().is_some_and(|entry| entry.4)
@@ -2318,12 +2337,13 @@ impl<'a> TaskDocuments<'a> {
             .store
             .get(&key)?
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
+        after_snapshot();
         crate::runtime::validate_task_input(self.store, &record.value, &request_id, &content)?;
         self.input_validator
             .ok_or_else(|| {
                 Error::InvalidSessionAdmission("task input requires an attached harness".into())
             })?
-            .validate_task_input_context(*conversation, record.version)?;
+            .validate_task_input_context(*conversation, &record.value)?;
         self.task_input = Some(TaskInputIntent {
             conversation: *conversation,
             version: record.version,
