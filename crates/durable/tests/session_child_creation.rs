@@ -513,6 +513,13 @@ fn task_owned_conversation_is_explicitly_rejected() {
     };
     let prepared = EdgeStore::new(&store).prepare_create(&edge).unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    // A successful terminal owner remains a valid anchor for later work.
+    // An unresolved missing definition is intentionally fenced at recovery.
+    let tasks = TaskStore::new(&store);
+    let snapshot = tasks.load(owner.id()).unwrap().unwrap();
+    tasks.update(&snapshot, |task| task.start()).unwrap();
+    let snapshot = tasks.load(owner.id()).unwrap().unwrap();
+    tasks.update(&snapshot, |task| task.succeed(json!(null))).unwrap();
     let (driver, started, release) = driver(&h);
     let parent = task(TaskOwner::Conversation(c), "parent", 0);
     driver.submit(&parent).unwrap();
