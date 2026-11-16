@@ -2512,7 +2512,7 @@ fn atomic_failure_preserves_abort_policy_and_publishes_task_notification() {
 
 #[test]
 fn task_input_on_reset_fork_fences_original_proof() {
-    for duplicate in [false, true] {
+    for (continuation, duplicate) in [(false, false), (false, true), (true, false), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let (mut h, id, _, steps) = setup_with_adapter(&path, true);
@@ -2533,8 +2533,13 @@ fn task_input_on_reset_fork_fences_original_proof() {
         h.save(&failure, Expected::Version(version)).unwrap();
         let fork = h.fork_by_entry_id(id, occurrence).unwrap();
         if duplicate {
-            h.submit(fork, Some("task-request".into()), "input".into())
-                .unwrap();
+            if continuation {
+                h.submit_continue(fork, Some("task-request".into()))
+                    .unwrap();
+            } else {
+                h.submit(fork, Some("task-request".into()), "input".into())
+                    .unwrap();
+            }
         }
         let record = h.owner.store().get(&Harness::key(fork)).unwrap().unwrap();
         let intent = crate::document::TaskInputIntent {
@@ -2544,9 +2549,13 @@ fn task_input_on_reset_fork_fences_original_proof() {
             snapshot: record.value,
             admissions: vec![crate::document::TaskAdmission {
                 request_id: "task-request".into(),
-                draft: crate::document::TaskSubmissionDraft::Input {
-                    content: "input".into(),
-                    options: Default::default(),
+                draft: if continuation {
+                    crate::document::TaskSubmissionDraft::Continue
+                } else {
+                    crate::document::TaskSubmissionDraft::Input {
+                        content: "input".into(),
+                        options: Default::default(),
+                    }
                 },
                 notify: None,
                 notification_binding: None,

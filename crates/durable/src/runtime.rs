@@ -4105,6 +4105,9 @@ fn admit_task_draft(
     notify: &Option<SubmissionNotify>,
 ) -> Result<Uuid, crate::document::Error> {
     match draft {
+        crate::document::TaskSubmissionDraft::Continue => {
+            tx.submit_continue(Some(request_id.to_owned()), notify.clone())
+        }
         crate::document::TaskSubmissionDraft::Input { content, options } => tx.submit_input(
             Some(request_id.to_owned()),
             content.clone(),

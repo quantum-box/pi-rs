@@ -2046,6 +2046,7 @@ pub(crate) struct TaskAdmission {
 
 #[derive(Clone)]
 pub(crate) enum TaskSubmissionDraft {
+    Continue,
     Input {
         content: String,
         options: crate::state::AdmissionOptions,
@@ -2413,6 +2414,16 @@ impl<'a> TaskDocuments<'a> {
         )
     }
 
+    /// Stage a continuation of the owning conversation in this task step.
+    /// A duplicate request retains its original submission and notification.
+    pub fn submit_continue(
+        &mut self,
+        request_id: String,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_submission(request_id, TaskSubmissionDraft::Continue, notify, || {})
+    }
+
     /// Stage a display-only write, including its optional settlement notification.
     pub fn submit_write(
         &mut self,
@@ -2499,10 +2510,12 @@ impl<'a> TaskDocuments<'a> {
             let result =
                 crate::runtime::validate_task_submissions(self.store, &snapshot, &mut admissions);
             result.map_err(|error| self.remember_task_input_error(error))?;
-            if admissions
-                .iter()
-                .any(|item| matches!(item.draft, TaskSubmissionDraft::Input { .. }))
-            {
+            if admissions.iter().any(|item| {
+                matches!(
+                    item.draft,
+                    TaskSubmissionDraft::Input { .. } | TaskSubmissionDraft::Continue
+                )
+            }) {
                 let validation = self
                     .input_validator
                     .ok_or_else(|| {
@@ -2571,7 +2584,10 @@ impl<'a> TaskDocuments<'a> {
                 notification_binding: None,
             }];
             crate::runtime::validate_task_submissions(self.store, &record.value, &mut admissions)?;
-            if matches!(admissions[0].draft, TaskSubmissionDraft::Input { .. }) {
+            if matches!(
+                admissions[0].draft,
+                TaskSubmissionDraft::Input { .. } | TaskSubmissionDraft::Continue
+            ) {
                 self.input_validator
                     .ok_or_else(|| {
                         Error::InvalidSessionAdmission(

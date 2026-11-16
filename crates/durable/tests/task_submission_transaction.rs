@@ -157,6 +157,427 @@ fn setup(path: &std::path::Path) -> (Harness, Uuid) {
     (h, id)
 }
 
+struct ContinueBatch {
+    fail: bool,
+    notify: bool,
+}
+impl Handler for ContinueBatch {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        docs.submit_write("before".into(), "app.before".into(), None, None)
+            .map_err(|e| e.to_string())?;
+        let notify = self.notify.then(|| SubmissionNotify {
+            task_id: task.id(),
+            key: "continue".into(),
+        });
+        docs.submit_continue("continue".into(), notify)
+            .map_err(|e| e.to_string())?;
+        docs.submit_continue("continue".into(), None)
+            .map_err(|e| e.to_string())?;
+        assert!(docs.submit_continue("other-continue".into(), None).is_err());
+        assert!(
+            docs.submit_input("continue".into(), "wrong type".into())
+                .is_err()
+        );
+        docs.submit_input("after".into(), "after continue".into())
+            .map_err(|e| e.to_string())?;
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"continue":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.fail {
+            return Ok(Step::Fail("rollback".into()));
+        }
+        if !self.notify {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("continue").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn task_continue_batch_deduplicates_orders_and_notifies_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let parent = task(id, "hold");
+    let child = descendant(parent.id(), "continue");
+    let mut registry = Registry::default();
+    registry.register(
+        "hold",
+        true,
+        Hold(std::collections::HashMap::from([(
+            parent.id(),
+            vec![child.clone()],
+        )])),
+    );
+    registry.register(
+        "continue",
+        true,
+        ContinueBatch {
+            fail: false,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&parent).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Waiting(_)));
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.submissions[0].request_id.as_deref(), Some("continue"));
+    assert_eq!(state.submissions[0].status, Status::Running);
+    assert_eq!(state.submissions[1].request_id.as_deref(), Some("after"));
+    assert_eq!(state.submissions[1].status, Status::Queued);
+    assert_eq!(state.application_writes.len(), 1);
+    let store = Store::open(&path).unwrap();
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), "continue")
+            .unwrap()
+            .is_none()
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("hold", true, Hold(std::collections::HashMap::new()));
+    registry.register(
+        "continue",
+        true,
+        ContinueBatch {
+            fail: false,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    let receipt = TaskStore::new(&store)
+        .read_typed_signal(child.id(), &submission_settled_signal(), "continue")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt["id"], state.submissions[0].id.to_string());
+    assert_eq!(receipt["type"], "continue");
+    assert_eq!(receipt["status"], "unanswered");
+    assert_eq!(receipt["reason"], "nothing_to_answer");
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 2);
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn failed_task_rolls_back_continue_and_other_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register(
+        "continue",
+        true,
+        ContinueBatch {
+            fail: true,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "continue");
+    driver.submit(&task).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Failed(_)));
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    let store = Store::open(&path).unwrap();
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(task.id(), &submission_settled_signal(), "continue")
+            .unwrap()
+            .is_none()
+    );
+    driver.shutdown().unwrap();
+}
+
+struct BusyContinue;
+impl Handler for BusyContinue {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        assert!(matches!(
+            docs.submit_continue("busy".into(), None),
+            Err(pi_rs_durable::document::Error::SessionAdmission(
+                pi_rs_durable::state::AdmissionError::Busy
+            ))
+        ));
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+#[test]
+fn task_continue_rejects_busy_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id) = setup(&path);
+    h.submit(id, None, "busy".into()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("busy", true, BusyContinue);
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "busy");
+    driver.submit(&task).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 1);
+    driver.shutdown().unwrap();
+}
+
+struct RacingContinue {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    staged: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl Handler for RacingContinue {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        let result = ContinueBatch {
+            fail: false,
+            notify: false,
+        }
+        .run_with_documents(task, docs)?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.staged.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(result)
+    }
+}
+#[test]
+fn task_continue_conflict_replays_entire_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id) = setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry.register(
+        "race",
+        true,
+        RacingContinue {
+            calls: calls.clone(),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "race");
+    driver.submit(&task).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    h.submit_write(id, None, "app.concurrent".into(), None)
+        .unwrap();
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    release_tx.send(()).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.application_writes.len(), 2);
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn abort_discards_staged_task_continue_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register(
+        "race",
+        true,
+        RacingContinue {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "race");
+    driver.submit(&task).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    driver.request_abort(task.id()).unwrap();
+    release_tx.send(()).unwrap();
+    driver.shutdown().unwrap();
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+struct KillContinue;
+#[cfg(unix)]
+impl Handler for KillContinue {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use std::io::Write;
+        ContinueBatch {
+            fail: false,
+            notify: false,
+        }
+        .run_with_documents(task, docs)?;
+        println!("CONTINUE_STAGED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+#[cfg(unix)]
+#[test]
+fn continue_kill_worker() {
+    let Ok(path) = std::env::var("PI_TASK_CONTINUE_KILL_DB") else {
+        return;
+    };
+    let id =
+        Uuid::parse_str(&std::env::var("PI_TASK_CONTINUE_KILL_CONVERSATION").unwrap()).unwrap();
+    let h = Harness::open_paused(path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("continue", true, KillContinue);
+    let driver = h.start_tasks(registry).unwrap();
+    let task = Task::new(
+        Uuid::from_u128(8846),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("continue".into(), true);
+    driver.submit(&task).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn killed_staged_continue_replays_once_after_reopen() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    drop(h);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "continue_kill_worker", "--nocapture"])
+        .env("PI_TASK_CONTINUE_KILL_DB", &path)
+        .env("PI_TASK_CONTINUE_KILL_CONVERSATION", id.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if line.contains("CONTINUE_STAGED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    let reached = rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    reached.expect("worker did not stage continuation");
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    let mut registry = Registry::default();
+    registry.register(
+        "continue",
+        true,
+        ContinueBatch {
+            fail: false,
+            notify: false,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    wait_task(&path, Uuid::from_u128(8846), |s| {
+        matches!(s, TaskState::Succeeded(_))
+    });
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 2);
+    assert_eq!(state.submissions[0].request_id.as_deref(), Some("continue"));
+    assert_eq!(state.application_writes.len(), 1);
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_some()
+    );
+}
+
 struct Multiple {
     fail: bool,
     notify: bool,
