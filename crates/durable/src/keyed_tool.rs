@@ -211,11 +211,19 @@ impl KeyedHost {
             .suspend_pending_with_checkpoint(Some(checkpoint))
     }
 
+    /// Park a replay-safe keyed intermediate until at least one pending
+    /// descendant settles. Its wake contains the atomically frozen ended IDs.
+    /// A woken child with unfinished descendants must park again; no new
+    /// descendant can be admitted after wake. The root must forward the park.
+    pub fn suspend_pending_any_with_checkpoint(&self, checkpoint: Value) -> Result<(), String> {
+        self.nested.suspend_pending_any_with_checkpoint(checkpoint)
+    }
+
     /// Checkpoint and ended nested operation IDs from the preceding park.
-    /// This is an all-pending wake, not an upstream task `any` wake. When a
-    /// direct child forwards its park, the root sees the descendant operation
-    /// IDs; the child receives its own checkpoint when re-entered. All listed
-    /// descendants must settle before wake; early `any` wakes are unsupported.
+    /// A direct child forwards its park to the root, which sees the same ended
+    /// descendant operation IDs; the child receives its own checkpoint when
+    /// re-entered. A normal checkpoint park waits for all accepted jobs; an
+    /// intermediate's explicit any park freezes the jobs ended at wake.
     pub fn pending_wake(&self) -> Option<crate::nested::PendingWake> {
         self.nested.resumed_checkpoint()
     }

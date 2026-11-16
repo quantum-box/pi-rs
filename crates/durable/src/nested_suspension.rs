@@ -49,6 +49,8 @@ struct Record {
     suspension: Uuid,
     checkpoint: Value,
     jobs: Vec<PendingJob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_ended: Option<Vec<Uuid>>,
     abort_requested: bool,
     owner: Owner,
 }
@@ -81,6 +83,13 @@ fn validate(record: &Record) -> Result<(), Error> {
             job.operation_id.is_nil()
                 || job.operation_id == record.operation
                 || !ids.insert(job.operation_id)
+        })
+        || record.frozen_ended.as_ref().is_some_and(|ended| {
+            let mut seen = HashSet::new();
+            ended.is_empty()
+                || ended
+                    .iter()
+                    .any(|id| !seen.insert(*id) || !ids.contains(id))
         })
     {
         return Err(Error::Invalid);
@@ -124,6 +133,7 @@ pub(crate) fn prepare_create(
         suspension,
         checkpoint,
         jobs,
+        frozen_ended: None,
         abort_requested: false,
         owner: Owner::Active { executor },
     };
@@ -158,6 +168,7 @@ pub(crate) fn prepare_retired(
         suspension,
         checkpoint,
         jobs,
+        frozen_ended: None,
         abort_requested: false,
         owner: Owner::Retired { executor },
     };
@@ -180,7 +191,7 @@ impl Snapshot {
         if self.record.abort_requested {
             return Err(Error::Aborted);
         }
-        if !self.is_retired() {
+        if !self.is_retired() || self.record.frozen_ended.is_some() {
             return Err(Error::Stale);
         }
         Ok(self.check())
@@ -212,6 +223,34 @@ impl Snapshot {
     }
     pub(crate) fn jobs(&self) -> &[PendingJob] {
         &self.record.jobs
+    }
+    pub(crate) fn frozen_ended(&self) -> Option<&[Uuid]> {
+        self.record.frozen_ended.as_deref()
+    }
+    pub(crate) fn freeze(&self, ended: Vec<Uuid>) -> Result<crate::task_store::OwnedBatch, Error> {
+        self.retired_check()?;
+        let mut next = self.record.clone();
+        next.frozen_ended = Some(ended);
+        self.update(next)
+    }
+    pub(crate) fn repark(
+        &self,
+        executor: Uuid,
+        suspension: Uuid,
+        checkpoint: Value,
+        jobs: Vec<PendingJob>,
+    ) -> Result<crate::task_store::OwnedBatch, Error> {
+        self.claim_check(executor)?;
+        if self.record.frozen_ended.is_none() || suspension.is_nil() {
+            return Err(Error::Invalid);
+        }
+        let mut next = self.record.clone();
+        next.suspension = suspension;
+        next.checkpoint = checkpoint;
+        next.jobs = jobs;
+        next.frozen_ended = None;
+        next.owner = Owner::Retired { executor };
+        self.update(next)
     }
     pub(crate) fn checkpoint(&self) -> &Value {
         &self.record.checkpoint
@@ -374,6 +413,82 @@ mod tests {
     }
 
     #[test]
+    fn any_freeze_fences_leaf_changes_and_repark_fences_old_claim() {
+        let store = Store::memory().unwrap();
+        let (conversation, operation, old, jobs) = setup(&store);
+        let active = load(&store, conversation, operation).unwrap().unwrap();
+        commit(&store, active.retire(old).unwrap()).unwrap();
+        let retired = load(&store, conversation, operation).unwrap().unwrap();
+        let leaf = b"test/any-leaf".to_vec();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: leaf.clone(),
+                    value: vec![1],
+                }],
+            )
+            .unwrap();
+        let version = store.get(&leaf).unwrap().unwrap().version;
+        let mut stale_freeze = retired.freeze(vec![jobs[0].operation_id]).unwrap();
+        stale_freeze.checks.push(Check {
+            key: leaf.clone(),
+            expected: Expected::Version(version),
+        });
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: leaf.clone(),
+                    value: vec![2],
+                }],
+            )
+            .unwrap();
+        assert!(commit(&store, stale_freeze).is_err());
+        assert!(
+            load(&store, conversation, operation)
+                .unwrap()
+                .unwrap()
+                .frozen_ended()
+                .is_none()
+        );
+        let mut fresh = retired
+            .freeze(vec![jobs[0].operation_id, jobs[1].operation_id])
+            .unwrap();
+        fresh.checks.push(Check {
+            key: leaf.clone(),
+            expected: Expected::Version(store.get(&leaf).unwrap().unwrap().version),
+        });
+        commit(&store, fresh).unwrap();
+        let frozen = load(&store, conversation, operation).unwrap().unwrap();
+        assert_eq!(
+            frozen.frozen_ended().unwrap(),
+            &[jobs[0].operation_id, jobs[1].operation_id]
+        );
+        assert!(frozen.retired_check().is_err());
+        let executor = Uuid::new_v4();
+        commit(&store, frozen.claim(executor).unwrap()).unwrap();
+        let claimed = load(&store, conversation, operation).unwrap().unwrap();
+        let old_claim = claimed.claim_check(executor).unwrap();
+        commit(
+            &store,
+            claimed
+                .repark(
+                    executor,
+                    Uuid::new_v4(),
+                    serde_json::json!("next"),
+                    vec![jobs[1].clone()],
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(store.commit(&[old_claim], &[]).is_err());
+        let parked = load(&store, conversation, operation).unwrap().unwrap();
+        assert!(parked.jobs() == &[jobs[1].clone()]);
+        assert!(parked.frozen_ended().is_none());
+    }
+
+    #[test]
     fn creation_is_atomic_and_rejects_bad_sets_and_formats() {
         let store = Store::memory().unwrap();
         let (c, o, s, e, j) = (
@@ -411,6 +526,7 @@ mod tests {
             suspension: s,
             checkpoint: Value::Null,
             jobs: vec![job(j, "a")],
+            frozen_ended: None,
             abort_requested: false,
             owner: Owner::Active { executor: e },
         };

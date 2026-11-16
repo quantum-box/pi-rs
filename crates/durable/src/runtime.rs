@@ -15060,9 +15060,40 @@ impl Harness {
             || dispatch_identity(&reg.tool).ok() != Some(resume.dispatch_identity.clone())
             || (resume.explicit_suspend
                 && crate::nested::has_staged_results(self.owner.store(), operation_id)?)
-            || !crate::nested::resolved_for_replay(self.owner.store(), operation_id)?
         {
             return Ok(NestedResumeDecision::NotReady);
+        }
+        let any_wake = if let Some(attempt) = c
+            .suspended_nested_attempt()
+            .filter(|_| safe_replay && resume.explicit_suspend)
+        {
+            crate::nested::freeze_any_wake(
+                self.owner.store(),
+                &crate::nested_fence::Binding {
+                    conversation: c.id,
+                    attempt,
+                    suspended: true,
+                },
+            )?
+        } else {
+            crate::nested::AnyWake::Absent
+        };
+        let (any_ended, any_leaves) = match any_wake {
+            crate::nested::AnyWake::Absent => (None, Vec::new()),
+            crate::nested::AnyWake::Waiting => return Ok(NestedResumeDecision::NotReady),
+            crate::nested::AnyWake::Retry => return Ok(NestedResumeDecision::Busy),
+            crate::nested::AnyWake::Ready { ended, leaves } => (Some(ended), leaves),
+        };
+        if !crate::nested::resolved_for_replay(self.owner.store(), operation_id, &any_leaves)? {
+            return Ok(NestedResumeDecision::NotReady);
+        }
+        if let Some(ended) = any_ended {
+            let wake = c
+                .nested_resume
+                .as_mut()
+                .and_then(|resume| resume.pending_wake.as_mut())
+                .ok_or_else(|| Error::Invalid("nested any root checkpoint missing".into()))?;
+            wake.ended = ended;
         }
         let _child_leases = match crate::nested::lease_children_for_resume(
             self.owner.store(),
@@ -15336,6 +15367,32 @@ impl Harness {
                     continue;
                 }
             }
+            // The poller releases the conversation worker while it awaits remote
+            // jobs. A concurrent driver must not dispatch an any-woken child
+            // until the poller has dropped every in-flight poll future. Never
+            // await this lock while holding the worker lock.
+            let poll_control = self.owner.conversation_controls().get(id);
+            let has_any = if c.nested_suspended() {
+                match &c.nested_resume {
+                    Some(resume) => {
+                        crate::nested::has_any_park(self.owner.store(), resume.operation_id)?
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let any_poll_guard = if has_any {
+                match poll_control.nested_poll.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        *identity_busy = true;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
             match self.prepare_nested_resume(&mut c)? {
                 NestedResumeDecision::Ready => {
                     match self.save(&c, Expected::Version(version)) {
@@ -15354,6 +15411,7 @@ impl Harness {
                 }
                 NestedResumeDecision::NotReady => (),
             }
+            drop(any_poll_guard);
             match c.phase.clone() {
                 Phase::Idle => {
                     if !c.pending_resets.is_empty() {
@@ -22382,6 +22440,16 @@ async fn poll_suspended_nested(
             }
         };
     }
+    match worker.prepare_nested_resume(&mut state.clone()) {
+        Ok(NestedResumeDecision::Ready) => return Ok(true),
+        Ok(NestedResumeDecision::Busy) => return Ok(true),
+        Err(Error::Storage(durable_store::Error::Conflict { .. })) => return Ok(true),
+        Err(error) => return Err(error),
+        _ => (),
+    }
+    if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? {
+        return Ok(false);
+    }
     let jobs = crate::nested::pending_polls(worker.owner.store(), *operation_id)?;
     if jobs.is_empty() {
         #[cfg(test)]
@@ -22533,6 +22601,13 @@ async fn poll_suspended_nested(
             }
             _ = cancel.cancelled() => return Ok(gates_woken),
             _ = tokio::time::sleep(Duration::from_millis(100)), if gate_scan => {
+                match worker.prepare_nested_resume(&mut state.clone()) {
+                    Ok(NestedResumeDecision::Ready) => return Ok(true),
+                    Ok(NestedResumeDecision::Busy) if crate::nested::has_frozen_any(worker.owner.store(), id, *operation_id)? => return Ok(true),
+                    Err(Error::Storage(durable_store::Error::Conflict { .. })) => return Ok(true),
+                    Err(error) => return Err(error),
+                    _ => (),
+                }
                 match fenced_poll(async {
                     crate::nested::wake_before_gates(worker.owner.store(), *operation_id, id, Harness::key(id), version, (worker.clock)())
                 }, worker.execution_gate.as_ref(), cancel).await {

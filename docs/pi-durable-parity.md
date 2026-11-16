@@ -371,11 +371,17 @@ One bounded intermediate park is supported: a replay-safe root can invoke a
 replay-safe keyed direct child which checkpoints while one to eight keyed descendants are
 pending. Both invocations return normally without state or controls; the root
 also checkpoints and parks, and must explicitly re-enter the same child after
-wake. After all descendants settle, the root wake names them, while the child receives its own
-checkpoint and the same ended IDs in key order. Pollable descendant references can change
-without redispatch. The intermediate executor is retired before replay, and
+wake. An all-settled park wakes after every descendant settles; an explicit
+`suspend_pending_any_with_checkpoint` wakes when at least one settles. Its
+ended IDs are frozen with checks on every job and survive crash and replay.
+The root receives the same ended IDs, and the child receives its own checkpoint.
+The child must re-park while descendants remain, and cannot admit new ones after
+wake. Results are ordered by key. Pollable descendant references can change
+without redispatch. In-flight polls are dropped before replay; a still-pending
+job may be polled again after re-parking, so external polling must tolerate
+retries. The intermediate executor is retired before replay, and
 its checkpoint, claim and effects are fenced by the current root attempt and
-abort state. This subset excludes extension hooks, early `any` wakes,
+abort state. This subset excludes extension hooks,
 deeper intermediate parks, new descendants after a child wake, and independently
 scheduled or parallel child handles. Unsupported and legacy unbound cases fail
 closed; external job cancellation is not provided.
@@ -674,8 +680,8 @@ builds.
 
 This is a bounded extension of the existing external-pending path, not upstream
 `executeTool(..., {wait: false})` or `ToolPark`: initial child execution is
-awaited, operation IDs are not independently scheduled task handles, wake is
-all-pending rather than `any`, and checkpointed before-tool gates,
+awaited, operation IDs are not independently scheduled task handles, early
+`any` is limited to the bounded keyed-intermediate subset, and checkpointed before-tool gates,
 non-opted-in unsafe parents, tool sleep and independent synchronous children
 are unsupported.
 Abort fences local replay but does not abort an accepted remote job. TaskTool

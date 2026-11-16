@@ -74,6 +74,8 @@ struct ChildPark {
     leaf_key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     additional_leaf_keys: Vec<Vec<u8>>,
+    #[serde(default)]
+    any: bool,
 }
 impl ChildPark {
     fn leaf_keys(&self) -> impl Iterator<Item = &[u8]> {
@@ -84,6 +86,7 @@ impl ChildPark {
 struct ChildParkRequest {
     checkpoint: Value,
     leaves: Vec<ChildParkLeaf>,
+    any: bool,
 }
 struct ChildParkLeaf {
     leaf_key: Vec<u8>,
@@ -518,14 +521,165 @@ pub(crate) fn lease_children_for_resume(
 
 // Automatic replay is restricted to a root with only terminal records and at
 // least one explicitly resolved job. Unresolved descendants remain barriers.
-pub(crate) fn resolved_for_replay(
+pub(crate) enum AnyWake {
+    Absent,
+    Waiting,
+    Retry,
+    Ready {
+        ended: Vec<Uuid>,
+        leaves: Vec<Vec<u8>>,
+    },
+}
+
+pub(crate) fn has_any_park(
     store: &durable_store::Store,
     root: Uuid,
 ) -> Result<bool, crate::runtime::Error> {
-    let mut resolved = false;
     for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
         let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.child_park.as_ref().is_some_and(|park| park.any) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn has_frozen_any(
+    store: &durable_store::Store,
+    conversation: Uuid,
+    root: Uuid,
+) -> Result<bool, crate::runtime::Error> {
+    for (_, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.child_park.as_ref().is_some_and(|park| park.any) {
+            let snapshot = crate::nested_suspension::load(store, conversation, record.operation_id)
+                .map_err(suspension_error)?
+                .ok_or_else(|| {
+                    crate::runtime::Error::Invalid("nested suspension missing".into())
+                })?;
+            if snapshot.frozen_ended().is_some() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn freeze_any_wake(
+    store: &durable_store::Store,
+    binding: &crate::nested_fence::Binding,
+) -> Result<AnyWake, crate::runtime::Error> {
+    use crate::runtime::Error;
+    let root = binding.attempt.operation_id;
+    let mut marker = None;
+    for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
+        if record.child_park.as_ref().is_some_and(|park| park.any) {
+            if marker.is_some() {
+                return Err(Error::Invalid("multiple nested any parks".into()));
+            }
+            marker = Some((key, entry, record));
+        }
+    }
+    let Some((key, entry, record)) = marker else {
+        return Ok(AnyWake::Absent);
+    };
+    let park = record.child_park.as_ref().unwrap();
+    let prefix = format!("nested/{root}/{}/k", record.operation_id);
+    let leaves: Vec<Vec<u8>> = park.leaf_keys().map(<[u8]>::to_vec).collect();
+    if leaves.iter().any(|key| !key.starts_with(prefix.as_bytes())) {
+        return Err(Error::Invalid("invalid nested any park".into()));
+    }
+    let suspension =
+        crate::nested_suspension::load(store, binding.conversation, record.operation_id)
+            .map_err(suspension_error)?
+            .ok_or_else(|| Error::Invalid("nested suspension missing".into()))?;
+    if suspension.suspension_id() != park.suspension
+        || suspension.abort_requested()
+        || suspension.jobs().len() != leaves.len()
+        || record.outcome
+            != Some(Outcome::Pending {
+                reference: format!("nested-child-park:{}", park.suspension),
+            })
+    {
+        return Err(Error::Invalid("nested any suspension changed".into()));
+    }
+    if let Some(ended) = suspension.frozen_ended() {
+        return Ok(AnyWake::Ready {
+            ended: ended.to_vec(),
+            leaves,
+        });
+    }
+    let mut checks = vec![Check {
+        key,
+        expected: Expected::Version(entry.version),
+    }];
+    let mut ended = Vec::new();
+    let mut seen = HashSet::new();
+    for leaf_key in &leaves {
+        let entry = store
+            .get(leaf_key)?
+            .ok_or_else(|| Error::Invalid("nested park leaf missing".into()))?;
+        let leaf: Record = serde_json::from_slice(&entry.value)?;
+        if !seen.insert(leaf.operation_id) || leaf.staged_outcome.is_some() {
+            return Err(Error::Invalid("invalid nested park leaf".into()));
+        }
+        let reference = match &leaf.outcome {
+            Some(Outcome::Pending { reference }) => reference,
+            Some(outcome) => {
+                let resolution = leaf
+                    .resolution
+                    .as_ref()
+                    .ok_or_else(|| Error::Invalid("nested park leaf has no resolution".into()))?;
+                if outcome != &resolution.outcome || matches!(outcome, Outcome::Unknown(_)) {
+                    return Err(Error::Invalid("invalid nested park resolution".into()));
+                }
+                ended.push(leaf.operation_id);
+                &resolution.reference
+            }
+            None => return Err(Error::Invalid("nested park leaf uncertain".into())),
+        };
+        if !suspension
+            .jobs()
+            .iter()
+            .any(|job| job.operation_id == leaf.operation_id && &job.reference == reference)
+        {
+            return Err(Error::Invalid("nested suspension evidence changed".into()));
+        }
+        checks.push(Check {
+            key: leaf_key.clone(),
+            expected: Expected::Version(entry.version),
+        });
+    }
+    if ended.is_empty() {
+        return Ok(AnyWake::Waiting);
+    }
+    let batch = suspension.freeze(ended.clone()).map_err(suspension_error)?;
+    checks.extend(batch.checks);
+    match binding.commit(store, &checks, &batch.mutations) {
+        Ok(()) => Ok(AnyWake::Ready { ended, leaves }),
+        Err(crate::nested_fence::Error::Stale) => Ok(AnyWake::Waiting),
+        Err(crate::nested_fence::Error::Store(durable_store::Error::Conflict { .. })) => {
+            Ok(AnyWake::Retry)
+        }
+        Err(crate::nested_fence::Error::Store(error)) => Err(error.into()),
+        Err(crate::nested_fence::Error::Json(error)) => Err(error.into()),
+    }
+}
+
+pub(crate) fn resolved_for_replay(
+    store: &durable_store::Store,
+    root: Uuid,
+    any_leaves: &[Vec<u8>],
+) -> Result<bool, crate::runtime::Error> {
+    let mut resolved = false;
+    for (key, entry) in store.list(format!("nested/{root}/").as_bytes())? {
+        let record: Record = serde_json::from_slice(&entry.value)?;
         if let Some(park) = &record.child_park {
+            if park.any && !any_leaves.is_empty() {
+                resolved = true;
+                continue;
+            }
             for leaf_key in park.leaf_keys() {
                 let Some(leaf) = store.get(leaf_key)? else {
                     return Ok(false);
@@ -548,6 +702,9 @@ pub(crate) fn resolved_for_replay(
                 }
             }
             resolved = true;
+            continue;
+        }
+        if any_leaves.contains(&key) && matches!(record.outcome, Some(Outcome::Pending { .. })) {
             continue;
         }
         if record
@@ -1146,13 +1303,31 @@ impl NestedHost {
         &self,
         checkpoint: Option<Value>,
     ) -> Result<(), String> {
+        self.suspend_pending_with_policy(checkpoint, false)
+    }
+
+    pub(crate) fn suspend_pending_any_with_checkpoint(
+        &self,
+        checkpoint: Value,
+    ) -> Result<(), String> {
+        if self.parent == self.shared.root {
+            return Err("any park is supported only by a keyed intermediate".into());
+        }
+        self.suspend_pending_with_policy(Some(checkpoint), true)
+    }
+
+    fn suspend_pending_with_policy(
+        &self,
+        checkpoint: Option<Value>,
+        any: bool,
+    ) -> Result<(), String> {
         if checkpoint.as_ref().is_some_and(|value| {
             !serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
         }) {
             return Err("nested checkpoint exceeds 64 KiB".into());
         }
         if self.parent != self.shared.root {
-            return self.request_child_park(checkpoint);
+            return self.request_child_park(checkpoint, any);
         }
         if self.shared.failed.load(Ordering::Acquire) {
             return Err("nested suspension requires a healthy root invocation".into());
@@ -1259,10 +1434,10 @@ impl NestedHost {
     }
     // Deliberately bounded: only one keyed intermediate, up to eight keyed pending
     // descendant, replay-safe root and child, with no extension hooks.
-    fn request_child_park(&self, checkpoint: Option<Value>) -> Result<(), String> {
+    fn request_child_park(&self, checkpoint: Option<Value>, any: bool) -> Result<(), String> {
         let checkpoint = checkpoint.ok_or("nested child park requires a checkpoint")?;
         if self.depth != 1
-            || self.child_wake.is_some()
+            || (self.child_wake.is_some() && self.claim.is_none())
             || !self.child_replay_safe
             || self.shared.hooks.is_some()
             || self.shared.failed.load(Ordering::Acquire)
@@ -1278,6 +1453,17 @@ impl NestedHost {
             return Err("nested child park requires live root".into());
         }
         let store = self.shared.owner.store();
+        if self.child_wake.is_some() {
+            let snapshot = crate::nested_suspension::load(store, binding.conversation, self.parent)
+                .map_err(|error| error.to_string())?
+                .ok_or("nested suspension missing")?;
+            snapshot
+                .claim_check(binding.attempt.attempt_id)
+                .map_err(|error| error.to_string())?;
+            if snapshot.frozen_ended().is_none() {
+                return Err("re-parking requires a frozen any wake".into());
+            }
+        }
         let root = store
             .get(&crate::runtime::Harness::key(binding.conversation))
             .map_err(|e| e.to_string())?
@@ -1318,6 +1504,12 @@ impl NestedHost {
             }
             let record: Record = serde_json::from_slice(&leaf.value).map_err(|e| e.to_string())?;
             let Some(Outcome::Pending { reference }) = &record.outcome else {
+                if self.child_wake.is_some()
+                    && record.resolution.is_some()
+                    && record.outcome.as_ref() == record.resolution.as_ref().map(|r| &r.outcome)
+                {
+                    continue;
+                }
                 return Err("nested descendant is not pending".into());
             };
             if record.before_pending
@@ -1336,6 +1528,9 @@ impl NestedHost {
                 operation_id: record.operation_id,
                 reference: reference.clone(),
             });
+        }
+        if leaves.is_empty() {
+            return Err("nested child park requires a pending descendant".into());
         }
         let mut request = self
             .child_park_request
@@ -1360,7 +1555,11 @@ impl NestedHost {
                 return Err("nested child park has an unrelated unresolved descendant".into());
             }
         }
-        *request = Some(ChildParkRequest { checkpoint, leaves });
+        *request = Some(ChildParkRequest {
+            checkpoint,
+            leaves,
+            any,
+        });
         lifecycle.closed.insert(self.parent);
         Ok(())
     }
@@ -2076,7 +2275,7 @@ impl NestedHost {
             {
                 return self.fail("nested child park invocation did not finish cleanly");
             }
-            return self.commit_child_park(&key, &record, request);
+            return self.commit_child_park(&key, &record, request, resumed_claim.as_ref());
         }
         let has_state = reply.state.is_some();
         let outcome = if has_state {
@@ -2114,6 +2313,26 @@ impl NestedHost {
                     || !matches!(completed.outcome, Some(Outcome::Pending { .. }))
                 {
                     return self.fail("nested child park changed");
+                }
+                if let Some(park) = &completed.child_park
+                    && park.any
+                {
+                    for leaf_key in park.leaf_keys() {
+                        let entry = match store.get(leaf_key) {
+                            Ok(Some(entry)) => entry,
+                            _ => return self.fail("nested park leaf missing"),
+                        };
+                        let leaf: Record = match serde_json::from_slice(&entry.value) {
+                            Ok(leaf) => leaf,
+                            Err(_) => return self.fail("invalid nested park leaf"),
+                        };
+                        if matches!(
+                            leaf.outcome,
+                            None | Some(Outcome::Pending { .. } | Outcome::Unknown(_))
+                        ) {
+                            return self.fail("unfinished nested descendants require another park");
+                        }
+                    }
                 }
                 completed.child_park = None;
                 completed.outcome = None;
@@ -2215,6 +2434,14 @@ impl NestedHost {
         {
             return Err("nested suspension evidence changed".into());
         }
+        let frozen = if park.any {
+            let Some(ended) = suspension.frozen_ended() else {
+                return Ok(None);
+            };
+            Some(ended.to_vec())
+        } else {
+            None
+        };
         let mut ended = Vec::new();
         let mut extra = vec![Check {
             key: journal_key.to_vec(),
@@ -2226,8 +2453,24 @@ impl NestedHost {
                 .map_err(|e| e.to_string())?
                 .ok_or("nested park leaf missing")?;
             let leaf: Record = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
-            if matches!(leaf.outcome, Some(Outcome::Pending { .. })) {
-                return Ok(None);
+            if let Some(Outcome::Pending { reference }) = &leaf.outcome {
+                if !park.any {
+                    return Ok(None);
+                }
+                if frozen
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&leaf.operation_id))
+                    || !suspension.jobs().iter().any(|job| {
+                        job.operation_id == leaf.operation_id && job.reference == *reference
+                    })
+                {
+                    return Err("nested suspension evidence changed".into());
+                }
+                extra.push(Check {
+                    key: leaf_key.to_vec(),
+                    expected: Expected::Version(entry.version),
+                });
+                continue;
             }
             let resolution = leaf
                 .resolution
@@ -2245,11 +2488,20 @@ impl NestedHost {
             {
                 return Err("nested suspension evidence changed".into());
             }
-            ended.push(leaf.operation_id);
+            if !park.any
+                || frozen
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&leaf.operation_id))
+            {
+                ended.push(leaf.operation_id);
+            }
             extra.push(Check {
                 key: leaf_key.to_vec(),
                 expected: Expected::Version(entry.version),
             });
+        }
+        if frozen.as_ref().is_some_and(|ids| *ids != ended) {
+            return Err("nested frozen wake evidence changed".into());
         }
         let executor = binding.attempt.attempt_id;
         if suspension.executor() == executor {
@@ -2290,6 +2542,7 @@ impl NestedHost {
         key: &[u8],
         original: &Record,
         request: ChildParkRequest,
+        resumed: Option<&(crate::nested_suspension::Snapshot, Uuid)>,
     ) -> Outcome {
         let Some(binding) = &self.shared.fence else {
             return self.fail("nested park root missing");
@@ -2302,28 +2555,35 @@ impl NestedHost {
             return self.fail("invalid nested park intent");
         };
         if record.operation_id != original.operation_id
-            || record.outcome.is_some()
-            || record.child_park.is_some()
+            || (resumed.is_none() && (record.outcome.is_some() || record.child_park.is_some()))
+            || (resumed.is_some()
+                && (record.child_park.is_none()
+                    || !matches!(record.outcome, Some(Outcome::Pending { .. }))))
             || record.policy != ReplayPolicy::Safe
         {
             return self.fail("nested park intent changed");
         }
         let suspension = Uuid::new_v4();
-        let batch = match crate::nested_suspension::prepare_retired(
-            binding.conversation,
-            record.operation_id,
-            suspension,
-            binding.attempt.attempt_id,
-            request.checkpoint,
-            request
-                .leaves
-                .iter()
-                .map(|leaf| crate::nested_suspension::PendingJob {
-                    operation_id: leaf.operation_id,
-                    reference: leaf.reference.clone(),
-                })
-                .collect(),
-        ) {
+        let jobs: Vec<_> = request
+            .leaves
+            .iter()
+            .map(|leaf| crate::nested_suspension::PendingJob {
+                operation_id: leaf.operation_id,
+                reference: leaf.reference.clone(),
+            })
+            .collect();
+        let batch = match if let Some((snapshot, executor)) = resumed {
+            snapshot.repark(*executor, suspension, request.checkpoint, jobs)
+        } else {
+            crate::nested_suspension::prepare_retired(
+                binding.conversation,
+                record.operation_id,
+                suspension,
+                binding.attempt.attempt_id,
+                request.checkpoint,
+                jobs,
+            )
+        } {
             Ok(batch) => batch,
             Err(error) => return self.fail(error.to_string()),
         };
@@ -2338,6 +2598,7 @@ impl NestedHost {
                 .skip(1)
                 .map(|leaf| leaf.leaf_key.clone())
                 .collect(),
+            any: request.any,
         });
         record.outcome = Some(Outcome::Pending {
             reference: reference.clone(),

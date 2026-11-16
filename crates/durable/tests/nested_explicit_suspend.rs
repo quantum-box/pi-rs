@@ -3532,6 +3532,562 @@ async fn multiple_child_jobs_recover_after_process_loss() {
 }
 
 struct MultiParkMiddle(Arc<AtomicUsize>);
+
+struct AnyRoot;
+#[async_trait]
+impl KeyedTool for AnyRoot {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let middle = host
+            .call_keyed_unpolled_with_id("middle", "middle", json!({}))
+            .await
+            .unwrap();
+        match middle.outcome {
+            Outcome::Pending { .. } => {
+                host.suspend_pending_with_checkpoint(json!({"middle": middle.operation_id}))
+                    .unwrap();
+                Outcome::Succeeded("park".into()).into()
+            }
+            other => other.into(),
+        }
+    }
+}
+struct AnyMiddle(Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>);
+#[async_trait]
+impl KeyedTool for AnyMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let wake = host.pending_wake();
+        let a = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        let b = host
+            .call_keyed_unpolled_with_id("b", "child", json!({"job":"b"}))
+            .await
+            .unwrap();
+        if let Some(wake) = wake {
+            self.0.lock().unwrap().push(wake.ended.clone());
+            assert!(wake.checkpoint == json!("first") || wake.checkpoint == json!("again"));
+        }
+        if matches!(a.outcome, Outcome::Pending { .. })
+            || matches!(b.outcome, Outcome::Pending { .. })
+        {
+            host.suspend_pending_any_with_checkpoint(if host.pending_wake().is_some() {
+                json!("again")
+            } else {
+                json!("first")
+            })
+            .unwrap();
+            Outcome::Succeeded("park".into()).into()
+        } else {
+            Outcome::Succeeded("any complete".into()).into()
+        }
+    }
+}
+fn any_options(
+    wakes: Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
+    calls: Arc<AtomicUsize>,
+) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(AnyMiddle(wakes))).register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkLeaf(calls)),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+#[tokio::test]
+async fn any_child_wakes_early_and_reparks_remaining_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut scheduler = Scheduler::open(&path, any_options(wakes.clone(), calls.clone())).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a done".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(*wakes.lock().unwrap(), vec![vec![a.operation_id]]);
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(
+        scheduler.nested_pending_jobs(id, root).unwrap(),
+        vec![b.clone()]
+    );
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, any_options(wakes.clone(), calls.clone())).unwrap();
+    scheduler
+        .cancel_nested_pending(id, root, b.operation_id, &b.reference, "cancelled".into())
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        *wakes.lock().unwrap(),
+        vec![vec![a.operation_id], vec![b.operation_id]]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "any complete"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_after_any_wake_fences_reparked_child_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut scheduler = Scheduler::open(&path, any_options(wakes.clone(), calls.clone())).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(*wakes.lock().unwrap(), vec![vec![a.operation_id]]);
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, any_options(wakes.clone(), calls.clone())).unwrap();
+    scheduler
+        .cancel_nested_pending(id, root, b.operation_id, &b.reference, "cancelled".into())
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().abort_requested);
+    assert_eq!(*wakes.lock().unwrap(), vec![vec![a.operation_id]]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    scheduler.shutdown().await.unwrap();
+}
+
+struct AnyHangingPoll {
+    in_flight: Arc<AtomicUsize>,
+    invoked: Arc<AtomicUsize>,
+    release_a: Arc<std::sync::atomic::AtomicBool>,
+}
+struct PollGuard(Arc<AtomicUsize>);
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl Tool for AnyHangingPoll {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        self.invoked.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: args["job"].as_str().unwrap().into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        if reference == "a" {
+            while !self.release_a.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return Some(Outcome::Succeeded("done".into()));
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _guard = PollGuard(self.in_flight.clone());
+        std::future::pending().await
+    }
+}
+struct AssertPollRetiredMiddle {
+    active: Arc<AtomicUsize>,
+    wakes: Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
+}
+#[async_trait]
+impl KeyedTool for AssertPollRetiredMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if host.pending_wake().is_some() {
+            assert_eq!(
+                self.active.load(Ordering::SeqCst),
+                0,
+                "old poll still running during replay"
+            );
+        }
+        AnyMiddle(self.wakes.clone())
+            .invoke(args, context, state, host)
+            .await
+    }
+}
+#[tokio::test]
+async fn any_wake_retires_other_inflight_poll_before_child_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let release_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(AssertPollRetiredMiddle {
+                active: active.clone(),
+                wakes: wakes.clone(),
+            }))
+            .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(AnyHangingPoll {
+                    in_flight: active.clone(),
+                    invoked: calls.clone(),
+                    release_a: release_a.clone(),
+                }),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    until(|| active.load(Ordering::SeqCst) == 1).await;
+    scheduler.schedule(id);
+    release_a.store(true, Ordering::SeqCst);
+    until(|| !wakes.lock().unwrap().is_empty()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    scheduler.abort(id).unwrap();
+    scheduler.shutdown().await.unwrap();
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn any_wake_freezes_all_results_already_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut scheduler = Scheduler::open(
+        dir.path().join("db"),
+        any_options(wakes.clone(), calls.clone()),
+    )
+    .unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    // Both synchronous resolutions commit before this task yields to the worker.
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a".into()),
+        )
+        .unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            b.operation_id,
+            &b.reference,
+            Outcome::Succeeded("b".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(
+        *wakes.lock().unwrap(),
+        vec![vec![a.operation_id, b.operation_id]]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    scheduler.shutdown().await.unwrap();
+}
+
+struct AnyDiskRoot(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for AnyDiskRoot {
+    fn spec(&self) -> ToolSpec {
+        spec("parent")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        let waking = host.pending_wake().is_some();
+        let middle = host
+            .call_keyed_unpolled_with_id("middle", "middle", json!({}))
+            .await
+            .unwrap();
+        match middle.outcome {
+            Outcome::Pending { .. } => {
+                if waking && self.0.join("stop-repark").exists() {
+                    std::fs::write(self.0.join("at-repark"), b"ready").unwrap();
+                    std::future::pending::<()>().await;
+                }
+                host.suspend_pending_with_checkpoint(json!({"middle":middle.operation_id}))
+                    .unwrap();
+                Outcome::Succeeded("park".into()).into()
+            }
+            other => other.into(),
+        }
+    }
+}
+struct AnyDiskMiddle(std::path::PathBuf);
+#[async_trait]
+impl KeyedTool for AnyDiskMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if let Some(wake) = host.pending_wake() {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("wakes"))
+                    .unwrap(),
+                "{}",
+                serde_json::to_string(&wake.ended).unwrap()
+            )
+            .unwrap();
+            if self.0.join("stop-wake").exists() {
+                std::fs::write(self.0.join("at-wake"), b"ready").unwrap();
+                std::future::pending::<()>().await;
+            }
+        }
+        AnyMiddle(Arc::new(std::sync::Mutex::new(Vec::new())))
+            .invoke(args, context, state, host)
+            .await
+    }
+}
+fn any_disk_options(path: &std::path::Path) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(AnyDiskRoot(path.into()))).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(AnyDiskMiddle(path.into())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkFileLeaf(path.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 8,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+#[tokio::test]
+async fn any_park_crash_worker() {
+    let Some(path) = std::env::var_os("PI_ANY_PARK_CRASH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut scheduler = Scheduler::open(path.join("db"), any_disk_options(&path)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(path.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("a".into()),
+        )
+        .unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn any_wake_and_repark_recover_after_process_loss() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for stage in ["wake", "repark"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        std::fs::write(path.join(format!("stop-{stage}")), b"yes").unwrap();
+        let mut process = Kill(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "any_park_crash_worker"])
+                .env("PI_ANY_PARK_CRASH", path)
+                .spawn()
+                .unwrap(),
+        );
+        until(|| path.join(format!("at-{stage}")).exists()).await;
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        std::fs::remove_file(path.join(format!("stop-{stage}"))).unwrap();
+        let id = std::fs::read_to_string(path.join("conversation"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut scheduler = Scheduler::open(path.join("db"), any_disk_options(path)).unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(
+            scheduler.conversation(id).unwrap().nested_suspended(),
+            "{stage}"
+        );
+        let root = scheduler.blocked(id).unwrap().unwrap().0;
+        let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+        assert_eq!(jobs.len(), 1, "{stage}");
+        assert_eq!(jobs[0].reference, "b");
+        scheduler
+            .cancel_nested_pending(
+                id,
+                root,
+                jobs[0].operation_id,
+                &jobs[0].reference,
+                "cancelled".into(),
+            )
+            .unwrap();
+        wait(&mut scheduler, id).await;
+        assert!(
+            scheduler.blocked(id).unwrap().is_none(),
+            "{stage}: {:?}",
+            scheduler.conversation(id).unwrap()
+        );
+        assert!(
+            scheduler
+                .conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m,Message::Tool{content,..} if content == "any complete"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("dispatches")).unwrap(),
+            "a\nb\n"
+        );
+        let wake_log = std::fs::read_to_string(path.join("wakes")).unwrap();
+        let wake_log: Vec<Vec<uuid::Uuid>> = wake_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if stage == "wake" {
+            assert_eq!(wake_log.len(), 3);
+            assert_eq!(wake_log[0], wake_log[1], "frozen wake changed after crash");
+            assert_ne!(wake_log[1], wake_log[2]);
+        } else {
+            assert_eq!(wake_log.len(), 2);
+            assert_ne!(wake_log[0], wake_log[1]);
+        }
+        scheduler.shutdown().await.unwrap();
+    }
+}
 struct OverLimitMiddle(Arc<std::sync::Mutex<Option<String>>>);
 #[async_trait]
 impl KeyedTool for OverLimitMiddle {
