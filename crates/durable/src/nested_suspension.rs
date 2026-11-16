@@ -484,7 +484,7 @@ mod tests {
         .unwrap();
         assert!(store.commit(&[old_claim], &[]).is_err());
         let parked = load(&store, conversation, operation).unwrap().unwrap();
-        assert!(parked.jobs() == &[jobs[1].clone()]);
+        assert!(parked.jobs() == [jobs[1].clone()]);
         assert!(parked.frozen_ended().is_none());
     }
 
