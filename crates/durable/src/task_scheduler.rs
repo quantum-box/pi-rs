@@ -384,6 +384,20 @@ pub enum PendingSettlement {
         lease: InvocationLease,
         settlement: PreparedSettlement,
     },
+    PreparationConflict {
+        lease: InvocationLease,
+        conflict: PreparationConflict,
+    },
+    Failure {
+        lease: InvocationLease,
+        settlement: FailureSettlement,
+    },
+}
+
+/// A definitively uncommitted document-preparation conflict awaiting abort revalidation.
+pub struct PreparationConflict {
+    attachment: Arc<Attachment>,
+    running: task_store::StoredTask,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -394,6 +408,8 @@ enum DeferredSettlement {
         crate::document::DetachedTaskDocuments,
     ),
     Prepared(PreparedSettlement),
+    PreparationConflict(PreparationConflict),
+    Failure(FailureSettlement),
 }
 
 impl std::fmt::Debug for PendingSettlement {
@@ -404,6 +420,11 @@ impl std::fmt::Debug for PendingSettlement {
                 .field(&completed.task_id())
                 .finish(),
             Self::Prepared { lease, .. } => f.debug_tuple("Prepared").field(&lease.id).finish(),
+            Self::PreparationConflict { lease, .. } => f
+                .debug_tuple("PreparationConflict")
+                .field(&lease.id)
+                .finish(),
+            Self::Failure { lease, .. } => f.debug_tuple("Failure").field(&lease.id).finish(),
         }
     }
 }
@@ -413,6 +434,7 @@ impl PendingSettlement {
         match self {
             Self::Unprepared(completed) => &completed.lease,
             Self::Prepared { lease, .. } => lease,
+            Self::PreparationConflict { lease, .. } | Self::Failure { lease, .. } => lease,
         }
     }
 
@@ -423,6 +445,18 @@ impl PendingSettlement {
         let lease = self.lease();
         let owner = &lease.attachment.owner;
         if let Self::Prepared { settlement, .. } = self
+            && (lease.id != settlement.running.task.id()
+                || !Arc::ptr_eq(&lease.attachment, &settlement.attachment))
+        {
+            return Err(Error::Ownership);
+        }
+        if let Self::PreparationConflict { conflict, .. } = self
+            && (lease.id != conflict.running.task.id()
+                || !Arc::ptr_eq(&lease.attachment, &conflict.attachment))
+        {
+            return Err(Error::Ownership);
+        }
+        if let Self::Failure { settlement, .. } = self
             && (lease.id != settlement.running.task.id()
                 || !Arc::ptr_eq(&lease.attachment, &settlement.attachment))
         {
@@ -554,7 +588,9 @@ impl PreparedSettlement {
 
 // Failure settlement retains its original outcome and the most recently
 // prepared checked write until that write commits or is superseded.
-struct FailureSettlement {
+/// An owned failure outcome and its checked candidate.
+pub struct FailureSettlement {
+    attachment: Arc<Attachment>,
     running: task_store::StoredTask,
     reason: String,
     completed: bool,
@@ -853,6 +889,8 @@ pub struct Scheduler {
     #[cfg(test)]
     after_result_load_hook: Option<CommitHook>,
     #[cfg(test)]
+    preparation_conflict_hook: Option<CommitHook>,
+    #[cfg(test)]
     failure_commit_hook: Option<CommitHook>,
     #[cfg(test)]
     inject_batch_prepare_conflict: bool,
@@ -1059,6 +1097,17 @@ impl Scheduler {
                 }
                 DeferredSettlement::Prepared(settlement) => SettlementError::PendingPrepared {
                     pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+                },
+                DeferredSettlement::PreparationConflict(conflict) => {
+                    SettlementError::PendingPrepared {
+                        pending: Box::new(PendingSettlement::PreparationConflict {
+                            lease,
+                            conflict,
+                        }),
+                    }
+                }
+                DeferredSettlement::Failure(settlement) => SettlementError::PendingPrepared {
+                    pending: Box::new(PendingSettlement::Failure { lease, settlement }),
                 },
             });
         }
@@ -1275,6 +1324,10 @@ impl Scheduler {
                 return self.try_settle_invocation(completed);
             }
             PendingSettlement::Prepared { lease, settlement } => (lease, settlement),
+            other @ (PendingSettlement::PreparationConflict { .. }
+            | PendingSettlement::Failure { .. }) => {
+                return self.try_resume_failure_or_conflict(other);
+            }
         };
         let fence = self.failure_fence.clone();
         let guard = match fence.try_lock() {
@@ -1326,6 +1379,7 @@ impl Scheduler {
                 });
             }
         };
+        let mut deferred = None;
         let mut precommit_rejection = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let revalidation = match settlement.revalidate(self, &owner, &gate) {
@@ -1336,9 +1390,13 @@ impl Scheduler {
                 }
             };
             match revalidation {
-                PreparedRevalidation::Ready => {
-                    self.commit_prepared_settlement(&mut settlement, &owner, gate, true)
-                }
+                PreparedRevalidation::Ready => self.commit_prepared_settlement(
+                    &mut settlement,
+                    &owner,
+                    gate,
+                    true,
+                    &mut deferred,
+                ),
                 PreparedRevalidation::PendingAbort(root) => Err(Error::PendingAbort(root)),
                 PreparedRevalidation::Aborted(latest) => {
                     self.ts().update(&latest, |task| task.yield_ready())?;
@@ -1371,7 +1429,12 @@ impl Scheduler {
         if matches!(result, Err(Error::PendingAbort(_))) {
             drop(guard);
             return Err(SettlementError::PendingPrepared {
-                pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+                pending: Box::new(match deferred {
+                    Some(DeferredSettlement::Failure(settlement)) => {
+                        PendingSettlement::Failure { lease, settlement }
+                    }
+                    _ => PendingSettlement::Prepared { lease, settlement },
+                }),
             });
         }
         if precommit_rejection {
@@ -1395,6 +1458,183 @@ impl Scheduler {
             if state.failed_handlers.remove(&lease.id) {
                 state.handler_failed = !state.failed_handlers.is_empty();
             }
+        }
+        lease.retired = true;
+        drop(guard);
+        drop(lease);
+        result.map_err(SettlementError::Indeterminate)
+    }
+
+    fn try_resume_failure_or_conflict(
+        &mut self,
+        pending: PendingSettlement,
+    ) -> Result<bool, SettlementError> {
+        let (mut lease, mut failure, conflict) = match pending {
+            PendingSettlement::Failure { lease, settlement } => (lease, Some(settlement), None),
+            PendingSettlement::PreparationConflict { lease, conflict } => {
+                (lease, None, Some(conflict))
+            }
+            _ => unreachable!(),
+        };
+        macro_rules! pending {
+            () => {
+                if let Some(settlement) = failure.take() {
+                    PendingSettlement::Failure { lease, settlement }
+                } else {
+                    PendingSettlement::PreparationConflict {
+                        lease,
+                        conflict: conflict.unwrap(),
+                    }
+                }
+            };
+        }
+        let fence = self.failure_fence.clone();
+        let guard = match fence.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(SettlementError::PendingPrepared {
+                    pending: Box::new(pending!()),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SettlementError::RejectedPrepared {
+                    error: Error::Poisoned,
+                    pending: Box::new(pending!()),
+                });
+            }
+        };
+        let (attachment, running) = if let Some(ref f) = failure {
+            (&f.attachment, &f.running)
+        } else {
+            let c = conflict.as_ref().unwrap();
+            (&c.attachment, &c.running)
+        };
+        let health = if !Arc::ptr_eq(&self.live_invocations, &lease.state)
+            || !Arc::ptr_eq(&lease.attachment, attachment)
+            || lease.id != running.task.id()
+        {
+            Err(Error::Ownership)
+        } else {
+            self.live_invocations
+                .lock()
+                .map_err(|_| Error::Poisoned)
+                .and_then(|state| {
+                    if self.poisoned.load(std::sync::atomic::Ordering::Acquire) || state.poisoned {
+                        Err(Error::Poisoned)
+                    } else if state.handler_failed && !state.failed_handlers.contains(&lease.id) {
+                        Err(Error::Busy)
+                    } else {
+                        Ok(())
+                    }
+                })
+        };
+        if let Err(error) = health {
+            drop(guard);
+            return Err(SettlementError::RejectedPrepared {
+                error,
+                pending: Box::new(pending!()),
+            });
+        }
+        let owner = self.owner();
+        let gate = match owner.task_gate().lock() {
+            Ok(g) => g,
+            Err(_) => {
+                drop(guard);
+                return Err(SettlementError::RejectedPrepared {
+                    error: Error::Poisoned,
+                    pending: Box::new(pending!()),
+                });
+            }
+        };
+        let mut rejected = false;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool, Error> {
+                let running = if let Some(ref f) = failure {
+                    &f.running
+                } else {
+                    &conflict.as_ref().unwrap().running
+                };
+                let current = self.ts().load(lease.id)?.ok_or(Error::Ownership)?;
+                if current.version != running.version && current.task.abort_requested() {
+                    self.ts().update(&current, |task| task.yield_ready())?;
+                    return Ok(true);
+                }
+                if current.version != running.version {
+                    rejected = true;
+                    return Err(task_store::Error::Store(durable_store::Error::Conflict {
+                        key: task_store::key(lease.id),
+                    })
+                    .into());
+                }
+                if failure.is_none() {
+                    if let Some(root) = pending_abort_root_for_running(
+                        &self.ts(),
+                        lease.id,
+                        self.validator.is_none(),
+                    )? {
+                        return Err(Error::PendingAbort(root));
+                    }
+                    if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                        self.ts().update(&current, |task| task.yield_ready())?;
+                        return Ok(true);
+                    }
+                    failure = Some(FailureSettlement {
+                        attachment: self.attachment.clone(),
+                        running: current,
+                        reason: "document conflict: execution outcome requires reconciliation"
+                            .into(),
+                        completed: false,
+                        check_pending: true,
+                        attempt: 0,
+                        candidate: None,
+                    });
+                }
+                self.commit_failure_settlement(failure.as_mut().unwrap(), || {})?;
+                Ok(true)
+            }));
+        drop(gate);
+        let result = match result {
+            Ok(r) => r,
+            Err(payload) => {
+                self.live_invocations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .poisoned = true;
+                lease.retired = true;
+                drop(guard);
+                drop(lease);
+                std::panic::resume_unwind(payload);
+            }
+        };
+        if matches!(result, Err(Error::PendingAbort(_))) {
+            drop(guard);
+            return Err(SettlementError::PendingPrepared {
+                pending: Box::new(pending!()),
+            });
+        }
+        if rejected {
+            let error = result.unwrap_err();
+            drop(guard);
+            return Err(SettlementError::RejectedPrepared {
+                error,
+                pending: Box::new(pending!()),
+            });
+        }
+        if result.is_err() {
+            self.live_invocations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poisoned = true;
+        } else {
+            let mut state = self
+                .live_invocations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.failed_handlers.remove(&lease.id) {
+                state.handler_failed = !state.failed_handlers.is_empty();
+            }
+            self.poisoned
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         lease.retired = true;
         drop(guard);
@@ -1551,6 +1791,8 @@ impl Scheduler {
             result_commit_hook: None,
             #[cfg(test)]
             after_result_load_hook: None,
+            #[cfg(test)]
+            preparation_conflict_hook: None,
             #[cfg(test)]
             failure_commit_hook: None,
             #[cfg(test)]
@@ -2367,7 +2609,14 @@ impl Scheduler {
         let step = match result {
             Ok(step) => step,
             Err(reason) if running.task.is_task_tool() => {
-                return self.finish_running_failure(&running, reason, &owner, _gate);
+                return self.finish_running_failure(
+                    &running,
+                    reason,
+                    &owner,
+                    _gate,
+                    nonblocking_abort,
+                    deferred,
+                );
             }
             Err(reason) => {
                 *reported_handler_failure = true;
@@ -2376,7 +2625,14 @@ impl Scheduler {
         };
         if let Step::Fail(reason) = step {
             // Failure discards all staged effects, including child admissions.
-            return self.finish_running_failure(&running, reason, &owner, _gate);
+            return self.finish_running_failure(
+                &running,
+                reason,
+                &owner,
+                _gate,
+                nonblocking_abort,
+                deferred,
+            );
         }
         let mut staged = std::mem::take(&mut documents.keyed_children);
         let parent_key = task_store::key(running.task.id());
@@ -2441,18 +2697,36 @@ impl Scheduler {
                     let mut seen = std::collections::HashSet::new();
                     for id in waiting {
                         if *id == next.task.id() || !seen.insert(*id) {
-                            return self.reject_invalid_wait(&running, &owner, _gate);
+                            return self.reject_invalid_wait(
+                                &running,
+                                &owner,
+                                _gate,
+                                nonblocking_abort,
+                                deferred,
+                            );
                         }
                         if !children.iter().any(|c| c.id() == *id)
                             && !staged.iter().any(|(_, _, p)| p.child == *id)
                         {
                             let Some(child) = self.ts().load(*id)? else {
-                                return self.reject_invalid_wait(&running, &owner, _gate);
+                                return self.reject_invalid_wait(
+                                    &running,
+                                    &owner,
+                                    _gate,
+                                    nonblocking_abort,
+                                    deferred,
+                                );
                             };
                             if matches!(condition, WaitFor::TasksFailFast(_))
                                 && child.task.owner() != &TaskOwner::Task(next.task.id())
                             {
-                                return self.reject_invalid_wait(&running, &owner, _gate);
+                                return self.reject_invalid_wait(
+                                    &running,
+                                    &owner,
+                                    _gate,
+                                    nonblocking_abort,
+                                    deferred,
+                                );
                             }
                         }
                     }
@@ -2470,7 +2744,13 @@ impl Scheduler {
                     {
                         Ok(()) => (),
                         Err(Error::Ownership) => {
-                            return self.reject_invalid_wait(&running, &owner, _gate);
+                            return self.reject_invalid_wait(
+                                &running,
+                                &owner,
+                                _gate,
+                                nonblocking_abort,
+                                deferred,
+                            );
                         }
                         Err(error) => return Err(error),
                     }
@@ -2508,7 +2788,15 @@ impl Scheduler {
             let targets: Vec<_> = new_children.keys().copied().collect();
             match validate_wait_graph(owner.store(), next.task.id(), &targets, &new_children) {
                 Ok(()) => (),
-                Err(Error::Ownership) => return self.reject_invalid_wait(&running, &owner, _gate),
+                Err(Error::Ownership) => {
+                    return self.reject_invalid_wait(
+                        &running,
+                        &owner,
+                        _gate,
+                        nonblocking_abort,
+                        deferred,
+                    );
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -2545,6 +2833,10 @@ impl Scheduler {
         } else {
             document_result
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.preparation_conflict_hook {
+            hook(0, owner.store());
+        }
         let prepared_documents = match document_result {
             Ok(prepared) => prepared,
             Err(crate::document::Error::Store(durable_store::Error::Conflict { .. })) => {
@@ -2553,6 +2845,15 @@ impl Scheduler {
                     running.task.id(),
                     self.validator.is_none(),
                 )? {
+                    if nonblocking_abort && self.validator.is_some() {
+                        *deferred = Some(DeferredSettlement::PreparationConflict(
+                            PreparationConflict {
+                                attachment: self.attachment.clone(),
+                                running: current.clone(),
+                            },
+                        ));
+                        return Err(Error::PendingAbort(root));
+                    }
                     self.abort_failed_running(&owner, root, running.task.id(), _gate)?;
                     self.poisoned
                         .store(false, std::sync::atomic::Ordering::Release);
@@ -2568,6 +2869,8 @@ impl Scheduler {
                         "document conflict: execution outcome requires reconciliation".into(),
                         &owner,
                         _gate,
+                        nonblocking_abort,
+                        deferred,
                     );
                 }
                 self.poisoned
@@ -2634,10 +2937,17 @@ impl Scheduler {
             graph_version: success_graph_version,
             attempts: 0,
         };
-        let result =
-            self.commit_prepared_settlement(&mut prepared, &owner, _gate, nonblocking_abort);
+        let result = self.commit_prepared_settlement(
+            &mut prepared,
+            &owner,
+            _gate,
+            nonblocking_abort,
+            deferred,
+        );
         if nonblocking_abort && matches!(result, Err(Error::PendingAbort(_))) {
-            *deferred = Some(DeferredSettlement::Prepared(prepared));
+            if deferred.is_none() {
+                *deferred = Some(DeferredSettlement::Prepared(prepared));
+            }
             return result;
         }
         #[cfg(test)]
@@ -2653,6 +2963,7 @@ impl Scheduler {
         owner: &Arc<OwnedStore>,
         _gate: std::sync::MutexGuard<'_, ()>,
         nonblocking_abort: bool,
+        deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
         const GRAPH_RETRIES: usize = 8;
         let committed = loop {
@@ -2750,6 +3061,8 @@ impl Scheduler {
                             "document conflict: execution outcome requires reconciliation".into(),
                             owner,
                             _gate,
+                            nonblocking_abort,
+                            deferred,
                         );
                     }
                 } else {
@@ -2777,7 +3090,7 @@ impl Scheduler {
     ) -> Result<bool, Error> {
         match prepared.revalidate(self, owner, &gate)? {
             PreparedRevalidation::Ready => {
-                self.commit_prepared_settlement(prepared, owner, gate, false)
+                self.commit_prepared_settlement(prepared, owner, gate, false, &mut None)
             }
             PreparedRevalidation::PendingAbort(root) => Err(Error::PendingAbort(root)),
             PreparedRevalidation::Aborted(latest) => {
@@ -2929,43 +3242,74 @@ impl Scheduler {
         Ok(())
     }
 
-    fn finish_failed_completed(
-        &self,
-        parent: &task_store::StoredTask,
-        reason: String,
-    ) -> Result<(), Error> {
-        self.finish_failed_inner(parent, reason, true)
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn finish_running_failure(
         &mut self,
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
         gate: std::sync::MutexGuard<'_, ()>,
+        nonblocking_abort: bool,
+        deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
-        match self.finish_failed_completed(parent, reason) {
-            Ok(()) => drop(gate),
-            Err(Error::PendingAbort(root)) => {
-                self.abort_failed_running(owner, root, parent.task.id(), gate)?
-            }
-            Err(error) => return Err(error),
-        }
-        self.poisoned
-            .store(false, std::sync::atomic::Ordering::Release);
-        Ok(true)
+        self.finish_running_owned_failure(
+            parent,
+            reason,
+            owner,
+            gate,
+            nonblocking_abort,
+            deferred,
+            true,
+        )
     }
+    #[allow(clippy::too_many_arguments)]
     fn finish_running_conflict(
         &mut self,
         parent: &task_store::StoredTask,
         reason: String,
         owner: &Arc<OwnedStore>,
         gate: std::sync::MutexGuard<'_, ()>,
+        nonblocking_abort: bool,
+        deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
-        match self.finish_failed_inner_with_pending(parent, reason, false, true, || {}) {
+        self.finish_running_owned_failure(
+            parent,
+            reason,
+            owner,
+            gate,
+            nonblocking_abort,
+            deferred,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn finish_running_owned_failure(
+        &mut self,
+        parent: &task_store::StoredTask,
+        reason: String,
+        owner: &Arc<OwnedStore>,
+        gate: std::sync::MutexGuard<'_, ()>,
+        nonblocking_abort: bool,
+        deferred: &mut Option<DeferredSettlement>,
+        completed: bool,
+    ) -> Result<bool, Error> {
+        let mut settlement = FailureSettlement {
+            attachment: self.attachment.clone(),
+            running: parent.clone(),
+            reason,
+            completed,
+            check_pending: true,
+            attempt: 0,
+            candidate: None,
+        };
+        match self.commit_failure_settlement(&mut settlement, || {}) {
             Ok(()) => drop(gate),
             Err(Error::PendingAbort(root)) => {
-                self.abort_failed_running(owner, root, parent.task.id(), gate)?
+                if nonblocking_abort && self.validator.is_some() {
+                    *deferred = Some(DeferredSettlement::Failure(settlement));
+                    return Err(Error::PendingAbort(root));
+                }
+                self.abort_failed_running(owner, root, parent.task.id(), gate)?;
             }
             Err(error) => return Err(error),
         }
@@ -2978,12 +3322,16 @@ impl Scheduler {
         parent: &task_store::StoredTask,
         owner: &Arc<OwnedStore>,
         gate: std::sync::MutexGuard<'_, ()>,
+        nonblocking_abort: bool,
+        deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
         self.finish_running_failure(
             parent,
             "invalid task wait or ownership cycle".into(),
             owner,
             gate,
+            nonblocking_abort,
+            deferred,
         )
     }
     fn finish_failed(&self, parent: &task_store::StoredTask, reason: String) -> Result<(), Error> {
@@ -3017,6 +3365,7 @@ impl Scheduler {
         before_commit: impl FnMut(),
     ) -> Result<(), Error> {
         let mut settlement = FailureSettlement {
+            attachment: self.attachment.clone(),
             running: parent.clone(),
             reason,
             completed,
@@ -3681,7 +4030,7 @@ mod tests {
                 unreachable!()
             }
         }
-        struct Staging(Address);
+        struct Staging(Address, bool);
         impl Handler for Staging {
             fn run(&self, _: &Task) -> Result<Step, String> {
                 unreachable!()
@@ -3706,11 +4055,19 @@ mod tests {
                 let staged = task(6, TaskOwner::Task(parent.id()), "spawn", false, 3);
                 docs.stage_keyed_child("keyed", "tool", staged.input(), staged.clone())
                     .unwrap();
-                Ok(Step::Succeed(json!("discard")))
+                if self.1 {
+                    Ok(Step::Fail("retained failure".into()))
+                } else {
+                    Ok(Step::Succeed(json!("discard")))
+                }
             }
         }
         for timing in [
             "before",
+            "prepare_conflict",
+            "prepare_conflict_stale",
+            "failure",
+            "failure_stale",
             "preparation",
             "commit",
             "stale",
@@ -3738,9 +4095,12 @@ mod tests {
             };
             let mut registry = Registry::default();
             registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
-            registry.register_with_abort("child", false, Staging(address.clone()), |_: &Task| {
-                Ok(Step::Succeed(json!(null)))
-            });
+            registry.register_with_abort(
+                "child",
+                false,
+                Staging(address.clone(), timing.starts_with("failure")),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
             registry.register("independent", false, |_: &Task| {
                 Ok(Step::Succeed(json!("independent")))
             });
@@ -3795,7 +4155,26 @@ mod tests {
             let owner = scheduler.owner();
             let control = owner.conversation_controls().get(Uuid::from_u128(99));
             let poll = control.gate.lock().unwrap();
-            if timing == "preparation" {
+            if timing.starts_with("prepare_conflict") || timing.starts_with("failure") {
+                let hook: CommitHook = Arc::new(move |attempt, store| {
+                    if attempt == 0 {
+                        let tasks = TaskStore::new(store);
+                        let sibling = tasks.load(Uuid::from_u128(3)).unwrap().unwrap();
+                        tasks
+                            .update(&sibling, |task| {
+                                task.start()?;
+                                task.fail("failed".into())
+                            })
+                            .unwrap();
+                    }
+                });
+                if timing.starts_with("prepare_conflict") {
+                    scheduler.inject_batch_prepare_conflict = true;
+                    scheduler.preparation_conflict_hook = Some(hook);
+                } else {
+                    scheduler.failure_commit_hook = Some(hook);
+                }
+            } else if timing == "preparation" {
                 scheduler.after_result_load_hook = Some(Arc::new(move |_, store| {
                     let tasks = TaskStore::new(store);
                     let sibling = tasks.load(Uuid::from_u128(3)).unwrap().unwrap();
@@ -3837,7 +4216,15 @@ mod tests {
                 Err(SettlementError::PendingPrepared { pending })
                     if matches!(
                         timing,
-                        "commit" | "stale" | "stale_doc" | "stale_signal" | "poison_prepared"
+                        "commit"
+                            | "stale"
+                            | "stale_doc"
+                            | "stale_signal"
+                            | "poison_prepared"
+                            | "prepare_conflict"
+                            | "prepare_conflict_stale"
+                            | "failure"
+                            | "failure_stale"
                     ) =>
                 {
                     *pending
@@ -3846,6 +4233,20 @@ mod tests {
             };
             scheduler.after_result_load_hook = None;
             scheduler.result_commit_hook = None;
+            scheduler.preparation_conflict_hook = None;
+            scheduler.failure_commit_hook = None;
+            scheduler.inject_batch_prepare_conflict = false;
+            if timing.starts_with("failure") {
+                assert!(
+                    matches!(&pending, PendingSettlement::Failure { settlement, .. } if settlement.reason == "retained failure" && settlement.candidate.is_some())
+                );
+            }
+            if timing.starts_with("prepare_conflict") {
+                assert!(matches!(
+                    &pending,
+                    PendingSettlement::PreparationConflict { .. }
+                ));
+            }
             if matches!(
                 timing,
                 "commit" | "stale" | "stale_doc" | "stale_signal" | "poison_prepared"
@@ -3910,7 +4311,10 @@ mod tests {
                 drop(pending);
                 continue;
             }
-            if matches!(timing, "stale" | "stale_doc" | "stale_signal") {
+            if matches!(
+                timing,
+                "stale" | "stale_doc" | "stale_signal" | "prepare_conflict_stale" | "failure_stale"
+            ) {
                 // Simulate an external graph rewrite after conflict discovery.
                 let _gate = owner.task_gate().lock().unwrap();
                 let current = scheduler.ts().load(sibling.id()).unwrap().unwrap();
@@ -3954,7 +4358,14 @@ mod tests {
             if timing == "stale" {
                 assert_eq!(child.state(), &TaskState::Completing(json!("discard")));
                 assert!(!child.abort_requested());
-            } else if timing == "stale_doc" || timing == "stale_signal" {
+            } else if timing == "failure_stale" {
+                assert!(
+                    matches!(child.state(), TaskState::Failed(reason) if reason == "retained failure")
+                );
+            } else if timing == "stale_doc"
+                || timing == "stale_signal"
+                || timing == "prepare_conflict_stale"
+            {
                 assert!(
                     matches!(child.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
                 );
@@ -5981,6 +6392,7 @@ mod tests {
         scheduler.ts().save(&[Save::Create(&parent)]).unwrap();
         let running = scheduler.ts().load(parent.id()).unwrap().unwrap();
         let mut settlement = FailureSettlement {
+            attachment: scheduler.attachment.clone(),
             running: running.clone(),
             reason: "retained failure".into(),
             completed: true,
