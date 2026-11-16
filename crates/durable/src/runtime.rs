@@ -17558,6 +17558,27 @@ fn apply_failed_run_policy(c: &mut Conversation) {
     match c.after_failed_run {
         AfterFailedRun::Keep => {}
         AfterFailedRun::Continue => {
+            // Ordered resets, summaries and writes need their existing boundary
+            // processing before inputs can be placed in the transcript.
+            if c.pending_resets.is_empty()
+                && c.pending_independent_summary.is_none()
+                && !c
+                    .application_writes
+                    .iter()
+                    .any(|w| !w.placed && !w.withdrawn)
+            {
+                let failure = c.run_failure.clone();
+                if place_queued(c, true) {
+                    c.run_failure = failure;
+                    c.auto_compaction_attempted = false;
+                    c.retry_state = RetryState::default();
+                    c.overflow_compaction_attempted = false;
+                    c.phase = Phase::ModelReady { turns: 0 };
+                } else {
+                    c.phase = Phase::Idle;
+                }
+                return;
+            }
             c.failure_continuation_inputs = c
                 .submissions
                 .iter()
@@ -17688,6 +17709,8 @@ mod scheduler_tests {
         next.status = Status::Queued;
         c.submissions.push(next);
         c.after_failed_run = AfterFailedRun::Continue;
+        c.pending_resets
+            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
         finish_failure(&mut c, "failure".into(), FailureCause::ModelError);
         apply_failed_run_policy(&mut c);
         let mut restored: Conversation =
