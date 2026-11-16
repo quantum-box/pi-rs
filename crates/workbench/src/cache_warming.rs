@@ -45,7 +45,13 @@ impl Mode {
     fn load(workspace: &Path) -> Option<Self> {
         super::config::Settings::load(workspace, false)
             .ok()
-            .map(|settings| Self::from_settings(&settings))
+            .and_then(|settings| Self::from_loaded(&settings))
+    }
+    fn from_loaded(settings: &super::config::Settings) -> Option<Self> {
+        settings
+            .diagnostics()
+            .is_empty()
+            .then(|| Self::from_settings(settings))
     }
 }
 
@@ -805,6 +811,16 @@ mod tests {
     use super::*;
     use pi_rs::ModelStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn broken_settings_do_not_enable_cache_warming() {
+        let settings: super::super::config::Settings = serde_json::from_value(serde_json::json!({
+            "value":{}, "resource_layers":[], "diagnostics":["invalid settings"],
+            "live_auto_retry":null, "live_auto_compaction":null
+        }))
+        .unwrap();
+        assert!(Mode::from_loaded(&settings).is_none());
+    }
 
     struct FlakyRefresh {
         attempts: AtomicUsize,

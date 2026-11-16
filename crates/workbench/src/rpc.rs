@@ -35,12 +35,23 @@ pub(super) fn run(
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
     }
-    super::backend::initialize_queue_modes(&mut session, &args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, &mut args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
     drop(session);
+    let reported_settings = args.settings.diagnostics().to_vec();
     interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -2310,6 +2321,7 @@ fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
 }
 
 fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
+    args.settings.fork_worker_history();
     args.refresh_workspace_selection();
     args.session = if args.no_session {
         args.session
@@ -2326,7 +2338,12 @@ fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
     }
     let mut session = Session::open(&args.session)?;
     session.set_working_directory(&args.workspace)?;
-    super::backend::initialize_queue_modes(&mut session, args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(parent) = parent {
         session.set_parent_session(parent)?;
     }
@@ -2348,8 +2365,12 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
     }
     drop(session);
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     next.session = path.to_path_buf();
     interactive::restore_workspace(&mut next)?;
+    for warning in next.settings.diagnostics() {
+        eprintln!("{warning}");
+    }
     *args = next;
     Ok(())
 }
@@ -2409,6 +2430,10 @@ fn forward_event(
 ) -> Result<()> {
     let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
+        Some("warning") => {
+            eprintln!("{}", event["message"].as_str().unwrap_or_default());
+            Ok(())
+        }
         Some("response") if event["command"] == "get_commands" => emit_command_catalog(event),
         Some("response")
             if matches!(
