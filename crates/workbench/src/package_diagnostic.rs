@@ -14,6 +14,73 @@ const MAX_IGNORE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXTGLOB_PATTERN: usize = 1024;
 const MAX_EXTGLOB_DEPTH: usize = 16;
 const MAX_EXTGLOB_INPUT: usize = 16 * 1024;
+const NEGATIVE_BACKTRACK_LIMIT: usize = 2_000;
+const MAX_NEGATIVE_EVALUATIONS: usize = 256;
+
+// One top-level negation with literal alternatives and a simple component
+// suffix. Anything more complex must keep using the diagnostic fallback.
+fn negative_extglob_regex(pattern: &str) -> Option<fancy_regex::Regex> {
+    if pattern.len() > MAX_EXTGLOB_PATTERN
+        || !pattern.is_ascii()
+        || pattern.contains(['[', ']', '{', '}'])
+        || pattern.contains("**")
+    {
+        return None;
+    }
+    let start = pattern.find("!(")?;
+    if has_extglob(&pattern[..start]) {
+        return None;
+    }
+    let end = start + 2 + pattern[start + 2..].find(')')?;
+    let alternatives = &pattern[start + 2..end];
+    if alternatives.split('|').any(|s| {
+        s.is_empty()
+            || !s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    }) {
+        return None;
+    }
+    let after = &pattern[end + 1..];
+    if has_extglob(after) || after.contains(['(', ')', '|']) {
+        return None;
+    }
+    let suffix_end = after.find('/').unwrap_or(after.len());
+    let (suffix, rest) = after.split_at(suffix_end);
+    // Node's minimatch handles a terminal wildcard after !() differently
+    // from the suffix-aware lookahead below (including an empty match).
+    if suffix.ends_with(['*', '?']) {
+        return None;
+    }
+    fn simple(pattern: &str) -> Option<String> {
+        let mut result = String::new();
+        for c in pattern.chars() {
+            match c {
+                '*' => result.push_str("[^/]*?"),
+                '?' => result.push_str("[^/]"),
+                '(' | ')' | '|' => return None,
+                _ => result.push_str(&regex::escape(&c.to_string())),
+            }
+        }
+        Some(result)
+    }
+    let prefix = simple(&pattern[..start])?;
+    let suffix = simple(suffix)?;
+    let rest = simple(rest)?;
+    let alternatives = alternatives
+        .split('|')
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("|");
+    let expression =
+        format!(r"\A{prefix}(?!(?:{alternatives}){suffix}(?:/|\z))[^/]*?{suffix}{rest}\z");
+    fancy_regex::RegexBuilder::new(&expression)
+        .backtrack_limit(NEGATIVE_BACKTRACK_LIMIT)
+        .delegate_size_limit(1024 * 1024)
+        .delegate_dfa_size_limit(1024 * 1024)
+        .build()
+        .ok()
+}
 
 // This deliberately supports a bounded subset. In particular negated extglobs,
 // classes, braces and globstars require Node-specific semantics; falling back
@@ -139,6 +206,7 @@ pub(super) fn candidates(root: &Path, kind: Kind) -> Result<Option<Vec<PathBuf>>
         count: 0,
         ignore_bytes: 0,
         active: HashSet::new(),
+        negative_evaluations: 0,
     };
     let mut paths = Vec::new();
     for entry in entries
@@ -206,11 +274,19 @@ struct Scanner {
     count: usize,
     ignore_bytes: usize,
     active: HashSet<PathBuf>,
+    negative_evaluations: usize,
 }
 impl Scanner {
     fn tick(&mut self) -> bool {
         self.count += 1;
         self.count <= MAX_ENTRIES
+    }
+    fn match_negative(&mut self, regex: &fancy_regex::Regex, input: &str) -> Option<bool> {
+        self.negative_evaluations = self.negative_evaluations.checked_add(1)?;
+        if self.negative_evaluations > MAX_NEGATIVE_EVALUATIONS {
+            return None;
+        }
+        regex.is_match(input).ok()
     }
     fn glob(&mut self, root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
         // Keep discovery within the package and avoid walking through symlinked trees.
@@ -241,8 +317,17 @@ impl Scanner {
                 return None;
             }
         }
-        let extglob = extglob_regex(&normalized)?;
-        let matcher = if extglob.is_none() {
+        let negative = if normalized.contains("!(") {
+            Some(negative_extglob_regex(&normalized)?)
+        } else {
+            None
+        };
+        let extglob = if negative.is_none() {
+            extglob_regex(&normalized)?
+        } else {
+            None
+        };
+        let matcher = if extglob.is_none() && negative.is_none() {
             Some(
                 globset::GlobBuilder::new(&normalized)
                     .literal_separator(true)
@@ -295,6 +380,17 @@ impl Scanner {
                 let relative = entry.path().strip_prefix(root).ok()?;
                 let reachable = if normalized.contains("**") {
                     true
+                } else if prefix.contains("!(") {
+                    let regex = negative_extglob_regex(&prefix)?;
+                    let input = relative.to_str()?;
+                    if !input.is_ascii() || input.len() > MAX_EXTGLOB_INPUT {
+                        return None;
+                    }
+                    matched_bytes = matched_bytes.checked_add(input.len())?;
+                    if matched_bytes > MAX_IGNORE_BYTES {
+                        return None;
+                    }
+                    self.match_negative(&regex, &input.replace('\\', "/"))?
                 } else if let Some(regex) = extglob_regex(&prefix)? {
                     let input = relative.to_str()?;
                     if !input.is_ascii() {
@@ -315,7 +411,17 @@ impl Scanner {
                 }
             }
             let relative = entry.path().strip_prefix(root).ok()?;
-            let matched = if let Some(regex) = &extglob {
+            let matched = if let Some(regex) = &negative {
+                let input = relative.to_str()?;
+                if !input.is_ascii() || input.len() > MAX_EXTGLOB_INPUT {
+                    return None;
+                }
+                matched_bytes = matched_bytes.checked_add(input.len())?;
+                if matched_bytes > MAX_IGNORE_BYTES {
+                    return None;
+                }
+                self.match_negative(regex, &input.replace('\\', "/"))?
+            } else if let Some(regex) = &extglob {
                 let input = relative.to_str()?;
                 // Node matches UTF-16 code units, while Rust regex matches Unicode
                 // scalars; use the safe fallback for non-ASCII paths.
@@ -591,6 +697,11 @@ mod tests {
             "@(p|q)/*.@(md|txt)",
             "p/*.@(md|)",
             "p/@(a|b)?(b|c)*.md",
+            "p/!(a|b)*.md",
+            "p/!(a)ba*.md",
+            "p/*.!(md|txt)",
+            "p/!(a)*.txt",
+            "p/!(missing)*.zzz",
         ];
         let output = std::process::Command::new("node")
             .args(["-e", "const f=require('fs'); if(!f.globSync)process.exit(77); const p=JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(p.map(x=>f.globSync(x,{cwd:process.cwd()}).sort())))", &serde_json::to_string(&patterns).unwrap()])
@@ -611,6 +722,7 @@ mod tests {
                 count: 0,
                 ignore_bytes: 0,
                 active: HashSet::new(),
+                negative_evaluations: 0,
             };
             let actual = scanner.glob(root.path(), pattern).unwrap();
             let expected: Vec<_> = expected
@@ -662,6 +774,71 @@ mod tests {
             candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
             vec![root.path().join("prompts/a.md")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn negative_extglob_symlink_prefix_checks_reachability() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("p");
+        std::fs::create_dir_all(parent.join("good.dir")).unwrap();
+        std::fs::write(parent.join("good.dir/a.md"), "prompt").unwrap();
+        std::os::unix::fs::symlink(parent.join("good.dir"), parent.join("blocked.dir")).unwrap();
+        let pattern = "p/!(blocked).dir/*.md";
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":[pattern]}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
+            vec![parent.join("good.dir/a.md")]
+        );
+        let mut scanner = Scanner {
+            count: 0,
+            ignore_bytes: 0,
+            active: HashSet::new(),
+            negative_evaluations: 0,
+        };
+        assert!(scanner.glob(root.path(), pattern).is_some());
+        // The extra evaluation is the symlink prefix reachability check.
+        assert_eq!(scanner.negative_evaluations, scanner.count + 1);
+        // A link that matches the prefix could contain candidates and must fall back.
+        std::os::unix::fs::symlink(parent.join("good.dir"), parent.join("other.dir")).unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+    }
+
+    #[test]
+    fn terminal_wildcard_negative_extglob_discards_partial_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        std::fs::write(root.path().join("p/a.md"), "prompt").unwrap();
+        for pattern in [
+            "p/!(a.md)*",
+            "p/!(a.md)?",
+            "p/*.!(md|txt)*",
+            "p/!(a.md)*/child.md",
+        ] {
+            std::fs::write(
+                root.path().join("package.json"),
+                serde_json::json!({"pi":{"prompts":["p/a.md", pattern]}}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                candidates(root.path(), Kind::Prompt).unwrap().is_none(),
+                "{pattern}"
+            );
+        }
+        // Node's globSync includes a.md for this pattern; do not assert an
+        // empty set just because our bounded matcher cannot represent it.
+        let output = std::process::Command::new("node").args(["-e", "const f=require('fs'); if(!f.globSync)process.exit(77); process.stdout.write(JSON.stringify(f.globSync('p/!(a.md)*',{cwd:process.cwd()})))"]).current_dir(root.path()).output();
+        if let Ok(output) = output
+            && output.status.code() != Some(77)
+        {
+            assert!(output.status.success());
+            let paths: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(paths.contains(&"p/a.md".to_owned()));
+        }
     }
 
     #[test]
@@ -731,8 +908,10 @@ mod tests {
         std::fs::create_dir(root.path().join("p")).unwrap();
         std::fs::write(root.path().join("p/a.md"), "fixture").unwrap();
         for pattern in [
-            "p/*.!(md|txt)",
             "p/@(a|!(b))*.md",
+            "p/!(!(b))*.md",
+            "p/!(a|@(b|c))*.md",
+            "p/!(a)*!(b).md",
             "p/@(a|b/*.md)",
             "p/@(a|b*.md",
             "p/**/@(a|b)*",
@@ -757,6 +936,111 @@ mod tests {
         assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
         assert!(extglob_regex(&format!("{}*.md", "@(a|".repeat(MAX_EXTGLOB_DEPTH + 1))).is_none());
         assert!(extglob_regex(&format!("{}@(a|b)*", "a".repeat(MAX_EXTGLOB_PATTERN))).is_none());
+    }
+
+    #[test]
+    fn negative_extglob_budget_discards_all_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        std::fs::write(root.path().join("p/a.md"), "fixture").unwrap();
+        let mut entries = vec!["p/a.md".to_owned()];
+        entries.extend(std::iter::repeat_n(
+            "p/!(x)*.md".to_owned(),
+            MAX_NEGATIVE_EVALUATIONS,
+        ));
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":entries}}).to_string(),
+        )
+        .unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+    }
+
+    #[test]
+    fn negative_extglob_backtrack_error_is_fallback() {
+        let regex = fancy_regex::RegexBuilder::new(r"\A(?:(?!b)a|aa)+b\z")
+            .backtrack_limit(NEGATIVE_BACKTRACK_LIMIT)
+            .build()
+            .unwrap();
+        let input = format!("{}bc", "a".repeat(40));
+        assert!(regex.is_match(&input).is_err());
+        let mut scanner = Scanner {
+            count: 0,
+            ignore_bytes: 0,
+            active: HashSet::new(),
+            negative_evaluations: 0,
+        };
+        assert!(scanner.match_negative(&regex, &input).is_none());
+    }
+
+    #[test]
+    fn negative_extglob_multiple_manifest_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        for name in ["a.md", "b.md", "a.txt", "b.txt"] {
+            std::fs::write(root.path().join("p").join(name), "fixture").unwrap();
+        }
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["p/!(a)*.md", "p/!(b)*.txt"]}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
+            vec![root.path().join("p/b.md"), root.path().join("p/a.txt")]
+        );
+    }
+
+    #[test]
+    fn negative_extglob_generated_node_comparison() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("p")).unwrap();
+        for name in [
+            "a.md",
+            "ab.md",
+            "foo.md",
+            "foobar.md",
+            "xbar.md",
+            "b.txt",
+            "x.md.txt",
+        ] {
+            std::fs::write(root.path().join("p").join(name), "fixture").unwrap();
+        }
+        let mut patterns = Vec::new();
+        for prefix in ["", "x", "*", "?"] {
+            for alternatives in ["a", "foo|bar", "md|txt"] {
+                for suffix in ["*.md", "bar*.md", "*.txt", "*.missing"] {
+                    patterns.push(format!("p/{prefix}!({alternatives}){suffix}"));
+                }
+            }
+        }
+        let output = std::process::Command::new("node")
+            .args(["-e", "const f=require('fs'); if(!f.globSync)process.exit(77); const p=JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(p.map(x=>f.globSync(x,{cwd:process.cwd()}).sort())))", &serde_json::to_string(&patterns).unwrap()])
+            .current_dir(root.path()).output();
+        let Ok(output) = output else { return };
+        if output.status.code() == Some(77) {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<Vec<String>> = serde_json::from_slice(&output.stdout).unwrap();
+        for (pattern, expected) in patterns.iter().zip(expected) {
+            let mut scanner = Scanner {
+                count: 0,
+                ignore_bytes: 0,
+                active: HashSet::new(),
+                negative_evaluations: 0,
+            };
+            let actual = scanner.glob(root.path(), pattern).unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|name| root.path().join(name))
+                .collect();
+            assert_eq!(actual, expected, "{pattern}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -810,6 +1094,7 @@ mod tests {
                 count: 0,
                 ignore_bytes: 0,
                 active: HashSet::new(),
+                negative_evaluations: 0,
             };
             assert_eq!(
                 scanner.glob(root.path(), pattern).unwrap(),
@@ -985,6 +1270,7 @@ mod tests {
             count: MAX_ENTRIES,
             ignore_bytes: 0,
             active: HashSet::new(),
+            negative_evaluations: 0,
         };
         assert!(!scanner.source(&root.path().join("missing"), Kind::Prompt, &mut Vec::new()));
     }

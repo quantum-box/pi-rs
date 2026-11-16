@@ -176,9 +176,11 @@ back to native candidates on cycles, excessive traversal, unsafe ignore files,
 unsupported absolute/parent globs, potentially traversed directory symlinks,
 or unsupported
 extglob forms. Diagnostic
-extglob discovery supports bounded ASCII positive groups; negated groups,
-extglob overrides, non-ASCII paths, and combinations with classes, braces, or
-globstars fall back, so errors can still be missed in those
+extglob discovery supports bounded ASCII positive groups and a single negated
+group with literal alternatives and a supported suffix; complex negation,
+suffixes ending in wildcards, extglob overrides, non-ASCII
+paths, and combinations with classes, braces, or globstars fall back, so errors
+can still be missed in those
 cases. Package resources are evaluated in settings order, with project sources
 first.
 
