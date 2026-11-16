@@ -504,8 +504,8 @@ struct ToolDecisionMetadata {
     snapshot: crate::ToolDecisionSnapshot,
 }
 
-/// A validated decision from the source session or a settled fork's history.
-/// Historical decisions must not authorize execution in the fork.
+/// A decision from the active branch or historical session/branch context.
+/// Historical decisions must not authorize execution on the active branch.
 #[derive(Debug)]
 pub enum RecordedToolDecision {
     Legacy,
@@ -879,7 +879,9 @@ impl Session {
     }
 
     /// Validate the snapshot using the marker retained independently in the event.
-    /// A fork retains the original context and is reported as historical.
+    /// A fork retains the original context and is reported as historical. A
+    /// decision on an inactive branch is also historical, even in its source
+    /// session. Neither classification authorizes execution by itself.
     pub fn recorded_tool_decision(&self, id: u64) -> Result<RecordedToolDecision> {
         let record = id
             .checked_sub(1)
@@ -897,6 +899,14 @@ impl Session {
             return Err(Error::Session("record is not a model request".into()));
         };
         let Some(marker) = tool_decision else {
+            if self
+                .record_metadata(id)
+                .is_some_and(|metadata| metadata.get("toolDecision").is_some())
+            {
+                return Err(Error::Session(
+                    "tool decision metadata without a request marker".into(),
+                ));
+            }
             return Ok(RecordedToolDecision::Legacy);
         };
         if record.version < TOOL_DECISION_JOURNAL_VERSION
@@ -950,11 +960,18 @@ impl Session {
                 &marker.binding_sha256,
             )
             .map_err(|_| Error::Session("invalid tool decision snapshot".into()))?;
-        Ok(if self.session_id() == marker.origin_session_id {
-            RecordedToolDecision::Current(metadata.snapshot)
-        } else {
-            RecordedToolDecision::Historical(metadata.snapshot)
-        })
+        Ok(
+            if self.session_id() == marker.origin_session_id
+                && self
+                    .path(self.head)
+                    .iter()
+                    .any(|ancestor| ancestor.id == id)
+            {
+                RecordedToolDecision::Current(metadata.snapshot)
+            } else {
+                RecordedToolDecision::Historical(metadata.snapshot)
+            },
+        )
     }
 
     pub(crate) fn set_run_id(&mut self, run_id: Option<Uuid>) {
@@ -5768,6 +5785,111 @@ mod durable_tool_decision_tests {
             fork.recorded_tool_decision(next).unwrap(),
             RecordedToolDecision::Legacy
         ));
+    }
+
+    #[test]
+    fn durable_tool_decision_rejects_orphan_metadata_but_allows_unrelated_metadata() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (event, snapshot, request, declarations) = fixture(&session);
+        let id = session
+            .append_tool_decision_request(event, &snapshot, &request, &request, &declarations)
+            .unwrap()
+            .id;
+        let mut records = session.records().to_vec();
+        if let Event::ModelRequested { tool_decision, .. } = &mut records[id as usize - 1].event {
+            *tool_decision = None;
+        }
+        let orphan =
+            Session::from_records_with_metadata(records.clone(), session.record_metadata.clone())
+                .unwrap();
+        assert!(orphan.recorded_tool_decision(id).is_err());
+        let mut old_version = records.clone();
+        old_version[id as usize - 1].version = BRANCH_FALLBACK_JOURNAL_VERSION;
+        let old_orphan =
+            Session::from_records_with_metadata(old_version, session.record_metadata.clone())
+                .unwrap();
+        assert!(old_orphan.recorded_tool_decision(id).is_err());
+        let mut metadata = BTreeMap::new();
+        metadata.insert(id, serde_json::json!({"toolDecision": null}));
+        let orphan_null = Session::from_records_with_metadata(records.clone(), metadata).unwrap();
+        assert!(orphan_null.recorded_tool_decision(id).is_err());
+        let mut metadata = BTreeMap::new();
+        metadata.insert(id, serde_json::json!({"other": "value"}));
+        let unrelated = Session::from_records_with_metadata(records.clone(), metadata).unwrap();
+        assert!(matches!(
+            unrelated.recorded_tool_decision(id).unwrap(),
+            RecordedToolDecision::Legacy
+        ));
+        // Without either field, this is indistinguishable from an ordinary
+        // request written after the journal's version had already advanced.
+        let both_missing = Session::from_records(records).unwrap();
+        assert!(matches!(
+            both_missing.recorded_tool_decision(id).unwrap(),
+            RecordedToolDecision::Legacy
+        ));
+    }
+
+    #[test]
+    fn durable_tool_decision_on_inactive_branch_is_historical() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let base = session.head();
+        let (event, snapshot, request, declarations) = fixture(&session);
+        let id = session
+            .append_tool_decision_request(event, &snapshot, &request, &request, &declarations)
+            .unwrap()
+            .id;
+        assert!(matches!(
+            session.recorded_tool_decision(id).unwrap(),
+            RecordedToolDecision::Current(_)
+        ));
+        session.checkout(base).unwrap();
+        assert!(matches!(
+            session.recorded_tool_decision(id).unwrap(),
+            RecordedToolDecision::Historical(_)
+        ));
+        session.checkout(id).unwrap();
+        assert!(matches!(
+            session.recorded_tool_decision(id).unwrap(),
+            RecordedToolDecision::Current(_)
+        ));
+    }
+
+    #[test]
+    fn durable_tool_decision_version_is_monotonic_but_not_a_per_request_marker() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let base = session.head();
+        let (event, snapshot, request, declarations) = fixture(&session);
+        let id = session
+            .append_tool_decision_request(event, &snapshot, &request, &request, &declarations)
+            .unwrap()
+            .id;
+        session.checkout(base).unwrap();
+        let (ordinary, _, _, _) = fixture(&session);
+        let ordinary_id = session.append(ordinary).unwrap().id;
+        let mut downgraded = session.records().to_vec();
+        downgraded[ordinary_id as usize - 1].version = TOOL_DECISION_JOURNAL_VERSION - 1;
+        assert!(Session::from_records(downgraded).is_err());
+        // A fork can omit the marked request while retaining later v5 records.
+        let fork = session.fork_session(ordinary_id).unwrap();
+        assert!(fork.records().iter().all(|record| !matches!(
+            record.event,
+            Event::ModelRequested {
+                tool_decision: Some(_),
+                ..
+            }
+        )));
+        assert!(matches!(
+            fork.recorded_tool_decision(fork.head()).unwrap(),
+            RecordedToolDecision::Legacy
+        ));
+        assert_eq!(
+            fork.records().last().unwrap().version,
+            TOOL_DECISION_JOURNAL_VERSION
+        );
+        assert_eq!(
+            session.records()[id as usize - 1].version,
+            TOOL_DECISION_JOURNAL_VERSION
+        );
     }
 
     #[test]
