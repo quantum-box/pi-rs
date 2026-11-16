@@ -14,6 +14,7 @@ pub(super) const BLOCKED_IMAGE: &str = "Image reading is disabled.";
 const NON_VISION_USER_IMAGE: &str = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE: &str = "(tool image omitted: model does not support images)";
 
+#[derive(Clone)]
 pub(super) struct WorkbenchModel {
     pub client: Client,
     pub block_images: bool,
@@ -24,6 +25,33 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch + 'a>>> {
+        if !self.client.supports_prepared_tool_dispatch() {
+            pi_rs::validate_legacy_tool_declarations(request, declarations)?;
+            return Ok(None);
+        }
+        let (client, headers) = if context.summary {
+            (self.client.clone(), HeaderMap::new())
+        } else {
+            self.affinity_headers(&context.external_id).await?
+        };
+        let request = self.filtered(request.clone());
+        Ok(client
+            .prepare_tool_dispatch_with_headers(&request, declarations, context, &headers, true)
+            .await?
+            .map(|inner| {
+                Box::new(PreparedWorkbenchToolDispatch {
+                    inner,
+                    owner: self.clone(),
+                }) as Box<dyn pi_rs::PreparedToolDispatch>
+            }))
+    }
+
     async fn prepare_context<'a>(
         &'a self,
         request: &ModelRequest,
@@ -195,8 +223,41 @@ struct PreparedWorkbenchModel {
     identity: Option<String>,
 }
 
+struct PreparedWorkbenchToolDispatch {
+    inner: Box<dyn pi_rs::PreparedToolDispatch>,
+    owner: WorkbenchModel,
+}
+
+#[async_trait::async_trait]
+impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
+    fn effective_tools(&self) -> &[pi_rs::EffectiveToolDeclaration] {
+        self.inner.effective_tools()
+    }
+
+    fn reservation_request(&self) -> &ModelRequest {
+        self.inner.reservation_request()
+    }
+
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs::DetailedModelStream> {
+        Ok(self
+            .owner
+            .estimate_detailed_usage(self.inner.dispatch().await?))
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch + 'a>>> {
+        self.inner
+            .prepare_tool_dispatch(request, declarations, context)
+            .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         self.identity.clone()
     }

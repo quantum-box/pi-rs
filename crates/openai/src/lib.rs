@@ -86,6 +86,7 @@ pub struct OpenAiResponses {
 pub struct PreparedResponsesRequest {
     client: OpenAiResponses,
     request: ModelRequest,
+    reservation_request: ModelRequest,
     wire_tools: Vec<Value>,
     effective_tools: Vec<pi_rs_core::EffectiveToolDeclaration>,
 }
@@ -122,7 +123,46 @@ impl PreparedResponsesRequest {
     }
 }
 
+struct PreparedResponsesDispatch {
+    request: PreparedResponsesRequest,
+    context: pi_rs_core::ToolDispatchContext,
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedResponsesDispatch {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        self.request.effective_tools()
+    }
+
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.request.reservation_request
+    }
+
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        if self.context.summary {
+            self.request.stream_for_summary().await
+        } else {
+            self.request
+                .stream_in_session(&self.context.external_id)
+                .await
+        }
+    }
+}
+
 impl OpenAiResponses {
+    /// Prepare an owned dispatch bound to its request and session context.
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        Ok(Box::new(PreparedResponsesDispatch {
+            request: self.prepare_tool_request(request.clone(), declarations)?,
+            context: context.clone(),
+        }))
+    }
+
     /// Resolve tool constraints once and bind their decisions to this request.
     pub fn prepare_tool_request(
         &self,
@@ -131,9 +171,14 @@ impl OpenAiResponses {
     ) -> Result<PreparedResponsesRequest> {
         let (wire_tools, effective_tools) =
             resolved_constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let mut reservation_request = request.clone();
+        for (spec, wire) in reservation_request.tools.iter_mut().zip(&wire_tools) {
+            spec.parameters = wire["parameters"].clone();
+        }
         Ok(PreparedResponsesRequest {
             client: self.clone(),
             request,
+            reservation_request,
             wire_tools,
             effective_tools,
         })
@@ -683,6 +728,18 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
     fn context_identity(&self) -> Option<String> {
         if !self.identity_safe_transport {
             return None;
@@ -2005,14 +2062,24 @@ mod tests {
         let model =
             OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
                 .unwrap();
-        let prepared = model
-            .prepare_tool_request(req.clone(), &[declaration])
+        let mut context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "prepared-session".into(),
+            summary: false,
+        };
+        let prepared = (&model as &dyn Model)
+            .prepare_tool_dispatch(&req, &[declaration], &context)
+            .await
+            .unwrap()
             .unwrap();
+        context.external_id = "changed-after-preparation".into();
+        assert_eq!(context.external_id, "changed-after-preparation");
         assert!(matches!(
             prepared.effective_tools()[0].sampling,
             pi_rs_core::EffectiveToolSampling::Unconstrained
         ));
-        let _ = prepared.stream_in_session("prepared-session").await;
+        let _ = prepared.dispatch().await;
         let (headers, body) = server.join().unwrap();
         assert!(
             headers

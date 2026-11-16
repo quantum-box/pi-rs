@@ -30,8 +30,56 @@ pub(crate) struct BudgetedModel<'a> {
     pub recorded_usage: Mutex<BTreeSet<Uuid>>,
 }
 
+struct PreparedBudgetDispatch<'a> {
+    inner: Box<dyn pi_rs_core::PreparedToolDispatch + 'a>,
+    scope: &'a RunScope,
+    budget: &'a dyn BudgetPort,
+    request: ModelRequest,
+    request_id: Uuid,
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedBudgetDispatch<'_> {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        self.inner.effective_tools()
+    }
+
+    fn reservation_request(&self) -> &ModelRequest {
+        self.inner.reservation_request()
+    }
+
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        self.budget
+            .reserve(self.scope, self.request_id, &self.request)
+            .await?;
+        self.inner.dispatch().await
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(self
+            .inner
+            .prepare_tool_dispatch(request, declarations, context)
+            .await?
+            .map(|inner| {
+                let request = inner.reservation_request().clone();
+                Box::new(PreparedBudgetDispatch {
+                    inner,
+                    scope: self.scope,
+                    budget: self.budget,
+                    request,
+                    request_id: context.request_id,
+                }) as Box<dyn pi_rs_core::PreparedToolDispatch + 'a>
+            }))
+    }
+
     async fn prepare_context<'a>(
         &'a self,
         request: &ModelRequest,
@@ -211,6 +259,28 @@ struct PreparedBudgetedModel<'a, 'b> {
 
 #[async_trait::async_trait]
 impl Model for PreparedBudgetedModel<'_, '_> {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(self
+            .inner
+            .prepare_tool_dispatch(request, declarations, context)
+            .await?
+            .map(|inner| {
+                let request = inner.reservation_request().clone();
+                Box::new(PreparedBudgetDispatch {
+                    inner,
+                    scope: self.parent.scope,
+                    budget: self.parent.budget,
+                    request,
+                    request_id: context.request_id,
+                }) as Box<dyn pi_rs_core::PreparedToolDispatch + 'a>
+            }))
+    }
+
     fn context_identity(&self) -> Option<String> {
         self.inner.context_identity()
     }
@@ -448,11 +518,16 @@ mod external_identity_tests {
     struct Budget {
         reservations: Mutex<Vec<Uuid>>,
         settlements: Mutex<Vec<(Uuid, UsageReport)>>,
+        reservation_requests: Mutex<Vec<ModelRequest>>,
     }
     #[async_trait::async_trait]
     impl BudgetPort for Budget {
-        async fn reserve(&self, _: &RunScope, id: Uuid, _: &ModelRequest) -> Result<()> {
+        async fn reserve(&self, _: &RunScope, id: Uuid, request: &ModelRequest) -> Result<()> {
             self.reservations.lock().unwrap().push(id);
+            self.reservation_requests
+                .lock()
+                .unwrap()
+                .push(request.clone());
             Ok(())
         }
         async fn settle(&self, _: &RunScope, id: Uuid, usage: &UsageReport) -> Result<()> {
@@ -466,8 +541,61 @@ mod external_identity_tests {
         receipts: Arc<Mutex<Vec<Uuid>>>,
         enriched: Arc<Mutex<Vec<(Uuid, Uuid, String)>>>,
     }
+
+    struct TestPreparedDispatch {
+        context: pi_rs_core::ToolDispatchContext,
+        calls: Arc<Mutex<Vec<(Uuid, Uuid, String)>>>,
+        request: ModelRequest,
+        effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
+    }
+    #[async_trait::async_trait]
+    impl pi_rs_core::PreparedToolDispatch for TestPreparedDispatch {
+        fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+            &self.effective
+        }
+        fn reservation_request(&self) -> &ModelRequest {
+            &self.request
+        }
+        async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+            self.calls.lock().unwrap().push((
+                self.context.request_id,
+                self.context.session_id,
+                if self.context.summary {
+                    "summary".into()
+                } else {
+                    self.context.external_id.clone()
+                },
+            ));
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
     #[async_trait::async_trait]
     impl Model for Inner {
+        async fn prepare_tool_dispatch<'a>(
+            &'a self,
+            request: &ModelRequest,
+            _: &[pi_rs_core::ToolDeclaration],
+            context: &pi_rs_core::ToolDispatchContext,
+        ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+            let mut reservation = request.clone();
+            if let Some(tool) = reservation.tools.first_mut() {
+                tool.parameters["required"] = serde_json::json!(["path"]);
+            }
+            let effective = request
+                .tools
+                .iter()
+                .map(|spec| pi_rs_core::EffectiveToolDeclaration {
+                    spec: spec.clone(),
+                    sampling: pi_rs_core::EffectiveToolSampling::Unconstrained,
+                })
+                .collect();
+            Ok(Some(Box::new(TestPreparedDispatch {
+                context: context.clone(),
+                calls: self.enriched.clone(),
+                request: reservation,
+                effective,
+            })))
+        }
         async fn prepare_context<'a>(
             &'a self,
             _: &ModelRequest,
@@ -557,6 +685,86 @@ mod external_identity_tests {
             self.receipts.lock().unwrap().push(request_id);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_tool_dispatch_reserves_at_dispatch_for_both_wrappers() {
+        let scope = RunScope {
+            tenant: "t".into(),
+            actor: "a".into(),
+            workspace: "w".into(),
+            journal_run_id: Uuid::new_v4(),
+            aip_run: "r".into(),
+            parent_run: None,
+            audit_id: "audit".into(),
+        };
+        let budget = Budget::default();
+        let inner = Inner::default();
+        let wrapper = BudgetedModel {
+            scope: &scope,
+            inner: &inner,
+            budget: &budget,
+            recorded_usage: Mutex::default(),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![pi_rs_core::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            }],
+            max_output_tokens: 1,
+        };
+        let prepared_model = wrapper.prepare_context(&request).await.unwrap().unwrap();
+        let declarations = [pi_rs_core::ToolDeclaration {
+            spec: request.tools[0].clone(),
+            constrained_sampling: None,
+        }];
+        let mut ids = Vec::new();
+        for (model, summary) in [
+            (&wrapper as &dyn Model, false),
+            (prepared_model.as_ref(), true),
+        ] {
+            let id = Uuid::new_v4();
+            let context = pi_rs_core::ToolDispatchContext {
+                request_id: id,
+                session_id: Uuid::nil(),
+                external_id: "fixture".into(),
+                summary,
+            };
+            let dispatch = model
+                .prepare_tool_dispatch(&request, &declarations, &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                budget.reservations.lock().unwrap().as_slice(),
+                ids.as_slice()
+            );
+            let _ = dispatch.dispatch().await.unwrap();
+            ids.push(id);
+        }
+        assert_eq!(*budget.reservations.lock().unwrap(), ids);
+        assert!(
+            budget
+                .reservation_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.tools[0].parameters["required"]
+                    == serde_json::json!(["path"]))
+        );
+        assert_eq!(
+            inner
+                .enriched
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.2.as_str())
+                .collect::<Vec<_>>(),
+            ["fixture", "summary"]
+        );
     }
     #[tokio::test]
     async fn prepared_and_unprepared_preserve_identity_and_budget() {

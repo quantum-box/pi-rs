@@ -697,6 +697,24 @@ impl From<EnrichedModelEvent> for DetailedModelEvent {
 }
 pub type DetailedModelStream = futures_util::stream::BoxStream<'static, Result<DetailedModelEvent>>;
 
+/// Identity and cache purpose fixed when preparing a model dispatch.
+#[derive(Clone, Debug)]
+pub struct ToolDispatchContext {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub external_id: String,
+    pub summary: bool,
+}
+
+/// An immutable prepared model dispatch and its actual tool-sampling decisions.
+#[async_trait::async_trait]
+pub trait PreparedToolDispatch: Send {
+    fn effective_tools(&self) -> &[crate::EffectiveToolDeclaration];
+    /// Request with the tool schemas actually sent, for budget estimation.
+    fn reservation_request(&self) -> &ModelRequest;
+    async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream>;
+}
+
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
     /// Resolve a request-specific adapter once for estimation and dispatch.
@@ -704,6 +722,19 @@ pub trait Model: Send + Sync {
         &'a self,
         _request: &ModelRequest,
     ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(None)
+    }
+
+    /// Prepare the actual tool decisions and dispatch together. A legacy
+    /// adapter may return `None` only after rejecting required constraints;
+    /// in that case every tool is treated as unconstrained.
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[crate::ToolDeclaration],
+        _context: &ToolDispatchContext,
+    ) -> Result<Option<Box<dyn PreparedToolDispatch + 'a>>> {
+        validate_legacy_tool_declarations(request, declarations)?;
         Ok(None)
     }
 
@@ -950,6 +981,19 @@ mod declaration_dispatch_tests {
             }),
         };
         let model = LegacyModel;
+        let context = ToolDispatchContext {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            external_id: "id".into(),
+            summary: false,
+        };
+        assert!(
+            model
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             model
                 .stream_detailed_with_tool_declarations(
@@ -965,6 +1009,12 @@ mod declaration_dispatch_tests {
         declaration.constrained_sampling = Some(crate::ToolConstraint::JsonSchema {
             strict: crate::StrictToolPolicy::Require,
         });
+        assert!(
+            model
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .is_err()
+        );
         assert!(
             model
                 .stream_detailed_with_tool_declarations(

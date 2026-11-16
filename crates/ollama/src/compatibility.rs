@@ -203,6 +203,11 @@ enum ThinkingFormat {
 }
 
 impl ChatCompatibility {
+    /// Whether the model explicitly declares strict tool support.
+    pub fn supports_strict_mode(&self) -> Option<bool> {
+        self.supports_strict_mode
+    }
+
     /// Model-specific values override the provider defaults field by field.
     pub fn overlay(self, model: Self) -> Self {
         let chat_template_args = match (self.chat_template_args, model.chat_template_args) {

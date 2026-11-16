@@ -454,6 +454,14 @@ impl Deferred {
 }
 
 impl Client {
+    pub fn supports_prepared_tool_dispatch(&self) -> bool {
+        match self {
+            Self::OpenAi(_) => true,
+            Self::Deferred(client) => client.adapter == Adapter::OpenAiResponses,
+            _ => false,
+        }
+    }
+
     /// Resolve dynamic credentials and request headers once before deciding
     /// which affinity defaults are actually needed.
     pub(super) async fn resolve_affinity_headers(&self) -> Result<(Self, HeaderMap)> {
@@ -782,6 +790,47 @@ impl Client {
         }
     }
 
+    pub async fn prepare_tool_dispatch_with_headers(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+        defaults: &HeaderMap,
+        workbench_routing: bool,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch>>> {
+        match self {
+            Self::OpenAi(client) => {
+                let client = client.clone().with_default_headers(defaults);
+                let client = if workbench_routing {
+                    client.with_session_affinity_format(
+                        pi_rs::openai::SessionAffinityFormat::Disabled,
+                    )
+                } else {
+                    client
+                };
+                Ok(Some(client.prepare_bound_tool_dispatch(
+                    request,
+                    declarations,
+                    context,
+                )?))
+            }
+            Self::Deferred(client) if client.adapter == Adapter::OpenAiResponses => {
+                Box::pin(client.resolve().await?.prepare_tool_dispatch_with_headers(
+                    request,
+                    declarations,
+                    context,
+                    defaults,
+                    workbench_routing,
+                ))
+                .await
+            }
+            _ => {
+                pi_rs::validate_legacy_tool_declarations(request, declarations)?;
+                Ok(None)
+            }
+        }
+    }
+
     pub fn aliases(&self) -> Vec<(String, String)> {
         match self {
             Self::PiMessages(client) => client.aliases(),
@@ -1081,6 +1130,12 @@ impl Client {
                     .responses_cache_support(&args.provider, metadata.as_ref());
                 let client = client
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
+                    .with_strict_tool_support(
+                        args.model_profiles
+                            .chat_compatibility(&args.provider, metadata.as_ref())
+                            .supports_strict_mode()
+                            .unwrap_or(false),
+                    )
                     .with_prompt_cache_key_enabled(
                         args.model_profiles
                             .responses_prompt_cache_key_enabled(&args.provider, metadata.as_ref()),
@@ -1193,6 +1248,22 @@ impl Client {
 
 #[async_trait::async_trait]
 impl Model for Client {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs::ToolDeclaration],
+        context: &pi_rs::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch + 'a>>> {
+        self.prepare_tool_dispatch_with_headers(
+            request,
+            declarations,
+            context,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         match self {
             Self::Ollama(c) => c.context_identity(),
@@ -1272,6 +1343,200 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn prepared_responses_dispatch_preserves_capability_and_session_policy() {
+        use clap::Parser;
+        use serde_json::Value;
+        use std::io::{Read, Write};
+        for (deferred, summary, direct) in [false, true].into_iter().flat_map(|deferred| {
+            [false, true].into_iter().flat_map(move |summary| {
+                [false, true]
+                    .into_iter()
+                    .map(move |direct| (deferred, summary, direct))
+            })
+        }) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut block = [0; 4096];
+                    let count = socket.read(&mut block).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&block[..count]);
+                }
+                let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/responses");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"openai-responses","baseUrl":endpoint,"compat":{"supportsStrictMode":true},"models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::OpenAiResponses,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::OpenAi(
+                    pi_rs::openai::OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap(),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let direct_client = client.clone();
+            let model = super::super::image_policy::WorkbenchModel {
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let declaration = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: pi_rs::StrictToolPolicy::Require,
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected = if direct {
+                None
+            } else {
+                model.prepare_context(&req).await.unwrap()
+            };
+            let selected: &dyn Model = selected.as_deref().unwrap_or(&direct_client);
+            let prepared = selected
+                .prepare_tool_dispatch(&req, &[declaration], &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                prepared.effective_tools()[0].sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+            let _ = prepared.dispatch().await;
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session-fixture")
+            );
+            assert_eq!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: session-fixture"),
+                !summary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_legacy_preparation_does_not_resolve_credentials() {
+        let client = Client::deferred(
+            Provider::named("anthropic").unwrap(),
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            None,
+            RequestHeaders::default(),
+        );
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        assert!(
+            client
+                .prepare_tool_dispatch(&request, &[], &context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let model = super::super::image_policy::WorkbenchModel {
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &["x-session-affinity"],
+            price: None,
+        };
+        assert!(
+            model
+                .prepare_tool_dispatch(&request, &[], &context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn deferred_radius_connect_waits_for_shared_credentials_and_can_cancel() {
