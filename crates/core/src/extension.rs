@@ -659,6 +659,13 @@ pub trait ToolHost: Send + Sync {
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Requested model-side sampling constraint, captured when the tool is registered.
+    /// The provider's effective decision may differ when fallback is allowed.
+    /// Agent dispatch currently rejects required JSON constraints until it can
+    /// record and replay the provider's effective decision.
+    fn constrained_sampling(&self) -> Option<crate::ToolConstraint> {
+        None
+    }
     /// Whether the host default execution timeout applies when none was explicitly configured.
     fn use_default_timeout(&self) -> bool {
         true
@@ -1835,6 +1842,7 @@ pub(crate) struct RegisteredTool {
     pub owner: String,
     pub tool: Arc<dyn Tool>,
     pub spec: ToolSpec,
+    pub constrained_sampling: Option<crate::ToolConstraint>,
     pub validator: jsonschema::Validator,
 }
 
@@ -2682,6 +2690,38 @@ impl Registry {
             .map(|(_, tool)| tool.spec.clone())
             .collect()
     }
+    /// Registered declarations selected for model advertisement. These are
+    /// requests to the provider, not evidence of the provider's decision.
+    pub fn active_tool_declarations(&self) -> Vec<crate::ToolDeclaration> {
+        self.tools
+            .iter()
+            .filter(|(name, _)| {
+                self.active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(*name))
+            })
+            .map(|(_, tool)| crate::ToolDeclaration {
+                spec: tool.spec.clone(),
+                constrained_sampling: tool.constrained_sampling.clone(),
+            })
+            .collect()
+    }
+    pub(crate) fn declarations_for_request(
+        &self,
+        request: &crate::ModelRequest,
+    ) -> Vec<crate::ToolDeclaration> {
+        request
+            .tools
+            .iter()
+            .map(|spec| crate::ToolDeclaration {
+                spec: spec.clone(),
+                constrained_sampling: self
+                    .tools
+                    .get(&spec.name)
+                    .and_then(|tool| tool.constrained_sampling.clone()),
+            })
+            .collect()
+    }
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec.clone()).collect()
     }
@@ -2808,6 +2848,7 @@ impl Registry {
         let mut tools = BTreeMap::new();
         for tool in extension.tools() {
             let spec = tool.spec();
+            let constrained_sampling = tool.constrained_sampling();
             let name = &spec.name;
             if name.is_empty()
                 || name.len() > 64
@@ -2834,6 +2875,7 @@ impl Registry {
                     owner: extension.id().to_owned(),
                     tool,
                     spec,
+                    constrained_sampling,
                     validator,
                 }),
             );
@@ -3975,6 +4017,60 @@ mod replacement_tests {
         async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
             Outcome::Succeeded(String::new())
         }
+    }
+
+    #[test]
+    fn active_declarations_capture_constraints_at_registration() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ConstrainedTool(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl Tool for ConstrainedTool {
+            fn spec(&self) -> ToolSpec {
+                TestTool("constrained").spec()
+            }
+            fn constrained_sampling(&self) -> Option<crate::ToolConstraint> {
+                self.0
+                    .load(Ordering::Relaxed)
+                    .then_some(crate::ToolConstraint::JsonSchema {
+                        strict: crate::StrictToolPolicy::Prefer,
+                    })
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                Outcome::Succeeded(String::new())
+            }
+        }
+        struct ConstrainedExtension(Arc<AtomicBool>);
+        impl Extension for ConstrainedExtension {
+            fn id(&self) -> &str {
+                "constrained-extension"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                vec![Arc::new(ConstrainedTool(self.0.clone()))]
+            }
+        }
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ConstrainedExtension(enabled.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(TestExtension("plain", "plain")))
+            .unwrap();
+        enabled.store(false, Ordering::Relaxed);
+        let declarations = registry.active_tool_declarations();
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0].spec, registry.active_tool_specs()[0]);
+        assert_eq!(
+            declarations[0].constrained_sampling,
+            Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            })
+        );
+        assert_eq!(declarations[1].constrained_sampling, None);
+        registry.set_active_tools(["plain".into()]).unwrap();
+        assert_eq!(registry.active_tool_declarations(), declarations[1..]);
     }
 
     #[test]

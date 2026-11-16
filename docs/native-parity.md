@@ -3688,6 +3688,11 @@ strict capability, including through the declaration-aware detailed model
 stream; callers must normalize returned arguments before validation. Legacy
 model implementations reject required constraints and can fall back for
 preferred constraints.
+Native tools can declare a constraint when registered; the registry retains
+that declaration alongside the registered tool definition. Until the native
+agent records effective decisions for recovery, it rejects required JSON Schema
+constraints before model dispatch and permits preferred constraints to fall
+back. Built-in tools do not yet opt in.
 The Responses SDK can also prepare a request once and inspect the effective
 strict-or-fallback decision bound to its wire tools before dispatch.
 Workbench and AIP prepared-dispatch wrappers preserve that decision, routing,

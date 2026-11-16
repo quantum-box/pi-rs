@@ -2695,6 +2695,19 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<ReplyAttempt> {
+        // Until prepared dispatch decisions are journaled and replayable,
+        // do not silently downgrade a registered required constraint.
+        let declarations = self.registry.declarations_for_request(&request);
+        if declarations.iter().any(|declaration| {
+            matches!(
+                declaration.constrained_sampling,
+                Some(crate::ToolConstraint::JsonSchema {
+                    strict: crate::StrictToolPolicy::Require
+                })
+            )
+        }) {
+            crate::validate_legacy_tool_declarations(&request, &declarations)?;
+        }
         let request_id = Uuid::new_v4();
         let allowance = request.max_output_tokens;
         let advertised_tools =
