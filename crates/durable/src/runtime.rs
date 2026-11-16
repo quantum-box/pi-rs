@@ -2489,6 +2489,39 @@ impl Drop for ResetProofScope {
     }
 }
 
+// Preserve every distinct original fence, including multiple versions or
+// prefix boundaries for the same key. Conflicting evidence must fail closed.
+fn merge_reset_proof_checks(checks: &mut Vec<Check>, additional: impl IntoIterator<Item = Check>) {
+    let mut seen: HashMap<Vec<u8>, Vec<Expected>> = HashMap::new();
+    for check in checks.iter() {
+        seen.entry(check.key.clone())
+            .or_default()
+            .push(check.expected.clone());
+    }
+    for check in additional {
+        let versions = seen.entry(check.key.clone()).or_default();
+        if !versions.contains(&check.expected) {
+            versions.push(check.expected.clone());
+            checks.push(check);
+        }
+    }
+}
+fn cached_reset_proof_checks(owner: &Arc<OwnedStore>) -> Vec<Check> {
+    let identity = Arc::as_ptr(owner) as usize;
+    RESET_PROOF_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        let mut checks = Vec::new();
+        if let Some(memo) = memo.as_ref() {
+            for (key, value) in memo {
+                if key.0 == identity {
+                    merge_reset_proof_checks(&mut checks, value.2.clone());
+                }
+            }
+        }
+        checks
+    })
+}
+
 struct AtomicResetPlan<'a> {
     steps: &'a [ResetDerivationStep],
     cuts: &'a [Conversation],
@@ -3841,6 +3874,9 @@ impl Harness {
                     mutations: batch.mutations.clone(),
                 })?;
             }
+            // Preparing a fork can itself validate nested reset origins. Fence
+            // every such proof in the same transaction that creates the child.
+            merge_reset_proof_checks(&mut prepared.checks, cached_reset_proof_checks(&self.owner));
             match self.commit_conversation_save(prepared) {
                 Ok(()) => break,
                 Err(Error::Storage(durable_store::Error::Conflict { key: conflict }))
@@ -7287,6 +7323,9 @@ impl Harness {
         if let Some(value) =
             RESET_PROOF_MEMO.with(|memo| memo.borrow().as_ref().and_then(|m| m.get(&key).cloned()))
         {
+            // A cached result is only a shortcut for computation, not a lease
+            // on mutable evidence. Check all original versions and prefixes.
+            self.owner.store().commit(&value.2, &[])?;
             return Ok(value);
         }
         #[cfg(test)]
@@ -7580,6 +7619,9 @@ impl Harness {
             key: event_key,
             expected: Expected::Version(event.version),
         });
+        // Nested origin validation can discover proofs whose return values are
+        // intentionally discarded. Carry their original fences to callers.
+        merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
         store.commit(&checks, &[])?;
         Ok((cuts[selected].clone(), revision, checks))
     }

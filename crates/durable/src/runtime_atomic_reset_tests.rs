@@ -1214,6 +1214,42 @@ fn reset_proof_replays_each_prior_cut_once_per_traversal() {
         "{replay_count} replays for {batches} batches"
     );
     let occurrence = cut.content_blocks.values().next().unwrap().message_id;
+    RESET_PROOF_REPLAYS.with(|count| count.set(0));
     let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+    let replay_count = RESET_PROOF_REPLAYS.with(std::cell::Cell::get);
+    assert!(
+        replay_count <= 2 * batches,
+        "{replay_count} fork replays for {batches} batches"
+    );
     assert_eq!(h.conversation(fork).unwrap().resets.len(), 2 * batches - 1);
+
+    // Change an earlier proof's evidence from another thread between cache
+    // hits. The old supporting fences must survive in both the cached result
+    // and any transaction that depends on the outer proof.
+    let _scope = ResetProofScope::enter();
+    let (_, _, checks) = h.prove_failure_reset_cut(id, &first, observation).unwrap();
+    let (entry, sequence) = first.entry_identity().unwrap();
+    let own_prefix = crate::reset_manifest::candidate_prefix(id, entry, sequence);
+    let nested = checks
+        .iter()
+        .find(|check| {
+            check.key.starts_with(b"runtime/reset-manifest/")
+                && !check.key.starts_with(&own_prefix)
+                && matches!(check.expected, Expected::Version(_))
+        })
+        .unwrap()
+        .key
+        .clone();
+    let owner = h.owner.clone();
+    std::thread::spawn(move || {
+        let value = owner.store().get(&nested).unwrap().unwrap().value;
+        owner
+            .store()
+            .commit(&[], &[Mutation::Put { key: nested, value }])
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    assert!(h.owner.store().commit(&checks, &[]).is_err());
+    assert!(h.prove_failure_reset_cut(id, &first, observation).is_err());
 }
