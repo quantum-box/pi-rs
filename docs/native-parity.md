@@ -3817,9 +3817,11 @@ backend recovery identity. Grammar tool execution remains unsupported. The OpenA
 Responses SDK can send explicitly supplied tool
 declarations with JSON Schema constraints when its caller supplies the model's
 strict capability through prepared dispatch. Declaration-aware stream-only
-methods reject an effective strict decision before dispatch because they cannot
-return that decision; preferred constraints may stream when they fall back to
-unconstrained sampling. Callers must retain prepared decisions and normalize a
+methods reject an effective strict decision before model dispatch because they
+cannot return that decision; preferred constraints may stream when they fall
+back to unconstrained sampling. Deferred preparation can resolve credentials,
+including running configured credential commands or refreshing credentials,
+before this rejection; authentication side effects are outside this guarantee. Callers must retain prepared decisions and normalize a
 copy of strict arguments before validation. Legacy
 model implementations reject required constraints and can fall back for
 preferred constraints.
@@ -3854,7 +3856,7 @@ The Chat Completions adapter also resolves explicitly supplied JSON Schema
 constraints for declaration-aware and prepared dispatch. It enables strict mode
 only when `supportsStrictMode` is explicitly true, preserves `strict: false`
 for unconstrained or preferred fallback tools when supported, and omits the
-field otherwise. Required constraints fail before dispatch when unsupported
+field otherwise. Required constraints fail before model dispatch when unsupported
 or unsafe to normalize. Prepared session and summary dispatch, including through resolved and deferred
 Workbench clients, bind decisions and budget estimates to the transformed wire
 schemas. Declaration-aware session and summary streams use the same prepared
