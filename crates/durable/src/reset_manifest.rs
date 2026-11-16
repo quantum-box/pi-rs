@@ -201,9 +201,10 @@ pub(crate) fn lookup_candidate(
         }
     }
     let root = format!("runtime/conversation/{id}").into_bytes();
-    let root_entry = store
-        .get_bounded(&root, 8 * 1024 * 1024)?
-        .ok_or(LookupError::Invalid)?;
+    // These are runtime-owned snapshots, whose size scales with the admitted
+    // conversation. They are already read by the runtime without a fixed cap;
+    // a proof lookup must not reject a snapshot that settlement accepted.
+    let root_entry = store.get(&root)?.ok_or(LookupError::Invalid)?;
     let root_json: serde_json::Value =
         serde_json::from_slice(&root_entry.value).map_err(|_| LookupError::Invalid)?;
     if root_json.get("id") != Some(&serde_json::json!(id)) {
@@ -211,16 +212,12 @@ pub(crate) fn lookup_candidate(
     }
     let anchor = format!("runtime/fork/{id}/{anchor_observation:020}").into_bytes();
     let fork_prefix = format!("runtime/fork/{id}/");
-    let anchor_entry = store
-        .get_bounded(&anchor, 8 * 1024 * 1024)?
-        .ok_or(LookupError::Invalid)?;
+    let anchor_entry = store.get(&anchor)?.ok_or(LookupError::Invalid)?;
     let mut event_key = b"durable/observer/".to_vec();
     event_key.extend_from_slice(id.as_bytes());
     event_key.extend_from_slice(b"/r");
     event_key.extend_from_slice(&anchor_observation.to_be_bytes());
-    let event = store
-        .get_bounded(&event_key, 8 * 1024 * 1024)?
-        .ok_or(LookupError::Invalid)?;
+    let event = store.get(&event_key)?.ok_or(LookupError::Invalid)?;
     let event_json: serde_json::Value =
         serde_json::from_slice(&event.value).map_err(|_| LookupError::Invalid)?;
     let anchor_json: serde_json::Value =

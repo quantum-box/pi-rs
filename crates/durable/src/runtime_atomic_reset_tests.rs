@@ -245,9 +245,10 @@ fn oversized_reset_settlement_and_fork_survive_reopen() {
     let (mut stopped, version) = h.load(id).unwrap();
     let occurrence = stopped.pending_reset_blocks[&steps[0].reset_id][0].message_id;
     for _ in stopped.pending_resets.len()..=crate::reset_manifest::MAX_SHARED_CUTS {
-        stopped
-            .pending_resets
-            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+        stopped.pending_resets.push(crate::reset::Reset::new(
+            Uuid::new_v4(),
+            Some("x".repeat(520)),
+        ));
     }
     stopped.phase = Phase::FailedModel {
         turns: 0,
@@ -260,6 +261,17 @@ fn oversized_reset_settlement_and_fork_survive_reopen() {
     finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
     h.save(&failure, Expected::Version(version)).unwrap();
     let state = h.conversation(id).unwrap();
+    let root = format!("runtime/conversation/{id}");
+    assert!(
+        h.owner
+            .store()
+            .get(root.as_bytes())
+            .unwrap()
+            .unwrap()
+            .value
+            .len()
+            > 8 * 1024 * 1024
+    );
     assert_eq!(
         state.resets.len(),
         crate::reset_manifest::MAX_SHARED_CUTS + 1
