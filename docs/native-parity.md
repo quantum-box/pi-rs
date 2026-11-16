@@ -380,7 +380,9 @@ The international, China, and individual Qwen Token Plan providers expose the
 pinned Pi model catalogs, regional credentials, per-model reasoning maps, and
 image limits. Their chat-completions requests use Qwen's `enable_thinking`
 switch, with `reasoning_effort` only where the selected model supports it.
-Explicit strict-mode support emits the reference `strict: false` tool setting.
+For models declaring strict-mode support, unconstrained and preferred fallback
+tools use `strict: false`, while successfully prepared strict tools use
+`strict: true` with the transformed schema.
 Loopback CLI coverage does not replace live Token Plan acceptance.
 
 ### Xiaomi MiMo checkpoint
