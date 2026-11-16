@@ -21,6 +21,14 @@ pub(crate) struct SessionChild {
     result_id: Uuid,
 }
 
+type SessionParts = (
+    Conversation,
+    OwnedBatch,
+    bool,
+    Vec<crate::task::Task>,
+    Vec<SessionChild>,
+);
+
 /// The candidate state of one host-initiated session transaction.
 pub struct SessionTransaction<'a> {
     store: &'a Store,
@@ -449,18 +457,7 @@ impl<'a> SessionTransaction<'a> {
         Ok(id)
     }
 
-    pub(crate) fn into_parts(
-        mut self,
-    ) -> Result<
-        (
-            Conversation,
-            OwnedBatch,
-            bool,
-            Vec<crate::task::Task>,
-            Vec<SessionChild>,
-        ),
-        Error,
-    > {
+    pub(crate) fn into_parts(mut self) -> Result<SessionParts, Error> {
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter

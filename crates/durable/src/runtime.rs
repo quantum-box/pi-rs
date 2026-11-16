@@ -4725,6 +4725,7 @@ impl Harness {
             None,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn save_composed_locked_with_fence(
         &mut self,
         state: &Conversation,
