@@ -3710,7 +3710,12 @@ dispatch, and exposes raw model tool arguments for caller normalization. It does
 not infer the current Pi catalog capability or wire this setting through native
 workbench configuration. Unlike Pi v1.5/current, it does not retry a rejected
 preferred strict request without strict mode: changing the wire decision after
-preparation would invalidate the recorded decision. Provider errors are returned.
+preparation would invalidate the recorded decision. Current Pi also remembers a
+strict-limit rejection for the session and sends subsequent preferred tools
+non-strict; this prepared path does not implement that session memoization.
+Provider errors are returned until a safe decision-bound fallback is available.
+Root combinators fall back for preferred constraints or fail when required,
+since dropping them from a strict schema would change its meaning.
 There is no claim of native agent end-to-end constrained sampling or recovery.
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the

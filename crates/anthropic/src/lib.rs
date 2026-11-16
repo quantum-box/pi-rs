@@ -1294,7 +1294,7 @@ fn anthropic_unsupported_keyword(key: &str, value: &Value) -> bool {
         "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf"
         | "maxItems" | "uniqueItems" | "minContains" | "maxContains" | "minProperties"
         | "maxProperties" => true,
-        "minItems" => value != &json!(0) && value != &json!(1),
+        "minItems" => !matches!(value.as_f64(), Some(n) if n == 0.0 || n == 1.0),
         "format" => !matches!(
             value.as_str(),
             Some(
@@ -1312,6 +1312,34 @@ fn anthropic_unsupported_keyword(key: &str, value: &Value) -> bool {
         ),
         _ => false,
     }
+}
+
+// Pi keeps strict root annotations, while ordinary tools use only the
+// Anthropic-supported root fields. Root combinators cannot be sent.
+fn anthropic_input_schema(parameters: &Value, strict: bool) -> Value {
+    let mut root = if strict {
+        parameters.as_object().cloned().unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for key in ["anyOf", "oneOf", "allOf"] {
+        root.remove(key);
+    }
+    root.insert("type".into(), json!("object"));
+    for (key, default) in [("properties", json!({})), ("required", json!([]))] {
+        let value = parameters
+            .get(key)
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(default);
+        root.insert(key.into(), value);
+    }
+    for key in ["additionalProperties", "$defs", "definitions"] {
+        if let Some(value) = parameters.get(key) {
+            root.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(root)
 }
 
 fn resolve_tools(
@@ -1334,13 +1362,18 @@ fn resolve_tools(
     let mut effective = Vec::new();
     for declaration in declarations {
         let spec = &declaration.spec;
+        // Removing a root constraint would change what strict sampling promises.
+        // Fall back or fail before advertising such a decision.
+        let root_combinator = ["anyOf", "oneOf", "allOf"]
+            .iter()
+            .any(|key| spec.parameters.get(key).is_some());
         let strict = match &declaration.constrained_sampling {
             Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
                 pi_rs_core::resolve_strict_tool_schema(
                     &spec.name,
                     &spec.parameters,
                     *strict,
-                    supported,
+                    supported && !root_combinator,
                     anthropic_unsupported_keyword,
                 )
                 .map_err(|error| Error::Config(error.to_string()))?
@@ -1355,7 +1388,12 @@ fn resolve_tools(
         } else {
             pi_rs_core::EffectiveToolSampling::Unconstrained
         };
-        let mut tool = json!({"name":spec.name,"description":spec.description,"input_schema":strict.as_ref().unwrap_or(&spec.parameters)});
+        let schema = anthropic_input_schema(
+            strict.as_ref().unwrap_or(&spec.parameters),
+            strict.is_some(),
+        );
+        let mut tool =
+            json!({"name":spec.name,"description":spec.description,"input_schema":schema});
         if strict.is_some() {
             tool["strict"] = json!(true);
         }
@@ -1399,7 +1437,7 @@ impl Model for Anthropic {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
-        pi_rs_core::protected_model_fingerprint(&(
+        let identity = (
             headers,
             "anthropic-v1",
             self.endpoint.as_str(),
@@ -1414,8 +1452,12 @@ impl Model for Anthropic {
             self.allow_empty_signature,
             self.cache_retention.anthropic_control(),
             self.cache_tools,
-            self.strict_tool_support,
-        ))
+        );
+        if self.strict_tool_support {
+            pi_rs_core::protected_model_fingerprint(&(identity, "strict-tools-v1"))
+        } else {
+            pi_rs_core::protected_model_fingerprint(&identity)
+        }
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -1976,6 +2018,131 @@ mod tests {
         let (req, mut decl) = constrained_fixture(P::Require, schema);
         decl.spec.name = "different".into();
         assert!(super::resolve_tools(&req, &[decl], true).is_err());
+    }
+
+    #[test]
+    fn constrained_root_projection_and_reservation_match() {
+        use pi_rs_core::{StrictToolPolicy as P, ToolDispatchContext};
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_support(true);
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let schema = json!({"type":"object", "anyOf":[{"type":"object"}], "oneOf":[], "allOf":[], "description":"omit", "additionalProperties":false, "$defs":{"x":{"type":"string"}}, "definitions":{}});
+        let (request, decl) = constrained_fixture(P::Prefer, schema);
+        let (wire, effective) = super::resolve_tools(&request, &[decl.clone()], true).unwrap();
+        assert!(matches!(
+            effective[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        assert_eq!(
+            wire[0]["input_schema"],
+            json!({"type":"object","properties":{},"required":[],"additionalProperties":false,"$defs":{"x":{"type":"string"}},"definitions":{}})
+        );
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            wire[0]["input_schema"]
+        );
+        let (required, declaration) = constrained_fixture(
+            P::Require,
+            json!({"type":"object","anyOf":[{"type":"string"}]}),
+        );
+        assert!(
+            model
+                .prepare_bound_tool_dispatch(&required, &[declaration], &context)
+                .is_err()
+        );
+
+        let (request, decl) =
+            constrained_fixture(P::Require, json!({"type":"object","title":"strict title"}));
+        let (wire, _) = super::resolve_tools(&request, &[decl.clone()], true).unwrap();
+        assert_eq!(wire[0]["strict"], true);
+        assert_eq!(wire[0]["input_schema"]["properties"], json!({}));
+        assert_eq!(wire[0]["input_schema"]["required"], json!([]));
+        assert_eq!(wire[0]["input_schema"]["title"], "strict title");
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            wire[0]["input_schema"]
+        );
+        let defaults =
+            super::anthropic_input_schema(&json!({"properties":null,"required":null}), false);
+        assert_eq!(
+            defaults,
+            json!({"type":"object","properties":{},"required":[]})
+        );
+    }
+
+    #[test]
+    fn constrained_min_items_accepts_javascript_numeric_equivalents() {
+        for number in [json!(0), json!(0.0), json!(1), json!(1.0), json!(-0.0)] {
+            assert!(
+                !super::anthropic_unsupported_keyword("minItems", &number),
+                "{number}"
+            );
+        }
+        for value in [json!(2), json!(0.5), json!("1"), Value::Null] {
+            assert!(
+                super::anthropic_unsupported_keyword("minItems", &value),
+                "{value}"
+            );
+        }
+        for number in [json!(0.0), json!(1.0)] {
+            let (request, decl) = constrained_fixture(
+                pi_rs_core::StrictToolPolicy::Require,
+                json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"string"},"minItems":number}}}),
+            );
+            assert!(super::resolve_tools(&request, &[decl], true).is_ok());
+        }
+    }
+
+    #[test]
+    fn constrained_capability_preserves_legacy_context_identity() {
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let mut headers: Vec<_> = model
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        let legacy = pi_rs_core::protected_model_fingerprint(&(
+            headers,
+            "anthropic-v1",
+            model.endpoint.as_str(),
+            model.provider.as_ref(),
+            model.replay_scope.as_ref(),
+            model.auth.0.as_str(),
+            model.auth.1.as_bytes(),
+            &model.thinking_level,
+            &model.thinking_budgets,
+            format!("{:?}", model.configured_thinking),
+            model.configured_thinking_is_fallback,
+            model.allow_empty_signature,
+            model.cache_retention.anthropic_control(),
+            model.cache_tools,
+        ));
+        assert!(legacy.is_some());
+        assert_eq!(model.context_identity(), legacy);
+        assert_eq!(
+            model
+                .clone()
+                .with_strict_tool_support(false)
+                .context_identity(),
+            legacy
+        );
+        assert_ne!(
+            model.with_strict_tool_support(true).context_identity(),
+            legacy
+        );
     }
 
     #[tokio::test]
