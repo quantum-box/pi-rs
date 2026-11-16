@@ -4149,7 +4149,7 @@ fn admit_task_draft(
 
 // Legacy admissions have no binding. Check both their destinations and
 // retained receipts before reserving a destination for a new admission.
-fn check_submission_destination(
+pub(crate) fn check_submission_destination(
     store: &durable_store::Store,
     notify: &SubmissionNotify,
 ) -> Result<bool, crate::document::Error> {

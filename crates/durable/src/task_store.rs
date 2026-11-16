@@ -433,14 +433,7 @@ impl<'a> TaskStore<'a> {
                     key: revision_key,
                     expected: revision.map_or(Expected::Missing, |e| Expected::Version(e.version)),
                 });
-                for (_, entry) in self.store.list(&signal_task_prefix(task.id()))? {
-                    let signal: Signal = serde_json::from_slice(&entry.value)?;
-                    if signal.typed_key().is_some_and(|k| wait_keys.contains(k))
-                        && (signal.consumed || signal.expired)
-                    {
-                        return Err(Error::SignalKeyConsumed);
-                    }
-                }
+                self.validate_typed_wait_keys(task.id(), wait_keys)?;
             }
             let key = key(task.id());
             if !seen.insert(key.clone()) {
@@ -456,6 +449,22 @@ impl<'a> TaskStore<'a> {
             });
         }
         Ok(OwnedBatch { checks, mutations })
+    }
+
+    pub(crate) fn validate_typed_wait_keys(
+        &self,
+        task_id: Uuid,
+        keys: &[SignalKey],
+    ) -> Result<(), Error> {
+        for (_, entry) in self.store.list(&signal_task_prefix(task_id))? {
+            let signal: Signal = serde_json::from_slice(&entry.value)?;
+            if signal.typed_key().is_some_and(|key| keys.contains(key))
+                && (signal.consumed || signal.expired)
+            {
+                return Err(Error::SignalKeyConsumed);
+            }
+        }
+        Ok(())
     }
 
     fn check_create_ownership(

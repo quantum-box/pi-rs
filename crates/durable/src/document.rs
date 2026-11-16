@@ -1402,6 +1402,21 @@ impl Transaction {
         true
     }
 
+    pub(crate) fn refresh_reservation_conversations(
+        &mut self,
+        old: u64,
+        new: u64,
+    ) -> bool {
+        let Some(check) = self.checks.iter_mut().find(|check| {
+            check.key == b"runtime/conversation/"
+                && check.expected == Expected::PrefixUnchangedSince(old)
+        }) else {
+            return false;
+        };
+        check.expected = Expected::PrefixUnchangedSince(new);
+        true
+    }
+
     pub(crate) fn assemble_submission_notifications(
         self,
         store: &Store,
