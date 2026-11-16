@@ -131,6 +131,30 @@ impl ValidatedToolDecisionSnapshot<'_> {
     pub fn effective_tools(&self) -> &[EffectiveToolDeclaration] {
         &self.snapshot.effective
     }
+
+    /// Parse a model call and normalize it only when this validated decision
+    /// says that strict JSON Schema sampling was actually used. The caller
+    /// must independently establish the call's request and branch provenance.
+    pub fn normalized_arguments(&self, call: &crate::ToolCall) -> Result<Value, StrictSchemaError> {
+        let decision = self
+            .snapshot
+            .effective
+            .iter()
+            .find(|entry| entry.spec.name == call.name)
+            .ok_or_else(|| StrictSchemaError("tool was not in the decision snapshot".into()))?;
+        let arguments = crate::parse_tool_arguments(&call.arguments)
+            .map_err(|error| StrictSchemaError(format!("invalid tool arguments: {error}")))?;
+        match &decision.sampling {
+            EffectiveToolSampling::Unconstrained => Ok(arguments),
+            EffectiveToolSampling::StrictJsonSchema {
+                original_schema,
+                normalization_version: STRICT_TOOL_NORMALIZATION_VERSION,
+            } => normalize_strict_tool_arguments(original_schema, &arguments),
+            EffectiveToolSampling::StrictJsonSchema { .. } => Err(StrictSchemaError(
+                "unsupported strict-tool normalization version".into(),
+            )),
+        }
+    }
 }
 
 impl ToolDecisionSnapshot {
@@ -692,6 +716,75 @@ fn make_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_decision_normalizes_only_actual_strict_calls() {
+        let spec = crate::ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object", "properties":{"path":{"type":"string"},"limit":{"type":"integer"}}, "required":["path"]}),
+        };
+        let request = crate::ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "external".into(),
+            summary: false,
+        };
+        let declaration = ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Prefer,
+            }),
+        };
+        let call = crate::ToolCall {
+            id: "call".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"file","limit":null}"#.into(),
+        };
+        for (sampling, expected) in [
+            (
+                EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: spec.parameters.clone(),
+                    normalization_version: STRICT_TOOL_NORMALIZATION_VERSION,
+                },
+                json!({"path":"file"}),
+            ),
+            (
+                EffectiveToolSampling::Unconstrained,
+                json!({"path":"file","limit":null}),
+            ),
+        ] {
+            let snapshot = ToolDecisionSnapshot::capture(
+                &context,
+                &request,
+                std::slice::from_ref(&declaration),
+                &[EffectiveToolDeclaration {
+                    spec: spec.clone(),
+                    sampling,
+                }],
+            )
+            .unwrap();
+            let validated = snapshot
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration),
+                )
+                .unwrap();
+            assert_eq!(validated.normalized_arguments(&call).unwrap(), expected);
+            let mut unknown = call.clone();
+            unknown.name = "unknown".into();
+            assert!(validated.normalized_arguments(&unknown).is_err());
+        }
+        assert!(call.arguments.contains("null"));
+    }
 
     #[test]
     fn decision_snapshot_rejects_changed_request_context_and_version() {

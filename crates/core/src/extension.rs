@@ -666,6 +666,12 @@ pub trait Tool: Send + Sync {
     fn constrained_sampling(&self) -> Option<crate::ToolConstraint> {
         None
     }
+    /// Stable, non-secret identity of the implementation and backend used to
+    /// recover a pending operation across restarts. Return `None` when that
+    /// continuity cannot be established. The agent does not yet consume it.
+    fn recovery_identity(&self) -> Option<String> {
+        None
+    }
     /// Whether the host default execution timeout applies when none was explicitly configured.
     fn use_default_timeout(&self) -> bool {
         true
