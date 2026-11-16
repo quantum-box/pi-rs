@@ -15730,7 +15730,9 @@ impl Scheduler {
                     })
                     .unwrap_or(true)
             }) {
-                return Err(Error::Invalid("unreachable foreground ownership graph".into()));
+                return Err(Error::Invalid(
+                    "unreachable foreground ownership graph".into(),
+                ));
             }
         }
         Ok((busy || tasks_pending, tasks_pending))
