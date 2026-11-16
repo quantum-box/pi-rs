@@ -665,7 +665,7 @@ async fn deadline_login_with_precommit<F, P, PFut, G, C, Fut>(
 ) -> Result<()>
 where
     F: std::future::Future<Output = Result<()>>,
-    P: FnOnce(PathBuf) -> PFut,
+    P: FnOnce(Arc<std::fs::File>) -> PFut,
     PFut: std::future::Future<Output = Result<G>>,
     C: FnOnce(FileCredentials, StoredCredentials, G) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -686,7 +686,13 @@ where
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
-        let config_guard = precommit(store.path.with_extension("lock")).await?;
+        let credential_file = store
+            .lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+            .ok_or_else(|| Error::Config("MCP OAuth credential lock handle is missing".into()))?;
+        let config_guard = precommit(credential_file).await?;
         Ok::<_, Error>((store, credentials, guard, config_guard))
     };
     let ready = tokio::select! {
@@ -1110,7 +1116,7 @@ pub async fn login_cli_with_precommit<G, P, PFut, C>(
 ) -> Result<()>
 where
     G: Send + 'static,
-    P: FnOnce(PathBuf) -> PFut,
+    P: FnOnce(Arc<std::fs::File>) -> PFut,
     PFut: std::future::Future<Output = Result<G>>,
     C: FnOnce(&G) -> Result<Option<LoginConfigRollback>> + Send + 'static,
 {
@@ -1843,6 +1849,27 @@ mod tests {
             async {
                 stage_fixture(&store).await?;
                 std::future::pending::<()>().await;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn deadline_login_missing_lock_handle_preserves_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, "old").unwrap();
+        let (store, staged) = staged_fixture(path.clone());
+        let result = deadline_login(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            staged,
+            &pi_rs::CancellationToken::new(),
+            async {
+                stage_fixture(&store).await?;
+                *store.store.lease.lock().unwrap() = Weak::new();
                 Ok(())
             },
         )

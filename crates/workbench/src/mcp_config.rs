@@ -457,7 +457,7 @@ async fn lock_mcp_file(file: &std::fs::File) -> Result<()> {
 
 async fn mcp_write_guard(
     target: Option<&std::path::Path>,
-    credential_lock: Option<&std::path::Path>,
+    credential_lock: Option<&std::fs::File>,
 ) -> Result<McpWriteGuard> {
     mcp_write_guard_at(
         &config::agent_dir().join("mcp-config-gate.lock"),
@@ -470,12 +470,12 @@ async fn mcp_write_guard(
 async fn mcp_write_guard_at(
     gate_path: &std::path::Path,
     target: Option<&std::path::Path>,
-    credential_lock: Option<&std::path::Path>,
+    credential_lock: Option<&std::fs::File>,
 ) -> Result<McpWriteGuard> {
     let gate = open_mcp_lock(gate_path)?;
     let gate_id = same_file::Handle::from_file(gate.try_clone()?)?;
     let credential_id = credential_lock
-        .map(same_file::Handle::from_path)
+        .map(|file| same_file::Handle::from_file(file.try_clone()?))
         .transpose()?;
     if credential_id.as_ref() == Some(&gate_id) {
         return Err(Error::Config(
@@ -1586,11 +1586,31 @@ mod tests {
             held.lock().unwrap();
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                mcp_write_guard_at(&gate, Some(&target), Some(&credential)),
+                mcp_write_guard_at(&gate, Some(&target), Some(&held)),
             )
             .await;
             assert!(result.expect("lock acquisition hung").is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_checks_the_held_credential_file_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let credential = root.path().join("credential.lock");
+        let gate = root.path().join("gate.lock");
+        std::fs::write(&credential, "").unwrap();
+        let held = open_mcp_lock(&credential).unwrap();
+        held.lock().unwrap();
+        std::fs::hard_link(&credential, &gate).unwrap();
+        std::fs::remove_file(&credential).unwrap();
+        std::fs::write(&credential, "replacement").unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mcp_write_guard_at(&gate, None, Some(&held)),
+        )
+        .await;
+        assert!(result.expect("lock acquisition hung").is_err());
     }
 
     #[tokio::test]
