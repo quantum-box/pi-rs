@@ -906,7 +906,7 @@ impl Session {
                 "tool decision metadata exceeds size limit".into(),
             ));
         }
-        self.append_inner_with_metadata(event, true, Some(metadata))
+        self.append_inner_with_metadata(event, true, Some(metadata), false)
     }
 
     /// Validate the snapshot using the marker retained independently in the event.
@@ -1259,7 +1259,7 @@ impl Session {
             }),
         };
         let metadata = serde_json::json!({"toolExecution": ToolExecutionMetadata { version: 1, snapshot: snapshot.clone() }});
-        self.append_inner_with_metadata(event, true, Some(metadata))
+        self.append_inner_with_metadata(event, true, Some(metadata), false)
     }
 
     /// Return validated arguments for an active-branch start, or None for a
@@ -7661,6 +7661,7 @@ mod durable_tool_decision_tests {
                 },
                 true,
                 Some(metadata),
+                false,
             )
             .unwrap()
             .id;
@@ -7727,7 +7728,7 @@ mod durable_tool_decision_tests {
                 "append accepted later {kind}"
             );
             let id = session
-                .append_inner_with_metadata(start_event, true, Some(start_metadata))
+                .append_inner_with_metadata(start_event, true, Some(start_metadata), false)
                 .unwrap()
                 .id;
             assert!(

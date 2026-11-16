@@ -2757,6 +2757,7 @@ impl Agent<'_> {
             .saturating_add(trailing)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_attempt<'a, T: Into<AgentInput> + Send>(
         &'a self,
         session: &mut Session,
@@ -9659,11 +9660,22 @@ mod tree_tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        agent
-            .reply::<AgentInput>(
+        let attempt = agent
+            .prepare_attempt::<AgentInput>(
                 &mut session,
                 request,
                 false,
+                false,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        agent
+            .reply::<AgentInput>(
+                &mut session,
+                attempt,
                 false,
                 &CancellationToken::new(),
                 &mut |_| {},
@@ -12968,8 +12980,8 @@ mod request_privacy_tests {
                 .await
                 .unwrap();
             assert_eq!(transformed, rewrite);
-            agent
-                .reply::<AgentInput>(
+            let attempt = agent
+                .prepare_attempt::<AgentInput>(
                     &mut session,
                     request,
                     true,
@@ -12978,6 +12990,10 @@ mod request_privacy_tests {
                     &mut observer,
                     None,
                 )
+                .await
+                .unwrap();
+            agent
+                .reply::<AgentInput>(&mut session, attempt, true, &cancel, &mut observer, None)
                 .await
                 .unwrap();
             let hooks = seen.lock().unwrap();
