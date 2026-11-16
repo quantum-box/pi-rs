@@ -31,8 +31,54 @@ noncooperating writers or processes. A task driver started through the harness
 atomically marks its foreground owned graph, cancels active conversation workers,
 and drives cleanup using the harness registrations. Pending cleanup is discovered
 again when the driver is restarted. Shutdown can interrupt cleanup; blocked effects
-still require reconciliation. A driver started directly from a standalone task
-scheduler has no conversation runtime and continues to reject foreground aborts.
+still require reconciliation. To enable the same cleanup from the standalone task
+scheduler, use `task_scheduler::Scheduler::open_with_conversation_runtime` with
+runtime options. It shares one exclusive store owner with its attached harness.
+`tick_with_conversation_cleanup` drives one task step and schedules up to eight
+independent marked task-owned conversation cleanups without executing retained
+queued input. A child marked independently is discovered even if its owner is
+completing successfully. Busy workers consume no slot; candidates rotate so
+repeatedly blocked conversations cannot monopolize admission. Each cleanup step
+has a 30-second timeout. Callback failures and timeouts are exposed by
+`conversation_cleanup_failures`, and the affected conversation stays marked while
+other graphs continue. Before each standalone cleanup step, the runtime waits for active summaries to
+leave their shared execution fence, then commits an attempt marker fenced by the
+conversation version. A timeout while waiting for that fence starts no cleanup
+attempt and creates no marker; it is retryable by a later tick without reopening
+or reconciliation. The existing summary remains governed by its own recovery
+and request-ID settlement contract. Timeout, cancellation, crash, callback
+failure, or a crash after the callback succeeds can leave the marker and block
+all subsequent abort cleanup and independent-summary execution for that conversation,
+including automatic recovery and explicit resume after reopen. Blocked summaries
+appear in `blocked_summary_recovery`.
+The host must determine whether external effects occurred, make retry safe, then
+call `reconcile_owned_cleanup` on the task scheduler or harness. Reconciliation
+requires the cleanup worker to be stopped; it does not itself inspect or reverse
+external effects. Even a crash before dispatch can require reconciliation. An
+unrelated missing owned conversation, malformed edge, or invalid abort mark is skipped during
+candidate discovery; the affected graph requires separate repair. Task abort
+settlement also isolates edges whose affected task can be identified; a missing
+background child does not hold its owner's abort. If an edge
+is too malformed to identify its owner, all task abort settlements remain parked
+until repair because the runtime cannot prove which task owns it; independent
+conversation cleanup can still proceed. Summary execution shares a per-conversation
+read fence, and cleanup marker creation takes its write fence, so a summary that
+already passed the marker check finishes before the marker is created. Different
+summaries in the same conversation can still run concurrently. Storage failures, worker panics,
+cancelled or dropped cleanup ticks poison the scheduler and require reopening.
+Dropping the scheduler cancels its cleanup jobs; their attachments remain held
+until the jobs actually stop. Timeouts require callbacks to yield to the async
+runtime; synchronous blocking or detached external effects cannot be preempted.
+A reset retained in a failed-idle conversation remains queued for a later boundary
+and does not hold its failed task owner open. Hosts needing
+additional provider or extension configuration can configure a `Harness` and use
+`Harness::attach_tasks` instead; the scheduler retains a shared harness worker.
+A `task_driver::Driver`
+started from that scheduler runs its cleanup coordinator automatically. The
+driver's coordinator still stops the driver on any cleanup failure and does not
+apply the manual coordinator's timeout or eight-worker bound; per-conversation
+failure isolation described above applies to manual ticks. Plain `Scheduler::open`
+has no conversation runtime and still rejects foreground aborts.
 
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before
@@ -580,10 +626,11 @@ descendants. Task-owned foreground subagent conversations are marked and
 scheduled for cleanup by the conversation scheduler; background edges are boundaries.
 Task cleanup waits until each foreground child conversation has settled its abort,
 including that conversation's foreground tasks. `Scheduler::abort_and_wait` joins
-workers for the entire affected foreground scope. Standalone task-driver aborts
-still reject foreground conversation children because they cannot drive or cancel
-their workers. A blocked uncertain operation requires reconciliation, and a task
-driver must be running to drain tasks.
+workers for the entire affected foreground scope. Standalone task schedulers can
+attach a conversation runtime using `open_with_conversation_runtime`; manually
+driven callers use `tick_with_conversation_cleanup` and drivers run cleanup in the
+background. Plain `open` still rejects foreground conversation aborts. A blocked
+uncertain operation requires reconciliation.
 
 Inputs parked after a failed child run do not hold their task owner open. Before
 a failed owner finishes, its foreground cascade withdraws parked inputs unless
@@ -1610,8 +1657,9 @@ a task commit and become stale as soon as it returns. Signal and child wait eval
 driver and scheduler signal delivery is fenced by the task gate; direct unfenced
 TaskStore writers are outside the consistency protocol. Abort
 cleanup may still depend on foreground conversations. A standalone scheduler
-cannot abort a task with foreground owned conversations; use the attached driver
-for that ownership graph. Unlike upstream `onWake`, hints are
+opened with `open_with_conversation_runtime` can mark them and use
+`tick_with_conversation_cleanup` to drain them; a driver started from it drives
+cleanup automatically. Plain `open` still rejects such aborts. Unlike upstream `onWake`, hints are
 not a change-only `{active, at}` callback, and the snapshot covers generic tasks
 only. The driver continues polling; this is not a host-managed alarm or a
 conversation scheduling snapshot.

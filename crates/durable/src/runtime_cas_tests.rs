@@ -5866,7 +5866,7 @@ async fn legacy_finished_abort_with_hooks_redacts_published_metadata_and_content
     let (state, version) = h.load(id).unwrap();
     assert!(state.pending_tool_result.is_none());
     assert_eq!(state.tool_results.len(), 1);
-    h.settle_abort(state, version, &CancellationToken::new())
+    h.settle_abort(state, version, &CancellationToken::new(), None)
         .await
         .unwrap();
     let result = h.conversation(id).unwrap();
