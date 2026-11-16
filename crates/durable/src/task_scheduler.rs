@@ -14906,7 +14906,7 @@ mod standalone_foreground_cleanup_tests {
     }
 
     #[tokio::test]
-    async fn dropped_manual_cleanup_requires_reopen() {
+    async fn interrupted_manual_cleanup_requires_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let mut harness = Harness::open_paused(&path, options()).unwrap();
@@ -14921,20 +14921,17 @@ mod standalone_foreground_cleanup_tests {
         drop(harness);
         let mut scheduler =
             Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
-        let control = scheduler.owner().conversation_controls().get(conversation);
-        let worker = control.worker.lock().await;
         let cancel = CancellationToken::new();
+        cancel.cancel();
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                scheduler.tick_with_conversation_cleanup(0, &cancel)
-            )
-            .await
-            .is_err()
+            scheduler
+                .tick_with_conversation_cleanup(0, &cancel)
+                .await
+                .is_err()
         );
         assert!(matches!(scheduler.tick(0), Err(Error::Poisoned)));
-        drop(worker);
         drop(scheduler);
+        let cancel = CancellationToken::new();
         let mut reopened =
             Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
         assert!(
@@ -14943,5 +14940,79 @@ mod standalone_foreground_cleanup_tests {
                 .await
                 .unwrap()
         );
+    }
+    #[tokio::test]
+    async fn marked_unrelated_busy_worker_does_not_block_owned_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let a = harness.create_conversation(cfg.clone()).unwrap();
+        let b = harness.create_conversation(cfg.clone()).unwrap();
+        let (unrelated, owned) = if a.to_string() < b.to_string() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let root_conversation = harness.create_conversation(cfg).unwrap();
+        harness.request_abort(unrelated).unwrap();
+        let root = task(1, TaskOwner::Conversation(root_conversation), "parent");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&root)]).unwrap();
+        let edge = Edge {
+            task: root.id(),
+            task_owner: root.owner().clone(),
+            child: owned,
+            mode: Mode::Foreground,
+        };
+        let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        drop(harness);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        scheduler.request_abort(root.id()).unwrap();
+        let control = scheduler.owner().conversation_controls().get(unrelated);
+        let _busy = control.worker.lock().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for _ in 0..10 {
+                if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                    return;
+                }
+                scheduler
+                    .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
+            panic!("owned cleanup did not finish");
+        })
+        .await
+        .expect("unrelated marked worker blocked cleanup");
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert!(
+            scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(unrelated)
+                .unwrap()
+                .abort_requested
+        );
+        assert!(
+            !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(owned)
+                .unwrap()
+                .abort_requested
+        );
+        assert!(!scheduler.tick(0).unwrap());
     }
 }

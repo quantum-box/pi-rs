@@ -13010,11 +13010,12 @@ impl Harness {
             if !observed.abort_requested {
                 continue;
             }
+            if cancel.is_cancelled() {
+                return Err(Error::Interrupted);
+            }
             let control = self.owner.conversation_controls().get(id);
-            let _worker = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Interrupted),
-                guard = control.worker.lock() => guard,
+            let Ok(_worker) = control.worker.try_lock() else {
+                continue;
             };
             let mut worker = self.worker();
             worker.execution_gate = Some(control.gate.clone());

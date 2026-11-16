@@ -35,7 +35,8 @@ still require reconciliation. To enable the same cleanup from the standalone tas
 scheduler, use `task_scheduler::Scheduler::open_with_conversation_runtime` with
 runtime options. It shares one exclusive store owner with its attached harness.
 `tick_with_conversation_cleanup` drives one task step and at most one marked
-conversation cleanup step without executing retained queued input. A cleanup error or cancelled
+conversation cleanup step without executing retained queued input. Busy
+conversation workers are skipped and can be retried on a later tick. A cleanup error or cancelled
 cleanup or a dropped cleanup future poisons the task scheduler; drop it and reopen before retrying. Hosts needing
 additional provider or extension configuration can configure a `Harness` and use
 `Harness::attach_tasks` instead; the scheduler retains a shared harness worker.
