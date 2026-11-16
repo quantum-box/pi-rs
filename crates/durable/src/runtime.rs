@@ -15622,6 +15622,8 @@ impl Scheduler {
         let mut tasks = VecDeque::new();
         let mut seen_conversations = HashSet::new();
         let mut seen_tasks = HashSet::new();
+        let mut background_tasks = VecDeque::new();
+        let mut background_conversations = VecDeque::new();
         let mut busy = false;
         let mut tasks_pending = false;
         while !conversations.is_empty() || !tasks.is_empty() {
@@ -15642,10 +15644,12 @@ impl Scheduler {
                                 .is_some_and(|task| !task.join.is_finished()))
                 });
                 for record in &records {
-                    if record.task.owner() == &TaskOwner::Conversation(id)
-                        && !record.task.is_background()
-                    {
-                        tasks.push_back(record.task.id());
+                    if record.task.owner() == &TaskOwner::Conversation(id) {
+                        if record.task.is_background() {
+                            background_tasks.push_back(record.task.id());
+                        } else {
+                            tasks.push_back(record.task.id());
+                        }
                     }
                 }
             }
@@ -15656,8 +15660,12 @@ impl Scheduler {
                 let record = by_id.get(&id).ok_or(Error::NotFound)?;
                 tasks_pending |= !record.task.is_terminal();
                 for child in &records {
-                    if child.task.owner() == &TaskOwner::Task(id) && !child.task.is_background() {
-                        tasks.push_back(child.task.id());
+                    if child.task.owner() == &TaskOwner::Task(id) {
+                        if child.task.is_background() {
+                            background_tasks.push_back(child.task.id());
+                        } else {
+                            tasks.push_back(child.task.id());
+                        }
                     }
                 }
                 for edge in edges.iter().filter(|edge| edge.edge.task == id) {
@@ -15666,6 +15674,8 @@ impl Scheduler {
                     }
                     if edge.edge.mode == Mode::Foreground {
                         conversations.push_back(edge.edge.child);
+                    } else {
+                        background_conversations.push_back(edge.edge.child);
                     }
                 }
             }
@@ -15674,21 +15684,12 @@ impl Scheduler {
             // Distinguish deliberately excluded background subtrees from broken
             // ownership chains. An unresolved foreground chain must not make a
             // harness-wide idle wait succeed.
-            let mut background_tasks: VecDeque<_> = records
-                .iter()
-                .filter(|record| record.task.is_background())
-                .map(|record| record.task.id())
-                .collect();
-            let mut background_conversations = VecDeque::new();
             for edge in &edges {
                 let record = by_id.get(&edge.edge.task).ok_or(Error::NotFound)?;
                 if edge.edge.task_owner != *record.task.owner()
                     || !snapshots.contains_key(&Harness::key(edge.edge.child))
                 {
                     return Err(Error::Invalid("invalid ownership edge".into()));
-                }
-                if edge.edge.mode == Mode::Background {
-                    background_conversations.push_back(edge.edge.child);
                 }
             }
             let mut background_seen_tasks = HashSet::new();
