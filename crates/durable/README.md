@@ -922,7 +922,12 @@ key is rejected, including across concurrent admission and reopening. Public sig
 writers cannot populate a reserved destination, even with the correct child and
 submission IDs; only the runtime settlement transaction can deliver it. After reopening, the scheduler resumes the committed child and settlement delivers
 the signal in the same transaction. Parent abort still traverses the foreground
-ownership edge. The signal payload uses the pi-rs settlement representation
+ownership edge. While an attached task scheduler has published a related failure
+but has not settled it, owned-child admission returns `Error::TaskPublicationBusy`
+without creating a child; retry outside the task gate. New admissions are also
+rejected below a persisted failing or aborting foreground ancestor. The built-in
+foreground tool parks and retries the admission. A background ownership boundary
+keeps independent work separate. The signal payload uses the pi-rs settlement representation
 (including answer text) rather than upstream's entry-only answer reference.
 Existing child selections may subsequently be changed using the
 settled-conversation API. This limits tool dispatch, not other effects of

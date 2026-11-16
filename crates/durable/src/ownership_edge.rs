@@ -345,10 +345,29 @@ pub(crate) fn owner_chain_checks(
     owner_chain_from(store, TaskOwner::Task(task), child)
 }
 
+// New owned conversations must not appear below an already failed foreground
+// ancestor while the persisted cleanup cascade is still in progress.
+pub(crate) fn owner_chain_admission_checks(
+    store: &Store,
+    task: Uuid,
+    child: Uuid,
+) -> Result<Vec<Check>, Error> {
+    owner_chain_from_inner(store, TaskOwner::Task(task), child, true)
+}
+
 pub(crate) fn owner_chain_from(
+    store: &Store,
+    next: TaskOwner,
+    child: Uuid,
+) -> Result<Vec<Check>, Error> {
+    owner_chain_from_inner(store, next, child, false)
+}
+
+fn owner_chain_from_inner(
     store: &Store,
     mut next: TaskOwner,
     child: Uuid,
+    admission: bool,
 ) -> Result<Vec<Check>, Error> {
     let mut checks = Vec::new();
     let mut seen_tasks = HashSet::new();
@@ -364,6 +383,18 @@ pub(crate) fn owner_chain_from(
                     return Err(Error::Invalid);
                 }
                 let stored = TaskStore::new(store).load(id)?.ok_or(Error::Invalid)?;
+                if admission
+                    && fence_scope
+                    && (stored.task.abort_requested()
+                        || matches!(
+                            stored.task.state(),
+                            TaskState::CompletingFailed(_)
+                                | TaskState::Failed(_)
+                                | TaskState::Cancelled
+                        ))
+                {
+                    return Err(Error::Invalid);
+                }
                 checks.push(Check {
                     key: task_store::key(id),
                     expected: Expected::Version(stored.version),

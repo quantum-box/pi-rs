@@ -92,17 +92,30 @@ impl Handler for Foreground {
             .harness
             .lock()
             .map_err(|_| "foreground harness lock poisoned")?;
-        let admission = harness
-            .submit_task_owned_subagent_notified(
-                task.id(),
-                task.owner().clone(),
-                "child",
-                self.config.clone(),
-                content.into(),
-                self.allowed_tools.clone(),
-                SIGNAL.into(),
-            )
-            .map_err(|e| format!("foreground admission: {e}"))?;
+        let admission = match harness.submit_task_owned_subagent_notified(
+            task.id(),
+            task.owner().clone(),
+            "child",
+            self.config.clone(),
+            content.into(),
+            self.allowed_tools.clone(),
+            SIGNAL.into(),
+        ) {
+            Ok(admission) => admission,
+            Err(crate::runtime::Error::TaskPublicationBusy) => {
+                return Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "retry-admission".into(),
+                        data: Value::Null,
+                    },
+                    condition: WaitFor::DeadlineMillis(
+                        crate::runtime::wall_time_millis().saturating_add(10),
+                    ),
+                    children: vec![],
+                });
+            }
+            Err(e) => return Err(format!("foreground admission: {e}")),
+        };
         let token = crate::runtime::submission_settled_signal();
         let receipt = TaskStore::new(harness.subagent_store().map_err(|e| e.to_string())?)
             .read_typed_signal(task.id(), &token, SIGNAL)
@@ -241,6 +254,69 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn busy_publication_parks_before_retrying_owned_child_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            model: Arc::new(ModelStub {
+                parent_dispatches: Arc::new(AtomicUsize::new(0)),
+                child_dispatches: Arc::new(AtomicUsize::new(0)),
+            }),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut harness = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+        let parent = harness.create_conversation(config()).unwrap();
+        let mut task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(parent),
+            Checkpoint {
+                phase: "start".into(),
+                data: Value::Null,
+            },
+            3,
+        )
+        .unwrap();
+        task = task
+            .registered_versioned(KIND.into(), true, 1, json!({"task":"work"}))
+            .unwrap();
+        TaskStore::new(harness.subagent_store().unwrap())
+            .save(&[crate::task_store::Save::Create(&task)])
+            .unwrap();
+        let scheduler = harness.attach_tasks(Registry::default()).unwrap();
+        let publication = scheduler.failure_publication();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handler = Foreground {
+            harness: Mutex::new(harness.worker()),
+            parent,
+            config: config(),
+            allowed_tools: Some(vec![]),
+            schedule: sender,
+        };
+        publication.test_set_published(task.id(), true);
+        assert!(matches!(
+            handler.run(&task).unwrap(),
+            Step::Wait {
+                condition: WaitFor::DeadlineMillis(_),
+                ..
+            }
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(harness.owner.task_gate().try_lock().is_ok());
+        publication.test_set_published(task.id(), false);
+        assert!(matches!(
+            handler.run(&task).unwrap(),
+            Step::Wait {
+                condition: WaitFor::TypedSignal(_),
+                ..
+            }
+        ));
+        let child = receiver.try_recv().unwrap();
+        assert_eq!(harness.conversation(child).unwrap().submissions.len(), 1);
     }
 
     #[tokio::test]

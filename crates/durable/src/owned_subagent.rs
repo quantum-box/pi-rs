@@ -184,6 +184,29 @@ impl Harness {
         // Serialize admission with the scheduler's post-handler graph decision.
         let owner_store = self.owner.clone();
         let _gate = owner_store.task_gate().lock().map_err(|_| Error::Failed)?;
+        let publication = self
+            .task_publication
+            .lock()
+            .map_err(|_| Error::Failed)?
+            .clone();
+        let _publication = publication
+            .as_ref()
+            .map(|publication| publication.admission())
+            .transpose()
+            .map_err(|_| Error::Failed)?;
+        if let Some(publication) = &_publication {
+            let snapshot = self
+                .subagent_store()?
+                .get(&task_store::key(task))?
+                .ok_or_else(invalid)?;
+            let parent: Task = serde_json::from_slice(&snapshot.value)?;
+            if parent.id() != task || parent.owner() != &owner {
+                return Err(invalid());
+            }
+            if !publication.permits_admission(&owner_store, Uuid::nil(), Some(&parent)) {
+                return Err(Error::TaskPublicationBusy);
+            }
+        }
         let key = reservation_key(task, name);
         loop {
             let store = self.subagent_store()?;
@@ -315,8 +338,8 @@ impl Harness {
                 }
             }
             let mut prepared = self.prepare_save(&child_state, Expected::Missing)?;
-            let mut checks =
-                ownership_edge::owner_chain_checks(store, task, child).map_err(|e| match e {
+            let mut checks = ownership_edge::owner_chain_admission_checks(store, task, child)
+                .map_err(|e| match e {
                     ownership_edge::Error::Store(e) => Error::from(e),
                     ownership_edge::Error::Json(e) => Error::from(e),
                     _ => invalid(),
@@ -536,6 +559,301 @@ mod tests {
             .save(&[Save::Create(&task)])
             .unwrap();
         (task.id(), owner)
+    }
+
+    #[test]
+    fn published_failure_fences_owned_conversation_admission_before_settlement() {
+        use crate::task_scheduler::{Registry, Step, TickReservation};
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let conversation = harness.create_conversation(config()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("fail", false, |_: &Task| Ok(Step::Fail("failure".into())));
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let root = Task::new(
+            Uuid::from_u128(1),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap()
+        .registered("fail".into(), false);
+        scheduler.submit(&root).unwrap();
+        let background = harness
+            .ensure_task_owned_subagent(
+                root.id(),
+                root.owner().clone(),
+                "background",
+                config(),
+                Mode::Background,
+            )
+            .unwrap();
+        let child = Task::new(
+            Uuid::from_u128(2),
+            TaskOwner::Task(root.id()),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap();
+        let separate = Task::new(
+            Uuid::from_u128(3),
+            TaskOwner::Conversation(background.child),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            1,
+        )
+        .unwrap();
+        TaskStore::new(harness.subagent_store().unwrap())
+            .save(&[Save::Create(&child), Save::Create(&separate)])
+            .unwrap();
+        let existing = harness
+            .submit_task_owned_subagent(
+                child.id(),
+                child.owner().clone(),
+                "existing",
+                config(),
+                Mode::Foreground,
+                "work".into(),
+            )
+            .unwrap();
+        let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+            panic!("expected root invocation");
+        };
+        let completed = invocation.execute().unwrap();
+        assert_eq!(
+            TaskStore::new(harness.subagent_store().unwrap())
+                .load(root.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Running
+        );
+        assert!(matches!(
+            harness.submit_task_owned_subagent(
+                child.id(),
+                child.owner().clone(),
+                "existing",
+                config(),
+                Mode::Foreground,
+                "work".into()
+            ),
+            Err(Error::TaskPublicationBusy)
+        ));
+        for mode in [Mode::Foreground, Mode::Background] {
+            assert!(matches!(
+                harness.ensure_task_owned_subagent(
+                    child.id(),
+                    child.owner().clone(),
+                    "blocked",
+                    config(),
+                    mode
+                ),
+                Err(Error::TaskPublicationBusy)
+            ));
+            assert!(matches!(
+                harness.submit_task_owned_subagent(
+                    child.id(),
+                    child.owner().clone(),
+                    "blocked",
+                    config(),
+                    mode,
+                    "work".into()
+                ),
+                Err(Error::TaskPublicationBusy)
+            ));
+        }
+        assert!(matches!(
+            harness.submit_task_owned_subagent_notified(
+                child.id(),
+                child.owner().clone(),
+                "blocked",
+                config(),
+                "work".into(),
+                None,
+                "done".into()
+            ),
+            Err(Error::TaskPublicationBusy)
+        ));
+        assert!(harness.owner.task_gate().try_lock().is_ok());
+        assert!(
+            EdgeStore::new(harness.subagent_store().unwrap())
+                .children(child.id())
+                .unwrap()
+                .iter()
+                .all(|edge| edge.edge.child == existing.child)
+        );
+        let permitted = harness
+            .submit_task_owned_subagent(
+                separate.id(),
+                separate.owner().clone(),
+                "independent",
+                config(),
+                Mode::Foreground,
+                "work".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            harness
+                .conversation(permitted.child)
+                .unwrap()
+                .submissions
+                .len(),
+            1
+        );
+        scheduler.settle_invocation(completed).unwrap();
+        assert!(
+            harness
+                .submit_task_owned_subagent(
+                    child.id(),
+                    child.owner().clone(),
+                    "blocked",
+                    config(),
+                    Mode::Foreground,
+                    "work".into()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn published_handler_error_and_panic_also_fence_owned_admission() {
+        use crate::task_scheduler::{Registry, TickReservation};
+        for panic_handler in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+            let conversation = harness.create_conversation(config()).unwrap();
+            let mut registry = Registry::default();
+            registry.register("failure", false, move |_: &Task| {
+                if panic_handler {
+                    panic!("handler panic");
+                }
+                Err("handler failure".into())
+            });
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            let root = Task::new(
+                Uuid::from_u128(1),
+                TaskOwner::Conversation(conversation),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .unwrap()
+            .registered("failure".into(), false);
+            scheduler.submit(&root).unwrap();
+            let child = Task::new(
+                Uuid::from_u128(2),
+                TaskOwner::Task(root.id()),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .unwrap();
+            TaskStore::new(harness.subagent_store().unwrap())
+                .save(&[Save::Create(&child)])
+                .unwrap();
+            let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("expected invocation");
+            };
+            let completed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invocation.execute()));
+            assert_eq!(completed.is_err(), panic_handler);
+            assert_eq!(
+                TaskStore::new(harness.subagent_store().unwrap())
+                    .load(root.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                &TaskState::Running
+            );
+            assert!(matches!(
+                harness.submit_task_owned_subagent(
+                    child.id(),
+                    child.owner().clone(),
+                    "blocked",
+                    config(),
+                    Mode::Foreground,
+                    "work".into()
+                ),
+                Err(Error::TaskPublicationBusy)
+            ));
+            assert!(
+                EdgeStore::new(harness.subagent_store().unwrap())
+                    .children(child.id())
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(completed);
+        }
+    }
+
+    #[test]
+    fn publication_busy_retry_does_not_hold_task_gate_or_reserve_child() {
+        use crate::task_scheduler::Registry;
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let (task, owner) = setup(&mut harness);
+        let scheduler = harness.attach_tasks(Registry::default()).unwrap();
+        let publication = scheduler.failure_publication();
+        publication.test_set_published(task, true);
+        assert!(matches!(
+            harness.submit_task_owned_subagent_notified(
+                task,
+                owner.clone(),
+                "job",
+                config(),
+                "work".into(),
+                None,
+                "done".into()
+            ),
+            Err(Error::TaskPublicationBusy)
+        ));
+        assert!(harness.owner.task_gate().try_lock().is_ok());
+        assert!(
+            EdgeStore::new(harness.subagent_store().unwrap())
+                .children(task)
+                .unwrap()
+                .is_empty()
+        );
+        publication.test_set_published(task, false);
+        let admission = harness
+            .submit_task_owned_subagent_notified(
+                task,
+                owner.clone(),
+                "job",
+                config(),
+                "work".into(),
+                None,
+                "done".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            harness
+                .submit_task_owned_subagent_notified(
+                    task,
+                    owner,
+                    "job",
+                    config(),
+                    "work".into(),
+                    None,
+                    "done".into()
+                )
+                .unwrap(),
+            admission
+        );
     }
 
     #[test]

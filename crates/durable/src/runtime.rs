@@ -3048,6 +3048,8 @@ pub struct Harness {
     loaded: std::sync::Mutex<HashMap<Uuid, (u64, Conversation)>>,
     execution_gate: Option<Arc<std::sync::Mutex<()>>>,
     task_driver: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::task_driver::Shared>>>>,
+    pub(crate) task_publication:
+        Arc<std::sync::Mutex<Option<crate::task_scheduler::FailurePublication>>>,
     activity: crate::worker_activity::WorkerActivity,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
@@ -3886,6 +3888,7 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
             task_driver: Arc::new(std::sync::Mutex::new(None)),
+            task_publication: Arc::new(std::sync::Mutex::new(None)),
             activity: Default::default(),
             clock: Arc::new(wall_time_millis),
         };
@@ -3909,6 +3912,7 @@ impl Harness {
             loaded: std::sync::Mutex::new(HashMap::new()),
             execution_gate: None,
             task_driver: self.task_driver.clone(),
+            task_publication: self.task_publication.clone(),
             activity: self.activity.clone(),
             clock: self.clock.clone(),
         }
@@ -8064,6 +8068,8 @@ impl Harness {
         let _gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
         self.validate_task_tool_registry(&registry)?;
         let mut scheduler = crate::task_scheduler::Scheduler::attach(self.owner.clone(), registry)?;
+        *self.task_publication.lock().map_err(|_| Error::Failed)? =
+            Some(scheduler.failure_publication());
         scheduler.bind_harness(self.worker());
         Ok(scheduler)
     }
