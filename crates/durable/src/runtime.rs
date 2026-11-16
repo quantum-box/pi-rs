@@ -9387,26 +9387,29 @@ impl Harness {
                 .map_err(|_| ())
                 .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
             match driver {
-                Ok(Some(driver)) => driver.with_session_child(&children, &tasks, id, |boundary| {
-                    if !changed {
-                        owner.store().commit_with_prefix_put_fence(
-                            &documents.checks,
+                Ok(Some(driver)) => {
+                    driver.with_session_child(&children, &tasks, id, |boundary, checks| {
+                        Self::merge_session_owner_checks(&mut documents.checks, checks);
+                        if !changed {
+                            owner.store().commit_with_prefix_put_fence(
+                                &documents.checks,
+                                &[],
+                                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                                boundary,
+                            )?;
+                            return Ok(());
+                        }
+                        self.save_composed_locked_with_fence(
+                            &state,
+                            Expected::Version(version),
+                            None,
                             &[],
-                            &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
-                            boundary,
-                        )?;
-                        return Ok(());
-                    }
-                    self.save_composed_locked_with_fence(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &[],
-                        &[],
-                        Some(&documents),
-                        Some(boundary),
-                    )
-                }),
+                            &[],
+                            Some(&documents),
+                            Some(boundary),
+                        )
+                    })
+                }
                 Ok(None) => Err(Error::Invalid("task driver is not running".into())),
                 Err(_) => Err(Error::Failed),
             }
@@ -9477,26 +9480,29 @@ impl Harness {
                 .map_err(|_| ())
                 .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
             match driver {
-                Ok(Some(driver)) => driver.with_session_child(&children, &tasks, id, |boundary| {
-                    if !changed {
-                        owner.store().commit_with_prefix_put_fence(
-                            &documents.checks,
+                Ok(Some(driver)) => {
+                    driver.with_session_child(&children, &tasks, id, |boundary, checks| {
+                        Self::merge_session_owner_checks(&mut documents.checks, checks);
+                        if !changed {
+                            owner.store().commit_with_prefix_put_fence(
+                                &documents.checks,
+                                &[],
+                                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                                boundary,
+                            )?;
+                            return Ok(());
+                        }
+                        self.save_composed_locked_with_fence(
+                            &state,
+                            Expected::Version(version),
+                            None,
                             &[],
-                            &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
-                            boundary,
-                        )?;
-                        return Ok(());
-                    }
-                    self.save_composed_locked_with_fence(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &[],
-                        &[],
-                        Some(&documents),
-                        Some(boundary),
-                    )
-                }),
+                            &[],
+                            Some(&documents),
+                            Some(boundary),
+                        )
+                    })
+                }
                 Ok(None) => Err(Error::Invalid("task driver is not running".into())),
                 Err(_) => Err(Error::Failed),
             }
@@ -9506,6 +9512,25 @@ impl Harness {
         self.merge_admissions = merge;
         saved?;
         Ok(result)
+    }
+
+    fn merge_session_owner_checks(checks: &mut Vec<Check>, owner_checks: Vec<Check>) {
+        for check in owner_checks {
+            if let Some(existing) = checks.iter_mut().find(|old| old.key == check.key) {
+                match (&existing.expected, &check.expected) {
+                    (Expected::Missing, Expected::MissingUnchangedSince(_)) => {
+                        existing.expected = check.expected;
+                    }
+                    (Expected::MissingUnchangedSince(a), Expected::MissingUnchangedSince(b)) => {
+                        existing.expected = Expected::MissingUnchangedSince((*a).min(*b));
+                    }
+                    (a, b) if a == b => (),
+                    _ => checks.push(check),
+                }
+            } else {
+                checks.push(check);
+            }
+        }
     }
 
     fn commit_session_candidate(

@@ -2039,8 +2039,12 @@ child can occupy the reserved worker; this fixed bound does not guarantee
 progress for arbitrary recursively blocking handlers. Handlers must remain
 cooperative. An interrupted parent must recover before its descendants run. Successful TaskTool
 settlement waits for owned work; failure and explicit abort cascade through it. This
-slice rejects task-owned conversations and TaskTool children through these host
-methods. Ordinary nested-tool
+slice supports child admission in task-owned conversations, validating and
+fencing the ownership chain, pending aborts and failure publication through
+commit. Foreground cancellation stops at a background boundary; successful
+conversation-owner tasks may remain anchors. Interrupted attempts must recover
+before their descendants can execute. TaskTool children through these host
+methods remain unsupported. Ordinary nested-tool
 keys use a separate journal, so upstream shared cross-kind key semantics are not
 implemented. Cross-conversation creation is also unsupported.
 
