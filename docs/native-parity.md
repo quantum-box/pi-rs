@@ -3215,6 +3215,8 @@ are recreated; compaction boundaries and retained record metadata are remapped.
 New Pi imports record conversion provenance. Forking rejects ambiguous legacy
 ownership or inconsistent provenance when it cannot safely reconstruct the
 selected history.
+Interactive and startup branch forks retain imported conversion provenance and
+compaction metadata when saving and reopening the fork.
 
 ### Session-name validation checkpoint
 
