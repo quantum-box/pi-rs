@@ -302,6 +302,37 @@ impl Harness {
         )
     }
 
+    /// Atomically submit a foreground child with inherited tool settings and
+    /// bind its settlement signal to the owning task. Selected parent extensions
+    /// are rejected; matching retries return the original submission.
+    pub fn submit_task_owned_subagent_notified_inheriting_tools(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        content: String,
+        signal_key: String,
+    ) -> Result<Admission, Error> {
+        if content.trim().is_empty() || signal_key.is_empty() {
+            return Err(invalid());
+        }
+        self.admit_task_owned_subagent(
+            task,
+            owner,
+            name,
+            config,
+            Mode::Foreground,
+            Some(content),
+            None,
+            Some(SubmissionNotify {
+                task_id: task,
+                key: signal_key,
+            }),
+            true,
+        )
+    }
+
     /// Create a child with a snapshot of the owner conversation's tool settings.
     /// The copy and reservation commit atomically; later parent changes do not propagate.
     pub fn ensure_task_owned_subagent_inheriting_tools(
@@ -695,6 +726,25 @@ impl Scheduler {
                 content,
                 allowed_tools,
                 signal_key,
+            )?;
+        self.schedule(admission.child);
+        Ok(admission)
+    }
+
+    /// Commit inherited settings and the settlement binding before scheduling.
+    pub fn submit_task_owned_subagent_notified_inheriting_tools(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        content: String,
+        signal_key: String,
+    ) -> Result<Admission, Error> {
+        let admission = self
+            .subagent_harness()
+            .submit_task_owned_subagent_notified_inheriting_tools(
+                task, owner, name, config, content, signal_key,
             )?;
         self.schedule(admission.child);
         Ok(admission)
@@ -3558,6 +3608,410 @@ mod tests {
             .unwrap(),
             *a
         );
+    }
+
+    #[test]
+    fn notified_inheritance_retries_parent_changes_and_rejects_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let TaskOwner::Conversation(parent) = owner.clone() else {
+            unreachable!()
+        };
+        h.set_deferred_tools(parent, vec!["before".into()]).unwrap();
+        let mut worker = h.worker();
+        BEFORE_INHERITED_ADMISSION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                worker
+                    .set_deferred_tools(parent, vec!["after".into()])
+                    .unwrap();
+            }))
+        });
+        let a = h
+            .submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                "work".into(),
+                "answer".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            h.conversation(a.child).unwrap().tool_filters.deferred,
+            vec!["after"]
+        );
+        let binding = h
+            .subagent_store()
+            .unwrap()
+            .get(&notification_binding_key(&SubmissionNotify {
+                task_id: task,
+                key: "answer".into(),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<(Uuid, Uuid)>(&binding.value).unwrap(),
+            (a.child, a.submission.as_ref().unwrap().id)
+        );
+        assert!(
+            h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                "work".into(),
+                "changed".into()
+            )
+            .is_err()
+        );
+        assert!(
+            h.submit_task_owned_subagent_inheriting_tools(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                Mode::Foreground,
+                "work".into()
+            )
+            .is_err()
+        );
+        h.install_extension(crate::extension::Extension {
+            name: "restricted".into(),
+            tools: vec![Arc::new(TestTool)],
+            ..Default::default()
+        })
+        .unwrap();
+        h.select_extensions(parent, vec!["restricted".into()])
+            .unwrap();
+        assert!(
+            h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner,
+                "denied",
+                config(),
+                "work".into(),
+                "unused".into()
+            )
+            .is_err()
+        );
+        let store = h.subagent_store().unwrap();
+        assert!(
+            store
+                .get(&reservation_key(task, "denied"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&notification_binding_key(&SubmissionNotify {
+                    task_id: task,
+                    key: "unused".into()
+                }))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn notified_inheritance_fences_racing_extension_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let TaskOwner::Conversation(parent) = owner.clone() else {
+            unreachable!()
+        };
+        h.install_extension(crate::extension::Extension {
+            name: "restricted".into(),
+            tools: vec![Arc::new(TestTool)],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut concurrent = h.worker();
+        BEFORE_INHERITED_ADMISSION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                concurrent
+                    .select_extensions(parent, vec!["restricted".into()])
+                    .unwrap();
+            }))
+        });
+        assert!(
+            h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner,
+                "child",
+                config(),
+                "work".into(),
+                "answer".into()
+            )
+            .is_err()
+        );
+        let store = h.subagent_store().unwrap();
+        assert!(
+            store
+                .get(&reservation_key(task, "child"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&inheritance_v2_key(task, "child"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&notification_binding_key(&SubmissionNotify {
+                    task_id: task,
+                    key: "answer".into()
+                }))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn notified_inheritance_scheduler_schedules_and_notifies() {
+        use futures_util::{StreamExt, stream};
+        use pi_rs_core::ModelEvent;
+        struct Answer;
+        #[async_trait]
+        impl Model for Answer {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("scheduled".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])
+                .boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        drop(h);
+        let mut opts = options();
+        opts.model = Arc::new(Answer);
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        let a = scheduler
+            .submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner,
+                "child",
+                config(),
+                "work".into(),
+                "answer".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(a.child))
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let signal = TaskStore::new(h.subagent_store().unwrap())
+            .read_typed_signal(task, &crate::runtime::submission_settled_signal(), "answer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal["id"], serde_json::json!(a.submission.unwrap().id));
+        assert_eq!(signal["answer"], "scheduled");
+    }
+
+    #[test]
+    fn notified_inheritance_races_notification_and_abort() {
+        for _ in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            let (task, owner) = setup(&mut h);
+            let other = h.create_conversation(config()).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let mut worker = h.worker();
+            let gate = barrier.clone();
+            let other_admission = std::thread::spawn(move || {
+                gate.wait();
+                worker.submit_with_notification(
+                    other,
+                    None,
+                    "ordinary".into(),
+                    crate::runtime::AdmissionOptions::default(),
+                    SubmissionNotify {
+                        task_id: task,
+                        key: "race".into(),
+                    },
+                )
+            });
+            barrier.wait();
+            let inherited = h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                "work".into(),
+                "race".into(),
+            );
+            assert_ne!(inherited.is_ok(), other_admission.join().unwrap().is_ok());
+            if inherited.is_err() {
+                let store = h.subagent_store().unwrap();
+                assert!(
+                    store
+                        .get(&reservation_key(task, "child"))
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    store
+                        .get(&inheritance_v2_key(task, "child"))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let barrier = Arc::new(Barrier::new(2));
+            let gate = barrier.clone();
+            let mut worker = h.worker();
+            let retry_owner = owner.clone();
+            let admission = std::thread::spawn(move || {
+                gate.wait();
+                worker.submit_task_owned_subagent_notified_inheriting_tools(
+                    task,
+                    retry_owner,
+                    "abort-child",
+                    config(),
+                    "work".into(),
+                    "abort-answer".into(),
+                )
+            });
+            barrier.wait();
+            h.request_abort_task(task).unwrap();
+            let result = admission.join().unwrap();
+            if let Ok(a) = result {
+                assert!(h.conversation(a.child).unwrap().abort_requested);
+                drop(h);
+                let mut h = Harness::open_paused(&path, options()).unwrap();
+                assert_eq!(
+                    h.submit_task_owned_subagent_notified_inheriting_tools(
+                        task,
+                        owner,
+                        "abort-child",
+                        config(),
+                        "work".into(),
+                        "abort-answer".into()
+                    )
+                    .unwrap(),
+                    a
+                );
+                assert!(h.conversation(a.child).unwrap().abort_requested);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn notified_inheritance_survives_kill_and_delivers_after_reopen() {
+        use futures_util::{StreamExt, stream};
+        use pi_rs_core::ModelEvent;
+        struct Answer;
+        #[async_trait]
+        impl Model for Answer {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])
+                .boxed())
+            }
+        }
+        const CHILD_PATH: &str = "PI_NOTIFIED_INHERIT_KILL_DB";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let task = std::env::var("PI_NOTIFIED_INHERIT_KILL_TASK")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let parent = std::env::var("PI_NOTIFIED_INHERIT_KILL_PARENT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let ready = std::env::var_os("PI_NOTIFIED_INHERIT_KILL_READY").unwrap();
+            let mut h = Harness::open_paused(path, options()).unwrap();
+            h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                TaskOwner::Conversation(parent),
+                "child",
+                config(),
+                "work".into(),
+                "answer".into(),
+            )
+            .unwrap();
+            std::fs::write(ready, b"committed").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let ready = dir.path().join("ready");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let TaskOwner::Conversation(parent) = owner.clone() else {
+            unreachable!()
+        };
+        h.select_tools(parent, Some(vec!["beta".into()])).unwrap();
+        h.set_deferred_tools(parent, vec!["beta".into()]).unwrap();
+        drop(h);
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("owned_subagent::tests::notified_inheritance_survives_kill_and_delivers_after_reopen")
+            .env(CHILD_PATH, &path).env("PI_NOTIFIED_INHERIT_KILL_TASK", task.to_string())
+            .env("PI_NOTIFIED_INHERIT_KILL_PARENT", parent.to_string()).env("PI_NOTIFIED_INHERIT_KILL_READY", &ready).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                process.try_wait().unwrap().is_none(),
+                "child exited before commit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !ready.exists() {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("child did not commit");
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let a = h
+            .submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner,
+                "child",
+                config(),
+                "work".into(),
+                "answer".into(),
+            )
+            .unwrap();
+        let child = h.conversation(a.child).unwrap();
+        assert_eq!(child.allowed_tools, Some(vec!["beta".into()]));
+        assert_eq!(child.tool_filters.deferred, vec!["beta"]);
+        drop(h);
+        let mut opts = options();
+        opts.model = Arc::new(Answer);
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(a.child))
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.shutdown().await.unwrap();
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let signal = TaskStore::new(h.subagent_store().unwrap())
+            .read_typed_signal(task, &crate::runtime::submission_settled_signal(), "answer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal["id"], serde_json::json!(a.submission.unwrap().id));
+        assert_eq!(signal["answer"], "answer");
     }
 
     #[test]

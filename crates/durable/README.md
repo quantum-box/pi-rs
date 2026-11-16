@@ -910,6 +910,12 @@ under that name; hosts must maintain the policy when registrations change.
 For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
 `submit_task_owned_subagent_inheriting_tools` opt in to copying the nearest
 owning conversation's enabled tools, model-facing selection and tool filters.
+`submit_task_owned_subagent_notified_inheriting_tools` additionally binds a
+foreground child's settlement notification in the same transaction as its input,
+ownership edge, inherited snapshot and provenance. The scheduler counterpart
+schedules only after commit. The key, input and signal destination are permanent;
+matching retries recover the same submission after abort or reopen, and competing
+destinations cannot both commit. Parent changes are fenced before publication.
 The parent must have no selected extensions: admission rejects any extension,
 even one whose tool names appear restricted, because names can shadow host tools.
 The parent snapshot and ownership chain are fenced in the child transaction;
