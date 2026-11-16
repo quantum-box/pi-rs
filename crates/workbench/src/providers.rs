@@ -454,6 +454,17 @@ impl Deferred {
 }
 
 impl Client {
+    pub(super) fn uses_final_strict_policy(&self) -> bool {
+        match self {
+            Self::OpenAi(_) | Self::Ollama(_) => true,
+            Self::Deferred(client) => matches!(
+                client.adapter,
+                Adapter::OpenAiResponses | Adapter::ChatCompletions
+            ),
+            _ => false,
+        }
+    }
+
     pub(super) async fn with_final_strict_support(self, supported: bool) -> Result<Self> {
         Ok(match self {
             Self::Ollama(client) => Self::Ollama(client.with_strict_tool_support(supported)),
@@ -1613,6 +1624,45 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn final_strict_policy_only_applies_to_openai_adapters() {
+        let endpoint = "http://127.0.0.1:1234/v1";
+        for (adapter, expected) in [
+            (Adapter::OpenAiResponses, true),
+            (Adapter::ChatCompletions, true),
+            (Adapter::Anthropic, false),
+            (Adapter::Google, false),
+            (Adapter::Bedrock, false),
+            (Adapter::PiMessages, false),
+        ] {
+            let provider = Provider::Custom {
+                id: Arc::from("fixture"),
+                adapter,
+            };
+            let client =
+                Client::deferred(provider, adapter, endpoint, None, RequestHeaders::default());
+            assert_eq!(client.uses_final_strict_policy(), expected, "{adapter:?}");
+        }
+        assert!(
+            !Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                .uses_final_strict_policy()
+        );
+        assert!(
+            !Client::Google(pi_rs::google::Google::new(endpoint, "fixture").unwrap())
+                .uses_final_strict_policy()
+        );
+        assert!(
+            Client::Ollama(Ollama::new(endpoint, Some("fixture".into())).unwrap())
+                .uses_final_strict_policy()
+        );
+        assert!(
+            Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api(endpoint, "fixture".into()).unwrap()
+            )
+            .uses_final_strict_policy()
+        );
+    }
 
     #[tokio::test]
     async fn anthropic_rewrite_uses_explicit_endpoint_for_both_models() {

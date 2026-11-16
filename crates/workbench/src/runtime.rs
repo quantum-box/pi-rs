@@ -866,7 +866,7 @@ pub(super) fn model_client(
         .connect_provider(&args.provider, Some(&args.model))?
         .with_context_probes(args.allow_model_probes())
         .with_model_options(args, reported)?;
-    let strict_policy = client.supports_prepared_tool_dispatch().then(|| {
+    let strict_policy = client.uses_final_strict_policy().then(|| {
         Arc::new(super::image_policy::FinalStrictPolicy {
             profiles: args.model_profiles.clone(),
             provider: args.provider.clone(),
@@ -1010,6 +1010,31 @@ impl pi_rs::Extension for LocalCommandPolicy {
 #[cfg(test)]
 mod resource_origin_tests {
     use super::*;
+
+    #[test]
+    fn runtime_final_strict_policy_is_limited_to_openai_adapters() {
+        use clap::Parser;
+        for (api, expected) in [
+            ("openai-responses", true),
+            ("openai-completions", true),
+            ("anthropic-messages", false),
+            ("google-generative-ai", false),
+        ] {
+            let endpoint = "http://127.0.0.1:1234/v1";
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
+                    "api":api, "baseUrl":endpoint, "models":[{"id":"a"}]
+                }}}))
+                .unwrap();
+            args.provider = args.model_profiles.provider("fixture").unwrap();
+            args.model = "a".into();
+            args.endpoint = endpoint.into();
+            args.api_key = Some("fixture".into());
+            let model = model_client(&args, false, false).unwrap();
+            assert_eq!(model.strict_policy.is_some(), expected, "{api}");
+        }
+    }
 
     struct InlineCommand;
     impl pi_rs::Extension for InlineCommand {
