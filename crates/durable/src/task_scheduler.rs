@@ -4136,6 +4136,7 @@ impl Scheduler {
         deferred: &mut Option<DeferredSettlement>,
     ) -> Result<bool, Error> {
         const GRAPH_RETRIES: usize = 8;
+        let mut notification_conflict_exhausted = false;
         let committed = loop {
             #[cfg(test)]
             if let Some(hook) = &self.result_commit_hook {
@@ -4152,7 +4153,6 @@ impl Scheduler {
             };
             prepared.commit_uncertain = false;
             if let Some(assembly) = &mut prepared.notifications
-                && assembly.retries < 3
                 && assembly.settlements.iter().any(|(notify, _, _)| {
                     task_store::key(notify.task_id) == *key
                         || task_store::signal_revision_key(notify.task_id) == *key
@@ -4187,6 +4187,13 @@ impl Scheduler {
                     _ => false,
                 };
                 if retry {
+                    if assembly.retries >= 3 {
+                        // The original checked transaction has not committed.
+                        // Use the ordinary replay/reconciliation policy after the
+                        // bounded notification-only reassembly budget is spent.
+                        notification_conflict_exhausted = true;
+                        break result;
+                    }
                     let harness = self.validator.as_ref().ok_or(Error::Ownership)?;
                     prepared.transaction = assembly.assemble(owner.store(), harness)?;
                     assembly.retries += 1;
@@ -4260,7 +4267,8 @@ impl Scheduler {
                         )
                         .into());
                     }
-                } else if prepared.conflict_keys.contains(&key)
+                } else if notification_conflict_exhausted
+                    || prepared.conflict_keys.contains(&key)
                     || key == task_store::PREFIX
                     || key == crate::ownership_edge::PREFIX
                     || key == b"runtime/conversation/"
@@ -5180,6 +5188,227 @@ mod tests {
         Checkpoint {
             phase: phase.into(),
             data: json!(null),
+        }
+    }
+
+    #[test]
+    fn exhausted_notification_revision_conflicts_follow_replay_policy() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{
+            Config, Harness, Options, SubmissionNotify, submission_settled_signal,
+        };
+        use crate::task_driver::Driver;
+        use crate::task_store::{Save, SignalResult, SignalToken, TaskStore};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Write {
+            target: Uuid,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Write {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.submit_write(
+                    "exhausted".into(),
+                    "app.note".into(),
+                    None,
+                    Some(SubmissionNotify {
+                        task_id: self.target,
+                        key: "settled".into(),
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+                let address = Address {
+                    scope: "test".into(),
+                    name: "exhaustion".into(),
+                    key: "".into(),
+                };
+                docs.get(&address).map_err(|e| e.to_string())?;
+                docs.put(&address, json!({"done":true}).as_object().unwrap().clone())
+                    .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        for replay_safe in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(
+                &path,
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let target = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("target"),
+                3,
+            )
+            .unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let tasks = TaskStore::new(&store);
+            tasks.save(&[Save::Create(&target)]).unwrap();
+            tasks
+                .reserve(&tasks.load(target.id()).unwrap().unwrap())
+                .unwrap();
+            tasks
+                .update(&tasks.load(target.id()).unwrap().unwrap(), |task| {
+                    task.wait(WaitFor::TypedSleep {
+                        until_millis: None,
+                        signals: vec![submission_settled_signal().key("settled").unwrap()],
+                    })
+                })
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "writer",
+                replay_safe,
+                Write {
+                    target: target.id(),
+                    calls: calls.clone(),
+                },
+            );
+            registry.register("probe", true, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            let writer = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("writer"),
+                3,
+            )
+            .unwrap()
+            .registered("writer".into(), replay_safe);
+            let commits = Arc::new(AtomicUsize::new(0));
+            let observed = commits.clone();
+            let target_id = target.id();
+            scheduler.set_result_commit_hook(Arc::new(move |_, store| {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                if attempt < 4 {
+                    assert_eq!(
+                        TaskStore::new(store)
+                            .deliver_signal_at(
+                                target_id,
+                                &SignalToken::new("concurrent", 1).unwrap(),
+                                &format!("key-{attempt}"),
+                                json!(attempt),
+                                0
+                            )
+                            .unwrap(),
+                        SignalResult::Delivered
+                    );
+                }
+            }));
+            let driver = Driver::start(scheduler);
+            driver.submit(&writer).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let final_task = loop {
+                let task = driver
+                    .get(writer.id())
+                    .expect("driver stopped after notification conflicts")
+                    .unwrap();
+                if task.is_terminal() {
+                    break task;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer did not settle"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let address = Address {
+                scope: "test".into(),
+                name: "exhaustion".into(),
+                key: "".into(),
+            };
+            let document = Documents::new(&store).get(&address).unwrap();
+            let notification = tasks
+                .read_typed_signal(target.id(), &submission_settled_signal(), "settled")
+                .unwrap();
+            if replay_safe {
+                assert!(matches!(final_task.state(), TaskState::Succeeded(_)));
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert!(document.is_some());
+                assert!(notification.is_some());
+                assert_eq!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .len(),
+                    1
+                );
+            } else {
+                assert!(matches!(final_task.state(), TaskState::Failed(_)));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(document.is_none());
+                assert!(notification.is_none());
+                assert!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .is_empty()
+                );
+            }
+            for index in 0..4 {
+                assert_eq!(
+                    tasks
+                        .read_typed_signal(
+                            target.id(),
+                            &SignalToken::new("concurrent", 1).unwrap(),
+                            format!("key-{index}")
+                        )
+                        .unwrap(),
+                    Some(json!(index))
+                );
+            }
+            let probe = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("probe"),
+                3,
+            )
+            .unwrap()
+            .registered("probe".into(), true);
+            driver.submit(&probe).expect("driver must remain usable");
+            loop {
+                let task = driver.get(probe.id()).unwrap().unwrap();
+                if task.is_terminal() {
+                    assert!(matches!(task.state(), TaskState::Succeeded(_)));
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "probe did not settle");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            driver.shutdown().unwrap();
         }
     }
 
