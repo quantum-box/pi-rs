@@ -295,6 +295,52 @@ fn oversized_reset_settlement_and_fork_survive_reopen() {
 }
 
 #[test]
+fn late_block_reset_validates_pending_queue_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, id, _, steps) = setup(&dir.path().join("db"));
+    let (mut baseline, _) = h.load(id).unwrap();
+    let blocks = baseline
+        .pending_reset_blocks
+        .remove(&steps[0].reset_id)
+        .unwrap();
+    baseline.pending_reset_blocks.clear();
+    baseline.pending_resets.clear();
+    for _ in 0..1024 {
+        baseline
+            .pending_resets
+            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+    }
+    let final_reset = baseline.pending_resets.last().unwrap().id;
+    baseline
+        .pending_reset_blocks
+        .insert(final_reset, blocks.clone());
+    let steps: Vec<_> = baseline
+        .pending_resets
+        .iter()
+        .map(|reset| ResetDerivationStep {
+            reset_id: reset.id,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        })
+        .collect();
+    RESET_PENDING_VALIDATION_VISITS.with(|count| count.set(0));
+    let final_state = visit_ordered_reset_states(&baseline, &steps, |_| Ok(())).unwrap();
+    assert_eq!(
+        RESET_PENDING_VALIDATION_VISITS.with(std::cell::Cell::get),
+        steps.len()
+    );
+    assert_eq!(final_state.resets.len(), steps.len());
+    assert_eq!(
+        final_state
+            .content_blocks
+            .values()
+            .cloned()
+            .collect::<Vec<_>>(),
+        blocks
+    );
+}
+
+#[test]
 fn large_atomic_failure_shared_evidence_reopens_and_fences_tampering() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

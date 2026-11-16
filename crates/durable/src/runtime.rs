@@ -3202,6 +3202,8 @@ thread_local! {
     #[cfg(test)]
     static RESET_PROOF_CHECK_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     #[cfg(test)]
+    static RESET_PENDING_VALIDATION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
     static RESET_FORCE_CHUNKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static RESET_PROOF_BEFORE_SAVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -21525,11 +21527,13 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
     if c.pending_reset_blocks.is_empty() {
         return Ok(());
     }
+    #[cfg(test)]
+    RESET_PENDING_VALIDATION_VISITS
+        .with(|visits| visits.set(visits.get() + c.resets.len() + c.pending_resets.len()));
+    let placed_ids: std::collections::HashSet<_> = c.resets.iter().map(|reset| reset.id).collect();
     let mut reset_ids = std::collections::HashSet::new();
     if c.pending_resets.iter().any(|reset| {
-        reset.id.is_nil()
-            || !reset_ids.insert(reset.id)
-            || c.resets.iter().any(|placed| placed.id == reset.id)
+        reset.id.is_nil() || !reset_ids.insert(reset.id) || placed_ids.contains(&reset.id)
     }) || c
         .pending_reset_blocks
         .keys()
@@ -21638,6 +21642,13 @@ fn visit_ordered_reset_states_with_before(
     }
     validate_pending_reset_blocks(baseline)?;
     let mut state = baseline.clone();
+    let mut pending_ids = (!state.pending_reset_blocks.is_empty()).then(|| {
+        state
+            .pending_resets
+            .iter()
+            .map(|reset| reset.id)
+            .collect::<std::collections::HashSet<_>>()
+    });
     let mut generations = std::collections::HashSet::new();
     if let Some(generation) = state.context_generation {
         generations.insert(generation);
@@ -21654,11 +21665,23 @@ fn visit_ordered_reset_states_with_before(
         {
             return Err(Error::Invalid("invalid ordered reset derivation".into()));
         }
+        if pending_ids
+            .as_mut()
+            .is_some_and(|ids| !ids.remove(&step.reset_id))
+        {
+            return Err(Error::Invalid(
+                "invalid pending reset block ordering".into(),
+            ));
+        }
         before(&state, step);
         let marker = state.pending_resets.remove(0);
         place_reset_before_writes(&mut state, marker, step.write_limit);
         state.context_generation = Some(step.context_generation);
-        validate_pending_reset_blocks(&state)?;
+        // The initial check proves uniqueness of all pending reset and block
+        // IDs. Placement removes exactly the first reset and its blocks, moves
+        // that reset to the placed list, and replaces active blocks with those
+        // removed blocks. It therefore preserves those invariants for the
+        // remaining pending resets without rescanning the entire queue.
         visit(&state)?;
     }
     Ok(state)
