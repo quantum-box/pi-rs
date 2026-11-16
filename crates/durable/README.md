@@ -987,6 +987,10 @@ or prove implementation identity across processes. The host remains responsible
 for protecting mutable credentials, authorization, budgets and endpoint policy.
 This fence does not enable adapter inheritance for task-owned children, and it
 does not change unpinned adapter installation. No identity token is stored.
+For scheduler-driven recovery, `Scheduler::open_with_pinned_provider_adapter`
+installs and pins the supplied adapter before any recovered conversation is
+scheduled. Reapply this constructor on each reopen; it does not verify identity
+against an earlier process or prevent adapter-internal changes.
 
 For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
 `submit_task_owned_subagent_inheriting_tools` opt in to copying the nearest

@@ -2267,6 +2267,118 @@ mod tests {
         h.pin_provider_adapter().unwrap();
     }
 
+    #[tokio::test]
+    async fn pinned_scheduler_fences_same_id_replacement_during_recovery() {
+        use futures_util::{StreamExt, stream};
+        use pi_rs_core::ModelEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Gate {
+            entered: Arc<tokio::sync::Semaphore>,
+            release: Arc<tokio::sync::Semaphore>,
+            dispatched: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::model::ProviderAdapter for Gate {
+            fn id(&self) -> &str {
+                "guarded/v1"
+            }
+            async fn prepare(
+                &self,
+                _: &crate::model::ProviderAttempt,
+                _: &ModelRequest,
+            ) -> Result<serde_json::Value, ModelError> {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                Ok(serde_json::json!({"auth":"allowed","budget":1,"endpoint":"safe"}))
+            }
+            fn validate(
+                &self,
+                _: &crate::model::ProviderAttempt,
+                _: &ModelRequest,
+                body: &serde_json::Value,
+            ) -> Result<(), ModelError> {
+                if body != &serde_json::json!({"auth":"allowed","budget":1,"endpoint":"safe"}) {
+                    return Err(ModelError::Config("policy rejected request".into()));
+                }
+                Ok(())
+            }
+            async fn dispatch(
+                &self,
+                _: &crate::model::ProviderAttempt,
+                _: &ModelRequest,
+                _: serde_json::Value,
+            ) -> Result<ModelStream, ModelError> {
+                self.dispatched.fetch_add(1, Ordering::SeqCst);
+                Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("guarded".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])
+                .boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn crate::model::ProviderAdapter> = Arc::new(Gate {
+            entered: entered.clone(),
+            release: release.clone(),
+            dispatched: dispatched.clone(),
+        });
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(adapter.clone()).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_provider_adapter(id, true).unwrap();
+        h.submit(id, None, "recover".into()).unwrap();
+        drop(h);
+        let mut scheduler = Scheduler::open_with_pinned_provider_adapter(
+            &path,
+            options(),
+            Default::default(),
+            adapter,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let mut worker = scheduler.subagent_harness().worker();
+        let replacement =
+            std::thread::spawn(move || worker.install_provider_adapter(Arc::new(GuardedAdapter)));
+        assert!(replacement.join().unwrap().is_err());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        scheduler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_scheduler_adapter_start_remains_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler = Scheduler::open_with_provider_adapter(
+            dir.path().join("db"),
+            options(),
+            Default::default(),
+            Arc::new(GuardedAdapter),
+        )
+        .unwrap();
+        let mut worker = scheduler.subagent_harness().worker();
+        worker
+            .install_provider_adapter(Arc::new(GuardedAdapter))
+            .unwrap();
+        drop(worker);
+        scheduler.shutdown().await.unwrap();
+    }
+
     #[test]
     fn adapter_selection_is_fenced_and_inherited_admission_fails_closed() {
         let dir = tempfile::tempdir().unwrap();

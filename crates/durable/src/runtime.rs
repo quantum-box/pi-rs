@@ -19032,6 +19032,29 @@ impl Scheduler {
     ) -> Result<Self, Error> {
         Self::open_configured(path, options, registry, None, Some(adapter))
     }
+    /// Install and pin the adapter before any recovered work is scheduled.
+    /// The pin is process-local and does not attest implementation identity
+    /// after reopen or prevent mutation inside the adapter.
+    pub fn open_with_pinned_provider_adapter(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        adapter: Arc<dyn crate::model::ProviderAdapter>,
+    ) -> Result<Self, Error> {
+        Self::open_configured_with_tasks_and_adapter_pin(
+            path,
+            options,
+            registry,
+            None,
+            Some(adapter),
+            None,
+            None,
+            None,
+            true,
+        )
+        .map(|(scheduler, _)| scheduler)
+    }
+
     /// Opt into bounded recovery of independent summaries. The identity is a
     /// host assertion about `options.model`, including the service that handles
     /// its usage receipts. It must be stable across restarts and changed when
@@ -19189,9 +19212,34 @@ impl Scheduler {
         registry: crate::extension::Registry,
         management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+        tasks: Option<crate::task_scheduler::Registry>,
+        summary_provider: Option<SummaryProviderIdentity>,
+        foreground: Option<(Uuid, Config, Option<Vec<String>>)>,
+    ) -> Result<(Self, Option<crate::task_driver::Driver>), Error> {
+        Self::open_configured_with_tasks_and_adapter_pin(
+            path,
+            options,
+            registry,
+            management,
+            adapter,
+            tasks,
+            summary_provider,
+            foreground,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_configured_with_tasks_and_adapter_pin(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        management: Option<(Uuid, Config, Option<Vec<String>>)>,
+        adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
         mut tasks: Option<crate::task_scheduler::Registry>,
         summary_provider: Option<SummaryProviderIdentity>,
         foreground: Option<(Uuid, Config, Option<Vec<String>>)>,
+        pin_adapter: bool,
     ) -> Result<(Self, Option<crate::task_driver::Driver>), Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
@@ -19207,6 +19255,9 @@ impl Scheduler {
         let mut harness = Harness::open_paused(path, options)?;
         if let Some(adapter) = adapter {
             harness.install_provider_adapter(adapter)?;
+        }
+        if pin_adapter {
+            harness.pin_provider_adapter()?;
         }
         *harness.extensions.write().map_err(|_| Error::Failed)? = registry;
         harness.summary_provider = summary_provider.clone();
