@@ -71,6 +71,14 @@ fn turn_active_decision(
     session: &Session,
     invocations: &[Invocation],
 ) -> Result<Option<crate::ToolDecisionSnapshot>> {
+    turn_active_decision_inner(session, invocations, false)
+}
+
+fn turn_active_decision_inner(
+    session: &Session,
+    invocations: &[Invocation],
+    allow_started: bool,
+) -> Result<Option<crate::ToolDecisionSnapshot>> {
     if invocations.is_empty() {
         return Ok(None);
     }
@@ -209,7 +217,7 @@ fn turn_active_decision(
                 Event::ToolStarted { operation_id, .. }
                 | Event::ToolFinished { operation_id, .. }
                 | Event::ToolReconciled { operation_id, .. } => {
-                    *operation_id == invocation.operation_id
+                    !allow_started && *operation_id == invocation.operation_id
                 }
                 _ => false,
             })
@@ -329,6 +337,35 @@ fn turn_poll_snapshot(
     let Event::ToolStarted { tool_execution, .. } = &start.event else {
         unreachable!()
     };
+    // Classify direct model calls from their active request, not from the
+    // start marker: both the marker and its metadata may have been stripped.
+    let mut assistants = branch.iter().filter_map(|record| match &record.event {
+        Event::Assistant { invocations, .. }
+            if invocations
+                .iter()
+                .any(|call| call.operation_id == invocation.operation_id) =>
+        {
+            Some(invocations)
+        }
+        _ => None,
+    });
+    let decision = if let Some(invocations) = assistants.next() {
+        if assistants.next().is_some() {
+            return Err(pending());
+        }
+        turn_active_decision_inner(session, invocations, true).map_err(|_| pending())?
+    } else {
+        None
+    };
+    let strict = decision
+        .as_ref()
+        .map(|decision| turn_is_strict(decision, &tool.spec))
+        .transpose()
+        .map_err(|_| pending())?
+        .unwrap_or(false);
+    if strict && tool_execution.is_none() {
+        return Err(pending());
+    }
     let identity = if tool_execution.is_some() {
         turn_recovery_identity(&tool).map_err(|_| pending())?
     } else {
@@ -337,6 +374,9 @@ fn turn_poll_snapshot(
     let args = session
         .recorded_tool_execution(start.id, &tool.owner, &tool.spec, &identity)
         .map_err(|_| pending())?;
+    if strict && args.is_none() {
+        return Err(pending());
+    }
     Ok(args.map(|args| (tool, args)))
 }
 
@@ -1117,6 +1157,48 @@ mod strict_argument_tests {
                 states: ExtensionStates::new(),
             })
             .unwrap();
+        let start_id = session
+            .branch()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::ToolStarted { operation_id, .. }
+                    if *operation_id == invocation.operation_id =>
+                {
+                    Some(record.id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let records = session.records().to_vec();
+        let metadata: std::collections::BTreeMap<_, _> = records
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut stripped_records = records.clone();
+        let Event::ToolStarted { tool_execution, .. } =
+            &mut stripped_records[(start_id - 1) as usize].event
+        else {
+            unreachable!()
+        };
+        *tool_execution = None;
+        let mut stripped_metadata = metadata.clone();
+        stripped_metadata.remove(&start_id);
+        let stripped =
+            Session::from_records_with_metadata(stripped_records, stripped_metadata).unwrap();
+        assert!(turn_poll_snapshot(&stripped, &registry, &invocation).is_err());
+        let mut duplicate = Session::from_records_with_metadata(records, metadata).unwrap();
+        duplicate
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        assert!(turn_poll_snapshot(&duplicate, &registry, &invocation).is_err());
         let prepared = turn_poll_snapshot(&session, &registry, &invocation)
             .unwrap()
             .unwrap();
@@ -1159,6 +1241,237 @@ mod strict_argument_tests {
         let mut forged = invocation.clone();
         forged.call.arguments = "{}".into();
         assert!(turn_poll_snapshot(&session, &registry, &forged).is_err());
+    }
+
+    #[test]
+    fn unconstrained_fallback_keeps_legacy_poll_preparation() {
+        let tool = Arc::new(FixtureTool {
+            pollable: true,
+            pending: false,
+            identity: None,
+            seen: Arc::default(),
+            callbacks: Arc::default(),
+        });
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FixtureExtension(tool.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = recorded_turn(&mut session, crate::Tool::spec(tool.as_ref()), false);
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        assert!(
+            turn_poll_snapshot(&session, &registry, &invocation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mixed_parallel_starts_keep_per_call_decisions() {
+        struct FallbackTool;
+        #[async_trait::async_trait]
+        impl crate::Tool for FallbackTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "fallback".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            fn can_poll(&self) -> bool {
+                true
+            }
+            async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+                unreachable!()
+            }
+        }
+        struct FallbackExtension;
+        #[async_trait::async_trait]
+        impl crate::Extension for FallbackExtension {
+            fn id(&self) -> &str {
+                "fallback-owner"
+            }
+            fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+                vec![Arc::new(FallbackTool)]
+            }
+        }
+        let tool = Arc::new(FixtureTool {
+            pollable: true,
+            pending: false,
+            identity: Some("backend:v1"),
+            seen: Arc::default(),
+            callbacks: Arc::default(),
+        });
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FixtureExtension(tool.clone())))
+            .unwrap();
+        registry.register(Arc::new(FallbackExtension)).unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let specs = vec![
+            crate::Tool::spec(tool.as_ref()),
+            crate::Tool::spec(&FallbackTool),
+        ];
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: specs.clone(),
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: false,
+        };
+        let declarations: Vec<_> = specs
+            .iter()
+            .map(|spec| crate::ToolDeclaration {
+                spec: spec.clone(),
+                constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                    strict: crate::StrictToolPolicy::Prefer,
+                }),
+            })
+            .collect();
+        let effective: Vec<_> = specs
+            .iter()
+            .map(|spec| crate::EffectiveToolDeclaration {
+                spec: spec.clone(),
+                sampling: if spec.name == "read" {
+                    crate::EffectiveToolSampling::StrictJsonSchema {
+                        original_schema: spec.parameters.clone(),
+                        normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+                    }
+                } else {
+                    crate::EffectiveToolSampling::Unconstrained
+                },
+            })
+            .collect();
+        let decision =
+            crate::ToolDecisionSnapshot::capture(&context, &request, &declarations, &effective)
+                .unwrap();
+        session
+            .append_tool_decision_request(
+                Event::ModelRequested {
+                    model: request.model.clone(),
+                    messages: 0,
+                    tools: 2,
+                    max_output_tokens: 10,
+                    request_id: Some(context.request_id),
+                    context_head: Some(session.head()),
+                    context_sha256: Some(decision.request_sha256().into()),
+                    context_transformed: Some(false),
+                    context_configuration_sha256: None,
+                    tool_decision: None,
+                },
+                &decision,
+                &request,
+                &request,
+                &declarations,
+            )
+            .unwrap();
+        let calls: Vec<_> = ["read", "fallback"]
+            .into_iter()
+            .map(|name| Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: name.into(),
+                    name: name.into(),
+                    arguments: if name == "read" {
+                        r#"{"path":"file","limit":null}"#
+                    } else {
+                        "{}"
+                    }
+                    .into(),
+                },
+            })
+            .collect();
+        session
+            .append(Event::ModelFinished {
+                request_id: context.request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: String::new(),
+                    invocations: calls.clone(),
+                    advertised_tools: vec!["read".into(), "fallback".into()],
+                    max_output_tokens: 10,
+                }),
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: calls.clone(),
+                usage: None,
+                request_id: Some(context.request_id),
+            })
+            .unwrap();
+        let snapshot = crate::ToolExecutionSnapshot::capture(
+            context.request_id,
+            &calls[0],
+            "fixture",
+            &specs[0],
+            "backend:v1",
+            decision.binding_sha256(),
+            json!({"path":"authorized"}),
+        )
+        .unwrap();
+        session
+            .append_tool_execution_started(
+                context.request_id,
+                calls[0].operation_id,
+                &snapshot,
+                "fixture",
+                &specs[0],
+                "backend:v1",
+            )
+            .unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id: calls[1].operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        for call in &calls {
+            session
+                .append(Event::ToolFinished {
+                    operation_id: call.operation_id,
+                    outcome: Outcome::Pending {
+                        reference: "job".into(),
+                    },
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            turn_poll_snapshot(&session, &registry, &calls[0])
+                .unwrap()
+                .unwrap()
+                .1,
+            json!({"path":"authorized"})
+        );
+        assert!(
+            turn_poll_snapshot(&session, &registry, &calls[1])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
