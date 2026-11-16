@@ -1312,13 +1312,13 @@ pub(super) fn bare_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
 // Marked identifies bare links before parsing inline formatting. Protect the
 // ASCII delimiters within candidates so pulldown-cmark makes the same choice.
 // Byte lengths remain unchanged, allowing all parser offsets to index `text`.
-fn protect_bare_links(text: &str, options: Options) -> String {
+fn protect_bare_links(text: &str, options: Options, reference_source: &str) -> String {
     let mut plain_ranges = Vec::new();
     let mut segments = Vec::new();
     let mut after_table = 0;
     let mut protected = 0usize;
     let mut formatting = Vec::new();
-    for (event, range) in super::strike::events(text, text, options) {
+    for (event, range) in super::strike::events(text, text, options, reference_source) {
         match event {
             Event::Start(Tag::Table(_)) => {
                 segments.push((after_table..range.start, false));
@@ -1513,8 +1513,6 @@ fn markdown_at_depth(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
-    // Marked normalizes line endings before invoking the block extension. Keep
-    // all offsets local to this normalized document, including list contents.
     if text.contains('\r') {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         return markdown_at_depth(
@@ -1527,8 +1525,44 @@ fn markdown_at_depth(
             preserve_source,
         );
     }
+    let sanitized = super::math_blocks::reference_source(text);
+    let reference_source = sanitized.as_ref();
+    markdown_at_depth_with_refs(
+        (text, reference_source),
+        theme,
+        width,
+        depth,
+        mermaid,
+        hyperlinks,
+        preserve_source,
+    )
+}
+
+fn markdown_at_depth_with_refs(
+    (text, reference_source): (&str, &str),
+    theme: &Theme,
+    width: usize,
+    depth: usize,
+    mermaid: super::mermaid::Mermaid,
+    hyperlinks: bool,
+    preserve_source: bool,
+) -> Vec<Line> {
+    // Marked normalizes line endings before invoking the block extension. Keep
+    // all offsets local to this normalized document, including list contents.
+    if text.contains('\r') {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        return markdown_at_depth_with_refs(
+            (&normalized, reference_source),
+            theme,
+            width,
+            depth,
+            mermaid,
+            hyperlinks,
+            preserve_source,
+        );
+    }
     if let Some(lines) = markdown_with_block_spacing(
-        text,
+        (text, reference_source),
         theme,
         width,
         depth,
@@ -1544,7 +1578,7 @@ fn markdown_at_depth(
         || text.len().saturating_mul(blocks.len() + 1) > 1024 * 1024
     {
         return markdown_plain_at_depth(
-            (text, text),
+            (text, text, reference_source),
             theme,
             width,
             depth,
@@ -1553,23 +1587,12 @@ fn markdown_at_depth(
             preserve_source,
         );
     }
-    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS);
-    let definitions: Vec<_> = parser
-        .reference_definitions()
-        .iter()
-        .map(|(_, definition)| definition.span.clone())
-        .filter(|range| {
-            !blocks
-                .iter()
-                .any(|block| range.start < block.source.end && block.source.start < range.end)
-        })
-        .collect();
     let mut lines = Vec::new();
     let mut start = 0;
     for block in &blocks {
-        let segment = masked_math_segment(text, start..block.source.start, &definitions);
+        let segment = masked_math_segment(text, start..block.source.start);
         let before = markdown_plain_at_depth(
-            (text, &segment),
+            (text, &segment, reference_source),
             theme,
             width,
             depth,
@@ -1595,9 +1618,9 @@ fn markdown_at_depth(
         );
         start = block.source.end;
     }
-    let segment = masked_math_segment(text, start..text.len(), &definitions);
+    let segment = masked_math_segment(text, start..text.len());
     let after = markdown_plain_at_depth(
-        (text, &segment),
+        (text, &segment, reference_source),
         theme,
         width,
         depth,
@@ -1610,11 +1633,11 @@ fn markdown_at_depth(
 }
 
 // Render source-ordered blocks and explicit space tokens. The complete source
-// retains its offsets and definitions in each masked segment so references
-// resolve across block boundaries. The bounded fallback uses the existing
+// retains its offsets while references resolve against the complete source.
+// The bounded fallback uses the existing
 // renderer when a source cannot be safely inventoried in time or space.
 fn markdown_with_block_spacing(
-    text: &str,
+    (text, reference_source): (&str, &str),
     theme: &Theme,
     width: usize,
     depth: usize,
@@ -1642,25 +1665,6 @@ fn markdown_with_block_spacing(
     if tokens.len() > 1024 || text.len().saturating_mul(count) > 1024 * 1024 {
         return None;
     }
-    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS);
-    let mut definitions: Vec<_> = parser
-        .reference_definitions()
-        .iter()
-        .map(|(_, def)| def.span.clone())
-        .collect();
-    definitions.retain(|range| {
-        !tokens.iter().any(|token| {
-            token.kind == BlockTokenKind::Math
-                && range.start < token.range.end
-                && token.range.start < range.end
-        })
-    });
-    definitions.extend(
-        tokens
-            .iter()
-            .filter(|token| token.kind == BlockTokenKind::Definition)
-            .map(|token| token.range.clone()),
-    );
     let mut lines = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         if super::strike::frame_expired() {
@@ -1686,9 +1690,9 @@ fn markdown_with_block_spacing(
                 lines.extend(wrap(&[Span::themed(rendered, theme, "text")], width));
             }
             BlockTokenKind::Block(flavor) => {
-                let masked = masked_math_segment(text, token.range.clone(), &definitions);
+                let masked = masked_math_segment(text, token.range.clone());
                 let mut block_lines = markdown_plain_at_depth(
-                    (text, &masked),
+                    (text, &masked, reference_source),
                     theme,
                     width,
                     depth,
@@ -1727,17 +1731,14 @@ fn markdown_with_block_spacing(
     Some(lines)
 }
 
-// Preserve offsets into the original message and retain all reference
-// definitions, so links resolve across display-math boundaries.
-fn masked_math_segment(text: &str, segment: Range<usize>, definitions: &[Range<usize>]) -> String {
+// Preserve offsets into the original message. Reference links are resolved
+// separately against the whole document, without copying container contents.
+fn masked_math_segment(text: &str, segment: Range<usize>) -> String {
     let mut bytes: Vec<_> = text
         .bytes()
         .map(|b| if matches!(b, b'\n' | b'\r') { b } else { b' ' })
         .collect();
     bytes[segment.clone()].copy_from_slice(&text.as_bytes()[segment]);
-    for range in definitions {
-        bytes[range.clone()].copy_from_slice(&text.as_bytes()[range.clone()]);
-    }
     String::from_utf8(bytes).expect("masks preserve UTF-8 boundaries")
 }
 
@@ -1855,7 +1856,7 @@ fn insert_list_math(
 }
 
 fn markdown_plain_at_depth(
-    (text, parsed): (&str, &str),
+    (text, parsed, reference_source): (&str, &str, &str),
     theme: &Theme,
     width: usize,
     depth: usize,
@@ -1884,6 +1885,7 @@ fn markdown_plain_at_depth(
     let mut item_prefixes = Vec::new();
     let mut item_block_ends: Vec<Option<usize>> = Vec::new();
     let mut item_after_math = Vec::new();
+    let mut item_reference_scan_work = 0usize;
     let mut list_code_start = None;
     let mut table: Option<Table> = None;
     let mut table_cell_start = None;
@@ -1892,10 +1894,10 @@ fn markdown_plain_at_depth(
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
     let mut last_rule_separator = None;
-    let protected_text = protect_bare_links(parsed, options);
+    let protected_text = protect_bare_links(parsed, options, reference_source);
     let list_math = super::math_blocks::list_blocks(parsed);
     let mut events = insert_list_math(
-        super::strike::events(parsed, &protected_text, options),
+        super::strike::events(parsed, &protected_text, options, reference_source),
         &list_math,
         parsed,
     )
@@ -2257,8 +2259,8 @@ fn markdown_plain_at_depth(
                 let bordered = available_width >= 3;
                 let content_width = available_width.saturating_sub(if bordered { 2 } else { 0 });
                 let mut quoted = if depth < 32 {
-                    markdown_at_depth(
-                        &body,
+                    markdown_at_depth_with_refs(
+                        (&body, reference_source),
                         theme,
                         content_width,
                         depth + 1,
@@ -2537,14 +2539,45 @@ fn markdown_plain_at_depth(
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 if let Some(Some(end)) = item_block_ends.last()
-                    && let Some(def) = definition_ranges
-                        .get(definition_ranges.partition_point(|def| def.start < *end))
-                    && def.end <= range.end
-                    && text[*end..def.start]
-                        .lines()
-                        .any(|line| line.trim().is_empty())
+                    && *end <= range.end
                 {
-                    lines.push(Line::default());
+                    let known = definition_ranges
+                        .get(definition_ranges.partition_point(|def| def.start < *end))
+                        .filter(|def| def.end <= range.end)
+                        .map(|def| def.start);
+                    // Pulldown retains only the first definition for each
+                    // label. Reparse the bounded item suffix to locate later
+                    // definitions that still own preceding space tokens.
+                    let suffix_len = range.end - *end;
+                    let duplicate = if known.is_none()
+                        && suffix_len <= 64 * 1024
+                        && item_reference_scan_work.saturating_add(suffix_len) <= 1024 * 1024
+                        && !super::strike::frame_expired()
+                        && parsed[*end..range.end].contains('[')
+                    {
+                        item_reference_scan_work += suffix_len;
+                        super::strike::item_indent(parsed, range.start).and_then(|indent| {
+                            let suffix = format!("\n{}", &parsed[*end..range.end]);
+                            let (normalized, offsets) = super::strike::normalize_continuations(
+                                &suffix,
+                                &[super::strike::Container::Item(indent)],
+                            )?;
+                            let parser = Parser::new_ext(&normalized, options);
+                            let start = parser
+                                .reference_definitions()
+                                .iter()
+                                .map(|(_, def)| def.span.start)
+                                .min()?;
+                            Some(*end + offsets[start].saturating_sub(1))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(start) = known.or(duplicate)
+                        && text[*end..start].lines().any(|line| line.trim().is_empty())
+                    {
+                        lines.push(Line::default());
+                    }
                 }
                 item_prefixes.pop();
                 item_block_ends.pop();
@@ -2722,6 +2755,88 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
     #[test]
+    fn markdown_nested_references_keep_document_destinations_and_styles() {
+        let theme = Theme::system();
+        for source in [
+            "[x][r]\n\n- outer\n  - inner\n\n    [r]: https://first.example\n",
+            "> [x][r]\n\n[r]: https://first.example",
+            "[x][r]\n$$x$$\n- outer\n  - inner\n\n    [r]: https://first.example",
+            "- first\n\n  [r]: https://first.example\n\ntext\n\n- [x][r]\n\n  [r]: https://second.example",
+            "~~[x][r]~~\n\n- outer\n  - inner\n\n    [r]: https://first.example",
+        ] {
+            let lines = markdown_at_depth(
+                source,
+                &theme,
+                80,
+                0,
+                super::super::mermaid::Mermaid::Off,
+                true,
+                false,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text.contains('x')
+                        && span.hyperlink.as_deref() == Some("https://first.example")),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hyperlink.as_deref() == Some("https://second.example")),
+                "{source:?}: {lines:?}"
+            );
+            if source.starts_with("~~") {
+                assert!(
+                    lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| span.text.contains('x')
+                            && span.strikethrough
+                            && span.hyperlink.as_deref() == Some("https://first.example")),
+                    "{source:?}: {lines:?}"
+                );
+            }
+        }
+        let unresolved = markdown(
+            "- [**bold**][r]\n\n  $$\n\n  [r]: /fake\n\n  $$",
+            &theme,
+            80,
+        );
+        assert!(
+            unresolved
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("bold") && span.bold)
+        );
+    }
+    #[test]
+    fn markdown_quote_math_limit_does_not_resolve_unverified_references() {
+        let source = format!(
+            "[x][r]\n\n{}> $$\n>\n> [r]: /fake\n>\n> $$\n\n[r]: /real",
+            "> $$x$$\n\n".repeat(65)
+        );
+        let lines = markdown(&source, &Theme::system(), 80);
+        let text = lines
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.text)
+            .collect::<String>();
+        assert!(text.starts_with("[x][r]"), "{text:?}");
+        let source = format!(
+            "[x][r]\n\n{}- $$\n\n  [r]: /fake\n\n  $$\n\n[r]: /real",
+            "- $$x$$\n\n".repeat(65)
+        );
+        let text = markdown(&source, &Theme::system(), 80)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.text)
+            .collect::<String>();
+        assert!(text.starts_with("[x][r]"), "{text:?}");
+    }
+    #[test]
     fn list_blocks_wrap_at_item_width() {
         for source in [
             "- > alpha beta gamma delta",
@@ -2776,6 +2891,7 @@ mod tests {
             "hello\n\n",
             "# heading\n\ntext\n\n",
             "[x][r]\n\n[r]: https://e.co\n\n",
+            "[x][r]\n\n$$\n\n[r]: /fake\n\n$$\n\n[r]: /real",
         ] {
             let render = |s: &str| {
                 markdown(s, &theme, 80)

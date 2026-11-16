@@ -2015,6 +2015,8 @@ indentation for code and quotes. A pinned Pi fixture checks these layouts,
 including duplicate definitions and narrow quotes. Inventory and rendering
 have native work limits; inputs that exceed them use the existing bounded
 renderer and can differ in spacing from Pi.
+If nested-math scanning exceeds its resource limit, reference links may remain
+unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
 Inline and display LaTeX use a native port of the pinned Pi terminal renderer,
 including fractions, operators, scripts and matrix environments. Math can occur

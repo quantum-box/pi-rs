@@ -2400,6 +2400,380 @@
           "raw": "end"
         }
       ]
+    },
+    {
+      "source": "[x][r]\n\n- outer\n  - inner\n\n    [r]: /url\n",
+      "lines": [
+        "x (/url)",
+        "",
+        "- outer",
+        "    - inner",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n\n    [r]: /url\n"
+        }
+      ]
+    },
+    {
+      "source": "[r]: /first\n\n- [x][r]\n\n  [r]: /second\n",
+      "lines": [
+        "",
+        "- x (/first)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "def",
+          "raw": "[r]: /first"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  [r]: /second\n"
+        }
+      ]
+    },
+    {
+      "source": "- outer\n  - inner\n\n    [r]: /first\n\n[x][r]\n\n[r]: /second",
+      "lines": [
+        "- outer",
+        "    - inner",
+        "",
+        "",
+        "x (/first)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n\n    [r]: /first"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n> [r]: /url\n\n$$x^2$$",
+      "lines": [
+        "x (/url)",
+        "",
+        "",
+        "x²"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "blockquote",
+          "raw": "> [r]: /url"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$x^2$$"
+        }
+      ]
+    },
+    {
+      "source": "- first\n\n  [r]: /one\n\ntext\n\n- [x][r]\n\n  [r]: /two",
+      "lines": [
+        "- first",
+        "",
+        "",
+        "text",
+        "",
+        "- x (/one)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- first\n\n  [r]: /one"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  [r]: /two"
+        }
+      ]
+    },
+    {
+      "source": "- a\n  - b\n\n    [r]: /one\n\ntext\n\n- [x][r]\n\n  [r]: /two",
+      "lines": [
+        "- a",
+        "    - b",
+        "",
+        "",
+        "text",
+        "",
+        "- x (/one)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- a\n  - b\n\n    [r]: /one"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "paragraph",
+          "raw": "text"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  [r]: /two"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n- outer\n\n  [r]:\n    /url\n    \"title\"\n",
+      "lines": [
+        "x (/url)",
+        "",
+        "- outer",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "list",
+          "raw": "- outer\n\n  [r]:\n    /url\n    \"title\"\n"
+        }
+      ]
+    },
+    {
+      "source": "> [x][r]\n\n[r]: /url",
+      "lines": [
+        "│ x (/url)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "blockquote",
+          "raw": "> [x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /url"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n$$\n[r]: /fake\n$$",
+      "lines": [
+        "[x][r]",
+        "",
+        "[r]: /fake"
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$\n[r]: /fake\n$$"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n$$x$$\n- outer\n  - inner\n\n    [r]: /url",
+      "lines": [
+        "x (/url)",
+        "",
+        "x",
+        "",
+        "- outer",
+        "    - inner",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$x$$\n"
+        },
+        {
+          "type": "list",
+          "raw": "- outer\n  - inner\n\n    [r]: /url"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n$$\n\n[r]: /fake\n\n$$\n\n[r]: /real",
+      "lines": [
+        "x (/real)",
+        "",
+        "[r]: /fake",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "latexBlock",
+          "raw": "$$\n\n[r]: /fake\n\n$$\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /real"
+        }
+      ]
+    },
+    {
+      "source": "[https://e.co/a_b][r]\n\n[r]: /real",
+      "lines": [
+        "https://e.co/a_b (/real)",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[https://e.co/a_b][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /real"
+        }
+      ]
+    },
+    {
+      "source": "[x][r]\n\n> $$\n>\n> [r]: /fake\n>\n> $$\n\n[r]: /real",
+      "lines": [
+        "x (/real)",
+        "",
+        "│ [r]: /fake",
+        ""
+      ],
+      "tokens": [
+        {
+          "type": "paragraph",
+          "raw": "[x][r]"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "blockquote",
+          "raw": "> $$\n>\n> [r]: /fake\n>\n> $$"
+        },
+        {
+          "type": "space",
+          "raw": "\n\n"
+        },
+        {
+          "type": "def",
+          "raw": "[r]: /real"
+        }
+      ]
+    },
+    {
+      "source": "- [x][r]\n\n  $$\n\n  [r]: /fake\n\n  $$",
+      "lines": [
+        "- [x][r]",
+        "",
+        "  [r]: /fake"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- [x][r]\n\n  $$\n\n  [r]: /fake\n\n  $$"
+        }
+      ]
+    },
+    {
+      "source": "- [**bold**][r]\n\n  $$\n\n  [r]: /fake\n\n  $$",
+      "lines": [
+        "- [bold][r]",
+        "",
+        "  [r]: /fake"
+      ],
+      "tokens": [
+        {
+          "type": "list",
+          "raw": "- [**bold**][r]\n\n  $$\n\n  [r]: /fake\n\n  $$"
+        }
+      ]
     }
   ]
 }

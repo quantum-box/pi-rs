@@ -56,6 +56,21 @@ const extras = [
   '- >', '- ```\n  a\n\n\n  ```',
   '- first\n\n  # heading\n\n  next', '- # heading\n\n  next',
   '[x]: /a\n\n# h\n[X]: /b\n\nend',
+  '[x][r]\n\n- outer\n  - inner\n\n    [r]: /url\n',
+  '[r]: /first\n\n- [x][r]\n\n  [r]: /second\n',
+  '- outer\n  - inner\n\n    [r]: /first\n\n[x][r]\n\n[r]: /second',
+  '[x][r]\n\n> [r]: /url\n\n$$x^2$$',
+  '- first\n\n  [r]: /one\n\ntext\n\n- [x][r]\n\n  [r]: /two',
+  '- a\n  - b\n\n    [r]: /one\n\ntext\n\n- [x][r]\n\n  [r]: /two',
+  '[x][r]\n\n- outer\n\n  [r]:\n    /url\n    "title"\n',
+  '> [x][r]\n\n[r]: /url',
+  '[x][r]\n\n$$\n[r]: /fake\n$$',
+  '[x][r]\n$$x$$\n- outer\n  - inner\n\n    [r]: /url',
+  '[x][r]\n\n$$\n\n[r]: /fake\n\n$$\n\n[r]: /real',
+  '[https://e.co/a_b][r]\n\n[r]: /real',
+  '[x][r]\n\n> $$\n>\n> [r]: /fake\n>\n> $$\n\n[r]: /real',
+  '- [x][r]\n\n  $$\n\n  [r]: /fake\n\n  $$',
+  '- [**bold**][r]\n\n  $$\n\n  [r]: /fake\n\n  $$',
 ];
 for (const source of extras) if (!sources.includes(source)) sources.push(source);
 const fixture = {

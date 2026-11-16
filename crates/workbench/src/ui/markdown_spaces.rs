@@ -294,6 +294,8 @@ pub(super) fn block_inventory(source: &str) -> Option<Vec<BlockToken>> {
     let mut cursor = 0;
     let mut scan_work = 0usize;
     let mut seen_definitions = std::collections::HashSet::new();
+    let reference_source = super::math_blocks::reference_source(source);
+    let document_parser = Parser::new_ext(&reference_source, options);
     for block in blocks.iter().map(Some).chain(std::iter::once(None)) {
         if result.len() > 1024 || Instant::now() >= deadline || super::strike::frame_expired() {
             return None;
@@ -323,8 +325,20 @@ pub(super) fn block_inventory(source: &str) -> Option<Vec<BlockToken>> {
             let Some((label, span)) = earliest else {
                 break;
             };
-            let duplicate = !seen_definitions.insert(unicase::UniCase::new(label));
             let start = from + span.start;
+            let earlier_in_document = document_parser
+                .reference_definitions()
+                .get(&label)
+                .is_some_and(|definition| {
+                    definition.span.start < cursor + start
+                        && !blocks.iter().any(|block| {
+                            block.kind == BlockTokenKind::Math
+                                && block.range.start <= definition.span.start
+                                && definition.span.end <= block.range.end
+                        })
+                });
+            let duplicate =
+                earlier_in_document || !seen_definitions.insert(unicase::UniCase::new(label));
             let mut finish = from + span.end;
             while finish > start && gap.as_bytes()[finish - 1] == b'\n' {
                 finish -= 1;
