@@ -456,10 +456,10 @@ impl Deferred {
 impl Client {
     pub fn supports_prepared_tool_dispatch(&self) -> bool {
         match self {
-            Self::OpenAi(_) | Self::Ollama(_) => true,
+            Self::OpenAi(_) | Self::Ollama(_) | Self::Google(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
-                Adapter::OpenAiResponses | Adapter::ChatCompletions
+                Adapter::OpenAiResponses | Adapter::ChatCompletions | Adapter::Google
             ),
             _ => false,
         }
@@ -813,6 +813,11 @@ impl Client {
                     context,
                 )?))
             }
+            Self::Google(client) => Ok(Some(client.prepare_bound_tool_dispatch(
+                request,
+                declarations,
+                context,
+            )?)),
             Self::OpenAi(client) => {
                 let client = client.clone().with_default_headers(defaults);
                 let client = if workbench_routing {
@@ -831,7 +836,7 @@ impl Client {
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
-                    Adapter::OpenAiResponses | Adapter::ChatCompletions
+                    Adapter::OpenAiResponses | Adapter::ChatCompletions | Adapter::Google
                 ) =>
             {
                 Box::pin(client.resolve().await?.prepare_tool_dispatch_with_headers(
@@ -1118,6 +1123,11 @@ impl Client {
                     };
                 Self::Google(
                     client
+                        .with_strict_tool_support(
+                            args.model_profiles
+                                .chat_compatibility(&args.provider, metadata.as_ref())
+                                .supports_strict_mode(),
+                        )
                         .with_thinking(mapped.as_deref().or(selected))
                         .with_disabled_thinking_fallback(fallback.as_deref())
                         .with_reasoning_support(metadata.as_ref().and_then(|model| model.reasoning))

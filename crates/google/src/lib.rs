@@ -53,6 +53,8 @@ pub struct Google {
     thinking_budgets: Option<Value>,
     disabled_thinking_fallback: Option<String>,
     reasoning_supported: Option<bool>,
+    strict_tool_support: Option<bool>,
+    bound_tools: Option<(Vec<Value>, bool)>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -99,6 +101,8 @@ impl Google {
             thinking_budgets: None,
             disabled_thinking_fallback: None,
             reasoning_supported: None,
+            strict_tool_support: None,
+            bound_tools: None,
             progress: None,
             reasoning: None,
         })
@@ -173,6 +177,89 @@ impl Google {
         self.reasoning_supported = supported;
         self
     }
+    /// Override model-derived strict tool support for compatible endpoints.
+    pub fn with_strict_tool_support(mut self, supported: Option<bool>) -> Self {
+        self.strict_tool_support = supported;
+        self
+    }
+
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        if request.tools.len() != declarations.len()
+            || request
+                .tools
+                .iter()
+                .zip(declarations)
+                .any(|(a, b)| a != &b.spec)
+        {
+            return Err(Error::Config(
+                "tool declarations do not match the effective request".into(),
+            ));
+        }
+        let supported = self
+            .strict_tool_support
+            .unwrap_or_else(|| gemini_major(model_id(&request.model)).is_some_and(|v| v >= 3));
+        let mut effective = Vec::new();
+        let mut schemas = Vec::new();
+        let mut validated = false;
+        for declaration in declarations {
+            let spec = &declaration.spec;
+            let strict = match &declaration.constrained_sampling {
+                Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+                    pi_rs_core::resolve_strict_tool_schema(
+                        &spec.name,
+                        &spec.parameters,
+                        *strict,
+                        supported,
+                        |_, _| false,
+                    )
+                    .map_err(|e| Error::Config(e.to_string()))?
+                }
+                _ => None,
+            };
+            let sampling = if strict.is_some() {
+                validated = true;
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: spec.parameters.clone(),
+                    normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+                }
+            } else {
+                pi_rs_core::EffectiveToolSampling::Unconstrained
+            };
+            schemas.push(rewrite_const_as_enum(
+                strict.as_ref().unwrap_or(&spec.parameters),
+                false,
+            ));
+            effective.push(pi_rs_core::EffectiveToolDeclaration {
+                spec: spec.clone(),
+                sampling,
+            });
+        }
+        pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let snapshot =
+            pi_rs_core::ToolDecisionSnapshot::capture(context, request, declarations, &effective)
+                .map_err(|e| Error::Config(e.to_string()))?;
+        let mut reservation = request.clone();
+        for (tool, schema) in reservation.tools.iter_mut().zip(&schemas) {
+            tool.parameters = schema.clone();
+        }
+        let mut client = self.clone();
+        client.bound_tools = Some((schemas, validated));
+        Ok(Box::new(PreparedGoogleDispatch {
+            client,
+            request: request.clone(),
+            reservation,
+            effective,
+            snapshot,
+            context: context.clone(),
+        }))
+    }
+
     pub fn with_progress(mut self, observer: impl Fn(Progress) + Send + Sync + 'static) -> Self {
         self.progress = Some(Arc::new(observer));
         self
@@ -556,6 +643,116 @@ fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>, merge:
     }
 }
 
+// Only traverse schema locations, never literal defaults/examples or property names.
+fn rewrite_const_as_enum(value: &Value, name_map: bool) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| rewrite_const_as_enum(v, false))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                let names = matches!(
+                    key.as_str(),
+                    "properties"
+                        | "patternProperties"
+                        | "$defs"
+                        | "definitions"
+                        | "dependentSchemas"
+                        | "dependencies"
+                );
+                let subschema = matches!(
+                    key.as_str(),
+                    "additionalProperties"
+                        | "unevaluatedProperties"
+                        | "propertyNames"
+                        | "items"
+                        | "prefixItems"
+                        | "additionalItems"
+                        | "unevaluatedItems"
+                        | "contains"
+                        | "allOf"
+                        | "anyOf"
+                        | "oneOf"
+                        | "not"
+                        | "if"
+                        | "then"
+                        | "else"
+                        | "contentSchema"
+                );
+                out.insert(
+                    key.clone(),
+                    if name_map || subschema {
+                        rewrite_const_as_enum(value, false)
+                    } else if names {
+                        rewrite_const_as_enum(value, true)
+                    } else {
+                        value.clone()
+                    },
+                );
+            }
+            if !name_map
+                && !out.contains_key("enum")
+                && out
+                    .get("const")
+                    .is_some_and(|v| v.is_string() || v.is_number())
+            {
+                let v = out.remove("const").unwrap();
+                out.insert("enum".into(), json!([v]));
+            }
+            Value::Object(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+struct PreparedGoogleDispatch {
+    client: Google,
+    request: ModelRequest,
+    reservation: ModelRequest,
+    effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
+    snapshot: pi_rs_core::ToolDecisionSnapshot,
+    context: pi_rs_core::ToolDispatchContext,
+}
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedGoogleDispatch {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.effective
+    }
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request
+    }
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.reservation
+    }
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        if self.context.summary {
+            self.client
+                .stream_detailed_for_summary(
+                    self.context.request_id,
+                    self.context.session_id,
+                    self.request,
+                )
+                .await
+        } else {
+            self.client
+                .stream_detailed_in_session_with_identity(
+                    self.context.request_id,
+                    self.context.session_id,
+                    &self.context.external_id,
+                    self.request,
+                )
+                .await
+        }
+    }
+}
+
 fn wire_request(
     request: &ModelRequest,
     thinking: Option<&str>,
@@ -716,7 +913,7 @@ fn wire_request(
     }
     if !request.tools.is_empty() {
         let declarations = request.tools.iter().map(|tool| json!({
-            "name":tool.name,"description":tool.description,"parametersJsonSchema":tool.parameters
+            "name":tool.name,"description":tool.description,"parametersJsonSchema":rewrite_const_as_enum(&tool.parameters, false)
         })).collect::<Vec<_>>();
         body["tools"] = json!([{"functionDeclarations":declarations}]);
         body["toolConfig"] = json!({"functionCallingConfig":{"mode":"AUTO"}});
@@ -729,6 +926,18 @@ fn wire_request(
 
 #[async_trait::async_trait]
 impl Model for Google {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
     fn context_identity(&self) -> Option<String> {
         if !self.http_proxies.is_empty() {
             return None;
@@ -739,6 +948,17 @@ impl Model for Google {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
+        if let Some(supported) = self.strict_tool_support {
+            return pi_rs_core::protected_model_fingerprint(&(
+                "google-strict-v1",
+                {
+                    let mut base = self.clone();
+                    base.strict_tool_support = None;
+                    base.context_identity()
+                },
+                supported,
+            ));
+        }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
             "google-v1",
@@ -805,6 +1025,16 @@ impl Model for Google {
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
         let mut body = wire_request(&request, thinking, &self.replay_scope, &edited_scope)?;
+        if let Some((schemas, validated)) = &self.bound_tools {
+            if let Some(tools) = body["tools"][0]["functionDeclarations"].as_array_mut() {
+                for (tool, schema) in tools.iter_mut().zip(schemas) {
+                    tool["parametersJsonSchema"] = schema.clone();
+                }
+                if *validated {
+                    body["toolConfig"]["functionCallingConfig"]["mode"] = json!("VALIDATED");
+                }
+            }
+        }
         if !supports_thinking {
             body["generationConfig"]
                 .as_object_mut()
@@ -1018,6 +1248,237 @@ fn report_progress(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_google_strict_decision_and_wire_projection() {
+        use pi_rs_core::{
+            EffectiveToolSampling, StrictToolPolicy, ToolConstraint, ToolDeclaration,
+            ToolDispatchContext, ToolSpec,
+        };
+        let client = Google::new("http://localhost:9999", "key").unwrap();
+        let spec = ToolSpec {
+            name: "test".into(),
+            description: "test".into(),
+            parameters: json!({"type":"object", "properties":{"x":{"type":"string", "const":"a"}}, "required":[]}),
+        };
+        let declaration = ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            }),
+        };
+        let mut request = ModelRequest {
+            model: "gemini-3-pro".into(),
+            messages: vec![],
+            tools: vec![spec],
+            max_output_tokens: 32,
+        };
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "session".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+            .unwrap();
+        pi_rs_core::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+        )
+        .unwrap();
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            EffectiveToolSampling::StrictJsonSchema { .. }
+        ));
+        let schema = &prepared.reservation_request().tools[0].parameters;
+        assert_eq!(schema["properties"]["x"]["anyOf"][0]["enum"], json!(["a"]));
+        assert_eq!(schema["required"], json!(["x"]));
+        request.model = "gemini-2.5-pro".into();
+        assert!(
+            client
+                .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .is_err()
+        );
+        let mut preferred = declaration;
+        preferred.constrained_sampling = Some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Prefer,
+        });
+        let fallback = client
+            .prepare_bound_tool_dispatch(&request, &[preferred], &context)
+            .unwrap();
+        assert!(matches!(
+            fallback.effective_tools()[0].sampling,
+            EffectiveToolSampling::Unconstrained
+        ));
+        assert_eq!(
+            fallback.reservation_request().tools[0].parameters["properties"]["x"]["enum"],
+            json!(["a"])
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_google_dispatch_sends_bound_validated_schema() {
+        use pi_rs_core::{
+            StrictToolPolicy, ToolConstraint, ToolDeclaration, ToolDispatchContext, ToolSpec,
+        };
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            let body_start = loop {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+                if let Some(i) = data.windows(4).position(|v| v == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&data[..body_start]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|n| n.trim().parse().unwrap())
+                })
+                .unwrap();
+            while data.len() < body_start + length {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+            }
+            let body: Value =
+                serde_json::from_slice(&data[body_start..body_start + length]).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            body
+        });
+        let client = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let spec = ToolSpec {
+            name: "test".into(),
+            description: "".into(),
+            parameters: json!({"type":"object","properties":{"x":{"type":"string"}}}),
+        };
+        let request = ModelRequest {
+            model: "gemini-3-pro".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 32,
+        };
+        let decl = ToolDeclaration {
+            spec,
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            }),
+        };
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: true,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        let expected = prepared.reservation_request().tools[0].parameters.clone();
+        let _ = prepared.dispatch().await.unwrap();
+        let body = server.join().unwrap();
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"],
+            expected
+        );
+    }
+
+    #[test]
+    fn google_strict_overrides_and_unsafe_schema_fallback() {
+        use pi_rs_core::{
+            EffectiveToolSampling, StrictToolPolicy, ToolConstraint, ToolDeclaration,
+            ToolDispatchContext, ToolSpec,
+        };
+        let base = Google::new("http://localhost:9999", "key").unwrap();
+        let spec = ToolSpec {
+            name: "test".into(),
+            description: "".into(),
+            parameters: json!({"type":"object","properties":{"x":{"type":"string"}}}),
+        };
+        let request = ModelRequest {
+            model: "gemini-2.5-pro".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 32,
+        };
+        let mut decl = ToolDeclaration {
+            spec,
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            }),
+        };
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: true,
+        };
+        assert!(
+            base.clone()
+                .with_strict_tool_support(Some(true))
+                .prepare_bound_tool_dispatch(&request, &[decl.clone()], &context)
+                .is_ok()
+        );
+        assert_ne!(
+            base.context_identity(),
+            base.clone()
+                .with_strict_tool_support(Some(true))
+                .context_identity()
+        );
+        let mut unsupported = request.clone();
+        unsupported.model = "gemini-3-pro".into();
+        unsupported.tools[0].parameters = json!({"type":"object", "$dynamicRef":"#x"});
+        decl.spec = unsupported.tools[0].clone();
+        assert!(
+            base.prepare_bound_tool_dispatch(&unsupported, &[decl.clone()], &context)
+                .is_err()
+        );
+        decl.constrained_sampling = Some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Prefer,
+        });
+        let prepared = base
+            .prepare_bound_tool_dispatch(&unsupported, &[decl], &context)
+            .unwrap();
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            EffectiveToolSampling::Unconstrained
+        ));
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            unsupported.tools[0].parameters
+        );
+    }
+
+    #[test]
+    fn google_const_rewrite_preserves_literal_data_and_names() {
+        let schema = json!({"properties":{"const":{"const":"v"}, "n":{"const":2}, "b":{"const":true}, "e":{"const":"x", "enum":["y"]}}, "default":{"const":"literal"}});
+        let result = rewrite_const_as_enum(&schema, false);
+        assert_eq!(result["properties"]["const"]["enum"], json!(["v"]));
+        assert_eq!(result["properties"]["n"]["enum"], json!([2]));
+        assert_eq!(result["properties"]["b"]["const"], true);
+        assert_eq!(result["properties"]["e"]["const"], "x");
+        assert_eq!(result["default"]["const"], "literal");
+    }
+
     #[tokio::test]
     async fn response_id_survives_handled_agent_cancellation() {
         use pi_rs_core::{
