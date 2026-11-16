@@ -21,6 +21,117 @@ enum TurnNormalized {
     Skipped(String),
 }
 
+// A validated decision alone is not sufficient authorization: callers must
+// first bind the invocation to the successful active-branch model reply.
+fn turn_model_arguments(
+    invocation: &Invocation,
+    spec: &ToolSpec,
+    decision: Option<&crate::ValidatedToolDecisionSnapshot<'_>>,
+) -> std::result::Result<serde_json::Value, String> {
+    match decision {
+        None => crate::parse_tool_arguments(&invocation.call.arguments)
+            .map_err(|error| error.to_string()),
+        Some(decision) => {
+            if !decision
+                .effective_tools()
+                .iter()
+                .any(|entry| &entry.spec == spec)
+                || invocation.call.name != spec.name
+            {
+                return Err("registered tool does not match the request decision".into());
+            }
+            decision
+                .normalized_arguments(&invocation.call)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod strict_argument_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn uses_actual_sampling_and_rejects_changed_tool_specs() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object", "properties":{"path":{"type":"string"},"limit":{"type":"integer"}}, "required":["path"]}),
+        };
+        let request = crate::ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            external_id: "test".into(),
+            summary: false,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"file","limit":null}"#.into(),
+            },
+        };
+        for (sampling, expected) in [
+            (
+                crate::EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: spec.parameters.clone(),
+                    normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+                },
+                json!({"path":"file"}),
+            ),
+            (
+                crate::EffectiveToolSampling::Unconstrained,
+                json!({"path":"file","limit":null}),
+            ),
+        ] {
+            let snapshot = crate::ToolDecisionSnapshot::capture(
+                &context,
+                &request,
+                std::slice::from_ref(&declaration),
+                &[crate::EffectiveToolDeclaration {
+                    spec: spec.clone(),
+                    sampling,
+                }],
+            )
+            .unwrap();
+            let decision = snapshot
+                .validate(
+                    &context,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration),
+                )
+                .unwrap();
+            assert_eq!(
+                turn_model_arguments(&invocation, &spec, Some(&decision)).unwrap(),
+                expected
+            );
+            let mut changed = spec.clone();
+            changed.description = "changed".into();
+            assert!(turn_model_arguments(&invocation, &changed, Some(&decision)).is_err());
+        }
+        assert_eq!(
+            turn_model_arguments(&invocation, &spec, None).unwrap(),
+            json!({"path":"file","limit":null})
+        );
+        assert!(invocation.call.arguments.contains("null"));
+    }
+}
+
 impl Agent<'_> {
     pub(super) async fn turn_poll_normalize(
         registry: &Registry,
@@ -131,7 +242,9 @@ impl Agent<'_> {
                 "tool is not registered or advertised".into(),
             ));
         };
-        let args = match crate::parse_tool_arguments(&call.arguments) {
+        // Until the caller provides proven request provenance, use the legacy
+        // path. Strict decisions must never be inferred from a tool preference.
+        let args = match turn_model_arguments(invocation, &tool.spec, None) {
             Ok(arguments) => arguments,
             Err(error) => {
                 return Ok(TurnNormalized::Skipped(format!(
