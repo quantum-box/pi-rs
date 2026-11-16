@@ -613,6 +613,18 @@ fn stopped_model_failure_reset_cut_proof_reopens_and_fences_evidence() {
         )
         .unwrap();
     let occurrence = cut.content_blocks.values().next().unwrap().message_id;
+    let original = h
+        .original_occurrence_position(
+            &MessageHistory {
+                id: occurrence,
+                commit: observation,
+                origin: id,
+                commit_boundary: true,
+            },
+            cut.messages.last().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(original.cursor, cursor);
     let by_id = h.fork_by_entry_id(id, occurrence).unwrap();
     assert_eq!(
         h.conversation(by_id).unwrap().content_blocks,
@@ -632,6 +644,14 @@ fn stopped_model_failure_reset_cut_proof_reopens_and_fences_evidence() {
         cut.content_blocks
     );
     let (_, _, checks) = h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+    let prior_cursor: crate::transcript::Cursor =
+        serde_json::from_value(manifest["predecessor_cursor"].clone()).unwrap();
+    let (prior_entry, prior_version) = crate::transcript::Transcript::new(h.owner.store(), id)
+        .entry_evidence(&prior_cursor)
+        .unwrap();
+    assert!(checks.iter().any(
+        |check| check.key == prior_entry && check.expected == Expected::Version(prior_version)
+    ));
     let predecessor = checks
         .iter()
         .find(|check| {
@@ -978,5 +998,65 @@ fn atomic_failure_fork_preserves_writes_at_each_reset() {
     assert_eq!(
         writes.iter().map(|w| w.id).collect::<Vec<_>>(),
         vec![first_write]
+    );
+}
+
+#[test]
+fn repeated_atomic_failure_batches_keep_prior_fork_proofs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup_with_adapter(&path, true);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "replacement one".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    let old_occurrence = state.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    state.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "first error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&state, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "first error".into(), FailureCause::ModelError);
+    h.save(&failure, Expected::Version(version)).unwrap();
+    h.submit(id, None, "replacement two".into()).unwrap();
+    let (third, occurrences) = h
+        .reset_with_blocks(
+            id,
+            Some("third".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"c"})]],
+        )
+        .unwrap();
+    h.reset_with_blocks(
+        id,
+        Some("fourth".into()),
+        vec![vec![serde_json::json!({"type":"text","text":"d"})]],
+    )
+    .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    state.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "second error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&state, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(
+        &mut failure,
+        "second error".into(),
+        FailureCause::ModelError,
+    );
+    h.save(&failure, Expected::Version(version)).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let old = h.fork_by_entry_id(id, old_occurrence).unwrap();
+    assert_eq!(h.conversation(old).unwrap().resets.len(), 1);
+    let new = h.fork_by_entry_id(id, occurrences[0]).unwrap();
+    assert_eq!(
+        h.conversation(new).unwrap().resets.last().unwrap().id,
+        third
     );
 }

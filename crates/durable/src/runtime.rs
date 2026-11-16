@@ -6237,6 +6237,51 @@ impl Harness {
                 .value
                 .clone(),
         )?;
+        // Atomic failure commits anchor the observation at the trailing
+        // continuation append, while retained reset occurrences originate in
+        // earlier entries of that same commit.
+        if let TranscriptChange::AppendV2 { ids, .. } = &change
+            && !ids.contains(&history.id)
+        {
+            let mut next = batch.next;
+            for _ in 0..64 {
+                let page = transcript.read_with_blocks(&next, std::num::NonZeroUsize::MIN)?;
+                let Some(record) = page.records.first() else {
+                    break;
+                };
+                let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+                let TranscriptChange::ReplaceV2 {
+                    messages,
+                    ids,
+                    commit,
+                    origin,
+                } = change
+                else {
+                    break;
+                };
+                if commit != history.commit || origin != history.origin {
+                    break;
+                }
+                if let Some(index) = ids.iter().position(|id| *id == history.id) {
+                    if ids.iter().filter(|id| **id == history.id).count() != 1
+                        || messages.get(index) != Some(expected)
+                        || history.commit_boundary != (index + 1 == messages.len())
+                    {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    self.prove_failure_reset_cut(history.origin, &next, history.commit)?;
+                    return Ok(ViewCursor {
+                        cursor: next,
+                        remaining: Some(index + 1),
+                    });
+                }
+                if !page.has_more {
+                    break;
+                }
+                next = page.next;
+            }
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         let index = match &change {
             TranscriptChange::ReplaceCompacted {
                 messages,
@@ -7303,6 +7348,62 @@ impl Harness {
         chain.push(anchor_cursor.clone());
         let mut checks = candidate.checks;
         checks.extend(transcript.atomic_append_checks(&anchor_key, &predecessor_cursor, &chain)?);
+        // The predecessor's occurrence proof reads its entire immutable chain.
+        // Fence those records and their runtime anchors too: otherwise an old
+        // entry could change after replay but before the dependent fork commits.
+        let mut prior = predecessor_cursor.clone();
+        loop {
+            let (key, version) = transcript.entry_evidence(&prior)?;
+            checks.push(Check {
+                key,
+                expected: Expected::Version(version),
+            });
+            let page = transcript.read_with_blocks(&prior, std::num::NonZeroUsize::MIN)?;
+            let record = page.records.first().ok_or_else(invalid)?;
+            let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+            let origin_commit = match &change {
+                TranscriptChange::ReplaceCompacted { origin, commit, .. }
+                | TranscriptChange::ForkCut { origin, commit, .. } => Some((*origin, *commit)),
+                _ => change
+                    .parts()?
+                    .2
+                    .map(|(_, commit, origin)| (origin, commit)),
+            };
+            if let Some((origin, commit)) = origin_commit {
+                let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+                let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
+                let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+                let mut original = serde_json::to_value(&prior)?;
+                original["transcript"] = serde_json::to_value(origin)?;
+                let original: crate::transcript::Cursor = serde_json::from_value(original)?;
+                if value.get("_transcript") != Some(&serde_json::to_value(&original)?) {
+                    let revision = store.document_cut(&fork)?.ok_or_else(invalid)?;
+                    let evidence = crate::reset_manifest::lookup_candidate(
+                        store, origin, &original, commit, revision,
+                    )
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?;
+                    checks.extend(evidence.checks);
+                }
+                checks.push(Check {
+                    key: fork,
+                    expected: Expected::Version(snapshot.version),
+                });
+                let mut event = b"durable/observer/".to_vec();
+                event.extend_from_slice(origin.as_bytes());
+                event.extend_from_slice(b"/r");
+                event.extend_from_slice(&commit.to_be_bytes());
+                let version = store.get(&event)?.ok_or_else(invalid)?.version;
+                checks.push(Check {
+                    key: event,
+                    expected: Expected::Version(version),
+                });
+            }
+            if !page.has_more {
+                break;
+            }
+            prior = page.next;
+        }
         let (_, mut seen) = self.resolved_occurrences_with_ids(id, predecessor_cursor)?;
         for (position, cut) in positions.iter().zip(&cuts) {
             let page = transcript.read_with_blocks(position, std::num::NonZeroUsize::MIN)?;
