@@ -36,6 +36,7 @@ pub mod report;
 pub mod reset;
 pub mod retry_policy;
 pub mod runtime;
+pub mod session_transaction;
 pub mod state;
 pub mod streamed_output;
 pub mod subagent;

@@ -8258,6 +8258,60 @@ impl Harness {
         )?;
         Ok((reset, ids, notes))
     }
+    /// Atomically commit host application entries and checked JSON documents.
+    /// The callback runs once; on conflict the host may start a new transaction.
+    pub fn session_transaction<T>(
+        &mut self,
+        id: Uuid,
+        change: impl FnOnce(
+            &mut crate::session_transaction::SessionTransaction<'_>,
+        ) -> Result<T, crate::document::Error>,
+    ) -> Result<T, Error> {
+        let (mut state, version) = self.load(id)?;
+        if state.abort_requested {
+            return Err(Error::Invalid("abort in progress".into()));
+        }
+        let entries_allowed = state.pending_resets.is_empty()
+            && state.pending_independent_summary.is_none()
+            && !state
+                .application_writes
+                .iter()
+                .any(|write| !write.placed && !write.withdrawn);
+        let owner = self.owner.clone();
+        let mut transaction = crate::session_transaction::SessionTransaction::new(
+            owner.store(),
+            state.application_writes.clone(),
+            state.resets.last().map(|reset| reset.id),
+            entries_allowed,
+        )?;
+        let result = change(&mut transaction)?;
+        let (entries, mut documents, changed) = transaction.into_parts()?;
+        if !changed {
+            documents.checks.push(Check {
+                key: Self::key(id),
+                expected: Expected::Version(version),
+            });
+            owner.store().commit(&documents.checks, &[])?;
+            return Ok(result);
+        }
+        state.application_writes = entries;
+        // Do not merge concurrent admissions into a callback's observed state:
+        // preserve its exact conversation and document checks on conflict.
+        let merge = self.merge_admissions;
+        self.merge_admissions = false;
+        let saved = self.save_composed_locked(
+            &state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            Some(&documents),
+        );
+        self.merge_admissions = merge;
+        saved?;
+        Ok(result)
+    }
+
     /// Persist a display-only application entry and return its submission ID.
     /// It is immediately placed unless a reset is queued ahead of it.
     pub fn submit_write(
@@ -15019,6 +15073,18 @@ impl Scheduler {
         let admitted = self.harness.reset_with_blocks(id, handoff, additions)?;
         self.schedule(id);
         Ok(admitted)
+    }
+    /// Commit a host session transaction and schedule its conversation.
+    pub fn session_transaction<T>(
+        &mut self,
+        id: Uuid,
+        change: impl FnOnce(
+            &mut crate::session_transaction::SessionTransaction<'_>,
+        ) -> Result<T, crate::document::Error>,
+    ) -> Result<T, Error> {
+        let result = self.harness.session_transaction(id, change)?;
+        self.schedule(id);
+        Ok(result)
     }
     pub fn submit_write(
         &mut self,

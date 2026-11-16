@@ -40,6 +40,10 @@ pub enum Error {
     InvalidApplicationEntry,
     #[error("application entry head does not match the expected ID")]
     ApplicationEntryHeadMismatch,
+    #[error("session entry kind must be nonempty and outside pi.")]
+    InvalidSessionEntry,
+    #[error("session entries cannot pass a pending reset, summary, or write")]
+    SessionEntryBlocked,
 }
 
 /// An application-defined address. Components are encoded unambiguously;
