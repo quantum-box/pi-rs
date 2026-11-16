@@ -3028,6 +3028,7 @@ dependencies = [
  "globset",
  "grep-regex",
  "grep-searcher",
+ "hmac",
  "http 1.5.0",
  "icu_collator",
  "icu_locale_core",
@@ -3075,6 +3076,7 @@ dependencies = [
  "uuid",
  "winapi",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

@@ -32,6 +32,7 @@ eventsource-stream = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 futures-util = "0.3"
 http = "1"
+hmac = "0.12"
 fancy-regex = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
@@ -81,6 +82,7 @@ unicode-segmentation = "1.12"
 unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "process", "signal", "sync", "time", "fs", "io-util", "io-std", "net"] }
 uuid = { version = "1", features = ["serde"] }
+zeroize = "1"
 filetime = "0.2.29"
 
 [dev-dependencies]
