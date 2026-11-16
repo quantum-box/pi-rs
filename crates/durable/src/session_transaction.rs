@@ -125,11 +125,13 @@ impl<'a> SessionTransaction<'a> {
     /// Create a ready task directly owned by this conversation. The returned ID
     /// is provisional until the enclosing transaction commits.
     pub fn create_task(&mut self, task: crate::task::Task) -> Result<Uuid, Error> {
+        if self.tasks.iter().any(|existing| existing.id() == task.id()) {
+            return Err(Error::DuplicateTask);
+        }
         if task.id().is_nil()
             || task.owner() != &crate::task::TaskOwner::Conversation(self.state.id)
             || task.state() != &crate::task::TaskState::Ready
             || task.abort_requested()
-            || self.tasks.iter().any(|existing| existing.id() == task.id())
         {
             return Err(Error::InvalidSessionAdmission(
                 "invalid scoped task creation".into(),
