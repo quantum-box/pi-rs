@@ -369,6 +369,91 @@ struct PreparedSettlement {
     attempts: usize,
 }
 
+enum PreparedRevalidation {
+    Ready,
+    PendingAbort(Uuid),
+    Aborted(Box<task_store::StoredTask>),
+    Stale,
+}
+
+impl PreparedSettlement {
+    /// Revalidate under the owner's task gate. The graph boundary precedes all
+    /// reads, so later graph writes remain fenced by the checked transaction.
+    fn revalidate(
+        &mut self,
+        scheduler: &Scheduler,
+        owner: &Arc<OwnedStore>,
+        _gate: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<PreparedRevalidation, Error> {
+        self.graph_version = owner
+            .store()
+            .put_version()
+            .map_err(task_store::Error::from)?;
+        if let Some(root) = pending_abort_root_for_running(
+            &scheduler.ts(),
+            self.running.task.id(),
+            scheduler.validator.is_none(),
+        )? {
+            return Ok(PreparedRevalidation::PendingAbort(root));
+        }
+        let latest = scheduler
+            .ts()
+            .load(self.running.task.id())?
+            .ok_or(Error::Ownership)?;
+        if latest.task.abort_requested() {
+            return Ok(PreparedRevalidation::Aborted(Box::new(latest)));
+        }
+        if latest.task != self.running.task {
+            return Ok(PreparedRevalidation::Stale);
+        }
+        let mut candidate = self.candidate.task.clone();
+        if matches!(candidate.state(), TaskState::Succeeded(_))
+            && has_live_owned(owner.store(), candidate.id(), &scheduler.ts().list()?)?
+        {
+            candidate
+                .hold_prepared_success()
+                .map_err(Error::Transition)?;
+        }
+        if latest.version != self.running.version || candidate != self.candidate.task {
+            self.transaction.rebase_task_candidate(
+                self.running.task.id(),
+                self.running.version,
+                latest.version,
+                &self.candidate.task,
+                &candidate,
+            )?;
+            self.running = latest;
+            self.candidate.task = candidate;
+        }
+        let refs: HashMap<_, _> = self
+            .staged_children
+            .iter()
+            .map(|(id, task)| (*id, task))
+            .collect();
+        if !self.wait_targets.is_empty() {
+            match validate_wait_graph(
+                owner.store(),
+                self.candidate.task.id(),
+                &self.wait_targets,
+                &refs,
+            ) {
+                Ok(()) => (),
+                Err(Error::Ownership) => return Ok(PreparedRevalidation::Stale),
+                Err(error) => return Err(error),
+            }
+        }
+        if !refs.is_empty() {
+            let targets: Vec<_> = refs.keys().copied().collect();
+            match validate_wait_graph(owner.store(), self.candidate.task.id(), &targets, &refs) {
+                Ok(()) => (),
+                Err(Error::Ownership) => return Ok(PreparedRevalidation::Stale),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(PreparedRevalidation::Ready)
+    }
+}
+
 // Failure settlement retains its original outcome and the most recently
 // prepared checked write until that write commits or is superseded.
 struct FailureSettlement {
@@ -2180,25 +2265,22 @@ impl Scheduler {
         transaction.append(document_batch)?;
         transaction.append(graph)?;
         let _ = wait_graph_fence;
-        self.commit_prepared_settlement(
-            PreparedSettlement {
-                transaction,
-                running,
-                candidate: next,
-                wait_targets: retry_wait,
-                staged_children: retry_children,
-                conflict_keys: document_keys,
-                graph_version: success_graph_version,
-                attempts: 0,
-            },
-            &owner,
-            _gate,
-        )
+        let mut prepared = PreparedSettlement {
+            transaction,
+            running,
+            candidate: next,
+            wait_targets: retry_wait,
+            staged_children: retry_children,
+            conflict_keys: document_keys,
+            graph_version: success_graph_version,
+            attempts: 0,
+        };
+        self.commit_prepared_settlement(&mut prepared, &owner, _gate)
     }
 
     fn commit_prepared_settlement(
         &mut self,
-        mut prepared: PreparedSettlement,
+        prepared: &mut PreparedSettlement,
         owner: &Arc<OwnedStore>,
         _gate: std::sync::MutexGuard<'_, ()>,
     ) -> Result<bool, Error> {
@@ -2223,79 +2305,19 @@ impl Scheduler {
             {
                 break result;
             }
-            prepared.graph_version = owner
-                .store()
-                .put_version()
-                .map_err(task_store::Error::from)?;
-            if let Some(root) = pending_abort_root_for_running(
-                &self.ts(),
-                prepared.running.task.id(),
-                self.validator.is_none(),
-            )? {
-                self.abort_failed_running(owner, root, prepared.running.task.id(), _gate)?;
-                self.poisoned = false;
-                return Ok(true);
-            }
-            let latest = self
-                .ts()
-                .load(prepared.running.task.id())?
-                .ok_or(Error::Ownership)?;
-            if latest.task.abort_requested() {
-                self.ts().update(&latest, |task| task.yield_ready())?;
-                self.poisoned = false;
-                return Ok(true);
-            }
-            if latest.task != prepared.running.task {
-                break result;
-            }
-            let mut candidate = prepared.candidate.task.clone();
-            if matches!(candidate.state(), TaskState::Succeeded(_))
-                && has_live_owned(owner.store(), candidate.id(), &self.ts().list()?)?
-            {
-                candidate
-                    .hold_prepared_success()
-                    .map_err(Error::Transition)?;
-            }
-            if latest.version != prepared.running.version || candidate != prepared.candidate.task {
-                prepared.transaction.rebase_task_candidate(
-                    prepared.running.task.id(),
-                    prepared.running.version,
-                    latest.version,
-                    &prepared.candidate.task,
-                    &candidate,
-                )?;
-                prepared.running = latest;
-                prepared.candidate.task = candidate;
-            }
-            let refs: HashMap<_, _> = prepared
-                .staged_children
-                .iter()
-                .map(|(id, task)| (*id, task))
-                .collect();
-            if !prepared.wait_targets.is_empty() {
-                match validate_wait_graph(
-                    owner.store(),
-                    prepared.candidate.task.id(),
-                    &prepared.wait_targets,
-                    &refs,
-                ) {
-                    Ok(()) => (),
-                    Err(Error::Ownership) => break result,
-                    Err(e) => return Err(e),
+            match prepared.revalidate(self, owner, &_gate)? {
+                PreparedRevalidation::Ready => (),
+                PreparedRevalidation::PendingAbort(root) => {
+                    self.abort_failed_running(owner, root, prepared.running.task.id(), _gate)?;
+                    self.poisoned = false;
+                    return Ok(true);
                 }
-            }
-            if !refs.is_empty() {
-                let targets: Vec<_> = refs.keys().copied().collect();
-                match validate_wait_graph(
-                    owner.store(),
-                    prepared.candidate.task.id(),
-                    &targets,
-                    &refs,
-                ) {
-                    Ok(()) => (),
-                    Err(Error::Ownership) => break result,
-                    Err(e) => return Err(e),
+                PreparedRevalidation::Aborted(latest) => {
+                    self.ts().update(&latest, |task| task.yield_ready())?;
+                    self.poisoned = false;
+                    return Ok(true);
                 }
+                PreparedRevalidation::Stale => break result,
             }
             prepared.attempts += 1;
         };
@@ -2358,6 +2380,32 @@ impl Scheduler {
         }
         self.poisoned = false;
         Ok(true)
+    }
+
+    /// Revalidate retained state before its first resumed commit. The caller
+    /// retains the settlement and its lease when abort intent remains pending.
+    #[allow(dead_code)] // The pending-settlement coordinator will call this.
+    fn resume_prepared_settlement(
+        &mut self,
+        prepared: &mut PreparedSettlement,
+        owner: &Arc<OwnedStore>,
+        gate: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, Error> {
+        match prepared.revalidate(self, owner, &gate)? {
+            PreparedRevalidation::Ready => self.commit_prepared_settlement(prepared, owner, gate),
+            PreparedRevalidation::PendingAbort(root) => Err(Error::PendingAbort(root)),
+            PreparedRevalidation::Aborted(latest) => {
+                self.ts().update(&latest, |task| task.yield_ready())?;
+                self.poisoned = false;
+                Ok(true)
+            }
+            PreparedRevalidation::Stale => {
+                Err(task_store::Error::Store(durable_store::Error::Conflict {
+                    key: task_store::key(prepared.running.task.id()),
+                })
+                .into())
+            }
+        }
     }
     /// A child must not execute while an interrupted or incompatible ancestor is
     /// still awaiting recovery; such an ancestor can later cancel the subtree.
@@ -7416,6 +7464,233 @@ mod tests {
                 &TaskOwner::Task(Uuid::from_u128(1))
             );
         }
+    }
+
+    #[test]
+    fn prepared_revalidation_refreshes_stale_graph_and_keeps_document_checks() {
+        use crate::document::{Address, Documents, Transaction};
+        use durable_store::Expected;
+        for document_changed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut scheduler =
+                Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+            let owner = scheduler.owner();
+            let gate = owner.task_gate().lock().unwrap();
+            let mut root = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                false,
+                3,
+            );
+            root.start_attempt(Uuid::new_v4()).unwrap();
+            scheduler.ts().save(&[Save::Create(&root)]).unwrap();
+            let running = scheduler.ts().load(root.id()).unwrap().unwrap();
+            let boundary = owner.store().put_version().unwrap();
+            let mut candidate = running.clone();
+            candidate.task.succeed(json!("result")).unwrap();
+            candidate
+                .task
+                .record_completed_attempt(&running.task)
+                .unwrap();
+            let address = Address {
+                scope: "revalidate".into(),
+                name: "doc".into(),
+                key: "".into(),
+            };
+            let mut transaction = Transaction::new();
+            transaction
+                .put(
+                    &address,
+                    Expected::Missing,
+                    json!({"value":"staged"}).as_object().unwrap(),
+                )
+                .unwrap();
+            transaction
+                .append(
+                    scheduler
+                        .ts()
+                        .prepare_save(&[Save::Update(&candidate)])
+                        .unwrap(),
+                )
+                .unwrap();
+            let mut prepared = PreparedSettlement {
+                transaction,
+                running: running.clone(),
+                candidate,
+                wait_targets: vec![],
+                staged_children: HashMap::new(),
+                conflict_keys: HashSet::from([address.storage_key().unwrap()]),
+                graph_version: boundary,
+                attempts: 0,
+            };
+            let child = task(2, TaskOwner::Task(root.id()), "child", false, 3);
+            scheduler.ts().save(&[Save::Create(&child)]).unwrap();
+            scheduler.ts().update(&running, |_| Ok(())).unwrap();
+            assert!(matches!(
+                prepared.revalidate(&scheduler, &owner, &gate).unwrap(),
+                PreparedRevalidation::Ready
+            ));
+            assert!(prepared.running.version > running.version);
+            assert_eq!(
+                prepared.candidate.task.state(),
+                &TaskState::Completing(json!("result"))
+            );
+            if document_changed {
+                let mut external = Transaction::new();
+                external
+                    .put(
+                        &address,
+                        Expected::Missing,
+                        json!({"value":"external"}).as_object().unwrap(),
+                    )
+                    .unwrap();
+                external.commit(owner.store()).unwrap();
+                assert!(matches!(
+                    prepared
+                        .transaction
+                        .commit_task_graph(owner.store(), prepared.graph_version),
+                    Err(crate::document::Error::Store(
+                        durable_store::Error::Conflict { .. }
+                    ))
+                ));
+                assert_eq!(
+                    scheduler
+                        .ts()
+                        .load(root.id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Running
+                );
+                assert_eq!(
+                    Documents::new(owner.store())
+                        .get(&address)
+                        .unwrap()
+                        .unwrap()
+                        .value["value"],
+                    "external"
+                );
+            } else {
+                scheduler
+                    .resume_prepared_settlement(&mut prepared, &owner, gate)
+                    .unwrap();
+                assert_eq!(
+                    scheduler
+                        .ts()
+                        .load(root.id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Completing(json!("result"))
+                );
+                assert_eq!(
+                    Documents::new(owner.store())
+                        .get(&address)
+                        .unwrap()
+                        .unwrap()
+                        .value["value"],
+                    "staged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_revalidation_reports_pending_abort_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scheduler = Scheduler::open(dir.path().join("db"), Registry::default()).unwrap();
+        let owner = scheduler.owner();
+        let gate = owner.task_gate().lock().unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let mut child = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        child.start_attempt(Uuid::new_v4()).unwrap();
+        let mut sibling = task(3, TaskOwner::Task(parent.id()), "sibling", false, 3);
+        sibling.start().unwrap();
+        sibling.fail("failure".into()).unwrap();
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&child),
+                Save::Create(&sibling),
+            ])
+            .unwrap();
+        let running = scheduler.ts().load(child.id()).unwrap().unwrap();
+        let mut candidate = running.clone();
+        candidate.task.succeed(json!("must wait")).unwrap();
+        candidate
+            .task
+            .record_completed_attempt(&running.task)
+            .unwrap();
+        let mut transaction = crate::document::Transaction::new();
+        transaction
+            .append(
+                scheduler
+                    .ts()
+                    .prepare_save(&[Save::Update(&candidate)])
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut prepared = PreparedSettlement {
+            transaction,
+            running,
+            candidate,
+            wait_targets: vec![],
+            staged_children: HashMap::new(),
+            conflict_keys: HashSet::new(),
+            graph_version: owner.store().put_version().unwrap(),
+            attempts: 0,
+        };
+        assert!(
+            matches!(prepared.revalidate(&scheduler, &owner, &gate).unwrap(), PreparedRevalidation::PendingAbort(id) if id == child.id())
+        );
+        assert_eq!(
+            prepared.candidate.task.state(),
+            &TaskState::Succeeded(json!("must wait"))
+        );
+        assert_eq!(
+            scheduler
+                .ts()
+                .load(child.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Running
+        );
+        assert!(
+            matches!(scheduler.resume_prepared_settlement(&mut prepared, &owner, gate), Err(Error::PendingAbort(id)) if id == child.id())
+        );
+        assert_eq!(
+            prepared.candidate.task.state(),
+            &TaskState::Succeeded(json!("must wait"))
+        );
+        assert_eq!(
+            scheduler
+                .ts()
+                .load(child.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .state(),
+            &TaskState::Running
+        );
     }
 
     #[test]
