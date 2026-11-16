@@ -88,7 +88,10 @@ async fn waits_for_foreground_and_cancellation_does_not_abort() {
     let cancel = CancellationToken::new();
     let mut wait = Box::pin(scheduler.wait_for_idle(id, &cancel));
     assert!(matches!(poll!(&mut wait), Poll::Pending));
-    scheduler.wait_for_idle(other, &CancellationToken::new()).await.unwrap();
+    scheduler
+        .wait_for_idle(other, &CancellationToken::new())
+        .await
+        .unwrap();
     let all_cancel = CancellationToken::new();
     let mut all = Box::pin(scheduler.wait_for_all_idle(&all_cancel));
     assert!(matches!(poll!(&mut all), Poll::Pending));
@@ -107,7 +110,10 @@ async fn waits_for_foreground_and_cancellation_does_not_abort() {
     .await
     .unwrap()
     .unwrap();
-    scheduler.wait_for_all_idle(&CancellationToken::new()).await.unwrap();
+    scheduler
+        .wait_for_all_idle(&CancellationToken::new())
+        .await
+        .unwrap();
     driver.shutdown().unwrap();
     scheduler.shutdown().await.unwrap();
 }
@@ -133,7 +139,10 @@ async fn background_is_ignored_and_unknown_conversation_errors() {
         .wait_for_idle(id, &CancellationToken::new())
         .await
         .unwrap();
-    scheduler.wait_for_all_idle(&CancellationToken::new()).await.unwrap();
+    scheduler
+        .wait_for_all_idle(&CancellationToken::new())
+        .await
+        .unwrap();
     assert!(matches!(
         scheduler
             .wait_for_idle(Uuid::new_v4(), &CancellationToken::new())
@@ -277,12 +286,19 @@ async fn follows_terminal_task_anchor_to_recovered_child() {
     let cancel = CancellationToken::new();
     let mut wait = Box::pin(scheduler.wait_for_idle(parent, &cancel));
     assert!(matches!(poll!(&mut wait), Poll::Pending));
+    let mut all = Box::pin(scheduler.wait_for_all_idle(&cancel));
+    assert!(matches!(poll!(&mut all), Poll::Pending));
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), &mut wait)
         .await
         .unwrap()
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), &mut all)
+        .await
+        .unwrap()
+        .unwrap();
     drop(wait);
+    drop(all);
     scheduler.shutdown().await.unwrap();
 }
 
