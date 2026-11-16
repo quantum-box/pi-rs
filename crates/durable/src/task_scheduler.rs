@@ -8308,10 +8308,20 @@ mod tests {
                 );
             }
             assert_eq!(
-                scheduler.get(generic.id()).unwrap().unwrap().abort_requested(),
+                scheduler
+                    .get(generic.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested(),
                 !success
             );
-            assert!(!scheduler.get(external.id()).unwrap().unwrap().abort_requested());
+            assert!(
+                !scheduler
+                    .get(external.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
             assert!(scheduler.get(parent.id()).unwrap().unwrap().is_completing());
             drop(scheduler); // marks and cleanup must survive another restart
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
