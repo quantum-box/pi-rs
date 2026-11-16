@@ -175,7 +175,17 @@ pub async fn prepare(args: &Cli) -> Result<()> {
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
     for declaration in plan {
-        let cached = installed.contains_key(&key(&declaration.source));
+        let cached = if remote(&declaration.source) {
+            installed.contains_key(&key(&declaration.source))
+        } else {
+            installed
+                .get(&key(&declaration.source))
+                .is_some_and(|value| {
+                    serde_json::from_value::<Installed>(value.clone())
+                        .map(|package| local_source_matches_cache(&package))
+                        .unwrap_or(true)
+                })
+        };
         if args.offline && remote(&declaration.source) {
             if !cached {
                 eprintln!(
@@ -275,6 +285,17 @@ fn resolve_package_resources(
         // Single-file native sources retain their existing handling; Pi loads
         // such files directly and does not apply directory package filters.
         let legacy = local && Path::new(&declaration.source).is_file();
+        if legacy {
+            let identity = source_identity(&declaration.source);
+            extensions.insert(
+                Path::new(&declaration.source),
+                true,
+                &identity,
+                &package.root,
+                true,
+            );
+            continue;
+        }
         let pi_package =
             !legacy && local_startup_manifest(&package.root).is_ok_and(|(_, upstream)| upstream);
         let identity = source_identity(&declaration.source);
@@ -355,9 +376,38 @@ fn resolve_package_resources(
     })
 }
 
+fn local_source_matches_cache(package: &Installed) -> bool {
+    let source = Path::new(&package.source);
+    if source.is_file() {
+        source.parent().is_some_and(|parent| {
+            dunce::simplified(&package.root) == dunce::simplified(parent)
+                && package
+                    .resources
+                    .extensions
+                    .iter()
+                    .any(|path| dunce::simplified(path) == dunce::simplified(source))
+        })
+    } else {
+        source.is_dir() && dunce::simplified(&package.root) == dunce::simplified(source)
+    }
+}
+
 fn revalidate_cached_package(mut package: Installed) -> Option<Installed> {
-    if !package.root.is_dir() || (!remote(&package.source) && !Path::new(&package.source).exists())
-    {
+    if !remote(&package.source) {
+        if !local_source_matches_cache(&package) {
+            return None;
+        }
+        let source = Path::new(&package.source);
+        if source.is_file() {
+            package.root = source.parent()?.to_path_buf();
+            package.resources = PackageResources {
+                extensions: vec![source.to_path_buf()],
+                ..PackageResources::default()
+            };
+            return Some(package);
+        }
+    }
+    if !package.root.is_dir() {
         return None;
     }
     let (manifest, pi_package) = local_startup_manifest(&package.root).ok()?;
@@ -1613,6 +1663,25 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         }
     }
     let _lock = lock;
+    if !remote(source) && Path::new(source).is_file() {
+        let executable = PathBuf::from(source);
+        pi_rs_extensions::ExecutableExtension::load(&executable)?;
+        let root = executable.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let package = Installed {
+            source: source.into(),
+            root,
+            version: None,
+            resources: PackageResources {
+                extensions: vec![executable],
+                ..PackageResources::default()
+            },
+        };
+        config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
+            index.insert(key(source), serde_json::to_value(&package)?);
+            Ok(())
+        })?;
+        return Ok(package);
+    }
     let generation = tempfile::Builder::new()
         .prefix("install-")
         .tempdir_in(&directory)?;
@@ -2938,7 +3007,7 @@ mod tests {
         std::fs::write(directory.join("first/prompts/demo.md"), "prompt").unwrap();
         assert_eq!(resources_for(&args, false).unwrap().themes.len(), 2);
         assert_eq!(startup_themes(&args, false).unwrap().len(), 2);
-        // File sources use the cached package root for the upstream-manifest exclusion.
+        // A file source ignores its parent's manifest, resources and filters.
         let file_root = directory.join("file-source");
         std::fs::create_dir_all(file_root.join("themes")).unwrap();
         std::fs::write(file_root.join("themes/demo.json"), "{}").unwrap();
@@ -2969,11 +3038,37 @@ mod tests {
         .unwrap();
         std::fs::write(
             agent.join("settings.json"),
-            json!({"packages":[{"source":source,"themes":["-file:///bad%2Fpath"]}]}).to_string(),
+            json!({"packages":[{"source":source,"autoload":false,"extensions":["file:///bad%2Fpath"],"themes":["-file:///bad%2Fpath"]}]}).to_string(),
         )
         .unwrap();
-        assert_eq!(resources_for(&args, false).unwrap().themes.len(), 1);
-        assert_eq!(startup_themes(&args, false).unwrap().len(), 1);
+        // Old caches may contain only the parent's theme and never validated
+        // the selected file; they cannot activate it until re-prepared.
+        assert!(resources_for(&args, false).unwrap().extensions.is_empty());
+        assert!(startup_themes(&args, false).unwrap().is_empty());
+        let validated = Installed {
+            source: source.clone(),
+            root: PathBuf::from(&root),
+            version: None,
+            resources: PackageResources {
+                extensions: vec![PathBuf::from(&source)],
+                ..PackageResources::default()
+            },
+        };
+        let mut file_index = serde_json::Map::new();
+        file_index.insert(key(&source), serde_json::to_value(validated).unwrap());
+        std::fs::write(
+            agent.join("packages/index.json"),
+            Value::Object(file_index).to_string(),
+        )
+        .unwrap();
+        let file_resources = resources_for(&args, false).unwrap();
+        assert_eq!(file_resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(file_resources.themes.is_empty());
+        assert!(startup_themes(&args, false).unwrap().is_empty());
+        // Replacing the file with a directory does not load the old parent.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(resources_for(&args, false).unwrap().extensions.is_empty());
         std::fs::write(agent.join("settings.json"), settings.to_string()).unwrap();
         // Without a cache and without candidates the URL is never evaluated.
         std::fs::remove_file(agent.join("packages/index.json")).unwrap();
@@ -2989,6 +3084,138 @@ mod tests {
         entries.insert(first, false, "cargo:example", Path::new("/src/one"), true);
         entries.insert(second, true, "cargo:example", Path::new("/src/two"), true);
         assert!(entries.enabled().is_empty());
+    }
+
+    #[test]
+    fn local_package_cache_requires_matching_source_kind_and_validated_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source");
+        std::fs::write(&file, "fixture").unwrap();
+        let source = normalize(&file.to_string_lossy(), directory.path()).unwrap();
+        let mut package = Installed {
+            source: source.clone(),
+            root: Path::new(&source).parent().unwrap().to_path_buf(),
+            version: None,
+            resources: PackageResources::default(),
+        };
+        assert!(!local_source_matches_cache(&package));
+        package.resources.extensions.push(PathBuf::from(&source));
+        assert!(local_source_matches_cache(&package));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(!local_source_matches_cache(&package));
+        package.root = PathBuf::from(&source);
+        assert!(local_source_matches_cache(&package));
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, "fixture").unwrap();
+        assert!(!local_source_matches_cache(&package));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_file_install_ignores_parent_manifests_and_resources() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "PI_RS_SINGLE_FILE_TEST_DIR";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let temporary = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "packages::tests::single_file_install_ignores_parent_manifests_and_resources",
+                    "--nocapture",
+                ])
+                .env(CHILD, temporary.path())
+                .env("PI_RS_HOME", temporary.path().join("agent"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let root = directory.join("package");
+        std::fs::create_dir_all(root.join("themes")).unwrap();
+        std::fs::write(root.join("themes/sibling.json"), "{}").unwrap();
+        std::fs::write(root.join("pi-package.json"), "not json").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "not toml").unwrap();
+        let file = root.join("extension");
+        std::fs::write(&file, r#"#!/bin/sh
+cat >/dev/null
+touch "$PI_RS_HOME/validated"
+printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"commands":[],"tools":[]}}}'
+"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = normalize(&file.to_string_lossy(), &directory).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let package = runtime.block_on(install(&source, false)).unwrap();
+        assert_eq!(package.resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(package.resources.themes.is_empty());
+        assert!(package.resources.prompts.is_empty());
+        assert!(package.resources.skills.is_empty());
+        let mut old_cache = package.clone();
+        old_cache.resources.extensions.clear();
+        old_cache
+            .resources
+            .themes
+            .push(root.join("themes/sibling.json"));
+        let restored = revalidate_cached_package(package).unwrap();
+        assert_eq!(restored.resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(restored.resources.themes.is_empty());
+
+        use clap::Parser;
+        std::fs::write(
+            config::agent_dir().join("settings.json"),
+            json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi", "--no-trust"]);
+        args.workspace = directory.clone();
+        std::fs::remove_file(config::agent_dir().join("validated")).unwrap();
+        config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
+            index.insert(key(&source), serde_json::to_value(old_cache).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(config::agent_dir().join("validated").exists());
+        assert_eq!(
+            resources_for(&args, false).unwrap().extensions,
+            vec![PathBuf::from(&source)]
+        );
+        std::fs::remove_file(config::agent_dir().join("validated")).unwrap();
+        // A file replaced by a directory must be prepared as a new package.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(file.join("themes")).unwrap();
+        std::fs::write(file.join("themes/new.json"), "{}").unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        let resources = resources_for(&args, false).unwrap();
+        assert!(resources.extensions.is_empty());
+        assert_eq!(resources.themes.len(), 1);
+        // A directory replaced by an invalid executable cannot reuse its cache.
+        std::fs::remove_dir_all(&file).unwrap();
+        std::fs::write(&file, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(resources_for(&args, false).unwrap().extensions.is_empty());
+        // The next valid executable is revalidated before becoming available.
+        std::fs::write(&file, r#"#!/bin/sh
+cat >/dev/null
+touch "$PI_RS_HOME/validated"
+printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"commands":[],"tools":[]}}}'
+"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runtime.block_on(prepare(&args)).unwrap();
+        assert!(config::agent_dir().join("validated").exists());
+        let resources = resources_for(&args, false).unwrap();
+        assert_eq!(resources.extensions, vec![PathBuf::from(&source)]);
+        assert!(resources.themes.is_empty());
     }
 
     #[test]

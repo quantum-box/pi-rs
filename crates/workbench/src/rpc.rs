@@ -1872,6 +1872,14 @@ pub(super) fn snapshot_response(
             Ok(state)
         }
         "get_entries" => {
+            if let Some(since) = request.get("since")
+                && !since.is_string()
+            {
+                return Err(Error::Config(format!(
+                    "Entry not found: {}",
+                    js_command_string(since)?
+                )));
+            }
             let mut result =
                 super::rpc_entries::Entries::new(session).after(request.get("since"))?;
             if request["includeNative"] == true {
@@ -2713,6 +2721,38 @@ mod tests {
             session_name(&json!({"name":"  example  "})).unwrap(),
             "example"
         );
+    }
+
+    #[test]
+    fn get_entries_since_uses_strict_type_and_js_diagnostics() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), Vec::new(), None)
+            .unwrap();
+        let path = std::path::Path::new("session.jsonl");
+        let snapshot =
+            |request: Value| snapshot_response(&request, &session, path, None, json!({}));
+        let entries = snapshot(json!({"type":"get_entries"})).unwrap();
+        let id = entries["entries"][0]["id"].as_str().unwrap();
+        let numeric: u64 = id.parse().expect("native entry id is numeric");
+        assert!(snapshot(json!({"type":"get_entries","since":id})).is_ok());
+        for (value, expected) in [
+            (json!(numeric), format!("Entry not found: {numeric}")),
+            (Value::Null, "Entry not found: null".into()),
+            (
+                json!([1, null, [true, 2], {}]),
+                "Entry not found: 1,,true,2,[object Object]".into(),
+            ),
+            (json!({"x":1}), "Entry not found: [object Object]".into()),
+            (
+                json!({"toString":0}),
+                "Cannot convert object to primitive value".into(),
+            ),
+        ] {
+            assert!(
+                matches!(snapshot(json!({"type":"get_entries","since":value})), Err(Error::Config(message)) if message == expected)
+            );
+        }
     }
 
     #[test]

@@ -116,6 +116,50 @@ fn retry_number(value: &str) -> Option<f64> {
     value[..i].parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
+fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(date.to_utc());
+    }
+    // Date.parse also accepts the obsolete RFC 850 HTTP-date form. Use
+    // JavaScript's 1950/2049 pivot for its two-digit year.
+    let (weekday, rest) = value.trim().split_once(',')?;
+    if ![
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    .iter()
+    .any(|day| weekday.eq_ignore_ascii_case(day))
+    {
+        return None;
+    }
+    let mut parts = rest.split_ascii_whitespace();
+    let date = parts.next()?;
+    let time = parts.next()?;
+    if !parts.next()?.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
+        return None;
+    }
+    let mut date = date.split('-');
+    let day = date.next()?;
+    let month = date.next()?;
+    let year = date.next()?;
+    if year.len() != 2 || !year.bytes().all(|b| b.is_ascii_digit()) || date.next().is_some() {
+        return None;
+    }
+    let year: u32 = year.parse().ok()?;
+    let year = if year < 50 { year + 2000 } else { year + 1900 };
+    chrono::NaiveDateTime::parse_from_str(
+        &format!("{day} {month} {year} {time}"),
+        "%d %b %Y %H:%M:%S",
+    )
+    .ok()
+    .map(|date| date.and_utc())
+}
+
 fn classifier_retry_delay(
     headers: &HeaderMap,
     retry_index: usize,
@@ -134,7 +178,7 @@ fn classifier_retry_delay(
                 headers
                     .get("retry-after")
                     .and_then(|value| value.to_str().ok())
-                    .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+                    .and_then(classifier_retry_date)
                     .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
             })
     });
@@ -3022,6 +3066,34 @@ mod tests {
         assert_eq!(retry_number("1e+seconds"), Some(1.0));
         assert_eq!(retry_number(".25e2 seconds"), Some(25.0));
         assert_eq!(retry_number("Wed, 21 Oct 2015 07:28:05 GMT"), None);
+        let old_now = chrono::DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:32 GMT")
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sunday, 06-Nov-94 08:49:37 GMT"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, old_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sunday, 06-Nov-94 08:51:00 GMT"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, old_now).is_err());
+        assert_eq!(
+            classifier_retry_date("Sunday, 06-Nov-50 08:49:37 GMT")
+                .unwrap()
+                .to_rfc3339(),
+            "1950-11-06T08:49:37+00:00"
+        );
+        assert_eq!(
+            classifier_retry_date("Sunday, 06-Nov-49 08:49:37 GMT")
+                .unwrap()
+                .to_rfc3339(),
+            "2049-11-06T08:49:37+00:00"
+        );
     }
 
     #[tokio::test]

@@ -58,7 +58,8 @@ Invalid `--thinking` values produce a warning and leave the previous valid
 selection or configured default in place. Repeated values use the last valid
 selection, including when an invalid value follows it.
 
-`httpIdleTimeoutMs` defaults to five minutes and applies to model HTTP response
+`httpIdleTimeoutMs` accepts Pi's numeric strings and case-insensitive `disabled`
+with ECMAScript whitespace, and defaults to five minutes. It applies to model HTTP response
 headers and individual body reads; `0` or `"disabled"` disables this idle
 deadline. `/settings` can change it. The separate `--model-timeout-secs` bounds
 the entire model operation and defaults to 2,147,483 seconds.
@@ -177,7 +178,9 @@ reached against an available native or Pi manifest diagnostic candidate. For a l
 package it stops the current declaration at that resource type, retaining
 earlier resources and processing later declarations. Remote errors propagate.
 Startup theme discovery uses cached candidates when available. Single-file
-sources and other resource filter paths still treat invalid URLs as non-matches.
+sources load only the selected executable and bypass package filters, as in Pi;
+the native executable must pass protocol validation. Other resource filter
+paths still treat invalid URLs as non-matches.
 Pi-only extensions, skills and prompts are scanned only for filter diagnostics;
 they are not loaded as native resources. Diagnostic scans are bounded and fall
 back to native candidates on cycles, excessive traversal, unsafe ignore files,
@@ -523,7 +526,8 @@ out of order, and a settings-write failure can leave the live mode changed.
 Queued input is acknowledged after it is saved. The `get_entries` and
 `get_tree` responses use Pi entry types, string IDs, parent links, and a leaf
 ID. Session records used internally for run recovery are omitted from this
-view. Set `includeNative: true` for the native entries or tree and the native
+view. `get_entries` compares `since` to string IDs without coercion and uses
+JavaScript string conversion in the not-found diagnostic. Set `includeNative: true` for the native entries or tree and the native
 leaf ID. Newly committed entries are emitted as `entry_appended` with those
 same IDs. Full malformed-JSON preview fidelity and additional session events
 remain in progress.
@@ -1466,6 +1470,9 @@ inference; model discovery and resolution remain available while those slots are
 
 ### Native codemode checkpoint
 
+Model catalogue search checks provider and ID argument types before dispatch,
+including the sandbox's JSON conversion of omitted and non-finite values.
+
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
 fresh QuickJS context. Scripts can call registered tools through `tools`, use
 `searchTools`, `describeTool` and `describeNamespace`, emit `text` or `image`,
@@ -1516,7 +1523,8 @@ request fails early or is cancelled, as they do on successful requests.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
 `Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
-server-delay cap still applies to the parsed value.
+server-delay cap still applies to the parsed value. GMT retry dates also accept
+the obsolete RFC 850 form with JavaScript's two-digit year interpretation.
 
 ### Resource selection checkpoint
 
@@ -4396,6 +4404,8 @@ files. A declared root takes precedence over nested skills. Name and
 description diagnostics preserve otherwise loadable skills. Malformed
 prompt templates report their path while other templates remain usable.
 Prompt descriptions without frontmatter use a bounded first-line preview.
+Missing explicit prompt template paths are silently skipped, while native glob
+patterns that match no files remain errors.
 
 Native `grep` now applies inclusion and exclusion globs with the same
 walker semantics as ripgrep, including workspace-relative patterns. Explicit

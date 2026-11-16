@@ -55,6 +55,39 @@ fn executable(path: &Path) -> bool {
 fn has_pattern(value: &str) -> bool {
     value.contains(['*', '?', '[', '{'])
 }
+fn pattern_before_parent(path: &Path) -> bool {
+    let mut patterned = false;
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) && patterned {
+            return true;
+        }
+        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        {
+            patterned = true;
+        }
+    }
+    false
+}
+// Windows may collapse a patterned component followed by `..` during a
+// metadata check. Test the literal prefix first, preserving real bracket names.
+fn wildcard_parent_path(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    let mut patterned = false;
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) && patterned && !prefix.exists() {
+            return true;
+        }
+        if matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        {
+            patterned = true;
+        }
+        prefix.push(component.as_os_str());
+    }
+    false
+}
 pub fn skill_path(args: &Cli, value: &str) -> Option<PathBuf> {
     let workspace = args
         .workspace
@@ -105,8 +138,27 @@ pub fn resolve(
     let mut paths = Vec::new();
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
+        let pattern_path = path.strip_prefix(&workspace).unwrap_or(&path);
+        let patterned = pattern_path.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        });
+        let path = if kind == Kind::Prompt
+            && (!patterned
+                || cfg!(windows) && pattern_before_parent(&path) && !wildcard_parent_path(&path))
+            && path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            normalize_resource_path(&path)
+        } else {
+            path
+        };
+        let pattern_path = path.strip_prefix(&workspace).unwrap_or(&path);
+        let patterned = pattern_path.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
+        });
         if kind == Kind::Skill {
-            let normalized = normalize_skill_path(&path);
+            let normalized = normalize_resource_path(&path);
             let pattern_path = normalized.strip_prefix(&workspace).unwrap_or(&normalized);
             let patterned = pattern_path.components().any(|component| {
                 matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
@@ -119,10 +171,13 @@ pub fn resolve(
                 continue;
             }
         }
+        if kind == Kind::Prompt && !patterned && !path.exists() {
+            continue;
+        }
         if !skill_file_is_markdown(kind, &path, warnings) {
             continue;
         }
-        if kind == Kind::Prompt && path.is_dir() {
+        if kind == Kind::Prompt && !wildcard_parent_path(&path) && path.is_dir() {
             append(&mut paths, vec![path]);
             continue;
         }
@@ -253,7 +308,7 @@ fn skill_file_is_markdown(kind: Kind, path: &Path, warnings: &mut Vec<String>) -
     if kind != Kind::Skill {
         return true;
     }
-    let normalized = normalize_skill_path(path);
+    let normalized = normalize_resource_path(path);
     let path = normalized.as_path();
     if path.is_file()
         && !path
@@ -318,14 +373,35 @@ fn absolute(base: &Path, value: &str) -> PathBuf {
     if let Some(relative) = value.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
     {
-        return PathBuf::from(home).join(relative);
+        return join_resource_path(&PathBuf::from(home), Path::new(relative));
     }
     let path = PathBuf::from(value);
     if path.is_absolute() {
         path
     } else {
-        base.join(path)
+        join_resource_path(base, &path)
     }
+}
+fn join_resource_path(base: &Path, path: &Path) -> PathBuf {
+    // `PathBuf::push` normalizes `..` on Windows verbatim bases. Keep glob
+    // components intact until the pattern has been expanded.
+    if cfg!(windows)
+        && path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+        && path.components().any(|component| matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy())))
+    {
+        let mut joined = base.as_os_str().to_os_string();
+        joined.push(std::path::MAIN_SEPARATOR_STR);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::{OsStrExt, OsStringExt};
+            let separators = path.as_os_str().encode_wide().map(|ch| if ch == b'/' as u16 { b'\\' as u16 } else { ch }).collect::<Vec<_>>();
+            joined.push(std::ffi::OsString::from_wide(&separators));
+        }
+        #[cfg(not(windows))]
+        joined.push(path.as_os_str());
+        return PathBuf::from(joined);
+    }
+    base.join(path)
 }
 fn expand(
     path: &Path,
@@ -335,14 +411,16 @@ fn expand(
 ) -> Result<Vec<PathBuf>> {
     let normalized;
     let path = if kind == Kind::Skill {
-        normalized = normalize_skill_path(path);
+        normalized = normalize_resource_path(path);
         normalized.as_path()
     } else {
         path
     };
-    if path.exists() || !path.components().any(|component| {
+    let patterned = path.components().any(|component| {
         matches!(component, std::path::Component::Normal(name) if has_pattern(&name.to_string_lossy()))
-    }) {
+    });
+    let literal_exists = !wildcard_parent_path(path) && path.exists();
+    if literal_exists || !patterned {
         return collect(path, kind, required, warnings);
     }
     let pattern = path.to_string_lossy().replace('\\', "/");
@@ -378,13 +456,19 @@ fn collect(
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
     if kind == Kind::Skill {
-        collect_matching(&normalize_skill_path(path), kind, required, warnings, None)
+        collect_matching(
+            &normalize_resource_path(path),
+            kind,
+            required,
+            warnings,
+            None,
+        )
     } else {
         collect_matching(path, kind, required, warnings, None)
     }
 }
 // Node's resolve removes lexical dot components without resolving symlinks.
-fn normalize_skill_path(path: &Path) -> PathBuf {
+fn normalize_resource_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -690,5 +774,22 @@ mod glob_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    #[test]
+    fn verbatim_workspace_join_preserves_glob_before_parent() {
+        let base = std::path::Path::new(r"\\?\C:\workspace");
+        for relative in [r"no-match-*\..\valid.md", "no-match-*/../valid.md"] {
+            let joined = super::join_resource_path(base, std::path::Path::new(relative));
+            assert!(joined.to_string_lossy().contains(r"no-match-*\..\valid.md"));
+            assert!(
+                joined
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            );
+        }
     }
 }

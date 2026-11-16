@@ -72,11 +72,28 @@
     globalThis.describeNamespace = async name => JSON.parse(__describe_namespace(String(name))) ?? undefined;
     const callModel = __call_model_operation;
     const modelType = type => {
-        if (!["chat", "classifier", "image"].includes(type)) throw new Error("Unknown model type");
+        if (!["chat", "classifier", "image"].includes(type))
+            throw new Error(`Unknown model type ${JSON.stringify(type)}. Use "chat", "image", or "classifier".`);
         return type;
     };
-    const listModels = async (type, provider, available, id) => {
-        const reply = JSON.parse(await callModel(JSON.stringify({ action: "list", type: modelType(type), provider, available, id })));
+    const modelProvider = provider => {
+        if (provider == null) return undefined;
+        if (typeof provider !== "string") throw new Error("provider must be a string");
+        return provider;
+    };
+    const describeModelArg = value => {
+        if (value == null) return String(value);
+        if (Array.isArray(value)) return value.length ? "an array" : "an empty array";
+        if (typeof value === "object") {
+            const keys = Object.keys(value);
+            return keys.length ? `{ ${keys.slice(0, 6).join(", ")}${keys.length > 6 ? ", ..." : ""} }` : "{}";
+        }
+        return typeof value === "string" ? "a string" : `a ${typeof value}`;
+    };
+    const listModels = async (available, lookup, ...args) => {
+        // Pi passes spread arguments through a JSON boundary before checking them.
+        const [kind, owner, modelId] = JSON.parse(JSON.stringify(args));
+        const reply = JSON.parse(await callModel(JSON.stringify({ action: "list", type: modelType(kind), provider: modelProvider(owner), available, id: lookup ? modelId : undefined })));
         if (!reply.ok) throw new Error(reply.error);
         return reply.value;
     };
@@ -122,9 +139,15 @@
         return reply.value;
     };
     globalThis.models = Object.freeze({
-        getModelsOfType: (type, provider) => listModels(type, provider, false),
-        getAvailableOfType: (type, provider) => listModels(type, provider, true),
-        getModelOfType: async (type, provider, id) => (await listModels(type, provider, false, id))[0],
+        getModelsOfType: (...args) => listModels(false, false, ...args),
+        getAvailableOfType: (...args) => listModels(true, false, ...args),
+        getModelOfType: async (...args) => {
+            const values = JSON.parse(JSON.stringify(args));
+            const [kind, owner, modelId] = values;
+            if (typeof owner !== "string" || typeof modelId !== "string")
+                throw new Error(`models.getModelOfType(type, provider, id) expects three strings, got (${values.map(describeModelArg).join(", ")}). The provider and the id are separate arguments, for example models.getModelOfType("classifier", "typesafe", "jev-latest").`);
+            return (await listModels(false, true, kind, owner, modelId))[0];
+        },
         classify: (model, context) => modelOperation("classify", model, context),
         generateImages: (model, context) => modelOperation("generateImages", model, context),
     });
