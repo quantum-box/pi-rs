@@ -55,6 +55,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub enum Step {
     Continue(Checkpoint),
     Wait {
@@ -434,6 +435,7 @@ pub struct DetachedInvocation {
     lease: InvocationLease,
 }
 
+#[derive(Clone)]
 enum InvocationResult {
     Handler(
         Result<Step, String>,
@@ -498,6 +500,7 @@ enum DeferredSettlement {
     ),
     Prepared(PreparedSettlement),
     IndeterminatePrepared(PreparedSettlement),
+    IndeterminateFailure(FailureSettlement),
     PreparationConflict(PreparationConflict),
     Failure(FailureSettlement),
 }
@@ -523,6 +526,36 @@ impl PendingSettlement {
     /// The task whose result and exclusive lease remain owned here.
     pub fn task_id(&self) -> Uuid {
         self.lease().id
+    }
+
+    /// The reserved attempt identity, retained for external reconciliation.
+    pub fn attempt_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Unprepared(completed) => completed.running.task.attempt_id(),
+            Self::Prepared { settlement, .. } => settlement.running.task.attempt_id(),
+            Self::PreparationConflict { conflict, .. } => conflict.running.task.attempt_id(),
+            Self::Failure { settlement, .. } => settlement.running.task.attempt_id(),
+        }
+    }
+
+    /// The preserved reason for an owned failure settlement, if present.
+    pub fn failure_reason(&self) -> Option<&str> {
+        match self {
+            Self::Failure { settlement, .. } => Some(&settlement.reason),
+            _ => None,
+        }
+    }
+
+    /// The task transition candidate, where preparation reached that boundary.
+    pub fn candidate_task(&self) -> Option<&Task> {
+        match self {
+            Self::Prepared { settlement, .. } => Some(&settlement.candidate.task),
+            Self::Failure { settlement, .. } => settlement
+                .candidate
+                .as_ref()
+                .map(|candidate| &candidate.task.task),
+            _ => None,
+        }
     }
 
     fn lease(&self) -> &InvocationLease {
@@ -712,7 +745,8 @@ impl std::fmt::Debug for CompletedInvocation {
 /// `Handler` means the handler returned an error, not that its external effects
 /// were rolled back. Indeterminate errors do not prove a commit failed; where
 /// available, `IndeterminatePrepared` retains the exact candidate and lease for
-/// reconciliation. Other indeterminate paths still consume their input.
+/// reconciliation. Nonblocking owned paths retain the original input or the
+/// failure candidate in `IndeterminateOwned`.
 #[derive(Debug)]
 pub enum SettlementError {
     #[cfg(test)]
@@ -742,6 +776,12 @@ pub enum SettlementError {
     /// A prepared transaction may have committed. Retain it for external
     /// reconciliation; it must not be blindly retried.
     IndeterminatePrepared {
+        error: Error,
+        pending: Box<PendingSettlement>,
+    },
+    /// An uncertain settlement retaining its original input or failure candidate.
+    /// Inspect durable state before choosing how to reconcile it.
+    IndeterminateOwned {
         error: Error,
         pending: Box<PendingSettlement>,
     },
@@ -1019,6 +1059,12 @@ pub struct Scheduler {
     #[cfg(test)]
     inject_post_commit_error: bool,
     #[cfg(test)]
+    inject_preparation_error: u8,
+    #[cfg(test)]
+    inject_failure_commit_error: u8,
+    #[cfg(test)]
+    inject_abort_commit_error: u8,
+    #[cfg(test)]
     yield_before_preparation: bool,
     #[cfg(test)]
     yield_after_graph_conflict: bool,
@@ -1166,6 +1212,13 @@ impl Scheduler {
                 pending: Box::new(PendingSettlement::Unprepared(completed)),
             });
         }
+        // Preserve the exact handler input until all preparation and commit
+        // paths have either succeeded or returned a more precise owned candidate.
+        let backup = if nonblocking_abort {
+            Some((completed.running.clone(), completed.result.clone()))
+        } else {
+            None
+        };
         let CompletedInvocation {
             running,
             result,
@@ -1185,9 +1238,17 @@ impl Scheduler {
             ),
             InvocationResult::Abort(outcome) => {
                 let _gate = task_gate;
+                #[cfg(test)]
+                if self.inject_abort_commit_error == 1 {
+                    return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+                }
                 match outcome {
                     None => self.ts().update(&running, |task| task.cancel())?,
                     Some(reason) => self.ts().update(&running, |task| task.fail(reason))?,
+                }
+                #[cfg(test)]
+                if self.inject_abort_commit_error == 2 {
+                    return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
                 }
                 Ok(true)
             }
@@ -1206,7 +1267,11 @@ impl Scheduler {
             }
         };
         if let Some(deferred) = deferred {
-            if matches!(deferred, DeferredSettlement::IndeterminatePrepared(_)) {
+            if matches!(
+                deferred,
+                DeferredSettlement::IndeterminatePrepared(_)
+                    | DeferredSettlement::IndeterminateFailure(_)
+            ) {
                 self.live_invocations
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1232,6 +1297,12 @@ impl Scheduler {
                         pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
                     }
                 }
+                DeferredSettlement::IndeterminateFailure(settlement) => {
+                    SettlementError::IndeterminateOwned {
+                        error: result.expect_err("indeterminate failure must have an error"),
+                        pending: Box::new(PendingSettlement::Failure { lease, settlement }),
+                    }
+                }
                 DeferredSettlement::PreparationConflict(conflict) => {
                     SettlementError::PendingPrepared {
                         pending: Box::new(PendingSettlement::PreparationConflict {
@@ -1251,6 +1322,25 @@ impl Scheduler {
             drop(guard);
             return Err(SettlementError::Yielded {
                 pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+            });
+        }
+        if result.is_err()
+            && !reported_handler_failure
+            && let Some((running, result_backup)) = backup
+        {
+            self.live_invocations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poisoned = true;
+            let error = result.expect_err("indeterminate settlement must have an error");
+            drop(guard);
+            return Err(SettlementError::IndeterminateOwned {
+                error,
+                pending: Box::new(PendingSettlement::Unprepared(CompletedInvocation {
+                    running,
+                    result: result_backup,
+                    lease,
+                })),
             });
         }
         if result.is_ok() {
@@ -1359,7 +1449,7 @@ impl Scheduler {
         if matches!(&completed.result, InvocationResult::Abort(_)) {
             drop(gate);
             drop(guard);
-            return self.settle_invocation(completed);
+            return self.settle_invocation_inner(completed, true);
         }
         let pending = (|| {
             let current = self
@@ -1586,6 +1676,21 @@ impl Scheduler {
                 pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
             });
         }
+        if let Some(DeferredSettlement::IndeterminateFailure(failure)) = deferred {
+            self.live_invocations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poisoned = true;
+            let error = result.expect_err("indeterminate failure must have an error");
+            drop(guard);
+            return Err(SettlementError::IndeterminateOwned {
+                error,
+                pending: Box::new(PendingSettlement::Failure {
+                    lease,
+                    settlement: failure,
+                }),
+            });
+        }
         if result.is_err() && settlement.commit_uncertain {
             self.live_invocations
                 .lock()
@@ -1792,6 +1897,12 @@ impl Scheduler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .poisoned = true;
+            let error = result.expect_err("indeterminate settlement must have an error");
+            drop(guard);
+            return Err(SettlementError::IndeterminateOwned {
+                error,
+                pending: Box::new(pending!()),
+            });
         } else {
             let mut state = self
                 .live_invocations
@@ -1975,6 +2086,12 @@ impl Scheduler {
             inject_batch_prepare_conflict: false,
             #[cfg(test)]
             inject_post_commit_error: false,
+            #[cfg(test)]
+            inject_preparation_error: 0,
+            #[cfg(test)]
+            inject_failure_commit_error: 0,
+            #[cfg(test)]
+            inject_abort_commit_error: 0,
             #[cfg(test)]
             yield_before_preparation: false,
             #[cfg(test)]
@@ -2462,7 +2579,8 @@ impl Scheduler {
                     SettlementError::Pending { .. }
                     | SettlementError::PendingPrepared { .. }
                     | SettlementError::RejectedPrepared { .. }
-                    | SettlementError::IndeterminatePrepared { .. } => {
+                    | SettlementError::IndeterminatePrepared { .. }
+                    | SettlementError::IndeterminateOwned { .. } => {
                         unreachable!("serial settlement does not return pending")
                     }
                     #[cfg(test)]
@@ -3067,7 +3185,15 @@ impl Scheduler {
         batch.extend(staged.iter().filter_map(|(_, child, prepared)| {
             (!prepared.mutations.is_empty()).then_some(Save::Create(child))
         }));
+        #[cfg(test)]
+        if self.inject_preparation_error == 1 {
+            return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+        }
         let document_result = documents.prepare(&running);
+        #[cfg(test)]
+        if self.inject_preparation_error == 2 {
+            return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+        }
         #[cfg(test)]
         let document_result = if self.inject_batch_prepare_conflict {
             Err(crate::document::Error::Store(
@@ -3564,7 +3690,12 @@ impl Scheduler {
                 }
                 self.abort_failed_running(owner, root, parent.task.id(), gate)?;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if nonblocking_abort {
+                    *deferred = Some(DeferredSettlement::IndeterminateFailure(settlement));
+                }
+                return Err(error);
+            }
         }
         self.poisoned
             .store(false, std::sync::atomic::Ordering::Release);
@@ -3699,7 +3830,11 @@ impl Scheduler {
                 hook(settlement.attempt, store.store());
             }
             before_commit();
-            match store.store().commit_with_prefix_put_fence(
+            #[cfg(test)]
+            if self.inject_failure_commit_error == 1 {
+                return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+            }
+            let commit = store.store().commit_with_prefix_put_fence(
                 &candidate.batch.checks,
                 &candidate.batch.mutations,
                 &[
@@ -3708,7 +3843,12 @@ impl Scheduler {
                     b"runtime/conversation/",
                 ],
                 candidate.graph_version,
-            ) {
+            );
+            #[cfg(test)]
+            if commit.is_ok() && self.inject_failure_commit_error == 2 {
+                return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
+            }
+            match commit {
                 Ok(()) => return Ok(()),
                 Err(durable_store::Error::Conflict { ref key })
                     if settlement.attempt < 31
@@ -5515,6 +5655,347 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn uncertain_document_preparation_retains_original_staged_input() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::task_store::{SignalResult, SignalToken};
+        struct Staged(Address);
+        impl Handler for Staged {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                parent: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.get(&self.0).unwrap();
+                docs.put(
+                    &self.0,
+                    json!({"value": "retained"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    docs.signal_at(Uuid::from_u128(2), &token, "key", json!(7), 0)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                let child = task(3, TaskOwner::Task(parent.id()), "child", false, 3);
+                docs.stage_keyed_child("child", "tool", child.input(), child.clone())
+                    .unwrap();
+                Ok(Step::Succeed(json!("result")))
+            }
+        }
+        for injection in [1, 2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let address = Address {
+                scope: "uncertain".into(),
+                name: "doc".into(),
+                key: "".into(),
+            };
+            let mut registry = Registry::default();
+            registry.register("parent", false, Staged(address.clone()));
+            registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+            let owner = scheduler.owner();
+            scheduler
+                .ts()
+                .save(&[
+                    Save::Create(&task(
+                        1,
+                        TaskOwner::Conversation(Uuid::from_u128(9)),
+                        "parent",
+                        false,
+                        3,
+                    )),
+                    Save::Create(&task(
+                        2,
+                        TaskOwner::Conversation(Uuid::from_u128(10)),
+                        "missing",
+                        false,
+                        3,
+                    )),
+                ])
+                .unwrap();
+            let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("reservation")
+            };
+            let completed = invocation.execute().unwrap();
+            let attempt = completed.running.task.attempt_id();
+            scheduler.inject_preparation_error = if injection == 3 { 0 } else { injection };
+            scheduler.inject_post_commit_error = injection == 3;
+            let pending = match scheduler.try_settle_invocation(completed) {
+                Err(
+                    SettlementError::IndeterminateOwned { pending, .. }
+                    | SettlementError::IndeterminatePrepared { pending, .. },
+                ) => pending,
+                result => panic!("expected retained input: {result:?}"),
+            };
+            assert_eq!(pending.task_id(), Uuid::from_u128(1));
+            match &*pending {
+                PendingSettlement::Unprepared(completed) => {
+                    assert_eq!(completed.running.task.attempt_id(), attempt);
+                    let InvocationResult::Handler(Ok(Step::Succeed(value)), documents) =
+                        &completed.result
+                    else {
+                        panic!("original result")
+                    };
+                    assert_eq!(*value, json!("result"));
+                    assert_eq!(documents.keyed_children.len(), 1);
+                    let prepared = (**documents).clone().prepare(&completed.running).unwrap();
+                    assert!(prepared.document_batch.mutations.iter().any(|mutation| matches!(mutation, durable_store::Mutation::Put { key, .. } if key.starts_with(b"durable/signal/"))));
+                    assert!(prepared.document_batch.mutations.len() >= 2);
+                    assert_eq!(prepared.keyed_children.len(), 1);
+                }
+                PendingSettlement::Prepared { settlement, .. } if injection == 3 => {
+                    assert_eq!(settlement.running.task.attempt_id(), attempt);
+                    assert!(settlement.staged_children.contains_key(&Uuid::from_u128(3)));
+                    assert_eq!(
+                        Documents::new(owner.store())
+                            .get(&address)
+                            .unwrap()
+                            .unwrap()
+                            .value["value"],
+                        json!("retained")
+                    );
+                    let token = SignalToken::new("answer", 1).unwrap();
+                    assert_eq!(
+                        scheduler
+                            .ts()
+                            .read_typed_signal(Uuid::from_u128(2), &token, "key")
+                            .unwrap(),
+                        Some(json!(7))
+                    );
+                }
+                _ => panic!("retained input or transaction required"),
+            }
+            let stored = scheduler
+                .ts()
+                .load(Uuid::from_u128(1))
+                .unwrap()
+                .unwrap()
+                .task;
+            let expected = if injection == 3 {
+                TaskState::Completing(json!("result"))
+            } else {
+                TaskState::Running
+            };
+            assert_eq!(stored.state(), &expected);
+            let retained = match scheduler.try_resume_pending(*pending) {
+                Err(SettlementError::Rejected {
+                    error: Error::Poisoned,
+                    completed,
+                }) => Box::new(PendingSettlement::Unprepared(*completed)),
+                Err(SettlementError::RejectedPrepared {
+                    error: Error::Poisoned,
+                    pending,
+                }) => pending,
+                result => panic!("blind retry must be rejected: {result:?}"),
+            };
+            drop(scheduler);
+            assert!(matches!(
+                Scheduler::attach(owner.clone(), registry.clone()),
+                Err(Error::AlreadyAttached)
+            ));
+            drop(retained);
+            assert!(Scheduler::attach(owner.clone(), registry).is_ok());
+        }
+    }
+
+    #[test]
+    fn uncertain_abort_commit_retains_original_outcome_and_lease() {
+        for injection in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::default();
+            registry.register_with_abort(
+                "work",
+                false,
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+            let owner = scheduler.owner();
+            scheduler
+                .submit(&task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "work",
+                    false,
+                    3,
+                ))
+                .unwrap();
+            scheduler.request_abort(Uuid::from_u128(1)).unwrap();
+            let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("abort reservation")
+            };
+            let completed = invocation.execute().unwrap();
+            assert!(matches!(completed.result, InvocationResult::Abort(None)));
+            scheduler.inject_abort_commit_error = injection;
+            let pending = match scheduler.try_settle_invocation(completed) {
+                Err(SettlementError::IndeterminateOwned { pending, .. }) => pending,
+                result => panic!("expected retained abort: {result:?}"),
+            };
+            assert!(
+                matches!(&*pending, PendingSettlement::Unprepared(completed) if matches!(completed.result, InvocationResult::Abort(None)))
+            );
+            let expected = if injection == 1 {
+                TaskState::Running
+            } else {
+                TaskState::Cancelled
+            };
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .load(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                &expected
+            );
+            let retained = match scheduler.try_resume_pending(*pending) {
+                Err(SettlementError::Rejected {
+                    error: Error::Poisoned,
+                    completed,
+                }) => completed,
+                result => panic!("blind retry must be rejected: {result:?}"),
+            };
+            drop(scheduler);
+            assert!(matches!(
+                Scheduler::attach(owner.clone(), registry.clone()),
+                Err(Error::AlreadyAttached)
+            ));
+            drop(retained);
+            assert!(Scheduler::attach(owner.clone(), registry).is_ok());
+        }
+    }
+
+    #[test]
+    fn uncertain_failure_commit_retains_reason_candidate_and_lease() {
+        for resumed in [false, true] {
+            for injection in [1, 2] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut registry = Registry::default();
+                registry.register("work", false, |_: &Task| {
+                    Ok(Step::Fail("exact failure".into()))
+                });
+                registry.register("independent", false, |_: &Task| {
+                    Ok(Step::Succeed(json!("other")))
+                });
+                let mut scheduler =
+                    Scheduler::open(dir.path().join("db"), registry.clone()).unwrap();
+                let owner = scheduler.owner();
+                scheduler
+                    .submit(&task(
+                        1,
+                        TaskOwner::Conversation(Uuid::from_u128(9)),
+                        "work",
+                        false,
+                        3,
+                    ))
+                    .unwrap();
+                scheduler
+                    .submit(&task(
+                        2,
+                        TaskOwner::Conversation(Uuid::from_u128(10)),
+                        "independent",
+                        false,
+                        3,
+                    ))
+                    .unwrap();
+                let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap()
+                else {
+                    panic!("reservation")
+                };
+                let TickReservation::Invocation(other) = scheduler.reserve_tick(0).unwrap() else {
+                    panic!("other reservation")
+                };
+                let other = other.execute().unwrap();
+                let completed = invocation.execute().unwrap();
+                let attempt = completed.running.task.attempt_id();
+                scheduler.inject_failure_commit_error = injection;
+                let result = if resumed {
+                    let CompletedInvocation { running, lease, .. } = completed;
+                    let settlement = FailureSettlement {
+                        attachment: scheduler.attachment.clone(),
+                        running,
+                        reason: "exact failure".into(),
+                        completed: true,
+                        check_pending: true,
+                        attempt: 0,
+                        candidate: None,
+                    };
+                    scheduler.try_resume_pending(PendingSettlement::Failure { lease, settlement })
+                } else {
+                    scheduler.try_settle_invocation(completed)
+                };
+                let pending = match result {
+                    Err(SettlementError::IndeterminateOwned { pending, .. }) => pending,
+                    result => panic!("expected retained failure: {result:?}"),
+                };
+                assert_eq!(pending.attempt_id(), attempt);
+                assert_eq!(pending.failure_reason(), Some("exact failure"));
+                assert_eq!(
+                    pending.candidate_task().unwrap().state(),
+                    &TaskState::Failed("exact failure".into())
+                );
+                match &*pending {
+                    PendingSettlement::Failure { settlement, .. } => {
+                        assert_eq!(settlement.reason, "exact failure");
+                        assert_eq!(settlement.running.task.attempt_id(), attempt);
+                        let candidate = settlement.candidate.as_ref().unwrap();
+                        assert_eq!(
+                            candidate.task.task.state(),
+                            &TaskState::Failed("exact failure".into())
+                        );
+                        assert_eq!(candidate.task.task.retired_attempt_id(), attempt);
+                    }
+                    _ => panic!("owned failure required"),
+                }
+                let stored = scheduler
+                    .ts()
+                    .load(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .task;
+                let expected = if injection == 1 {
+                    TaskState::Running
+                } else {
+                    TaskState::Failed("exact failure".into())
+                };
+                assert_eq!(stored.state(), &expected);
+                let pending = match scheduler.try_resume_pending(*pending) {
+                    Err(SettlementError::RejectedPrepared {
+                        error: Error::Poisoned,
+                        pending,
+                    }) => pending,
+                    result => panic!("blind retry must be rejected: {result:?}"),
+                };
+                let other = match scheduler.try_settle_invocation(other) {
+                    Err(SettlementError::Rejected {
+                        error: Error::Poisoned,
+                        completed,
+                    }) => completed,
+                    result => panic!("independent outcome must remain owned: {result:?}"),
+                };
+                assert_eq!(other.task_id(), Uuid::from_u128(2));
+                drop(scheduler);
+                assert!(matches!(
+                    Scheduler::attach(owner.clone(), registry.clone()),
+                    Err(Error::AlreadyAttached)
+                ));
+                drop(pending);
+                assert!(matches!(
+                    Scheduler::attach(owner.clone(), registry.clone()),
+                    Err(Error::AlreadyAttached)
+                ));
+                drop(other);
+                assert!(Scheduler::attach(owner.clone(), registry).is_ok());
+            }
+        }
     }
 
     #[test]

@@ -1538,6 +1538,7 @@ enum StagedSignalStatus {
     Present,
 }
 
+#[derive(Clone)]
 struct StagedSignals {
     batch: OwnedBatch,
     keys: HashMap<(uuid::Uuid, String, String), StagedSignalStatus>,
@@ -1753,6 +1754,7 @@ pub struct TaskDocuments<'a> {
 /// This is not an executor lease: the scheduler must still fence the attempt,
 /// validate children and commit the parent transition with the prepared batch.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct DetachedTaskDocuments {
     owner: std::sync::Arc<durable_store::owner::OwnedStore>,
     reservation: crate::task_store::StoredTask,

@@ -55,6 +55,7 @@ struct Record {
     identity: Identity,
 }
 
+#[derive(Clone)]
 pub(crate) struct Prepared {
     pub(crate) child: Uuid,
     pub(crate) parent_version: u64,
