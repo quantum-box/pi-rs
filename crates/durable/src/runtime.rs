@@ -1789,6 +1789,14 @@ impl Conversation {
         }
         self.tool_attempt()
     }
+    pub(crate) fn has_submission_notification(&self, notify: &SubmissionNotify) -> bool {
+        self.submission_notifications
+            .values()
+            .any(|existing| existing == notify)
+    }
+    pub(crate) fn set_initial_notification(&mut self, id: Uuid, notify: SubmissionNotify) {
+        self.submission_notifications.insert(id, notify);
+    }
     pub(crate) fn admit_initial_input(&mut self, id: Uuid, content: String) {
         self.submissions.push(Submission {
             kind: SubmissionKind::Input,
@@ -3964,8 +3972,10 @@ impl Harness {
     }
     fn selected_extensions(&self, c: &Conversation) -> Result<crate::extension::Resolved, Error> {
         if c.extensions.iter().any(|name| {
-            name.starts_with(crate::subagent_management::EXTENSION_PREFIX)
-                && name != &crate::subagent_management::extension_name(c.id)
+            (name.starts_with(crate::subagent_management::EXTENSION_PREFIX)
+                && name != &crate::subagent_management::extension_name(c.id))
+                || (name.starts_with(crate::foreground_subagent::PREFIX)
+                    && name != &crate::foreground_subagent::extension_name(c.id))
         }) {
             return Err(Error::Invalid(
                 "subagent management extension belongs to another conversation".into(),
@@ -5643,6 +5653,35 @@ impl Harness {
             key: key.clone(),
             expected: expected.clone(),
         }];
+        // A task-owned foreground admission can reserve its settlement key.
+        // Every later notification admission fences that reservation, including
+        // ordinary submissions and application writes.
+        if !state.submission_notifications.is_empty() {
+            let previous: Option<Conversation> = self
+                .owner
+                .store()
+                .get(&key)?
+                .map(|entry| serde_json::from_slice(&entry.value))
+                .transpose()?;
+            for (id, notify) in &state.submission_notifications {
+                if previous
+                    .as_ref()
+                    .is_some_and(|old| old.submission_notifications.get(id) == Some(notify))
+                {
+                    continue;
+                }
+                let binding = crate::owned_subagent::notification_binding_key(notify);
+                if self.owner.store().get(&binding)?.is_some() {
+                    return Err(Error::Invalid(
+                        "submission notification key is reserved".into(),
+                    ));
+                }
+                checks.push(Check {
+                    key: binding,
+                    expected: Expected::Missing,
+                });
+            }
+        }
         let transcript_mutations = if let Some(batch) = prepared {
             checks.extend(batch.checks);
             batch.mutations
@@ -6048,7 +6087,7 @@ impl Harness {
                 if let Some(reason) = reason {
                     record["reason"] = serde_json::json!(reason);
                 }
-                settling.push((notify.clone(), record));
+                settling.push((notify.clone(), record, (candidate.id, submission.id)));
             }
             for write in &candidate.application_writes {
                 let Some(notify) = candidate.submission_notifications.get(&write.id) else {
@@ -6075,7 +6114,7 @@ impl Harness {
                 } else {
                     record["entry"] = serde_json::json!(write.id);
                 }
-                settling.push((notify.clone(), record));
+                settling.push((notify.clone(), record, (candidate.id, write.id)));
             }
         }
         // Retry only observations added by notification assembly. The
@@ -6094,7 +6133,7 @@ impl Harness {
                 let mut host = crate::document::HostTransaction::new(store);
                 host.append_runtime_candidate(assembled)?;
                 let token = submission_settled_signal();
-                for (index, (notify, value)) in settling.iter().enumerate() {
+                for (index, (notify, value, settlement)) in settling.iter().enumerate() {
                     let sample = (self.clock)();
                     let (anchor, started) =
                         notification_clocks[index].get_or_insert_with(|| (sample, Instant::now()));
@@ -6105,8 +6144,14 @@ impl Harness {
                         *anchor = sample;
                         *started = Instant::now();
                     }
-                    if host.signal_at(notify.task_id, &token, &notify.key, value.clone(), now)?
-                        == crate::task_store::SignalResult::Invalid
+                    if host.signal_submission_at(
+                        notify.task_id,
+                        &token,
+                        &notify.key,
+                        value.clone(),
+                        now,
+                        *settlement,
+                    )? == crate::task_store::SignalResult::Invalid
                     {
                         return Err(Error::Invalid("invalid submission notification".into()));
                     }
@@ -6131,9 +6176,9 @@ impl Harness {
                 let retry = match (original_check, assembled_check) {
                     (None, Some(_)) => true,
                     (Some(original), Some(merged))
-                        if settling
-                            .iter()
-                            .any(|(notify, _)| crate::task_store::key(notify.task_id) == *key) =>
+                        if settling.iter().any(|(notify, _, _)| {
+                            crate::task_store::key(notify.task_id) == *key
+                        }) =>
                     {
                         notification_deadline_only_conflict(
                             store,
@@ -6287,9 +6332,10 @@ impl Harness {
         state.tool_attempt = None;
         state.id = child;
         state.context_generation = Some(Uuid::new_v4());
-        state
-            .extensions
-            .retain(|name| !name.starts_with(crate::subagent_management::EXTENSION_PREFIX));
+        state.extensions.retain(|name| {
+            !name.starts_with(crate::subagent_management::EXTENSION_PREFIX)
+                && !name.starts_with(crate::foreground_subagent::PREFIX)
+        });
         state.config = config;
         state.submissions.clear();
         state.submission_notifications.clear();
@@ -11234,6 +11280,17 @@ impl Harness {
             return Err(Error::Invalid("task-backed tool owner mismatch".into()));
         }
         Ok(match child.task.state() {
+            crate::task::TaskState::Succeeded(value)
+                if child.task.kind() == Some(crate::foreground_subagent::KIND)
+                    && value
+                        .get("foreground_error")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some() =>
+            {
+                Some(Outcome::Failed(
+                    value["foreground_error"].as_str().unwrap().into(),
+                ))
+            }
             crate::task::TaskState::Succeeded(value) => Some(Outcome::Succeeded(
                 value
                     .as_str()
@@ -13377,6 +13434,41 @@ impl Harness {
                         }
                         match prepared {
                             Ok(prepared) => {
+                                // This internal adapter has no external dispatch. Persist its
+                                // task and the pending phase together, so recovery never
+                                // replays a tool invocation.
+                                if let Some(adapter) = crate::task_tool::lookup(&reg.tool)
+                                    .filter(|adapter| adapter.is_direct())
+                                {
+                                    let task = adapter
+                                        .task(
+                                            c.id,
+                                            operation_id,
+                                            prepared.arguments().clone(),
+                                            self.options.restart_limit,
+                                        )
+                                        .map_err(Error::Invalid)?;
+                                    c.tool_attempt = Some(ToolAttempt {
+                                        operation_id,
+                                        attempt_id: Uuid::new_v4(),
+                                    });
+                                    c.phase = Phase::TaskPending {
+                                        turns,
+                                        calls,
+                                        index,
+                                        operation_id,
+                                        arguments: prepared.arguments().clone(),
+                                        task: task.id(),
+                                        identity: adapter.identity(),
+                                    };
+                                    self.save_hook_children(
+                                        &c,
+                                        Expected::Version(version),
+                                        &[task],
+                                        &[adapter.handler()],
+                                    )?;
+                                    continue;
+                                }
                                 c.tool_attempt = Some(ToolAttempt {
                                     operation_id,
                                     attempt_id: Uuid::new_v4(),
@@ -13781,6 +13873,41 @@ impl Harness {
                             valid_schema,
                         ) {
                             Ok(prepared) => {
+                                // This internal adapter has no external dispatch. Persist its
+                                // task and the pending phase together, so recovery never
+                                // replays a tool invocation.
+                                if let Some(adapter) = crate::task_tool::lookup(&reg.tool)
+                                    .filter(|adapter| adapter.is_direct())
+                                {
+                                    let task = adapter
+                                        .task(
+                                            c.id,
+                                            operation_id,
+                                            prepared.arguments().clone(),
+                                            self.options.restart_limit,
+                                        )
+                                        .map_err(Error::Invalid)?;
+                                    c.tool_attempt = Some(ToolAttempt {
+                                        operation_id,
+                                        attempt_id: Uuid::new_v4(),
+                                    });
+                                    c.phase = Phase::TaskPending {
+                                        turns,
+                                        calls,
+                                        index,
+                                        operation_id,
+                                        arguments: prepared.arguments().clone(),
+                                        task: task.id(),
+                                        identity: adapter.identity(),
+                                    };
+                                    self.save_hook_children(
+                                        &c,
+                                        Expected::Version(version),
+                                        &[task],
+                                        &[adapter.handler()],
+                                    )?;
+                                    continue;
+                                }
                                 c.tool_attempt = Some(ToolAttempt {
                                     operation_id,
                                     attempt_id: Uuid::new_v4(),
@@ -15543,6 +15670,7 @@ pub struct Scheduler {
     cancel: CancellationToken,
     reporter_cancel: CancellationToken,
     reporter: Option<tokio::task::JoinHandle<()>>,
+    foreground_worker: Option<tokio::task::JoinHandle<()>>,
     reporter_error: Arc<std::sync::Mutex<Option<String>>>,
     worker_errors: Arc<std::sync::Mutex<HashMap<Uuid, String>>>,
     summary_tasks: HashMap<Uuid, SummaryTask>,
@@ -16003,6 +16131,7 @@ impl Scheduler {
             adapter,
             None,
             Some(provider),
+            None,
         )
         .map(|(scheduler, _)| scheduler)
     }
@@ -16026,6 +16155,7 @@ impl Scheduler {
             adapter,
             Some(tasks),
             Some(provider),
+            None,
         )?;
         Ok((
             scheduler,
@@ -16037,6 +16167,32 @@ impl Scheduler {
     /// persisted provider binding was absent or different.
     pub fn blocked_summary_recovery(&self) -> &[Uuid] {
         &self.summary_blocked
+    }
+    /// Install a parent-bound foreground subagent and its task driver before recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_foreground_subagent(
+        path: impl AsRef<Path>,
+        options: Options,
+        registry: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        parent: Uuid,
+        child_config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<(Self, crate::task_driver::Driver), Error> {
+        let (scheduler, driver) = Self::open_configured_with_tasks(
+            path,
+            options,
+            registry,
+            None,
+            None,
+            Some(tasks),
+            None,
+            Some((parent, child_config, allowed_tools)),
+        )?;
+        Ok((
+            scheduler,
+            driver.ok_or_else(|| Error::Invalid("task driver missing".into()))?,
+        ))
     }
     /// Open with parent-bound management; new children exclude the `subagent` tool.
     /// Other registered tool names are captured as an allowlist at open time.
@@ -16100,17 +16256,21 @@ impl Scheduler {
         management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
     ) -> Result<Self, Error> {
-        Self::open_configured_with_tasks(path, options, registry, management, adapter, None, None)
-            .map(|(scheduler, _)| scheduler)
+        Self::open_configured_with_tasks(
+            path, options, registry, management, adapter, None, None, None,
+        )
+        .map(|(scheduler, _)| scheduler)
     }
+    #[allow(clippy::too_many_arguments)]
     fn open_configured_with_tasks(
         path: impl AsRef<Path>,
         options: Options,
         registry: crate::extension::Registry,
         management: Option<(Uuid, Config, Option<Vec<String>>)>,
         adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
-        tasks: Option<crate::task_scheduler::Registry>,
+        mut tasks: Option<crate::task_scheduler::Registry>,
         summary_provider: Option<SummaryProviderIdentity>,
+        foreground: Option<(Uuid, Config, Option<Vec<String>>)>,
     ) -> Result<(Self, Option<crate::task_driver::Driver>), Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
@@ -16138,6 +16298,42 @@ impl Scheduler {
                 allowed_tools,
             ))?;
         }
+        let foreground_receiver = if let Some((parent, config, allowed_tools)) = foreground {
+            validate_allowed_tools(&allowed_tools)?;
+            harness.conversation(parent)?;
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut worker = harness.worker();
+            worker.extensions =
+                Arc::new(std::sync::RwLock::new(crate::extension::Registry::default()));
+            let (extension, handler) = crate::foreground_subagent::extension(
+                worker,
+                parent,
+                config,
+                allowed_tools,
+                sender,
+            );
+            if !tasks
+                .as_mut()
+                .ok_or_else(|| Error::Invalid("foreground extension requires task driver".into()))?
+                .register_shared(crate::foreground_subagent::KIND, true, handler)
+            {
+                return Err(Error::Invalid(
+                    "foreground task kind already registered".into(),
+                ));
+            }
+            tasks.as_mut().expect("task registry checked").set_abort(
+                crate::foreground_subagent::KIND,
+                |_: &crate::task::Task| {
+                    Ok(crate::task_scheduler::Step::Succeed(
+                        serde_json::Value::Null,
+                    ))
+                },
+            );
+            harness.install_extension(extension)?;
+            Some(receiver)
+        } else {
+            None
+        };
         let ids = harness.conversations()?;
         let (summaries, summary_blocked) = if let Some(identity) = &summary_provider {
             crate::summary_store::SummaryStore::new(harness.owner.store())
@@ -16156,12 +16352,16 @@ impl Scheduler {
             summary_blocked,
             reporter_cancel: CancellationToken::new(),
             reporter: None,
+            foreground_worker: None,
             reporter_error: Arc::new(std::sync::Mutex::new(None)),
         };
         // Attach and publish the task driver before any recovered worker is spawned.
         let driver = tasks
             .map(|registry| scheduler.start_tasks(registry))
             .transpose()?;
+        if let Some(receiver) = foreground_receiver {
+            scheduler.start_foreground_worker(receiver);
+        }
         for id in ids {
             scheduler.schedule(id);
         }
@@ -17568,6 +17768,46 @@ impl Scheduler {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+    fn start_foreground_worker(
+        &mut self,
+        mut receiver: tokio::sync::mpsc::UnboundedReceiver<Uuid>,
+    ) {
+        let source = self.harness.worker();
+        let cancel = self.reporter_cancel.clone();
+        let errors = self.worker_errors.clone();
+        self.foreground_worker = Some(tokio::spawn(async move {
+            let mut workers = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    Some(id) = receiver.recv() => {
+                        let mut worker = source.worker();
+                        let control = worker.owner.conversation_controls().get(id);
+                        worker.execution_gate = Some(control.gate.clone());
+                        let errors = errors.clone();
+                        let activity = worker.activity.enter_at(crate::worker_activity::WorkerKind::Conversation, id, crate::worker_activity::WorkerPhase::Queued);
+                        workers.spawn(async move {
+                            let mut guard = Some(tokio::select! {
+                                biased;
+                                _ = control.cancel.cancelled() => return,
+                                guard = control.worker.lock() => guard,
+                            });
+                            let result = std::panic::AssertUnwindSafe(drive_scheduled(
+                                &mut worker, id, &control.cancel, &control.worker, &mut guard, Some(&errors), activity,
+                            )).catch_unwind().await;
+                            if let Err(message) = result.map_err(|_| "worker panicked".to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+                                errors.lock().unwrap_or_else(|e| e.into_inner()).insert(id, message);
+                            }
+                        });
+                    }
+                    Some(_) = workers.join_next(), if !workers.is_empty() => {},
+                    else => break,
+                }
+            }
+            while workers.join_next().await.is_some() {}
+        }));
+    }
     fn start_reporter(&mut self) {
         let source = self.harness.worker();
         let cancel = self.reporter_cancel.clone();
@@ -17720,6 +17960,11 @@ impl Scheduler {
                 Err(e) => {
                     error.get_or_insert(Error::Invalid(format!("summary task: {e}")));
                 }
+            }
+        }
+        if let Some(worker) = self.foreground_worker.take() {
+            if let Err(e) = worker.await {
+                error.get_or_insert(Error::Invalid(format!("foreground scheduler task: {e}")));
             }
         }
         if let Some(reporter) = self.reporter.take()
@@ -17947,6 +18192,32 @@ impl RuntimeOwner {
         Self::open_configured(path, options, extensions, tasks, None, Some(adapter))
     }
 
+    /// Install a parent-bound foreground subagent and its task driver before recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_foreground_subagent(
+        path: impl AsRef<Path>,
+        options: Options,
+        extensions: crate::extension::Registry,
+        tasks: crate::task_scheduler::Registry,
+        parent: Uuid,
+        child_config: Config,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self, Error> {
+        let (scheduler, driver) = Scheduler::open_with_foreground_subagent(
+            path,
+            options,
+            extensions,
+            tasks,
+            parent,
+            child_config,
+            allowed_tools,
+        )?;
+        Ok(Self {
+            scheduler,
+            driver,
+            wake_subscriptions: WakeSubscriptions::default(),
+        })
+    }
     /// Install parent-bound management with the default child tool allowlist.
     pub fn open_with_subagent_management(
         path: impl AsRef<Path>,
@@ -18026,6 +18297,7 @@ impl RuntimeOwner {
             management,
             adapter,
             Some(tasks),
+            None,
             None,
         )?;
         Ok(Self {

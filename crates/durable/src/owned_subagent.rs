@@ -1,7 +1,7 @@
 //! Opt-in task-owned subagent admission. Harness abort traversal follows foreground edges.
 use crate::{
     ownership_edge::{self, Edge, Mode},
-    runtime::{Config, Conversation, Error, Harness, Scheduler},
+    runtime::{Config, Conversation, Error, Harness, Scheduler, SubmissionNotify},
     task::{Task, TaskOwner, TaskState},
     task_store,
 };
@@ -30,6 +30,9 @@ pub struct Admission {
 pub struct InitialSubmission {
     pub id: Uuid,
     pub content: String,
+    /// Settlement destination, permanently bound to this admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<SubmissionNotify>,
 }
 
 fn reservation_key(task: Uuid, name: &str) -> Vec<u8> {
@@ -37,6 +40,16 @@ fn reservation_key(task: Uuid, name: &str) -> Vec<u8> {
     key.extend_from_slice(name.as_bytes());
     key
 }
+/// Reserved destinations are permanent, including after settlement and reopen.
+pub(crate) fn notification_binding_key(notify: &SubmissionNotify) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut key = format!("durable/owned-subagent-notify/{}/", notify.task_id);
+    for byte in notify.key.as_bytes() {
+        write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    key.into_bytes()
+}
+
 fn child_key(id: Uuid) -> Vec<u8> {
     format!("runtime/conversation/{id}").into_bytes()
 }
@@ -60,7 +73,7 @@ impl Harness {
         config: Config,
         mode: Mode,
     ) -> Result<Admission, Error> {
-        self.admit_task_owned_subagent(task, owner, name, config, mode, None, None)
+        self.admit_task_owned_subagent(task, owner, name, config, mode, None, None, None)
     }
 
     /// Atomically reserve a child and admit its first input. The key permanently
@@ -78,7 +91,7 @@ impl Harness {
         if content.trim().is_empty() {
             return Err(invalid());
         }
-        self.admit_task_owned_subagent(task, owner, name, config, mode, Some(content), None)
+        self.admit_task_owned_subagent(task, owner, name, config, mode, Some(content), None, None)
     }
 
     /// Atomically create an owned child with its initial tool selection.
@@ -91,7 +104,7 @@ impl Harness {
         mode: Mode,
         allowed_tools: Option<Vec<String>>,
     ) -> Result<Admission, Error> {
-        self.admit_task_owned_subagent(task, owner, name, config, mode, None, allowed_tools)
+        self.admit_task_owned_subagent(task, owner, name, config, mode, None, allowed_tools, None)
     }
     /// Atomically create a restricted child and queue its first input.
     #[allow(clippy::too_many_arguments)]
@@ -116,6 +129,37 @@ impl Harness {
             mode,
             Some(content),
             allowed_tools,
+            None,
+        )
+    }
+
+    /// Atomically submit a foreground child and notify its owning task when it settles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_task_owned_subagent_notified(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        content: String,
+        allowed_tools: Option<Vec<String>>,
+        signal_key: String,
+    ) -> Result<Admission, Error> {
+        if content.trim().is_empty() || signal_key.is_empty() {
+            return Err(invalid());
+        }
+        self.admit_task_owned_subagent(
+            task,
+            owner,
+            name,
+            config,
+            Mode::Foreground,
+            Some(content),
+            allowed_tools,
+            Some(SubmissionNotify {
+                task_id: task,
+                key: signal_key,
+            }),
         )
     }
 
@@ -129,6 +173,7 @@ impl Harness {
         mode: Mode,
         content: Option<String>,
         allowed_tools: Option<Vec<String>>,
+        notify: Option<SubmissionNotify>,
     ) -> Result<Admission, Error> {
         crate::runtime::validate_allowed_tools(&allowed_tools)?;
         if name.is_empty() || config.model.is_empty() || config.max_output_tokens == 0 {
@@ -149,9 +194,23 @@ impl Harness {
                     || a.mode != mode
                     || a.allowed_tools != allowed_tools
                     || a.submission.as_ref().map(|s| &s.content) != content.as_ref()
+                    || a.submission.as_ref().and_then(|s| s.notify.as_ref()) != notify.as_ref()
                     || a.task_owner == TaskOwner::Conversation(a.child)
                 {
                     return Err(invalid());
+                }
+                if let Some(notify) = &notify {
+                    let binding = store
+                        .get(&notification_binding_key(notify))?
+                        .ok_or_else(invalid)?;
+                    let bound: (Uuid, Uuid) = serde_json::from_slice(&binding.value)?;
+                    if Some(bound)
+                        != a.submission
+                            .as_ref()
+                            .map(|submission| (a.child, submission.id))
+                    {
+                        return Err(invalid());
+                    }
                 }
                 let edge = store
                     .get(&ownership_edge::edge_key(a.child))?
@@ -185,6 +244,41 @@ impl Harness {
             {
                 return Err(invalid());
             }
+            // Fence legacy conversation notifications and signal receipts as well
+            // as the new binding. Other admission paths check the binding in their
+            // conversation save, so neither order of a concurrent race can win twice.
+            let boundary = if let Some(notify) = &notify {
+                let boundary = store.put_version()?;
+                if store.get(&notification_binding_key(notify))?.is_some() {
+                    return Err(invalid());
+                }
+                let revision_key = task_store::signal_revision_key(task);
+                let revision = store.get(&revision_key)?;
+                if task_store::TaskStore::new(store)
+                    .read_typed_signal_state(
+                        task,
+                        &crate::runtime::submission_settled_signal(),
+                        &notify.key,
+                    )
+                    .map_err(|_| invalid())?
+                    .is_some()
+                {
+                    return Err(invalid());
+                }
+                for (_, entry) in store.list(b"runtime/conversation/")? {
+                    let conversation: Conversation = serde_json::from_slice(&entry.value)?;
+                    if conversation.has_submission_notification(notify) {
+                        return Err(invalid());
+                    }
+                }
+                Some((
+                    boundary,
+                    revision_key,
+                    revision.map_or(Expected::Missing, |e| Expected::Version(e.version)),
+                ))
+            } else {
+                None
+            };
             let child = Uuid::new_v4();
             if owner == TaskOwner::Conversation(child) {
                 continue;
@@ -200,6 +294,7 @@ impl Harness {
                 submission: content.as_ref().map(|content| InitialSubmission {
                     id: Uuid::new_v4(),
                     content: content.clone(),
+                    notify: notify.clone(),
                 }),
             };
             let edge = Edge {
@@ -213,6 +308,9 @@ impl Harness {
             child_state.allowed_tools = allowed_tools.clone();
             if let Some(initial) = &a.submission {
                 child_state.admit_initial_input(initial.id, initial.content.clone());
+                if let Some(notify) = &initial.notify {
+                    child_state.set_initial_notification(initial.id, notify.clone());
+                }
             }
             let mut prepared = self.prepare_save(&child_state, Expected::Missing)?;
             let mut checks =
@@ -235,7 +333,7 @@ impl Harness {
                     expected: Expected::Missing,
                 },
             ]);
-            let mutations = [
+            let mut mutations = vec![
                 Mutation::Put {
                     key: tk,
                     value: snapshot.value,
@@ -249,9 +347,30 @@ impl Harness {
                     value: serde_json::to_vec(&edge)?,
                 },
             ];
+            if let Some((_, revision_key, expected)) = &boundary {
+                checks.push(Check {
+                    key: revision_key.clone(),
+                    expected: expected.clone(),
+                });
+                let initial = a.submission.as_ref().ok_or_else(invalid)?;
+                mutations.push(Mutation::Put {
+                    key: notification_binding_key(notify.as_ref().ok_or_else(invalid)?),
+                    value: serde_json::to_vec(&(child, initial.id))?,
+                });
+            }
             prepared.checks.extend(checks);
             prepared.mutations.extend(mutations);
-            match store.commit(&prepared.checks, &prepared.mutations) {
+            let result = if let Some((boundary, _, _)) = boundary {
+                store.commit_with_prefix_put_fence(
+                    &prepared.checks,
+                    &prepared.mutations,
+                    &[b"runtime/conversation/"],
+                    boundary,
+                )
+            } else {
+                store.commit(&prepared.checks, &prepared.mutations)
+            };
+            match result {
                 Ok(()) => return Ok(a),
                 Err(durable_store::Error::Conflict { .. }) => continue,
                 Err(e) => {
@@ -277,6 +396,33 @@ impl Scheduler {
         let admission = self
             .subagent_harness()
             .submit_task_owned_subagent(task, owner, name, config, mode, content)?;
+        self.schedule(admission.child);
+        Ok(admission)
+    }
+
+    /// Submit a foreground child and schedule it after the notification is committed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_task_owned_subagent_notified(
+        &mut self,
+        task: Uuid,
+        owner: TaskOwner,
+        name: &str,
+        config: Config,
+        content: String,
+        allowed_tools: Option<Vec<String>>,
+        signal_key: String,
+    ) -> Result<Admission, Error> {
+        let admission = self
+            .subagent_harness()
+            .submit_task_owned_subagent_notified(
+                task,
+                owner,
+                name,
+                config,
+                content,
+                allowed_tools,
+                signal_key,
+            )?;
         self.schedule(admission.child);
         Ok(admission)
     }
@@ -2135,6 +2281,363 @@ mod tests {
             .unwrap(),
             *a
         );
+    }
+
+    #[test]
+    fn notification_destination_is_exclusive_across_races_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let mut worker = h.worker();
+                let owner = owner.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    worker.submit_task_owned_subagent_notified(
+                        task,
+                        owner,
+                        name,
+                        config(),
+                        "work".into(),
+                        None,
+                        "same".into(),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        let other = h.create_conversation(config()).unwrap();
+        let notify = SubmissionNotify {
+            task_id: task,
+            key: "same".into(),
+        };
+        assert!(
+            h.submit_with_notification(
+                other,
+                None,
+                "other".into(),
+                crate::runtime::AdmissionOptions::default(),
+                notify.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            h.submit_write_with_notification(other, None, "note".into(), None, notify)
+                .is_err()
+        );
+        let forged = task_store::Signal::new_typed(
+            Uuid::new_v4(),
+            task,
+            &crate::runtime::submission_settled_signal(),
+            "same",
+            serde_json::json!({"id": winner.submission.as_ref().unwrap().id, "conversationId": winner.child,
+                "type":"input", "status":"done", "answer":"wrong"}),
+        )
+        .unwrap();
+        assert!(
+            TaskStore::new(h.subagent_store().unwrap())
+                .send_signal(&forged)
+                .is_err()
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.submit_task_owned_subagent_notified(
+                task,
+                owner.clone(),
+                &winner.key,
+                config(),
+                "work".into(),
+                None,
+                "same".into()
+            )
+            .unwrap(),
+            winner
+        );
+        assert!(
+            h.submit_task_owned_subagent_notified(
+                task,
+                owner,
+                "third",
+                config(),
+                "work".into(),
+                None,
+                "same".into()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_reservation_races_ordinary_admission() {
+        for _ in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+            let (task, owner) = setup(&mut h);
+            let other = h.create_conversation(config()).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let mut worker = h.worker();
+            let gate = barrier.clone();
+            let ordinary = std::thread::spawn(move || {
+                gate.wait();
+                worker.submit_with_notification(
+                    other,
+                    None,
+                    "ordinary".into(),
+                    crate::runtime::AdmissionOptions::default(),
+                    SubmissionNotify {
+                        task_id: task,
+                        key: "race".into(),
+                    },
+                )
+            });
+            barrier.wait();
+            let foreground = h.submit_task_owned_subagent_notified(
+                task,
+                owner,
+                "child",
+                config(),
+                "work".into(),
+                None,
+                "race".into(),
+            );
+            let ordinary = ordinary.join().unwrap();
+            assert_ne!(foreground.is_ok(), ordinary.is_ok());
+        }
+    }
+
+    #[test]
+    fn notification_destination_rejects_legacy_admissions_and_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let other = h.create_conversation(config()).unwrap();
+        h.submit_with_notification(
+            other,
+            None,
+            "legacy".into(),
+            crate::runtime::AdmissionOptions::default(),
+            SubmissionNotify {
+                task_id: task,
+                key: "legacy".into(),
+            },
+        )
+        .unwrap();
+        let token = crate::runtime::submission_settled_signal();
+        let receipt = task_store::Signal::new_typed(
+            Uuid::new_v4(),
+            task,
+            &token,
+            "receipt",
+            serde_json::json!({"id": Uuid::new_v4(), "conversationId": other,
+                "type":"input", "status":"done", "answer":"old"}),
+        )
+        .unwrap();
+        TaskStore::new(h.subagent_store().unwrap())
+            .send_signal(&receipt)
+            .unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        for key in ["legacy", "receipt"] {
+            assert!(
+                h.submit_task_owned_subagent_notified(
+                    task,
+                    owner.clone(),
+                    key,
+                    config(),
+                    "work".into(),
+                    None,
+                    key.into()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notified_foreground_submission_recovers_and_delivers_to_owner() {
+        use futures_util::{StreamExt, stream};
+        use pi_rs_core::ModelEvent;
+
+        struct Answer;
+        #[async_trait]
+        impl Model for Answer {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text("child answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])
+                .boxed())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let admission = h
+            .submit_task_owned_subagent_notified(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                "work".into(),
+                None,
+                "answered".into(),
+            )
+            .unwrap();
+        assert!(
+            h.submit_task_owned_subagent_notified(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                "work".into(),
+                None,
+                "other".into(),
+            )
+            .is_err()
+        );
+        assert!(
+            h.submit_task_owned_subagent_notified(
+                task,
+                owner.clone(),
+                "invalid",
+                config(),
+                "work".into(),
+                None,
+                String::new(),
+            )
+            .is_err()
+        );
+        let store = TaskStore::new(h.subagent_store().unwrap());
+        let forged = serde_json::json!({
+            "id": admission.submission.as_ref().unwrap().id, "conversationId": admission.child,
+            "type": "input", "status": "done", "answer": "forged"
+        });
+        let forged_status = serde_json::json!({
+            "id": admission.submission.as_ref().unwrap().id, "conversationId": admission.child,
+            "type": "input", "status": "unanswered", "reason": "forged"
+        });
+        let forged_receipt = task_store::Signal::new_typed(
+            Uuid::new_v4(),
+            task,
+            &crate::runtime::submission_settled_signal(),
+            "answered",
+            forged_status,
+        )
+        .unwrap();
+        assert!(store.send_signal(&forged_receipt).is_err());
+        assert!(
+            store
+                .deliver_signal(
+                    task,
+                    &crate::runtime::submission_settled_signal(),
+                    "answered",
+                    forged.clone()
+                )
+                .is_err()
+        );
+        let mut waiting = store.load(task).unwrap().unwrap();
+        waiting.task.start().unwrap();
+        waiting
+            .task
+            .wait(crate::task::WaitFor::TypedSignal(
+                crate::runtime::submission_settled_signal()
+                    .key("answered")
+                    .unwrap(),
+            ))
+            .unwrap();
+        store.save(&[Save::Update(&waiting)]).unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert_eq!(
+            h.submit_task_owned_subagent_notified(
+                task,
+                owner,
+                "child",
+                config(),
+                "work".into(),
+                None,
+                "answered".into(),
+            )
+            .unwrap(),
+            admission
+        );
+        let store = TaskStore::new(h.subagent_store().unwrap());
+        assert!(
+            store
+                .deliver_signal_at(
+                    task,
+                    &crate::runtime::submission_settled_signal(),
+                    "answered",
+                    forged.clone(),
+                    0
+                )
+                .is_err()
+        );
+        drop(h);
+        let mut opts = options();
+        opts.model = Arc::new(Answer);
+        let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        let attacker = scheduler.subagent_harness().worker();
+        let forger = std::thread::spawn(move || {
+            for _ in 0..64 {
+                assert!(
+                    TaskStore::new(attacker.subagent_store().unwrap())
+                        .deliver_signal(
+                            task,
+                            &crate::runtime::submission_settled_signal(),
+                            "answered",
+                            forged.clone(),
+                        )
+                        .is_err()
+                );
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scheduler.wait(admission.child),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        forger.join().unwrap();
+        scheduler.shutdown().await.unwrap();
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let signal = TaskStore::new(h.subagent_store().unwrap())
+            .read_typed_signal(
+                task,
+                &crate::runtime::submission_settled_signal(),
+                "answered",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            signal["id"],
+            serde_json::json!(admission.submission.unwrap().id)
+        );
+        assert_eq!(signal["status"], "done");
+        assert_eq!(signal["answer"], "child answer");
+        let store = TaskStore::new(h.subagent_store().unwrap());
+        let waiting = store.load(task).unwrap().unwrap();
+        assert!(matches!(
+            store.poll_wait(&waiting, 0).unwrap(),
+            crate::task_store::WakeResult::Woken { .. }
+        ));
     }
 
     #[test]
