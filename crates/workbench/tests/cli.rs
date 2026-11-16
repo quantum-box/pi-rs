@@ -1231,6 +1231,72 @@ fn malformed_settings_warn_without_blocking_offline_model_listing() {
 }
 
 #[test]
+fn malformed_settings_keep_other_scope_in_package_listing() {
+    for (bad_global, trusted) in [(true, true), (false, true), (false, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        let user = home.join("settings.json");
+        let local = project.join(".pi/settings.json");
+        std::fs::write(
+            &user,
+            if bad_global {
+                "{"
+            } else {
+                r#"{"packages":["git:https://example.com/user.git"]}"#
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            &local,
+            if bad_global {
+                r#"{"packages":["git:https://example.com/project.git"]}"#
+            } else {
+                "{"
+            },
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args([
+                if trusted { "--trust" } else { "--no-trust" },
+                "--offline",
+                "--no-mcp",
+                "list",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(if bad_global {
+                "project.git"
+            } else {
+                "user.git"
+            }),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("Invalid settings file"),
+            bad_global || trusted,
+            "{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(if bad_global { &user } else { &local }).unwrap(),
+            "{"
+        );
+    }
+}
+
+#[test]
 fn malformed_settings_keep_other_scope_package_resources_in_rpc() {
     for bad_global in [false, true] {
         let root = tempfile::tempdir().unwrap();

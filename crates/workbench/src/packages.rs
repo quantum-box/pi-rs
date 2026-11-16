@@ -1183,7 +1183,10 @@ fn configured_packages(args: &Cli) -> Result<Vec<(Declaration, bool)>> {
     }
     let mut result = Vec::new();
     for (file, base, scope_order) in files {
-        let document = config::read_object(&file)?;
+        let document = match args.settings.stored_layer(&base) {
+            Some(snapshot) => snapshot.clone(),
+            None => config::read_object(&file)?,
+        };
         if let Some(packages) = document.get("packages") {
             for value in packages
                 .as_array()
@@ -2530,6 +2533,13 @@ mod tests {
                 entries[0].source.contains("old.git"),
                 "{}",
                 entries[0].source
+            );
+            let listing = configured_packages(&args).unwrap();
+            assert_eq!(listing.len(), 1);
+            assert!(
+                listing[0].0.source.contains("old.git"),
+                "{}",
+                listing[0].0.source
             );
             let layered = resource_declarations(&args, false).unwrap();
             assert_eq!(layered.len(), 1);
