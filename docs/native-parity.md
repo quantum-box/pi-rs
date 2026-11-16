@@ -572,9 +572,10 @@ such as `1e400` are rejected by the native parser.
 Malformed JSON produces a `parse` response with a
 parser diagnostic. Unescaped string control characters reached by the parser
 use Pi's V8 wording and UTF-16 positions, including controls after a lone
-surrogate in the same string. If serde stops on an earlier surrogate in a
-different string, its diagnostic can still differ from Pi. Other diagnostics
-that are not explicitly mapped retain the Rust JSON parser's wording.
+surrogate in the same string. For records up to 1 MiB, a diagnostic-only retry
+also recognizes controls after a surrogate in another string when it is the
+next parser error. Larger records, retry depth or number-range failures, and
+other unmapped errors retain the Rust JSON parser's wording.
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
 requests are bounded and retain their individual response IDs.
@@ -5038,8 +5039,9 @@ initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, and missing values. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
-Escapes following lone surrogate
-escapes and other malformed JSON retain the native parser's diagnostics; full
+For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
+control after a surrogate in another string if no other parse error occurs first.
+Other malformed JSON retains the native parser's diagnostics; full
 malformed-input parity remains open.
 
 ### Shell execution transcript checkpoint

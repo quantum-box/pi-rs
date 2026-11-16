@@ -958,6 +958,101 @@ mod jsonl_framing_tests {
     }
 
     #[test]
+    fn controls_after_surrogates_in_other_strings_match_v8() {
+        for (input, expected) in [
+            ("[\"\\ud800\",\"a\t\"]", "position 12 (line 1 column 13)"),
+            (
+                "{\"あ\":\"\\udc00\",\"x\":\"😺\r\"}",
+                "position 21 (line 1 column 22)",
+            ),
+            (
+                "[\"\\ud800\",\"\\ud83d\\ude00\",\"\t\"]",
+                "position 26 (line 1 column 27)",
+            ),
+            (
+                "[\"\\ud800\",\"\\\\ud800\t\"]",
+                "position 18 (line 1 column 19)",
+            ),
+            (
+                "[\"\\\\ud800\",\"\\udc00\",\"x\\\"y\t\"]",
+                "position 25 (line 1 column 26)",
+            ),
+            (
+                "{\r\n\"😀\":\"\\ud800\",\r\n\"other\":\"x\u{1}\"}",
+                "position 29 (line 3 column 11)",
+            ),
+            (
+                "[\"\\ud800\",\"\\udbff\\udfff\",\"\\udc00\",\"\t\"]",
+                "position 35 (line 1 column 36)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Bad control character"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        // A successful sanitized parse is diagnostic-only; the actual RPC
+        // request still rejects a lone surrogate and does not change values.
+        let input = r#"{"type":"\ud800"}"#;
+        let original = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(
+            super::rpc_json_error(input, &original),
+            original.to_string()
+        );
+        assert!(parse_request(input).is_err());
+        let valid = parse_request(r#"{"type":"\ud83d\ude00"}"#).unwrap();
+        assert_eq!(valid["type"], "😀");
+    }
+
+    #[test]
+    fn surrogate_retry_respects_first_error_and_resource_boundaries() {
+        for input in [
+            "[\"\\ud800\" false,\"\t\"]",
+            "[\"\\ud800\",\"\\q\",\"\t\"]",
+            "[\"\\ud800\",\"\\u12xz\",\"\t\"]",
+            "[\"\\ud800\",1e400,\"\t\"]",
+            "[\"\\ud800\",]",
+        ] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::rpc_json_error(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+        let deep = format!(
+            "[\"\\ud800\",{}0{},\"\t\"]",
+            "[".repeat(130),
+            "]".repeat(130)
+        );
+        let error = serde_json::from_str::<serde_json::Value>(&deep).unwrap_err();
+        assert_eq!(super::rpc_json_error(&deep, &error), error.to_string());
+        let prefix = "[\"\\ud800\",\"";
+        let suffix = "\t\"]";
+        for (size, mapped) in [
+            (super::SURROGATE_DIAGNOSTIC_LIMIT, true),
+            (super::SURROGATE_DIAGNOSTIC_LIMIT + 1, false),
+        ] {
+            let input = format!(
+                "{prefix}{}{suffix}",
+                "a".repeat(size - prefix.len() - suffix.len())
+            );
+            let error = serde_json::from_str::<serde_json::Value>(&input).unwrap_err();
+            let actual = super::rpc_json_error(&input, &error);
+            assert_eq!(
+                actual.contains("Bad control character"),
+                mapped,
+                "size={size}: {actual}"
+            );
+            if !mapped {
+                assert_eq!(actual, error.to_string());
+            }
+        }
+    }
+
+    #[test]
     fn surrogate_errors_do_not_hide_other_syntax_errors() {
         for input in [
             "\"\\uDC00\"",
@@ -965,7 +1060,6 @@ mod jsonl_framing_tests {
             "\"\\uDC00\\x",
             "\"\\uDC00\\u12",
             "[\"\\ud800\" false,\"\t\"]",
-            "[\"\\ud800\",\"\t\"]",
         ] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
@@ -1000,7 +1094,8 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
                 || message.starts_with("unexpected end of hex escape"))
                 && invalid_json_escape(line).is_none()
                 && serde_error_offset(line, error)
-                    .is_some_and(|position| position >= start && position <= offset + 1)))
+                    .is_some_and(|position| position >= start && position <= offset + 1))
+            || surrogate_retry_control(line, error, offset))
     {
         let prefix = &line[..offset];
         let position = prefix.encode_utf16().count();
@@ -1112,6 +1207,60 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+// This is only a diagnostic retry; it never changes the JSON parsed by the
+// caller. Cap both the copy and the second parse for untrusted RPC input.
+const SURROGATE_DIAGNOSTIC_LIMIT: usize = 1024 * 1024;
+
+fn surrogate_retry_control(line: &str, error: &serde_json::Error, offset: usize) -> bool {
+    let message = error.to_string();
+    if line.len() > SURROGATE_DIAGNOSTIC_LIMIT
+        || !(message.starts_with("lone leading surrogate in hex escape")
+            || message.starts_with("unexpected end of hex escape"))
+    {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let mut sanitized: Option<Vec<u8>> = None;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
+            }
+            b'\\' if in_string => {
+                if bytes.get(i + 1) == Some(&b'u')
+                    && let Some(hex) = bytes.get(i + 2..i + 6)
+                    && hex.iter().all(u8::is_ascii_hexdigit)
+                {
+                    let code = hex.iter().fold(0u16, |value, digit| {
+                        (value << 4) | u16::from((*digit as char).to_digit(16).unwrap() as u8)
+                    });
+                    if (0xD800..=0xDFFF).contains(&code) {
+                        let copy = sanitized.get_or_insert_with(|| bytes.to_vec());
+                        copy[i + 2..i + 6].copy_from_slice(b"FFFD");
+                    }
+                    i += 6;
+                } else {
+                    // Escaped backslashes and quotes must not start new escapes
+                    // or strings. Invalid escapes remain for serde to diagnose.
+                    i += 2;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(sanitized) = sanitized else {
+        return false;
+    };
+    let Err(retry) = serde_json::from_slice::<Value>(&sanitized) else {
+        return false;
+    };
+    retry.to_string().starts_with("control character")
+        && serde_error_offset(line, &retry) == Some(offset + 1)
 }
 
 fn serde_error_offset(line: &str, error: &serde_json::Error) -> Option<usize> {
