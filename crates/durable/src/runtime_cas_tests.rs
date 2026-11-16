@@ -5504,6 +5504,74 @@ fn failed_run_replacement_is_placed_at_failure_commit() {
     );
 }
 
+#[test]
+fn failed_submission_notification_and_replacement_start_commit_together() {
+    use crate::task::{Checkpoint, Task, TaskOwner, TaskState};
+    use crate::task_store::{Save, TaskStore};
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let destination = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    TaskStore::new(h.owner.store())
+        .save(&[Save::Create(&destination)])
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let first = h
+        .submit_with_notification(
+            id,
+            None,
+            "failed".into(),
+            AdmissionOptions::default(),
+            SubmissionNotify {
+                task_id: destination.id(),
+                key: "settled".into(),
+            },
+        )
+        .unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    assert_eq!(state.run_failure.unwrap().inputs, vec![first]);
+    let ts = TaskStore::new(h.owner.store());
+    assert_eq!(
+        ts.load(destination.id()).unwrap().unwrap().task.state(),
+        &TaskState::Ready
+    );
+    let signal = ts
+        .read_typed_signal(destination.id(), &submission_settled_signal(), "settled")
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal["id"], first.to_string());
+    assert_eq!(signal["status"], "unanswered");
+}
+
 #[tokio::test]
 async fn abort_after_failure_settlement_aborts_replacement_run() {
     let (_dir, mut h, id, replacement) = atomic_failure_replacement_fixture();
