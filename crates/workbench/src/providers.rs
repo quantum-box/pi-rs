@@ -1057,10 +1057,11 @@ impl Client {
                     .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
                 let mut client = client
                     .with_strict_tool_support(strict)
-                    .with_strict_tool_models(
-                        args.model_profiles
-                            .anthropic_strict_tool_models(&args.provider, &args.model),
-                    )
+                    .with_strict_tool_models(args.model_profiles.anthropic_strict_tool_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    ))
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),
@@ -1560,6 +1561,79 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn anthropic_rewrite_uses_explicit_endpoint_for_both_models() {
+        use clap::Parser;
+        let endpoint = "http://127.0.0.1:1234/v1/messages";
+        for deferred in [false, true] {
+            for (selected, rewritten, strict) in [("a", "b", false), ("b", "a", true)] {
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                    "api":"anthropic-messages", "baseUrl":"http://127.0.0.1:1235/v1/messages",
+                    "models":[
+                        {"id":"a", "baseUrl":"http://127.0.0.1:1236/v1/messages", "compat":{"supportsStrictTools":true}},
+                        {"id":"b", "baseUrl":"http://127.0.0.1:1237/v1/messages", "compat":{"supportsStrictTools":false}}
+                    ]
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("test").unwrap();
+                args.model = selected.into();
+                args.endpoint = endpoint.into();
+                args.endpoint_explicit = true;
+                args.initial_connection = Some((args.provider.clone(), endpoint.into()));
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Anthropic,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                }
+                .with_context_probes(false)
+                .with_model_options(&args, false)
+                .unwrap();
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let request = ModelRequest {
+                    model: rewritten.into(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 1,
+                };
+                let declaration = pi_rs::ToolDeclaration {
+                    spec,
+                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                        strict: pi_rs::StrictToolPolicy::Prefer,
+                    }),
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let prepared = client
+                    .prepare_tool_dispatch(&request, &[declaration], &context)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    matches!(
+                        prepared.effective_tools()[0].sampling,
+                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                    ),
+                    strict,
+                    "deferred={deferred}, {selected} -> {rewritten}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn anthropic_disabled_capability_preserves_workbench_context_fingerprint() {

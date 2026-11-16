@@ -1143,9 +1143,10 @@ impl Profiles {
         &self,
         provider: &Provider,
         selected: &str,
+        explicit_endpoint: Option<&str>,
     ) -> BTreeMap<String, bool> {
-        let endpoint = self
-            .model_endpoint(provider, selected)
+        let endpoint = explicit_endpoint
+            .or_else(|| self.model_endpoint(provider, selected))
             .unwrap_or_else(|| self.endpoint(provider));
         // A partial model override does not establish a routable model.
         let ids = self.model_ids(provider);
@@ -1153,8 +1154,8 @@ impl Profiles {
             .into_iter()
             .filter_map(|id| {
                 if self.model_adapter(provider, &id) != Adapter::Anthropic
-                    || self
-                        .model_endpoint(provider, &id)
+                    || explicit_endpoint
+                        .or_else(|| self.model_endpoint(provider, &id))
                         .unwrap_or_else(|| self.endpoint(provider))
                         != endpoint
                 {
@@ -1547,6 +1548,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn anthropic_explicit_endpoint_overrides_model_endpoints() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "models":[
+                {"id":"a", "baseUrl":"http://localhost:1/v1", "compat":{"supportsStrictTools":true}},
+                {"id":"b", "baseUrl":"http://localhost:2/v1", "compat":{"supportsStrictTools":false}},
+                {"id":"other-api", "api":"openai-completions", "compat":{"supportsStrictTools":true}}
+            ]
+        }}})).unwrap();
+        let provider = profiles.provider("proxy").unwrap();
+        for (selected, rewritten, expected) in [("a", "b", false), ("b", "a", true)] {
+            let normal = profiles.anthropic_strict_tool_models(&provider, selected, None);
+            assert!(!normal.contains_key(rewritten));
+            let explicit = profiles.anthropic_strict_tool_models(
+                &provider,
+                selected,
+                Some("http://localhost:3/v1"),
+            );
+            assert_eq!(explicit.get(rewritten), Some(&expected));
+            assert!(!explicit.contains_key("other-api"));
+        }
+    }
+
+    #[test]
     fn anthropic_selected_uncatalogued_model_keeps_provider_capability() {
         for configured in [None, Some(false), Some(true)] {
             let profiles = Profiles::parse(&json!({"providers":{"proxy":{
@@ -1555,7 +1580,7 @@ mod tests {
                 "modelOverrides":{"rewritten-unknown":{"name":"partial override"},"selected-overridden":{"compat":{"supportsStrictTools":false}}}
             }}})).unwrap();
             let provider = profiles.provider("proxy").unwrap();
-            let models = profiles.anthropic_strict_tool_models(&provider, "selected-unknown");
+            let models = profiles.anthropic_strict_tool_models(&provider, "selected-unknown", None);
             assert_eq!(
                 models.get("selected-unknown"),
                 Some(&configured.unwrap_or(false))
@@ -1563,7 +1588,8 @@ mod tests {
             assert_eq!(models.get("known"), Some(&true));
             assert!(!models.contains_key("rewritten-unknown"));
             assert!(!models.contains_key("selected-overridden"));
-            let selected = profiles.anthropic_strict_tool_models(&provider, "selected-overridden");
+            let selected =
+                profiles.anthropic_strict_tool_models(&provider, "selected-overridden", None);
             assert_eq!(selected.get("selected-overridden"), Some(&false));
         }
     }
