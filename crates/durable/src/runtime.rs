@@ -14310,6 +14310,17 @@ impl Harness {
                             metadata.structured_output = value.structured_output;
                             metadata.attachments = value.attachments;
                             metadata.diagnostics = value.diagnostics;
+                            // Values with ambiguous occurrence identity are all
+                            // treated as derived until the next redaction.
+                            explicit_diagnostics = metadata.diagnostics.clone();
+                            for diagnostic in &derived {
+                                if let Some(index) = explicit_diagnostics
+                                    .iter()
+                                    .rposition(|item| item == diagnostic)
+                                {
+                                    explicit_diagnostics.remove(index);
+                                }
+                            }
                             metadata.redacted = false;
                             metadata.metadata_truncated = false;
                             metadata.schema_validated = false;

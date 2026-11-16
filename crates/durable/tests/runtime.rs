@@ -4102,6 +4102,12 @@ async fn top_level_derived_diagnostics_are_fenced_without_losing_equal_explicit_
             result: &ToolResult,
             _: &Context<'_>,
         ) -> Result<Option<ToolResult>, String> {
+            if self.0 == "drop-and-redact" {
+                let mut result = result.clone();
+                result.diagnostics.remove(0);
+                result.output = "redacted".into();
+                return Ok(Some(result));
+            }
             if self.0 == "chain" {
                 let mut result = result.clone();
                 result.diagnostics.pop();
@@ -4135,6 +4141,7 @@ async fn top_level_derived_diagnostics_are_fenced_without_losing_equal_explicit_
         (true, Some("tool_skipped"), false, "rich"),
         (true, Some("tool_skipped"), false, "blocks"),
         (true, Some("tool_skipped"), false, "chain"),
+        (true, Some("tool_skipped"), false, "drop-and-redact"),
         (false, Some("tool_failed"), false, "rich"),
         (false, Some("custom"), false, "blocks"),
         (false, Some("tool_failed"), true, "none"),
@@ -4194,10 +4201,13 @@ async fn top_level_derived_diagnostics_are_fenced_without_losing_equal_explicit_
                     .iter()
                     .filter(|d| d.code.as_deref() == Some(code))
                     .count(),
-                1,
+                usize::from(!matches!(hook, "chain" | "drop-and-redact")),
                 "{code} {hook}"
             );
-            assert!(messages[0].contains("[error] public"));
+            assert_eq!(
+                messages[0].contains("[error] public"),
+                !matches!(hook, "chain" | "drop-and-redact")
+            );
         }
         if long {
             assert_eq!(messages[0].matches("Output truncated").count(), 1);
@@ -4343,4 +4353,144 @@ async fn top_level_diagnostic_provenance_survives_process_crash_before_hook() {
     assert_eq!(messages.len(), 1);
     assert!(messages[0].starts_with("redacted"));
     assert_eq!(messages[0].matches("[error] public").count(), 1);
+}
+
+#[tokio::test]
+async fn ambiguous_identical_diagnostic_removal_cannot_leak_through_hook_chain() {
+    use pi_rs_durable::extension::{
+        Context, Extension, Hook, ToolBlockResult, ToolCall as HookCall, ToolResult,
+    };
+    use pi_rs_durable::keyed_tool::{KeyedHost, KeyedTool, KeyedToolAdapter};
+    use pi_rs_durable::runtime::{DiagnosticSeverity, ToolDiagnostic};
+    struct Tool;
+    #[async_trait]
+    impl KeyedTool for Tool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            host.diagnostic(ToolDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                message: "private secret".into(),
+                code: Some("tool_failed".into()),
+            })
+            .unwrap();
+            host.diagnostic(ToolDiagnostic {
+                severity: DiagnosticSeverity::Warn,
+                message: "retained safe event".into(),
+                code: Some("safe".into()),
+            })
+            .unwrap();
+            Outcome::Failed("private secret".into()).into()
+        }
+    }
+    struct Chain {
+        first: bool,
+        block: bool,
+    }
+    #[async_trait]
+    impl Hook for Chain {
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            if self.block {
+                return Ok(None);
+            }
+            let mut result = result.clone();
+            if self.first {
+                result.diagnostics.remove(0);
+            } else {
+                result.output = "redacted".into();
+            }
+            Ok(Some(result))
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            self.block
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            result: &ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            let mut result = result.clone();
+            if self.first {
+                result.diagnostics.remove(0);
+            } else {
+                result.output = vec![json!({"type":"text","text":"redacted"})];
+            }
+            Ok(Some(result))
+        }
+    }
+    for (first_block, second_block) in [(false, false), (false, true), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = || Options {
+            model: Arc::new(RecordingModel {
+                inner: FakeModel {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                },
+                observed_tools: observed.clone(),
+            }),
+            tools: vec![Arc::new(KeyedToolAdapter::new(Tool)).register(ReplayPolicy::Unsafe)],
+            restart_limit: 4,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.install_extension(Extension {
+            name: "chain".into(),
+            hooks: vec![
+                Arc::new(Chain {
+                    first: true,
+                    block: first_block,
+                }),
+                Arc::new(Chain {
+                    first: false,
+                    block: second_block,
+                }),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["chain".into()]).unwrap();
+        h.submit_and_run(id, None, "go".into(), &cancel)
+            .await
+            .unwrap();
+        let messages = observed.lock().unwrap().clone();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("redacted"));
+        assert!(messages[0].contains("retained safe event"));
+        assert!(!messages[0].contains("private secret"));
+        let state = h.conversation(id).unwrap();
+        assert!(!format!("{:?}", state.tool_results).contains("private secret"));
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let state = h.conversation(id).unwrap();
+        assert!(!format!("{state:?}").contains("private secret"));
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content,.. } if content == &messages[0]))
+        );
+    }
 }

@@ -207,14 +207,24 @@ fn remove_cloned_derived_diagnostics(
     after: &mut Vec<crate::runtime::ToolDiagnostic>,
     derived: &[crate::runtime::ToolDiagnostic],
 ) {
+    let mut handled = Vec::new();
     for item in derived {
+        if handled.contains(item) {
+            continue;
+        }
+        handled.push(item.clone());
         let before_count = before.iter().filter(|d| *d == item).count();
+        let after_count = after.iter().filter(|d| *d == item).count();
         let derived_count = derived.iter().filter(|d| *d == item).count();
-        let explicit_count = before_count.saturating_sub(derived_count);
-        if after.iter().filter(|d| *d == item).count() > explicit_count
-            && let Some(index) = after.iter().rposition(|d| d == item)
-        {
-            after.remove(index);
+        if after_count < before_count {
+            // Equal occurrences lost identity when the hook removed one.
+            after.retain(|d| d != item);
+        } else {
+            for _ in 0..derived_count {
+                if let Some(index) = after.iter().rposition(|d| d == item) {
+                    after.remove(index);
+                }
+            }
         }
     }
 }
@@ -226,17 +236,16 @@ pub(crate) fn remaining_derived_diagnostics(
 ) -> Vec<crate::runtime::ToolDiagnostic> {
     let mut remaining = Vec::new();
     for item in derived {
-        let explicit_count = before
-            .iter()
-            .filter(|d| *d == item)
-            .count()
-            .saturating_sub(derived.iter().filter(|d| *d == item).count());
-        let available = after
-            .iter()
-            .filter(|d| *d == item)
-            .count()
-            .saturating_sub(explicit_count);
-        if remaining.iter().filter(|d| *d == item).count() < available {
+        let before_count = before.iter().filter(|d| *d == item).count();
+        let after_count = after.iter().filter(|d| *d == item).count();
+        let derived_count = derived.iter().filter(|d| *d == item).count();
+        let ambiguous = after_count < before_count;
+        let available = if ambiguous {
+            after_count
+        } else {
+            derived_count.min(after_count)
+        };
+        while remaining.iter().filter(|d| *d == item).count() < available {
             remaining.push(item.clone());
         }
     }
