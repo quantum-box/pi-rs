@@ -30,6 +30,31 @@ pub(super) struct RefreshBarrier {
     _worker: Option<std::fs::File>,
 }
 
+/// The auth lock must be released before the worker barrier: once the barrier
+/// becomes available, a supervisor may immediately kill the worker.
+pub(super) struct RefreshAuthGuard {
+    auth: super::auth_lock::Guard,
+    _barrier: RefreshBarrier,
+}
+
+impl std::ops::Deref for RefreshAuthGuard {
+    type Target = super::auth_lock::Guard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.auth
+    }
+}
+
+pub(super) fn guard_refresh_auth(
+    barrier: RefreshBarrier,
+    auth: super::auth_lock::Guard,
+) -> RefreshAuthGuard {
+    RefreshAuthGuard {
+        auth,
+        _barrier: barrier,
+    }
+}
+
 pub(super) fn stop_new_refreshes() -> std::sync::MutexGuard<'static, ()> {
     IN_FLIGHT_REFRESH
         .lock()
@@ -904,6 +929,141 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         waiter.join().unwrap();
     }
+
+    #[tokio::test]
+    async fn worker_teardown_waits_for_child_anthropic_refresh_to_persist() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, serde_json::json!({"anthropic":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "anthropic_auth::tests::share_barrier_refresh_fixture",
+                "--nocapture",
+            ])
+            .env("PI_RS_TEST_SHARE_BARRIER_AUTH", &path)
+            .env(
+                "PI_RS_TEST_SHARE_BARRIER_URL",
+                format!("http://{}/v1/oauth/token", listener.local_addr().unwrap()),
+            )
+            .env(super::REFRESH_BARRIER_ENV, barrier.path())
+            .env("PI_RS_TEST_PAUSE_AUTH_UNLOCK", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut release = child.stdin.take().unwrap();
+        let mut child = Reap(child);
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|value| value.parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break bytes[end + 4..].to_vec();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(request["refresh_token"], "old-refresh");
+        let body = r#"{"access_token":"new-access","refresh_token":"rotated","expires_in":3600}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dir.path().join("unlock-entered").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(barrier.path())
+            .unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "worker barrier was released before auth unlock"
+        );
+        let mut termination = tokio::task::spawn_blocking(move || {
+            super::terminate_after_grace(
+                &mut child.0,
+                barrier.as_file(),
+                std::time::Instant::now(),
+            );
+            child.0.wait().unwrap()
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut termination)
+                .await
+                .is_err(),
+            "worker terminated before releasing the auth lock"
+        );
+        std::io::Write::write_all(&mut release, b"x").unwrap();
+        drop(release);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), termination)
+            .await
+            .unwrap()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+        #[cfg(windows)]
+        assert_eq!(status.code(), Some(1));
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::super::auth_lock::acquire_async(&path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let stored = super::super::config::read_object_unlocked(&path).unwrap();
+        assert_eq!(stored["anthropic"]["access"], "new-access");
+        assert_eq!(stored["anthropic"]["refresh"], "rotated");
+        drop(guard);
+    }
+
     #[test]
     fn queue_mode_uses_current_branch_even_when_session_is_locked() {
         let root = tempfile::tempdir().unwrap();

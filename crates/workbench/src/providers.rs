@@ -586,19 +586,18 @@ impl Client {
         session_cache_key: Option<&str>,
     ) -> Result<ModelStream> {
         match self {
-            Self::Ollama(client) if cache_disabled => {
-                client
-                    .clone()
-                    .with_cache_retention(CacheRetention::None)
-                    .stream(request)
-                    .await
-            }
-            Self::Ollama(client) if !defaults.is_empty() => {
-                client
-                    .clone()
-                    .with_default_headers(defaults)
-                    .stream(request)
-                    .await
+            Self::Ollama(client) => {
+                let client = if cache_disabled {
+                    client.clone().without_cache()
+                } else {
+                    let client = client.clone().with_default_headers(defaults);
+                    if let Some(key) = session_cache_key {
+                        client.with_session_cache_key(key)
+                    } else {
+                        client
+                    }
+                };
+                client.stream(request).await
             }
             Self::OpenAi(client) => {
                 let client = if cache_disabled {
@@ -960,7 +959,16 @@ impl Client {
                     .chat_cache_support(&args.provider, &args.model, configured.as_ref())
                     .map(cache_retention)
                     .unwrap_or_default();
-                let client = client.with_cache_retention(retention);
+                let (key_enabled, long) = args.model_profiles.chat_prompt_cache_policy(
+                    &args.provider,
+                    &args.model,
+                    configured.as_ref(),
+                    args.model_endpoint_for(&args.provider, Some(&args.model)),
+                    std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
+                );
+                let client = client
+                    .with_cache_retention(retention)
+                    .with_prompt_cache_policy(key_enabled, long);
                 let mapped = configured.as_ref().and_then(|model| {
                     let level = thinking.or((model.reasoning == Some(true)).then_some("off"))?;
                     model.mapped_effort(level)
@@ -1313,6 +1321,7 @@ impl Model for Client {
         self.stream_detailed_with_headers(request, &HeaderMap::new(), false, Some(external_id))
             .await
     }
+
     async fn stream_detailed_for_summary(
         &self,
         _request_id: uuid::Uuid,
@@ -1320,6 +1329,63 @@ impl Model for Client {
         request: ModelRequest,
     ) -> Result<pi_rs::DetailedModelStream> {
         self.stream_detailed_with_headers(request, &HeaderMap::new(), true, None)
+            .await
+    }
+
+    async fn stream_in_session(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_in_session_with_identity(
+            request_id,
+            session_id,
+            &session_id.to_string(),
+            request,
+        )
+        .await
+    }
+
+    async fn stream_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+
+    async fn stream_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_with_headers(request, &HeaderMap::new(), true, None)
+            .await
+    }
+
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        self.stream_enriched_with_headers(request, &HeaderMap::new(), false, Some(external_id))
+            .await
+    }
+
+    async fn stream_enriched_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs::EnrichedModelStream> {
+        self.stream_enriched_with_headers(request, &HeaderMap::new(), true, None)
             .await
     }
 
@@ -1787,6 +1853,161 @@ mod estimation_tests {
                 .with_thinking(Some("high")),
         );
         assert_eq!(reset.context_identity(), expected.context_identity());
+    }
+
+    #[tokio::test]
+    async fn chat_cache_key_reaches_resolved_and_deferred_client_sessions() {
+        use std::io::{Read, Write};
+        for (deferred, summary, path) in [false, true].into_iter().flat_map(|deferred| {
+            [false, true].into_iter().flat_map(move |summary| {
+                ["legacy", "enriched", "detailed"]
+                    .into_iter()
+                    .map(move |path| (deferred, summary, path))
+            })
+        }) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let endpoint = format!("http://{address}/v1/chat/completions");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"test":{
+                "api":"openai-completions", "baseUrl":endpoint, "compat":{"promptCacheKeyMode":"enabled"}, "models":[{"id":"m"}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::ChatCompletions,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Ollama(
+                    pi_rs::ollama::Ollama::new(&endpoint, Some("fixture".into()))
+                        .unwrap()
+                        .with_provider("test")
+                        .with_native_probes(false),
+                )
+            }
+            .with_model_options(&args, false)
+            .unwrap();
+            let model: &dyn Model = &client;
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 10,
+            };
+            let request_id = uuid::Uuid::new_v4();
+            let session_id = uuid::Uuid::new_v4();
+            match (summary, path) {
+                (true, "legacy") => {
+                    let _ = model
+                        .stream_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "legacy") => {
+                    let _ = model
+                        .stream_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                (true, "enriched") => {
+                    let _ = model
+                        .stream_enriched_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "enriched") => {
+                    let _ = model
+                        .stream_enriched_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                (true, "detailed") => {
+                    let _ = model
+                        .stream_detailed_for_summary(request_id, session_id, request)
+                        .await;
+                }
+                (false, "detailed") => {
+                    let _ = model
+                        .stream_detailed_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            "imported-session",
+                            request,
+                        )
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+            let body = server.join().unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key")
+                    .and_then(serde_json::Value::as_str),
+                (!summary).then_some("imported-session")
+            );
+        }
     }
 
     #[tokio::test]

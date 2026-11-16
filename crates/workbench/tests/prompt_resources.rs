@@ -268,3 +268,225 @@ fn context_read_failure_does_not_return_partial_snapshot() {
         .is_err()
     );
 }
+
+#[test]
+fn nested_worktree_context_shadows_matching_main_filename_only() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("worktrees/feature");
+    let other = main.join("worktrees");
+    let sibling = temp.path().join("sibling");
+    for dir in [&main, &nested, &other, &sibling] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(main.join("AGENTS.md"), "main").unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "worktree").unwrap();
+    std::fs::write(other.join("AGENTS.md"), "ancestor").unwrap();
+    std::fs::write(sibling.join("AGENTS.md"), "sibling").unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![main.clone(), other.clone(), nested.clone(), sibling.clone()],
+    };
+    let snapshot = grants
+        .load_with_nested_worktree(&main, &nested, None)
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>(),
+        ["ancestor", "worktree", "sibling"]
+    );
+    assert_eq!(
+        grants
+            .load_with_nested_worktree(&main, &sibling, None)
+            .unwrap()
+            .files
+            .len(),
+        4
+    );
+    assert!(
+        grants
+            .load_with_nested_worktree(&main, temp.path(), None)
+            .is_err()
+    );
+    std::fs::remove_file(nested.join("AGENTS.md")).unwrap();
+    std::fs::write(nested.join("CLAUDE.md"), "different").unwrap();
+    assert_eq!(
+        grants
+            .load_with_nested_worktree(&main, &nested, None)
+            .unwrap()
+            .files
+            .len(),
+        4
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_context_symlink_shadows_main_by_directory_not_file_target() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("worktrees/feature");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(main.join("AGENTS.md"), "instructions").unwrap();
+    std::os::unix::fs::symlink(main.join("AGENTS.md"), nested.join("AGENTS.md")).unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![main.clone(), nested.clone()],
+    };
+    let result = grants
+        .load_with_nested_worktree(&main, &nested, None)
+        .unwrap();
+    assert_eq!(result.files.len(), 1);
+    assert_eq!(result.files[0].path, nested.join("AGENTS.md"));
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_shadow_preserves_separately_granted_main_alias() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let alias = temp.path().join("global");
+    let nested = main.join("worktrees/feature");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(main.join("AGENTS.md"), "global and main").unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "worktree").unwrap();
+    std::os::unix::fs::symlink(&main, &alias).unwrap();
+    for directories in [
+        vec![alias.clone(), main.clone(), nested.clone()],
+        vec![main.clone(), alias.clone(), nested.clone()],
+    ] {
+        let result = ContextReadGrants { directories }
+            .load_with_nested_worktree(&main, &nested, None)
+            .unwrap();
+        assert_eq!(
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            [&alias.join("AGENTS.md"), &nested.join("AGENTS.md")]
+        );
+    }
+}
+
+#[test]
+fn worktree_shadow_preserves_global_role_with_identical_path() {
+    use pi_rs_workbench::prompt_resources::ContextReadGrants;
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("worktree");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(main.join("AGENTS.md"), "global").unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "worktree").unwrap();
+    let grants = ContextReadGrants {
+        directories: vec![main.clone(), main.clone(), nested.clone()],
+    };
+    let result = grants
+        .load_with_nested_worktree(&main, &nested, Some(&main))
+        .unwrap();
+    assert_eq!(
+        result
+            .files
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>(),
+        ["global", "worktree"]
+    );
+    assert!(
+        grants
+            .load_with_nested_worktree(&main, &nested, Some(temp.path()))
+            .is_err()
+    );
+}
+
+#[test]
+fn explicit_prompt_files_require_grants_and_preserve_snapshots() {
+    use pi_rs_workbench::prompt_resources::{
+        ExplicitPromptResourceFactory, PromptInput, PromptReadGrants,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let system = root.path().join("system.md");
+    let appendix = root.path().join("append.md");
+    std::fs::write(&system, "\u{feff}system").unwrap();
+    std::fs::write(&appendix, "appendix").unwrap();
+    let factory = ExplicitPromptResourceFactory {
+        system: Some(PromptInput::File(system.clone())),
+        append: Some(vec![
+            PromptInput::Literal("literal".into()),
+            PromptInput::File(appendix.clone()),
+        ]),
+    };
+    let grants = PromptReadGrants::default();
+    assert!(
+        factory
+            .load(&grants, std::slice::from_ref(&system))
+            .is_err()
+    );
+    let files = vec![system.clone(), appendix.clone()];
+    let snapshot = factory.load(&grants, &files).unwrap();
+    assert_eq!(snapshot.system.as_ref().unwrap().text, "system");
+    assert_eq!(
+        snapshot.system.as_ref().unwrap().source.as_ref(),
+        Some(&system)
+    );
+    assert_eq!(
+        snapshot
+            .append
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        ["literal", "appendix"]
+    );
+    assert_eq!(snapshot.append[1].source.as_ref(), Some(&appendix));
+    std::fs::remove_file(&appendix).unwrap();
+    assert!(factory.load(&grants, &files).is_err());
+    assert_eq!(snapshot.append[1].text, "appendix");
+    std::fs::write(&appendix, [0xff]).unwrap();
+    assert!(factory.load(&grants, &files).is_err());
+    std::fs::write(&appendix, vec![b'a'; 256 * 1024 + 1]).unwrap();
+    assert!(factory.load(&grants, &files).is_err());
+    let relative = ExplicitPromptResourceFactory {
+        system: Some(PromptInput::File("relative.md".into())),
+        append: None,
+    };
+    assert!(relative.load(&grants, &["relative.md".into()]).is_err());
+    let traversal = root.path().join("../system.md");
+    let invalid = ExplicitPromptResourceFactory {
+        system: Some(PromptInput::File(traversal.clone())),
+        append: None,
+    };
+    assert!(invalid.load(&grants, &[traversal]).is_err());
+}
+
+#[test]
+fn explicit_prompt_inputs_enforce_aggregate_limits() {
+    use pi_rs_workbench::prompt_resources::{
+        ExplicitPromptResourceFactory, PromptInput, PromptReadGrants,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.md");
+    std::fs::write(&path, vec![b'a'; 256 * 1024]).unwrap();
+    let mut factory = ExplicitPromptResourceFactory {
+        system: None,
+        append: Some(vec![PromptInput::File(path.clone()); 16]),
+    };
+    let grants = PromptReadGrants::default();
+    let files = [path.clone()];
+    assert_eq!(factory.load(&grants, &files).unwrap().append.len(), 16);
+    factory
+        .append
+        .as_mut()
+        .unwrap()
+        .push(PromptInput::File(path));
+    assert!(factory.load(&grants, &files).is_err());
+    factory.append = Some(vec![PromptInput::Literal("a".repeat(4 * 1024 * 1024 + 1))]);
+    assert!(factory.load(&grants, &[]).is_err());
+    factory.append = Some(vec![PromptInput::Literal(String::new()); 128]);
+    assert_eq!(factory.load(&grants, &[]).unwrap().append.len(), 128);
+    factory
+        .append
+        .as_mut()
+        .unwrap()
+        .push(PromptInput::Literal(String::new()));
+    assert!(factory.load(&grants, &[]).is_err());
+}

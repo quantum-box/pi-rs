@@ -36,9 +36,13 @@ pub mod prompt_resources;
 pub mod prompt_template_arguments;
 mod shell_config;
 mod shell_output;
+pub mod skill_resources;
 pub mod template_resources;
 mod text_edit;
 mod text_page;
+#[doc(hidden)]
+pub mod theme_parser;
+pub mod theme_resources;
 mod tool_output;
 
 pub fn agent_dir() -> PathBuf {

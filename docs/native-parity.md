@@ -134,15 +134,23 @@ without `defaultProvider` are still accepted.
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Package list emits native JSON events for every configured entry in user then
+trusted-project order, including duplicates, with `scope` and `filtered` fields.
+Transient `-e` sources are excluded, as in Pi's configured-package list.
+
 Local package `file://` sources ignore URL query and fragment components and
 reject malformed path escapes and encoded separators, as Pi does.
 
 ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
 minimum lifetime for bearer-token export. A refreshed credential is saved
 before a short lifetime is reported, preserving refresh-token rotation. In a
-live check, a saved credential was observed expired before a successful text
-inference and had a future expiry afterward. New-account browser login, other
-account configurations and broader live acceptance remain open.
+live check with an expired saved credential, an instrumented local build marked
+its own successful refresh persistence before returning `READY` from a text
+inference. The saved access and refresh values both changed and the expiry was
+in the future afterward. The probe preserved credentials on authorization
+failure; its successful refresh path was otherwise unchanged. New-account
+browser login, other account configurations and broader live acceptance remain
+open.
 
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
@@ -165,14 +173,29 @@ settings scope, matching Pi.
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 An invalid file URL in a package settings filter reports an error when
-reached against an available native resource candidate. For a local directory
+reached against an available native or Pi manifest diagnostic candidate. For a local directory
 package it stops the current declaration at that resource type, retaining
 earlier resources and processing later declarations. Remote errors propagate.
 Startup theme discovery uses cached candidates when available. Single-file
 sources and other resource filter paths still treat invalid URLs as non-matches.
-Diagnostic candidates for unsupported upstream Pi package resources remain
-incomplete. Package resources are evaluated in
-settings order, with project sources first.
+Pi-only extensions, skills and prompts are scanned only for filter diagnostics;
+they are not loaded as native resources. Diagnostic scans are bounded and fall
+back to native candidates on cycles, excessive traversal, unsafe ignore files,
+unsupported absolute/parent globs, potentially traversed directory symlinks,
+or unsupported
+extglob forms. Diagnostic
+extglob discovery supports bounded ASCII positive groups and a single negated
+group with literal alternatives and a supported suffix; complex negation,
+suffixes ending in wildcards, extglob overrides, non-ASCII
+paths, and combinations with classes, braces, or globstars fall back, so errors
+can still be missed in those
+cases. Package resources are evaluated in settings order, with project sources
+first.
+
+Diagnostic manifest globs expand bounded numeric and same-case ASCII letter
+brace ranges, including descending ranges, signed steps and padded numbers,
+and include the starting directory for a trailing directory globstar. Complex,
+invalid or oversized brace expansions fall back to native candidates.
 
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
@@ -471,6 +494,12 @@ is active cannot yet execute immediately. A model turn returns
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
+`toolcall_start` includes the ID and tool name available at that point. Native
+does not yet expose Pi's top-level live usage in `message_update`; provider
+usage currently reaches the stream only on completion. Native retains the cumulative
+`message` and `partial` snapshots as extensions; unlike Pi's compact wire
+format, update size therefore grows with streamed content. Fragmented provider
+IDs or names can be incomplete in `toolcall_start`; the final call is authoritative.
 Failed live assistant messages include a fixed `errorMessage` based on the
 native failure classification, including cancellation and retryable failures.
 Unlike Pi, native live failures do not retain provider error text in the journal
@@ -531,6 +560,9 @@ command to finish, even if an internal agent-settled event arrives first.
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID and original type when present. Object, array and numeric types use
 JavaScript string conversion in the diagnostic, including null array elements.
+Non-null JSON values without a command type also return `Unknown command:
+undefined`, as in Pi. Native rejects a top-level `null` as a parse response;
+Pi instead attempts to access command properties on it.
 RPC `set_model` rejects non-string `provider` and `modelId` fields using Pi's
 diagnostic conversion. Missing `provider` still selects within the current
 provider as a native extension.
@@ -538,7 +570,11 @@ The echoed JSON value retains Rust's parsed integer precision, which can differ
 from JavaScript for integers outside the safe range; out-of-range JSON numbers
 such as `1e400` are rejected by the native parser.
 Malformed JSON produces a `parse` response with a
-parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
+parser diagnostic. Unescaped string control characters reached by the parser
+use Pi's V8 wording and UTF-16 positions, including controls after a lone
+surrogate in the same string. If serde stops on an earlier surrogate in a
+different string, its diagnostic can still differ from Pi. Other diagnostics
+that are not explicitly mapped retain the Rust JSON parser's wording.
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
 requests are bounded and retain their individual response IDs.
@@ -638,6 +674,8 @@ layout cases still need comparison.
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Empty terminal-identification environment variables do not advertise OSC 8
+support or indicate a tmux session.
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
 styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
@@ -691,6 +729,21 @@ reasoning, a local read tool, theme and session-name persistence, native branch
 cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
 
 ### Resources checkpoint
+
+Native SDK hosts can explicitly load skill metadata snapshots from granted files
+and format the visible skills with Pi's reader hint and XML escaping. Relative
+paths require an explicit absolute base; parent components and non-UTF-8 paths
+are rejected so rendering cannot change the file selected by the host. Hidden
+model-invocation skills remain in the snapshot for explicit use. Reads follow
+symlinks and do not grant later file access; no directories, packages or settings
+are discovered implicitly. Hosts can explicitly grant recursive directories;
+scans read local ignore files, skip hidden entries and node_modules, and stop at
+an unignored SKILL.md. Directory grants authorize enumeration and ignore-file
+reads and discovered skill-file contents throughout the granted subtree, including symlink targets outside it; they
+are not a sandbox. Scans bound file, entry, ignore-byte, ignore-line and depth
+counts. Each file is capped at 256 KiB. Read, ignore, parse and duplicate-name
+errors fail the entire load, unlike Pi's per-file warnings and continuation.
+Hosts own skill invocation and must authorize each later file read independently.
 
 Native SDK hosts can load prompt template snapshots from explicitly granted `.md`
 files or direct children of explicitly granted directories. No directories,
@@ -1067,6 +1120,11 @@ This is a native embedding control rather than an upstream Pi API.
 
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
+The Tauri mock fixture also accepts a host-built session, including a persistent
+journal and host-supplied system prompt. Its close operation survives cancellation
+of the requesting IPC call, shares its result with later callers, and releases its
+session after completed shutdown. It does not provide resource discovery or live
+session replacement.
 
 Owned SDK sessions expose configured extension command names, collision-resolved
 invocations, descriptions, and source provenance for host command pickers. Hosts
@@ -1448,6 +1506,19 @@ existing named project-skill mode remains supported. Native built-ins can be
 selected with `builtin:codemode`, `builtin:tool-search` and `builtin:mcp`.
 Repeated project-approval flags follow Pi's last-option-wins behavior, including
 the `-a` and `-na` aliases; flags after `--` remain prompt text.
+For root help and version requests, Pi-compatible argument diagnostics are
+reported before metadata; version takes precedence over help, and export takes
+precedence over help. Metadata scanning follows Pi's value ownership for its
+options, including values that begin with a dash. Native subcommands retain their
+own Clap parsing and help, while native-only attached values and short-option
+clusters continue to be accepted. For root `--export`, the last export input and first positional message select
+the input and HTML output, including when help is present; native option
+validation runs before writing. As a deliberate safety difference from Pi, an
+export destination cannot overwrite any explicitly supplied export input, even
+one replaced by a later option; aliases and symlinks are checked as well. A
+missing or empty final export input is rejected
+rather than falling back to an earlier input. Other invocations without root metadata keep
+their existing native argument parsing.
 These selections propagate to persistent CLI workers. The settings editor,
 remaining CLI aliases still require parity work.
 
@@ -1671,6 +1742,10 @@ results in both terminal modes. Image normalization shares the local read
 implementation, preserves alpha and avoids upscaling. Kitty uploads are reused
 on redraw and resize. Fullscreen exit releases owned images, while regular
 mode retains them in scrollback. Unsupported terminals retain text notices.
+Empty terminal-identification environment variables do not enable image
+protocols or imply an active tmux session, matching Pi's detection behavior.
+`PI_IMAGE_PROTOCOL` is case-insensitive, and `TERM=xterm-kitty` alone does not
+override another terminal's image protocol.
 
 A PTY fixture verifies both protocols, user and tool images, cached redraw,
 cleanup and terminal restoration. Protocol bytes were checked without a GUI
@@ -1896,6 +1971,15 @@ Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
 block quotes; hard line breaks do not add paragraph spacing.
+Top-level tables are separated from a preceding rendered block by a blank line.
+Inline and display LaTeX use a native port of the pinned Pi terminal renderer,
+including fractions, operators, scripts and matrix environments. Math can occur
+in list items and quotes; unsupported or incomplete expressions retain their
+source. Oversized or deeply nested expressions and exhausted rendering budgets
+fall back to source text. These limits are intentional native safeguards and
+may preserve an expression that Pi would render. A pinned reference fixture
+checks 3,474 expression renderings; Markdown tests cover delimiters, code,
+links, list indentation, streaming and narrow display widths.
 
 Unit tests cover these layouts and Unicode widths. A PTY fixture verifies both
 terminal modes, heading decoration, code fences, nested quotes and clean exit.
@@ -1907,6 +1991,8 @@ numbers, and highlight changed words for one-line replacements. Added, removed
 and context lines use their dedicated theme colors. Tabs expand to three spaces,
 and word comparison follows Pi's `diffWords` token grouping and whitespace
 deduplication, including the first changed fragment's indentation treatment.
+Numbered diff gutters use JavaScript's whitespace and line-terminator rules,
+including its treatment of BOM and U+0085.
 Comparison has a shared 100 ms budget per render; oversized or unfinished
 comparisons retain line-level highlighting. The Rust word-diff implementation
 derives from jsdiff 8.0.4; its BSD license is in
@@ -3075,6 +3161,14 @@ A CLI RPC smoke check covers creation and persistence through normal commands.
 CLI, terminal and RPC fork/clone operations record their immediate source as the
 parent, replacing inherited ancestry metadata when a child is forked again.
 This preserves the copied conversation while retaining the correct origin path.
+
+Selected-branch forks resolve labels across the source journal, including
+updates and clears made on other branches, and retain the latest label timestamp.
+Imported Pi label entries are removed from the copied path and retained labels
+are recreated; compaction boundaries and retained record metadata are remapped.
+New Pi imports record conversion provenance. Forking rejects ambiguous legacy
+ownership or inconsistent provenance when it cannot safely reconstruct the
+selected history.
 
 ### Session-name validation checkpoint
 
@@ -4327,6 +4421,10 @@ The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
 pi-rs does not automatically remove stale `auth.json.lock` directories.
+After a worker admits a protected OAuth refresh, pi-rs retains its worker
+refresh barrier until the auth lock is released, including on errors. A worker
+terminated while holding the auth lock but waiting to enter that barrier can
+still leave a stale directory, as can a crash or external termination.
 To recover one safely, stop **all** Pi and pi-rs processes that can access
 that credential store, including background or waiting processes on other
 hosts sharing the filesystem. Once they have exited, either remove the stale
@@ -4564,6 +4662,16 @@ New RPC and TUI prompt images are prepared before the worker accepts
 them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
+
+### Chat Completions prompt cache keys
+
+Chat Completions models honor `promptCacheKeyMode`: `enabled` uses the
+session key, `disabled` omits the automatic key, and `auto` uses it for
+OpenAI endpoints or supported long retention. Supported long retention also
+sends the 24-hour retention request. Provider and model overrides merge, and
+summary requests omit automatic keys and retention. Explicit sampling fields
+retain precedence. Native Ollama keeps long retention disabled by default as a
+pi-rs extension; its explicit compatibility setting can enable it.
 
 ### Responses prompt cache key configuration
 
@@ -5094,6 +5202,20 @@ returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
 
+### Native SDK theme snapshots
+
+`pi_rs_workbench::theme_resources::ThemeReadGrants` loads an ordered snapshot
+from explicitly granted absolute files without parent components. It shares schema validation and color
+resolution with the interactive frontend and exposes each name, source path and
+resolved color roles without selecting a theme or probing the terminal. Reads
+are synchronous, bounded, follow symlinks, and are not a filesystem sandbox.
+A grant includes the symlink target. Reloading creates an independent snapshot.
+Missing, invalid, duplicate-name, oversized or excessive inputs fail atomically;
+variable chains have a depth limit. Unlike Pi's resource loader, this API does
+not discover directories, packages, settings or built-in themes, detect terminal
+capabilities, or return per-file warnings and deduplicate collisions. Hosts choose
+when to apply a snapshot, and revoking a grant does not erase an existing one.
+
 ### Native SDK prompt resource factory
 
 `pi_rs_workbench::prompt_resources::PromptResourceFactory` exposes the system
@@ -5105,7 +5227,12 @@ the corresponding global files. Nothing is read without a grant. As in the
 project files take precedence independently for each category, and explicit
 system or append values replace discovery. File values have a UTF-8 BOM removed
 and carry their source path. An empty system prompt uses the host default; an
-explicit empty append list suppresses discovery.
+explicit empty append list suppresses discovery. `ExplicitPromptResourceFactory`
+also accepts unambiguous literal and file inputs for each category. File inputs
+require a matching current grant for the absolute path, reject parent components,
+retain their source path, and fail atomically on missing or unreadable files.
+Explicit inputs are limited to 128 entries and 4 MiB of resolved text per
+snapshot. File grants follow symlinks and are not a sandbox.
 
 The host must obtain and reevaluate its own permissions and choose the paths;
 grants permit ordinary filesystem reads including symlink targets and are not a
@@ -5117,7 +5244,8 @@ content. A failed load returns an error without modifying an earlier snapshot.
 
 This is a focused native API, not a complete Pi resource loader. It does not
 load skills, prompt templates, extensions, context files, themes, or settings;
-it does not interpret an explicit string as a filename. Unlike Pi's fallback
+it does not interpret an explicit string as a filename; hosts opt into file
+inputs explicitly. Unlike Pi's fallback
 for unreadable prompt files, invalid UTF-8, oversized files, and read failures
 are errors. Unix file opens are nonblocking and validate the opened handle before
 reading, so a FIFO is rejected. The host supplies the default prompt and any Pi-specific context
@@ -5139,6 +5267,12 @@ loaded once. Hosts choose directories and
 when to apply a snapshot. No ancestor or global discovery occurs implicitly. Reads
 follow symlinks, fail atomically on errors, and use the prompt resource size limit.
 Unlike Pi, unreadable higher-priority files fail rather than falling through.
+Hosts that have verified a nested linked worktree can opt into Pi's matching-name
+shadowing by supplying both explicitly granted roots. The selected main-root
+entry is suppressed when the nested worktree has the same selected filename;
+separate directory aliases remain available for global context. Hosts identify
+the global role explicitly when it shares the main-root path. The host verifies
+the repository relationship, and no Git metadata or additional paths are read.
 
 The SDK model catalog can enumerate its host-registered provider/model identities
 in deterministic order for host model pickers. This lists the immutable catalog
