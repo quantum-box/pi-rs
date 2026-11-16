@@ -3295,6 +3295,492 @@ async fn intermediate_park_rejects_public_resolution_and_leaf_wakes_after_reopen
     }
 }
 
+struct MultiParkLeaf(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for MultiParkLeaf {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: args["job"].as_str().unwrap().into(),
+        }
+    }
+}
+
+struct MultiParkFileLeaf(std::path::PathBuf);
+#[async_trait]
+impl Tool for MultiParkFileLeaf {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        use std::io::Write;
+        let name = args["job"].as_str().unwrap();
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.0.join("dispatches"))
+                .unwrap(),
+            "{name}"
+        )
+        .unwrap();
+        Outcome::Pending {
+            reference: name.into(),
+        }
+    }
+}
+
+struct MultiRotatingLeaf {
+    calls: AtomicUsize,
+    initial_polls: AtomicUsize,
+    barrier: tokio::sync::Barrier,
+}
+#[async_trait]
+impl Tool for MultiRotatingLeaf {
+    fn spec(&self) -> ToolSpec {
+        spec("child")
+    }
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Pending {
+            reference: args["job"].as_str().unwrap().into(),
+        }
+    }
+    fn can_poll(&self) -> bool {
+        true
+    }
+    async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+        if reference == "a" || reference == "b" {
+            if self.initial_polls.fetch_add(1, Ordering::SeqCst) < 2 {
+                self.barrier.wait().await;
+            }
+            return Some(Outcome::Pending {
+                reference: format!("{reference}-rotated"),
+            });
+        }
+        Some(match reference {
+            "a-rotated" => Outcome::Succeeded("first".into()),
+            "b-rotated" => Outcome::Failed("cancelled".into()),
+            _ => Outcome::Unknown("unexpected reference".into()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_rotations_preserve_both_child_references_and_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let leaf = Arc::new(MultiRotatingLeaf {
+        calls: AtomicUsize::new(0),
+        initial_polls: AtomicUsize::new(0),
+        barrier: tokio::sync::Barrier::new(2),
+    });
+    let middle = Arc::new(AtomicUsize::new(0));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(MultiParkMiddle(middle.clone())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: leaf.clone(),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(leaf.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(middle.load(Ordering::SeqCst), 2);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "both resolved"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+fn multi_park_disk_options(path: &std::path::Path) -> Options {
+    Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(MultiParkMiddle(Arc::new(
+                AtomicUsize::new(0),
+            ))))
+            .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkFileLeaf(path.into())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    }
+}
+
+#[tokio::test]
+async fn multi_park_crash_worker() {
+    let Some(path) = std::env::var_os("PI_MULTI_PARK_CRASH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let mut scheduler = Scheduler::open(path.join("db"), multi_park_disk_options(&path)).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    std::fs::write(path.join("conversation"), id.to_string()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("first".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    std::fs::write(path.join("one-resolved"), b"ready").unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
+async fn multiple_child_jobs_recover_after_process_loss() {
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let mut process = Kill(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "multi_park_crash_worker"])
+            .env("PI_MULTI_PARK_CRASH", path)
+            .spawn()
+            .unwrap(),
+    );
+    until(|| path.join("one-resolved").exists()).await;
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    let id = std::fs::read_to_string(path.join("conversation"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut scheduler = Scheduler::open(path.join("db"), multi_park_disk_options(path)).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].reference, "b");
+    scheduler
+        .cancel_nested_pending(
+            id,
+            root,
+            jobs[0].operation_id,
+            &jobs[0].reference,
+            "cancelled".into(),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "both resolved"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("dispatches")).unwrap(),
+        "a\nb\n"
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+struct MultiParkMiddle(Arc<AtomicUsize>);
+struct OverLimitMiddle(Arc<std::sync::Mutex<Option<String>>>);
+#[async_trait]
+impl KeyedTool for OverLimitMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        for i in 0..9 {
+            let call = host
+                .call_keyed_unpolled_with_id(
+                    &format!("key{i}"),
+                    "child",
+                    json!({"job":format!("{i}")}),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(call.outcome, Outcome::Pending { .. }));
+        }
+        let error = host.suspend_pending_with_checkpoint(json!({})).unwrap_err();
+        *self.0.lock().unwrap() = Some(error);
+        Outcome::Failed("over limit".into()).into()
+    }
+}
+
+#[tokio::test]
+async fn intermediate_rejects_more_than_eight_pending_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = Arc::new(std::sync::Mutex::new(None));
+    let options = Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(OverLimitMiddle(error.clone())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkLeaf(Arc::new(AtomicUsize::new(0)))),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.path().join("db"), options).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(
+        error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains("one to eight")
+    );
+    assert!(scheduler.blocked(id).unwrap().is_some());
+    scheduler.shutdown().await.unwrap();
+}
+
+#[async_trait]
+impl KeyedTool for MultiParkMiddle {
+    fn spec(&self) -> ToolSpec {
+        spec("middle")
+    }
+    async fn invoke(
+        &self,
+        _: Value,
+        _: ToolContext,
+        _: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let wake = host.pending_wake();
+        let a = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        let duplicate = host
+            .call_keyed_unpolled_with_id("a", "child", json!({"job":"a"}))
+            .await
+            .unwrap();
+        assert_eq!(a.operation_id, duplicate.operation_id);
+        let b = host
+            .call_keyed_unpolled_with_id("b", "child", json!({"job":"b"}))
+            .await
+            .unwrap();
+        match wake {
+            None => {
+                assert!(matches!(a.outcome, Outcome::Pending { .. }));
+                assert!(matches!(b.outcome, Outcome::Pending { .. }));
+                host.suspend_pending_with_checkpoint(
+                    json!({"a":a.operation_id,"b":b.operation_id}),
+                )
+                .unwrap();
+                Outcome::Succeeded("park".into()).into()
+            }
+            Some(wake) => {
+                assert_eq!(
+                    wake.checkpoint,
+                    json!({"a":a.operation_id,"b":b.operation_id})
+                );
+                assert_eq!(wake.ended, vec![a.operation_id, b.operation_id]);
+                assert_eq!(a.outcome, Outcome::Succeeded("first".into()));
+                assert_eq!(b.outcome, Outcome::Failed("cancelled".into()));
+                Outcome::Succeeded("both resolved".into()).into()
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn multiple_child_jobs_wait_for_all_and_resume_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let leaf_calls = Arc::new(AtomicUsize::new(0));
+    let middle_calls = Arc::new(AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(MultiParkMiddle(middle_calls.clone())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkLeaf(leaf_calls.clone())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    assert_eq!(jobs.len(), 2);
+    let a = jobs.iter().find(|job| job.reference == "a").unwrap();
+    let b = jobs.iter().find(|job| job.reference == "b").unwrap();
+    scheduler
+        .reconcile_nested_pending(
+            id,
+            root,
+            a.operation_id,
+            &a.reference,
+            Outcome::Succeeded("first".into()),
+        )
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().nested_suspended());
+    assert_eq!(middle_calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    wait(&mut scheduler, id).await;
+    assert_eq!(middle_calls.load(Ordering::SeqCst), 1);
+    scheduler
+        .cancel_nested_pending(id, root, b.operation_id, &b.reference, "cancelled".into())
+        .unwrap();
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.blocked(id).unwrap().is_none());
+    assert_eq!(middle_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(leaf_calls.load(Ordering::SeqCst), 2);
+    assert!(
+        scheduler
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool {content, ..} if content == "both resolved"))
+    );
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_with_multiple_child_jobs_fences_replay_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let leaf_calls = Arc::new(AtomicUsize::new(0));
+    let middle_calls = Arc::new(AtomicUsize::new(0));
+    let options = || Options {
+        model: Arc::new(ModelStub),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParkedRoot)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(MultiParkMiddle(middle_calls.clone())))
+                .register(ReplayPolicy::Safe),
+            RegisteredTool {
+                tool: Arc::new(MultiParkLeaf(leaf_calls.clone())),
+                replay: ReplayPolicy::Unsafe,
+            },
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    wait(&mut scheduler, id).await;
+    let root = scheduler.blocked(id).unwrap().unwrap().0;
+    let jobs = scheduler.nested_pending_jobs(id, root).unwrap();
+    assert_eq!(jobs.len(), 2);
+    scheduler.abort(id).unwrap();
+    wait(&mut scheduler, id).await;
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    for job in &jobs {
+        scheduler
+            .cancel_nested_pending(
+                id,
+                root,
+                job.operation_id,
+                &job.reference,
+                "cancelled".into(),
+            )
+            .unwrap();
+    }
+    wait(&mut scheduler, id).await;
+    assert!(scheduler.conversation(id).unwrap().abort_requested);
+    assert_eq!(middle_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(leaf_calls.load(Ordering::SeqCst), 2);
+    scheduler.shutdown().await.unwrap();
+}
+
 struct ChildParkDiskRoot(std::path::PathBuf);
 #[async_trait]
 impl KeyedTool for ChildParkDiskRoot {

@@ -368,14 +368,14 @@ Compared with upstream pi at [`c1d4b0ac3e35dc4eb1c5d00d90bf54003cf517c0`](https:
 The present Rust path has different boundaries:
 
 One bounded intermediate park is supported: a replay-safe root can invoke a
-replay-safe keyed direct child which checkpoints while one keyed descendant is
+replay-safe keyed direct child which checkpoints while one to eight keyed descendants are
 pending. Both invocations return normally without state or controls; the root
 also checkpoints and parks, and must explicitly re-enter the same child after
-wake. The root wake names the descendant, while the child receives its own
-checkpoint and that descendant's ID. Pollable descendant references can change
+wake. After all descendants settle, the root wake names them, while the child receives its own
+checkpoint and the same ended IDs in key order. Pollable descendant references can change
 without redispatch. The intermediate executor is retired before replay, and
 its checkpoint, claim and effects are fenced by the current root attempt and
-abort state. This subset excludes extension hooks, multiple unresolved jobs,
+abort state. This subset excludes extension hooks, early `any` wakes,
 deeper intermediate parks, new descendants after a child wake, and independently
 scheduled or parallel child handles. Unsupported and legacy unbound cases fail
 closed; external job cancellation is not provided.

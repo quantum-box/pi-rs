@@ -192,14 +192,14 @@ impl Snapshot {
         new: String,
     ) -> Result<crate::task_store::OwnedBatch, Error> {
         self.retired_check()?;
-        if self.record.jobs.len() != 1
-            || self.record.jobs[0].operation_id != operation
-            || self.record.jobs[0].reference != old
-        {
-            return Err(Error::Invalid);
-        }
+        let index = self
+            .record
+            .jobs
+            .iter()
+            .position(|job| job.operation_id == operation && job.reference == old)
+            .ok_or(Error::Invalid)?;
         let mut next = self.record.clone();
-        next.jobs[0].reference = new;
+        next.jobs[index].reference = new;
         self.update(next)
     }
     pub(crate) fn is_retired(&self) -> bool {
