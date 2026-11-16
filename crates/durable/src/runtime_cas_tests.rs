@@ -7652,3 +7652,423 @@ fn legacy_undigested_baseline_is_only_usable_at_current_root() {
     );
     assert!(h.authenticated_reset_baseline(id, head.0).is_err());
 }
+
+#[test]
+fn fork_session_membership_inherits_all_local_paths_and_unscoped_remains_unscoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = || Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let parent = h.create_conversation(config()).unwrap();
+    let unscoped = h.create_conversation(config()).unwrap();
+    let store = h.owner.store();
+    let membership = crate::session_membership::SessionMembership::new(store);
+    let session = membership.create().unwrap();
+    membership.enroll(session, parent).unwrap();
+    let plain = h.fork(unscoped).unwrap();
+    assert!(
+        crate::session_membership::SessionMembership::new(h.owner.store())
+            .authorize_pair(session, parent, plain)
+            .is_err()
+    );
+    let (mut state, version) = h.load(parent).unwrap();
+    state.messages.push(Message::User {
+        content: "hello".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let page = h
+        .view_positioned(parent, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    let id = page.entries[0].history.as_ref().unwrap().id;
+    let position = page.entries[0].position.clone();
+    let notified = h
+        .submit_write_with_notification(
+            parent,
+            None,
+            "app.notified".into(),
+            None,
+            SubmissionNotify {
+                task_id: Uuid::new_v4(),
+                key: "receipt".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        h.conversation(parent)
+            .unwrap()
+            .submission_notification(notified)
+            .is_some()
+    );
+    let display = h
+        .submit_write(parent, None, "app.note".into(), None)
+        .unwrap();
+    let at = crate::observer::Observer::new(h.owner.store(), parent)
+        .head()
+        .unwrap();
+    let children = [
+        h.fork(parent).unwrap(),
+        h.fork_at(parent, at).unwrap(),
+        h.fork_at_position(parent, position).unwrap(),
+        h.fork_by_entry_id(parent, id).unwrap(),
+        h.fork_by_display_entry_id(parent, display).unwrap(),
+    ];
+    for child in children {
+        crate::session_membership::SessionMembership::new(h.owner.store())
+            .authorize_pair(session, parent, child)
+            .unwrap()
+            .commit(&[], &[])
+            .unwrap();
+        assert!(
+            h.conversation(child)
+                .unwrap()
+                .submission_notification(notified)
+                .is_none()
+        );
+    }
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    for child in children {
+        crate::session_membership::SessionMembership::new(h.owner.store())
+            .authorize_pair(session, parent, child)
+            .unwrap()
+            .commit(&[], &[])
+            .unwrap();
+    }
+}
+
+#[test]
+fn inherited_occurrence_fork_uses_callers_membership_not_history_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let origin = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(origin).unwrap();
+    state.messages.push(Message::User {
+        content: "origin".into(),
+    });
+    h.save(&state, Expected::Version(version)).unwrap();
+    let id = h
+        .view_positioned(origin, std::num::NonZeroUsize::new(10).unwrap())
+        .unwrap()
+        .entries[0]
+        .history
+        .as_ref()
+        .unwrap()
+        .id;
+    let parent = h.fork(origin).unwrap();
+    let membership = crate::session_membership::SessionMembership::new(h.owner.store());
+    let session = membership.create().unwrap();
+    membership.enroll(session, parent).unwrap();
+    let child = h.fork_by_entry_id(parent, id).unwrap();
+    let membership = crate::session_membership::SessionMembership::new(h.owner.store());
+    membership
+        .authorize_pair(session, parent, child)
+        .unwrap()
+        .commit(&[], &[])
+        .unwrap();
+    assert!(membership.authorize_pair(session, origin, child).is_err());
+}
+
+#[test]
+fn fork_membership_fences_revoke_reenroll_abort_and_unscoped_aba() {
+    for mode in ["reenroll", "abort", "unscoped-aba"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let parent = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let member = crate::session_membership::SessionMembership::new(h.owner.store());
+        let session = member.create().unwrap();
+        if mode != "unscoped-aba" {
+            member.enroll(session, parent).unwrap();
+        }
+        let before = h
+            .owner
+            .store()
+            .list(b"runtime/conversation/")
+            .unwrap()
+            .len();
+        let owner = h.owner.clone();
+        RESET_PROOF_BEFORE_SAVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let member = crate::session_membership::SessionMembership::new(owner.store());
+                match mode {
+                    "reenroll" => {
+                        member.revoke(session, parent).unwrap();
+                        member.enroll(session, parent).unwrap();
+                    }
+                    "unscoped-aba" => {
+                        member.enroll(session, parent).unwrap();
+                        member.revoke(session, parent).unwrap();
+                    }
+                    "abort" => {
+                        let key = Harness::key(parent);
+                        let old = owner.store().get(&key).unwrap().unwrap();
+                        let mut value: serde_json::Value =
+                            serde_json::from_slice(&old.value).unwrap();
+                        value["abort_requested"] = true.into();
+                        owner
+                            .store()
+                            .commit(
+                                &[Check {
+                                    key: key.clone(),
+                                    expected: Expected::Version(old.version),
+                                }],
+                                &[Mutation::Put {
+                                    key,
+                                    value: serde_json::to_vec(&value).unwrap(),
+                                }],
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }))
+        });
+        assert!(
+            matches!(
+                h.fork(parent),
+                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+            ),
+            "{mode}"
+        );
+        assert_eq!(
+            h.owner
+                .store()
+                .list(b"runtime/conversation/")
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_membership_kill_worker() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_FORK_MEMBERSHIP_DB") else {
+        return;
+    };
+    let parent: Uuid = std::env::var("PI_FORK_MEMBERSHIP_PARENT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let before = std::env::var("PI_FORK_MEMBERSHIP_BEFORE").unwrap() == "1";
+    let mut h = Harness::open_paused(path, options()).unwrap();
+    if before {
+        RESET_PROOF_BEFORE_SAVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                println!("FORK_MEMBERSHIP_BEFORE");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }))
+        });
+    }
+    let child = h.fork(parent).unwrap();
+    println!("FORK_MEMBERSHIP_AFTER:{child}");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn fork_membership_process_kill_is_atomic_before_and_after_commit() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    for before in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let parent = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let member = crate::session_membership::SessionMembership::new(h.owner.store());
+        let session = member.create().unwrap();
+        member.enroll(session, parent).unwrap();
+        drop(h);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::runtime_cas_tests::fork_membership_kill_worker",
+                "--nocapture",
+            ])
+            .env("PI_FORK_MEMBERSHIP_DB", &path)
+            .env("PI_FORK_MEMBERSHIP_PARENT", parent.to_string())
+            .env("PI_FORK_MEMBERSHIP_BEFORE", if before { "1" } else { "0" })
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line.contains("FORK_MEMBERSHIP_BEFORE")
+                    || line.contains("FORK_MEMBERSHIP_AFTER:")
+                {
+                    let _ = tx.send(line);
+                    break;
+                }
+            }
+        });
+        let observed = rx.recv_timeout(Duration::from_secs(20));
+        let _ = child.kill();
+        let _ = child.wait();
+        let line = observed.expect("fork child did not reach commit boundary");
+        let h = Harness::open_paused(&path, options()).unwrap();
+        if before {
+            assert_eq!(
+                h.owner
+                    .store()
+                    .list(b"runtime/conversation/")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                h.owner
+                    .store()
+                    .list(b"durable/session-membership/v1/conversation/")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            let id: Uuid = line
+                .split("FORK_MEMBERSHIP_AFTER:")
+                .nth(1)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            crate::session_membership::SessionMembership::new(h.owner.store())
+                .authorize_pair(session, parent, id)
+                .unwrap()
+                .commit(&[], &[])
+                .unwrap();
+            assert!(h.conversation(id).is_ok());
+        }
+    }
+}
+
+#[test]
+fn scoped_forks_reject_aborting_parent_even_for_historical_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let member = crate::session_membership::SessionMembership::new(h.owner.store());
+    let session = member.create().unwrap();
+    member.enroll(session, parent).unwrap();
+    let cursor = crate::observer::Observer::new(h.owner.store(), parent)
+        .head()
+        .unwrap();
+    h.request_abort(parent).unwrap();
+    assert!(h.fork(parent).is_err());
+    assert!(h.fork_at(parent, cursor).is_err());
+    assert_eq!(
+        h.owner
+            .store()
+            .list(b"runtime/conversation/")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn historical_fork_membership_reenrollment_conflicts_at_publication() {
+    for mode in ["at", "position", "entry", "display"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let parent = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let member = crate::session_membership::SessionMembership::new(h.owner.store());
+        let session = member.create().unwrap();
+        member.enroll(session, parent).unwrap();
+        let (mut state, version) = h.load(parent).unwrap();
+        state.messages.push(Message::User {
+            content: "message".into(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        let page = h
+            .view_positioned(parent, std::num::NonZeroUsize::new(10).unwrap())
+            .unwrap();
+        let position = page.entries[0].position.clone();
+        let entry = page.entries[0].history.as_ref().unwrap().id;
+        let display = h
+            .submit_write(parent, None, "app.note".into(), None)
+            .unwrap();
+        let cursor = crate::observer::Observer::new(h.owner.store(), parent)
+            .head()
+            .unwrap();
+        let before = h
+            .owner
+            .store()
+            .list(b"runtime/conversation/")
+            .unwrap()
+            .len();
+        let owner = h.owner.clone();
+        RESET_PROOF_BEFORE_SAVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let member = crate::session_membership::SessionMembership::new(owner.store());
+                member.revoke(session, parent).unwrap();
+                member.enroll(session, parent).unwrap();
+            }))
+        });
+        let result = match mode {
+            "at" => h.fork_at(parent, cursor),
+            "position" => h.fork_at_position(parent, position),
+            "entry" => h.fork_by_entry_id(parent, entry),
+            "display" => h.fork_by_display_entry_id(parent, display),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(
+                result,
+                Err(Error::Storage(durable_store::Error::Conflict { .. }))
+            ),
+            "{mode}: {result:?}"
+        );
+        assert_eq!(
+            h.owner
+                .store()
+                .list(b"runtime/conversation/")
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+}

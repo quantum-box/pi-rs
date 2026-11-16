@@ -7600,6 +7600,18 @@ impl Harness {
     pub(crate) fn create_subagent_from_seed(&mut self, seed: &Conversation) -> Result<(), Error> {
         self.save(seed, Expected::Missing)
     }
+    fn fork_membership_proof(
+        &self,
+        parent: Uuid,
+    ) -> Result<crate::session_membership::ForkMembershipProof, Error> {
+        crate::session_membership::ForkMembershipProof::capture(self.owner.store(), parent).map_err(
+            |error| match error {
+                crate::session_membership::Error::Store(error) => Error::Storage(error),
+                other => Error::Invalid(format!("fork session membership: {other}")),
+            },
+        )
+    }
+
     /// Fork the current settled conversation. Queued inputs and request IDs
     /// are not inherited. Use `fork_at` for historical observation cuts.
     pub fn fork(&mut self, id: Uuid) -> Result<Uuid, Error> {
@@ -7612,7 +7624,8 @@ impl Harness {
         mut after_load: F,
     ) -> Result<Uuid, Error> {
         let mut attempts = 0;
-        let (mut state, revision) = loop {
+        let (mut state, revision, membership) = loop {
+            let membership = self.fork_membership_proof(id)?;
             let (state, version) = self.load(id)?;
             after_load();
             let revision = self.owner.store().document_snapshot()?;
@@ -7624,7 +7637,7 @@ impl Harness {
                 .get(&Self::key(id))?
                 .is_some_and(|entry| entry.version == version)
             {
-                break (state, revision);
+                break (state, revision, membership);
             }
             attempts += 1;
             if attempts == FORK_DOCUMENT_ATTEMPTS {
@@ -7665,8 +7678,11 @@ impl Harness {
         state.compaction_return_turns = None;
         state.phase = Phase::Idle;
         retry_document_fork(|| {
-            let batch = crate::document::Documents::new(self.owner.store())
+            let mut batch = crate::document::Documents::new(self.owner.store())
                 .fork_scope(id, state.id, revision)?;
+            membership
+                .append_to(state.id, &mut batch)
+                .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
             self.save_composed_locked(&state, Expected::Missing, None, &[], &[], Some(&batch))
         })?;
         Ok(state.id)
@@ -7674,15 +7690,17 @@ impl Harness {
     /// Fork a committed observation cut, including cuts during active work.
     /// Incomplete tool batches and snapshots without historical state fail closed.
     pub fn fork_at(&mut self, id: Uuid, cursor: crate::observer::Cursor) -> Result<Uuid, Error> {
-        self.fork_at_cut(id, cursor, None)
+        let membership = self.fork_membership_proof(id)?;
+        self.fork_at_cut(id, cursor, None, &membership)
     }
     fn fork_at_cut(
         &mut self,
         id: Uuid,
         cursor: crate::observer::Cursor,
         prefix: Option<(usize, usize)>,
+        membership: &crate::session_membership::ForkMembershipProof,
     ) -> Result<Uuid, Error> {
-        self.fork_at_selected(id, cursor, prefix, None, None, None, &[])
+        self.fork_at_selected(id, cursor, prefix, None, None, None, &[], membership)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7695,6 +7713,7 @@ impl Harness {
         reset_cut: Option<(Conversation, crate::transcript::Cursor, u64, Vec<Check>)>,
         display_len: Option<usize>,
         evidence: &[Check],
+        membership: &crate::session_membership::ForkMembershipProof,
     ) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
@@ -8049,6 +8068,9 @@ impl Harness {
             )?;
             batch.checks.extend_from_slice(evidence);
             batch.checks.extend_from_slice(&source_checks);
+            membership
+                .append_to(state.id, &mut batch)
+                .map_err(|error| Error::Invalid(format!("fork session membership: {error}")))?;
             if let Some((_, _, _, checks)) = &reset_cut {
                 batch.checks.extend(checks.clone());
             }
@@ -8192,6 +8214,7 @@ impl Harness {
     /// prefix. Historical state comes from its owner, current-policy documents
     /// from the immediate parent. Unprovable histories fail closed.
     pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let membership = self.fork_membership_proof(id)?;
         self.load(id)?;
         if entry_id.is_nil() || self.owner.store().legacy_version_boundary()? != 0 {
             return Err(crate::fork::Error::InvalidSnapshot.into());
@@ -8336,6 +8359,7 @@ impl Harness {
             None,
             None,
             &[],
+            &membership,
         )
     }
 
@@ -8356,6 +8380,7 @@ impl Harness {
             ],
             crate::transcript::DISPLAY_FORK_RECORD_LIMIT,
         );
+        let membership = self.fork_membership_proof(id)?;
         let _proof_scope = ResetProofScope::enter();
         let (_, root_version) = self.load(id)?;
         let store = self.owner.store();
@@ -8506,6 +8531,7 @@ impl Harness {
                             None,
                             Some(index + 1),
                             &checks,
+                            &membership,
                         );
                     }
                 }
@@ -8523,6 +8549,15 @@ impl Harness {
     /// Interior positions require proof of unchanged fork state or a tool-free
     /// append changing only config; incomplete tool transcripts are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
+        let membership = self.fork_membership_proof(id)?;
+        self.fork_at_position_with_membership(id, position, &membership)
+    }
+    fn fork_at_position_with_membership(
+        &mut self,
+        id: Uuid,
+        position: ViewCursor,
+        membership: &crate::session_membership::ForkMembershipProof,
+    ) -> Result<Uuid, Error> {
         let _proof_scope = ResetProofScope::enter();
         self.load(id)?;
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
@@ -8548,7 +8583,7 @@ impl Harness {
                 .as_ref()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             let original = self.original_occurrence_position(history, message)?;
-            return self.fork_at_position(history.origin, original);
+            return self.fork_at_position_with_membership(history.origin, original, membership);
         }
         let compacted_metadata = match &change {
             TranscriptChange::ReplaceCompacted {
@@ -8617,6 +8652,7 @@ impl Harness {
                 Some((cut, position.cursor, revision, checks)),
                 None,
                 &[],
+                membership,
             );
         }
         let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
@@ -8661,10 +8697,10 @@ impl Harness {
                 .as_ref()
                 .ok_or(crate::fork::Error::InvalidSnapshot)?;
             let original = self.original_occurrence_position(history, message)?;
-            return self.fork_at_position(history.origin, original);
+            return self.fork_at_position_with_membership(history.origin, original, membership);
         }
         if count == messages.len() {
-            return self.fork_at(id, record.cursor);
+            return self.fork_at_cut(id, record.cursor, None, membership);
         }
         let prefix = stable_prefix.ok_or(crate::fork::Error::InvalidSnapshot)?;
         let total = prefix
@@ -8673,7 +8709,7 @@ impl Harness {
         let expected_len = prefix
             .checked_add(messages.len())
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
-        self.fork_at_cut(id, record.cursor, Some((total, expected_len)))
+        self.fork_at_cut(id, record.cursor, Some((total, expected_len)), membership)
     }
 
     fn original_occurrence_position(
@@ -8803,6 +8839,7 @@ impl Harness {
     /// be visible in the captured shared chain and have an origin snapshot.
     /// Local retained observations are scanned across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let membership = self.fork_membership_proof(id)?;
         let _proof_scope = ResetProofScope::enter();
         self.load(id)?;
         if entry_id.is_nil() {
@@ -8982,7 +9019,11 @@ impl Harness {
                     } else if local_match.is_some() || found.is_some() {
                         return Err(crate::fork::Error::InvalidSnapshot.into());
                     }
-                    return self.fork_at_position(history.origin, original);
+                    return self.fork_at_position_with_membership(
+                        history.origin,
+                        original,
+                        &membership,
+                    );
                 }
                 break;
             }
@@ -9030,8 +9071,12 @@ impl Harness {
             next_position = Some(page.next);
         }
         match (local_match, found) {
-            (Some(position), None) => self.fork_at_position(id, position),
-            (None, Some((origin, position))) => self.fork_at_position(origin, position),
+            (Some(position), None) => {
+                self.fork_at_position_with_membership(id, position, &membership)
+            }
+            (None, Some((origin, position))) => {
+                self.fork_at_position_with_membership(origin, position, &membership)
+            }
             _ => Err(crate::fork::Error::InvalidCursor.into()),
         }
     }

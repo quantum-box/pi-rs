@@ -74,6 +74,88 @@ fn checked(key: Vec<u8>, version: u64) -> Check {
     }
 }
 
+/// Membership evidence captured for the conversation the caller actually
+/// forks, even when the selected history originated in another conversation.
+pub(crate) struct ForkMembershipProof {
+    checks: Vec<Check>,
+    session: Option<Uuid>,
+    boundary: u64,
+}
+impl ForkMembershipProof {
+    pub(crate) fn capture(store: &Store, parent: Uuid) -> Result<Self, Error> {
+        let boundary = store.put_version()?;
+        let root = crate::runtime::Harness::key(parent);
+        let record = store.get(&root)?.ok_or(Error::InvalidConversation)?;
+        let key = member_key(parent);
+        // These are small identity records, including when the caller is a
+        // resource-bounded historical fork.
+        let entry = store.get_bounded(&key, 4096)?;
+        let mut checks = vec![checked(root, record.version)];
+        let session = if let Some(entry) = entry {
+            validate_conversation(parent, &record.value)?;
+            let membership: Membership =
+                serde_json::from_slice(&entry.value).map_err(|_| Error::Unauthorized)?;
+            if membership.version != 1
+                || membership.conversation != parent
+                || membership.session.is_nil()
+            {
+                return Err(Error::Unauthorized);
+            }
+            checks.push(checked(key, entry.version));
+            let session_key = session_key(membership.session);
+            let session_entry = store
+                .get_bounded(&session_key, 4096)?
+                .ok_or(Error::Unauthorized)?;
+            let session: SessionRecord =
+                serde_json::from_slice(&session_entry.value).map_err(|_| Error::Unauthorized)?;
+            if session.version != 1 || session.id != membership.session {
+                return Err(Error::Unauthorized);
+            }
+            checks.push(checked(session_key, session_entry.version));
+            Some(membership.session)
+        } else {
+            checks.push(Check {
+                key,
+                expected: Expected::MissingUnchangedSince(boundary),
+            });
+            None
+        };
+        Ok(Self {
+            checks,
+            session,
+            boundary,
+        })
+    }
+
+    pub(crate) fn append_to(
+        &self,
+        child: Uuid,
+        batch: &mut crate::task_store::OwnedBatch,
+    ) -> Result<(), Error> {
+        let key = member_key(child);
+        batch.checks.push(Check {
+            key: key.clone(),
+            expected: Expected::MissingUnchangedSince(self.boundary),
+        });
+        if let Some(session) = self.session {
+            batch.mutations.push(Mutation::Put {
+                key,
+                value: serde_json::to_vec(&Membership {
+                    version: 1,
+                    session,
+                    conversation: child,
+                })?,
+            });
+        }
+        for check in &self.checks {
+            if !batch.checks.contains(check) {
+                batch.checks.push(check.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Resolve authority from the owner's membership, never from a caller-supplied
 /// session identifier. Every record used here is retained as a commit check.
 pub(crate) fn task_pair(

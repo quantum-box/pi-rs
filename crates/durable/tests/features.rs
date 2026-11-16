@@ -2812,6 +2812,9 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
     scheduler.tick(0).unwrap();
     drop(scheduler);
     let db = Store::open(&path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&db);
+    let session = membership.create().unwrap();
+    membership.enroll(session, parent).unwrap();
     let entries = application_entry::list(&db, parent).unwrap();
     assert_eq!(entries.len(), 2);
     h.submit_and_run(parent, None, "after task".into(), &cancel)
@@ -2841,7 +2844,25 @@ async fn application_entry_fork_uses_atomic_entry_commit_and_reopens() {
             .iter()
             .all(|record| { record.task.owner() != &TaskOwner::Conversation(child) })
     );
+    membership
+        .authorize_pair(session, parent, child)
+        .unwrap()
+        .commit(&[], &[])
+        .unwrap();
+    let child_session = membership.create().unwrap();
+    membership.revoke(session, child).unwrap();
+    membership.enroll(child_session, child).unwrap();
     let inherited = h.fork_at_application_entry(child, entries[0].id).unwrap();
+    membership
+        .authorize_pair(child_session, child, inherited)
+        .unwrap()
+        .commit(&[], &[])
+        .unwrap();
+    assert!(
+        membership
+            .authorize_pair(session, parent, inherited)
+            .is_err()
+    );
     assert_eq!(
         application_entry::list(&db, inherited).unwrap(),
         entries[..1]
