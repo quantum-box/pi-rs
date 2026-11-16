@@ -282,6 +282,10 @@ impl CleanupGraph {
                 opaque_edge = true;
                 continue;
             }
+            // A background conversation is not an abort dependency of its owner.
+            if edge.mode == Mode::Background {
+                continue;
+            }
             if !conversations.contains(&edge.child) || invalid_conversations.contains(&edge.child) {
                 invalid_tasks.insert(edge.task);
                 continue;

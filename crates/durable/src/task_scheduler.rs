@@ -3306,6 +3306,7 @@ impl Scheduler {
             };
             let worker = self.validator.as_ref().unwrap().worker();
             let timeout = self.cleanup_timeout;
+            let store_owner = self.owner();
             // Keep the scheduler attachment until a cancelled worker has actually stopped.
             let attachment = self.attachment.clone();
             let cancel = cancel.clone();
@@ -3313,14 +3314,25 @@ impl Scheduler {
             self.cleanup_cursor = Some(id);
             self.cleanup_jobs.spawn(async move {
                 let _attachment = attachment;
-                let result =
-                    tokio::time::timeout(timeout, worker.settle_owned_abort(id, &cancel, lock))
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(crate::runtime::Error::Invalid(
-                                "cleanup timed out; reconcile before reopening".into(),
-                            ))
-                        });
+                let result = match tokio::time::timeout(
+                    timeout,
+                    worker.settle_owned_abort(id, &cancel, lock),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => match store_owner
+                        .store()
+                        .get(&crate::runtime::owned_cleanup_key(id))
+                    {
+                        // No marker means the future stopped before it could dispatch.
+                        Ok(None) => Ok(false),
+                        Ok(Some(_)) => Err(crate::runtime::Error::Invalid(
+                            "cleanup timed out; reconcile before retry".into(),
+                        )),
+                        Err(error) => Err(crate::runtime::Error::Storage(error)),
+                    },
+                };
                 (id, result)
             });
             progress = true;
@@ -16011,6 +16023,143 @@ mod standalone_foreground_cleanup_tests {
                 .is_terminal()
         );
         assert!(!scheduler.get(broken.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn pre_marker_timeout_retries_after_summary_fence_is_released() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let parent = task(1, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        let edge = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        db.commit(&edge.checks, &edge.mutations).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.succeed(json!(null))
+            })
+            .unwrap();
+        h.request_abort(child).unwrap();
+        drop(h);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        scheduler.cleanup_timeout = Duration::from_millis(20);
+        let control = scheduler.owner().conversation_controls().get(child);
+        let guard = control.summary_execution.read().await;
+        scheduler
+            .tick_with_conversation_cleanup(0, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(scheduler.cleanup_running.contains(&child));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        scheduler
+            .tick_with_conversation_cleanup(0, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!scheduler.cleanup_running.contains(&child));
+        assert!(
+            !scheduler
+                .conversation_cleanup_failures()
+                .contains_key(&child)
+        );
+        assert!(
+            db.get(&crate::runtime::owned_cleanup_key(child))
+                .unwrap()
+                .is_none()
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                scheduler
+                    .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                if !scheduler
+                    .validator
+                    .as_ref()
+                    .unwrap()
+                    .conversation(child)
+                    .unwrap()
+                    .abort_requested
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup did not retry after the summary fence was released");
+    }
+
+    #[tokio::test]
+    async fn missing_background_child_does_not_hold_owner_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let parent = task(1, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&parent)]).unwrap();
+        let edge = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Background,
+            })
+            .unwrap();
+        db.commit(&edge.checks, &edge.mutations).unwrap();
+        h.request_abort_task(parent.id()).unwrap();
+        drop(h);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        let key = format!("runtime/conversation/{child}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Delete { key }],
+        )
+        .unwrap();
+        for _ in 0..20 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
     }
 
     #[tokio::test]

@@ -44,8 +44,9 @@ has a 30-second timeout. Callback failures and timeouts are exposed by
 other graphs continue. Before each standalone cleanup step, the runtime waits for active summaries to
 leave their shared execution fence, then commits an attempt marker fenced by the
 conversation version. A timeout while waiting for that fence starts no cleanup
-attempt and creates no marker; the existing summary remains governed by its own
-recovery and request-ID settlement contract. Timeout, cancellation, crash, callback
+attempt and creates no marker; it is retryable by a later tick without reopening
+or reconciliation. The existing summary remains governed by its own recovery
+and request-ID settlement contract. Timeout, cancellation, crash, callback
 failure, or a crash after the callback succeeds can leave the marker and block
 all subsequent abort cleanup and independent-summary execution for that conversation,
 including automatic recovery and explicit resume after reopen. Blocked summaries
@@ -56,7 +57,8 @@ requires the cleanup worker to be stopped; it does not itself inspect or reverse
 external effects. Even a crash before dispatch can require reconciliation. An
 unrelated missing owned conversation, malformed edge, or invalid abort mark is skipped during
 candidate discovery; the affected graph requires separate repair. Task abort
-settlement also isolates edges whose affected task can be identified. If an edge
+settlement also isolates edges whose affected task can be identified; a missing
+background child does not hold its owner's abort. If an edge
 is too malformed to identify its owner, all task abort settlements remain parked
 until repair because the runtime cannot prove which task owns it; independent
 conversation cleanup can still proceed. Summary execution shares a per-conversation
