@@ -90,6 +90,10 @@ impl Cursor {
     pub(crate) fn transcript_id(&self) -> Uuid {
         self.transcript
     }
+
+    pub(crate) fn entry_identity(&self) -> Option<(Uuid, u64)> {
+        self.next.map(|link| (link.id, link.sequence))
+    }
 }
 #[derive(Debug)]
 pub struct Record {
@@ -102,6 +106,15 @@ pub struct Page {
     pub records: Vec<Record>,
     pub next: Cursor,
     pub has_more: bool,
+}
+
+/// A snapshot expected at an intermediate transcript position. The expected
+/// state must be derived independently by the caller from a trusted baseline.
+#[derive(Clone, Debug)]
+pub struct AtomicSnapshotProof {
+    pub cursor: Cursor,
+    pub snapshot_key: Vec<u8>,
+    pub expected_snapshot: Value,
 }
 
 /// Add all checks and mutations intact to a single host transaction.
@@ -119,6 +132,22 @@ pub struct Transcript<'a> {
 impl<'a> Transcript<'a> {
     pub fn new(store: &'a Store, id: Uuid) -> Self {
         Self { store, id }
+    }
+
+    /// Locate and validate the exact entry addressed by a cursor. This does
+    /// not prove that the entry is reachable or authorize a fork.
+    pub(crate) fn entry_evidence(&self, cursor: &Cursor) -> Result<(Vec<u8>, u64), Error> {
+        if cursor.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        let link = cursor.next.ok_or(Error::Corrupt)?;
+        let key = entry_key(link.id);
+        let stored = self
+            .store
+            .get_bounded(&key, 8 * 1024 * 1024)?
+            .ok_or(Error::Corrupt)?;
+        decode_entry(link, &stored.value)?;
+        Ok((key, stored.version))
     }
 
     /// Create an empty transcript, failing atomically if its ID already exists.
@@ -171,9 +200,31 @@ impl<'a> Transcript<'a> {
         blocks: Option<Vec<MessageContentBlocks>>,
         create: bool,
     ) -> Result<(Batch, Cursor), Error> {
-        if blocks
-            .as_ref()
-            .is_some_and(|blocks| !valid_block_bindings(value, blocks))
+        let (batch, mut positions) = self.prepare_writes(&[(value.clone(), blocks)], create)?;
+        Ok((batch, positions.pop().expect("one transcript record")))
+    }
+
+    /// Prepare ordered immutable entries under one checked head update.
+    /// Positions correspond to the input records and can be used to fork at
+    /// an intermediate entry after the batch commits. An empty batch is invalid.
+    pub fn prepare_append_batch(
+        &self,
+        records: &[(Value, Option<Vec<MessageContentBlocks>>)],
+    ) -> Result<(Batch, Vec<Cursor>), Error> {
+        self.prepare_writes(records, false)
+    }
+
+    fn prepare_writes(
+        &self,
+        records: &[(Value, Option<Vec<MessageContentBlocks>>)],
+        create: bool,
+    ) -> Result<(Batch, Vec<Cursor>), Error> {
+        if records.is_empty()
+            || records.iter().any(|(value, blocks)| {
+                blocks
+                    .as_ref()
+                    .is_some_and(|blocks| !valid_block_bindings(value, blocks))
+            })
         {
             return Err(Error::Corrupt);
         }
@@ -192,55 +243,179 @@ impl<'a> Transcript<'a> {
         if let Some(tip) = head.tip {
             self.load_entry(tip)?;
         }
-        let sequence = head
-            .tip
-            .map_or(Some(1), |t| t.sequence.checked_add(1))
-            .ok_or(Error::SequenceExhausted)?;
-        let tip = Link {
-            id: Uuid::new_v4(),
-            sequence,
-        };
-        let entry = Entry {
-            format: if blocks.is_some() { 2 } else { 1 },
-            id: tip.id,
-            sequence,
-            previous: head.tip,
-            value: value.clone(),
-            content_blocks: blocks,
-        };
-        let hk = head_key(self.id);
-        let ek = entry_key(tip.id);
-        Ok((
-            Batch {
-                checks: vec![
-                    Check {
-                        key: hk.clone(),
-                        expected,
-                    },
-                    Check {
-                        key: ek.clone(),
-                        expected: Expected::Missing,
-                    },
-                ],
-                mutations: vec![
-                    Mutation::Put {
-                        key: ek,
-                        value: encode(&entry)?,
-                    },
-                    Mutation::Put {
-                        key: hk,
-                        value: encode(&Head {
-                            format: 1,
-                            tip: Some(tip),
-                        })?,
-                    },
-                ],
-            },
-            Cursor {
+        let head_key = head_key(self.id);
+        let mut checks = vec![Check {
+            key: head_key.clone(),
+            expected,
+        }];
+        let mut mutations = Vec::with_capacity(records.len() + 1);
+        let mut positions = Vec::with_capacity(records.len());
+        let mut previous = head.tip;
+        let mut keys = std::collections::HashSet::new();
+        for (value, blocks) in records {
+            let sequence = previous
+                .map_or(Some(1), |link| link.sequence.checked_add(1))
+                .ok_or(Error::SequenceExhausted)?;
+            let tip = Link {
+                id: Uuid::new_v4(),
+                sequence,
+            };
+            let key = entry_key(tip.id);
+            if !keys.insert(tip.id) {
+                return Err(Error::Corrupt);
+            }
+            let entry = Entry {
+                format: if blocks.is_some() { 2 } else { 1 },
+                id: tip.id,
+                sequence,
+                previous,
+                value: value.clone(),
+                content_blocks: blocks.clone(),
+            };
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            });
+            mutations.push(Mutation::Put {
+                key,
+                value: encode(&entry)?,
+            });
+            positions.push(Cursor {
                 transcript: self.id,
                 next: Some(tip),
-            },
-        ))
+            });
+            previous = Some(tip);
+        }
+        mutations.push(Mutation::Put {
+            key: head_key,
+            value: encode(&Head {
+                format: 1,
+                tip: previous,
+            })?,
+        });
+        Ok((Batch { checks, mutations }, positions))
+    }
+
+    /// Verify that a nonempty contiguous append chain and an application-owned
+    /// anchor were written in the same store commit. The caller must validate
+    /// the anchor's contents, namespace, and relationship to application state.
+    /// A later append to this transcript does not invalidate the proof.
+    pub fn verify_atomic_append(
+        &self,
+        anchor_key: &[u8],
+        prior: &Cursor,
+        positions: &[Cursor],
+    ) -> Result<(), Error> {
+        self.verify_atomic_chain(anchor_key, prior, positions)
+            .map(|_| ())
+    }
+
+    /// Return checks for a verified chain so the caller can fence all of its
+    /// evidence in the transaction that publishes the dependent result.
+    #[allow(dead_code)] // Used by the future authenticated fork commit.
+    pub(crate) fn atomic_append_checks(
+        &self,
+        anchor_key: &[u8],
+        prior: &Cursor,
+        positions: &[Cursor],
+    ) -> Result<Vec<Check>, Error> {
+        let (commit, anchor_version) = self.verify_atomic_chain(anchor_key, prior, positions)?;
+        let mut checks = vec![Check {
+            key: anchor_key.to_vec(),
+            expected: Expected::Version(anchor_version),
+        }];
+        for position in positions {
+            let (key, version) = self.entry_evidence(position)?;
+            if self.store.commit_for_version(&key, version)? != Some(commit) {
+                return Err(Error::Corrupt);
+            }
+            checks.push(Check {
+                key,
+                expected: Expected::Version(version),
+            });
+        }
+        self.store.commit(&checks, &[])?;
+        Ok(checks)
+    }
+
+    fn verify_atomic_chain(
+        &self,
+        anchor_key: &[u8],
+        prior: &Cursor,
+        positions: &[Cursor],
+    ) -> Result<(u64, u64), Error> {
+        if prior.transcript != self.id || positions.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        let anchor = self.store.get(anchor_key)?.ok_or(Error::Corrupt)?;
+        let commit = self
+            .store
+            .commit_for_version(anchor_key, anchor.version)?
+            .ok_or(Error::Corrupt)?;
+        let mut previous = prior.next;
+        for position in positions {
+            if position.transcript != self.id {
+                return Err(Error::Corrupt);
+            }
+            let link = position.next.ok_or(Error::Corrupt)?;
+            let key = entry_key(link.id);
+            let stored = self.store.get(&key)?.ok_or(Error::Corrupt)?;
+            let entry = decode_entry(link, &stored.value)?;
+            if entry.previous != previous
+                || self.store.commit_for_version(&key, stored.version)? != Some(commit)
+            {
+                return Err(Error::Corrupt);
+            }
+            previous = Some(link);
+        }
+        Ok((commit, anchor.version))
+    }
+
+    /// Verify exact independently derived snapshots and their cursor bindings
+    /// were committed together with the ordered entries and anchor. The caller
+    /// also checks the anchor's captured document revision. The caller must
+    /// independently derive states and the expected revision, authenticate the
+    /// anchor, and preserve immutability of these storage namespaces.
+    pub fn verify_atomic_snapshots(
+        &self,
+        anchor_key: &[u8],
+        prior: &Cursor,
+        proofs: &[AtomicSnapshotProof],
+        document_revision: u64,
+    ) -> Result<(), Error> {
+        if self.store.document_cut(anchor_key)? != Some(document_revision) {
+            return Err(Error::Corrupt);
+        }
+        let cursors: Vec<_> = proofs.iter().map(|proof| proof.cursor.clone()).collect();
+        let (commit, anchor_version) = self.verify_atomic_chain(anchor_key, prior, &cursors)?;
+        let mut keys = std::collections::HashSet::new();
+        for proof in proofs {
+            if proof.snapshot_key.as_slice() == anchor_key || !keys.insert(&proof.snapshot_key) {
+                return Err(Error::Corrupt);
+            }
+            let snapshot = self.store.get(&proof.snapshot_key)?.ok_or(Error::Corrupt)?;
+            let value: Value = decode(&snapshot.value)?;
+            let bound_cursor: Cursor =
+                serde_json::from_value(value.get("_transcript").cloned().ok_or(Error::Corrupt)?)
+                    .map_err(|_| Error::Corrupt)?;
+            if value != proof.expected_snapshot
+                || bound_cursor != proof.cursor
+                || self
+                    .store
+                    .commit_for_version(&proof.snapshot_key, snapshot.version)?
+                    != Some(commit)
+            {
+                return Err(Error::Corrupt);
+            }
+        }
+        if self
+            .store
+            .get(anchor_key)?
+            .is_none_or(|entry| entry.version != anchor_version)
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
     }
 
     /// Fork the current head. A simultaneous source append makes this batch
@@ -449,25 +624,30 @@ impl<'a> Transcript<'a> {
     }
     fn load_entry(&self, link: Link) -> Result<Entry, Error> {
         let stored = self.store.get(&entry_key(link.id))?.ok_or(Error::Corrupt)?;
-        let entry: Entry = decode(&stored.value)?;
-        if !match (entry.format, entry.content_blocks.as_ref()) {
-            (1, None) => true,
-            (2, Some(blocks)) => valid_block_bindings(&entry.value, blocks),
-            _ => false,
-        } || entry.id != link.id
-            || entry.sequence != link.sequence
-            || match entry.previous {
-                None => entry.sequence != 1,
-                Some(prev) => {
-                    prev.id == entry.id || prev.sequence.checked_add(1) != Some(entry.sequence)
-                }
-            }
-        {
-            return Err(Error::Corrupt);
-        }
-        Ok(entry)
+        decode_entry(link, &stored.value)
     }
 }
+
+fn decode_entry(link: Link, value: &[u8]) -> Result<Entry, Error> {
+    let entry: Entry = decode(value)?;
+    if !match (entry.format, entry.content_blocks.as_ref()) {
+        (1, None) => true,
+        (2, Some(blocks)) => valid_block_bindings(&entry.value, blocks),
+        _ => false,
+    } || entry.id != link.id
+        || entry.sequence != link.sequence
+        || match entry.previous {
+            None => entry.sequence != 1,
+            Some(prev) => {
+                prev.id == entry.id || prev.sequence.checked_add(1) != Some(entry.sequence)
+            }
+        }
+    {
+        return Err(Error::Corrupt);
+    }
+    Ok(entry)
+}
+
 fn valid_block_bindings(value: &Value, blocks: &[MessageContentBlocks]) -> bool {
     if blocks.is_empty() {
         return false;
@@ -591,6 +771,314 @@ mod tests {
                 return result;
             }
         }
+    }
+
+    #[test]
+    fn atomic_snapshot_proofs_bind_exact_state_cursor_and_transaction() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let prior = t.snapshot().unwrap();
+        let (mut batch, cursors) = t
+            .prepare_append_batch(&[(json!({"reset":1}), None), (json!({"reset":2}), None)])
+            .unwrap();
+        let document = crate::document::Address {
+            scope: "scope".into(),
+            name: "note".into(),
+            key: "".into(),
+        }
+        .storage_key()
+        .unwrap();
+        batch.mutations.push(Mutation::Put {
+            key: document.clone(),
+            value: br#"{"version":1}"#.to_vec(),
+        });
+        let anchor = format!("runtime/fork/{id}/00000000000000000001").into_bytes();
+        batch.mutations.push(Mutation::Put {
+            key: anchor.clone(),
+            value: b"runtime commit".to_vec(),
+        });
+        let proofs: Vec<_> = cursors.iter().enumerate().map(|(index, cursor)| AtomicSnapshotProof {
+            cursor: cursor.clone(), snapshot_key: format!("test/snapshot/{index}").into_bytes(),
+            expected_snapshot: json!({"_transcript":cursor,"resets":index+1,"documents":{"doc":"value"}}),
+        }).collect();
+        for proof in &proofs {
+            batch.mutations.push(Mutation::Put {
+                key: proof.snapshot_key.clone(),
+                value: serde_json::to_vec(&proof.expected_snapshot).unwrap(),
+            });
+        }
+        commit(&db, batch);
+        let revision = db.document_cut(&anchor).unwrap().unwrap();
+        t.verify_atomic_snapshots(&anchor, &prior, &proofs, revision)
+            .unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: document.clone(),
+                value: br#"{"version":2}"#.to_vec(),
+            }],
+        )
+        .unwrap();
+        t.verify_atomic_snapshots(&anchor, &prior, &proofs, revision)
+            .unwrap();
+        let historical = db.document_at(&document, revision).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&historical.value).unwrap(),
+            json!({"version":1})
+        );
+        assert!(matches!(
+            t.verify_atomic_snapshots(&anchor, &prior, &proofs, revision + 1),
+            Err(Error::Corrupt)
+        ));
+        let mut forged = proofs.clone();
+        forged[0].expected_snapshot["documents"]["doc"] = json!("changed");
+        assert!(matches!(
+            t.verify_atomic_snapshots(&anchor, &prior, &forged, revision),
+            Err(Error::Corrupt)
+        ));
+        let mut forged = proofs.clone();
+        forged[0].cursor = cursors[1].clone();
+        assert!(matches!(
+            t.verify_atomic_snapshots(&anchor, &prior, &forged, revision),
+            Err(Error::Corrupt)
+        ));
+        let mut forged = proofs.clone();
+        forged[1].snapshot_key = forged[0].snapshot_key.clone();
+        assert!(matches!(
+            t.verify_atomic_snapshots(&anchor, &prior, &forged, revision),
+            Err(Error::Corrupt)
+        ));
+        let snapshot = db.get(&proofs[0].snapshot_key).unwrap().unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: proofs[0].snapshot_key.clone(),
+                value: snapshot.value,
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            t.verify_atomic_snapshots(&anchor, &prior, &proofs, revision),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn atomic_append_checks_fence_intermediate_rewrite() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let prior = t.snapshot().unwrap();
+        let (mut batch, cursors) = t
+            .prepare_append_batch(&[(json!({"a":1}), None), (json!({"b":2}), None)])
+            .unwrap();
+        let anchor = b"proof/anchor".to_vec();
+        batch.mutations.push(Mutation::Put {
+            key: anchor.clone(),
+            value: vec![],
+        });
+        commit(&db, batch);
+        let checks = t.atomic_append_checks(&anchor, &prior, &cursors).unwrap();
+        let (key, _) = t.entry_evidence(&cursors[0]).unwrap();
+        let value = db.get(&key).unwrap().unwrap().value;
+        db.commit(&[], &[Mutation::Put { key, value }]).unwrap();
+        let fork = b"proof/fork".to_vec();
+        assert!(matches!(
+            db.commit(
+                &checks,
+                &[Mutation::Put {
+                    key: fork.clone(),
+                    value: vec![]
+                }]
+            ),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(db.get(&fork).unwrap().is_none());
+    }
+
+    #[test]
+    fn atomic_append_proof_checks_anchor_chain_and_commit() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let prior = t.snapshot().unwrap();
+        let (mut batch, cursors) = t
+            .prepare_append_batch(&[(json!({"first":1}), None), (json!({"second":2}), None)])
+            .unwrap();
+        let anchor = b"test/proof".to_vec();
+        batch.checks.push(Check {
+            key: anchor.clone(),
+            expected: Expected::Missing,
+        });
+        batch.mutations.push(Mutation::Put {
+            key: anchor.clone(),
+            value: b"anchor".to_vec(),
+        });
+        commit(&db, batch);
+        t.verify_atomic_append(&anchor, &prior, &cursors).unwrap();
+        append(&db, id, json!({"later":3}));
+        t.verify_atomic_append(&anchor, &prior, &cursors).unwrap();
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &prior, &[]),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &prior, &[cursors[1].clone(), cursors[0].clone()]),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &cursors[0], &cursors),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            t.verify_atomic_append(b"test/missing", &prior, &cursors),
+            Err(Error::Corrupt)
+        ));
+        let mut foreign = cursors[0].clone();
+        foreign.transcript = Uuid::new_v4();
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &prior, &[foreign]),
+            Err(Error::Corrupt)
+        ));
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: anchor.clone(),
+                value: b"replacement".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &prior, &cursors),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn atomic_append_proof_rejects_forged_or_missing_entry() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let prior = t.snapshot().unwrap();
+        let (mut batch, cursors) = t.prepare_append_batch(&[(json!({"one":1}), None)]).unwrap();
+        let anchor = b"test/proof".to_vec();
+        batch.mutations.push(Mutation::Put {
+            key: anchor.clone(),
+            value: vec![],
+        });
+        commit(&db, batch);
+        let key = entry_key(cursors[0].next.unwrap().id);
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &prior, &cursors),
+            Err(Error::Corrupt)
+        ));
+        db.commit(&[], &[Mutation::Delete { key }]).unwrap();
+        assert!(matches!(
+            t.verify_atomic_append(&anchor, &prior, &cursors),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn ordered_batch_is_atomic_and_forkable_at_each_block_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let binding = |message_id, text: &str| MessageContentBlocks {
+            message_id,
+            blocks: vec![json!({"type":"text", "text":text})],
+        };
+        let record = |message_id| json!({"ReplaceV2":{"ids":[message_id],"messages":[{"role":"user","content":""}],"commit":1,"origin":id}});
+        let records = vec![
+            (record(first), Some(vec![binding(first, "first")])),
+            (record(second), Some(vec![binding(second, "second")])),
+        ];
+        let db = Store::open(&path).unwrap();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let before = t.snapshot().unwrap();
+        let (batch, cursors) = t.prepare_append_batch(&records).unwrap();
+        assert!(
+            t.read_with_blocks(&before, NonZeroUsize::MIN)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(matches!(
+            t.read_with_blocks(&cursors[0], NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
+        commit(&db, batch);
+        let (fork, _) = t.prepare_fork_at(&cursors[0], child).unwrap();
+        commit(&db, fork);
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        let t = Transcript::new(&db, id);
+        let page = t
+            .read_with_blocks(&t.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(
+            page.records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(page.records[0].content_blocks, records[1].1);
+        assert_eq!(page.records[1].content_blocks, records[0].1);
+        let fork = Transcript::new(&db, child);
+        let page = fork
+            .read_with_blocks(&fork.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].content_blocks, records[0].1);
+    }
+
+    #[test]
+    fn ordered_batch_rejects_invalid_records_and_stale_head_without_partial_entries() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        assert!(matches!(t.prepare_append_batch(&[]), Err(Error::Corrupt)));
+        let invalid = vec![(json!({"ok": true}), None), (json!(null), Some(vec![]))];
+        assert!(matches!(
+            t.prepare_append_batch(&invalid),
+            Err(Error::Corrupt)
+        ));
+        let (stale, positions) = t
+            .prepare_append_batch(&[(json!({"a":1}), None), (json!({"b":2}), None)])
+            .unwrap();
+        append(&db, id, json!({"winner": true}));
+        assert!(matches!(
+            db.commit(&stale.checks, &stale.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        for cursor in positions {
+            assert!(matches!(
+                t.read_with_blocks(&cursor, NonZeroUsize::MIN),
+                Err(Error::Corrupt)
+            ));
+        }
+        let page = t
+            .read_with_blocks(&t.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].value, json!({"winner": true}));
     }
 
     #[test]

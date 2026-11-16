@@ -42,6 +42,9 @@ pub enum Expected {
     MissingUnchangedSinceBefore(u64, Instant),
     /// Key must remain absent and the monotonic deadline must not elapse.
     MissingBefore(Instant),
+    /// No put under this byte prefix after the observed database put version.
+    /// Pair this with checks on observed keys to fence deletion.
+    PrefixUnchangedSince(u64),
     Version(u64),
     /// Version must match and the monotonic deadline must not have elapsed.
     VersionBefore(u64, Instant),
@@ -180,6 +183,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_document_history (key BLOB NOT NULL, revision INTEGER NOT NULL, value BLOB, version INTEGER, PRIMARY KEY(key, revision)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS durable_document_history_by_revision ON durable_document_history(revision, key);
             CREATE TABLE IF NOT EXISTS durable_document_cuts (key BLOB PRIMARY KEY NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS durable_document_cut_versions (key BLOB NOT NULL, version INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,version)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS durable_document_fence_versions (key BLOB NOT NULL, version INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,version)) WITHOUT ROWID;
             INSERT INTO durable_document_history(key, revision, value, version)
                 SELECT key, 0, value, version FROM durable_store_entries
                 WHERE substr(key, 1, 17)=CAST('durable/document/' AS BLOB)
@@ -603,6 +608,27 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// Read at most `limit` keys without allocating their values. Oversized
+    /// keys fail closed instead of being copied out of SQLite.
+    pub fn prefix_keys_bounded(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        max_key_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if limit == 0 || limit > 256 || max_key_bytes < prefix.len() {
+            return Err(Error::InvalidSnapshot);
+        }
+        let limit = i64::try_from(limit).map_err(|_| Error::InvalidSnapshot)?;
+        let cap = i64::try_from(max_key_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT CASE WHEN length(key)<=?3 THEN key ELSE NULL END FROM durable_store_entries WHERE substr(key,1,?1)=?2 ORDER BY key LIMIT ?4")?;
+        let rows = stmt.query_map(params![prefix.len() as i64, prefix, cap, limit], |r| {
+            r.get::<_, Option<Vec<u8>>>(0)
+        })?;
+        rows.map(|row| row?.ok_or(Error::InvalidSnapshot)).collect()
+    }
     /// Read multiple key ranges from one SQLite snapshot.
     pub fn list_prefixes(&self, prefixes: &[&[u8]]) -> Result<Vec<(Vec<u8>, Entry)>, Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
@@ -865,6 +891,42 @@ impl Store {
             .optional()?)
     }
 
+    /// Document cut captured for this exact snapshot version. Evidence is
+    /// forward-only; older snapshots are not assigned inferred versions.
+    pub fn document_cut_for_version(&self, key: &[u8], version: u64) -> Result<Option<u64>, Error> {
+        if version > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT revision FROM durable_document_cut_versions WHERE key=?1 AND version=?2",
+                params![key, version],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The document revision explicitly checked by the snapshot's commit.
+    /// Absence means no tracked fence; legacy records are not backfilled.
+    pub fn document_fence_for_version(
+        &self,
+        key: &[u8],
+        version: u64,
+    ) -> Result<Option<u64>, Error> {
+        if version > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT revision FROM durable_document_fence_versions WHERE key=?1 AND version=?2",
+                params![key, version],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Bounded, immutable application snapshots in commit order. Missing commit
     /// metadata (including migration seeds) is returned as `None` and must not
     /// be treated as a reconstructible entry boundary.
@@ -898,6 +960,19 @@ impl Store {
         Ok(conn.query_row(
             "SELECT MIN(sequence) FROM durable_commit_versions WHERE key=?1",
             [key],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// First tracked put of a key strictly after a store commit sequence.
+    pub fn next_commit_for_key(&self, key: &[u8], after: u64) -> Result<Option<u64>, Error> {
+        if after > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT MIN(sequence) FROM durable_commit_versions WHERE key=?1 AND sequence>?2",
+            params![key, after],
             |r| r.get(0),
         )?)
     }
@@ -937,6 +1012,82 @@ impl Store {
             return Ok(None);
         }
         Ok(keys.into_iter().next().map(|key| (runtime_sequence, key)))
+    }
+
+    /// Find a unique canonical, twenty-digit snapshot key written with the
+    /// specified runtime root commit. Other same-commit snapshot keys are
+    /// ignored. The caller must authenticate the matching observer and payload.
+    pub fn runtime_canonical_snapshot_at(
+        &self,
+        runtime_key: &[u8],
+        snapshot_prefix: &[u8],
+        sequence: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if sequence == 0 || sequence > i64::MAX as u64 || snapshot_prefix.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT e.key FROM durable_store_entries e JOIN durable_commit_versions c ON c.key=e.key AND c.version=e.version JOIN durable_commit_versions r ON r.key=?1 AND r.sequence=c.sequence WHERE c.sequence=?2 AND substr(e.key,1,?3)=?4 AND length(e.key)=?5")?;
+        let rows = stmt.query_map(
+            params![
+                runtime_key,
+                sequence,
+                snapshot_prefix.len() as i64,
+                snapshot_prefix,
+                snapshot_prefix.len() as i64 + 20
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut found = None;
+        for row in rows {
+            let key = row?;
+            let suffix = &key[snapshot_prefix.len()..];
+            let Ok(text) = std::str::from_utf8(suffix) else {
+                continue;
+            };
+            let Ok(observation) = text.parse::<u64>() else {
+                continue;
+            };
+            if observation == 0 || format!("{observation:020}").as_bytes() != suffix {
+                continue;
+            }
+            if found.replace(key).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Verify that an explicitly selected, currently retained snapshot and a
+    /// runtime root were put in the same tracked commit. This does not prove
+    /// that the snapshot is authorized by a manifest or that its contents are
+    /// correct; the caller must verify those relationships separately. Later
+    /// root updates are allowed, but rewriting the selected snapshot invalidates
+    /// the proof. The prefix must be the caller's trusted snapshot namespace.
+    pub fn runtime_snapshot_exact_at(
+        &self,
+        runtime_key: &[u8],
+        snapshot_prefix: &[u8],
+        snapshot_key: &[u8],
+        sequence: u64,
+    ) -> Result<bool, Error> {
+        if sequence > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        if sequence == 0
+            || runtime_key.is_empty()
+            || snapshot_prefix.is_empty()
+            || snapshot_key == runtime_key
+            || !snapshot_key.starts_with(snapshot_prefix)
+        {
+            return Ok(false);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_commit_versions r JOIN durable_store_entries s ON s.key=?2 JOIN durable_commit_versions c ON c.key=s.key AND c.version=s.version WHERE r.key=?1 AND r.sequence=?3 AND c.sequence=r.sequence)",
+            params![runtime_key, snapshot_key, sequence],
+            |row| row.get(0),
+        )?)
     }
 
     /// Read an application log at a proven history boundary. Older cuts are
@@ -1129,6 +1280,27 @@ impl Store {
                     version.is_none() && !changed && before
                 }
                 Expected::MissingBefore(deadline) => version.is_none() && Instant::now() < deadline,
+                Expected::PrefixUnchangedSince(boundary) => {
+                    let current: u64 = tx.query_row(
+                        "SELECT version FROM durable_store_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let legacy: u64 = tx.query_row(
+                        "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if boundary > current || boundary < legacy {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    let changed: bool = if let Some(end) = prefix_end(&check.key) {
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND key<?2 AND version>?3)", params![check.key, end, boundary], |r| r.get(0))?
+                    } else {
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions INDEXED BY durable_commit_versions_by_version WHERE key>=?1 AND version>?2)", params![check.key, boundary], |r| r.get(0))?
+                    };
+                    !changed
+                }
                 Expected::Version(v) => version == Some(v),
                 Expected::DocumentRevision(revision) => {
                     let current: u64 = tx.query_row(
@@ -1431,10 +1603,18 @@ impl Store {
         }
         // Capture the post-mutation revision in the same transaction as every
         // conversation snapshot, even when the document batch is appended later.
+        let document_fence = checks.iter().find_map(|check| match check.expected {
+            Expected::DocumentRevision(revision) => Some(revision),
+            _ => None,
+        });
         for mutation in mutations {
             if let Mutation::Put { key, .. } = mutation {
                 if key.starts_with(b"runtime/fork/") {
                     tx.execute("INSERT OR IGNORE INTO durable_document_cuts(key,revision) SELECT ?1,revision FROM durable_document_history_meta WHERE id=1", [key])?;
+                    tx.execute("INSERT OR IGNORE INTO durable_document_cut_versions(key,version,revision) SELECT ?1,e.version,m.revision FROM durable_store_entries e CROSS JOIN durable_document_history_meta m WHERE e.key=?1 AND m.id=1", [key])?;
+                    if let Some(revision) = document_fence {
+                        tx.execute("INSERT OR IGNORE INTO durable_document_fence_versions(key,version,revision) SELECT ?1,version,?2 FROM durable_store_entries WHERE key=?1", params![key, revision])?;
+                    }
                 }
             }
         }
@@ -1557,6 +1737,43 @@ mod document_history_tests {
         )
         .unwrap();
         assert!(matches!(db.commit(&[check], &[]), Err(Error::Conflict { key: k }) if k == key));
+    }
+
+    #[test]
+    fn next_key_commit_skips_unrelated_writes_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let put = |key: &[u8]| Mutation::Put {
+            key: key.to_vec(),
+            value: vec![1],
+        };
+        store.commit(&[], &[put(b"root")]).unwrap();
+        let first = store
+            .commit_for_version(b"root", store.get(b"root").unwrap().unwrap().version)
+            .unwrap()
+            .unwrap();
+        store.commit(&[], &[put(b"other")]).unwrap();
+        store.commit(&[], &[put(b"root")]).unwrap();
+        let second = store
+            .commit_for_version(b"root", store.get(b"root").unwrap().unwrap().version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.next_commit_for_key(b"root", first).unwrap(),
+            Some(second)
+        );
+        assert_eq!(store.next_commit_for_key(b"root", second).unwrap(), None);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.next_commit_for_key(b"root", first).unwrap(),
+            Some(second)
+        );
+        assert!(matches!(
+            reopened.next_commit_for_key(b"root", u64::MAX),
+            Err(Error::InvalidSnapshot)
+        ));
     }
 
     #[test]
@@ -1697,6 +1914,269 @@ mod document_history_tests {
             store.next_scoped_document_commit(b"durable/document/", boundary),
             Err(Error::DocumentFrameTooLarge)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_snapshot_kill_child() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("PI_EXACT_SNAPSHOT_KILL_DB") else {
+            return;
+        };
+        let db = Store::open(path).unwrap();
+        let root = b"runtime/conversation/kill".to_vec();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.clone(),
+                    value: b"root".to_vec(),
+                },
+                Mutation::Put {
+                    key: b"runtime/fork/kill/first".to_vec(),
+                    value: b"first".to_vec(),
+                },
+                Mutation::Put {
+                    key: b"runtime/fork/kill/second".to_vec(),
+                    value: b"second".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let version = db.get(&root).unwrap().unwrap().version;
+        let sequence = db.commit_for_version(&root, version).unwrap().unwrap();
+        println!("EXACT_SNAPSHOT_COMMITTED {sequence}");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_runtime_snapshots_survive_process_kill() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "document_history_tests::exact_snapshot_kill_child",
+                "--nocapture",
+            ])
+            .env("PI_EXACT_SNAPSHOT_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some((_, sequence)) = line.split_once("EXACT_SNAPSHOT_COMMITTED ") {
+                    let _ = tx.send(sequence.to_string());
+                    break;
+                }
+            }
+        });
+        let sequence = rx.recv_timeout(Duration::from_secs(20));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let sequence = sequence.unwrap().parse::<u64>().unwrap();
+        let db = Store::open(&path).unwrap();
+        for key in [
+            b"runtime/fork/kill/first".as_slice(),
+            b"runtime/fork/kill/second".as_slice(),
+        ] {
+            assert!(db
+                .runtime_snapshot_exact_at(
+                    b"runtime/conversation/kill",
+                    b"runtime/fork/kill/",
+                    key,
+                    sequence
+                )
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn canonical_runtime_snapshot_selects_only_one_exact_commit_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("db")).unwrap();
+        let root = b"runtime/conversation/a";
+        let prefix = b"runtime/fork/a/";
+        let canonical = b"runtime/fork/a/00000000000000000007";
+        let other = b"runtime/fork/a/intermediate";
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: canonical.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: other.to_vec(),
+                    value: vec![],
+                },
+            ],
+        )
+        .unwrap();
+        let v = db.get(root).unwrap().unwrap().version;
+        let sequence = db.commit_for_version(root, v).unwrap().unwrap();
+        assert_eq!(
+            db.runtime_canonical_snapshot_at(root, prefix, sequence)
+                .unwrap(),
+            Some(canonical.to_vec())
+        );
+        let duplicate = b"runtime/fork/a/00000000000000000008";
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: canonical.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: duplicate.to_vec(),
+                    value: vec![],
+                },
+            ],
+        )
+        .unwrap();
+        let new_version = db.get(root).unwrap().unwrap().version;
+        let ambiguous = db.commit_for_version(root, new_version).unwrap().unwrap();
+        assert_eq!(
+            db.runtime_canonical_snapshot_at(root, prefix, ambiguous)
+                .unwrap(),
+            None
+        );
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: canonical.to_vec(),
+                value: b"tampered".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            db.runtime_canonical_snapshot_at(root, prefix, sequence)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_snapshot_requires_the_same_tracked_root_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = b"runtime/conversation/example".to_vec();
+        let other_root = b"runtime/conversation/other".to_vec();
+        let prefix = b"runtime/fork/example/";
+        let first = b"runtime/fork/example/first".to_vec();
+        let second = b"runtime/fork/example/second".to_vec();
+        let doc = b"durable/document/example".to_vec();
+        let db = Store::open(&path).unwrap();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.clone(),
+                    value: b"root".to_vec(),
+                },
+                Mutation::Put {
+                    key: first.clone(),
+                    value: b"first".to_vec(),
+                },
+                Mutation::Put {
+                    key: second.clone(),
+                    value: b"second".to_vec(),
+                },
+                Mutation::Put {
+                    key: doc.clone(),
+                    value: b"before".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let root_version = db.get(&root).unwrap().unwrap().version;
+        let sequence = db.commit_for_version(&root, root_version).unwrap().unwrap();
+        assert!(db
+            .runtime_snapshot_at(&root, prefix, sequence)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+            .unwrap());
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+            .unwrap());
+        assert!(!db
+            .runtime_snapshot_exact_at(&other_root, prefix, &first, sequence)
+            .unwrap());
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, b"other/", &first, sequence)
+            .unwrap());
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, prefix, &first, 0)
+            .unwrap());
+        let revision = db.document_cut(&first).unwrap().unwrap();
+        assert_eq!(db.document_cut(&second).unwrap(), Some(revision));
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.clone(),
+                    value: b"later".to_vec(),
+                },
+                Mutation::Put {
+                    key: doc.clone(),
+                    value: b"after".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+            .unwrap());
+        assert_eq!(
+            db.document_at(&doc, revision).unwrap().unwrap().value,
+            b"before"
+        );
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: first.clone(),
+                value: b"first".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+            .unwrap());
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+            .unwrap());
+        db.commit(
+            &[],
+            &[Mutation::Delete {
+                key: second.clone(),
+            }],
+        )
+        .unwrap();
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+            .unwrap());
     }
 
     #[test]

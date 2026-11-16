@@ -6525,3 +6525,478 @@ async fn publication_defers_completed_hook_without_replay() {
     );
     driver.shutdown().unwrap();
 }
+
+#[test]
+fn historical_fork_rejects_anchor_rewritten_in_another_commit() {
+    for mode in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let occurrence = h
+            .append_user_blocks(id, vec![serde_json::json!({"type":"text", "text":"cut"})])
+            .unwrap();
+        let cursor = h
+            .history(
+                id,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(100).unwrap(),
+            )
+            .unwrap()
+            .records
+            .last()
+            .unwrap()
+            .cursor;
+        h.fork_by_entry_id(id, occurrence).unwrap();
+        let mut observer = b"durable/observer/".to_vec();
+        observer.extend_from_slice(id.as_bytes());
+        observer.extend_from_slice(b"/r");
+        observer.extend_from_slice(&cursor.0.to_be_bytes());
+        let fork = format!("runtime/fork/{id}/{:020}", cursor.0).into_bytes();
+        let keys = match mode {
+            0 => vec![observer],
+            1 => vec![fork],
+            _ => vec![observer, fork],
+        };
+        let changes: Vec<_> = keys
+            .into_iter()
+            .map(|key| {
+                let value = h.owner.store().get(&key).unwrap().unwrap().value;
+                Mutation::Put { key, value }
+            })
+            .collect();
+        h.owner.store().commit(&[], &changes).unwrap();
+        assert!(h.fork_by_entry_id(id, occurrence).is_err());
+    }
+}
+
+#[test]
+fn anchored_reset_derivation_replays_committed_prefix_and_rejects_tampering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let address = crate::document::Address {
+        scope: id.to_string(),
+        name: "proof-doc".into(),
+        key: "".into(),
+    };
+    let mut document = crate::document::Transaction::new();
+    document
+        .put(
+            &address,
+            Expected::Missing,
+            serde_json::json!({"version":1}).as_object().unwrap(),
+        )
+        .unwrap();
+    document.commit(h.owner.store()).unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let blocks1 = vec![serde_json::json!({"type":"text","text":"first"})];
+    let blocks2 = vec![serde_json::json!({"type":"text","text":"second"})];
+    let (r1, first_ids) = h
+        .reset_with_blocks(id, Some("one".into()), vec![blocks1.clone()])
+        .unwrap();
+    let w1 = h
+        .submit_write(id, None, "first.write".into(), None)
+        .unwrap();
+    let (r2, second_ids) = h
+        .reset_with_blocks(id, Some("two".into()), vec![blocks2.clone()])
+        .unwrap();
+    let w2 = h
+        .submit_write(id, None, "second.write".into(), None)
+        .unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let (before, version) = h.load(id).unwrap();
+    let steps = [
+        ResetDerivationStep {
+            reset_id: r1,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        },
+        ResetDerivationStep {
+            reset_id: r2,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        },
+    ];
+    let cuts = h.derive_anchored_reset_states(id, version, &steps).unwrap();
+    assert_eq!(cuts.len(), 2);
+    assert_eq!(
+        cuts[0].resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r1]
+    );
+    assert_eq!(
+        cuts[0]
+            .pending_resets
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![r2]
+    );
+    assert_eq!(cuts[0].content_blocks[&1].message_id, first_ids[0]);
+    assert_eq!(cuts[0].content_blocks[&1].blocks, blocks1);
+    assert!(
+        cuts[0]
+            .application_writes
+            .iter()
+            .find(|w| w.id == w1)
+            .unwrap()
+            .placed
+    );
+    assert!(
+        !cuts[0]
+            .application_writes
+            .iter()
+            .find(|w| w.id == w2)
+            .unwrap()
+            .placed
+    );
+    assert_eq!(
+        cuts[1].resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r1, r2]
+    );
+    assert!(cuts[1].pending_resets.is_empty());
+    assert_eq!(cuts[1].content_blocks[&1].message_id, second_ids[0]);
+    assert_eq!(cuts[1].content_blocks[&1].blocks, blocks2);
+    assert!(
+        cuts[1]
+            .application_writes
+            .iter()
+            .find(|w| w.id == w2)
+            .unwrap()
+            .placed
+    );
+    assert_eq!(h.conversation(id).unwrap().resets, before.resets);
+    assert!(
+        h.derive_anchored_reset_states(id, version, &[steps[1], steps[0]])
+            .is_err()
+    );
+    assert!(
+        h.derive_anchored_reset_states(
+            id,
+            version,
+            &[
+                steps[0],
+                ResetDerivationStep {
+                    context_generation: steps[0].context_generation,
+                    ..steps[1]
+                }
+            ]
+        )
+        .is_err()
+    );
+    assert!(
+        h.derive_anchored_reset_states(id, version + 1, &steps)
+            .is_err()
+    );
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    let key = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let fork = h.fork_at(id, head).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().messages, before.messages);
+    let revision = h.owner.store().document_cut(&key).unwrap().unwrap();
+    let document_version = h.document(&address).unwrap().unwrap().version;
+    let mut document = crate::document::Transaction::new();
+    document
+        .put(
+            &address,
+            Expected::Version(document_version),
+            serde_json::json!({"version":2}).as_object().unwrap(),
+        )
+        .unwrap();
+    document.commit(h.owner.store()).unwrap();
+    h.submit(id, None, "later".into()).unwrap();
+    assert_eq!(
+        h.document_at_cut(id, head, &address)
+            .unwrap()
+            .unwrap()
+            .value["version"],
+        1
+    );
+    let (historical, cut_revision) = h.authenticated_reset_baseline(id, head.0).unwrap();
+    assert_eq!(cut_revision, revision);
+    assert_eq!(
+        serde_json::to_value(&historical).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(historical.messages, before.messages);
+    assert_eq!(historical.content_blocks, before.content_blocks);
+    assert_eq!(
+        derive_ordered_reset_states(&historical, &steps).unwrap()[1].content_blocks[&1].message_id,
+        second_ids[0]
+    );
+    let entry = h.owner.store().get(&key).unwrap().unwrap();
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key,
+                value: entry.value,
+            }],
+        )
+        .unwrap();
+    assert!(h.authenticated_reset_baseline(id, head.0).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_baseline_kill_child() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_RESET_BASELINE_KILL_DB") else {
+        return;
+    };
+    let mut h = Harness::open_paused(path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let (reset, ids) = h
+        .reset_with_blocks(
+            id,
+            Some("handoff".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"saved"})]],
+        )
+        .unwrap();
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    println!(
+        "RESET_BASELINE_COMMITTED {id} {} {reset} {}",
+        head.0, ids[0]
+    );
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_reset_baseline_survives_process_kill_and_reopen() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::runtime_cas_tests::reset_baseline_kill_child",
+            "--nocapture",
+        ])
+        .env("PI_RESET_BASELINE_KILL_DB", &path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, rest)) = line.split_once("RESET_BASELINE_COMMITTED ") {
+                let _ = tx.send(rest.to_string());
+                break;
+            }
+        }
+    });
+    let marker = rx.recv_timeout(Duration::from_secs(20));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let marker = marker.expect("child did not commit baseline");
+    let mut fields = marker.split_whitespace();
+    let id = Uuid::parse_str(fields.next().unwrap()).unwrap();
+    let head: u64 = fields.next().unwrap().parse().unwrap();
+    let reset = Uuid::parse_str(fields.next().unwrap()).unwrap();
+    let occurrence = Uuid::parse_str(fields.next().unwrap()).unwrap();
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let (baseline, _) = h.authenticated_reset_baseline(id, head).unwrap();
+    assert_eq!(baseline.pending_resets[0].id, reset);
+    assert_eq!(
+        baseline.pending_reset_blocks[&reset][0].message_id,
+        occurrence
+    );
+    let steps = [ResetDerivationStep {
+        reset_id: reset,
+        context_generation: Uuid::new_v4(),
+        write_limit: usize::MAX,
+    }];
+    let cuts = derive_ordered_reset_states(&baseline, &steps).unwrap();
+    assert_eq!(cuts[0].content_blocks[&1].message_id, occurrence);
+}
+
+#[test]
+fn reset_baseline_digest_rejects_forged_same_commit_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    h.reset_with_blocks(
+        id,
+        None,
+        vec![vec![serde_json::json!({"type":"text", "text":"one"})]],
+    )
+    .unwrap();
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    h.authenticated_reset_baseline(id, head.0).unwrap();
+    let root = Harness::key(id);
+    let fork = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let mut event = b"durable/observer/".to_vec();
+    event.extend_from_slice(id.as_bytes());
+    event.extend_from_slice(b"/r");
+    event.extend_from_slice(&head.0.to_be_bytes());
+    let root_value = h.owner.store().get(&root).unwrap().unwrap().value;
+    let fork_value = h.owner.store().get(&fork).unwrap().unwrap().value;
+    let mut event_value: serde_json::Value =
+        serde_json::from_slice(&h.owner.store().get(&event).unwrap().unwrap().value).unwrap();
+    event_value["_reset_baseline_sha256"] = serde_json::json!("forged");
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root,
+                    value: root_value,
+                },
+                Mutation::Put {
+                    key: fork,
+                    value: fork_value,
+                },
+                Mutation::Put {
+                    key: event,
+                    value: serde_json::to_vec(&event_value).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    h.authenticate_fork_anchor(id, head.0).unwrap();
+    assert!(h.authenticated_reset_baseline(id, head.0).is_err());
+}
+
+#[test]
+fn legacy_undigested_baseline_is_only_usable_at_current_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let (reset, _) = h
+        .reset_with_blocks(
+            id,
+            None,
+            vec![vec![serde_json::json!({"type":"text", "text":"one"})]],
+        )
+        .unwrap();
+    let head = h
+        .history(
+            id,
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap()
+        .records
+        .last()
+        .unwrap()
+        .cursor;
+    let root = Harness::key(id);
+    let fork = format!("runtime/fork/{id}/{:020}", head.0).into_bytes();
+    let mut event = b"durable/observer/".to_vec();
+    event.extend_from_slice(id.as_bytes());
+    event.extend_from_slice(b"/r");
+    event.extend_from_slice(&head.0.to_be_bytes());
+    let root_value = h.owner.store().get(&root).unwrap().unwrap().value;
+    let fork_value = h.owner.store().get(&fork).unwrap().unwrap().value;
+    let mut event_value: serde_json::Value =
+        serde_json::from_slice(&h.owner.store().get(&event).unwrap().unwrap().value).unwrap();
+    event_value
+        .as_object_mut()
+        .unwrap()
+        .remove("_reset_baseline_sha256");
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root,
+                    value: root_value,
+                },
+                Mutation::Put {
+                    key: fork,
+                    value: fork_value,
+                },
+                Mutation::Put {
+                    key: event,
+                    value: serde_json::to_vec(&event_value).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    let (_, version) = h.load(id).unwrap();
+    let steps = [ResetDerivationStep {
+        reset_id: reset,
+        context_generation: Uuid::new_v4(),
+        write_limit: usize::MAX,
+    }];
+    assert_eq!(
+        h.derive_anchored_reset_states(id, version, &steps)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(h.authenticated_reset_baseline(id, head.0).is_err());
+}

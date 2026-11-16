@@ -414,6 +414,24 @@ enum Phase {
         reason: String,
         decision: ModelFailureDecision,
     },
+    /// Independently persisted host configuration and its source counter.
+    /// A terminal decision must bind to this checkpoint, never to its own bound.
+    LimitEvidence {
+        kind: LimitFailureKind,
+        count: u32,
+        limit: u32,
+        source_observation: u64,
+        source_root_version: u64,
+    },
+    /// A host-selected terminal limit decision. The configured bound is
+    /// retained so recovery and historical replay do not infer it from a counter.
+    LimitFailure {
+        kind: LimitFailureKind,
+        count: u32,
+        limit: u32,
+        source_observation: u64,
+        source_root_version: u64,
+    },
     RetryWait {
         turns: u32,
     },
@@ -618,6 +636,12 @@ fn dispatch_identity(tool: &Arc<dyn pi_rs_core::Tool>) -> Result<DispatchIdentit
         None => Ok(DispatchIdentity::Other),
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum LimitFailureKind {
+    Turn,
+    Restart,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum ModelFailureDecision {
     Retry,
@@ -1753,6 +1777,8 @@ pub fn conversation_wake(
         Phase::ModelReady { .. }
         | Phase::AbandonedModel { .. }
         | Phase::FailedModel { .. }
+        | Phase::LimitFailure { .. }
+        | Phase::LimitEvidence { .. }
         | Phase::CompactionHook { .. }
         | Phase::CompactionReady { .. }
         | Phase::CompactionAbandoned { .. }
@@ -3059,6 +3085,86 @@ pub(crate) struct PreparedConversationSave {
     owner: Arc<OwnedStore>,
     pub(crate) checks: Vec<Check>,
     pub(crate) mutations: Vec<Mutation>,
+}
+
+// A proof traversal may encounter the same earlier reset through several
+// branches of the transcript. Cache only while this synchronous traversal is
+// active; never reuse evidence across operations or across store owners.
+type ResetProofKey = (usize, Uuid, Uuid, u64, u64);
+type ResetProofValue = (Conversation, u64, Vec<Check>);
+thread_local! {
+    static RESET_PROOF_MEMO: std::cell::RefCell<Option<HashMap<ResetProofKey, ResetProofValue>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static RESET_PROOF_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static RESET_PROOF_BEFORE_SAVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+struct ResetProofScope(bool);
+impl ResetProofScope {
+    fn reset_owned(&self) {
+        if self.0 {
+            RESET_PROOF_MEMO.with(|memo| *memo.borrow_mut() = Some(HashMap::new()));
+        }
+    }
+    fn enter() -> Self {
+        Self(RESET_PROOF_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.is_some() {
+                false
+            } else {
+                *memo = Some(HashMap::new());
+                true
+            }
+        }))
+    }
+}
+impl Drop for ResetProofScope {
+    fn drop(&mut self) {
+        if self.0 {
+            RESET_PROOF_MEMO.with(|memo| *memo.borrow_mut() = None);
+        }
+    }
+}
+
+// Preserve every distinct original fence, including multiple versions or
+// prefix boundaries for the same key. Conflicting evidence must fail closed.
+fn merge_reset_proof_checks(checks: &mut Vec<Check>, additional: impl IntoIterator<Item = Check>) {
+    let mut seen: HashMap<Vec<u8>, Vec<Expected>> = HashMap::new();
+    for check in checks.iter() {
+        seen.entry(check.key.clone())
+            .or_default()
+            .push(check.expected.clone());
+    }
+    for check in additional {
+        let versions = seen.entry(check.key.clone()).or_default();
+        if !versions.contains(&check.expected) {
+            versions.push(check.expected.clone());
+            checks.push(check);
+        }
+    }
+}
+fn cached_reset_proof_checks(owner: &Arc<OwnedStore>) -> Vec<Check> {
+    let identity = Arc::as_ptr(owner) as usize;
+    RESET_PROOF_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        let mut checks = Vec::new();
+        if let Some(memo) = memo.as_ref() {
+            for (key, value) in memo {
+                if key.0 == identity {
+                    merge_reset_proof_checks(&mut checks, value.2.clone());
+                }
+            }
+        }
+        checks
+    })
+}
+
+type AtomicFailureResetSelection = (u64, Vec<ResetDerivationStep>, Vec<Check>);
+
+struct AtomicResetPlan<'a> {
+    steps: &'a [ResetDerivationStep],
+    cuts: &'a [Conversation],
+    failure_base: Option<&'a Conversation>,
 }
 
 impl PreparedConversationSave {
@@ -4723,6 +4829,10 @@ impl Harness {
                 .ok_or_else(|| Error::Invalid("invalid observation".into()))?
                 .remove("_transcript");
         }
+        if let Some(object) = value.as_object_mut() {
+            object.remove("_reset_baseline");
+            object.remove("_reset_baseline_sha256");
+        }
         Ok(())
     }
     fn save(&mut self, state: &Conversation, expected: Expected) -> Result<(), Error> {
@@ -4750,6 +4860,13 @@ impl Harness {
             Some(owner.task_gate().lock().map_err(|_| Error::Failed)?)
         };
         self.save_composed_locked(state, expected, wake, children, &[], None)
+    }
+    fn save_limit_checkpoint(&mut self, state: &Conversation, version: u64) -> Result<(), Error> {
+        let merge = self.merge_admissions;
+        self.merge_admissions = false;
+        let result = self.save(state, Expected::Version(version));
+        self.merge_admissions = merge;
+        result
     }
     // Keep the completed hook/dispatch and its child IDs in this future while
     // the driver publishes an outcome. Never wait holding the poll gate: abort
@@ -4839,6 +4956,8 @@ impl Harness {
         {
             return Err(Error::Failed);
         }
+        // Keep nested transcript proofs alive through preparation and commit.
+        let proof_scope = ResetProofScope::enter();
         let key = Self::key(state.id);
         let mut state = state.clone();
         let failed_transition = {
@@ -4857,8 +4976,107 @@ impl Harness {
             if failed_transition {
                 apply_failed_run_policy(&mut committed);
             }
+            let transition_checks = if let Expected::Version(version) = expected {
+                let loaded = self.loaded.lock().map_err(|_| Error::Failed)?;
+                if let Some((loaded_version, baseline)) = loaded.get(&state.id) {
+                    if *loaded_version == version
+                        && matches!(baseline.phase, Phase::LimitEvidence { .. })
+                        && matches!(state.phase, Phase::LimitEvidence { .. })
+                    {
+                        self.validate_limit_source(baseline, version)?
+                    } else if *loaded_version == version
+                        && matches!(state.phase, Phase::LimitEvidence { .. })
+                    {
+                        self.validate_limit_evidence_admission(baseline, &state, version)?
+                    } else if *loaded_version == version
+                        && matches!(
+                            baseline.phase,
+                            Phase::LimitEvidence { .. } | Phase::LimitFailure { .. }
+                        )
+                        && (matches!(state.phase, Phase::LimitFailure { .. }) || failed_transition)
+                    {
+                        if matches!(baseline.phase, Phase::LimitEvidence { .. })
+                            && failed_transition
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        if matches!(baseline.phase, Phase::LimitFailure { .. })
+                            && matches!(state.phase, Phase::LimitFailure { .. })
+                            && serde_json::to_value(&baseline.phase)?
+                                != serde_json::to_value(&state.phase)?
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        if let (
+                            Phase::LimitEvidence {
+                                kind, count, limit, ..
+                            },
+                            Phase::LimitFailure {
+                                kind: next_kind,
+                                count: next_count,
+                                limit: next_limit,
+                                source_observation,
+                                source_root_version,
+                            },
+                        ) = (&baseline.phase, &state.phase)
+                            && (kind != next_kind
+                                || count != next_count
+                                || limit != next_limit
+                                || *source_root_version != version
+                                || self.limit_source_observation(state.id, version)?
+                                    != Some(*source_observation))
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        if matches!(baseline.phase, Phase::LimitFailure { .. }) && failed_transition
+                        {
+                            let replay = replay_checkpoint_failure(baseline)
+                                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                            if serde_json::to_value(&replay)? != serde_json::to_value(&state)?
+                                || replay.messages != state.messages
+                                || replay.content_blocks != state.content_blocks
+                            {
+                                return Err(crate::fork::Error::InvalidSnapshot.into());
+                            }
+                        }
+                        self.validate_limit_source(baseline, version)?
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             let state_for_commit = &committed;
-            let mut prepared = if wake.is_none() && children.is_empty() && abort_tasks.is_empty() {
+            let atomic = if failed_transition
+                && wake.is_none()
+                && children.is_empty()
+                && abort_tasks.is_empty()
+                && documents.is_none()
+            {
+                self.atomic_failure_reset_steps(&state, &expected)?
+            } else {
+                None
+            };
+            let atomic_prepared = if let Some((version, steps, source_checks)) = atomic {
+                match self.prepare_atomic_failure_reset_save(&state, version, &steps) {
+                    Ok(mut batch) => {
+                        merge_reset_proof_checks(&mut batch.checks, source_checks);
+                        Some(batch)
+                    }
+                    // An admission can race preparation. The ordinary CAS below
+                    // enters the existing admission merge and rebuilds the plan.
+                    Err(Error::Storage(durable_store::Error::Conflict { .. })) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let mut prepared = if let Some(batch) = atomic_prepared {
+                batch
+            } else if wake.is_none() && children.is_empty() && abort_tasks.is_empty() {
                 self.prepare_saves(&[(state_for_commit, expected.clone())])?
             } else {
                 self.prepare_conversation_save(
@@ -4869,6 +5087,7 @@ impl Harness {
                     abort_tasks,
                 )?
             };
+            merge_reset_proof_checks(&mut prepared.checks, transition_checks);
             if let Some(batch) = documents {
                 let mut extra = crate::task_store::OwnedBatch {
                     checks: batch.checks.clone(),
@@ -4904,6 +5123,15 @@ impl Harness {
                     mutations: extra.mutations,
                 })?;
             }
+            #[cfg(test)]
+            RESET_PROOF_BEFORE_SAVE.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            // Preparing a fork or reset can validate nested reset origins. Fence
+            // every such proof in the transaction publishing the result.
+            merge_reset_proof_checks(&mut prepared.checks, cached_reset_proof_checks(&self.owner));
             match self.commit_conversation_save_inner(prepared, fence) {
                 Ok(()) => break,
                 Err(Error::Storage(durable_store::Error::Conflict { key: conflict }))
@@ -4916,6 +5144,7 @@ impl Harness {
                 {
                     // A callback won the race with sealing. Reload its latest
                     // partial and retry the whole atomic transition.
+                    proof_scope.reset_owned();
                     continue;
                 }
                 Err(Error::Storage(durable_store::Error::Conflict { key }))
@@ -5078,6 +5307,7 @@ impl Harness {
                         };
                     }
                     expected = Expected::Version(entry.version);
+                    proof_scope.reset_owned();
                     self.loaded.lock().map_err(|_| Error::Failed)?.insert(
                         state.id,
                         (entry.version, {
@@ -5111,6 +5341,177 @@ impl Harness {
         children: &[crate::task::Task],
         abort_tasks: &[crate::task_store::StoredTask],
         independent: Option<&crate::compact::CompactionResult>,
+    ) -> Result<PreparedConversationSave, Error> {
+        self.prepare_conversation_save_impl(
+            state,
+            expected,
+            wake,
+            children,
+            abort_tasks,
+            independent,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn prepare_atomic_reset_save(
+        &self,
+        id: Uuid,
+        version: u64,
+        steps: &[ResetDerivationStep],
+    ) -> Result<PreparedConversationSave, Error> {
+        let cuts = self.derive_anchored_reset_states(id, version, steps)?;
+        let state = cuts
+            .last()
+            .ok_or_else(|| Error::Invalid("empty reset batch".into()))?;
+        self.prepare_conversation_save_impl(
+            state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            None,
+            Some(AtomicResetPlan {
+                steps,
+                cuts: &cuts,
+                failure_base: None,
+            }),
+        )
+    }
+
+    // Only failures reconstructible from a persisted checkpoint are eligible.
+    fn atomic_failure_reset_steps(
+        &self,
+        failure: &Conversation,
+        expected: &Expected,
+    ) -> Result<Option<AtomicFailureResetSelection>, Error> {
+        let Expected::Version(version) = expected else {
+            return Ok(None);
+        };
+        let loaded = self.loaded.lock().map_err(|_| Error::Failed)?;
+        let Some((base_version, baseline)) = loaded.get(&failure.id) else {
+            return Ok(None);
+        };
+        if base_version != version
+            || baseline.abort_requested
+            || baseline.after_failed_run != AfterFailedRun::Continue
+            || !(2..=64).contains(&baseline.pending_resets.len())
+            || baseline.pending_reset_blocks.is_empty()
+            || baseline.pending_independent_summary.is_some()
+            || !baseline
+                .submissions
+                .iter()
+                .any(|s| s.status == Status::Queued)
+        {
+            return Ok(None);
+        }
+        let Some(mut replay) = replay_checkpoint_failure(baseline) else {
+            return Ok(None);
+        };
+        let source_checks = if matches!(baseline.phase, Phase::LimitFailure { .. }) {
+            match self.validate_limit_source(baseline, *version) {
+                Ok(checks) => checks,
+                Err(Error::Fork(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        if serde_json::to_value(&replay)? != serde_json::to_value(failure)?
+            || replay.messages != failure.messages
+            || replay.content_blocks != failure.content_blocks
+        {
+            return Ok(None);
+        }
+        let steps: Vec<_> = baseline
+            .pending_resets
+            .iter()
+            .map(|reset| ResetDerivationStep {
+                reset_id: reset.id,
+                context_generation: Uuid::new_v4(),
+                write_limit: usize::MAX,
+            })
+            .collect();
+        apply_failed_run_policy(&mut replay);
+        let cuts = derive_ordered_reset_states(&replay, &steps)?;
+        if cuts.last().is_none_or(|cut| {
+            cut.application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+        }) {
+            return Ok(None);
+        }
+        Ok(Some((*version, steps, source_checks)))
+    }
+
+    /// Stage a replayable failure, ordered reset cuts and the next input.
+    fn prepare_atomic_failure_reset_save(
+        &self,
+        failure: &Conversation,
+        version: u64,
+        steps: &[ResetDerivationStep],
+    ) -> Result<PreparedConversationSave, Error> {
+        // Authenticate the actual predecessor before deriving from the caller's
+        // post-failure candidate. This entry point is not a production boundary.
+        self.derive_anchored_reset_states(failure.id, version, steps)?;
+        if !matches!(failure.phase, Phase::FailedIdle)
+            || failure.abort_requested
+            || failure.after_failed_run != AfterFailedRun::Continue
+        {
+            return Err(Error::Invalid("expected a continuing failed run".into()));
+        }
+        let mut base = failure.clone();
+        apply_failed_run_policy(&mut base);
+        let cuts = derive_ordered_reset_states(&base, steps)?;
+        let mut final_state = cuts
+            .last()
+            .ok_or_else(|| Error::Invalid("empty reset batch".into()))?
+            .clone();
+        if !final_state.pending_resets.is_empty()
+            || final_state.pending_independent_summary.is_some()
+            || final_state
+                .application_writes
+                .iter()
+                .any(|w| !w.placed && !w.withdrawn)
+        {
+            return Err(Error::Invalid(
+                "pending work prevents atomic continuation".into(),
+            ));
+        }
+        let failure = final_state.run_failure.clone();
+        if !place_queued(&mut final_state, true) {
+            return Err(Error::Invalid("no queued replacement".into()));
+        }
+        final_state.run_failure = failure;
+        final_state.auto_compaction_attempted = false;
+        final_state.retry_state = RetryState::default();
+        final_state.overflow_compaction_attempted = false;
+        final_state.phase = Phase::ModelReady { turns: 0 };
+        self.prepare_conversation_save_impl(
+            &final_state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            None,
+            Some(AtomicResetPlan {
+                steps,
+                cuts: &cuts,
+                failure_base: Some(&base),
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_conversation_save_impl(
+        &self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
+        abort_tasks: &[crate::task_store::StoredTask],
+        independent: Option<&crate::compact::CompactionResult>,
+        atomic_resets: Option<AtomicResetPlan<'_>>,
     ) -> Result<PreparedConversationSave, Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
@@ -5224,28 +5625,39 @@ impl Harness {
         } else {
             false
         };
-        let reset_proven = old.is_some_and(|previous| {
-            state.block_reset_proof.as_ref().is_some_and(|proof| {
-                proof.previous_context == previous.context_generation
-                    && proof.previous_resets == previous.resets
-                    && proof.previous_messages == previous.messages
-                    && proof.previous_blocks == previous.content_blocks
-                    && !proof.placed_resets.is_empty()
-                    && !proof.overwritten_blocks
-                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
-                    && state.resets.starts_with(&proof.previous_resets)
-                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
-                    && state.context_generation != previous.context_generation
-                    && state.content_blocks == proof.blocks
-                    && state.messages == proof.messages
-            })
-        });
+        let reset_proven = atomic_resets.is_some()
+            || old.is_some_and(|previous| {
+                state.block_reset_proof.as_ref().is_some_and(|proof| {
+                    proof.previous_context == previous.context_generation
+                        && proof.previous_resets == previous.resets
+                        && proof.previous_messages == previous.messages
+                        && proof.previous_blocks == previous.content_blocks
+                        && !proof.placed_resets.is_empty()
+                        && !proof.overwritten_blocks
+                        && state.resets.len()
+                            == proof.previous_resets.len() + proof.placed_resets.len()
+                        && state.resets.starts_with(&proof.previous_resets)
+                        && state.resets[proof.previous_resets.len()..] == proof.placed_resets
+                        && state.context_generation != previous.context_generation
+                        && state.content_blocks == proof.blocks
+                        && state.messages == proof.messages
+                })
+            });
         if let Some(previous) = old {
             for (id, expected_blocks) in &previous.pending_reset_blocks {
                 if state.pending_reset_blocks.get(id) == Some(expected_blocks) {
                     continue;
                 }
-                let placed = reset_proven
+                let placed = atomic_resets.as_ref().is_some_and(|plan| {
+                    plan.steps.iter().zip(plan.cuts).any(|(step, cut)| {
+                        step.reset_id == *id
+                            && cut
+                                .content_blocks
+                                .values()
+                                .take(expected_blocks.len())
+                                .eq(expected_blocks.iter())
+                    })
+                }) || reset_proven
                     && state.block_reset_proof.as_ref().is_some_and(|proof| {
                         proof
                             .placed_resets
@@ -5526,7 +5938,218 @@ impl Harness {
                 return Err(crate::transcript::Error::Corrupt.into());
             }
         }
-        let prepared = if expected == Expected::Missing
+        let mut atomic_evidence: Option<(u64, Vec<Check>, Vec<Mutation>)> = None;
+        let prepared = if let Some(plan) = atomic_resets {
+            let steps = plan.steps;
+            let cuts = plan.cuts;
+            use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
+            if steps.len() < 2 || steps.len() != cuts.len() || cuts.len() > 64 {
+                return Err(Error::Invalid("invalid reset batch".into()));
+            }
+            let previous = old.ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let predecessor = previous
+                .transcript
+                .clone()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let store = self.owner.store();
+            let version = match expected {
+                Expected::Version(v) => v,
+                _ => return Err(crate::fork::Error::InvalidSnapshot.into()),
+            };
+            let sequence = store
+                .commit_for_version(&key, version)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let prefix = format!("runtime/fork/{}/", state.id);
+            let anchor_key = store
+                .runtime_canonical_snapshot_at(&key, prefix.as_bytes(), sequence)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let observation: u64 = std::str::from_utf8(
+                anchor_key
+                    .strip_prefix(prefix.as_bytes())
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?,
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            if anchor_key != format!("runtime/fork/{}/{observation:020}", state.id).as_bytes() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            let anchor_version = store
+                .get(&anchor_key)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?
+                .version;
+            let mut predecessor_event = b"durable/observer/".to_vec();
+            predecessor_event.extend_from_slice(state.id.as_bytes());
+            predecessor_event.extend_from_slice(b"/r");
+            predecessor_event.extend_from_slice(&observation.to_be_bytes());
+            let event_version = store
+                .get(&predecessor_event)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?
+                .version;
+            let anchored_cuts = self.derive_anchored_reset_states(state.id, version, steps)?;
+            let verified_cuts = if let Some(base) = plan.failure_base {
+                derive_ordered_reset_states(base, steps)?
+            } else {
+                anchored_cuts
+            };
+            if verified_cuts.len() != cuts.len() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            for (a, b) in verified_cuts.iter().zip(cuts) {
+                if serde_json::to_value(a)? != serde_json::to_value(b)?
+                    || a.content_blocks != b.content_blocks
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+            }
+            let revision = store.document_snapshot()?;
+            let (_, created) = self.resolved_occurrences_with_ids(state.id, predecessor.clone())?;
+            let mut seen = created;
+            let mut records = Vec::with_capacity(cuts.len());
+            for cut in cuts {
+                let mut ids: Vec<_> = cut.messages.iter().map(|_| Uuid::new_v4()).collect();
+                for (&index, binding) in &cut.content_blocks {
+                    *ids.get_mut(index)
+                        .ok_or(crate::transcript::Error::Corrupt)? = binding.message_id;
+                }
+                if ids.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let change = TranscriptChange::ReplaceV2 {
+                    messages: cut.messages.clone(),
+                    ids,
+                    commit,
+                    origin: state.id,
+                };
+                let blocks = (!cut.content_blocks.is_empty())
+                    .then(|| cut.content_blocks.values().cloned().collect());
+                records.push((serde_json::to_value(change)?, blocks));
+            }
+            if plan.failure_base.is_some() {
+                let last = cuts.last().ok_or(crate::transcript::Error::Corrupt)?;
+                if !state.messages.starts_with(&last.messages)
+                    || last
+                        .content_blocks
+                        .iter()
+                        .any(|(index, binding)| state.content_blocks.get(index) != Some(binding))
+                {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let messages = state.messages[last.messages.len()..].to_vec();
+                if messages.is_empty() {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let mut ids: Vec<_> = messages.iter().map(|_| Uuid::new_v4()).collect();
+                let blocks: Vec<_> = state
+                    .content_blocks
+                    .range(last.messages.len()..)
+                    .map(|(&index, binding)| {
+                        if let Some(id) = ids.get_mut(index - last.messages.len()) {
+                            *id = binding.message_id;
+                        }
+                        binding.clone()
+                    })
+                    .collect();
+                if ids.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let change = TranscriptChange::AppendV2 {
+                    messages,
+                    ids,
+                    commit,
+                    origin: state.id,
+                };
+                records.push((
+                    serde_json::to_value(change)?,
+                    (!blocks.is_empty()).then_some(blocks),
+                ));
+            }
+            let (batch, positions) = crate::transcript::Transcript::new(store, state.id)
+                .prepare_append_batch(&records)?;
+            let manifest_cursor =
+                |cursor: &crate::transcript::Cursor| -> Result<ManifestCursor, Error> {
+                    Ok(serde_json::from_value(serde_json::to_value(cursor)?)?)
+                };
+            let mut manifest_cuts = Vec::with_capacity(cuts.len());
+            for ((step, cut), cursor) in steps.iter().zip(cuts).zip(&positions) {
+                let value = serde_json::json!({"state":cut,"blocks":cut.content_blocks});
+                manifest_cuts.push(ResetCut {
+                    reset_id: step.reset_id,
+                    context_generation: step.context_generation,
+                    write_limit: if step.write_limit == usize::MAX {
+                        u64::MAX
+                    } else {
+                        u64::try_from(step.write_limit)
+                            .map_err(|_| Error::Invalid("reset write limit".into()))?
+                    },
+                    cursor: manifest_cursor(cursor)?,
+                    state_sha256: reset_cut_digest(&value)?,
+                });
+            }
+            let anchor_cursor = positions
+                .last()
+                .ok_or(crate::transcript::Error::Corrupt)?
+                .clone();
+            let binding = ExpectedBinding {
+                conversation_id: state.id,
+                predecessor_observation: observation,
+                predecessor_root_version: version,
+                anchor_observation: commit,
+                document_revision: revision,
+                predecessor_context_generation: previous.context_generation,
+                predecessor_cursor: manifest_cursor(&predecessor)?,
+                anchor_cursor: manifest_cursor(&anchor_cursor)?,
+                cuts: manifest_cuts,
+            };
+            let manifest = ResetManifest {
+                version: 1,
+                conversation_id: binding.conversation_id,
+                predecessor_observation: binding.predecessor_observation,
+                predecessor_root_version: binding.predecessor_root_version,
+                anchor_observation: binding.anchor_observation,
+                document_revision: binding.document_revision,
+                predecessor_context_generation: binding.predecessor_context_generation,
+                predecessor_cursor: binding.predecessor_cursor.clone(),
+                anchor_cursor: binding.anchor_cursor.clone(),
+                cuts: binding.cuts.clone(),
+            };
+            let bytes = manifest
+                .encode(&binding)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            let mut checks = vec![
+                Check {
+                    key: anchor_key,
+                    expected: Expected::Version(anchor_version),
+                },
+                Check {
+                    key: predecessor_event,
+                    expected: Expected::Version(event_version),
+                },
+                Check {
+                    key: b"durable/document-fork-revision".to_vec(),
+                    expected: Expected::DocumentRevision(revision),
+                },
+            ];
+            let mut mutations = Vec::new();
+            for position in positions.iter().take(cuts.len()) {
+                let (entry, sequence) = position
+                    .entry_identity()
+                    .ok_or(crate::transcript::Error::Corrupt)?;
+                let mut key = crate::reset_manifest::candidate_prefix(state.id, entry, sequence);
+                key.extend_from_slice(Uuid::new_v4().to_string().as_bytes());
+                checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                mutations.push(Mutation::Put {
+                    key,
+                    value: bytes.clone(),
+                });
+            }
+            atomic_evidence = Some((revision, checks, mutations));
+            state.transcript = Some(anchor_cursor);
+            Some(batch)
+        } else if expected == Expected::Missing
             && let Some(len) = state.block_fork_cut
         {
             let source = state
@@ -5615,7 +6238,16 @@ impl Harness {
         let mut persisted = state.clone();
         persisted.messages.clear();
         let value = serde_json::to_vec(&persisted)?;
-        let event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes, "tool_results": state.tool_results});
+        let mut event = serde_json::json!({"_transcript": state.transcript, "submissions": state.submissions, "aborted_generations": state.aborted_generations, "resets": state.resets, "abort_requested": state.abort_requested, "application_writes": state.application_writes, "tool_results": state.tool_results});
+        let reset_baseline: Option<serde_json::Value> = if state.pending_reset_blocks.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_slice(&value)?)
+        };
+        if let Some(baseline) = &reset_baseline {
+            event["_reset_baseline_sha256"] =
+                serde_json::Value::String(reset_baseline_digest(baseline)?);
+        }
         append.set_value(&event)?;
         let fork_key = format!("runtime/fork/{}/{:020}", state.id, append.cursor.0).into_bytes();
         let fork_snapshot = crate::fork::Snapshot {
@@ -5677,6 +6309,11 @@ impl Harness {
         };
         let mut fork_value = serde_json::to_value(&fork_snapshot)?;
         fork_value["_transcript"] = serde_json::to_value(&state.transcript)?;
+        // Retain the exact serialized root while block resets are pending so
+        // a later same-commit proof can replay the committed predecessor.
+        if let Some(baseline) = reset_baseline {
+            fork_value["_reset_baseline"] = baseline;
+        }
         let mut checks = vec![Check {
             key: key.clone(),
             expected: expected.clone(),
@@ -5717,6 +6354,9 @@ impl Harness {
             Vec::new()
         };
         checks.extend(append.checks);
+        if let Some((_, evidence_checks, _)) = &atomic_evidence {
+            checks.extend(evidence_checks.clone());
+        }
         checks.push(Check {
             key: fork_key.clone(),
             expected: Expected::Missing,
@@ -5805,6 +6445,9 @@ impl Harness {
             }
         }
         mutations.extend(transcript_mutations);
+        if let Some((_, _, evidence_mutations)) = atomic_evidence {
+            mutations.extend(evidence_mutations);
+        }
         mutations.extend(append.mutations);
         mutations.push(Mutation::Put {
             key: fork_key,
@@ -6470,7 +7113,7 @@ impl Harness {
         cursor: crate::observer::Cursor,
         prefix: Option<(usize, usize)>,
     ) -> Result<Uuid, Error> {
-        self.fork_at_selected(id, cursor, prefix, None)
+        self.fork_at_selected(id, cursor, prefix, None, None)
     }
 
     fn fork_at_selected(
@@ -6479,6 +7122,7 @@ impl Harness {
         cursor: crate::observer::Cursor,
         prefix: Option<(usize, usize)>,
         application_cut: Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
+        reset_cut: Option<(Conversation, crate::transcript::Cursor, u64, Vec<Check>)>,
     ) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
@@ -6490,9 +7134,10 @@ impl Harness {
             .store()
             .get(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidCursor)?;
-        let revision = match &application_cut {
-            Some((revision, _, _)) => *revision,
-            None => self
+        let revision = match (&application_cut, &reset_cut) {
+            (_, Some((_, _, revision, _))) => *revision,
+            (Some((revision, _, _)), None) => *revision,
+            (None, None) => self
                 .owner
                 .store()
                 .document_cut(key.as_bytes())?
@@ -6509,6 +7154,67 @@ impl Harness {
             }
         }
         let mut value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+        if let Some((cut, position, _, _)) = &reset_cut {
+            value["_transcript"] = serde_json::to_value(position)?;
+            value["config"] = serde_json::to_value(&cut.config)?;
+            value["submissions"] = serde_json::to_value(&cut.submissions)?;
+            value["tool_states"] = serde_json::to_value(&cut.tool_states)?;
+            value["active"] = serde_json::to_value(cut.active)?;
+            value["pending_resets"] = serde_json::to_value(&cut.pending_resets)?;
+            value["phase"] = serde_json::to_value(&cut.phase)?;
+            let documents = value
+                .get_mut("documents")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            for (name, document) in [
+                (
+                    "pi-rs/runtime/queue-modes",
+                    serde_json::to_value(cut.queue_modes)?,
+                ),
+                (
+                    "pi-rs/runtime/after-failed-run",
+                    serde_json::to_value(cut.after_failed_run)?,
+                ),
+                (
+                    "pi-rs/runtime/extensions",
+                    serde_json::to_value(&cut.extensions)?,
+                ),
+                (
+                    "pi-rs/runtime/provider-adapter",
+                    serde_json::to_value(&cut.provider_adapter)?,
+                ),
+                (
+                    "pi-rs/runtime/allowed-tools",
+                    serde_json::to_value(&cut.allowed_tools)?,
+                ),
+                (
+                    "pi-rs/runtime/model-tools",
+                    serde_json::to_value(&cut.model_tools)?,
+                ),
+                (
+                    "pi-rs/runtime/tool-filters",
+                    serde_json::to_value(&cut.tool_filters)?,
+                ),
+                (
+                    "pi-rs/runtime/tool-results",
+                    serde_json::to_value(&cut.tool_results)?,
+                ),
+            ] {
+                documents.insert(name.into(), document);
+            }
+            documents.insert(
+                "pi-rs/runtime/resets".into(),
+                serde_json::to_value(&cut.resets)?,
+            );
+            documents.insert(
+                "pi-rs/runtime/application-writes".into(),
+                serde_json::to_value(&cut.application_writes)?,
+            );
+            documents.insert(
+                "pi-rs/runtime/occurrence-epoch-proven".into(),
+                serde_json::to_value(cut.occurrence_epoch_proven)?,
+            );
+        }
         let transcript = value
             .get("_transcript")
             .cloned()
@@ -6669,6 +7375,9 @@ impl Harness {
                 state.id,
                 revision,
             )?;
+            if let Some((_, _, _, checks)) = &reset_cut {
+                batch.checks.extend(checks.clone());
+            }
             if let Some((_, _, entries)) = &application_cut {
                 let target = crate::application_entry::key(state.id);
                 let mutation = batch
@@ -6950,6 +7659,7 @@ impl Harness {
             crate::observer::Cursor(cursor),
             None,
             Some((revision, id, visible)),
+            None,
         )
     }
 
@@ -6957,6 +7667,7 @@ impl Harness {
     /// Interior positions require proof of unchanged fork state or a tool-free
     /// append changing only config; incomplete tool transcripts are rejected.
     pub fn fork_at_position(&mut self, id: Uuid, position: ViewCursor) -> Result<Uuid, Error> {
+        let _proof_scope = ResetProofScope::enter();
         self.load(id)?;
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let page = transcript.read_with_blocks(&position.cursor, std::num::NonZeroUsize::MIN)?;
@@ -7012,6 +7723,7 @@ impl Harness {
         if origin != id {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
+        self.authenticate_fork_anchor(origin, commit)?;
         let count = position
             .remaining
             .ok_or(crate::fork::Error::InvalidCursor)?;
@@ -7036,7 +7748,18 @@ impl Harness {
                 .ok_or(crate::fork::Error::InvalidSnapshot)?,
         )?;
         if reference.as_ref() != Some(&position.cursor) {
-            return Err(crate::fork::Error::InvalidSnapshot.into());
+            if count != messages.len() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            let (cut, revision, checks) =
+                self.prove_failure_reset_cut(id, &position.cursor, commit)?;
+            return self.fork_at_selected(
+                id,
+                record.cursor,
+                None,
+                None,
+                Some((cut, position.cursor, revision, checks)),
+            );
         }
         let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
         let entry = self
@@ -7129,6 +7852,51 @@ impl Harness {
                 .value
                 .clone(),
         )?;
+        // Atomic failure commits anchor the observation at the trailing
+        // continuation append, while retained reset occurrences originate in
+        // earlier entries of that same commit.
+        if let TranscriptChange::AppendV2 { ids, .. } = &change
+            && !ids.contains(&history.id)
+        {
+            let mut next = batch.next;
+            for _ in 0..64 {
+                let page = transcript.read_with_blocks(&next, std::num::NonZeroUsize::MIN)?;
+                let Some(record) = page.records.first() else {
+                    break;
+                };
+                let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+                let TranscriptChange::ReplaceV2 {
+                    messages,
+                    ids,
+                    commit,
+                    origin,
+                } = change
+                else {
+                    break;
+                };
+                if commit != history.commit || origin != history.origin {
+                    break;
+                }
+                if let Some(index) = ids.iter().position(|id| *id == history.id) {
+                    if ids.iter().filter(|id| **id == history.id).count() != 1
+                        || messages.get(index) != Some(expected)
+                        || history.commit_boundary != (index + 1 == messages.len())
+                    {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    self.prove_failure_reset_cut(history.origin, &next, history.commit)?;
+                    return Ok(ViewCursor {
+                        cursor: next,
+                        remaining: Some(index + 1),
+                    });
+                }
+                if !page.has_more {
+                    break;
+                }
+                next = page.next;
+            }
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         let index = match &change {
             TranscriptChange::ReplaceCompacted {
                 messages,
@@ -7177,6 +7945,7 @@ impl Harness {
     /// be visible in the captured shared chain and have an origin snapshot.
     /// Local retained observations are scanned across resets.
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let _proof_scope = ResetProofScope::enter();
         self.load(id)?;
         if entry_id.is_nil() {
             return Err(crate::fork::Error::InvalidCursor.into());
@@ -7258,6 +8027,73 @@ impl Harness {
                 break;
             }
             cursor = page.next;
+        }
+        // A multi-reset commit exposes only its final transcript cursor in the
+        // observer. Inspect its bounded same-commit predecessors and authorize
+        // an intermediate occurrence only through the full reset proof.
+        if local_match.is_none() {
+            let mut observer_cursor = crate::observer::Cursor(0);
+            let mut visited = std::collections::HashSet::new();
+            loop {
+                let page =
+                    observer.read(observer_cursor, std::num::NonZeroUsize::new(128).unwrap())?;
+                for record in &page.records {
+                    let Some(value) = record.value.get("_transcript") else {
+                        continue;
+                    };
+                    let Some(mut position): Option<crate::transcript::Cursor> =
+                        serde_json::from_value(value.clone())?
+                    else {
+                        continue;
+                    };
+                    for _ in 0..65 {
+                        let Some(identity) = position.entry_identity() else {
+                            break;
+                        };
+                        if !visited.insert(identity) {
+                            break;
+                        }
+                        let batch =
+                            transcript.read_with_blocks(&position, std::num::NonZeroUsize::MIN)?;
+                        let Some(entry) = batch.records.first() else {
+                            break;
+                        };
+                        let change: TranscriptChange = serde_json::from_value(entry.value.clone())?;
+                        let (_, _, metadata) = change.parts()?;
+                        let Some((ids, commit, origin)) = metadata else {
+                            break;
+                        };
+                        if commit != record.cursor.0 || origin != id {
+                            break;
+                        }
+                        if let Some(index) = ids.iter().position(|candidate| *candidate == entry_id)
+                        {
+                            if ids
+                                .iter()
+                                .filter(|candidate| **candidate == entry_id)
+                                .count()
+                                != 1
+                                || local_match.is_some()
+                            {
+                                return Err(crate::fork::Error::InvalidSnapshot.into());
+                            }
+                            self.prove_failure_reset_cut(id, &position, commit)?;
+                            local_match = Some(ViewCursor {
+                                cursor: position.clone(),
+                                remaining: Some(index + 1),
+                            });
+                        }
+                        if !batch.has_more {
+                            break;
+                        }
+                        position = batch.next;
+                    }
+                }
+                if !page.has_more {
+                    break;
+                }
+                observer_cursor = page.next;
+            }
         }
         // Inherited identities are valid only while their immutable batch is
         // reachable from the child's captured head, up to its replacement base.
@@ -7725,6 +8561,7 @@ impl Harness {
         id: Uuid,
         mut cursor: crate::transcript::Cursor,
     ) -> Result<ResolvedOccurrences, Error> {
+        let _proof_scope = ResetProofScope::enter();
         let transcript = crate::transcript::Transcript::new(self.owner.store(), id);
         let mut changes = Vec::new();
         loop {
@@ -7902,6 +8739,865 @@ impl Harness {
         Ok((active, created))
     }
 
+    // The baseline must be the current committed root at the authenticated
+    // observation; fork snapshots alone omit pending block-reset bindings.
+    fn derive_anchored_reset_states(
+        &self,
+        id: Uuid,
+        expected_version: u64,
+        steps: &[ResetDerivationStep],
+    ) -> Result<Vec<Conversation>, Error> {
+        let root = Self::key(id);
+        let entry = self.owner.store().get(&root)?.ok_or(Error::NotFound)?;
+        let version = entry.version;
+        let mut baseline: Conversation = serde_json::from_slice(&entry.value)?;
+        self.hydrate(&mut baseline)?;
+        if version != expected_version {
+            return Err(durable_store::Error::Conflict { key: root }.into());
+        }
+        let store = self.owner.store();
+        let sequence = store
+            .commit_for_version(&root, version)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let prefix = format!("runtime/fork/{id}/");
+        let fork_key = match store
+            .runtime_snapshot_at(&root, prefix.as_bytes(), sequence)?
+            .filter(|(commit, _)| *commit == sequence)
+        {
+            Some((_, key)) => key,
+            None => store
+                .runtime_canonical_snapshot_at(&root, prefix.as_bytes(), sequence)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        };
+        let suffix = fork_key
+            .strip_prefix(prefix.as_bytes())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let observation = std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if fork_key != format!("runtime/fork/{id}/{observation:020}").as_bytes() {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        self.authenticate_fork_anchor(id, observation)?;
+        let fork = store
+            .get(&fork_key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&fork.value)?;
+        if snapshot.get("conversation_id") != Some(&serde_json::to_value(id)?)
+            || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
+            || snapshot.get("config") != Some(&serde_json::to_value(&baseline.config)?)
+            || snapshot.get("submissions") != Some(&serde_json::to_value(&baseline.submissions)?)
+            || snapshot.get("tool_states") != Some(&serde_json::to_value(&baseline.tool_states)?)
+            || snapshot.get("active") != Some(&serde_json::to_value(baseline.active)?)
+            || snapshot.get("pending_resets")
+                != Some(&serde_json::to_value(&baseline.pending_resets)?)
+            || snapshot.get("phase") != Some(&serde_json::to_value(&baseline.phase)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1queue-modes")
+                != Some(&serde_json::to_value(baseline.queue_modes)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1after-failed-run")
+                != Some(&serde_json::to_value(baseline.after_failed_run)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1extensions")
+                != Some(&serde_json::to_value(&baseline.extensions)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1provider-adapter")
+                != Some(&serde_json::to_value(&baseline.provider_adapter)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1allowed-tools")
+                != Some(&serde_json::to_value(&baseline.allowed_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1model-tools")
+                != Some(&serde_json::to_value(&baseline.model_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-filters")
+                != Some(&serde_json::to_value(&baseline.tool_filters)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-results")
+                != Some(&serde_json::to_value(&baseline.tool_results)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1occurrence-epoch-proven")
+                != Some(&serde_json::to_value(baseline.occurrence_epoch_proven)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1resets")
+                != Some(&serde_json::to_value(&baseline.resets)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1application-writes")
+                != Some(&serde_json::to_value(&baseline.application_writes)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let previous = observation
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let events = crate::observer::Observer::new(store, id).read(
+            crate::observer::Cursor(previous),
+            std::num::NonZeroUsize::MIN,
+        )?;
+        let has_digest = events.records.first().is_some_and(|event| {
+            event.cursor.0 == observation && event.value.get("_reset_baseline_sha256").is_some()
+        });
+        if snapshot.get("_reset_baseline").is_some() && has_digest {
+            let (historical, _) = self.authenticated_reset_baseline(id, observation)?;
+            if serde_json::to_value(&historical)? != serde_json::to_value(&baseline)?
+                || historical.messages != baseline.messages
+                || historical.content_blocks != baseline.content_blocks
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            derive_ordered_reset_states(&historical, steps)
+        } else {
+            // Existing stores can have pending resets from before capture was
+            // introduced. Current-version derivation remains supported.
+            derive_ordered_reset_states(&baseline, steps)
+        }
+    }
+
+    // Prove a failure/reset cut from independently authenticated predecessor
+    // state. The returned checks must be committed with any dependent fork.
+    fn prove_failure_reset_cut(
+        &self,
+        id: Uuid,
+        target: &crate::transcript::Cursor,
+        observation: u64,
+    ) -> Result<(Conversation, u64, Vec<Check>), Error> {
+        let _scope = ResetProofScope::enter();
+        if target.transcript_id() != id {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let (entry, sequence) = target
+            .entry_identity()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let key = (
+            Arc::as_ptr(&self.owner) as usize,
+            id,
+            entry,
+            sequence,
+            observation,
+        );
+        if let Some(value) =
+            RESET_PROOF_MEMO.with(|memo| memo.borrow().as_ref().and_then(|m| m.get(&key).cloned()))
+        {
+            // A cached result is only a shortcut for computation, not a lease
+            // on mutable evidence. Check all original versions and prefixes.
+            self.owner.store().commit(&value.2, &[])?;
+            return Ok(value);
+        }
+        #[cfg(test)]
+        RESET_PROOF_REPLAYS.with(|count| count.set(count.get() + 1));
+        let value = self.prove_failure_reset_cut_uncached(id, target, observation)?;
+        RESET_PROOF_MEMO.with(|memo| {
+            if let Some(memo) = memo.borrow_mut().as_mut() {
+                memo.insert(key, value.clone());
+            }
+        });
+        Ok(value)
+    }
+
+    fn prove_failure_reset_cut_uncached(
+        &self,
+        id: Uuid,
+        target: &crate::transcript::Cursor,
+        observation: u64,
+    ) -> Result<(Conversation, u64, Vec<Check>), Error> {
+        use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
+        let invalid = || Error::from(crate::fork::Error::InvalidSnapshot);
+        let store = self.owner.store();
+        let anchor_key = format!("runtime/fork/{id}/{observation:020}").into_bytes();
+        let revision = store.document_cut(&anchor_key)?.ok_or_else(invalid)?;
+        let candidate =
+            crate::reset_manifest::lookup_candidate(store, id, target, observation, revision)
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?;
+        let hints = candidate.replay_hints().map_err(|_| invalid())?;
+        let (mut baseline, _) =
+            self.authenticated_reset_baseline(id, hints.predecessor_observation)?;
+        let predecessor_key =
+            format!("runtime/fork/{id}/{:020}", hints.predecessor_observation).into_bytes();
+        let predecessor = store.get(&predecessor_key)?.ok_or_else(invalid)?;
+        let root_key = Self::key(id);
+        let sequence = store
+            .commit_for_version(&predecessor_key, predecessor.version)?
+            .ok_or_else(invalid)?;
+        if store.commit_for_version(&root_key, hints.predecessor_root_version)? != Some(sequence)
+            || baseline.abort_requested
+            || baseline.after_failed_run != AfterFailedRun::Continue
+        {
+            return Err(invalid());
+        }
+        if baseline.pending_independent_summary.is_some()
+            || hints.cuts.len() != baseline.pending_resets.len()
+            || hints.cuts.iter().any(|cut| cut.write_limit != u64::MAX)
+        {
+            return Err(invalid());
+        }
+        let predecessor_cursor = baseline.transcript.clone().ok_or_else(invalid)?;
+        let predecessor_generation = baseline.context_generation;
+        let limit_source_checks =
+            self.validate_limit_source(&baseline, hints.predecessor_root_version)?;
+        baseline = replay_checkpoint_failure(&baseline).ok_or_else(invalid)?;
+        apply_failed_run_policy(&mut baseline);
+        let steps: Vec<_> = hints
+            .cuts
+            .iter()
+            .map(|cut| {
+                Ok(ResetDerivationStep {
+                    reset_id: cut.reset_id,
+                    context_generation: cut.context_generation,
+                    write_limit: if cut.write_limit == u64::MAX {
+                        usize::MAX
+                    } else {
+                        usize::try_from(cut.write_limit).map_err(|_| invalid())?
+                    },
+                })
+            })
+            .collect::<Result<_, Error>>()?;
+        let cuts = derive_ordered_reset_states(&baseline, &steps)?;
+        let anchor = store.get(&anchor_key)?.ok_or_else(invalid)?;
+        let anchor_value: serde_json::Value = serde_json::from_slice(&anchor.value)?;
+        let anchor_cursor: crate::transcript::Cursor = serde_json::from_value(
+            anchor_value
+                .get("_transcript")
+                .cloned()
+                .ok_or_else(invalid)?,
+        )?;
+        let cursor = |c: &crate::transcript::Cursor| -> Result<ManifestCursor, Error> {
+            Ok(serde_json::from_value(serde_json::to_value(c)?)?)
+        };
+        let positions: Vec<crate::transcript::Cursor> = hints
+            .cuts
+            .iter()
+            .map(|cut| {
+                serde_json::from_value(serde_json::to_value(&cut.cursor)?).map_err(Error::from)
+            })
+            .collect::<Result<_, _>>()?;
+        let expected = ExpectedBinding {
+            conversation_id: id,
+            predecessor_observation: hints.predecessor_observation,
+            predecessor_root_version: hints.predecessor_root_version,
+            anchor_observation: observation,
+            document_revision: revision,
+            predecessor_context_generation: predecessor_generation,
+            predecessor_cursor: cursor(&predecessor_cursor)?,
+            anchor_cursor: cursor(&anchor_cursor)?,
+            cuts: steps
+                .iter()
+                .zip(&cuts)
+                .zip(&positions)
+                .map(|((step, cut), position)| {
+                    Ok(ResetCut {
+                        reset_id: step.reset_id,
+                        context_generation: step.context_generation,
+                        write_limit: if step.write_limit == usize::MAX {
+                            u64::MAX
+                        } else {
+                            step.write_limit as u64
+                        },
+                        cursor: cursor(position)?,
+                        state_sha256: reset_cut_digest(
+                            &serde_json::json!({"state":cut,"blocks":cut.content_blocks}),
+                        )?,
+                    })
+                })
+                .collect::<Result<_, Error>>()?,
+        };
+        ResetManifest::decode(&candidate.bytes, &expected).map_err(|_| invalid())?;
+        let selected = positions
+            .iter()
+            .position(|position| position == target)
+            .ok_or_else(invalid)?;
+        // Failure continuation produces exactly one trailing append.
+        if positions.last() == Some(&anchor_cursor) {
+            return Err(invalid());
+        }
+        let transcript = crate::transcript::Transcript::new(store, id);
+        let mut chain = positions.clone();
+        chain.push(anchor_cursor.clone());
+        let mut checks = candidate.checks;
+        checks.extend(limit_source_checks);
+        checks.extend(transcript.atomic_append_checks(&anchor_key, &predecessor_cursor, &chain)?);
+        // The predecessor's occurrence proof reads its entire immutable chain.
+        // Fence those records and their runtime anchors too: otherwise an old
+        // entry could change after replay but before the dependent fork commits.
+        let mut prior = predecessor_cursor.clone();
+        loop {
+            let (key, version) = transcript.entry_evidence(&prior)?;
+            checks.push(Check {
+                key,
+                expected: Expected::Version(version),
+            });
+            let page = transcript.read_with_blocks(&prior, std::num::NonZeroUsize::MIN)?;
+            let record = page.records.first().ok_or_else(invalid)?;
+            let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+            let origin_commit = match &change {
+                TranscriptChange::ReplaceCompacted { origin, commit, .. }
+                | TranscriptChange::ForkCut { origin, commit, .. } => Some((*origin, *commit)),
+                _ => change
+                    .parts()?
+                    .2
+                    .map(|(_, commit, origin)| (origin, commit)),
+            };
+            if let Some((origin, commit)) = origin_commit {
+                let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+                let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
+                let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+                let mut original = serde_json::to_value(&prior)?;
+                original["transcript"] = serde_json::to_value(origin)?;
+                let original: crate::transcript::Cursor = serde_json::from_value(original)?;
+                if value.get("_transcript") != Some(&serde_json::to_value(&original)?) {
+                    let revision = store.document_cut(&fork)?.ok_or_else(invalid)?;
+                    let evidence = crate::reset_manifest::lookup_candidate(
+                        store, origin, &original, commit, revision,
+                    )
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?;
+                    checks.extend(evidence.checks);
+                }
+                checks.push(Check {
+                    key: fork,
+                    expected: Expected::Version(snapshot.version),
+                });
+                let mut event = b"durable/observer/".to_vec();
+                event.extend_from_slice(origin.as_bytes());
+                event.extend_from_slice(b"/r");
+                event.extend_from_slice(&commit.to_be_bytes());
+                let version = store.get(&event)?.ok_or_else(invalid)?.version;
+                checks.push(Check {
+                    key: event,
+                    expected: Expected::Version(version),
+                });
+            }
+            if !page.has_more {
+                break;
+            }
+            prior = page.next;
+        }
+        let (_, mut seen) = self.resolved_occurrences_with_ids(id, predecessor_cursor)?;
+        for (position, cut) in positions.iter().zip(&cuts) {
+            let page = transcript.read_with_blocks(position, std::num::NonZeroUsize::MIN)?;
+            let record = page.records.first().ok_or_else(invalid)?;
+            let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+            let TranscriptChange::ReplaceV2 {
+                messages,
+                ids,
+                commit,
+                origin,
+            } = change
+            else {
+                return Err(invalid());
+            };
+            if messages != cut.messages
+                || commit != observation
+                || origin != id
+                || ids.len() != messages.len()
+                || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
+                || cut
+                    .content_blocks
+                    .iter()
+                    .any(|(index, binding)| ids.get(*index) != Some(&binding.message_id))
+                || record.content_blocks.clone().unwrap_or_default()
+                    != cut.content_blocks.values().cloned().collect::<Vec<_>>()
+            {
+                return Err(invalid());
+            }
+        }
+        let last = cuts.last().ok_or_else(invalid)?;
+        let mut continuation = last.clone();
+        let failure = continuation.run_failure.clone();
+        if !place_queued(&mut continuation, true) {
+            return Err(invalid());
+        }
+        continuation.run_failure = failure;
+        continuation.auto_compaction_attempted = false;
+        continuation.retry_state = RetryState::default();
+        continuation.overflow_compaction_attempted = false;
+        continuation.phase = Phase::ModelReady { turns: 0 };
+        if continuation
+            .application_writes
+            .iter()
+            .any(|w| !w.placed && !w.withdrawn)
+            || anchor_value.get("config") != Some(&serde_json::to_value(&continuation.config)?)
+            || anchor_value.get("submissions")
+                != Some(&serde_json::to_value(&continuation.submissions)?)
+            || anchor_value.get("tool_states")
+                != Some(&serde_json::to_value(&continuation.tool_states)?)
+            || anchor_value.get("active") != Some(&serde_json::to_value(continuation.active)?)
+            || anchor_value.get("pending_resets")
+                != Some(&serde_json::to_value(&continuation.pending_resets)?)
+            || anchor_value.get("phase") != Some(&serde_json::to_value(&continuation.phase)?)
+            || anchor_value.pointer("/documents/pi-rs~1runtime~1resets")
+                != Some(&serde_json::to_value(&continuation.resets)?)
+            || anchor_value.pointer("/documents/pi-rs~1runtime~1application-writes")
+                != Some(&serde_json::to_value(&continuation.application_writes)?)
+        {
+            return Err(invalid());
+        }
+        let page = transcript.read_with_blocks(&anchor_cursor, std::num::NonZeroUsize::MIN)?;
+        let record = page.records.first().ok_or_else(invalid)?;
+        let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+        let TranscriptChange::AppendV2 {
+            messages,
+            ids,
+            commit,
+            origin,
+        } = change
+        else {
+            return Err(invalid());
+        };
+        if commit != observation
+            || origin != id
+            || ids.len() != messages.len()
+            || messages != continuation.messages[last.messages.len()..]
+            || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
+            || continuation
+                .content_blocks
+                .range(last.messages.len()..)
+                .any(|(index, binding)| {
+                    ids.get(index - last.messages.len()) != Some(&binding.message_id)
+                })
+            || record.content_blocks.clone().unwrap_or_default()
+                != continuation
+                    .content_blocks
+                    .range(last.messages.len()..)
+                    .map(|(_, b)| b.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(invalid());
+        }
+        let mut event_key = b"durable/observer/".to_vec();
+        event_key.extend_from_slice(id.as_bytes());
+        event_key.extend_from_slice(b"/r");
+        event_key.extend_from_slice(&hints.predecessor_observation.to_be_bytes());
+        let event = store.get(&event_key)?.ok_or_else(invalid)?;
+        checks.push(Check {
+            key: predecessor_key,
+            expected: Expected::Version(predecessor.version),
+        });
+        checks.push(Check {
+            key: event_key,
+            expected: Expected::Version(event.version),
+        });
+        // Nested origin validation can discover proofs whose return values are
+        // intentionally discarded. Carry their original fences to callers.
+        merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
+        store.commit(&checks, &[])?;
+        Ok((cuts[selected].clone(), revision, checks))
+    }
+
+    // Read a captured predecessor after the live root has advanced. The
+    // immutable fork record, observer and root were committed together.
+    fn authenticated_reset_baseline(
+        &self,
+        id: Uuid,
+        observation: u64,
+    ) -> Result<(Conversation, u64), Error> {
+        self.authenticate_fork_anchor(id, observation)?;
+        let key = format!("runtime/fork/{id}/{observation:020}");
+        let store = self.owner.store();
+        let fork = store
+            .get(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&fork.value)?;
+        let value = snapshot
+            .get("_reset_baseline")
+            .cloned()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let after = observation
+            .checked_sub(1)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let page = crate::observer::Observer::new(store, id)
+            .read(crate::observer::Cursor(after), std::num::NonZeroUsize::MIN)?;
+        let event = page
+            .records
+            .first()
+            .filter(|r| r.cursor.0 == observation)
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if event
+            .value
+            .get("_reset_baseline_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(reset_baseline_digest(&value)?.as_str())
+            || event.value.get("_transcript") != snapshot.get("_transcript")
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut baseline: Conversation = serde_json::from_value(value)?;
+        // Pending tool-result metadata lives at a separately mutable key and
+        // cannot be reconstructed historically by this baseline format.
+        if baseline.id != id
+            || !baseline.messages.is_empty()
+            || baseline.pending_reset_blocks.is_empty()
+            || matches!(baseline.phase, Phase::ToolFinished { .. })
+            || snapshot.get("conversation_id") != Some(&serde_json::to_value(id)?)
+            || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
+            || snapshot.get("config") != Some(&serde_json::to_value(&baseline.config)?)
+            || snapshot.get("submissions") != Some(&serde_json::to_value(&baseline.submissions)?)
+            || snapshot.get("tool_states") != Some(&serde_json::to_value(&baseline.tool_states)?)
+            || snapshot.get("active") != Some(&serde_json::to_value(baseline.active)?)
+            || snapshot.get("pending_resets")
+                != Some(&serde_json::to_value(&baseline.pending_resets)?)
+            || snapshot.get("phase") != Some(&serde_json::to_value(&baseline.phase)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1queue-modes")
+                != Some(&serde_json::to_value(baseline.queue_modes)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1after-failed-run")
+                != Some(&serde_json::to_value(baseline.after_failed_run)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1extensions")
+                != Some(&serde_json::to_value(&baseline.extensions)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1provider-adapter")
+                != Some(&serde_json::to_value(&baseline.provider_adapter)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1allowed-tools")
+                != Some(&serde_json::to_value(&baseline.allowed_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1model-tools")
+                != Some(&serde_json::to_value(&baseline.model_tools)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-filters")
+                != Some(&serde_json::to_value(&baseline.tool_filters)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1tool-results")
+                != Some(&serde_json::to_value(&baseline.tool_results)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1occurrence-epoch-proven")
+                != Some(&serde_json::to_value(baseline.occurrence_epoch_proven)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1resets")
+                != Some(&serde_json::to_value(&baseline.resets)?)
+            || snapshot.pointer("/documents/pi-rs~1runtime~1application-writes")
+                != Some(&serde_json::to_value(&baseline.application_writes)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let cursor = baseline
+            .transcript
+            .clone()
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let (messages, blocks) = self.read_transcript_blocks(id, cursor)?;
+        baseline.messages = messages;
+        baseline.content_blocks = blocks;
+        validate_pending_reset_blocks(&baseline)?;
+        let revision = store
+            .document_cut(key.as_bytes())?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        Ok((baseline, revision))
+    }
+
+    // Locate the canonical snapshot of the state on which a limit decision
+    // was made. Legacy roots without commit evidence retain staged settlement.
+    fn limit_source_observation(&self, id: Uuid, version: u64) -> Result<Option<u64>, Error> {
+        let store = self.owner.store();
+        let root = Self::key(id);
+        let Some(sequence) = store.commit_for_version(&root, version)? else {
+            return Ok(None);
+        };
+        let prefix = format!("runtime/fork/{id}/");
+        let Some(key) = store.runtime_canonical_snapshot_at(&root, prefix.as_bytes(), sequence)?
+        else {
+            return Ok(None);
+        };
+        let observation = std::str::from_utf8(
+            key.strip_prefix(prefix.as_bytes())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if key != format!("runtime/fork/{id}/{observation:020}").as_bytes() {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        match self.authenticate_fork_anchor(id, observation) {
+            Ok(()) => Ok(Some(observation)),
+            Err(Error::Fork(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    // The runtime, not the later decision, chooses and persists this bound.
+    // Fence the source snapshot in the evidence checkpoint itself.
+    fn validate_limit_evidence_admission(
+        &self,
+        baseline: &Conversation,
+        state: &Conversation,
+        version: u64,
+    ) -> Result<Vec<Check>, Error> {
+        let Phase::LimitEvidence {
+            kind,
+            count,
+            limit,
+            source_observation,
+            source_root_version,
+        } = &state.phase
+        else {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        };
+        let actual = match kind {
+            LimitFailureKind::Turn => self.options.max_turns,
+            LimitFailureKind::Restart => self.options.restart_limit,
+        };
+        let eligible = match (kind, &baseline.phase) {
+            (LimitFailureKind::Turn, Phase::ModelReady { turns }) => {
+                *turns == *count
+                    && matches!(
+                        baseline
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| !matches!(m, Message::System { .. })),
+                        Some(
+                            Message::User { .. }
+                                | Message::UserWithImages { .. }
+                                | Message::Tool { .. }
+                        )
+                    )
+                    && self.supports_context_blocks(baseline)
+            }
+            (LimitFailureKind::Restart, Phase::AbandonedModel { restarts, .. }) => {
+                *restarts == *count
+            }
+            _ => false,
+        };
+        let mut expected = baseline.clone();
+        expected.phase = state.phase.clone();
+        if !eligible
+            || actual == 0
+            || *limit != actual
+            || *count < *limit
+            || *source_root_version != version
+            || self.limit_source_observation(state.id, version)? != Some(*source_observation)
+            || serde_json::to_value(&expected)? != serde_json::to_value(state)?
+            || expected.messages != state.messages
+            || expected.content_blocks != state.content_blocks
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let store = self.owner.store();
+        let key = format!("runtime/fork/{}/{source_observation:020}", state.id).into_bytes();
+        let source_version = store
+            .get(&key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(state.id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&source_observation.to_be_bytes());
+        let event_version = store
+            .get(&event)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        Ok(vec![
+            Check {
+                key,
+                expected: Expected::Version(source_version),
+            },
+            Check {
+                key: event,
+                expected: Expected::Version(event_version),
+            },
+        ])
+    }
+
+    // Bind the terminal decision to an earlier authenticated runtime snapshot
+    // with the same transcript and actual counter. Fence that evidence with
+    // any fork authorized by the decision.
+    fn validate_limit_source(
+        &self,
+        baseline: &Conversation,
+        version: u64,
+    ) -> Result<Vec<Check>, Error> {
+        let (kind, count, limit, source_observation, source_root_version, is_terminal_decision) =
+            match &baseline.phase {
+                Phase::LimitEvidence {
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                } => (
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                    false,
+                ),
+                Phase::LimitFailure {
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                } => (
+                    kind,
+                    count,
+                    limit,
+                    source_observation,
+                    source_root_version,
+                    true,
+                ),
+                _ => return Ok(Vec::new()),
+            };
+        if *limit == 0 || count < limit {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let store = self.owner.store();
+        let root = Self::key(baseline.id);
+        let source_seq = store
+            .commit_for_version(&root, *source_root_version)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let current_seq = store
+            .commit_for_version(&root, version)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let decision_seq = store
+            .next_commit_for_key(&root, source_seq)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if decision_seq > current_seq
+            || self.limit_source_observation(baseline.id, *source_root_version)?
+                != Some(*source_observation)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let prefix = format!("runtime/fork/{}/", baseline.id);
+        let decision_key = store
+            .runtime_canonical_snapshot_at(&root, prefix.as_bytes(), decision_seq)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let decision_observation = std::str::from_utf8(
+            decision_key
+                .strip_prefix(prefix.as_bytes())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if decision_key
+            != format!("runtime/fork/{}/{decision_observation:020}", baseline.id).as_bytes()
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        self.authenticate_fork_anchor(baseline.id, decision_observation)?;
+        let decision = store
+            .get(&decision_key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let decision_value: serde_json::Value = serde_json::from_slice(&decision.value)?;
+        if decision_value.get("phase") != Some(&serde_json::to_value(&baseline.phase)?)
+            || decision_value.get("_transcript")
+                != Some(&serde_json::to_value(&baseline.transcript)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut decision_event = b"durable/observer/".to_vec();
+        decision_event.extend_from_slice(baseline.id.as_bytes());
+        decision_event.extend_from_slice(b"/r");
+        decision_event.extend_from_slice(&decision_observation.to_be_bytes());
+        let decision_event_version = store
+            .get(&decision_event)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        let key = format!("runtime/fork/{}/{source_observation:020}", baseline.id).into_bytes();
+        let source = store
+            .get(&key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&source.value)?;
+        let phase: Phase = serde_json::from_value(
+            snapshot
+                .get("phase")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        let mut prior_checks = Vec::new();
+        let valid_source = if is_terminal_decision {
+            if let Phase::LimitEvidence {
+                kind: prior_kind,
+                count: prior_count,
+                limit: prior_limit,
+                ..
+            } = &phase
+            {
+                if prior_kind != kind || prior_count != count || prior_limit != limit {
+                    false
+                } else {
+                    let mut evidence = baseline.clone();
+                    evidence.phase = phase.clone();
+                    prior_checks = self.validate_limit_source(&evidence, *source_root_version)?;
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            match (kind, phase) {
+                (LimitFailureKind::Turn, Phase::ModelReady { turns }) => turns == *count,
+                (LimitFailureKind::Restart, Phase::AbandonedModel { restarts, .. }) => {
+                    restarts == *count
+                }
+                _ => false,
+            }
+        };
+        let turn_has_input = !matches!(kind, LimitFailureKind::Turn)
+            || matches!(
+                baseline
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| !matches!(m, Message::System { .. })),
+                Some(Message::User { .. } | Message::UserWithImages { .. } | Message::Tool { .. })
+            );
+        if !valid_source
+            || !turn_has_input
+            || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(baseline.id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&source_observation.to_be_bytes());
+        let event_version = store
+            .get(&event)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        merge_reset_proof_checks(
+            &mut prior_checks,
+            vec![
+                Check {
+                    key,
+                    expected: Expected::Version(source.version),
+                },
+                Check {
+                    key: event,
+                    expected: Expected::Version(event_version),
+                },
+                Check {
+                    key: decision_key,
+                    expected: Expected::Version(decision.version),
+                },
+                Check {
+                    key: decision_event,
+                    expected: Expected::Version(decision_event_version),
+                },
+            ],
+        );
+        Ok(prior_checks)
+    }
+
+    // A matching observer payload alone is not evidence of a runtime commit:
+    // both reserved records must be the versions written by the same commit.
+    fn authenticate_fork_anchor(&self, origin: Uuid, commit: u64) -> Result<(), Error> {
+        if commit == 0 {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut observation = b"durable/observer/".to_vec();
+        observation.extend_from_slice(origin.as_bytes());
+        observation.extend_from_slice(b"/r");
+        observation.extend_from_slice(&commit.to_be_bytes());
+        let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+        let store = self.owner.store();
+        let event = store
+            .get(&observation)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot = store
+            .get(&fork)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let Some(sequence) = store.commit_for_version(&observation, event.version)? else {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        };
+        if Some(sequence) != store.commit_for_version(&fork, snapshot.version)?
+            || store.document_cut(&fork)?.is_none()
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let root = format!("runtime/conversation/{origin}");
+        let prefix = format!("runtime/fork/{origin}/");
+        if !store.runtime_snapshot_exact_at(root.as_bytes(), prefix.as_bytes(), &fork, sequence)? {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        Ok(())
+    }
+
     fn verify_occurrence_origin(
         &self,
         transcript_id: Uuid,
@@ -7909,6 +9605,7 @@ impl Harness {
         origin: Uuid,
         commit: u64,
     ) -> Result<(), Error> {
+        self.authenticate_fork_anchor(origin, commit)?;
         let after = commit
             .checked_sub(1)
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -7950,7 +9647,10 @@ impl Harness {
         let mut rebound = serde_json::to_value(source)?;
         rebound["transcript"] = serde_json::to_value(transcript_id)?;
         if serde_json::from_value::<crate::transcript::Cursor>(rebound)? != *position {
-            return Err(crate::fork::Error::InvalidSnapshot.into());
+            let mut original = serde_json::to_value(position)?;
+            original["transcript"] = serde_json::to_value(origin)?;
+            let original = serde_json::from_value(original)?;
+            self.prove_failure_reset_cut(origin, &original, commit)?;
         }
         Ok(())
     }
@@ -12106,8 +13806,25 @@ impl Harness {
             match c.phase.clone() {
                 Phase::Idle => {
                     if !c.pending_resets.is_empty() {
-                        for marker in take_reset_batch(&mut c) {
-                            place_reset(&mut c, marker);
+                        if c.pending_reset_blocks.is_empty() {
+                            for marker in take_reset_batch(&mut c) {
+                                place_reset(&mut c, marker);
+                            }
+                        } else {
+                            let step = ResetDerivationStep {
+                                reset_id: c.pending_resets[0].id,
+                                context_generation: Uuid::new_v4(),
+                                write_limit: usize::MAX,
+                            };
+                            c = match self.derive_anchored_reset_states(id, version, &[step]) {
+                                Ok(mut cuts) => cuts.pop().ok_or_else(|| {
+                                    Error::Invalid("missing reset derivation".into())
+                                })?,
+                                Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                         }
                         let merge = self.merge_admissions;
                         self.merge_admissions = false;
@@ -12414,7 +14131,23 @@ impl Harness {
                             FailureCause::NothingToAnswer,
                         );
                     } else if turns >= self.options.max_turns {
-                        finish_failure(&mut c, "turn limit".into(), FailureCause::TurnLimit(turns));
+                        if let Some(source_observation) =
+                            self.limit_source_observation(id, version)?
+                        {
+                            c.phase = Phase::LimitEvidence {
+                                kind: LimitFailureKind::Turn,
+                                count: turns,
+                                limit: self.options.max_turns,
+                                source_observation,
+                                source_root_version: version,
+                            };
+                        } else {
+                            finish_failure(
+                                &mut c,
+                                "turn limit".into(),
+                                FailureCause::TurnLimit(turns),
+                            );
+                        }
                     } else {
                         if !c.auto_compaction_attempted
                             && (c.content_blocks.is_empty()
@@ -12487,6 +14220,14 @@ impl Harness {
                             request_id: Uuid::new_v4(),
                             restarts: 0,
                         };
+                    }
+                    if matches!(c.phase, Phase::LimitEvidence { .. }) {
+                        match self.save_limit_checkpoint(&c, version) {
+                            Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -12867,6 +14608,48 @@ impl Harness {
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
+                Phase::LimitEvidence {
+                    kind, count, limit, ..
+                } => {
+                    self.validate_limit_source(&c, version)?;
+                    let source_observation = self
+                        .limit_source_observation(id, version)?
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                    c.phase = Phase::LimitFailure {
+                        kind,
+                        count,
+                        limit,
+                        source_observation,
+                        source_root_version: version,
+                    };
+                    match self.save_limit_checkpoint(&c, version) {
+                        Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Phase::LimitFailure {
+                    kind, count, limit, ..
+                } => {
+                    if limit == 0 || count < limit {
+                        return Err(Error::Invalid("invalid persisted limit decision".into()));
+                    }
+                    self.validate_limit_source(&c, version)?;
+                    match kind {
+                        LimitFailureKind::Turn => finish_failure(
+                            &mut c,
+                            "turn limit".into(),
+                            FailureCause::TurnLimit(count),
+                        ),
+                        LimitFailureKind::Restart => finish_failure(
+                            &mut c,
+                            "model restart limit".into(),
+                            FailureCause::RestartLimit(count),
+                        ),
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
                 Phase::RetryWait { turns } => {
                     match c.retry_state.poll(unix_ms()) {
                         Decision::WaitUntil(deadline) => {
@@ -12905,17 +14688,37 @@ impl Harness {
                         }
                     }
                     if restarts >= self.options.restart_limit {
-                        finish_failure(
-                            &mut c,
-                            "model restart limit".into(),
-                            FailureCause::RestartLimit(restarts),
-                        );
+                        if let Some(source_observation) =
+                            self.limit_source_observation(id, version)?
+                        {
+                            c.phase = Phase::LimitEvidence {
+                                kind: LimitFailureKind::Restart,
+                                count: restarts,
+                                limit: self.options.restart_limit,
+                                source_observation,
+                                source_root_version: version,
+                            };
+                        } else {
+                            finish_failure(
+                                &mut c,
+                                "model restart limit".into(),
+                                FailureCause::RestartLimit(restarts),
+                            );
+                        }
                     } else {
                         c.phase = Phase::ModelRunning {
                             turns,
                             request_id: Uuid::new_v4(),
                             restarts,
                         };
+                    }
+                    if matches!(c.phase, Phase::LimitEvidence { .. }) {
+                        match self.save_limit_checkpoint(&c, version) {
+                            Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -19411,6 +21214,61 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
     Ok(())
 }
 
+fn reset_baseline_digest(value: &serde_json::Value) -> Result<String, Error> {
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+// Reset cut states contain HashMaps whose iteration order can change after
+// reopen. Canonicalize recursively before hashing so replay is deterministic.
+fn reset_cut_digest(value: &serde_json::Value) -> Result<String, Error> {
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    reset_baseline_digest(&canonical)
+}
+
+// Derive reset cuts from a caller-authenticated baseline without writing storage.
+// A future batch proof can compare each returned state to its committed cut.
+#[derive(Clone, Copy)]
+struct ResetDerivationStep {
+    reset_id: Uuid,
+    context_generation: Uuid,
+    write_limit: usize,
+}
+
+fn derive_ordered_reset_states(
+    baseline: &Conversation,
+    steps: &[ResetDerivationStep],
+) -> Result<Vec<Conversation>, Error> {
+    if steps.is_empty() {
+        return Err(Error::Invalid("empty reset derivation".into()));
+    }
+    validate_pending_reset_blocks(baseline)?;
+    let mut state = baseline.clone();
+    let mut generations = std::collections::HashSet::new();
+    if let Some(generation) = state.context_generation {
+        generations.insert(generation);
+    }
+    let mut cuts = Vec::with_capacity(steps.len());
+    for step in steps {
+        if step.context_generation.is_nil()
+            || !generations.insert(step.context_generation)
+            || state
+                .pending_resets
+                .first()
+                .is_none_or(|reset| reset.id != step.reset_id)
+        {
+            return Err(Error::Invalid("invalid ordered reset derivation".into()));
+        }
+        let marker = state.pending_resets.remove(0);
+        place_reset_before_writes(&mut state, marker, step.write_limit);
+        state.context_generation = Some(step.context_generation);
+        validate_pending_reset_blocks(&state)?;
+        cuts.push(state.clone());
+    }
+    Ok(cuts)
+}
+
 // Each block-bearing reset needs its own durable transcript transition.
 fn take_reset_batch(c: &mut Conversation) -> Vec<crate::reset::Reset> {
     let count = if c.pending_reset_blocks.is_empty() {
@@ -19654,6 +21512,48 @@ enum FailureCause {
     TurnLimit(u32),
     NothingToAnswer,
     RestartLimit(u32),
+}
+
+// Reconstruct only terminal failures whose complete input state is captured in
+// the predecessor. The writer still checks this against its actual transition.
+fn replay_checkpoint_failure(baseline: &Conversation) -> Option<Conversation> {
+    let (reason, cause) = match &baseline.phase {
+        Phase::FailedModel {
+            reason,
+            decision: ModelFailureDecision::Stop,
+            ..
+        } => (reason.clone(), FailureCause::ModelError),
+        Phase::LimitFailure {
+            kind, count, limit, ..
+        } if *limit > 0 && *count >= *limit => match kind {
+            LimitFailureKind::Turn => ("turn limit".into(), FailureCause::TurnLimit(*count)),
+            LimitFailureKind::Restart => (
+                "model restart limit".into(),
+                FailureCause::RestartLimit(*count),
+            ),
+        },
+        // Legacy checkpoints have no authenticated terminal limit decision.
+        Phase::ModelReady { .. } => {
+            let has_input = matches!(
+                baseline
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| !matches!(m, Message::System { .. })),
+                Some(Message::User { .. } | Message::UserWithImages { .. } | Message::Tool { .. })
+            );
+            // Block-capable provider availability is not authenticated by the
+            // checkpoint, and the runtime checks it before this decision.
+            if has_input || !baseline.content_blocks.is_empty() {
+                return None;
+            }
+            ("nothing_to_answer".into(), FailureCause::NothingToAnswer)
+        }
+        _ => return None,
+    };
+    let mut replay = baseline.clone();
+    finish_failure(&mut replay, reason, cause);
+    Some(replay)
 }
 
 fn finish_failure(c: &mut Conversation, reason: String, cause: FailureCause) {
@@ -21947,6 +23847,96 @@ mod scheduler_tests {
                 assert_eq!(value["reason"], "aborted");
             }
         }
+    }
+
+    #[test]
+    fn fork_anchor_accepts_other_snapshots_in_same_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = Arc::new(GatedModel {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.submit(id, None, "active".into()).unwrap();
+        let (reset, _) = h
+            .reset_with_blocks(
+                id,
+                None,
+                vec![vec![serde_json::json!({"type":"text", "text":"block"})]],
+            )
+            .unwrap();
+        let head = h.history_head(id).unwrap().0;
+        let root = Harness::key(id);
+        let fork = format!("runtime/fork/{id}/{head:020}").into_bytes();
+        let extra = format!("runtime/fork/{id}/intermediate").into_bytes();
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&head.to_be_bytes());
+        let store = h.owner.store();
+        let root_value = store.get(&root).unwrap().unwrap().value;
+        let fork_value = store.get(&fork).unwrap().unwrap().value;
+        let event_value = store.get(&event).unwrap().unwrap().value;
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: root,
+                        value: root_value,
+                    },
+                    Mutation::Put {
+                        key: fork.clone(),
+                        value: fork_value,
+                    },
+                    Mutation::Put {
+                        key: event,
+                        value: event_value,
+                    },
+                    Mutation::Put {
+                        key: extra,
+                        value: b"untrusted".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        h.authenticate_fork_anchor(id, head).unwrap();
+        let (_, version) = h.load(id).unwrap();
+        let step = ResetDerivationStep {
+            reset_id: reset,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        };
+        assert_eq!(
+            h.derive_anchored_reset_states(id, version, &[step])
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        h.authenticate_fork_anchor(id, head).unwrap();
+        assert_eq!(
+            h.derive_anchored_reset_states(id, version, &[step])
+                .unwrap()
+                .len(),
+            1
+        );
+        // Rewriting the selected snapshot alone must still invalidate it.
+        let value = h.owner.store().get(&fork).unwrap().unwrap().value;
+        h.owner
+            .store()
+            .commit(&[], &[Mutation::Put { key: fork, value }])
+            .unwrap();
+        assert!(h.authenticate_fork_anchor(id, head).is_err());
+        assert!(
+            h.derive_anchored_reset_states(id, version, &[step])
+                .is_err()
+        );
     }
 
     #[test]
@@ -26831,6 +28821,10 @@ mod scheduler_tests {
 #[cfg(test)]
 #[path = "runtime_cas_tests.rs"]
 mod runtime_cas_tests;
+
+#[cfg(test)]
+#[path = "runtime_atomic_reset_tests.rs"]
+mod runtime_atomic_reset_tests;
 
 #[cfg(test)]
 mod tool_allowlist_tests {
