@@ -979,10 +979,10 @@ mod jsonl_framing_tests {
 
 fn parse_request(line: &str) -> Result<Value> {
     match serde_json::from_str(line) {
-        Ok(Value::Object(request)) => Ok(Value::Object(request)),
-        Ok(_) => Err(Error::Config(
+        Ok(Value::Null) => Err(Error::Config(
             "Failed to parse command: expected a JSON object".into(),
         )),
+        Ok(request) => Ok(request),
         Err(error) => Err(Error::Config(format!(
             "Failed to parse command: {}",
             rpc_json_error(line, &error)
