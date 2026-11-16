@@ -5784,6 +5784,30 @@ fn bounded_tool_blocks_preserve_nontext_order_and_bound_combined_text() {
         diagnostic.message,
         "Output truncated to its end: 0 lines, 2 bytes dropped"
     );
+    // Upstream pi 04fd0897 harness/tool.ts boundContent joins text and puts
+    // the retained head/tail in the first/last text block respectively.
+    let mut head = vec![
+        serde_json::json!({"type":"text", "text":"abc"}),
+        serde_json::json!({"type":"image", "data":"image", "mimeType":"image/png"}),
+        serde_json::json!({"type":"text", "text":"def"}),
+    ];
+    bound_tool_output(
+        &mut head,
+        OutputLimits {
+            max_bytes: 4,
+            max_lines: 10,
+            retain: Retain::Head,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        head,
+        vec![
+            serde_json::json!({"type":"text", "text":"abcd"}),
+            serde_json::json!({"type":"image", "data":"image", "mimeType":"image/png"})
+        ]
+    );
 }
 
 #[tokio::test]

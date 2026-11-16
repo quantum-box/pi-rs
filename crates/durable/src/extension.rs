@@ -207,14 +207,7 @@ fn remove_cloned_derived_diagnostics(
     after: &mut Vec<crate::runtime::ToolDiagnostic>,
     derived: &[crate::runtime::ToolDiagnostic],
 ) {
-    after.retain(|diagnostic| {
-        !(derived.contains(diagnostic)
-            || matches!(
-                diagnostic.code.as_deref(),
-                Some("tool_failed" | "tool_skipped")
-            ))
-            || !before.contains(diagnostic)
-    });
+    after.retain(|diagnostic| !derived.contains(diagnostic) || !before.contains(diagnostic));
 }
 
 /// A block-aware tool result for hosts that can persist and deliver ordered output.

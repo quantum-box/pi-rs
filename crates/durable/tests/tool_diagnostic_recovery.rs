@@ -1710,3 +1710,150 @@ async fn nested_gate_failure_diagnostics_are_redacted_before_parent_model_reques
         assert!(!format!("{:?}", h.conversation(id).unwrap()).contains("private"));
     }
 }
+
+#[tokio::test]
+async fn nested_explicit_diagnostics_survive_projection_and_redaction() {
+    use pi_rs_durable::extension::{ToolBlockResult, ToolCall as HookCall, ToolResult};
+    use std::sync::Mutex;
+    struct Capture(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for Capture {
+        async fn stream(&self, req: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            self.0.lock().unwrap().push(req.clone());
+            FakeModel("parent").stream(req).await
+        }
+    }
+    struct ChildTool(&'static str);
+    #[async_trait::async_trait]
+    impl KeyedTool for ChildTool {
+        fn spec(&self) -> ToolSpec {
+            spec("child")
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            host.diagnostic(ToolDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                code: Some(self.0.into()),
+                message: "same".into(),
+            })
+            .unwrap();
+            Outcome::Failed("same".into()).into()
+        }
+    }
+    struct ParentTool(&'static str);
+    #[async_trait::async_trait]
+    impl KeyedTool for ParentTool {
+        fn spec(&self) -> ToolSpec {
+            spec("parent")
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            for _ in 0..2 {
+                let result = host.call_keyed_with_blocks("key", "child", json!({})).await;
+                assert_eq!(result.outcome, Outcome::Failed("same".into()));
+                assert_eq!(result.diagnostics.len(), 1);
+                assert_eq!(result.diagnostics[0].code.as_deref(), Some(self.0));
+                assert_eq!(result.diagnostics[0].message, "same");
+                host.diagnostic(result.diagnostics[0].clone()).unwrap();
+            }
+            Outcome::Succeeded("parent".into()).into()
+        }
+    }
+    struct HookKind(bool);
+    #[async_trait::async_trait]
+    impl Hook for HookKind {
+        async fn after_tool_result(
+            &self,
+            call: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            if !self.0 || call.name != "child" {
+                return Ok(None);
+            }
+            let mut value = result.clone();
+            value.output = "same".into();
+            Ok(Some(value))
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            !self.0
+        }
+        async fn after_tool_blocks(
+            &self,
+            call: &HookCall,
+            result: &ToolBlockResult,
+            nested: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            if !nested || call.name != "child" {
+                return Ok(None);
+            }
+            let mut value = result.clone();
+            value.output = vec![json!({"type":"text","text":"same"})];
+            Ok(Some(value))
+        }
+    }
+    for code in ["tool_failed", "tool_skipped", "tool_error"] {
+        for rich in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let options = || Options {
+                model: Arc::new(Capture(requests.clone())),
+                tools: vec![
+                    Arc::new(KeyedToolAdapter::new(ParentTool(code))).register(ReplayPolicy::Safe),
+                    Arc::new(KeyedToolAdapter::new(ChildTool(code))).register(ReplayPolicy::Unsafe),
+                ],
+                restart_limit: 4,
+                max_turns: 4,
+                uncertain_policy: UncertainPolicy::RequireReconciliation,
+            };
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            h.install_extension(Extension {
+                name: "rewrite".into(),
+                hooks: vec![Arc::new(HookKind(rich))],
+                ..Default::default()
+            })
+            .unwrap();
+            let id = h.create_conversation(config()).unwrap();
+            h.select_extensions(id, vec!["rewrite".into()]).unwrap();
+            h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+                .await
+                .unwrap();
+            let result = h.conversation(id).unwrap();
+            assert_eq!(
+                result.tool_results[0]
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code.as_deref() == Some(code))
+                    .count(),
+                2
+            );
+            let requests = requests.lock().unwrap();
+            assert!(requests.iter().flat_map(|r| &r.messages).any(
+                |m| matches!(m, Message::Tool { content,.. } if content.contains("[error] same"))
+            ));
+            drop(requests);
+            drop(h);
+            let h = Harness::open_paused(&path, options()).unwrap();
+            assert_eq!(
+                h.conversation(id).unwrap().tool_results[0]
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code.as_deref() == Some(code))
+                    .count(),
+                2
+            );
+        }
+    }
+}

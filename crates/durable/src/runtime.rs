@@ -14164,7 +14164,13 @@ impl Harness {
                                     || content.strip_prefix("Tool failed: ")
                                         == Some(diagnostic.message.as_str())
                                     || content.strip_prefix("Tool skipped: ")
-                                        == Some(diagnostic.message.as_str()))
+                                        == Some(diagnostic.message.as_str())
+                                    || (diagnostic.code.as_deref() == Some("tool_failed")
+                                        && diagnostic.message
+                                            == "tool interrupted and may have partially run"
+                                        && content
+                                            .strip_suffix(&diagnostic.message)
+                                            .is_some_and(|prefix| prefix.ends_with('\n'))))
                             {
                                 derived.push(diagnostic.clone());
                             }

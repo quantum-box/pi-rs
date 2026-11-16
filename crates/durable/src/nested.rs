@@ -57,6 +57,9 @@ struct Record {
     diagnostics: Vec<crate::runtime::ToolDiagnostic>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     derived_diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    // Marks records whose generated diagnostics were explicitly tracked.
+    #[serde(default)]
+    diagnostic_provenance: bool,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     diagnostic_keys: std::collections::BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1059,6 +1062,7 @@ impl NestedHost {
             }
         };
         let mut output_blocks = None;
+        let mut provenance_known = false;
         let mut diagnostics = if valid_key(key) {
             match self
                 .shared
@@ -1092,6 +1096,7 @@ impl NestedHost {
                             };
                         }
                         output_blocks = record.output_blocks;
+                        provenance_known = record.diagnostic_provenance;
                         record.diagnostics
                     }
                     Ok(_) => Vec::new(),
@@ -1118,7 +1123,10 @@ impl NestedHost {
         // Older records may have retained their pre-hook outcome alongside
         // rewritten blocks. Project it before any fallback diagnostic is made.
         if let Some(blocks) = &output_blocks {
-            if let Outcome::Failed(reason) | Outcome::Skipped(reason) = &outcome {
+            if !provenance_known
+                && outcome_from_blocks(outcome.clone(), blocks) != outcome
+                && let Outcome::Failed(reason) | Outcome::Skipped(reason) = &outcome
+            {
                 diagnostics.retain(|diagnostic| {
                     !matches!(
                         diagnostic.code.as_deref(),
@@ -1569,6 +1577,7 @@ impl NestedHost {
                 projected_structured: None,
                 diagnostics: Vec::new(),
                 derived_diagnostics: Vec::new(),
+                diagnostic_provenance: true,
                 diagnostic_keys: Default::default(),
                 resolution: None,
             };
@@ -2004,7 +2013,9 @@ impl NestedHost {
         let mut derived = record.derived_diagnostics.clone();
         // Legacy records predate explicit provenance. A matching error reason
         // is conservatively treated as derived during redaction.
-        if let Outcome::Failed(reason) | Outcome::Skipped(reason) = &original {
+        if !record.diagnostic_provenance
+            && let Outcome::Failed(reason) | Outcome::Skipped(reason) = &original
+        {
             for diagnostic in &record.diagnostics {
                 if diagnostic.severity == crate::runtime::DiagnosticSeverity::Error
                     && diagnostic.message == *reason
@@ -2184,6 +2195,7 @@ impl NestedHost {
         record.output_blocks = blocks_changed.then_some(blocks.output);
         record.diagnostics = blocks.diagnostics;
         record.derived_diagnostics.clear();
+        record.diagnostic_provenance = true;
         record.diagnostic_keys.clear();
         let value = match serde_json::to_vec(&record) {
             Ok(value) => value,
@@ -2456,6 +2468,7 @@ mod tests {
             projected_structured: None,
             diagnostics: Vec::new(),
             derived_diagnostics: Vec::new(),
+            diagnostic_provenance: true,
             diagnostic_keys: Default::default(),
             resolution: None,
         };
@@ -2549,6 +2562,7 @@ mod tests {
             projected_structured: None,
             diagnostics: Vec::new(),
             derived_diagnostics: Vec::new(),
+            diagnostic_provenance: true,
             diagnostic_keys: Default::default(),
             resolution: None,
         };
@@ -3521,6 +3535,7 @@ mod tests {
             }),
             diagnostics: vec![],
             derived_diagnostics: vec![],
+            diagnostic_provenance: true,
             diagnostic_keys: Default::default(),
             resolution: None,
         };
