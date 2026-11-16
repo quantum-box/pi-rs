@@ -1515,7 +1515,7 @@ fn markdown_at_depth(
 ) -> Vec<Line> {
     // Marked normalizes line endings before invoking the block extension. Keep
     // all offsets local to this normalized document, including list contents.
-    if text.contains('\r') && (text.contains("$$") || text.contains("\\[")) {
+    if text.contains('\r') {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         return markdown_at_depth(
             &normalized,
@@ -1526,6 +1526,17 @@ fn markdown_at_depth(
             hyperlinks,
             preserve_source,
         );
+    }
+    if let Some(lines) = markdown_with_block_spacing(
+        text,
+        theme,
+        width,
+        depth,
+        mermaid,
+        hyperlinks,
+        preserve_source,
+    ) {
+        return lines;
     }
     let blocks = super::math_blocks::top_level(text);
     if blocks.is_empty()
@@ -1596,6 +1607,124 @@ fn markdown_at_depth(
     );
     append_math_section(&mut lines, after);
     lines
+}
+
+// Render source-ordered blocks and explicit space tokens. The complete source
+// retains its offsets and definitions in each masked segment so references
+// resolve across block boundaries. The bounded fallback uses the existing
+// renderer when a source cannot be safely inventoried in time or space.
+fn markdown_with_block_spacing(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    depth: usize,
+    mermaid: super::mermaid::Mermaid,
+    hyperlinks: bool,
+    preserve_source: bool,
+) -> Option<Vec<Line>> {
+    use super::markdown_spaces::{BlockFlavor, BlockTokenKind};
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let tokens = super::markdown_spaces::block_inventory(text)?;
+    if !tokens.iter().any(|token| {
+        matches!(
+            token.kind,
+            BlockTokenKind::Space | BlockTokenKind::Definition
+        )
+    }) {
+        return None;
+    }
+    let count = tokens
+        .iter()
+        .filter(|token| matches!(token.kind, BlockTokenKind::Block(_) | BlockTokenKind::Math))
+        .count();
+    if tokens.len() > 1024 || text.len().saturating_mul(count) > 1024 * 1024 {
+        return None;
+    }
+    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS);
+    let mut definitions: Vec<_> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(_, def)| def.span.clone())
+        .collect();
+    definitions.retain(|range| {
+        !tokens.iter().any(|token| {
+            token.kind == BlockTokenKind::Math
+                && range.start < token.range.end
+                && token.range.start < range.end
+        })
+    });
+    definitions.extend(
+        tokens
+            .iter()
+            .filter(|token| token.kind == BlockTokenKind::Definition)
+            .map(|token| token.range.clone()),
+    );
+    let mut lines = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if super::strike::frame_expired() {
+            return None;
+        }
+        match token.kind {
+            BlockTokenKind::Space => lines.push(Line::default()),
+            BlockTokenKind::Definition => {}
+            BlockTokenKind::Math => {
+                let expression =
+                    super::math_parser::trim_js(text.get(token.math_content.clone()?)?);
+                let rendered = (!token.pending)
+                    .then(|| super::math_parser::render(expression, true))
+                    .flatten()
+                    .filter(|value| {
+                        value
+                            .lines()
+                            .all(|line| UnicodeWidthStr::width(line) <= width)
+                    })
+                    .unwrap_or_else(|| {
+                        super::math_parser::trim_js(&text[token.range.clone()]).to_owned()
+                    });
+                lines.extend(wrap(&[Span::themed(rendered, theme, "text")], width));
+            }
+            BlockTokenKind::Block(flavor) => {
+                let masked = masked_math_segment(text, token.range.clone(), &definitions);
+                let mut block_lines = markdown_plain_at_depth(
+                    (text, &masked),
+                    theme,
+                    width,
+                    depth,
+                    mermaid,
+                    hyperlinks,
+                    preserve_source,
+                );
+                // Masking preserves source newlines after the HTML token for
+                // offset stability; Marked trims them from HTML output.
+                if flavor == BlockFlavor::Html {
+                    while block_lines
+                        .last()
+                        .is_some_and(|line| line.spans.iter().all(|span| span.text.is_empty()))
+                    {
+                        block_lines.pop();
+                    }
+                }
+                lines.extend(block_lines);
+            }
+        }
+        let next = tokens.get(index + 1).map(|token| token.kind);
+        let auto_space = match token.kind {
+            BlockTokenKind::Math | BlockTokenKind::Block(BlockFlavor::Other) => true,
+            BlockTokenKind::Block(BlockFlavor::Paragraph) => {
+                !matches!(next, Some(BlockTokenKind::Block(BlockFlavor::List)))
+            }
+            _ => false,
+        };
+        if auto_space && next.is_some() && next != Some(BlockTokenKind::Space) {
+            lines.push(Line::default());
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    Some(lines)
 }
 
 // Preserve offsets into the original message and retain all reference
@@ -1746,7 +1875,16 @@ fn markdown_plain_at_depth(
     let mut lists: Vec<(Option<u64>, bool, bool)> = Vec::new();
     let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let loose_lists = loose_list_offsets(text, options);
+    let mut definition_ranges: Vec<_> = Parser::new_ext(parsed, options)
+        .reference_definitions()
+        .iter()
+        .map(|(_, def)| def.span.clone())
+        .collect();
+    definition_ranges.sort_unstable_by_key(|range| range.start);
     let mut item_prefixes = Vec::new();
+    let mut item_block_ends: Vec<Option<usize>> = Vec::new();
+    let mut item_after_math = Vec::new();
+    let mut list_code_start = None;
     let mut table: Option<Table> = None;
     let mut table_cell_start = None;
     let mut links = Vec::new();
@@ -1771,6 +1909,35 @@ fn markdown_plain_at_depth(
                 _ => {}
             }
             continue;
+        }
+        // Pulldown omits space and reference-definition tokens inside items.
+        // Recover the blank runs between direct item blocks from their source ranges.
+        let starts_item_block = matches!(
+            &event,
+            Event::Start(
+                Tag::Paragraph | Tag::CodeBlock(_) | Tag::Heading { .. } | Tag::BlockQuote(_)
+            ) | Event::Rule
+        );
+        if starts_item_block
+            && !item_after_math.last().copied().unwrap_or(false)
+            && let Some(Some(end)) = item_block_ends.last().copied()
+            && end <= range.start
+        {
+            let gap = &text[end..range.start];
+            let mut blank = false;
+            for line in gap.lines() {
+                if line.trim().is_empty() {
+                    if !blank {
+                        lines.push(Line::default());
+                    }
+                    blank = true;
+                } else {
+                    blank = false;
+                }
+            }
+        }
+        if starts_item_block && let Some(after_math) = item_after_math.last_mut() {
+            *after_math = false;
         }
         let is_text = matches!(&event, Event::Text(_));
         match event {
@@ -1845,7 +2012,12 @@ fn markdown_plain_at_depth(
             Event::Start(Tag::Emphasis) => italic += 1,
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
             Event::Start(Tag::Heading { level, .. }) => {
-                flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if !item_prefixes
+                    .last()
+                    .is_some_and(|prefix| spans.as_slice() == [prefix.clone()])
+                {
+                    flush(&mut spans, &mut lines, width, item_prefixes.last());
+                }
                 previous_paragraph_end = None;
                 heading = level as usize;
                 if heading >= 3 {
@@ -1861,9 +2033,22 @@ fn markdown_plain_at_depth(
                 if lists.is_empty() {
                     last_heading_separator = Some(lines.len());
                     lines.push(Line::default());
+                } else if let Some(end) = item_block_ends.last_mut() {
+                    *end = Some(range.end);
                 }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
+                if let Some(prefix) = item_prefixes.last() {
+                    let marker = spans.as_slice() == [prefix.clone()];
+                    if marker {
+                        spans.clear();
+                    } else {
+                        flush(&mut spans, &mut lines, width, item_prefixes.last());
+                    }
+                    let unclosed = matches!(&kind, CodeBlockKind::Fenced(_))
+                        && super::markdown_spaces::unclosed_fence(&text[range.clone()]);
+                    list_code_start = Some((lines.len(), marker, unclosed));
+                }
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 if lists.is_empty()
                     && let Some(end) = previous_paragraph_end.take()
@@ -1881,6 +2066,11 @@ fn markdown_plain_at_depth(
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(language) = code.take() {
+                    let block_width = width.saturating_sub(
+                        item_prefixes
+                            .last()
+                            .map_or(0, |prefix| UnicodeWidthStr::width(prefix.text.as_str())),
+                    );
                     let (art, warning) = if depth == 0
                         && lists.is_empty()
                         && language.eq_ignore_ascii_case("mermaid")
@@ -1900,7 +2090,7 @@ fn markdown_plain_at_depth(
                             theme,
                             "mdCodeBlockBorder",
                         )],
-                        width,
+                        block_width,
                     ));
                     // Syntect's bundled grammars omit TypeScript and TSX. Use
                     // its JavaScript grammar for their shared syntax.
@@ -1915,6 +2105,11 @@ fn markdown_plain_at_depth(
                     let syntax = SYNTAXES.find_syntax_by_token(syntax_language);
                     let mut highlighter =
                         syntax.map(|syntax| HighlightLines::new(syntax, &SYNTAX_THEME));
+                    if list_code_start.is_some_and(|(_, _, unclosed)| unclosed) {
+                        while code_text.ends_with("\n\n") {
+                            code_text.pop();
+                        }
+                    }
                     for line in code_text
                         .split_inclusive('\n')
                         .chain(code_text.is_empty().then_some(""))
@@ -1953,8 +2148,8 @@ fn markdown_plain_at_depth(
                             .unwrap_or_else(|| {
                                 vec![Span::themed(display_line, theme, "mdCodeBlock")]
                             });
-                        let indent = width.saturating_sub(1).min(2);
-                        for mut line in wrap(&pieces, width.saturating_sub(indent)) {
+                        let indent = block_width.saturating_sub(1).min(2);
+                        for mut line in wrap(&pieces, block_width.saturating_sub(indent)) {
                             line.spans
                                 .insert(0, Span::themed(" ".repeat(indent), theme, "mdCodeBlock"));
                             lines.push(line);
@@ -1962,10 +2157,22 @@ fn markdown_plain_at_depth(
                     }
                     lines.extend(wrap(
                         &[Span::themed("```", theme, "mdCodeBlockBorder")],
-                        width,
+                        block_width,
                     ));
                     if let Some(warning) = warning {
                         lines.extend(wrap(&[Span::themed(warning, theme, "warning")], width));
+                    }
+                    if let Some((start, marker, _)) = list_code_start.take() {
+                        prefix_item_block(
+                            &mut lines,
+                            start,
+                            item_prefixes.last().unwrap(),
+                            marker,
+                            width,
+                        );
+                    }
+                    if let Some(end) = item_block_ends.last_mut() {
+                        *end = Some(range.end);
                     }
                     if lists.is_empty() {
                         last_code_separator = Some(lines.len());
@@ -2007,14 +2214,24 @@ fn markdown_plain_at_depth(
                     theme,
                     "mdListBullet",
                 );
+                item_block_ends.push(None);
+                item_after_math.push(false);
                 item_prefixes.push(prefix.clone());
                 spans.push(prefix);
             }
             Event::Start(Tag::BlockQuote(_)) => {
+                let marker = item_prefixes
+                    .last()
+                    .is_some_and(|prefix| spans.as_slice() == [prefix.clone()]);
+                if marker {
+                    spans.clear();
+                }
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 // The range indexes the original document; normalize only the
                 // extracted quote before recursively parsing its local text.
-                let quote = text[range].replace("\r\n", "\n").replace('\r', "\n");
+                let quote = text[range.clone()]
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n");
                 let body = quote
                     .lines()
                     .map(|line| {
@@ -2030,9 +2247,16 @@ fn markdown_plain_at_depth(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let bordered = width >= 3;
-                let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
-                let quoted = if depth < 32 {
+                let available_width = width
+                    .saturating_sub(
+                        item_prefixes
+                            .last()
+                            .map_or(0, |prefix| UnicodeWidthStr::width(prefix.text.as_str())),
+                    )
+                    .max(1);
+                let bordered = available_width >= 3;
+                let content_width = available_width.saturating_sub(if bordered { 2 } else { 0 });
+                let mut quoted = if depth < 32 {
                     markdown_at_depth(
                         &body,
                         theme,
@@ -2045,6 +2269,15 @@ fn markdown_plain_at_depth(
                 } else {
                     wrap(&[Span::themed(body, theme, "mdQuote")], content_width)
                 };
+                if bordered {
+                    while quoted
+                        .last()
+                        .is_some_and(|line| line.spans.iter().all(|span| span.text.is_empty()))
+                    {
+                        quoted.pop();
+                    }
+                }
+                let block_start = lines.len();
                 for mut line in quoted {
                     for span in &mut line.spans {
                         span.italic = true;
@@ -2059,6 +2292,19 @@ fn markdown_plain_at_depth(
                             .insert(0, Span::themed("│ ", theme, "mdQuoteBorder"));
                     }
                     lines.push(line);
+                }
+                if let Some(prefix) = item_prefixes.last() {
+                    if marker && lines.len() == block_start {
+                        lines.push(Line {
+                            spans: vec![prefix.clone()],
+                            ..Line::default()
+                        });
+                    } else {
+                        prefix_item_block(&mut lines, block_start, prefix, marker, width);
+                    }
+                    if let Some(end) = item_block_ends.last_mut() {
+                        *end = Some(range.end);
+                    }
                 }
                 quote_skip = 1;
             }
@@ -2254,6 +2500,12 @@ fn markdown_plain_at_depth(
                     .unwrap_or_else(|| super::math_parser::trim_js(&block.raw).to_owned());
                 spans.push(Span::themed(rendered, theme, "text"));
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if let Some(end) = item_block_ends.last_mut() {
+                    *end = Some(range.end);
+                }
+                if let Some(after_math) = item_after_math.last_mut() {
+                    *after_math = true;
+                }
             }
             Event::Code(text) => {
                 if let Some((_, label, _)) = links.last_mut() {
@@ -2284,12 +2536,26 @@ fn markdown_plain_at_depth(
             }
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if let Some(Some(end)) = item_block_ends.last()
+                    && let Some(def) = definition_ranges
+                        .get(definition_ranges.partition_point(|def| def.start < *end))
+                    && def.end <= range.end
+                    && text[*end..def.start]
+                        .lines()
+                        .any(|line| line.trim().is_empty())
+                {
+                    lines.push(Line::default());
+                }
                 item_prefixes.pop();
+                item_block_ends.pop();
+                item_after_math.pop();
             }
             Event::End(TagEnd::Paragraph) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 if lists.is_empty() {
                     previous_paragraph_end = Some(range.end);
+                } else if let Some(end) = item_block_ends.last_mut() {
+                    *end = Some(range.end);
                 }
             }
             Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
@@ -2335,6 +2601,33 @@ fn markdown_plain_at_depth(
     }
     lines
 }
+// Apply the same marker and continuation layout used for inline item text to
+// block renderers, preserving the individual themed spans and link metadata.
+fn prefix_item_block(
+    lines: &mut Vec<Line>,
+    start: usize,
+    prefix: &Span,
+    marker: bool,
+    width: usize,
+) {
+    let indent = UnicodeWidthStr::width(prefix.text.as_str()).min(width.saturating_sub(1));
+    let block: Vec<_> = lines.drain(start..).collect();
+    let mut first = true;
+    for line in block {
+        for mut wrapped in wrap(&line.spans, width.saturating_sub(indent)) {
+            let mut lead = prefix.clone();
+            lead.text = if first && marker {
+                prefix.text.chars().take(indent).collect()
+            } else {
+                " ".repeat(indent)
+            };
+            wrapped.spans.insert(0, lead);
+            lines.push(wrapped);
+            first = false;
+        }
+    }
+}
+
 fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Option<&Span>) {
     if spans.is_empty() {
         return;
@@ -2369,6 +2662,137 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_trailing_spaces_match_pinned_pi() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/markdown/pi-v150-trailing.json"
+        ))
+        .unwrap();
+        let theme = Theme::system();
+        let mut failures = Vec::new();
+        for case in fixture["cases"].as_array().unwrap() {
+            let source = case["source"].as_str().unwrap();
+            let expected: Vec<_> = case["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect();
+            let actual: Vec<_> = markdown(source, &theme, 80)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.text)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect();
+            if actual != expected {
+                failures.push(format!("{source:?}: {actual:?} != {expected:?}"));
+            }
+        }
+        for case in fixture["narrowCases"].as_array().unwrap() {
+            let source = case["source"].as_str().unwrap();
+            let width = case["width"].as_u64().unwrap() as usize;
+            let expected: Vec<_> = case["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap().to_owned())
+                .collect();
+            let actual: Vec<_> = markdown(source, &theme, width)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.text)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect();
+            if actual != expected {
+                failures.push(format!(
+                    "{source:?} width={width}: {actual:?} != {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+    #[test]
+    fn list_blocks_wrap_at_item_width() {
+        for source in [
+            "- > alpha beta gamma delta",
+            "- ```\n  alpha beta gamma delta\n  ```",
+        ] {
+            let lines = markdown(source, &Theme::system(), 14);
+            assert!(
+                lines.iter().all(|line| UnicodeWidthStr::width(
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        .as_str()
+                ) <= 14),
+                "{source:?}: {lines:?}"
+            );
+            assert!(
+                lines[0]
+                    .spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+                    .starts_with("- ")
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_many_paragraphs_keep_trailing_blank() {
+        let source = format!(
+            "{}\n\n",
+            (0..33)
+                .map(|i| format!("paragraph {i}"))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+        let lines = markdown(&source, &Theme::system(), 80);
+        let actual: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        let expected: Vec<String> = (0..33)
+            .flat_map(|i| [format!("paragraph {i}"), String::new()])
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn markdown_spacing_normalizes_line_endings() {
+        let theme = Theme::system();
+        for source in [
+            "hello\n\n",
+            "# heading\n\ntext\n\n",
+            "[x][r]\n\n[r]: https://e.co\n\n",
+        ] {
+            let render = |s: &str| {
+                markdown(s, &theme, 80)
+                    .into_iter()
+                    .map(|line| {
+                        line.spans
+                            .into_iter()
+                            .map(|span| span.text)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let expected = render(source);
+            assert_eq!(render(&source.replace('\n', "\r\n")), expected);
+            assert_eq!(render(&source.replace('\n', "\r")), expected);
+        }
+    }
     #[test]
     fn markdown_dividers_separate_following_blocks_without_a_trailing_blank() {
         let theme = Theme::system();
@@ -2517,7 +2941,8 @@ mod tests {
                 "─",
                 "2",
                 "",
-                "after (https://example.org)"
+                "after (https://example.org)",
+                ""
             ]
         );
         let source = "```text\n$$x^2$$\n```\n\n$$x^2$$";
@@ -3328,7 +3753,7 @@ mod tests {
             ("# Hello\nworld", vec!["Hello", "", "world"]),
             ("# Hello\n\nworld", vec!["Hello", "", "world"]),
             ("# Hello\n## Next", vec!["Hello", "", "Next"]),
-            ("# Hello\n\n", vec!["Hello"]),
+            ("# Hello\n\n", vec!["Hello", ""]),
         ] {
             let rendered: Vec<String> = markdown(source, &Theme::system(), 80)
                 .iter()
@@ -3340,14 +3765,14 @@ mod tests {
     #[test]
     fn markdown_heading_ignores_nonrendered_reference_definitions() {
         for (source, expected) in [
-            ("# Hello\n\n[ref]: https://example.com", vec!["Hello"]),
+            ("# Hello\n\n[ref]: https://example.com", vec!["Hello", ""]),
             (
                 "# Hello\n\n[ref]: https://example.com\n\nworld",
-                vec!["Hello", "", "world"],
+                vec!["Hello", "", "", "world"],
             ),
             (
                 "# First\n\n## Last\n\n[ref]: https://example.com",
-                vec!["First", "", "Last"],
+                vec!["First", "", "Last", ""],
             ),
         ] {
             let rendered: Vec<String> = markdown(source, &Theme::system(), 80)
@@ -3392,30 +3817,19 @@ mod tests {
                 "- outer\n  - one\n\n  - two\n- next",
                 vec!["- outer", "    - one", "", "    - two", "- next"],
             ),
-            ("- > quote\n- next", vec!["- ", "│ quote", "- next"]),
+            ("- > quote\n- next", vec!["- │ quote", "- next"]),
             (
                 "- > first\n\n- > second\n- > third",
-                vec!["- ", "│ first", "", "- ", "│ second", "", "- ", "│ third"],
+                vec!["- │ first", "", "- │ second", "", "- │ third"],
             ),
             (
                 "- > first\r\n \r\n- > second",
-                vec!["- ", "│ first", "", "- ", "│ second"],
+                vec!["- │ first", "", "- │ second"],
             ),
-            (
-                "- > first\n- > second",
-                vec!["- ", "│ first", "- ", "│ second"],
-            ),
+            ("- > first\n- > second", vec!["- │ first", "- │ second"]),
             (
                 "- outer\n  - > first\n\n  - > second\n- next",
-                vec![
-                    "- outer",
-                    "    - ",
-                    "│ first",
-                    "",
-                    "    - ",
-                    "│ second",
-                    "- next",
-                ],
+                vec!["- outer", "    - │ first", "", "    - │ second", "- next"],
             ),
         ] {
             let actual: Vec<String> = markdown(source, &theme, 80)
