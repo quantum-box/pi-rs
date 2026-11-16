@@ -278,6 +278,20 @@ pub fn fork(
     copy.export_jsonl(destination)
 }
 
+pub fn fork_full_history_when_inert(
+    session: &Session,
+    source: &Path,
+    destination: &Path,
+    workspace: &Path,
+) -> Result<()> {
+    let Some(mut copy) = session.fork_inert_full_history()? else {
+        return fork(session, source, session.head(), destination, workspace);
+    };
+    copy.set_parent_session(&source.to_string_lossy())?;
+    copy.set_working_directory(workspace)?;
+    copy.export_jsonl(destination)
+}
+
 pub fn import(source: &Path, destination: &Path) -> Result<()> {
     if !source.is_file() {
         return Err(Error::Config("session file not found".into()));
@@ -500,6 +514,24 @@ pub fn html(session: &Session) -> String {
                         _ => {}
                     }
                 }
+            }
+            Event::ImportedUnattributedToolResult {
+                call_id,
+                tool_name,
+                content,
+                is_error,
+                details,
+                ..
+            } => {
+                html.push_str(&format!(
+                    "<p>Unattributed tool result: {} (call {}, {})</p>",
+                    escape(tool_name),
+                    escape(call_id),
+                    if *is_error { "error" } else { "success" }
+                ));
+                html.push_str(&tool_html(&unattributed_outcome(
+                    content, *is_error, details,
+                )));
             }
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 html.push_str(&tool_html(outcome))
@@ -767,6 +799,43 @@ fn images_html(images: &[pi_rs::ImageContent]) -> String {
         "<img alt=\"Attached image\" style=\"max-width:100%;height:auto\" src=\"data:{};base64,{}\">", image.mime_type, image.data
     )).collect()
 }
+pub(super) fn unattributed_outcome(
+    content: &pi_rs::ContextContent,
+    is_error: bool,
+    details: &Option<serde_json::Value>,
+) -> pi_rs::Outcome {
+    match content {
+        pi_rs::ContextContent::Text(text) => pi_rs::Outcome::TextResult {
+            output: text.clone(),
+            is_error,
+            details: details.clone(),
+        },
+        pi_rs::ContextContent::Blocks(blocks)
+            if blocks
+                .iter()
+                .all(|block| matches!(block, pi_rs::ContentBlock::Text { .. })) =>
+        {
+            pi_rs::Outcome::TextResult {
+                output: blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                is_error,
+                details: details.clone(),
+            }
+        }
+        pi_rs::ContextContent::Blocks(blocks) => pi_rs::Outcome::StructuredWithDetails {
+            data: serde_json::json!({"content":blocks,"isError":is_error}),
+            attachments: Vec::new(),
+            details: details.clone().unwrap_or(serde_json::Value::Null),
+        },
+    }
+}
+
 fn tool_html(outcome: &pi_rs::Outcome) -> String {
     let mut value = serde_json::to_value(outcome).expect("serializable outcome");
     let mut images = Vec::new();
@@ -838,6 +907,19 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                 .or_else(|| data["output"].as_str().map(Cow::Borrowed)),
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 Some(Cow::Owned(outcome.tool_content()))
+            }
+            Event::ImportedUnattributedToolResult { content, .. } => {
+                Some(Cow::Owned(match content {
+                    pi_rs::ContextContent::Text(text) => text.clone(),
+                    pi_rs::ContextContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }))
             }
             Event::ModelFinished {
                 failure: Some(_),
@@ -1178,6 +1260,67 @@ async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_fork_keeps_legacy_pending_tree_trigger_fallback() {
+        for sibling in [false, true] {
+            let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let mut records = initial.records().to_vec();
+            records.push(pi_rs::Record {
+                timestamp: None,
+                run_id: None,
+                version: records[0].version,
+                id: 2,
+                parent: Some(1),
+                event: Event::TreeMessageQueued {
+                    input: pi_rs::QueuedCustomMessage {
+                        id: uuid::Uuid::new_v4(),
+                        delivery: pi_rs::CustomMessageDelivery::TriggerTurn,
+                        message: pi_rs::CustomMessage {
+                            custom_type: "trigger".into(),
+                            content: pi_rs::ContextContent::Text("queued".into()),
+                            display: false,
+                            details: None,
+                        },
+                    },
+                },
+            });
+            if sibling {
+                records.push(pi_rs::Record {
+                    timestamp: None,
+                    run_id: None,
+                    version: records[0].version,
+                    id: 3,
+                    parent: Some(2),
+                    event: Event::Checkout { target: 1 },
+                });
+                records.push(pi_rs::Record {
+                    timestamp: None,
+                    run_id: None,
+                    version: records[0].version,
+                    id: 4,
+                    parent: Some(1),
+                    event: Event::User {
+                        content: "other".into(),
+                        input_id: None,
+                    },
+                });
+            }
+            let session = Session::from_records(records).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("fork.jsonl");
+            fork_full_history_when_inert(
+                &session,
+                Path::new("source"),
+                &destination,
+                directory.path(),
+            )
+            .unwrap();
+            let forked = Session::open(&destination).unwrap();
+            assert_eq!(forked.queued_custom_messages().len(), 1);
+            assert_eq!(session.queued_custom_messages().len(), 1);
+        }
+    }
 
     #[test]
     fn resume_resolves_external_and_native_ids_without_following_fork_metadata() {
@@ -1729,7 +1872,9 @@ mod tests {
             })
             .unwrap()
             .id;
-        let mut records = imported.fork_records(source).unwrap();
+        // Model a historical record-only snapshot ending at the source. The
+        // current fork now completes a verified imported conversion.
+        let mut records = imported.records()[..source as usize].to_vec();
         let parent = records.last().unwrap().id;
         // Simulate an old native append without the new associated source marker.
         records.push(pi_rs::Record {

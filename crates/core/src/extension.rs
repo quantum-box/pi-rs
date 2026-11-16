@@ -279,12 +279,12 @@ pub struct ExtensionResources {
     pub resources: DiscoveredResources,
 }
 
-struct ResourceDiscoveryHost {
-    messages: Arc<dyn ToolHost>,
-    entries: tokio::sync::mpsc::Sender<DiscoveryEntryRequest>,
+pub(crate) struct SessionEntryHost {
+    pub(crate) messages: Arc<dyn ToolHost>,
+    pub(crate) entries: tokio::sync::mpsc::Sender<SessionEntryRequest>,
 }
 
-enum DiscoveryEntryRequest {
+pub(crate) enum SessionEntryRequest {
     Append(
         CustomEntry,
         tokio::sync::oneshot::Sender<ExtensionResult<()>>,
@@ -295,7 +295,7 @@ enum DiscoveryEntryRequest {
     ),
 }
 
-async fn branch_custom_entries(
+pub(crate) async fn branch_custom_entries(
     session: &mut crate::Session,
     custom_type: Option<&str>,
 ) -> ExtensionResult<Vec<CustomEntryRecord>> {
@@ -333,8 +333,70 @@ async fn branch_custom_entries(
     Ok(result)
 }
 
+async fn drive_session_entry_callback<F, T>(
+    session: &mut crate::Session,
+    observer: &mut crate::Observer<'_>,
+    mut incoming: tokio::sync::mpsc::Receiver<(
+        crate::QueuedCustomMessage,
+        tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+    )>,
+    mut entries: tokio::sync::mpsc::Receiver<SessionEntryRequest>,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    enum Request {
+        Entry(SessionEntryRequest),
+        Message(
+            crate::QueuedCustomMessage,
+            tokio::sync::oneshot::Sender<ExtensionResult<()>>,
+        ),
+    }
+    tokio::pin!(future);
+    'callback: loop {
+        tokio::select! {
+            biased;
+            result = &mut future => break Ok(result),
+            request = async {
+                tokio::select! {
+                    Some(entry) = entries.recv() => Request::Entry(entry),
+                    Some((message, reply)) = incoming.recv() => Request::Message(message, reply),
+                    else => std::future::pending().await,
+                }
+            } => match request {
+            Request::Entry(SessionEntryRequest::Append(entry, reply)) => {
+                if reply.is_closed() { continue; }
+                if let Err(error) = session.ensure_settled() {
+                    let _ = reply.send(Err(error.to_string()));
+                    continue;
+                }
+                let persisted = session.append_custom_entry(entry).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom entry"))));
+                match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+            }
+            Request::Entry(SessionEntryRequest::List(custom_type, mut reply)) => {
+                if reply.is_closed() { continue; }
+                tokio::select! {
+                    biased;
+                    result = &mut future => break 'callback Ok(result),
+                    _ = reply.closed() => {},
+                    records = branch_custom_entries(session, custom_type.as_deref()) => { let _ = reply.send(records); }
+                }
+            }
+            Request::Message(input, reply) => {
+                let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
+                    crate::agent::queue_custom_message(session, input, observer)
+                } else {
+                    session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
+                };
+                match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+            }}
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl ToolHost for ResourceDiscoveryHost {
+impl ToolHost for SessionEntryHost {
     fn tools(&self) -> Vec<ToolSpec> {
         self.messages.tools()
     }
@@ -358,9 +420,9 @@ impl ToolHost for ResourceDiscoveryHost {
         crate::journal::validate_custom_entry(&entry).map_err(|error| error.to_string())?;
         let (reply, response) = tokio::sync::oneshot::channel();
         self.entries
-            .send(DiscoveryEntryRequest::Append(entry, reply))
+            .send(SessionEntryRequest::Append(entry, reply))
             .await
-            .map_err(|_| "resource discovery has finished".to_owned())?;
+            .map_err(|_| "extension callback has finished".to_owned())?;
         response
             .await
             .map_err(|_| "custom entry acknowledgement was lost".to_owned())?
@@ -374,12 +436,12 @@ impl ToolHost for ResourceDiscoveryHost {
     ) -> ExtensionResult<Vec<CustomEntryRecord>> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.entries
-            .send(DiscoveryEntryRequest::List(
+            .send(SessionEntryRequest::List(
                 custom_type.map(str::to_owned),
                 reply,
             ))
             .await
-            .map_err(|_| "resource discovery has finished".to_owned())?;
+            .map_err(|_| "extension callback has finished".to_owned())?;
         response
             .await
             .map_err(|_| "custom entry response was lost".to_owned())?
@@ -1737,7 +1799,8 @@ pub trait Extension: Send + Sync {
 }
 
 /// Origin known to the host for an extension-provided command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExtensionCommandSourceKind {
     Builtin,
     Inline,
@@ -2199,65 +2262,18 @@ impl Registry {
             .iter()
             .filter(|item| item.handles_resource_discovery())
         {
-            let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
-            let (entry_sender, mut entries) = tokio::sync::mpsc::channel(32);
-            let host = Arc::new(ResourceDiscoveryHost {
+            let (sender, incoming) = tokio::sync::mpsc::channel(32);
+            let (entry_sender, entries) = tokio::sync::mpsc::channel(32);
+            let host = Arc::new(SessionEntryHost {
                 messages: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
                 entries: entry_sender,
             });
-            enum Request {
-                Entry(DiscoveryEntryRequest),
-                Message(
-                    crate::QueuedCustomMessage,
-                    tokio::sync::oneshot::Sender<ExtensionResult<()>>,
-                ),
-            }
-            let outcome = {
-                let future = platform_time::timeout(
-                    timeout,
-                    extension.discover_resources_with_host(event, states.get(extension.id()), host),
-                );
-                tokio::pin!(future);
-                'discovery: loop {
-                    tokio::select! {
-                        biased;
-                        result = &mut future => break result,
-                        request = async {
-                            tokio::select! {
-                                Some(entry) = entries.recv() => Request::Entry(entry),
-                                Some((message, reply)) = incoming.recv() => Request::Message(message, reply),
-                                else => std::future::pending().await,
-                            }
-                        } => match request {
-                        Request::Entry(DiscoveryEntryRequest::Append(entry, reply)) => {
-                            if reply.is_closed() { continue; }
-                            if let Err(error) = session.ensure_settled() {
-                                let _ = reply.send(Err(error.to_string()));
-                                continue;
-                            }
-                            let persisted = session.append_custom_entry(entry).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom entry"))));
-                            match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                        }
-                        Request::Entry(DiscoveryEntryRequest::List(custom_type, mut reply)) => {
-                            if reply.is_closed() { continue; }
-                            tokio::select! {
-                                biased;
-                                result = &mut future => break 'discovery result,
-                                _ = reply.closed() => {},
-                                records = branch_custom_entries(session, custom_type.as_deref()) => { let _ = reply.send(records); }
-                            }
-                        }
-                        Request::Message(input, reply) => {
-                            let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
-                                crate::agent::queue_custom_message(session, input, observer)
-                            } else {
-                                session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
-                            };
-                            match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                        }}
-                    }
-                }
-            };
+            let future = platform_time::timeout(
+                timeout,
+                extension.discover_resources_with_host(event, states.get(extension.id()), host),
+            );
+            let outcome =
+                drive_session_entry_callback(session, observer, incoming, entries, future).await?;
             match outcome {
                 Ok(Ok(resources)) => result.push(ExtensionResources {
                     extension_id: extension.id().into(),
@@ -2284,18 +2300,6 @@ impl Registry {
         observer: &mut crate::Observer<'_>,
     ) -> bool {
         self.session_transition_cancelled_inner(event, states, timeout, observer, None)
-            .await
-    }
-
-    pub(crate) async fn session_transition_cancelled_with_host(
-        &self,
-        event: &crate::BeforeSessionTransition,
-        states: &ExtensionStates,
-        timeout: std::time::Duration,
-        observer: &mut crate::Observer<'_>,
-        host: Arc<dyn ToolHost>,
-    ) -> bool {
-        self.session_transition_cancelled_inner(event, states, timeout, observer, Some(host))
             .await
     }
 
@@ -2356,52 +2360,53 @@ impl Registry {
         observer: &mut crate::Observer<'_>,
     ) -> Result<bool> {
         let states = session.extension_states();
-        let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
-        let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let deadline =
+            platform_time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
         let mut errors = Vec::new();
-        let mut collect = |event: crate::Notification<'_>| {
-            if let crate::Notification::ExtensionLifecycleError {
-                extension,
-                event,
-                message,
-            } = event
-            {
-                errors.push((extension.to_owned(), event, message.to_owned()));
-            }
-        };
-        let cancelled = {
-            let future = self.session_transition_cancelled_with_host(
-                event,
-                &states,
-                timeout,
-                &mut collect,
-                host,
+        let mut cancelled = false;
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|item| item.handles_session_transitions())
+        {
+            let (sender, incoming) = tokio::sync::mpsc::channel(32);
+            let (entry_sender, entries) = tokio::sync::mpsc::channel(32);
+            let host = Arc::new(SessionEntryHost {
+                messages: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+                entries: entry_sender,
+            });
+            let future = platform_time::timeout_at(
+                deadline,
+                extension.before_session_transition_with_host(
+                    event,
+                    states.get(extension.id()),
+                    host,
+                ),
             );
-            tokio::pin!(future);
-            loop {
-                tokio::select! {
-                    biased;
-                    Some((input, reply)) = incoming.recv() => {
-                        let persisted = if matches!(input.delivery, CustomMessageDelivery::NextTurn | CustomMessageDelivery::TriggerTurn) {
-                            crate::agent::queue_custom_message(session, input, observer)
-                        } else {
-                            session.append_custom_message(input.message).map(|()| observer(crate::Notification::Committed(session.records().last().expect("appended custom message"))))
-                        };
-                        match persisted { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                    }
-                    result = &mut future => break result,
+            match drive_session_entry_callback(session, observer, incoming, entries, future).await?
+            {
+                Ok(Ok(true)) => {
+                    cancelled = true;
+                    break;
                 }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => errors.push((extension.id().to_owned(), error)),
+                Err(_) => errors.push((
+                    extension.id().to_owned(),
+                    "session transition hook timed out".into(),
+                )),
             }
-        };
-        for (extension, event, message) in &errors {
+        }
+        for (extension, message) in &errors {
             observer(crate::Notification::ExtensionLifecycleError {
                 extension,
-                event,
+                event: event.kind(),
                 message,
             });
         }
         Ok(cancelled)
     }
+
     pub fn has_session_lifecycle_hooks(&self) -> bool {
         self.extensions
             .iter()
@@ -3272,6 +3277,171 @@ mod replacement_tests {
             assert_eq!(updated[1].entry.data, Some(Value::Null));
             Ok(DiscoveredResources::default())
         }
+    }
+
+    struct TransitionEntryHook;
+    #[async_trait::async_trait]
+    impl Extension for TransitionEntryHook {
+        fn id(&self) -> &str {
+            "transition-entry"
+        }
+        fn handles_session_transitions(&self) -> bool {
+            true
+        }
+        async fn before_session_transition_with_host(
+            &self,
+            _: &crate::BeforeSessionTransition,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<bool> {
+            let before = host.custom_entries(Some("transition")).await?;
+            assert_eq!(before.len(), 1);
+            host.append_entry(CustomEntry {
+                custom_type: "transition".into(),
+                data: Some(Value::Null),
+            })
+            .await?;
+            let after = host.custom_entries(Some("transition")).await?;
+            assert_eq!(after.len(), 2);
+            assert_eq!(after[1].entry.data, Some(Value::Null));
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn session_transition_callback_reads_and_appends_before_veto() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(TransitionEntryHook)).unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(CustomEntry {
+                custom_type: "transition".into(),
+                data: None,
+            })
+            .unwrap();
+        let mut committed = 0;
+        let cancelled = registry
+            .session_transition_cancelled_in_session(
+                &crate::BeforeSessionTransition::Fork {
+                    entry_id: session.head(),
+                    position: crate::ForkPosition::At,
+                },
+                &mut session,
+                std::time::Duration::from_secs(2),
+                &mut |event| {
+                    if matches!(event, crate::Notification::Committed(_)) {
+                        committed += 1;
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(cancelled);
+        assert_eq!(committed, 1);
+        let entries = branch_custom_entries(&mut session, Some("transition"))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].entry.data, Some(Value::Null));
+    }
+
+    struct TransitionLateProducer {
+        release: Arc<tokio::sync::Notify>,
+        done: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for TransitionLateProducer {
+        fn id(&self) -> &str {
+            "transition-late-producer"
+        }
+        fn handles_session_transitions(&self) -> bool {
+            true
+        }
+        async fn before_session_transition_with_host(
+            &self,
+            _: &crate::BeforeSessionTransition,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<bool> {
+            let release = self.release.clone();
+            let done = self.done.lock().unwrap().take().unwrap();
+            tokio::spawn(async move {
+                release.notified().await;
+                let result = host
+                    .append_entry(CustomEntry {
+                        custom_type: "late".into(),
+                        data: None,
+                    })
+                    .await;
+                let _ = done.send(result.is_err());
+            });
+            Ok(false)
+        }
+    }
+    struct TransitionRelease {
+        release: Arc<tokio::sync::Notify>,
+        done: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for TransitionRelease {
+        fn id(&self) -> &str {
+            "transition-release"
+        }
+        fn handles_session_transitions(&self) -> bool {
+            true
+        }
+        async fn before_session_transition_with_host(
+            &self,
+            _: &crate::BeforeSessionTransition,
+            _: Option<&ExtensionState>,
+            _: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<bool> {
+            self.release.notify_one();
+            let done = self.done.lock().await.take().unwrap();
+            assert!(done.await.unwrap());
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn transition_callback_closes_entry_scope_before_next_extension() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (done, received) = tokio::sync::oneshot::channel();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(TransitionLateProducer {
+                release: release.clone(),
+                done: std::sync::Mutex::new(Some(done)),
+            }))
+            .unwrap();
+        registry
+            .register(Arc::new(TransitionRelease {
+                release,
+                done: tokio::sync::Mutex::new(Some(received)),
+            }))
+            .unwrap();
+        let mut session = crate::Session::with_store(crate::MemoryStore::default()).unwrap();
+        let event = crate::BeforeSessionTransition::Fork {
+            entry_id: session.head(),
+            position: crate::ForkPosition::At,
+        };
+        assert!(
+            registry
+                .session_transition_cancelled_in_session(
+                    &event,
+                    &mut session,
+                    std::time::Duration::from_secs(2),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            branch_custom_entries(&mut session, Some("late"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

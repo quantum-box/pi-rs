@@ -188,7 +188,7 @@ impl Review<'_> {
         if let ReviewStatus::Done { answer } = link.status {
             return Ok(answer);
         }
-        let snapshot = serde_json::to_string(&parent.conversation_at(link.parent_record)?)?;
+        let snapshot = serde_json::to_string(&parent.model_conversation_at(link.parent_record)?)?;
         if snapshot.len() > 64 * 1024 {
             return Err(Error::Config(
                 "review snapshot is too large; compact the parent branch first".into(),

@@ -1345,6 +1345,7 @@ impl Agent<'_> {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let failed_assistants = crate::journal::failed_assistant_records(&session.branch());
         let trigger_unanswered = has_trigger_message(session, run_id)
             && !session.branch().iter().any(|record| {
                 record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. })
@@ -1365,6 +1366,9 @@ impl Agent<'_> {
                     if current_entries.contains(&record.id)
                         && !session.records().iter().any(|entry| matches!(&entry.event,
                             Event::CustomMessageQueued { input } if input.id == *id && input.delivery == crate::CustomMessageDelivery::AfterTurn)) => Some(None),
+                // A failed attempt is a boundary, not a completed answer. Do
+                // not return its partial text or fall back to an older reply.
+                Event::Assistant { .. } if failed_assistants.contains(&record.id) => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -2721,22 +2725,26 @@ impl Agent<'_> {
         )?;
         observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+        const MAX_ENRICHED_ITEMS: usize = 256;
+        const MAX_LEGACY_TEXT_SEGMENTS: usize = 128;
         let mut metadata = ModelMetadata::default();
         let mut tool_delta_bytes = 0_usize;
         let mut reasoning_delta_bytes = 0_usize;
         let mut text_item_ids = std::collections::HashMap::<u64, usize>::new();
         let mut text_parts = Vec::<String>::new();
         let mut legacy_text_slot = None;
+        let mut legacy_text_segments = 0usize;
         let mut text_len = 0usize;
         let mut text_delta_bytes = 0usize;
         let mut text_final_bytes = 0usize;
         let mut reasoning_item_ids = HashSet::new();
+        let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
         let mut reasoning_final_bytes = 0_usize;
         let collect = async {
             let session_id = session.session_id();
             let external_id = session.external_session_id();
             let opening = if retain_reply {
-                self.model.stream_enriched_in_session_with_identity(
+                self.model.stream_detailed_in_session_with_identity(
                     request_id,
                     session_id,
                     &external_id,
@@ -2744,7 +2752,7 @@ impl Agent<'_> {
                 )
             } else {
                 self.model
-                    .stream_enriched_for_summary(request_id, session_id, request)
+                    .stream_detailed_for_summary(request_id, session_id, request)
             };
             tokio::pin!(opening);
             let mut stream = loop {
@@ -2764,7 +2772,9 @@ impl Agent<'_> {
                 let Some(event) = event else {
                     break;
                 };
-                match event? {
+                let event = event?;
+                let redacted_start = event.is_redacted_start();
+                match event.event {
                     EnrichedModelEvent::Legacy(ModelEvent::Text(delta)) => {
                         text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
                         if text_delta_bytes > MAX_RESPONSE_BYTES
@@ -2772,14 +2782,13 @@ impl Agent<'_> {
                         {
                             return Err(Error::Model("response exceeds size limit".into()));
                         }
-                        observer(Notification::Text(&delta));
-                        text_len += delta.len();
                         let slot = match legacy_text_slot {
                             Some(slot) => slot,
                             None => {
-                                if text_parts.len() >= 128 {
+                                if legacy_text_segments >= MAX_LEGACY_TEXT_SEGMENTS {
                                     return Err(Error::Model("too many text segments".into()));
                                 }
+                                legacy_text_segments += 1;
                                 let slot = text_parts.len();
                                 text_parts.push(String::new());
                                 legacy_text_slot = Some(slot);
@@ -2787,11 +2796,13 @@ impl Agent<'_> {
                             }
                         };
                         text_parts[slot].push_str(&delta);
+                        text_len += delta.len();
+                        observer(Notification::Text(&delta));
                     }
                     EnrichedModelEvent::TextStart { index } => {
                         legacy_text_slot = None;
                         if !text_item_ids.contains_key(&index) {
-                            if text_item_ids.len() >= 64 {
+                            if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
                                 return Err(Error::Model("too many text items".into()));
                             }
                             text_item_ids.insert(index, text_parts.len());
@@ -2810,7 +2821,7 @@ impl Agent<'_> {
                         let slot = match text_item_ids.get(&index) {
                             Some(slot) => *slot,
                             None => {
-                                if text_item_ids.len() >= 64 {
+                                if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
                                     return Err(Error::Model("too many text items".into()));
                                 }
                                 let slot = text_parts.len();
@@ -2840,7 +2851,7 @@ impl Agent<'_> {
                         let slot = match text_item_ids.get(&index) {
                             Some(slot) => *slot,
                             None => {
-                                if text_item_ids.len() >= 64 {
+                                if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
                                     return Err(Error::Model("too many text items".into()));
                                 }
                                 let slot = text_parts.len();
@@ -2874,11 +2885,15 @@ impl Agent<'_> {
                     }
                     EnrichedModelEvent::ReasoningDelta { index, delta } => {
                         reasoning_item_ids.insert(index);
-                        if reasoning_item_ids.len() > 64 {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("too many reasoning items".into()));
                         }
                         reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
                         if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            observed_reasoning
+                                .entry(index)
+                                .or_default()
+                                .push_str(&delta);
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Delta { index },
                                 || observer(Notification::Reasoning(&delta)),
@@ -2887,22 +2902,30 @@ impl Agent<'_> {
                     }
                     EnrichedModelEvent::ReasoningStart { index } => {
                         reasoning_item_ids.insert(index);
-                        if reasoning_item_ids.len() > 64 {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("too many reasoning items".into()));
                         }
-                        with_reasoning_event_metadata(
-                            ReasoningEventMetadata::Start { index },
-                            || observer(Notification::Reasoning("")),
-                        );
+                        with_redacted_reasoning_start(redacted_start, || {
+                            with_reasoning_event_metadata(
+                                ReasoningEventMetadata::Start { index },
+                                || observer(Notification::Reasoning("")),
+                            );
+                        });
                     }
                     EnrichedModelEvent::ReasoningEnd { index, content } => {
                         reasoning_item_ids.insert(index);
                         reasoning_final_bytes = reasoning_final_bytes.saturating_add(content.len());
-                        if reasoning_item_ids.len() > 64
-                            || reasoning_final_bytes > MAX_RESPONSE_BYTES
-                        {
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("reasoning items exceed size limit".into()));
                         }
+                        // Always close the item. If the final-content budget is
+                        // exhausted, use only deltas already delivered for this item.
+                        let observed = observed_reasoning.remove(&index).unwrap_or_default();
+                        let content = if reasoning_final_bytes <= MAX_RESPONSE_BYTES {
+                            content
+                        } else {
+                            observed
+                        };
                         with_reasoning_event_metadata(
                             ReasoningEventMetadata::End { index, content },
                             || observer(Notification::Reasoning("")),
@@ -2994,6 +3017,18 @@ impl Agent<'_> {
                 }),
             ),
         };
+        // Only turn replies are displayable. Summary requests can contain
+        // private prompt material and must never enter the RPC transcript.
+        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:aborted-turn-partial".into(),
+                    entry: serde_json::json!({"requestId": request_id}),
+                },
+                observer,
+            )?;
+        }
         commit(
             session,
             Event::ModelFinished {
@@ -4929,27 +4964,7 @@ fn model_conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let failed: HashSet<_> = path
-        .iter()
-        .filter_map(|record| match record.event {
-            Event::ModelFinished {
-                request_id,
-                failure: Some(_),
-                ..
-            } => Some(request_id),
-            _ => None,
-        })
-        .collect();
-    let excluded: HashSet<_> = path
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Assistant {
-                request_id: Some(id),
-                ..
-            } if failed.contains(id) => Some(record.id),
-            _ => None,
-        })
-        .collect();
+    let excluded = crate::journal::failed_assistant_records(path);
     conversation_entries(path, operations)
         .into_iter()
         .filter(|(source, _)| !excluded.contains(source))
@@ -6174,6 +6189,7 @@ thread_local! {
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
     static REASONING_EVENT_METADATA: std::cell::RefCell<Vec<ReasoningEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REDACTED_REASONING_START: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6197,6 +6213,25 @@ fn with_text_event_metadata<T>(value: TextEventMetadata, f: impl FnOnce() -> T) 
         }
     }
     TEXT_EVENT_METADATA.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
+}
+
+/// Whether the current synchronous reasoning-start callback is redacted.
+#[doc(hidden)]
+pub fn redacted_reasoning_start() -> bool {
+    REDACTED_REASONING_START.with(|stack| stack.borrow().last().copied().unwrap_or(false))
+}
+fn with_redacted_reasoning_start<T>(value: bool, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            REDACTED_REASONING_START.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    REDACTED_REASONING_START.with(|stack| stack.borrow_mut().push(value));
     let _guard = Pop;
     f()
 }
@@ -7135,6 +7170,91 @@ mod tree_tests {
         let messages = model_conversation_entries(&session.branch(), session.operations());
         assert!(
             matches!(messages.as_slice(), [(_, Message::User { content })] if content == "question")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_after_failed_assistant_does_not_return_older_answer() {
+        struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
+        #[async_trait::async_trait]
+        impl Model for Capture {
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.0.lock().unwrap().push(request);
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(ModelEvent::Text("new answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "failed partial".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        let model = Capture(std::sync::Mutex::new(Vec::new()));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "new answer"
+        );
+        let requests = model.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !serde_json::to_string(&requests[0])
+                .unwrap()
+                .contains("failed partial")
         );
     }
 
@@ -8261,8 +8381,14 @@ mod tree_tests {
     impl Model for CancelSilentSummary {
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
             if request.messages.iter().any(|message| matches!(message, Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
-                self.0.cancel();
-                return Ok(Box::pin(futures_util::stream::pending()));
+                let cancel = self.0.clone();
+                return Ok(Box::pin(
+                    futures_util::stream::iter([Ok(ModelEvent::Text("private summary".into()))])
+                        .chain(futures_util::stream::once(async move {
+                            cancel.cancel();
+                            futures_util::future::pending::<Result<ModelEvent>>().await
+                        })),
+                ));
             }
             Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(ModelEvent::Text("answer".into())),
@@ -8327,6 +8453,8 @@ mod tree_tests {
             Err(Error::Cancelled)
         ));
         assert!(resumable_compaction_run(&session).is_some());
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::ModelFinished { failure: Some(ModelFailure::Cancelled), partial, .. } if partial == "private summary")));
+        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:aborted-turn-partial")));
         assert!(session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow")));
         assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
         assert_eq!(
