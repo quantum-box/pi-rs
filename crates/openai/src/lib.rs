@@ -2345,7 +2345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_preferred_fallback_stream_preserves_raw_arguments() {
+    async fn sdk_prepared_responses_sends_strict_schema() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2459,6 +2459,7 @@ mod tests {
         assert_eq!(args, json!({"path":null}));
         let body = server.join().unwrap();
         assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["input"][0]["role"], "system");
         assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
         assert_eq!(body["prompt_cache_key"], "strict-session");
     }
