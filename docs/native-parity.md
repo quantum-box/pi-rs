@@ -1486,6 +1486,19 @@ existing named project-skill mode remains supported. Native built-ins can be
 selected with `builtin:codemode`, `builtin:tool-search` and `builtin:mcp`.
 Repeated project-approval flags follow Pi's last-option-wins behavior, including
 the `-a` and `-na` aliases; flags after `--` remain prompt text.
+For root help and version requests, Pi-compatible argument diagnostics are
+reported before metadata; version takes precedence over help, and export takes
+precedence over help. Metadata scanning follows Pi's value ownership for its
+options, including values that begin with a dash. Native subcommands retain their
+own Clap parsing and help, while native-only attached values and short-option
+clusters continue to be accepted. For root `--export`, the last export input and first positional message select
+the input and HTML output, including when help is present; native option
+validation runs before writing. As a deliberate safety difference from Pi, an
+export destination cannot overwrite any explicitly supplied export input, even
+one replaced by a later option; aliases and symlinks are checked as well. A
+missing or empty final export input is rejected
+rather than falling back to an earlier input. Other invocations without root metadata keep
+their existing native argument parsing.
 These selections propagate to persistent CLI workers. The settings editor,
 remaining CLI aliases still require parity work.
 
