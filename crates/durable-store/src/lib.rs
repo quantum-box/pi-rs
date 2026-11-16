@@ -933,6 +933,50 @@ impl Store {
         Ok(keys.into_iter().next().map(|key| (runtime_sequence, key)))
     }
 
+    /// Find a unique canonical, twenty-digit snapshot key written with the
+    /// specified runtime root commit. Other same-commit snapshot keys are
+    /// ignored. The caller must authenticate the matching observer and payload.
+    pub fn runtime_canonical_snapshot_at(
+        &self,
+        runtime_key: &[u8],
+        snapshot_prefix: &[u8],
+        sequence: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if sequence == 0 || sequence > i64::MAX as u64 || snapshot_prefix.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT e.key FROM durable_store_entries e JOIN durable_commit_versions c ON c.key=e.key AND c.version=e.version JOIN durable_commit_versions r ON r.key=?1 AND r.sequence=c.sequence WHERE c.sequence=?2 AND substr(e.key,1,?3)=?4 AND length(e.key)=?5")?;
+        let rows = stmt.query_map(
+            params![
+                runtime_key,
+                sequence,
+                snapshot_prefix.len() as i64,
+                snapshot_prefix,
+                snapshot_prefix.len() as i64 + 20
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut found = None;
+        for row in rows {
+            let key = row?;
+            let suffix = &key[snapshot_prefix.len()..];
+            let Ok(text) = std::str::from_utf8(suffix) else {
+                continue;
+            };
+            let Ok(observation) = text.parse::<u64>() else {
+                continue;
+            };
+            if observation == 0 || format!("{observation:020}").as_bytes() != suffix {
+                continue;
+            }
+            if found.replace(key).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(found)
+    }
+
     /// Verify that an explicitly selected, currently retained snapshot and a
     /// runtime root were put in the same tracked commit. This does not prove
     /// that the snapshot is authorized by a manifest or that its contents are
@@ -1691,6 +1735,80 @@ mod document_history_tests {
                 )
                 .unwrap());
         }
+    }
+
+    #[test]
+    fn canonical_runtime_snapshot_selects_only_one_exact_commit_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("db")).unwrap();
+        let root = b"runtime/conversation/a";
+        let prefix = b"runtime/fork/a/";
+        let canonical = b"runtime/fork/a/00000000000000000007";
+        let other = b"runtime/fork/a/intermediate";
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: canonical.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: other.to_vec(),
+                    value: vec![],
+                },
+            ],
+        )
+        .unwrap();
+        let v = db.get(root).unwrap().unwrap().version;
+        let sequence = db.commit_for_version(root, v).unwrap().unwrap();
+        assert_eq!(
+            db.runtime_canonical_snapshot_at(root, prefix, sequence)
+                .unwrap(),
+            Some(canonical.to_vec())
+        );
+        let duplicate = b"runtime/fork/a/00000000000000000008";
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: canonical.to_vec(),
+                    value: vec![],
+                },
+                Mutation::Put {
+                    key: duplicate.to_vec(),
+                    value: vec![],
+                },
+            ],
+        )
+        .unwrap();
+        let new_version = db.get(root).unwrap().unwrap().version;
+        let ambiguous = db.commit_for_version(root, new_version).unwrap().unwrap();
+        assert_eq!(
+            db.runtime_canonical_snapshot_at(root, prefix, ambiguous)
+                .unwrap(),
+            None
+        );
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: canonical.to_vec(),
+                value: b"tampered".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            db.runtime_canonical_snapshot_at(root, prefix, sequence)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

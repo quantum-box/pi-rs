@@ -6531,10 +6531,15 @@ impl Harness {
             .commit_for_version(&root, version)?
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
         let prefix = format!("runtime/fork/{id}/");
-        let (_, fork_key) = store
+        let fork_key = match store
             .runtime_snapshot_at(&root, prefix.as_bytes(), sequence)?
             .filter(|(commit, _)| *commit == sequence)
-            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        {
+            Some((_, key)) => key,
+            None => store
+                .runtime_canonical_snapshot_at(&root, prefix.as_bytes(), sequence)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        };
         let suffix = fork_key
             .strip_prefix(prefix.as_bytes())
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -6542,6 +6547,9 @@ impl Harness {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if fork_key != format!("runtime/fork/{id}/{observation:020}").as_bytes() {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
         self.authenticate_fork_anchor(id, observation)?;
         let fork = store
             .get(&fork_key)?
@@ -16784,24 +16792,26 @@ mod scheduler_tests {
             .unwrap();
         h.authenticate_fork_anchor(id, head).unwrap();
         let (_, version) = h.load(id).unwrap();
-        // The anchored derivation still relies on the unique-snapshot lookup.
-        // Until that lookup is replaced with authenticated cut selection it
-        // cannot derive a baseline from a multi-snapshot commit.
-        assert!(
-            h.derive_anchored_reset_states(
-                id,
-                version,
-                &[ResetDerivationStep {
-                    reset_id: reset,
-                    context_generation: Uuid::new_v4(),
-                    write_limit: usize::MAX,
-                }]
-            )
-            .is_err()
+        let step = ResetDerivationStep {
+            reset_id: reset,
+            context_generation: Uuid::new_v4(),
+            write_limit: usize::MAX,
+        };
+        assert_eq!(
+            h.derive_anchored_reset_states(id, version, &[step])
+                .unwrap()
+                .len(),
+            1
         );
         drop(h);
         let h = Harness::open_paused(&path, options(model)).unwrap();
         h.authenticate_fork_anchor(id, head).unwrap();
+        assert_eq!(
+            h.derive_anchored_reset_states(id, version, &[step])
+                .unwrap()
+                .len(),
+            1
+        );
         // Rewriting the selected snapshot alone must still invalidate it.
         let value = h.owner.store().get(&fork).unwrap().unwrap().value;
         h.owner
@@ -16809,6 +16819,10 @@ mod scheduler_tests {
             .commit(&[], &[Mutation::Put { key: fork, value }])
             .unwrap();
         assert!(h.authenticate_fork_anchor(id, head).is_err());
+        assert!(
+            h.derive_anchored_reset_states(id, version, &[step])
+                .is_err()
+        );
     }
 
     #[test]
