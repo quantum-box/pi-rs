@@ -1573,6 +1573,16 @@ Stores with any pre-sequence versions fail closed unless `unified_history_start(
 
 ### Host submission settlement waits
 
+`Harness::session_transaction` and `Scheduler::session_transaction` can commit
+display-only application entries and JSON-object document changes together for
+one conversation. The synchronous callback reads its own staged changes; its
+entry IDs are provisional until commit. Conversation and document conflicts
+roll back the batch, and the callback is never retried automatically. Entry
+appends are rejected while a reset, independent summary, or earlier application
+write is pending. This is a limited host API; upstream entry trees, transaction
+admission and typed Chord drafts are not yet supported. See the
+[session transaction tests](tests/session_transaction.rs) for examples.
+
 For a durable task notification, use the `*_with_notification` admission
 variants with `SubmissionNotify { task_id, key }`. The settlement commit
 delivers the typed `submission_settled_signal()` to that task and key together
