@@ -724,12 +724,30 @@ fn resolved_constrained_tools(
     Ok((wire, effective))
 }
 
+#[cfg(test)]
 fn constrained_tools(
     request: &ModelRequest,
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
 ) -> Result<Vec<Value>> {
     resolved_constrained_tools(request, declarations, supports_strict).map(|(wire, _)| wire)
+}
+
+fn stream_only_constrained_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supports_strict: bool,
+) -> Result<Vec<Value>> {
+    let (wire, effective) = resolved_constrained_tools(request, declarations, supports_strict)?;
+    if effective.iter().any(|tool| {
+        matches!(
+            tool.sampling,
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+        )
+    }) {
+        return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+    }
+    Ok(wire)
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -960,7 +978,8 @@ impl Model for OpenAiResponses {
         request: ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<pi_rs_core::DetailedModelStream> {
-        let tools = constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let tools =
+            stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
         let stream = self
             .clone()
             .with_session_cache_key(external_id)
@@ -977,7 +996,8 @@ impl Model for OpenAiResponses {
         request: ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<pi_rs_core::DetailedModelStream> {
-        let tools = constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let tools =
+            stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
         let stream = self
             .clone()
             .without_cache()
@@ -990,15 +1010,15 @@ impl Model for OpenAiResponses {
 impl OpenAiResponses {
     /// Stream with explicit per-tool declarations and strict capability.
     ///
-    /// Callers executing a strict tool must normalize a copy of its returned
-    /// arguments against the original schema before validating them.
+    /// Strict decisions require the prepared-dispatch API; unconstrained
+    /// fallbacks can be streamed here without losing a normalization decision.
     pub async fn stream_with_tool_declarations(
         &self,
         request: ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
         supports_strict: bool,
     ) -> Result<ModelStream> {
-        let tools = constrained_tools(&request, declarations, supports_strict)?;
+        let tools = stream_only_constrained_tools(&request, declarations, supports_strict)?;
         let stream = self
             .stream_enriched_with_tools(request, Some(tools))
             .await?;
@@ -2142,6 +2162,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_stream_only_rejects_strict_or_unsupported_before_dispatch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        for (support, policy) in [
+            (true, pi_rs_core::StrictToolPolicy::Require),
+            (true, pi_rs_core::StrictToolPolicy::Prefer),
+            (false, pi_rs_core::StrictToolPolicy::Require),
+        ] {
+            let model = OpenAiResponses::new_api(&endpoint, "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(support);
+            let req = request();
+            let declaration = pi_rs_core::ToolDeclaration {
+                spec: req.tools[0].clone(),
+                constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                    strict: policy,
+                }),
+            };
+            let declarations = std::slice::from_ref(&declaration);
+            assert!(matches!(
+                model
+                    .stream_detailed_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        req.clone(),
+                        declarations
+                    )
+                    .await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                model
+                    .stream_detailed_summary_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        req.clone(),
+                        declarations
+                    )
+                    .await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                model
+                    .stream_with_tool_declarations(req, declarations, support)
+                    .await,
+                Err(Error::Config(_))
+            ));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
     async fn declaration_stream_defaults_to_unsupported_and_changes_identity_when_enabled() {
         let model =
             OpenAiResponses::new_api("https://example.test/responses", "fixture".into()).unwrap();
@@ -2317,7 +2394,7 @@ mod tests {
                 data.extend_from_slice(&chunk[..count]);
             }
             let body: Value = serde_json::from_slice(&data[end..end + length]).unwrap();
-            let final_arguments = r#"{"path":"hello"}"#;
+            let final_arguments = r#"{"path":null}"#;
             let events = [
                 json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":"}}),
                 json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":final_arguments}),
@@ -2346,6 +2423,123 @@ mod tests {
             OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
                 .unwrap()
                 .with_strict_tool_support(true);
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "strict-session".into(),
+            summary: false,
+        };
+        let prepared = model
+            .prepare_bound_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+            .unwrap();
+        let original = match &prepared.effective_tools()[0].sampling {
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                original_schema, ..
+            } => original_schema.clone(),
+            _ => panic!("expected strict decision"),
+        };
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut calls = None;
+        while let Some(event) = stream.next().await {
+            if let pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: completed,
+                ..
+            }) = event.unwrap().event
+            {
+                calls = Some(completed);
+            }
+        }
+        let raw = calls.unwrap()[0].arguments.clone();
+        assert_eq!(raw, r#"{"path":null}"#);
+        let args: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            pi_rs_core::normalize_strict_tool_arguments(&original, &args).unwrap(),
+            json!({})
+        );
+        assert_eq!(args, json!({"path":null}));
+        let body = server.join().unwrap();
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
+        assert_eq!(body["prompt_cache_key"], "strict-session");
+    }
+
+    #[tokio::test]
+    async fn responses_preferred_fallback_stream_keeps_raw_arguments() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut data = Vec::new();
+            let end = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&data[..end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while data.len() < end + length {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+            }
+            let body: Value = serde_json::from_slice(&data[end..end + length]).unwrap();
+            let final_arguments = r#"{"path":null}"#;
+            let events = [
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":"}}),
+                json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":final_arguments}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments}}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments}]}}),
+            ];
+            let events = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            body
+        });
+        let mut req = request();
+        req.tools[0].parameters = json!({"type":"object","properties":{"path":{"type":"string"}}});
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(false);
+        let original = req.tools[0].parameters.clone();
         let mut stream = model
             .stream_detailed_with_tool_declarations(
                 uuid::Uuid::nil(),
@@ -2366,11 +2560,12 @@ mod tests {
                 calls = Some(completed);
             }
         }
-        assert_eq!(calls.unwrap()[0].arguments, r#"{"path":"hello"}"#);
+        let raw = calls.unwrap()[0].arguments.clone();
+        assert_eq!(raw, r#"{"path":null}"#);
         let body = server.join().unwrap();
-        assert_eq!(body["tools"][0]["strict"], true);
+        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(body["tools"][0]["parameters"], original);
         assert_eq!(body["input"][0]["role"], "system");
-        assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
         assert_eq!(body["prompt_cache_key"], "strict-session");
     }
 

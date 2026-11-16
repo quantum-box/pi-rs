@@ -3816,8 +3816,11 @@ strict calls are polled using those recorded arguments and require a stable
 backend recovery identity. Grammar tool execution remains unsupported. The OpenAI
 Responses SDK can send explicitly supplied tool
 declarations with JSON Schema constraints when its caller supplies the model's
-strict capability, including through the declaration-aware detailed model
-stream; callers must normalize returned arguments before validation. Legacy
+strict capability through prepared dispatch. Declaration-aware stream-only
+methods reject an effective strict decision before dispatch because they cannot
+return that decision; preferred constraints may stream when they fall back to
+unconstrained sampling. Callers must retain prepared decisions and normalize a
+copy of strict arguments before validation. Legacy
 model implementations reject required constraints and can fall back for
 preferred constraints.
 Native tools can declare a constraint when registered; the registry retains
@@ -3855,8 +3858,9 @@ field otherwise. Required constraints fail before dispatch when unsupported
 or unsafe to normalize. Prepared session and summary dispatch, including through resolved and deferred
 Workbench clients, bind decisions and budget estimates to the transformed wire
 schemas. Declaration-aware session and summary streams use the same prepared
-dispatch through Client, WorkbenchModel, and context-prepared WorkbenchModel
-for both Chat Completions and Responses. Session dispatch applies the configured prompt-cache policy and
+decision resolution through Client, WorkbenchModel, and context-prepared
+WorkbenchModel for both Chat Completions and Responses, but reject strict
+decisions and direct callers to prepared dispatch. Session dispatch applies the configured prompt-cache policy and
 external session key; summary dispatch suppresses automatic cache controls,
 prompt-cache keys, and retention. Callers must normalize strict arguments
 before validation. Grammar declarations in Chat Completions currently fall back to

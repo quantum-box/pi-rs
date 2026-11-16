@@ -821,6 +821,7 @@ impl Model for Ollama {
             .clone()
             .with_session_cache_key(external_id)
             .prepare_tool_request(request, declarations)?;
+        reject_stream_only_strict(&prepared.effective_tools)?;
         let stream = prepared
             .client
             .stream_with_wire_tools(prepared.request, Some(prepared.wire_tools))
@@ -841,6 +842,7 @@ impl Model for Ollama {
             .clone()
             .without_cache()
             .prepare_tool_request(request, declarations)?;
+        reject_stream_only_strict(&prepared.effective_tools)?;
         let stream = prepared
             .client
             .stream_with_wire_tools(prepared.request, Some(prepared.wire_tools))
@@ -1319,6 +1321,18 @@ impl Ollama {
             Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
         }))
     }
+}
+
+fn reject_stream_only_strict(effective: &[pi_rs_core::EffectiveToolDeclaration]) -> Result<()> {
+    if effective.iter().any(|tool| {
+        matches!(
+            tool.sampling,
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+        )
+    }) {
+        return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+    }
+    Ok(())
 }
 
 fn resolved_constrained_tools(
@@ -2721,6 +2735,96 @@ mod constrained_chat_tests {
     }
 
     #[tokio::test]
+    async fn constrained_chat_stream_only_preferred_fallback_keeps_raw_tool_arguments() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 8192];
+            let _ = socket.read(&mut buf).unwrap();
+            let events = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"read","arguments":"{\"optional\":null}"}}]},"finish_reason":"tool_calls"}]})
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", events.len(), events).unwrap();
+        });
+        let client = model(Some(false), &endpoint);
+        let (request, declaration) = fixture(
+            StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{"optional":{"type":"string"}}}),
+        );
+        let events = client
+            .stream_detailed_with_tool_declarations(
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                "session",
+                request,
+                &[declaration],
+            )
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let calls = events
+            .into_iter()
+            .find_map(|event| match event.unwrap().event {
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, .. }) => {
+                    Some(calls)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(calls[0].arguments, r#"{"optional":null}"#);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn constrained_chat_stream_only_rejects_strict_or_unsupported_before_dispatch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        for (support, policy) in [
+            (Some(true), StrictToolPolicy::Require),
+            (Some(true), StrictToolPolicy::Prefer),
+            (Some(false), StrictToolPolicy::Require),
+        ] {
+            let client = model(support, &endpoint);
+            let (request, declaration) = fixture(
+                policy,
+                json!({"type":"object","properties":{"optional":{"type":"string"}}}),
+            );
+            for summary in [false, true] {
+                let result = if summary {
+                    client
+                        .stream_detailed_summary_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            request.clone(),
+                            std::slice::from_ref(&declaration),
+                        )
+                        .await
+                } else {
+                    client
+                        .stream_detailed_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            "session",
+                            request.clone(),
+                            std::slice::from_ref(&declaration),
+                        )
+                        .await
+                };
+                assert!(matches!(result, Err(Error::Config(_))));
+            }
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
     async fn constrained_chat_prepared_wire_matches_decision_in_session_and_summary() {
         use std::io::{Read, Write};
         for (summary, direct) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -2753,7 +2857,10 @@ mod constrained_chat_tests {
                     bytes.extend_from_slice(&buf[..n]);
                 }
                 let body: Value = serde_json::from_slice(&bytes[start..start + length]).unwrap();
-                let response = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"optional\":null}"}}]},"finish_reason":"tool_calls"}]})
+                );
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                 body
             });
@@ -2786,32 +2893,53 @@ mod constrained_chat_tests {
                 prepared.effective_tools()[0].sampling,
                 EffectiveToolSampling::StrictJsonSchema { .. }
             ));
-            let stream = if !direct {
-                prepared.dispatch().await.unwrap()
-            } else if summary {
-                client
-                    .stream_detailed_summary_with_tool_declarations(
-                        context.request_id,
-                        context.session_id,
-                        request.clone(),
-                        std::slice::from_ref(&declaration),
-                    )
-                    .await
-                    .unwrap()
-            } else {
-                client
-                    .stream_detailed_with_tool_declarations(
-                        context.request_id,
-                        context.session_id,
-                        &context.external_id,
-                        request.clone(),
-                        std::slice::from_ref(&declaration),
-                    )
-                    .await
-                    .unwrap()
-            };
+            if direct {
+                let result = if summary {
+                    client
+                        .stream_detailed_summary_with_tool_declarations(
+                            context.request_id,
+                            context.session_id,
+                            request.clone(),
+                            std::slice::from_ref(&declaration),
+                        )
+                        .await
+                } else {
+                    client
+                        .stream_detailed_with_tool_declarations(
+                            context.request_id,
+                            context.session_id,
+                            &context.external_id,
+                            request.clone(),
+                            std::slice::from_ref(&declaration),
+                        )
+                        .await
+                };
+                assert!(
+                    matches!(result, Err(Error::Config(message)) if message.contains("requires prepared dispatch"))
+                );
+            }
+            let stream = prepared.dispatch().await.unwrap();
             let events = stream.collect::<Vec<_>>().await;
-            assert!(events.into_iter().all(|event| event.is_ok()));
+            let calls = events
+                .into_iter()
+                .find_map(|event| match event.unwrap().event {
+                    pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                        calls, ..
+                    }) => Some(calls),
+                    _ => None,
+                })
+                .expect("completed tool call");
+            assert_eq!(calls[0].arguments, r#"{"optional":null}"#);
+            let arguments: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+            assert_eq!(
+                pi_rs_core::normalize_strict_tool_arguments(
+                    &declaration.spec.parameters,
+                    &arguments
+                )
+                .unwrap(),
+                json!({})
+            );
+            assert_eq!(arguments, json!({"optional":null}));
             let body = worker.join().unwrap();
             assert_eq!(body["tools"][0]["function"]["parameters"], expected);
             assert_eq!(body["tools"][0]["function"]["strict"], true);

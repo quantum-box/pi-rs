@@ -1300,6 +1300,14 @@ pub(super) async fn stream_with_declarations(
             &request,
             declarations,
         )?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
         prepared.dispatch().await
     } else if context.summary {
         pi_rs::validate_legacy_tool_declarations(&request, declarations)?;
@@ -2047,7 +2055,6 @@ mod contention_tests {
                 ),
                 supported
             );
-            drop(prepared);
             let result = if summary {
                 selected
                     .stream_detailed_summary_with_tool_declarations(
@@ -2068,7 +2075,14 @@ mod contention_tests {
                     )
                     .await
             };
-            assert!(result.is_err());
+            if supported {
+                assert!(
+                    matches!(result, Err(Error::Config(message)) if message.contains("requires prepared dispatch"))
+                );
+                let _ = prepared.dispatch().await;
+            } else {
+                assert!(result.is_err());
+            }
             let (headers, body) = server.join().unwrap();
             assert_eq!(
                 body["tools"][0].get("strict").and_then(Value::as_bool),
@@ -2265,7 +2279,6 @@ mod contention_tests {
                 supported
             );
             let expected_schema = prepared.reservation_request().tools[0].parameters.clone();
-            drop(prepared);
             let result = if summary {
                 selected
                     .stream_detailed_summary_with_tool_declarations(
@@ -2286,7 +2299,14 @@ mod contention_tests {
                     )
                     .await
             };
-            assert!(result.is_err());
+            if supported {
+                assert!(
+                    matches!(result, Err(Error::Config(message)) if message.contains("requires prepared dispatch"))
+                );
+                let _ = prepared.dispatch().await;
+            } else {
+                assert!(result.is_err());
+            }
             let (headers, body) = server.join().unwrap();
             assert_eq!(
                 body["tools"][0]["function"]
