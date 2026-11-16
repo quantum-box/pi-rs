@@ -1119,14 +1119,14 @@ impl Model for Google {
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
         let mut body = wire_request(&request, thinking, &self.replay_scope, &edited_scope)?;
-        if let Some((schemas, validated)) = &self.bound_tools {
-            if let Some(tools) = body["tools"][0]["functionDeclarations"].as_array_mut() {
-                for (tool, schema) in tools.iter_mut().zip(schemas) {
-                    tool["parametersJsonSchema"] = schema.clone();
-                }
-                if *validated {
-                    body["toolConfig"]["functionCallingConfig"]["mode"] = json!("VALIDATED");
-                }
+        if let Some((schemas, validated)) = &self.bound_tools
+            && let Some(tools) = body["tools"][0]["functionDeclarations"].as_array_mut()
+        {
+            for (tool, schema) in tools.iter_mut().zip(schemas) {
+                tool["parametersJsonSchema"] = schema.clone();
+            }
+            if *validated {
+                body["toolConfig"]["functionCallingConfig"]["mode"] = json!("VALIDATED");
             }
         }
         if !supports_thinking {
@@ -1437,7 +1437,13 @@ mod tests {
         };
         let id = uuid::Uuid::new_v4();
         let error = match client
-            .stream_detailed_with_tool_declarations(id, id, "s", request.clone(), &[decl.clone()])
+            .stream_detailed_with_tool_declarations(
+                id,
+                id,
+                "s",
+                request.clone(),
+                std::slice::from_ref(&decl),
+            )
             .await
         {
             Err(e) => e.to_string(),
@@ -1449,7 +1455,7 @@ mod tests {
                 id,
                 id,
                 request.clone(),
-                &[decl.clone()],
+                std::slice::from_ref(&decl),
             )
             .await
         {
