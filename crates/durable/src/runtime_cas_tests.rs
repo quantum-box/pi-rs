@@ -5770,6 +5770,7 @@ fn bounded_tool_blocks_preserve_nontext_order_and_bound_combined_text() {
             max_lines: 10,
             retain: Retain::Tail,
         },
+        None,
     )
     .unwrap();
     assert_eq!(

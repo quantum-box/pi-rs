@@ -232,14 +232,13 @@ async fn result_details_diagnostics_and_search_survive_hook_interruption_history
         requests
             .iter()
             .flat_map(|r| &r.messages)
-            .any(|m| matches!(m, Message::Tool { content, .. } if content == "visible output"))
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.starts_with("visible output\n<harness>\n") && content.contains("private warning")))
     );
     assert!(
         !requests
             .iter()
             .flat_map(|r| &r.messages)
-            .any(|m| format!("{m:?}").contains("private details")
-                || format!("{m:?}").contains("private warning"))
+            .any(|m| format!("{m:?}").contains("private details"))
     );
     drop(requests);
     let history = h
@@ -396,7 +395,7 @@ async fn oversized_metadata_records_warning_without_repeating_tool() {
         Some("metadata_truncated")
     );
     assert!(c.messages.iter().any(
-        |message| matches!(message, Message::Tool { content, .. } if content == "kept output")
+        |message| matches!(message, Message::Tool { content, .. } if content.starts_with("kept output\n<harness>\n[warn] "))
     ));
     assert_eq!(effects.load(Ordering::SeqCst), 1);
 }

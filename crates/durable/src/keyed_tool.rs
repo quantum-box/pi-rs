@@ -283,6 +283,7 @@ pub(crate) trait StreamSink: Send + Sync {
         checkpoint: &crate::output::OutputCheckpoint,
         limits: crate::output::OutputLimits,
         selected: bool,
+        _prebounded: Option<crate::output::PreboundedOutput>,
     ) -> ExtensionResult<()> {
         if selected {
             self.record_bounded_selected(text, checkpoint, limits.retain)
@@ -535,6 +536,10 @@ impl Drop for BoundedStreamGuard {
     }
 }
 
+/// Maximum explicit text held in a pending durable tool result before hooks.
+/// Larger text is prebounded to the adapter's configured window.
+pub const MAX_PENDING_EXPLICIT_BYTES: usize = 1024 * 1024;
+
 /// Wrap with `KeyedToolAdapter` and register normally. `limits.max_bytes` may
 /// not exceed the durable stream record's 64 KiB cap.
 pub struct BoundedStreamedToolAdapter<T> {
@@ -575,7 +580,7 @@ impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
             sink,
         });
         let guard = BoundedStreamGuard(inner.clone());
-        let reply = self
+        let mut reply = self
             .tool
             .invoke(
                 arguments,
@@ -585,6 +590,57 @@ impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
                 BoundedStreamOutput(inner.clone()),
             )
             .await;
+        // Tool effects have already happened. Bound oversized explicit text
+        // before the result can be checkpointed, retaining counts separately.
+        let mut prebounded = None;
+        let explicit = match &mut reply {
+            StreamedReply::Success {
+                output: Some(text), ..
+            } => Some(text),
+            StreamedReply::Explicit(reply) => match &mut reply.outcome {
+                Outcome::Succeeded(text)
+                | Outcome::SucceededWithDetails { output: text, .. }
+                | Outcome::Failed(text)
+                | Outcome::Skipped(text) => Some(text),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(text) = explicit
+            && text.len() > MAX_PENDING_EXPLICIT_BYTES
+        {
+            let bounded = crate::output::bound_output(text, self.limits);
+            prebounded = Some(crate::output::PreboundedOutput {
+                dropped_bytes: bounded.dropped_bytes,
+                dropped_lines: bounded.dropped_lines,
+            });
+            *text = bounded.text.to_owned();
+        }
+        // Do not checkpoint an unbounded state/details/structured payload after
+        // dispatch. Its external outcome is uncertain and requires reconciliation.
+        let oversized_auxiliary = match &reply {
+            StreamedReply::Success { state, .. } => !bounded_json(state),
+            StreamedReply::Explicit(reply) => {
+                !bounded_json(&reply.state)
+                    || match &reply.outcome {
+                        Outcome::SucceededWithDetails { details, .. } => !bounded_json(details),
+                        Outcome::Structured { data, attachments } => {
+                            !bounded_json(&(data, attachments))
+                        }
+                        Outcome::Unknown(reason) => reason.len() > MAX_PENDING_EXPLICIT_BYTES,
+                        Outcome::Pending { reference } => {
+                            reference.len() > MAX_PENDING_EXPLICIT_BYTES
+                        }
+                        _ => false,
+                    }
+            }
+        };
+        if oversized_auxiliary {
+            reply = StreamedReply::Explicit(
+                Outcome::Unknown("oversized tool result requires reconciliation".into()).into(),
+            );
+            prebounded = None;
+        }
         inner.open.store(false, Ordering::Release);
         let mut state = inner.state.lock().await;
         if !state.failed {
@@ -598,6 +654,7 @@ impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
                     &checkpoint,
                     self.limits,
                     matches!(&reply, StreamedReply::Success { output: None, .. }),
+                    prebounded,
                 )
                 .await;
             if result.is_err() {
@@ -624,6 +681,27 @@ impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
             StreamedReply::Explicit(reply) => reply,
         }
     }
+}
+
+// Bound serialized auxiliary values without allocating their complete encoding.
+fn bounded_json(value: &impl serde::Serialize) -> bool {
+    struct LimitWriter(usize);
+    impl std::io::Write for LimitWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("oversized"))?;
+            if self.0 > MAX_PENDING_EXPLICIT_BYTES {
+                return Err(std::io::Error::other("oversized"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(LimitWriter(0), value).is_ok()
 }
 
 // Weak entries keep allocations from being reused while they are registered. The

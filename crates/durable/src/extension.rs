@@ -792,14 +792,27 @@ impl Resolved {
     pub(crate) async fn runtime_after_tool_blocks(
         &self,
         call: &ToolCall,
-        mut result: ToolBlockResult,
+        result: ToolBlockResult,
         nested: bool,
         ctx: &Context<'_>,
     ) -> Result<(ToolBlockResult, Vec<Report>), String> {
+        let (result, _, reports) = self
+            .runtime_after_tool_blocks_with_replacement(call, result, nested, ctx)
+            .await?;
+        Ok((result, reports))
+    }
+    pub(crate) async fn runtime_after_tool_blocks_with_replacement(
+        &self,
+        call: &ToolCall,
+        mut result: ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<(ToolBlockResult, bool, Vec<Report>), String> {
         if !result.valid() {
             return Err("invalid tool output blocks".into());
         }
         let mut reports = vec![];
+        let mut replaced = false;
         for extension in &self.extensions {
             for hook in &extension.hooks {
                 match protect(async {
@@ -812,7 +825,8 @@ impl Resolved {
                 .await
                 {
                     Ok(Some(value)) if value.valid() && value.extra == result.extra => {
-                        result = value
+                        result = value;
+                        replaced = true;
                     }
                     Ok(Some(_)) => reports.push(failure(
                         &extension.name,
@@ -826,7 +840,7 @@ impl Resolved {
                 }
             }
         }
-        Ok((result, reports))
+        Ok((result, replaced, reports))
     }
     /// Request replacements pass down the chain; the first onYield decision wins.
     /// Returned task requests are only collected, never scheduled here.

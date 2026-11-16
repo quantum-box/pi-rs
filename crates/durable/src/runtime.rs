@@ -882,8 +882,8 @@ pub struct Conversation {
     phase: Phase,
 }
 
-/// A diagnostic associated with a tool result. Truncation warnings are also
-/// projected into model-visible tool content; other diagnostics remain metadata.
+/// A diagnostic associated with a finalized tool result. Diagnostics are also
+/// projected into model-visible tool content after hooks and redaction.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolDiagnostic {
     pub severity: DiagnosticSeverity,
@@ -1138,6 +1138,8 @@ fn hide_pending_tool_output(state: &mut Conversation) {
 struct BoundedResultProof {
     attempt_id: Uuid,
     limits: crate::output::OutputLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prebounded: Option<crate::output::PreboundedOutput>,
 }
 
 fn bounded_result_key(conversation: Uuid, operation: Uuid) -> Vec<u8> {
@@ -1148,7 +1150,7 @@ fn bounded_result_limits(
     owner: &OwnedStore,
     conversation: &Conversation,
     operation: Uuid,
-) -> Result<Option<crate::output::OutputLimits>, Error> {
+) -> Result<Option<BoundedResultProof>, Error> {
     let Some(attempt) = conversation
         .tool_attempt()
         .filter(|attempt| attempt.operation_id == operation)
@@ -1167,12 +1169,13 @@ fn bounded_result_limits(
     {
         return Err(Error::Invalid("invalid bounded tool result proof".into()));
     }
-    Ok(Some(proof.limits))
+    Ok(Some(proof))
 }
 
 fn bound_tool_output(
     blocks: &mut Vec<serde_json::Value>,
     limits: crate::output::OutputLimits,
+    prebounded: Option<crate::output::PreboundedOutput>,
 ) -> Option<ToolDiagnostic> {
     let positions: Vec<_> = blocks
         .iter()
@@ -1190,12 +1193,27 @@ fn bound_tool_output(
         .collect();
     let joined: String = positions.iter().map(|(_, text)| *text).collect();
     let bounded = crate::output::bound_output(&joined, limits);
-    if bounded.dropped_bytes == 0 {
+    let bytes = bounded
+        .dropped_bytes
+        .saturating_add(prebounded.map_or(0, |p| p.dropped_bytes));
+    let lines = bounded
+        .dropped_lines
+        .saturating_add(prebounded.map_or(0, |p| p.dropped_lines));
+    if bytes == 0 {
         return None;
     }
     let kept = bounded.text.to_owned();
-    let bytes = bounded.dropped_bytes;
-    let lines = bounded.dropped_lines;
+    if bounded.dropped_bytes == 0 {
+        let end = match limits.retain {
+            crate::output::Retain::Head => "beginning",
+            crate::output::Retain::Tail => "end",
+        };
+        return Some(ToolDiagnostic {
+            severity: DiagnosticSeverity::Warn,
+            code: Some("truncated".into()),
+            message: format!("Output truncated to its {end}: {lines} lines, {bytes} bytes dropped"),
+        });
+    }
     let selected = match limits.retain {
         crate::output::Retain::Head => positions.first(),
         crate::output::Retain::Tail => positions.last(),
@@ -1298,16 +1316,19 @@ fn interrupted_truncation_diagnostic(
         .cloned())
 }
 
-// Metadata is kept separately for hosts. Only truncation warnings are projected
-// here; rendering other diagnostic classes remains a separate parity gap.
-fn render_truncation_diagnostics(metadata: &ToolResultMetadata) -> Option<String> {
-    let lines: Vec<_> = metadata
-        .diagnostics
+// Render only finalized diagnostics. The caller stores this text with the
+// tool message, so retries and later request projections never append it again.
+fn render_tool_diagnostics(diagnostics: &[ToolDiagnostic]) -> Option<String> {
+    let lines: Vec<_> = diagnostics
         .iter()
-        .filter(|d| {
-            d.code.as_deref() == Some("truncated") && d.severity == DiagnosticSeverity::Warn
+        .map(|diagnostic| {
+            let severity = match diagnostic.severity {
+                DiagnosticSeverity::Info => "info",
+                DiagnosticSeverity::Warn => "warn",
+                DiagnosticSeverity::Error => "error",
+            };
+            format!("[{severity}] {}", diagnostic.message)
         })
-        .map(|d| format!("[warn] {}", d.message))
         .collect();
     (!lines.is_empty()).then(|| format!("<harness>\n{}\n</harness>", lines.join("\n")))
 }
@@ -1936,14 +1957,14 @@ struct RuntimeStreamOutput {
 #[async_trait::async_trait]
 impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
     async fn record(&self, text: &str) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, None, None, None)
+        self.record_inner(text, None, None, None, None)
     }
     async fn record_bounded(
         &self,
         text: &str,
         checkpoint: &crate::output::OutputCheckpoint,
     ) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, Some(checkpoint), None, None)
+        self.record_inner(text, Some(checkpoint), None, None, None)
     }
     async fn record_bounded_selected(
         &self,
@@ -1951,7 +1972,7 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
         checkpoint: &crate::output::OutputCheckpoint,
         retain: crate::output::Retain,
     ) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, Some(checkpoint), Some(retain), None)
+        self.record_inner(text, Some(checkpoint), Some(retain), None, None)
     }
     async fn record_bounded_final(
         &self,
@@ -1959,12 +1980,14 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
         checkpoint: &crate::output::OutputCheckpoint,
         limits: crate::output::OutputLimits,
         selected: bool,
+        prebounded: Option<crate::output::PreboundedOutput>,
     ) -> pi_rs_core::ExtensionResult<()> {
         self.record_inner(
             text,
             Some(checkpoint),
             selected.then_some(limits.retain),
             Some(limits),
+            prebounded,
         )
     }
 }
@@ -1975,6 +1998,7 @@ impl RuntimeStreamOutput {
         checkpoint: Option<&crate::output::OutputCheckpoint>,
         selected: Option<crate::output::Retain>,
         limits: Option<crate::output::OutputLimits>,
+        prebounded: Option<crate::output::PreboundedOutput>,
     ) -> pi_rs_core::ExtensionResult<()> {
         let _lease = self
             .source
@@ -2038,7 +2062,7 @@ impl RuntimeStreamOutput {
                     mutations.push(Mutation::Put {
                         key: checkpoint_key,
                         value: crate::streamed_output::encode_checkpoint(
-                            checkpoint, selected, limits,
+                            checkpoint, selected, limits, prebounded,
                         )?,
                     });
                 }
@@ -3887,8 +3911,16 @@ impl Harness {
         calls: &[ToolCall],
         index: usize,
         operation_id: Uuid,
-        content: String,
+        mut content: String,
     ) -> Result<(), Error> {
+        if let Some(metadata) = c
+            .tool_results
+            .iter()
+            .find(|m| m.operation_id == operation_id)
+            && let Some(diagnostic) = render_tool_diagnostics(&metadata.diagnostics)
+        {
+            append_diagnostic_text(&mut content, &diagnostic);
+        }
         if !self.status_aware(c) {
             return append_tool(c, calls, index, content);
         }
@@ -3919,7 +3951,16 @@ impl Harness {
     ) -> Result<(), Error> {
         let outcome = Outcome::Skipped(reason.into());
         if !self.status_aware(c) {
-            return append_tool(c, calls, index, outcome.tool_content());
+            let mut content = outcome.tool_content();
+            let diagnostics = [ToolDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                message: reason.into(),
+                code: Some("tool_skipped".into()),
+            }];
+            if let Some(diagnostic) = render_tool_diagnostics(&diagnostics) {
+                append_diagnostic_text(&mut content, &diagnostic);
+            }
+            return append_tool(c, calls, index, content);
         }
         let operation_id = Uuid::new_v4();
         record_tool_result(c, calls, index, operation_id, &outcome, Vec::new())?;
@@ -5422,7 +5463,7 @@ impl Harness {
         {
             let checkpoint_key = crate::streamed_output::checkpoint_key(attempt.attempt_id);
             if let Some(entry) = self.owner.store().get(&checkpoint_key)?
-                && let Some(limits) = crate::streamed_output::result_limits(&entry)
+                && let Some((limits, prebounded)) = crate::streamed_output::result_limits(&entry)
                     .map_err(|error| Error::Invalid(format!("bounded stream limits: {error}")))?
             {
                 checks.push(Check {
@@ -5439,6 +5480,7 @@ impl Harness {
                     value: serde_json::to_vec(&BoundedResultProof {
                         attempt_id: attempt.attempt_id,
                         limits,
+                        prebounded,
                     })?,
                 });
             }
@@ -11080,13 +11122,12 @@ impl Harness {
                     }
                     if let Some(limits) = limits {
                         let mut blocks = vec![serde_json::json!({"type":"text", "text":content})];
-                        if let Some(diagnostic) = bound_tool_output(&mut blocks, limits) {
+                        if let Some(diagnostic) =
+                            bound_tool_output(&mut blocks, limits.limits, limits.prebounded)
+                        {
                             append_harness_diagnostic(&mut metadata, diagnostic);
                         }
                         content = blocks[0]["text"].as_str().unwrap_or_default().to_owned();
-                    }
-                    if let Some(diagnostic) = render_truncation_diagnostics(&metadata) {
-                        append_diagnostic_text(&mut content, &diagnostic);
                     }
                     c.tool_results.push(metadata);
                 }
@@ -14137,7 +14178,7 @@ impl Harness {
                             reports,
                         )?;
                         if explicitly_replaced {
-                            retained_output_unchanged &= value.output == content;
+                            retained_output_unchanged = false;
                             content = value.output;
                             metadata.is_error = value.is_error;
                             metadata.details = value.details;
@@ -14183,8 +14224,8 @@ impl Harness {
                         extra,
                     };
                     let original_block_result = block_result.clone();
-                    let (mut block_result, reports) = fenced_poll(
-                        selected.runtime_after_tool_blocks(
+                    let (mut block_result, blocks_replaced, reports) = fenced_poll(
+                        selected.runtime_after_tool_blocks_with_replacement(
                             &hook_call,
                             block_result,
                             false,
@@ -14244,10 +14285,18 @@ impl Harness {
                         }
                         metadata.diagnostics = block_result.diagnostics;
                     }
-                    retained_output_unchanged &=
-                        block_result.output == original_block_result.output;
-                    let bounded = result_limits
-                        .and_then(|limits| bound_tool_output(&mut block_result.output, limits));
+                    retained_output_unchanged &= !blocks_replaced;
+                    let bounded = result_limits.and_then(|proof| {
+                        bound_tool_output(
+                            &mut block_result.output,
+                            proof.limits,
+                            if retained_output_unchanged {
+                                proof.prebounded
+                            } else {
+                                None
+                            },
+                        )
+                    });
                     if let Some(metadata) = c
                         .tool_results
                         .iter_mut()
@@ -14261,7 +14310,7 @@ impl Harness {
                         if let Some(diagnostic) = bounded {
                             append_harness_diagnostic(metadata, diagnostic);
                         }
-                        if let Some(diagnostic) = render_truncation_diagnostics(metadata) {
+                        if let Some(diagnostic) = render_tool_diagnostics(&metadata.diagnostics) {
                             if block_result.output.len() == 1
                                 && block_result.output[0]
                                     .as_object()

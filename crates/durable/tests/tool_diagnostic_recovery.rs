@@ -1090,7 +1090,7 @@ async fn explicit_result_rewrite_is_validated_and_survives_hook_interruption() {
         assert!(
             c.messages
                 .iter()
-                .any(|m| matches!(m,Message::Tool { content,.. } if content=="safe output"))
+                .any(|m| matches!(m,Message::Tool { content,.. } if content.starts_with("safe output\n<harness>\n") && content.contains("safe diagnostic")))
         );
         assert!(
             !h.history(

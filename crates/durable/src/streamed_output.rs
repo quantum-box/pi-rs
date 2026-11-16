@@ -70,6 +70,7 @@ pub(crate) fn encode_checkpoint(
     checkpoint: &crate::output::OutputCheckpoint,
     selected: Option<crate::output::Retain>,
     limits: Option<crate::output::OutputLimits>,
+    prebounded: Option<crate::output::PreboundedOutput>,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut value = serde_json::to_value(checkpoint)?;
     if let Some(retain) = selected {
@@ -77,6 +78,9 @@ pub(crate) fn encode_checkpoint(
     }
     if let Some(limits) = limits {
         value["result_limits"] = serde_json::to_value(limits)?;
+    }
+    if let Some(prebounded) = prebounded {
+        value["prebounded"] = serde_json::to_value(prebounded)?;
     }
     serde_json::to_vec(&value)
 }
@@ -99,18 +103,27 @@ pub(crate) fn load_selected_checkpoint(
     Ok(Some((checkpoint, serde_json::from_value(retain.clone())?)))
 }
 
+type ResultLimits = (
+    crate::output::OutputLimits,
+    Option<crate::output::PreboundedOutput>,
+);
+
 /// Read final adapter limits from a sidecar while retaining its CAS version.
 pub(crate) fn result_limits(
     entry: &durable_store::Entry,
-) -> Result<Option<crate::output::OutputLimits>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<ResultLimits>, Box<dyn std::error::Error + Send + Sync>> {
     decode_checkpoint(entry.clone())?;
     let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
-    let Some(value) = value.get("result_limits") else {
+    let Some(limits) = value.get("result_limits") else {
         return Ok(None);
     };
-    let limits: crate::output::OutputLimits = serde_json::from_value(value.clone())?;
+    let limits: crate::output::OutputLimits = serde_json::from_value(limits.clone())?;
     if limits.max_bytes > crate::keyed_tool::MAX_STREAMED_OUTPUT_BYTES {
         return Err("invalid bounded result limits".into());
     }
-    Ok(Some(limits))
+    let prebounded = value
+        .get("prebounded")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()?;
+    Ok(Some((limits, prebounded)))
 }

@@ -221,7 +221,7 @@ async fn validates_model_results_without_leaking_structured_output_and_survives_
                         .unwrap()
                         .iter()
                         .flat_map(|r| &r.messages)
-                        .any(|v| matches!(v,Message::Tool { content,.. } if content.is_empty()))
+                        .any(|v| matches!(v,Message::Tool { content,.. } if (mode == 0 && content.is_empty()) || (mode == 1 && content.contains("structured output missing or does not match the configured schema"))))
                 );
             }
             assert!(
@@ -319,7 +319,7 @@ async fn redaction_hides_pending_and_final_metadata_across_hook_interruption() {
     assert!(
         c.messages
             .iter()
-            .any(|m| matches!(m,Message::Tool { content,.. } if content=="REDACTED"))
+            .any(|m| matches!(m,Message::Tool { content,.. } if content=="REDACTED\n<harness>\n[info] tool metadata withheld after output replacement\n</harness>"))
     );
     assert!(
         !h.history(
@@ -462,7 +462,7 @@ async fn output_replacement_withholds_schema_bearing_structured_value() {
     assert!(
         c.messages
             .iter()
-            .any(|m| matches!(m, Message::Tool { content, .. } if content == "REDACTED"))
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "REDACTED\n<harness>\n[info] tool metadata withheld after output replacement\n</harness>"))
     );
     assert!(
         !h.history(

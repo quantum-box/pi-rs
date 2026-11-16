@@ -188,13 +188,15 @@ selects its retained stream, the runtime adds a
 `truncated` warning after result hooks if the retained output was not replaced.
 The warning appears in both result metadata and a model-visible `<harness>`
 text section. Interrupted recovery does the same; warnings are not duplicated
-on reopen. Other diagnostic classes remain metadata only. Explicit output does
-not acquire the stream's warning, even if its text matches.
+on reopen. All finalized diagnostic severities are also included in model-visible
+`<harness>` text after hooks; nested diagnostics remain scoped to the child unless
+the parent explicitly forwards them. Explicit output does not acquire the stream's warning, even if its text matches.
 After all result hooks, explicit output and hook-replaced text are bounded using
 the adapter's configured limits; a separate warning reports any bytes dropped.
 For block results, text blocks are joined for the limit and non-text blocks keep
-their order. Structured and block hook outputs are compared by value, since their
-Rust API does not expose upstream's output-object identity. Result-limit proofs
+their order. A rich or block hook returning `Some` is treated as an output
+replacement even if its output compares equal; return `None` to preserve the
+stream's truncation provenance. Result-limit proofs
 are recorded with normal result commits; older already-finished results lacking
 a proof are not retroactively bounded. These small result-limit proof records
 are not automatically deleted. Sidecars written before selection markers cannot prove
@@ -205,8 +207,13 @@ flushes an incomplete byte
 sequence as U+FFFD and adds a `truncated` warning when bytes were dropped. The
 existing text record remains readable, and older streams without a sidecar retain
 their prior recovery behavior. The sidecar stores the recovery projection, not
-a resumable producer or a complete stream history. The separate strict adapter
-below retains its existing overflow behavior.
+a resumable producer or a complete stream history. Before the first result
+commit, explicit text over 1 MiB is prebounded to the configured window, with
+dropped counts persisted; hooks see that bounded window even before a crash.
+Auxiliary state, details, or structured data whose JSON exceeds 1 MiB yields an
+unknown outcome requiring reconciliation rather than replay. This safety cap
+is a deliberate difference from upstream's unbounded pre-hook input. The separate
+strict adapter below retains its existing overflow behavior.
 
 For model-issued calls, `KeyedToolAdapter::new(StreamedToolAdapter(tool))`
 provides a separate, opt-in `StreamedTool` contract. Register the adapter as
@@ -849,8 +856,11 @@ included in history snapshots and inherited at a proven fork cut. A hook that
 replaces output also withholds its associated metadata and records a redaction
 diagnostic. Aborting before this phase finishes while extensions are selected
 withholds the pending output and metadata. Resets and compaction retain finalized records. `SucceededWithDetails`
-keeps details out of model messages. Failed or skipped results produce an error diagnostic, and truncated
-output produces a warning. Durable keyed tools can call `KeyedHost::diagnostic`
+keeps details out of model messages. Failed or skipped results produce an error
+diagnostic, and truncated output produces a warning. Finalized diagnostics are
+rendered in order in model-visible `<harness>` text as well as retained in metadata;
+older transcript messages are not rewritten. A nested child's diagnostics reach
+the model only if its parent forwards them into the parent result. Durable keyed tools can call `KeyedHost::diagnostic`
 while executing a top-level attempt; at most 32 diagnostics of at most 4 KiB
 each are accepted. Result metadata above 64 KiB is replaced by a truncation
 diagnostic, while the tool's model output is retained and the tool is not

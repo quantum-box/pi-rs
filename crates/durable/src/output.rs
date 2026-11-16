@@ -19,6 +19,13 @@ pub struct OutputLimits {
     pub retain: Retain,
 }
 
+/// Counts retained with an explicitly prebounded durable result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PreboundedOutput {
+    pub dropped_bytes: usize,
+    pub dropped_lines: usize,
+}
+
 /// A contiguous UTF-8 slice of the original output and its dropped counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundedOutput<'a> {
