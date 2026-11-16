@@ -11,6 +11,9 @@ mod host_auth;
 mod journal;
 mod lifecycle;
 mod model_catalog;
+mod persistent_map;
+#[doc(hidden)]
+pub mod pi_import;
 mod resource;
 mod retry;
 mod runtime;

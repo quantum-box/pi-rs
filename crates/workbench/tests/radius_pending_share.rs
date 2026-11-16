@@ -69,7 +69,7 @@ fn pending_radius_stops_auto_share_but_explicit_api_key_still_works() {
                 Err(error) => panic!("share request not received: {error}"),
             }
         };
-        // macOS may inherit the listener's nonblocking flag on accept.
+        // macOS can inherit O_NONBLOCK from the listener on accepted sockets.
         socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))

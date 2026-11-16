@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
-use super::{InputEvent, decoder::Decoder, escape_delay};
+use super::{InputEvent, decoder::Decoder};
 
 pub struct Reader {
     file: File,
@@ -99,18 +99,10 @@ impl Reader {
                 ))));
             }
         }
-        let timeout = self
-            .decoder
-            .escape_started
-            .filter(|_| {
-                self.decoder.buffer == b"\x1b"
-                    || (self.decoder.buffer.starts_with(b"\x1b]")
-                        && self.decoder.buffer.len() < 5
-                        && !self.decoder.buffer.starts_with(b"\x1b]4;"))
-            })
-            .map_or(timeout, |start| {
-                timeout.min(escape_delay().saturating_sub(start.elapsed()))
-            });
+        let timeout = match (self.decoder.escape_started, self.decoder.escape_timeout()) {
+            (Some(started), Some(delay)) => timeout.min(delay.saturating_sub(started.elapsed())),
+            _ => timeout,
+        };
         let mut descriptor = libc::pollfd {
             fd: self.file.as_raw_fd(),
             events: libc::POLLIN,
