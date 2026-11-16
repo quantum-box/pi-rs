@@ -2741,3 +2741,798 @@ fn ignored_write_validation_storage_error_discards_staged_effects() {
         Err(pi_rs_durable::task::scheduler::Error::Poisoned)
     ));
 }
+
+struct CrossSessionInput {
+    target: Uuid,
+    fail: bool,
+    staged: Option<std::sync::mpsc::Sender<()>>,
+    release: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Handler for CrossSessionInput {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        if let Err(error) = docs.submit_input_to_session_conversation(
+            self.target,
+            "cross-request".into(),
+            "cross input".into(),
+            AdmissionOptions::default(),
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: "cross-settled".into(),
+            }),
+        ) {
+            return Ok(Step::Fail(error.to_string()));
+        }
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"committed":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if let Some(staged) = &self.staged {
+                staged.send(()).unwrap();
+            }
+            if let Some(release) = &self.release {
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if self.fail {
+            return Ok(Step::Fail("deliberate failure".into()));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("cross-settled").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+fn cross_handler(target: Uuid) -> CrossSessionInput {
+    CrossSessionInput {
+        target,
+        fail: false,
+        staged: None,
+        release: None,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+fn cross_setup(path: &std::path::Path) -> (Harness, Uuid, Uuid, Uuid) {
+    let (mut h, owner) = setup(path);
+    let target = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let store = Store::open(path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+    let session = membership.create().unwrap();
+    membership.enroll(session, owner).unwrap();
+    membership.enroll(session, target).unwrap();
+    (h, owner, target, session)
+}
+
+#[tokio::test]
+async fn cross_session_commit_notification_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Waiting(_)));
+    assert!(h.conversation(owner).unwrap().submissions.is_empty());
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+    let store = Store::open(&path).unwrap();
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    h.resume_conversation(target, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), "cross-settled")
+            .unwrap()
+            .is_some()
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+}
+
+#[test]
+fn cross_session_rejects_unscoped_and_rolls_back_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, session) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+    membership.revoke(session, target).unwrap();
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    let other = membership.create().unwrap();
+    membership.enroll(other, target).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    membership.revoke(other, target).unwrap();
+    driver.shutdown().unwrap();
+    membership.enroll(session, target).unwrap();
+    let mut handler = cross_handler(target);
+    handler.fail = true;
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_revocation_reenrollment_replays_atomic_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, session) = cross_setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let calls = handler.calls.clone();
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+    membership.revoke(session, target).unwrap();
+    membership.enroll(session, target).unwrap();
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Waiting(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_target_abort_discards_prepared_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    h.request_abort(target).unwrap();
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+    let store = Store::open(&path).unwrap();
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_unsafe_conflict_does_not_replay_or_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, session) = cross_setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let calls = handler.calls.clone();
+    let mut registry = Registry::default();
+    registry.register("cross-unsafe", false, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let mut child = task(owner, "cross-unsafe");
+    child = child.registered("cross-unsafe".into(), false);
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+    membership.revoke(session, target).unwrap();
+    membership.enroll(session, target).unwrap();
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_owner_abort_discards_prepared_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    h.request_abort(owner).unwrap();
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |s| {
+        matches!(s, TaskState::Cancelled | TaskState::Failed(_))
+    });
+    let store = Store::open(&path).unwrap();
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+struct CrossSessionKill(Uuid);
+#[cfg(unix)]
+impl Handler for CrossSessionKill {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use std::io::Write;
+        cross_handler(self.0).run_with_documents(task, docs)?;
+        println!("CROSS_SESSION_STAGED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cross_session_kill_worker() {
+    let Ok(path) = std::env::var("CROSS_SESSION_DB") else {
+        return;
+    };
+    let owner = std::env::var("CROSS_SESSION_OWNER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let target = std::env::var("CROSS_SESSION_TARGET")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let h = Harness::open_paused(path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("cross", true, CrossSessionKill(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = Task::new(
+        Uuid::from_u128(9931),
+        TaskOwner::Conversation(owner),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("cross".into(), true);
+    driver.submit(&child).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cross_session_killed_step_recovers_once() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    drop(h);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cross_session_kill_worker", "--nocapture"])
+        .env("CROSS_SESSION_DB", &path)
+        .env("CROSS_SESSION_OWNER", owner.to_string())
+        .env("CROSS_SESSION_TARGET", target.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if line.contains("CROSS_SESSION_STAGED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    let reached = rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    reached.expect("worker did not stage input");
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    wait_task(&path, Uuid::from_u128(9931), |s| {
+        matches!(s, TaskState::Waiting(_))
+    });
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+}
+
+struct CrossForeignNotification(Uuid);
+impl Handler for CrossForeignNotification {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        let error = docs
+            .submit_input_to_session_conversation(
+                self.0,
+                "foreign-notify".into(),
+                "input".into(),
+                AdmissionOptions::default(),
+                Some(SubmissionNotify {
+                    task_id: Uuid::new_v4(),
+                    key: "foreign".into(),
+                }),
+            )
+            .unwrap_err();
+        Ok(Step::Fail(error.to_string()))
+    }
+}
+#[test]
+fn cross_session_rejects_foreign_notification_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let mut registry = Registry::default();
+    registry.register("foreign", true, CrossForeignNotification(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "foreign");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    driver.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn cross_session_scheduler_drives_target_and_settles_notification() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut scheduler = pi_rs_durable::runtime::Scheduler::open(&path, options()).unwrap();
+    let config = || Config {
+        model: "test".into(),
+        system_prompt: "".into(),
+        max_output_tokens: 10,
+    };
+    let owner = scheduler.create_conversation(config()).unwrap();
+    let target = scheduler.create_conversation(config()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+    let session = membership.create().unwrap();
+    membership.enroll(session, owner).unwrap();
+    membership.enroll(session, target).unwrap();
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let done = scheduler
+                .conversation(target)
+                .unwrap()
+                .submissions
+                .iter()
+                .any(|submission| matches!(submission.status, Status::Done { .. }));
+            let task_done = TaskStore::new(&store)
+                .load(child.id())
+                .unwrap()
+                .is_some_and(|task| matches!(task.task.state(), TaskState::Succeeded(_)));
+            if done && task_done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("target admission or notification did not settle");
+    assert!(
+        scheduler
+            .conversation(owner)
+            .unwrap()
+            .submissions
+            .is_empty()
+    );
+    assert_eq!(scheduler.conversation(target).unwrap().submissions.len(), 1);
+    tokio::task::spawn_blocking(move || driver.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[test]
+fn cross_session_rejects_missing_abort_evidence_on_both_conversations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    for id in [owner, target] {
+        let key = format!("runtime/conversation/{id}").into_bytes();
+        let original = store.get(&key).unwrap().unwrap();
+        let mut damaged: serde_json::Value = serde_json::from_slice(&original.value).unwrap();
+        damaged.as_object_mut().unwrap().remove("abort_requested");
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(original.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&damaged).unwrap(),
+                }],
+            )
+            .unwrap();
+        let child = task(owner, "cross");
+        driver.submit(&child).unwrap();
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Failed(_))
+        });
+        assert!(h.conversation(target).unwrap().submissions.is_empty());
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        let damaged = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(damaged.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: original.value,
+                }],
+            )
+            .unwrap();
+    }
+    driver.shutdown().unwrap();
+}
+
+fn cross_attach_target_owner(
+    store: &Store,
+    owner: Uuid,
+    target: Uuid,
+    mode: pi_rs_durable::ownership_edge::Mode,
+) -> Uuid {
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore},
+        task_store::Save,
+    };
+    let parent = task(owner, "not-registered");
+    TaskStore::new(store)
+        .save(&[Save::Create(&parent)])
+        .unwrap();
+    let prepared = EdgeStore::new(store)
+        .prepare_create(&Edge {
+            task: parent.id(),
+            task_owner: TaskOwner::Conversation(owner),
+            child: target,
+            mode,
+        })
+        .unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    parent.id()
+}
+fn cross_mark_completing_failed(store: &Store, id: Uuid) {
+    let key = format!("durable/task/{id}").into_bytes();
+    // Task keys are binary UUID suffixes; find the precise persisted key.
+    let (key, entry) = store
+        .list(b"durable/task/")
+        .unwrap()
+        .into_iter()
+        .find(|(_, entry)| {
+            serde_json::from_slice::<Task>(&entry.value).is_ok_and(|task| task.id() == id)
+        })
+        .unwrap_or_else(|| panic!("missing task {key:?}"));
+    let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+    value["state"] = json!({"CompletingFailed":"pending cascade"});
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+}
+
+#[test]
+fn cross_session_rejects_target_with_failed_foreground_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let parent = cross_attach_target_owner(
+        &store,
+        owner,
+        target,
+        pi_rs_durable::ownership_edge::Mode::Foreground,
+    );
+    cross_mark_completing_failed(&store, parent);
+    assert!(!h.conversation(target).unwrap().abort_requested);
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Failed(_) | TaskState::Cancelled)
+    });
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_target_owner_failure_race_fences_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let parent = cross_attach_target_owner(
+        &store,
+        owner,
+        target,
+        pi_rs_durable::ownership_edge::Mode::Foreground,
+    );
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    cross_mark_completing_failed(&store, parent);
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Failed(_) | TaskState::Cancelled)
+    });
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_background_target_does_not_inherit_failed_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let parent = cross_attach_target_owner(
+        &store,
+        owner,
+        target,
+        pi_rs_durable::ownership_edge::Mode::Background,
+    );
+    cross_mark_completing_failed(&store, parent);
+    let mut registry = Registry::default();
+    registry.register("cross", true, cross_handler(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Waiting(_))
+    });
+    assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_rejects_duplicate_with_different_notification_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    h.submit(target, Some("cross-request".into()), "host input".into())
+        .unwrap();
+    drop(h);
+    for _ in 0..2 {
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("cross", true, cross_handler(target));
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "cross");
+        driver.submit(&child).unwrap();
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Failed(_))
+        });
+        assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+        assert!(
+            Documents::new(&Store::open(&path).unwrap())
+                .get(&address())
+                .unwrap()
+                .is_none()
+        );
+        driver.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn cross_session_pending_fail_fast_sibling_fences_target() {
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore, Mode},
+        task_store::Save,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let store = Store::open(&path).unwrap();
+    let root = task(owner, "not-registered");
+    let branch = descendant(root.id(), "not-registered");
+    let sibling = descendant(root.id(), "not-registered");
+    TaskStore::new(&store)
+        .save(&[
+            Save::Create(&root),
+            Save::Create(&branch),
+            Save::Create(&sibling),
+        ])
+        .unwrap();
+    let edge = EdgeStore::new(&store)
+        .prepare_create(&Edge {
+            task: branch.id(),
+            task_owner: TaskOwner::Task(root.id()),
+            child: target,
+            mode: Mode::Foreground,
+        })
+        .unwrap();
+    store.commit(&edge.checks, &edge.mutations).unwrap();
+    let (key, entry) = store
+        .list(b"durable/task/")
+        .unwrap()
+        .into_iter()
+        .find(|(_, entry)| {
+            serde_json::from_slice::<Task>(&entry.value).is_ok_and(|task| task.id() == root.id())
+        })
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+    value["state"] = json!({"Waiting":{"TasksFailFast":[branch.id(),sibling.id()]}});
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    cross_mark_completing_failed(&store, sibling.id());
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Failed(_) | TaskState::Cancelled)
+    });
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_target_cleanup_marker_fences_prepared_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_handler(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("cross", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "cross");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let key = format!("runtime/owned-cleanup-attempt/{target}").into_bytes();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: b"{}".to_vec(),
+            }],
+        )
+        .unwrap();
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Failed(_))
+    });
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}

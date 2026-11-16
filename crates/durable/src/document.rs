@@ -1124,7 +1124,7 @@ pub struct Transaction {
     acquisitions: Vec<durable_store::TaskDocumentAcquisition>,
 }
 
-// Independently prepared task and signal-revision observations can race.
+// Independently prepared task, ownership, conversation and signal observations can race.
 // Compose their fences before appending batches so disagreement becomes a
 // normal commit conflict.
 fn merge_task_expected(a: &Expected, b: &Expected) -> Expected {
@@ -1164,6 +1164,10 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
     for other in &mut graph.checks {
         if !other.key.starts_with(crate::task_store::PREFIX)
             && !other.key.starts_with(b"durable/signal-revision/")
+            && !other.key.starts_with(crate::ownership_edge::PREFIX)
+            && !other.key.starts_with(b"durable/ownership-abort-fence/v1/")
+            && !other.key.starts_with(b"runtime/conversation/")
+            && !other.key.starts_with(b"runtime/owned-cleanup-attempt/")
         {
             continue;
         }
@@ -2032,6 +2036,7 @@ pub(crate) struct TaskInputIntent {
     pub conversation: uuid::Uuid,
     pub version: u64,
     pub ancestry_checks: Vec<Check>,
+    pub cross_conversation: bool,
     pub snapshot: Vec<u8>,
     pub admissions: Vec<TaskAdmission>,
 }
@@ -2387,6 +2392,34 @@ impl<'a> TaskDocuments<'a> {
     pub(crate) fn set_input_validator(&mut self, validator: Option<&'a crate::runtime::Harness>) {
         self.input_validator = validator;
     }
+    /// Stage one input for a different conversation explicitly enrolled by the
+    /// host in the same session as this task's owning conversation. This is the
+    /// only admission allowed in the step; UUIDs alone convey no authority.
+    pub fn submit_input_to_session_conversation(
+        &mut self,
+        target: uuid::Uuid,
+        request_id: String,
+        content: String,
+        options: crate::state::AdmissionOptions,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        if notify
+            .as_ref()
+            .is_some_and(|item| item.task_id != self.task.id())
+        {
+            return Err(Error::InvalidSessionAdmission(
+                "cross-conversation notification must target the submitting task".into(),
+            ));
+        }
+        self.stage_submission(
+            Some(target),
+            Some(request_id),
+            TaskSubmissionDraft::Input { content, options },
+            notify,
+            || {},
+        )
+    }
+
     /// Stage a text input in the task's owning conversation. The request ID
     /// is required; all effects remain provisional until the task step commits.
     pub fn submit_input(&mut self, request_id: String, content: String) -> Result<(), Error> {
@@ -2407,6 +2440,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
         self.stage_submission(
+            None,
             Some(request_id),
             TaskSubmissionDraft::Input { content, options },
             notify,
@@ -2422,6 +2456,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
         self.stage_submission(
+            None,
             Some(request_id),
             TaskSubmissionDraft::Continue,
             notify,
@@ -2438,6 +2473,7 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<(), Error> {
         self.stage_submission(
             None,
+            None,
             TaskSubmissionDraft::Input { content, options },
             notify,
             || {},
@@ -2449,7 +2485,7 @@ impl<'a> TaskDocuments<'a> {
         &mut self,
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
-        self.stage_submission(None, TaskSubmissionDraft::Continue, notify, || {})
+        self.stage_submission(None, None, TaskSubmissionDraft::Continue, notify, || {})
     }
 
     /// Stage a display write without a deduplication request ID.
@@ -2460,6 +2496,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
         self.stage_submission(
+            None,
             None,
             TaskSubmissionDraft::Write { kind, data },
             notify,
@@ -2476,6 +2513,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
         self.stage_submission(
+            None,
             Some(request_id),
             TaskSubmissionDraft::Write { kind, data },
             notify,
@@ -2491,6 +2529,7 @@ impl<'a> TaskDocuments<'a> {
         hook: impl FnOnce(),
     ) -> Result<(), Error> {
         self.stage_submission(
+            None,
             Some(request_id),
             TaskSubmissionDraft::Input {
                 content,
@@ -2521,6 +2560,7 @@ impl<'a> TaskDocuments<'a> {
 
     fn stage_submission(
         &mut self,
+        target: Option<uuid::Uuid>,
         request_id: Option<String>,
         draft: TaskSubmissionDraft,
         notify: Option<crate::runtime::SubmissionNotify>,
@@ -2536,6 +2576,11 @@ impl<'a> TaskDocuments<'a> {
             return Err(Error::InvalidSessionAdmission("request ID required".into()));
         }
         if let Some(intent) = &self.task_input {
+            if target.is_some() || intent.cross_conversation {
+                return Err(Error::InvalidSessionAdmission(
+                    "cross-conversation input must be the only admission in a step".into(),
+                ));
+            }
             if intent.admissions.len() >= 16 {
                 return Err(Error::InvalidSessionAdmission(
                     "at most 16 task admissions per step".into(),
@@ -2606,6 +2651,44 @@ impl<'a> TaskDocuments<'a> {
                 }
             }
         };
+        let cross_conversation = target.is_some();
+        let conversation = if let Some(target) = target {
+            if target == conversation {
+                return Err(Error::InvalidSessionAdmission(
+                    "target must differ from the owning conversation".into(),
+                ));
+            }
+            let proof = crate::session_membership::task_pair(self.store, conversation, target)
+                .map_err(|error| self.remember_task_input_error(error))?;
+            ancestry_checks.extend(proof);
+            let target_checks =
+                crate::ownership_edge::target_foreground_admission_checks(self.store, target)
+                    .map_err(|error| {
+                        let error = match error {
+                            crate::ownership_edge::Error::Store(error)
+                            | crate::ownership_edge::Error::Task(
+                                crate::task_store::Error::Store(error),
+                            ) => Error::Store(error),
+                            _ => Error::InvalidSessionAdmission(
+                                "target foreground ownership is unavailable".into(),
+                            ),
+                        };
+                        self.remember_task_input_error(error)
+                    })?;
+            for check in target_checks {
+                if let Some(existing) = ancestry_checks
+                    .iter_mut()
+                    .find(|item| item.key == check.key)
+                {
+                    existing.expected = merge_task_expected(&existing.expected, &check.expected);
+                } else {
+                    ancestry_checks.push(check);
+                }
+            }
+            target
+        } else {
+            conversation
+        };
         let key = crate::runtime::Harness::key(conversation);
         let record = self
             .store
@@ -2614,7 +2697,26 @@ impl<'a> TaskDocuments<'a> {
             .ok_or_else(|| Error::InvalidSessionAdmission("conversation missing".into()))?;
         after_snapshot();
         let validation = (|| {
+            if cross_conversation {
+                crate::session_membership::validate_conversation(conversation, &record.value)
+                    .map_err(|_| {
+                        Error::InvalidSessionAdmission(
+                            "target conversation lacks valid authorization evidence".into(),
+                        )
+                    })?;
+            }
             let state: crate::runtime::Conversation = serde_json::from_slice(&record.value)?;
+            if cross_conversation
+                && let Some(existing) = state
+                    .submissions
+                    .iter()
+                    .find(|submission| submission.request_id.as_ref() == request_id.as_ref())
+                && state.submission_notification(existing.id) != notify.as_ref()
+            {
+                return Err(Error::InvalidSessionAdmission(
+                    "duplicate request has a different settlement notification".into(),
+                ));
+            }
             if state.id != conversation || state.abort_requested {
                 return Err(Error::InvalidSessionAdmission(
                     "conversation is aborting or invalid".into(),
@@ -2650,6 +2752,7 @@ impl<'a> TaskDocuments<'a> {
             conversation,
             version: record.version,
             ancestry_checks,
+            cross_conversation,
             snapshot: record.value,
             admissions,
         });

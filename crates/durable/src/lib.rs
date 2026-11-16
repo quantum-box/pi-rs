@@ -39,6 +39,7 @@ pub mod reset;
 mod reset_manifest;
 pub mod retry_policy;
 pub mod runtime;
+pub mod session_membership;
 pub mod session_transaction;
 pub mod state;
 pub mod streamed_output;
