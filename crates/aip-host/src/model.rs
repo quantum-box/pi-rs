@@ -1039,3 +1039,298 @@ mod external_identity_tests {
         assert_eq!(*inner.enriched.lock().unwrap(), expected);
     }
 }
+
+#[cfg(test)]
+mod strict_budget_integration_tests {
+    use super::*;
+    use pi_rs_core::{
+        Agent, CancellationToken, ContextChange, ContextRequest, DetailedModelEvent,
+        DetailedModelStream, EffectiveToolDeclaration, EffectiveToolSampling, EnrichedModelEvent,
+        Extension, ExtensionResult, ExtensionState, Limits, MemoryStore, ModelEvent, Outcome,
+        PreparedToolDispatch, RecordedToolDecision, Registry, Session, SessionStore,
+        StrictToolPolicy, Tool, ToolConstraint, ToolContext, ToolDecisionSnapshot, ToolDeclaration,
+        ToolDispatchContext, ToolSpec, Usage,
+    };
+    use serde_json::{Value, json};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct StrictTool;
+    #[async_trait::async_trait]
+    impl Tool for StrictTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "strict_read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"}},"required":["path"]}),
+            }
+        }
+        fn constrained_sampling(&self) -> Option<ToolConstraint> {
+            Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            })
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            panic!("no tool call expected")
+        }
+    }
+    struct LimitedExtension(u32);
+    impl Extension for LimitedExtension {
+        fn id(&self) -> &str {
+            "budget-test-extension"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(StrictTool)]
+        }
+        fn context(
+            &self,
+            request: &mut ContextRequest<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<ContextChange> {
+            request.max_output_tokens = self.0;
+            Ok(ContextChange::Changed)
+        }
+    }
+    struct InspectBudget {
+        path: Option<PathBuf>,
+        requests: Arc<Mutex<Vec<(Uuid, ModelRequest)>>>,
+    }
+    #[async_trait::async_trait]
+    impl BudgetPort for InspectBudget {
+        async fn reserve(&self, _: &RunScope, id: Uuid, request: &ModelRequest) -> Result<()> {
+            let journal =
+                Session::snapshot(self.path.as_ref().expect("reservation after failed commit"))?;
+            assert!(matches!(
+                journal.active_tool_decision(id)?,
+                RecordedToolDecision::Current(_)
+            ));
+            assert!(journal.branch().iter().any(|record| matches!(&record.event, Event::ModelRequested { request_id: Some(request_id), tool_decision: Some(_), .. } if *request_id == id)));
+            self.requests.lock().unwrap().push((id, request.clone()));
+            Ok(())
+        }
+        async fn settle(&self, _: &RunScope, _: Uuid, _: &UsageReport) -> Result<()> {
+            Ok(())
+        }
+    }
+    struct RejectDecisionStore(MemoryStore, Arc<AtomicBool>);
+    impl SessionStore for RejectDecisionStore {
+        fn supports_record_metadata(&self) -> bool {
+            true
+        }
+        fn load(&mut self) -> Result<Vec<Record>> {
+            self.0.load()
+        }
+        fn load_record_metadata(&mut self) -> Result<BTreeMap<u64, Value>> {
+            self.0.load_record_metadata()
+        }
+        fn append(&mut self, record: &Record) -> Result<()> {
+            self.0.append(record)
+        }
+        fn append_with_metadata(
+            &mut self,
+            record: &Record,
+            metadata: Option<&Value>,
+        ) -> Result<()> {
+            if matches!(
+                record.event,
+                Event::ModelRequested {
+                    tool_decision: Some(_),
+                    ..
+                }
+            ) {
+                self.1.store(true, Ordering::SeqCst);
+                return Err(Error::Session("injected decision commit failure".into()));
+            }
+            self.0.append_with_metadata(record, metadata)
+        }
+    }
+    #[derive(Clone)]
+    struct StrictModel {
+        reservations: Arc<Mutex<Vec<(Uuid, ModelRequest)>>>,
+        sends: Arc<AtomicUsize>,
+        resolve: bool,
+    }
+    // This simulates the provider boundary; it does not exercise an actual
+    // provider adapter's wire serialization or HTTP transport.
+    struct Dispatch {
+        request: ModelRequest,
+        reservation: ModelRequest,
+        effective: Vec<EffectiveToolDeclaration>,
+        snapshot: ToolDecisionSnapshot,
+        reservations: Arc<Mutex<Vec<(Uuid, ModelRequest)>>>,
+        sends: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PreparedToolDispatch for Dispatch {
+        fn effective_tools(&self) -> &[EffectiveToolDeclaration] {
+            &self.effective
+        }
+        fn decision_snapshot(&self) -> &ToolDecisionSnapshot {
+            &self.snapshot
+        }
+        fn dispatch_request(&self) -> &ModelRequest {
+            &self.request
+        }
+        fn reservation_request(&self) -> &ModelRequest {
+            &self.reservation
+        }
+        async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream> {
+            assert_eq!(self.reservations.lock().unwrap().len(), 1);
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            let events = vec![
+                ModelEvent::Text("done".into()),
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 5,
+                        output_tokens: 2,
+                    }),
+                },
+            ];
+            Ok(Box::pin(futures_util::stream::iter(
+                events
+                    .into_iter()
+                    .map(|event| Ok(DetailedModelEvent::from(EnrichedModelEvent::Legacy(event)))),
+            )))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for StrictModel {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            Ok(self.resolve.then(|| {
+                Arc::new(Self {
+                    resolve: false,
+                    ..self.clone()
+                }) as Arc<dyn Model>
+            }))
+        }
+        async fn prepare_tool_dispatch<'a>(
+            &'a self,
+            request: &ModelRequest,
+            declarations: &[ToolDeclaration],
+            context: &ToolDispatchContext,
+        ) -> Result<Option<Box<dyn PreparedToolDispatch + 'a>>> {
+            assert!(self.reservations.lock().unwrap().is_empty());
+            let effective = vec![EffectiveToolDeclaration {
+                spec: request.tools[0].clone(),
+                sampling: EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: request.tools[0].parameters.clone(),
+                    normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+                },
+            }];
+            let snapshot =
+                ToolDecisionSnapshot::capture(context, request, declarations, &effective)
+                    .map_err(|error| Error::Config(error.to_string()))?;
+            let mut reservation = request.clone();
+            reservation.tools[0].parameters =
+                pi_rs_core::strict_tool_schema(&request.tools[0].parameters, |_, _| false)
+                    .map_err(|error| Error::Config(error.to_string()))?;
+            Ok(Some(Box::new(Dispatch {
+                request: request.clone(),
+                reservation,
+                effective,
+                snapshot,
+                reservations: self.reservations.clone(),
+                sends: self.sends.clone(),
+            })))
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("prepared dispatch required")
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_reservation_follows_durable_decision_and_uses_transformed_schema() {
+        for resolve in [false, true] {
+            for (fail_commit, extension_limit) in [(false, 37), (false, 256), (true, 37)] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("journal.jsonl");
+                let rejection_reached = Arc::new(AtomicBool::new(false));
+                let mut session = if fail_commit {
+                    Session::with_store(RejectDecisionStore(
+                        MemoryStore::default(),
+                        rejection_reached.clone(),
+                    ))
+                    .unwrap()
+                } else {
+                    Session::open(&path).unwrap()
+                };
+                let reservations = Arc::new(Mutex::new(Vec::new()));
+                let sends = Arc::new(AtomicUsize::new(0));
+                let budget = InspectBudget {
+                    path: (!fail_commit).then_some(path),
+                    requests: reservations.clone(),
+                };
+                let inner = StrictModel {
+                    reservations: reservations.clone(),
+                    sends: sends.clone(),
+                    resolve,
+                };
+                let scope = RunScope {
+                    tenant: "tenant".into(),
+                    actor: "actor".into(),
+                    workspace: "workspace".into(),
+                    journal_run_id: Uuid::new_v4(),
+                    aip_run: "child".into(),
+                    parent_run: Some("parent".into()),
+                    audit_id: "audit".into(),
+                };
+                let model = BudgetedModel {
+                    scope: &scope,
+                    inner: &inner,
+                    budget: &budget,
+                    recorded_usage: Mutex::default(),
+                };
+                let mut registry = Registry::default();
+                registry
+                    .register(Arc::new(LimitedExtension(extension_limit)))
+                    .unwrap();
+                let agent = Agent {
+                    model: &model,
+                    model_name: "fixture",
+                    registry: &registry,
+                    system_prompt: "",
+                    limits: Limits {
+                        output_tokens_per_request: 128,
+                        ..Limits::default()
+                    },
+                };
+                let (_, mut input) = tokio::sync::mpsc::channel(1);
+                let result = agent
+                    .run(
+                        &mut session,
+                        Some("hello".into()),
+                        &mut input,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await;
+                if fail_commit {
+                    assert!(result.is_err());
+                    assert!(rejection_reached.load(Ordering::SeqCst));
+                    assert!(reservations.lock().unwrap().is_empty());
+                    assert_eq!(sends.load(Ordering::SeqCst), 0);
+                } else {
+                    assert_eq!(result.unwrap(), "done");
+                    let requests = reservations.lock().unwrap();
+                    assert_eq!(requests.len(), 1);
+                    assert_eq!(sends.load(Ordering::SeqCst), 1);
+                    assert_eq!(requests[0].1.max_output_tokens, extension_limit.min(128));
+                    let original = StrictTool.spec().parameters;
+                    let expected = pi_rs_core::strict_tool_schema(&original, |_, _| false).unwrap();
+                    assert_ne!(expected, original);
+                    assert_eq!(requests[0].1.tools[0].parameters, expected);
+                    assert!(matches!(
+                        session.active_tool_decision(requests[0].0).unwrap(),
+                        RecordedToolDecision::Current(_)
+                    ));
+                }
+            }
+        }
+    }
+}
