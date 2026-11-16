@@ -18,6 +18,7 @@ mod sdk;
 mod statistics;
 mod strict_tool_schema;
 mod tokens;
+mod tool_execution_snapshot;
 mod types;
 mod ui;
 
@@ -54,5 +55,6 @@ pub use tokens::{
     fingerprint_model_context,
 };
 pub use tokio_util::sync::CancellationToken;
+pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
 pub use types::*;
 pub use ui::*;
