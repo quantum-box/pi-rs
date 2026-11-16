@@ -183,6 +183,10 @@ impl<'a> EdgeStore<'a> {
                 key: key.clone(),
                 expected: Expected::Missing,
             },
+            Check {
+                key: crate::runtime::owned_cleanup_key(edge.child),
+                expected: Expected::Missing,
+            },
         ]);
         Ok(PreparedEdge {
             checks,
@@ -211,6 +215,9 @@ enum CleanupNode {
 pub(crate) struct CleanupGraph {
     children: std::collections::HashMap<CleanupNode, Vec<CleanupNode>>,
     active: HashSet<CleanupNode>,
+    edges: std::collections::HashMap<Uuid, Vec<Edge>>,
+    invalid_tasks: HashSet<Uuid>,
+    opaque_edge: bool,
 }
 
 impl CleanupGraph {
@@ -220,6 +227,11 @@ impl CleanupGraph {
             store.list_prefixes(&[task_store::PREFIX, PREFIX, b"runtime/conversation/"])?;
         let mut tasks = HashMap::new();
         let mut edges = Vec::new();
+        let mut invalid_tasks = HashSet::new();
+        let mut malformed_edges = Vec::new();
+        let mut opaque_edge = false;
+        let mut invalid_conversations = HashSet::new();
+        let mut conversations = HashSet::new();
         let mut active = HashSet::new();
         for (key, entry) in entries {
             if key.starts_with(task_store::PREFIX) {
@@ -229,11 +241,40 @@ impl CleanupGraph {
                 }
                 tasks.insert(task.task.id(), task.task);
             } else if key.starts_with(PREFIX) {
-                edges.push(decode(&key, entry)?.edge);
+                match decode(&key, entry.clone()) {
+                    Ok(edge) => edges.push(edge.edge),
+                    Err(_) => {
+                        // Only a structurally valid child key and owner tuple can
+                        // scope a damaged edge. Otherwise no task can be ruled out.
+                        #[derive(serde::Deserialize)]
+                        struct PartialEdge {
+                            task: Uuid,
+                            task_owner: TaskOwner,
+                            child: Uuid,
+                        }
+                        match serde_json::from_slice::<PartialEdge>(&entry.value) {
+                            Ok(partial) if edge_key(partial.child) == key => malformed_edges
+                                .push((partial.task, partial.task_owner, partial.child)),
+                            _ => opaque_edge = true,
+                        }
+                    }
+                }
             } else {
-                let conversation: Conversation = serde_json::from_slice(&entry.value)?;
-                if conversation.abort_requested {
-                    active.insert(CleanupNode::Conversation(conversation.id));
+                let id = std::str::from_utf8(&key[b"runtime/conversation/".len()..])
+                    .ok()
+                    .and_then(|id| Uuid::parse_str(id).ok());
+                match serde_json::from_slice::<Conversation>(&entry.value) {
+                    Ok(conversation) if Some(conversation.id) == id => {
+                        conversations.insert(conversation.id);
+                        if conversation.abort_requested {
+                            active.insert(CleanupNode::Conversation(conversation.id));
+                        }
+                    }
+                    _ => {
+                        if let Some(id) = id {
+                            invalid_conversations.insert(id);
+                        }
+                    }
                 }
             }
         }
@@ -248,10 +289,53 @@ impl CleanupGraph {
                 .or_default()
                 .push(CleanupNode::Task(task.id()));
         }
+        for (task, claimed_owner, child) in malformed_edges {
+            // A damaged edge alone cannot prove its owner. A permanent owned
+            // subagent reservation, when present, independently binds the
+            // same task, parent and child. Legacy edges without it remain opaque.
+            let prefix = format!("durable/owned-subagent/{task}/");
+            let mut matches = 0;
+            for (_, entry) in store.list(prefix.as_bytes())? {
+                let Ok(admission) =
+                    serde_json::from_slice::<crate::owned_subagent::Admission>(&entry.value)
+                else {
+                    opaque_edge = true;
+                    continue;
+                };
+                if admission.child == child
+                    && admission.task == task
+                    && admission.task_owner == claimed_owner
+                {
+                    matches += 1;
+                }
+            }
+            if matches == 1
+                && tasks
+                    .get(&task)
+                    .is_some_and(|owner| *owner.owner() == claimed_owner)
+            {
+                invalid_tasks.insert(task);
+            } else {
+                opaque_edge = true;
+            }
+        }
+        let mut valid_edges: HashMap<Uuid, Vec<Edge>> = HashMap::new();
         for edge in edges {
-            let owner = tasks.get(&edge.task).ok_or(Error::Invalid)?;
+            let Some(owner) = tasks.get(&edge.task) else {
+                opaque_edge = true;
+                continue;
+            };
             if edge.task_owner != *owner.owner() {
-                return Err(Error::Invalid);
+                opaque_edge = true;
+                continue;
+            }
+            // A background conversation is not an abort dependency of its owner.
+            if edge.mode == Mode::Background {
+                continue;
+            }
+            if !conversations.contains(&edge.child) || invalid_conversations.contains(&edge.child) {
+                invalid_tasks.insert(edge.task);
+                continue;
             }
             if edge.mode == Mode::Foreground {
                 children
@@ -259,8 +343,38 @@ impl CleanupGraph {
                     .or_default()
                     .push(CleanupNode::Conversation(edge.child));
             }
+            valid_edges.entry(edge.task).or_default().push(edge);
         }
-        Ok(Self { children, active })
+        Ok(Self {
+            children,
+            active,
+            edges: valid_edges,
+            invalid_tasks,
+            opaque_edge,
+        })
+    }
+
+    pub(crate) fn uncertain_task(&self, task: Uuid) -> bool {
+        if self.opaque_edge {
+            return true;
+        }
+        let mut pending = vec![CleanupNode::Task(task)];
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            if matches!(node, CleanupNode::Task(id) if self.invalid_tasks.contains(&id)) {
+                return true;
+            }
+            if let Some(children) = self.children.get(&node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        false
+    }
+    pub(crate) fn task_edges(&self, task: Uuid) -> &[Edge] {
+        self.edges.get(&task).map_or(&[], Vec::as_slice)
     }
 
     fn reaches(&self, start: CleanupNode, target: CleanupNode) -> bool {

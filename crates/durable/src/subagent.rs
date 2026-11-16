@@ -112,6 +112,16 @@ fn reporter_key(parent: Uuid, request_id: &str) -> Vec<u8> {
     key.extend_from_slice(request_id.as_bytes());
     key
 }
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ANCHOR_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_anchor_commit(hook: Box<dyn FnOnce()>) {
+    BEFORE_ANCHOR_COMMIT.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
 impl Harness {
     fn reservation(&self, parent: Uuid, name: &str) -> Result<Option<Reservation>, Error> {
         self.conversation(parent)?;
@@ -413,6 +423,10 @@ impl Harness {
                     expected: Expected::Missing,
                 },
                 Check {
+                    key: crate::runtime::owned_cleanup_key(link.child),
+                    expected: Expected::Missing,
+                },
+                Check {
                     key: task_key.clone(),
                     expected: Expected::Missing,
                 },
@@ -543,6 +557,12 @@ impl Harness {
                 mode: Mode::Foreground,
             };
             let edge_key = ownership_edge::edge_key(link.child);
+            let cleanup_key = crate::runtime::owned_cleanup_key(link.child);
+            if store.get(&cleanup_key)?.is_some() {
+                return Err(Error::Invalid(
+                    "subagent cleanup is in progress or requires reconciliation".into(),
+                ));
+            }
             let task_key = task_store::key(id);
             let mut checks = ownership_edge::owner_chain_from(store, owner, link.child)
                 .map_err(|e| Error::Invalid(format!("anchor owner chain: {e}")))?;
@@ -561,6 +581,10 @@ impl Harness {
                 },
                 Check {
                     key: edge_key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: cleanup_key.clone(),
                     expected: Expected::Missing,
                 },
                 Check {
@@ -590,9 +614,20 @@ impl Harness {
                     value: serde_json::to_vec(&edge)?,
                 },
             ];
+            #[cfg(test)]
+            BEFORE_ANCHOR_COMMIT.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
             match store.commit(&checks, &mutations) {
                 Ok(()) => return Ok(id),
                 Err(durable_store::Error::Conflict { .. }) => {
+                    if store.get(&cleanup_key)?.is_some() {
+                        return Err(Error::Invalid(
+                            "subagent cleanup is in progress or requires reconciliation".into(),
+                        ));
+                    }
                     if store.get(&ownership_edge::edge_key(link.child))?.is_some()
                         && store.get(&anchor_key)?.is_none()
                     {

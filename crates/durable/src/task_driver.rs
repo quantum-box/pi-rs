@@ -130,7 +130,8 @@ impl Driver {
         )
     }
     pub fn start(scheduler: task_scheduler::Scheduler) -> Self {
-        Self::start_inner(scheduler, None)
+        let harness = scheduler.conversation_harness();
+        Self::start_inner(scheduler, harness)
     }
     pub(crate) fn start_with_harness(
         scheduler: task_scheduler::Scheduler,
@@ -171,6 +172,16 @@ impl Driver {
             notifications: Mutex::new(Some(notify_tx)),
             subscription: Mutex::new(Some(notify_rx)),
         });
+        if let Some(harness) = &shared.harness {
+            let bound = harness.lock().map_err(|_| ()).and_then(|harness| {
+                harness
+                    .bind_task_driver(Arc::downgrade(&shared))
+                    .map_err(|_| ())
+            });
+            if bound.is_err() {
+                shared.stop_for_failure("conversation driver binding failed".into());
+            }
+        }
         let task_shared = shared.clone();
         let worker = thread::spawn(move || {
             // Close the host channel even if a handler panics.
@@ -213,6 +224,40 @@ impl Driver {
             cleanup,
         }
     }
+    /// Failures of individual conversation cleanup workers, keyed by conversation.
+    pub fn conversation_cleanup_failures(&self) -> Result<HashMap<Uuid, String>, Error> {
+        Ok(self
+            .shared
+            .owner
+            .conversation_controls()
+            .worker_errors()
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .clone())
+    }
+
+    /// Acknowledge externally reconciled cleanup effects and permit a retry.
+    pub fn reconcile_owned_cleanup(&self, id: Uuid) -> Result<(), Error> {
+        let harness = self
+            .shared
+            .harness
+            .as_ref()
+            .ok_or_else(|| Error::Stopped("conversation runtime is not attached".into()))?;
+        harness
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .reconcile_owned_cleanup(id)?;
+        self.shared
+            .owner
+            .conversation_controls()
+            .worker_errors()
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .remove(&id);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+
     /// Take the driver's single, capacity-one work-change subscription. The first
     /// hint is immediate, including when work was recovered before subscription.
     /// Hints coalesce and may be spurious; inspect durable state after receiving.
@@ -589,6 +634,7 @@ fn cleanup_loop(shared: Arc<Shared>) {
         let mut active: tokio::task::JoinSet<(Uuid, Result<(), crate::runtime::Error>)> =
             tokio::task::JoinSet::new();
         let mut ids = std::collections::HashSet::new();
+        let mut blocked = std::collections::HashSet::new();
         loop {
             if shared.cleanup_stop.is_cancelled() {
                 break;
@@ -597,10 +643,35 @@ fn cleanup_loop(shared: Arc<Shared>) {
                 match result {
                     Ok((id, Ok(()))) => {
                         ids.remove(&id);
+                        shared
+                            .owner
+                            .conversation_controls()
+                            .worker_errors()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id);
                     }
-                    Ok((_, Err(error))) => {
+                    Ok((
+                        id,
+                        Err(
+                            error @ (crate::runtime::Error::Storage(_)
+                            | crate::runtime::Error::Failed),
+                        ),
+                    )) => {
+                        ids.remove(&id);
                         fail_cleanup(&shared, error.to_string());
                         return;
+                    }
+                    Ok((id, Err(error))) => {
+                        ids.remove(&id);
+                        blocked.insert(id);
+                        shared
+                            .owner
+                            .conversation_controls()
+                            .worker_errors()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(id, error.to_string());
                     }
                     Err(error) => {
                         fail_cleanup(&shared, error.to_string());
@@ -627,26 +698,52 @@ fn cleanup_loop(shared: Arc<Shared>) {
                     if !key.starts_with(b"runtime/conversation/") {
                         continue;
                     }
-                    let child: crate::runtime::Conversation =
-                        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+                    let Ok(child) =
+                        serde_json::from_slice::<crate::runtime::Conversation>(&entry.value)
+                    else {
+                        continue;
+                    };
                     if !child.abort_requested {
                         continue;
                     }
                     if *key != format!("runtime/conversation/{}", child.id).into_bytes() {
-                        return Err("conversation key mismatch".into());
+                        continue;
                     }
                     let edge_key = crate::ownership_edge::edge_key(child.id);
                     let Some(edge_entry) = entries.get(&edge_key) else {
                         continue;
                     };
-                    let edge = crate::ownership_edge::decode(&edge_key, edge_entry.clone())
-                        .map_err(|e| e.to_string())?;
+                    let report = |reason: String| {
+                        shared
+                            .owner
+                            .conversation_controls()
+                            .worker_errors()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(child.id, reason);
+                    };
+                    let edge = match crate::ownership_edge::decode(&edge_key, edge_entry.clone()) {
+                        Ok(edge) => edge,
+                        Err(error) => {
+                            report(format!("invalid ownership edge: {error}"));
+                            continue;
+                        }
+                    };
                     let task_key = crate::task_store::key(edge.edge.task);
-                    let task_entry = entries.get(&task_key).ok_or("ownership task missing")?;
-                    let task = crate::task_store::decode(&task_key, task_entry.clone())
-                        .map_err(|e| e.to_string())?;
+                    let Some(task_entry) = entries.get(&task_key) else {
+                        report("ownership task missing".into());
+                        continue;
+                    };
+                    let task = match crate::task_store::decode(&task_key, task_entry.clone()) {
+                        Ok(task) => task,
+                        Err(error) => {
+                            report(format!("invalid ownership task: {error}"));
+                            continue;
+                        }
+                    };
                     if edge.edge.task_owner != *task.task.owner() {
-                        return Err("ownership edge owner mismatch".into());
+                        report("ownership edge owner mismatch".into());
+                        continue;
                     }
                     // A child can be aborted independently of its live owner,
                     // and explicit abort can cross background boundaries.
@@ -657,8 +754,24 @@ fn cleanup_loop(shared: Arc<Shared>) {
             match discovered {
                 Ok(found) => {
                     for id in found {
+                        if blocked.contains(&id) {
+                            match shared
+                                .owner
+                                .store()
+                                .get(&crate::runtime::owned_cleanup_key(id))
+                            {
+                                Ok(Some(_)) => continue,
+                                Ok(None) => {
+                                    blocked.remove(&id);
+                                }
+                                Err(error) => {
+                                    fail_cleanup(&shared, error.to_string());
+                                    return;
+                                }
+                            }
+                        }
                         if ids.insert(id) {
-                            let mut worker = shared
+                            let worker = shared
                                 .harness
                                 .as_ref()
                                 .unwrap()
@@ -667,7 +780,7 @@ fn cleanup_loop(shared: Arc<Shared>) {
                                 .worker();
                             let stop = shared.cleanup_stop.clone();
                             active.spawn(async move {
-                                (id, worker.drive_owned_cleanup(id, &stop).await)
+                                (id, worker.drive_owned_cleanup_fenced(id, &stop).await)
                             });
                         }
                     }

@@ -103,6 +103,42 @@ pub enum Error {
     Invalid(String),
 }
 
+pub(crate) fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
+    format!("runtime/owned-cleanup-attempt/{id}").into_bytes()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CleanupAttempt {
+    attempt: Uuid,
+    ownerless_ephemeral: bool,
+}
+
+pub(crate) fn cleanup_attempt_id(value: &[u8]) -> Option<Uuid> {
+    serde_json::from_slice::<Uuid>(value).ok().or_else(|| {
+        serde_json::from_slice::<CleanupAttempt>(value)
+            .ok()
+            .map(|marker| marker.attempt)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn cleanup_marker_hooks()
+-> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn driver_cleanup_hooks()
+-> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
 // Bound synchronous retries so unrelated sustained writes cannot block a caller forever.
 const FORK_DOCUMENT_ATTEMPTS: usize = 8;
 
@@ -1866,6 +1902,15 @@ impl Conversation {
                 matches!(s.status, Status::Running)
                     || (s.status == Status::Queued && !matches!(self.phase, Phase::FailedIdle))
             })
+    }
+    // A reset retained by an aborted, parked conversation is future work,
+    // like a kept input; it must not hold its failed owner open indefinitely.
+    pub(crate) fn is_failure_cleanup_busy(&self) -> bool {
+        if matches!(self.phase, Phase::FailedIdle) {
+            self.active.is_some() || self.submissions.iter().any(|s| s.status == Status::Running)
+        } else {
+            self.is_idle_wait_busy()
+        }
     }
     pub(crate) fn has_abortable_queued_inputs(&self) -> bool {
         self.submissions
@@ -4481,6 +4526,14 @@ impl Harness {
         worker.merged_source = None;
         worker
     }
+    pub(crate) fn bind_task_driver(
+        &self,
+        driver: std::sync::Weak<crate::task_driver::Shared>,
+    ) -> Result<(), Error> {
+        *self.task_driver.lock().map_err(|_| Error::Failed)? = Some(driver);
+        Ok(())
+    }
+
     pub(crate) async fn drive_owned_cleanup(
         &mut self,
         id: Uuid,
@@ -4522,6 +4575,35 @@ impl Harness {
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
+    // Driver-owned cleanup must use the same durable attempt protocol as
+    // manual standalone cleanup; a stopped future can have external effects.
+    pub(crate) async fn drive_owned_cleanup_fenced(
+        &self,
+        id: Uuid,
+        stop: &CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            let control = self.owner.conversation_controls().get(id);
+            let lock = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(()),
+                lock = control.worker.clone().lock_owned() => lock,
+            };
+            #[cfg(test)]
+            if let Some(entered) = driver_cleanup_hooks().lock().unwrap().remove(&id) {
+                entered.add_permits(1);
+            }
+            let changed = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(()),
+                result = self.settle_owned_abort(id, &control.cleanup_cancel, lock) => result?,
+            };
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)
@@ -13261,6 +13343,44 @@ impl Harness {
         id: Uuid,
         mut after_stream_read: impl FnMut(),
     ) -> Result<(), Error> {
+        // Ownerless retries historically replay after interruption. Retire only
+        // an ownerless ephemeral marker, under the same lock and ownership CAS,
+        // before summary recovery is discovered on reopen.
+        let control = self.owner.conversation_controls().get(id);
+        if let Ok(_abort) = control.abort_execution.try_lock() {
+            let store = self.owner.store();
+            let key = owned_cleanup_key(id);
+            if let Some(marker) = store.get(&key)?
+                && serde_json::from_slice::<CleanupAttempt>(&marker.value)
+                    .is_ok_and(|value| value.ownerless_ephemeral)
+            {
+                let edge = crate::ownership_edge::edge_key(id);
+                if store.get(&edge)?.is_none()
+                    && let Some(root) = store.get(&Self::key(id))?
+                {
+                    match store.commit(
+                        &[
+                            Check {
+                                key: key.clone(),
+                                expected: Expected::Version(marker.version),
+                            },
+                            Check {
+                                key: edge,
+                                expected: Expected::Missing,
+                            },
+                            Check {
+                                key: Self::key(id),
+                                expected: Expected::Version(root.version),
+                            },
+                        ],
+                        &[Mutation::Delete { key }],
+                    ) {
+                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => (),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
         loop {
             let (mut c, version) = self.load(id)?;
             let mut stream_checks = Vec::new();
@@ -13653,6 +13773,111 @@ impl Harness {
         }
         Ok(())
     }
+    /// Acknowledge that the host has reconciled any external effects of an
+    /// interrupted owned cleanup. This permits a fresh cleanup attempt.
+    /// The caller must establish the external outcome before calling.
+    pub fn reconcile_owned_cleanup(&mut self, id: Uuid) -> Result<(), Error> {
+        let owner = self.owner.clone();
+        let control = owner.conversation_controls().get(id);
+        let _worker = control
+            .worker
+            .try_lock()
+            .map_err(|_| Error::Invalid("cleanup is still running".into()))?;
+        let _abort = control
+            .abort_execution
+            .try_lock()
+            .map_err(|_| Error::Invalid("cleanup is still running".into()))?;
+        let store = self.subagent_store()?;
+        let key = owned_cleanup_key(id);
+        let marker = store
+            .get(&key)?
+            .ok_or_else(|| Error::Invalid("no uncertain cleanup to reconcile".into()))?;
+        cleanup_attempt_id(&marker.value)
+            .ok_or_else(|| Error::Invalid("invalid cleanup marker".into()))?;
+        let root = Self::key(id);
+        let current = store.get(&root)?.ok_or(Error::NotFound)?;
+        store.commit(
+            &[
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Version(marker.version),
+                },
+                Check {
+                    key: root,
+                    expected: Expected::Version(current.version),
+                },
+            ],
+            &[Mutation::Delete { key }],
+        )?;
+        Ok(())
+    }
+
+    // Discover marked owned conversations independently of task state: a child
+    // may be aborted while its owner is successfully completing, or after an
+    // anchor has terminated. Standalone root conversations have no task edge.
+    pub(crate) fn owned_abort_candidates(&self) -> Result<Vec<Uuid>, Error> {
+        let tasks = crate::task_store::TaskStore::new(self.owner.store())
+            .list()
+            .map_err(|error| Error::Invalid(format!("task lookup: {error}")))?;
+        let anchors: HashMap<_, _> = tasks
+            .iter()
+            .map(|task| (task.task.id(), &task.task))
+            .collect();
+        let mut candidates = std::collections::BTreeSet::new();
+        for (key, entry) in self.owner.store().list(crate::ownership_edge::PREFIX)? {
+            let Ok(edge) = crate::ownership_edge::decode(&key, entry) else {
+                continue;
+            };
+            let Some(anchor) = anchors.get(&edge.edge.task) else {
+                continue;
+            };
+            if edge.edge.task_owner != *anchor.owner() {
+                continue;
+            }
+            let key = format!("runtime/conversation/{}", edge.edge.child);
+            let Some(entry) = self.owner.store().get(key.as_bytes())? else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+                continue;
+            };
+            let marked = match value.get("abort_requested") {
+                None => false,
+                Some(value) => match value.as_bool() {
+                    Some(value) => value,
+                    None => continue,
+                },
+            };
+            if marked {
+                candidates.insert(edge.edge.child);
+            }
+        }
+        Ok(candidates.into_iter().collect())
+    }
+
+    // Run one marked conversation only; a separate worker isolates callbacks
+    // and locks from other independently owned graphs.
+    pub(crate) async fn settle_owned_abort(
+        &self,
+        id: Uuid,
+        cancel: &CancellationToken,
+        _worker: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<bool, Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted);
+        }
+        let control = self.owner.conversation_controls().get(id);
+        let mut worker = self.worker();
+        worker.execution_gate = Some(control.gate.clone());
+        let (conversation, version) = worker.load(id)?;
+        if !conversation.abort_requested {
+            return Ok(false);
+        }
+        worker
+            .settle_abort_protocol(conversation, version, cancel, true)
+            .await
+    }
+
     fn task_tool_result(
         &self,
         conversation: Uuid,
@@ -13714,10 +13939,133 @@ impl Harness {
     }
     async fn settle_abort(
         &mut self,
+        c: Conversation,
+        version: u64,
+        cancel: &CancellationToken,
+        cleanup_attempt: Option<Uuid>,
+    ) -> Result<bool, Error> {
+        if cleanup_attempt.is_some() {
+            return Err(Error::Invalid("unexpected cleanup attempt".into()));
+        }
+        self.settle_abort_protocol(c, version, cancel, false).await
+    }
+
+    async fn settle_abort_protocol(
+        &mut self,
+        c: Conversation,
+        version: u64,
+        cancel: &CancellationToken,
+        force_durable: bool,
+    ) -> Result<bool, Error> {
+        let control = self.owner.conversation_controls().get(c.id);
+        let _abort = tokio::select! { biased; _ = cancel.cancelled() => return Err(Error::Interrupted), guard = control.abort_execution.lock() => guard };
+        #[cfg(test)]
+        if let Some(entered) = cleanup_marker_hooks().lock().unwrap().remove(&c.id) {
+            entered.add_permits(1);
+        }
+        let summary_guard = tokio::select! { biased; _ = cancel.cancelled() => return Err(Error::Interrupted), guard = control.summary_execution.write() => guard };
+        let owner = self.owner.clone();
+        let store = owner.store();
+        let edge_key = crate::ownership_edge::edge_key(c.id);
+        let edge = store.get(&edge_key)?;
+        if let Some(entry) = &edge {
+            crate::ownership_edge::decode(&edge_key, entry.clone())
+                .map_err(|e| Error::Invalid(format!("ownership edge: {e}")))?;
+        }
+        let edge_expected = edge
+            .as_ref()
+            .map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+        let key = owned_cleanup_key(c.id);
+        if let Some(marker) = store.get(&key)? {
+            let ephemeral = serde_json::from_slice::<CleanupAttempt>(&marker.value)
+                .is_ok_and(|value| value.ownerless_ephemeral);
+            if force_durable || edge.is_some() || !ephemeral {
+                return Err(Error::Invalid(
+                    "cleanup outcome uncertain; reconcile before retry".into(),
+                ));
+            }
+            store.commit(
+                &[
+                    Check {
+                        key: key.clone(),
+                        expected: Expected::Version(marker.version),
+                    },
+                    Check {
+                        key: edge_key.clone(),
+                        expected: edge_expected.clone(),
+                    },
+                    Check {
+                        key: Self::key(c.id),
+                        expected: Expected::Version(version),
+                    },
+                ],
+                &[Mutation::Delete { key: key.clone() }],
+            )?;
+        }
+        let attempt = Uuid::new_v4();
+        let marker = CleanupAttempt {
+            attempt,
+            ownerless_ephemeral: !force_durable && edge.is_none(),
+        };
+        match store.commit(
+            &[
+                Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                },
+                Check {
+                    key: edge_key,
+                    expected: edge_expected,
+                },
+                Check {
+                    key: Self::key(c.id),
+                    expected: Expected::Version(version),
+                },
+            ],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&marker)?,
+            }],
+        ) {
+            Ok(()) => (),
+            Err(durable_store::Error::Conflict { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        drop(summary_guard);
+        let result = self
+            .settle_abort_inner(c, version, cancel, Some(attempt))
+            .await;
+        if result.is_ok() {
+            let marker = store
+                .get(&key)?
+                .ok_or_else(|| Error::Invalid("cleanup marker missing".into()))?;
+            if cleanup_attempt_id(&marker.value) != Some(attempt) {
+                return Err(Error::Invalid("cleanup marker changed".into()));
+            }
+            store.commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(marker.version),
+                }],
+                &[Mutation::Delete { key }],
+            )?;
+        }
+        result
+    }
+
+    async fn settle_abort_inner(
+        &mut self,
         mut c: Conversation,
         version: u64,
         cancel: &CancellationToken,
+        cleanup_attempt: Option<Uuid>,
     ) -> Result<bool, Error> {
+        let marker = self.owner.store().get(&owned_cleanup_key(c.id))?;
+        match (marker, cleanup_attempt) {
+            (Some(marker), Some(attempt)) if cleanup_attempt_id(&marker.value) == Some(attempt) => {
+            }
+            _ => return Err(Error::Invalid("cleanup marker missing or changed".into())),
+        }
         // Keep the conversation marked until all owned cleanup has finished.
         let summaries = crate::summary_store::SummaryStore::new(self.owner.store())
             .list()
@@ -13752,13 +14100,14 @@ impl Harness {
                     "summary provider identity does not match abort cleanup".into(),
                 ));
             }
-            crate::summary_worker::run(
+            crate::summary_worker::run_for_cleanup(
                 self.owner.clone(),
                 self.options.model.clone(),
                 summary.operation.id(),
                 cancel.clone(),
                 provider,
                 None,
+                cleanup_attempt,
             )
             .await
             .map_err(|e| match e {
@@ -14387,7 +14736,7 @@ impl Harness {
             }
             self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
-                if self.settle_abort(c, version, cancel).await? {
+                if self.settle_abort(c, version, cancel, None).await? {
                     continue;
                 }
                 return Ok(());
@@ -18865,7 +19214,17 @@ impl Scheduler {
             scheduler.schedule(id);
         }
         for (id, conversation) in summaries {
-            scheduler.spawn_summary(id, conversation);
+            if scheduler
+                .harness
+                .owner
+                .store()
+                .get(&owned_cleanup_key(conversation))?
+                .is_some()
+            {
+                scheduler.summary_blocked.push(id);
+            } else {
+                scheduler.spawn_summary(id, conversation);
+            }
         }
         scheduler.start_reporter();
         Ok((scheduler, driver))
@@ -20055,6 +20414,17 @@ impl Scheduler {
         if snap.operation.provider() != Some(provider) {
             return Err(Error::Invalid(
                 "summary provider identity is missing or does not match".into(),
+            ));
+        }
+        if self
+            .harness
+            .owner
+            .store()
+            .get(&owned_cleanup_key(snap.operation.session_id()))?
+            .is_some()
+        {
+            return Err(Error::Invalid(
+                "standalone cleanup outcome uncertain; reconcile before retry".into(),
             ));
         }
         self.spawn_summary(id, snap.operation.session_id());
@@ -25867,6 +26237,46 @@ mod scheduler_tests {
         drop(guard);
     }
     #[tokio::test]
+    async fn ownerless_abort_retries_ephemeral_marker_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        h.request_abort(id).unwrap();
+        let key = owned_cleanup_key(id);
+        h.owner
+            .store()
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                }],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&CleanupAttempt {
+                        attempt: Uuid::new_v4(),
+                        ownerless_ephemeral: true,
+                    })
+                    .unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options(placement_model())).unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!h.conversation(id).unwrap().abort_requested);
+        assert!(h.owner.store().get(&key).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn cleanup_failure_is_visible_to_other_drivers() {
         let dir = tempfile::tempdir().unwrap();
         let mut harness =
@@ -27128,7 +27538,7 @@ mod scheduler_tests {
             h.request_abort(id).unwrap();
             let (c, version) = h.load(id).unwrap();
             assert!(
-                h.settle_abort(c, version, &CancellationToken::new())
+                h.settle_abort(c, version, &CancellationToken::new(), None)
                     .await
                     .unwrap()
             );

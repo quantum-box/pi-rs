@@ -4297,11 +4297,8 @@ mod tests {
         let driver = h.start_tasks(Default::default()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
-            if let Err(error) = driver.get(task) {
-                assert!(
-                    error.to_string().contains("ownership edge owner mismatch"),
-                    "{error}"
-                );
+            if let Some(error) = driver.conversation_cleanup_failures().unwrap().get(&child) {
+                assert!(error.contains("ownership edge owner mismatch"), "{error}");
                 break;
             }
             assert!(
@@ -4310,8 +4307,9 @@ mod tests {
             );
             std::thread::yield_now();
         }
+        assert!(driver.get(task).is_ok());
         assert!(h.conversation(child).unwrap().abort_requested);
-        assert!(driver.shutdown().is_err());
+        driver.shutdown().unwrap();
         drop(h);
         let reopened = Harness::open_paused(&path, options()).unwrap();
         assert!(reopened.conversation(child).unwrap().abort_requested);
@@ -4807,6 +4805,49 @@ mod tests {
             assert!(scheduler.get(id).unwrap().unwrap().is_terminal());
         }
         assert!(!scheduler.tick(0).unwrap());
+    }
+
+    #[test]
+    fn terminal_cycle_anchor_does_not_hold_its_own_aborting_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+        let task = |id, owner| {
+            Task::new(
+                id,
+                TaskOwner::Task(owner),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: serde_json::Value::Null,
+                },
+                1,
+            )
+            .unwrap()
+        };
+        let store = harness.subagent_store().unwrap();
+        let mutations: Vec<_> = [task(a, b), task(b, a), task(c, a)]
+            .iter()
+            .map(|t| Mutation::Put {
+                key: crate::task_store::key(t.id()),
+                value: serde_json::to_vec(t).unwrap(),
+            })
+            .collect();
+        store.commit(&[], &mutations).unwrap();
+        harness.request_abort_task(a).unwrap();
+        let tasks = TaskStore::new(harness.subagent_store().unwrap());
+        let terminal = tasks.load(b).unwrap().unwrap();
+        tasks.update(&terminal, |task| task.cancel()).unwrap();
+        drop(harness);
+        let harness = Harness::open_paused(&path, options()).unwrap();
+        let mut scheduler = harness.attach_tasks(Default::default()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.get(c).unwrap().unwrap().is_terminal());
+        assert!(!scheduler.get(a).unwrap().unwrap().is_terminal());
+        assert!(scheduler.tick(0).unwrap());
+        assert!(scheduler.get(a).unwrap().unwrap().is_terminal());
     }
 
     #[tokio::test]
