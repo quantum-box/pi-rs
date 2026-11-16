@@ -121,6 +121,71 @@ fn forge_limit_evidence(
 fn setup(path: &std::path::Path) -> (Harness, Uuid, u64, Vec<ResetDerivationStep>) {
     setup_with_adapter(path, false)
 }
+
+#[test]
+fn display_fork_checks_text_only_final_reset_manifest_and_fences_rewrites() {
+    for race in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id, _, _) = setup(&path);
+        h.set_after_failed_run(id, AfterFailedRun::Continue)
+            .unwrap();
+        h.submit(id, None, "replacement".into()).unwrap();
+        h.reset(id, Some("text-only final reset".into())).unwrap();
+        let (mut stopped, version) = h.load(id).unwrap();
+        stopped.phase = Phase::FailedModel {
+            turns: 0,
+            request_id: Uuid::new_v4(),
+            reason: "failure".into(),
+            decision: ModelFailureDecision::Stop,
+        };
+        h.save(&stopped, Expected::Version(version)).unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        finish_failure(&mut failure, "failure".into(), FailureCause::ModelError);
+        h.save(&failure, Expected::Version(version)).unwrap();
+        assert!(h.load(id).unwrap().0.content_blocks.is_empty());
+        let write = h
+            .submit_write(id, None, "app.after-reset".into(), None)
+            .unwrap();
+        let valid = h.fork_by_display_entry_id(id, write).unwrap();
+        assert_eq!(h.conversation(valid).unwrap().resets.len(), 3);
+        let manifests = h.owner.store().list(b"runtime/reset-manifest/").unwrap();
+        assert!(!manifests.is_empty());
+        let key = manifests[0].0.clone();
+        let owner = h.owner.clone();
+        let before = owner.store().list(b"runtime/conversation/").unwrap().len();
+        let rewrite = move || {
+            let record = owner.store().get(&key).unwrap().unwrap();
+            owner
+                .store()
+                .commit(
+                    &[Check {
+                        key: key.clone(),
+                        expected: Expected::Version(record.version),
+                    }],
+                    &[Mutation::Put {
+                        key,
+                        value: record.value,
+                    }],
+                )
+                .unwrap();
+        };
+        if race {
+            RESET_PROOF_BEFORE_SAVE.with(|hook| *hook.borrow_mut() = Some(Box::new(rewrite)));
+        } else {
+            rewrite();
+        }
+        assert!(h.fork_by_display_entry_id(id, write).is_err());
+        assert_eq!(
+            h.owner
+                .store()
+                .list(b"runtime/conversation/")
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+}
 fn setup_with_adapter(
     path: &std::path::Path,
     adapter: bool,

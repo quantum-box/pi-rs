@@ -150,6 +150,27 @@ impl<'a> Transcript<'a> {
         Ok((key, stored.version))
     }
 
+    /// Capture the versions of every source entry before a host reads a fork
+    /// seed. The host must commit these checks with its child publication.
+    pub(crate) fn fork_source_checks(&self, cursor: &Cursor) -> Result<Vec<Check>, Error> {
+        if cursor.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        let mut next = cursor.next;
+        let mut checks = Vec::new();
+        while let Some(link) = next {
+            let key = entry_key(link.id);
+            let stored = self.store.get(&key)?.ok_or(Error::Corrupt)?;
+            let entry = decode_entry(link, &stored.value)?;
+            checks.push(Check {
+                key,
+                expected: Expected::Version(stored.version),
+            });
+            next = entry.previous;
+        }
+        Ok(checks)
+    }
+
     /// Create an empty transcript, failing atomically if its ID already exists.
     pub fn prepare_create(&self) -> Result<Batch, Error> {
         let key = head_key(self.id);

@@ -195,6 +195,88 @@ fn display_entry_fork_fences_races_and_authenticates_history() {
 }
 
 #[test]
+fn display_entry_fork_fences_source_transcript_rewrite() {
+    for ancestor in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let root = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let (mut state, version) = h.load(root).unwrap();
+        state.messages.push(Message::User {
+            content: "earlier source".into(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        let (mut state, version) = h.load(root).unwrap();
+        state.messages.push(Message::User {
+            content: "original source".into(),
+        });
+        h.save(&state, Expected::Version(version)).unwrap();
+        let entry = h.submit_write(root, None, "app.note".into(), None).unwrap();
+        let source = h.load(root).unwrap().0.transcript.unwrap();
+        let transcript = crate::transcript::Transcript::new(h.owner.store(), root);
+        let position = if ancestor {
+            transcript
+                .read_with_blocks(&source, std::num::NonZeroUsize::MIN)
+                .unwrap()
+                .next
+        } else {
+            source
+        };
+        let (key, _) = transcript.entry_evidence(&position).unwrap();
+        let needle = if ancestor {
+            "earlier source"
+        } else {
+            "original source"
+        };
+        let owner = h.owner.clone();
+        let before = owner.store().list(b"runtime/conversation/").unwrap().len();
+        RESET_PROOF_BEFORE_SAVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let record = owner.store().get(&key).unwrap().unwrap();
+                let text = String::from_utf8(record.value).unwrap();
+                assert!(text.contains(needle));
+                let changed = text.replace(needle, "rewritten source").into_bytes();
+                owner
+                    .store()
+                    .commit(
+                        &[Check {
+                            key: key.clone(),
+                            expected: Expected::Version(record.version),
+                        }],
+                        &[Mutation::Put {
+                            key,
+                            value: changed,
+                        }],
+                    )
+                    .unwrap();
+            }));
+        });
+        assert!(matches!(
+            h.fork_by_display_entry_id(root, entry),
+            Err(Error::Storage(durable_store::Error::Conflict { .. }))
+        ));
+        assert_eq!(
+            h.owner
+                .store()
+                .list(b"runtime/conversation/")
+                .unwrap()
+                .len(),
+            before
+        );
+        // A fresh attempt must also reject the already-rewritten source.
+        assert!(h.fork_by_display_entry_id(root, entry).is_err());
+        drop(h);
+        let mut reopened = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        assert!(reopened.fork_by_display_entry_id(root, entry).is_err());
+    }
+}
+
+#[test]
 fn display_entry_fork_rejects_unplaced_reset_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();

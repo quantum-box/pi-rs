@@ -7749,12 +7749,102 @@ impl Harness {
                 serde_json::to_value(cut.occurrence_epoch_proven)?,
             );
         }
-        let transcript = value
+        let transcript: Option<crate::transcript::Cursor> = value
             .get("_transcript")
             .cloned()
             .map(serde_json::from_value)
             .transpose()?;
+        // Capture source versions before expanding or validating the seed, so
+        // a rewrite during either read cannot authorize a different child.
+        let source_checks = if display_len.is_some() {
+            let source = transcript
+                .as_ref()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let store = self.owner.store();
+            let transcript = crate::transcript::Transcript::new(store, source.transcript_id());
+            let mut checks = transcript.fork_source_checks(source)?;
+            let mut position = source.clone();
+            loop {
+                let (entry_key, entry_version) = transcript.entry_evidence(&position)?;
+                let page = transcript.read_with_blocks(&position, std::num::NonZeroUsize::MIN)?;
+                let record = page
+                    .records
+                    .first()
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+                let (origin, commit) = match &change {
+                    TranscriptChange::ReplaceCompacted { origin, commit, .. }
+                    | TranscriptChange::ForkCut { origin, commit, .. } => (*origin, *commit),
+                    _ => {
+                        let (_, _, metadata) = change.parts()?;
+                        let (_, commit, origin) =
+                            metadata.ok_or(crate::fork::Error::InvalidSnapshot)?;
+                        (origin, commit)
+                    }
+                };
+                let anchor = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+                let anchor_version = store
+                    .get(&anchor)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?
+                    .version;
+                let mut observation = b"durable/observer/".to_vec();
+                observation.extend_from_slice(origin.as_bytes());
+                observation.extend_from_slice(b"/r");
+                observation.extend_from_slice(&commit.to_be_bytes());
+                let event_version = store
+                    .get(&observation)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?
+                    .version;
+                let sequence = store
+                    .commit_for_version(&entry_key, entry_version)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if store.commit_for_version(&anchor, anchor_version)? != Some(sequence)
+                    || store.commit_for_version(&observation, event_version)? != Some(sequence)
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                checks.push(Check {
+                    key: entry_key,
+                    expected: Expected::Version(entry_version),
+                });
+                checks.push(Check {
+                    key: anchor,
+                    expected: Expected::Version(anchor_version),
+                });
+                checks.push(Check {
+                    key: observation,
+                    expected: Expected::Version(event_version),
+                });
+                if !page.has_more {
+                    break;
+                }
+                position = page.next;
+            }
+            checks
+        } else {
+            Vec::new()
+        };
         self.expand_event(id, &mut value)?;
+        if display_len.is_some() {
+            let source = transcript
+                .as_ref()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let occurrences = self.resolved_occurrences(source.transcript_id(), source.clone())?;
+            let messages: Vec<Message> = serde_json::from_value(
+                value
+                    .get("messages")
+                    .cloned()
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?,
+            )?;
+            if occurrences.iter().any(|(_, history)| history.is_none())
+                || occurrences
+                    .iter()
+                    .map(|(message, _)| message)
+                    .ne(messages.iter())
+            {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+        }
         let mut blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks> =
             value
                 .as_object_mut()
@@ -7910,6 +8000,7 @@ impl Harness {
                 revision,
             )?;
             batch.checks.extend_from_slice(evidence);
+            batch.checks.extend_from_slice(&source_checks);
             if let Some((_, _, _, checks)) = &reset_cut {
                 batch.checks.extend(checks.clone());
             }
@@ -8204,6 +8295,7 @@ impl Harness {
     /// sole visible change in its tracked runtime commit. Inherited and
     /// ambiguous cuts are rejected until their placement can be authenticated.
     pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let _proof_scope = ResetProofScope::enter();
         let (_, root_version) = self.load(id)?;
         let store = self.owner.store();
         if entry_id.is_nil() || store.legacy_version_boundary()? != 0 {
