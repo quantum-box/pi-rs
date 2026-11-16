@@ -1174,6 +1174,9 @@ fn task_ancestors_available(
         let (parent_id, through_conversation) = match current.owner() {
             TaskOwner::Task(id) => (*id, false),
             TaskOwner::Conversation(id) => {
+                if current.is_background() {
+                    return true;
+                }
                 if !seen_conversations.insert(*id) {
                     return false;
                 }
@@ -1201,9 +1204,7 @@ fn task_ancestors_available(
                 let Some(edge) = edge else {
                     return true;
                 };
-                if current.is_background()
-                    || edge.edge.mode == crate::ownership_edge::Mode::Background
-                {
+                if edge.edge.mode == crate::ownership_edge::Mode::Background {
                     return true;
                 }
                 let Some(parent) = tasks.iter().find(|entry| entry.task.id() == edge.edge.task)
@@ -2321,6 +2322,9 @@ impl Scheduler {
                     current = parent.task;
                 }
                 TaskOwner::Conversation(id) => {
+                    if background {
+                        return Ok(true);
+                    }
                     if !seen_conversations.insert(*id) {
                         return Ok(false);
                     }
@@ -2346,9 +2350,6 @@ impl Scheduler {
                         }
                         None if edge.is_some() => return Err(Error::Ownership),
                         None => (),
-                    }
-                    if background {
-                        return Ok(true);
                     }
                     match edge {
                         None => return Ok(true),
@@ -14074,6 +14075,283 @@ mod foreground_ancestor_regressions {
                 &TaskState::Succeeded(json!(null))
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0, "{disposition}");
+        }
+    }
+    #[test]
+    fn background_tasks_and_descendants_ignore_ordinary_conversation_abort_after_reopen() {
+        for with_descendants in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(&path, options()).unwrap();
+            let conversation = harness.create_conversation(config()).unwrap();
+            let db = durable_store::Store::open(&path).unwrap();
+            let tasks = TaskStore::new(&db);
+            let kind = if with_descendants { "parent" } else { "child" };
+            let mut background = registered(11, TaskOwner::Conversation(conversation), kind)
+                .background()
+                .unwrap();
+            if with_descendants {
+                background.start().unwrap();
+                background.wait(WaitFor::Signal("hold".into())).unwrap();
+            }
+            let first = registered(12, TaskOwner::Task(background.id()), "child");
+            let second = registered(13, TaskOwner::Task(background.id()), "child");
+            tasks.save(&[Save::Create(&background)]).unwrap();
+            if with_descendants {
+                tasks
+                    .save(&[Save::Create(&first), Save::Create(&second)])
+                    .unwrap();
+            }
+            harness.request_abort(conversation).unwrap();
+            assert!(harness.conversation(conversation).unwrap().abort_requested);
+            assert!(
+                !tasks
+                    .load(background.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested()
+            );
+            drop(harness);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut scheduler = Scheduler::open(&path, registry(calls.clone(), true)).unwrap();
+            assert!(scheduler.wake_snapshot(0).unwrap().active);
+            let invocation = scheduler
+                .reserve_independent_root()
+                .unwrap()
+                .expect("background work is runnable");
+            scheduler
+                .settle_invocation(invocation.execute().unwrap())
+                .unwrap();
+            if with_descendants {
+                assert!(scheduler.tick(0).unwrap());
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if with_descendants { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_tool_cascade_process_fixture() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("PI_HELD_TOOL_CASCADE_DB") else {
+            return;
+        };
+        let marked = std::env::var_os("PI_HELD_TOOL_CASCADE_MARKED").is_some();
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let root = harness.create_conversation(config()).unwrap();
+        let foreground = harness.create_conversation(config()).unwrap();
+        let background = harness.create_conversation(config()).unwrap();
+        let db = durable_store::Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        let parent = registered(1, TaskOwner::Conversation(root), "parent").into_task_tool();
+        let child = registered(2, TaskOwner::Conversation(foreground), "child");
+        let mut nested = registered(3, TaskOwner::Task(parent.id()), "nested").into_task_tool();
+        let mut independent = registered(4, TaskOwner::Conversation(background), "background");
+        nested.start().unwrap();
+        nested.wait(WaitFor::Signal("hold".into())).unwrap();
+        independent.start().unwrap();
+        independent.wait(WaitFor::Signal("hold".into())).unwrap();
+        tasks
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&child),
+                Save::Create(&nested),
+                Save::Create(&independent),
+            ])
+            .unwrap();
+        for (conversation, mode) in [
+            (foreground, Mode::Foreground),
+            (background, Mode::Background),
+        ] {
+            let edge = Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child: conversation,
+                mode,
+            };
+            let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+        }
+        let mut registry = Registry::default();
+        registry.register("parent", true, |_: &Task| {
+            Ok(Step::Fail("held tool failure".into()))
+        });
+        registry.register_with_abort(
+            "child",
+            true,
+            |_: &Task| panic!("child ran"),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        registry.register_with_abort(
+            "nested",
+            true,
+            |_: &Task| panic!("nested ran"),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        registry.register("background", true, |_: &Task| panic!("background ran"));
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let child_snapshot = tasks.load(child.id()).unwrap().unwrap();
+        tasks.update(&child_snapshot, |task| task.start()).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(matches!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::CompletingFailed(_)
+        ));
+        if marked {
+            assert!(scheduler.tick(0).unwrap());
+            assert!(
+                scheduler
+                    .get(child.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
+            assert!(
+                scheduler
+                    .get(nested.id())
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
+            assert!(harness.conversation(foreground).unwrap().abort_requested);
+        }
+        println!("HELD_TOOL_CASCADE_READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_task_tool_failure_cascades_across_reopen_before_and_after_marks() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for marked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "task_scheduler::foreground_ancestor_regressions::held_tool_cascade_process_fixture", "--nocapture"])
+                .env("PI_HELD_TOOL_CASCADE_DB", &path)
+                .stdout(Stdio::piped()).stderr(Stdio::inherit());
+            if marked {
+                command.env("PI_HELD_TOOL_CASCADE_MARKED", "1");
+            }
+            let mut process = KillOnDrop(command.spawn().unwrap());
+            let stdout = process.0.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    if line.unwrap().contains("HELD_TOOL_CASCADE_READY") {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+            rx.recv_timeout(Duration::from_secs(20))
+                .expect("fixture did not persist the held outcome");
+            process.0.kill().unwrap();
+            process.0.wait().unwrap();
+            let mut harness = Harness::open_paused(&path, options()).unwrap();
+            let db = durable_store::Store::open(&path).unwrap();
+            let parent = Uuid::from_u128(1);
+            let child = Uuid::from_u128(2);
+            let nested = Uuid::from_u128(3);
+            let independent = Uuid::from_u128(4);
+            let edges = EdgeStore::new(&db).children(parent).unwrap();
+            let foreground = edges
+                .iter()
+                .find(|e| e.edge.mode == Mode::Foreground)
+                .unwrap()
+                .edge
+                .child;
+            let background = edges
+                .iter()
+                .find(|e| e.edge.mode == Mode::Background)
+                .unwrap()
+                .edge
+                .child;
+            let mut registry = Registry::default();
+            registry.register_with_abort(
+                "child",
+                true,
+                |_: &Task| panic!("interrupted child replayed"),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            registry.register_with_abort(
+                "nested",
+                true,
+                |_: &Task| panic!("nested replayed"),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
+            registry.register("background", true, |_: &Task| panic!("background ran"));
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            if !marked {
+                assert_eq!(
+                    scheduler.get(child).unwrap().unwrap().state(),
+                    &TaskState::Running
+                );
+                assert!(scheduler.tick(0).unwrap());
+            }
+            assert!(scheduler.get(parent).unwrap().unwrap().abort_requested());
+            assert!(scheduler.get(child).unwrap().unwrap().abort_requested());
+            assert!(scheduler.get(nested).unwrap().unwrap().abort_requested());
+            assert!(harness.conversation(foreground).unwrap().abort_requested);
+            assert!(!harness.conversation(background).unwrap().abort_requested);
+            assert!(
+                !scheduler
+                    .get(independent)
+                    .unwrap()
+                    .unwrap()
+                    .abort_requested()
+            );
+            for _ in 0..16 {
+                if scheduler.get(child).unwrap().unwrap().is_terminal()
+                    && scheduler.get(nested).unwrap().unwrap().is_terminal()
+                {
+                    break;
+                }
+                scheduler.tick(0).unwrap();
+            }
+            assert_eq!(
+                scheduler.get(child).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+            assert_eq!(
+                scheduler.get(nested).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+            harness
+                .drive_owned_cleanup(foreground, &pi_rs_core::CancellationToken::new())
+                .await
+                .unwrap();
+            for _ in 0..8 {
+                if scheduler.get(parent).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                scheduler.tick(0).unwrap();
+            }
+            assert_eq!(
+                scheduler.get(parent).unwrap().unwrap().state(),
+                &TaskState::Failed("held tool failure".into())
+            );
+            assert!(matches!(
+                scheduler.get(independent).unwrap().unwrap().state(),
+                TaskState::Waiting(_)
+            ));
         }
     }
 }
