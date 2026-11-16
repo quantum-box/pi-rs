@@ -523,8 +523,19 @@ can queue input before the next prompt without starting the model. The same
 queue accepts prompts with `streamingBehavior` during a turn, expands prompt
 templates and skills, and emits `queue_update` as inputs are saved or consumed.
 Successful RPC steering and follow-up mode changes omit `data`, matching Pi.
-Native persists mode changes asynchronously; overlapping requests can persist
-out of order, and a settings-write failure can leave the live mode changed.
+Native applies mode changes in order and persists their settings in the same
+order. Unlike Pi's asynchronously queued settings save, native reports a mode
+request's settings-write result; a write failure can leave the live mode changed.
+At most 32 accepted mode changes may be awaiting application or persistence in
+one worker. Invalid mode values and changes rejected because this capacity is
+full receive errors without waiting for earlier accepted writes, so their
+responses can precede those writes' responses. The rejected changes do not take
+effect, and a client may retry after pending writes finish. Pi's handler forwards
+the mode without native's enum validation. This bound applies
+to mode changes, not to all RPC input. Shutdown waits for accepted mode writes
+while abort and extension UI responses remain available. Pi's JSONL reader
+dispatches lines without waiting for earlier command handlers; it does not
+promise FIFO ordering for all RPC responses.
 Queued input is acknowledged after it is saved. The `get_entries` and
 `get_tree` responses use Pi entry types, string IDs, parent links, and a leaf
 ID. Session records used internally for run recovery are omitted from this
