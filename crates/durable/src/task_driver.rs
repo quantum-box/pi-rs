@@ -39,6 +39,8 @@ pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
     failure_publication: task_scheduler::FailurePublication,
     reservation_stop: Arc<std::sync::atomic::AtomicBool>,
+    registry_gate: Mutex<()>,
+    registry_replacing: std::sync::atomic::AtomicBool,
     activity: crate::worker_activity::WorkerActivity,
     wake_reader: task_scheduler::WakeReader,
     owner: Arc<OwnedStore>,
@@ -149,6 +151,8 @@ impl Driver {
         // Seed the subscription so recovery before subscription cannot be missed.
         let _ = notify_tx.try_send(());
         let shared = Arc::new(Shared {
+            registry_gate: Mutex::new(()),
+            registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
@@ -189,85 +193,7 @@ impl Driver {
                 }
             }
             let _close = CloseOnExit(task_shared.clone());
-            loop {
-                let (stopped, failed) = match task_shared.state.lock() {
-                    Ok(state) => (state.stop, state.failure.is_some()),
-                    Err(_) => break,
-                };
-                if failed {
-                    break;
-                }
-                if !task_shared
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_empty()
-                {
-                    match task_shared.retry_pending() {
-                        Ok(true) => {
-                            task_shared.notify_host();
-                            continue;
-                        }
-                        Ok(false) => {
-                            let Ok(state) = task_shared.state.lock() else {
-                                break;
-                            };
-                            let _ = task_shared
-                                .wake
-                                .wait_timeout(state, Duration::from_millis(100));
-                            continue;
-                        }
-                        Err(error) => {
-                            task_shared
-                                .reservation_stop
-                                .store(true, std::sync::atomic::Ordering::Release);
-                            if let Ok(mut state) = task_shared.state.lock() {
-                                state.failure.get_or_insert(error);
-                                state.stop = true;
-                            }
-                            task_shared.close_notifications();
-                            break;
-                        }
-                    }
-                }
-                if stopped {
-                    break;
-                }
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(i64::MAX as u128) as i64;
-                let result = task_shared.tick_and_record_failure(now);
-                match result {
-                    Ok(true) => {
-                        task_shared.notify_host();
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        task_shared
-                            .reservation_stop
-                            .store(true, std::sync::atomic::Ordering::Release);
-                        if let Ok(mut state) = task_shared.state.lock() {
-                            state.failure.get_or_insert(error);
-                            state.stop = true;
-                        }
-                        task_shared.close_notifications();
-                        break;
-                    }
-                }
-                let Ok(state) = task_shared.state.lock() else {
-                    break;
-                };
-                if state.stop {
-                    drop(state);
-                    continue;
-                }
-                let _ = task_shared
-                    .wake
-                    .wait_timeout(state, Duration::from_millis(100));
-            }
+            task_shared.run_bounded_workers();
         });
         let cleanup = shared.harness.as_ref().map(|_| {
             let shared = shared.clone();
@@ -368,6 +294,24 @@ impl Driver {
             .as_ref()
             .map(|h| h.lock().map(|h| h.worker()).map_err(|_| Error::Poisoned))
             .transpose()?;
+        let _serial = self
+            .shared
+            .registry_gate
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
+        self.shared
+            .registry_replacing
+            .store(true, std::sync::atomic::Ordering::Release);
+        struct Replacing<'a>(&'a Shared);
+        impl Drop for Replacing<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .registry_replacing
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.0.wake.notify_all();
+            }
+        }
+        let _replacing = Replacing(&self.shared);
         loop {
             let mut scheduler = self.shared.scheduler.lock().map_err(|_| Error::Poisoned)?;
             let failure = match self.shared.failure_publication.try_lock() {
@@ -743,7 +687,316 @@ fn fail_cleanup(shared: &Shared, error: String) {
     shared.close_notifications();
 }
 
+enum WorkerEvent {
+    Completed(Box<task_scheduler::CompletedInvocation>),
+    Failed(String),
+}
+
+struct WorkerPool {
+    jobs: Option<mpsc::Sender<Box<task_scheduler::DetachedInvocation>>>,
+    done: mpsc::Receiver<WorkerEvent>,
+    inbox: std::collections::VecDeque<WorkerEvent>,
+    workers: Vec<JoinHandle<()>>,
+    shared: Arc<Shared>,
+}
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.jobs.take();
+        let mut failed = false;
+        for worker in self.workers.drain(..) {
+            failed |= worker.join().is_err();
+        }
+        while let Ok(event) = self.done.try_recv() {
+            self.inbox.push_back(event);
+        }
+        while let Some(event) = self.inbox.pop_front() {
+            match event {
+                WorkerEvent::Completed(completed) => self
+                    .shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(task_scheduler::PendingSettlement::Unprepared(*completed)),
+                WorkerEvent::Failed(_) => failed = true,
+            }
+        }
+        if failed {
+            fail_cleanup(
+                &self.shared,
+                "task worker pool failed while draining".into(),
+            );
+        }
+    }
+}
+
 impl Shared {
+    fn stop_for_failure(&self, error: String) {
+        self.reservation_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            state.failure.get_or_insert(error);
+            state.stop = true;
+            self.wake.notify_all();
+        }
+        self.activity.notify();
+        self.close_notifications();
+    }
+
+    fn run_bounded_workers(self: &Arc<Self>) {
+        const WORKERS: usize = 4;
+        let (jobs_tx, jobs_rx) = mpsc::channel::<Box<task_scheduler::DetachedInvocation>>();
+        let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+        let (done_tx, done_rx) = mpsc::channel::<WorkerEvent>();
+        let mut workers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let jobs = jobs_rx.clone();
+            let done = done_tx.clone();
+            let shared = self.clone();
+            workers.push(thread::spawn(move || {
+                loop {
+                    let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        job.execute()
+                    })) {
+                        Ok(Ok(completed)) => WorkerEvent::Completed(Box::new(completed)),
+                        Ok(Err(error)) => WorkerEvent::Failed(error.to_string()),
+                        Err(payload) => {
+                            crate::extension::discard_panic_payload(payload);
+                            WorkerEvent::Failed("task handler panicked".into())
+                        }
+                    };
+                    if let Err(mpsc::SendError(event)) = done.send(event) {
+                        if let WorkerEvent::Completed(completed) = event {
+                            shared
+                                .pending
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(task_scheduler::PendingSettlement::Unprepared(*completed));
+                        }
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(done_tx);
+        let mut pool = WorkerPool {
+            jobs: Some(jobs_tx),
+            done: done_rx,
+            inbox: std::collections::VecDeque::new(),
+            workers,
+            shared: self.clone(),
+        };
+        let mut active = 0usize;
+        let mut maintenance: Option<task_scheduler::PendingMaintenance> = None;
+        loop {
+            while let Ok(event) = pool.done.try_recv() {
+                pool.inbox.push_back(event);
+            }
+            let mut progressed = false;
+            while let Some(event) = pool.inbox.pop_front() {
+                active = active.saturating_sub(1);
+                match event {
+                    WorkerEvent::Completed(completed) => {
+                        let result = match self.scheduler.lock() {
+                            Ok(mut scheduler) => scheduler.try_settle_invocation(*completed),
+                            Err(_) => {
+                                self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                    task_scheduler::PendingSettlement::Unprepared(*completed),
+                                );
+                                self.stop_for_failure("task scheduler lock poisoned".into());
+                                continue;
+                            }
+                        };
+                        if let Err(error) = self.record_settlement(result) {
+                            self.stop_for_failure(error);
+                        }
+                    }
+                    WorkerEvent::Failed(error) => self.stop_for_failure(error),
+                }
+                self.notify_work();
+                progressed = true;
+            }
+            let (stopped, failed) = match self.state.lock() {
+                Ok(state) => (state.stop, state.failure.is_some()),
+                Err(_) => {
+                    self.stop_for_failure("task driver lock poisoned".into());
+                    (true, true)
+                }
+            };
+            let has_pending = !self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if has_pending {
+                let before = self.pending.lock().unwrap_or_else(|e| e.into_inner()).len();
+                match self.retry_pending() {
+                    Ok(true) => {
+                        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).len() < before {
+                            progressed = true;
+                        }
+                        self.notify_work();
+                    }
+                    Ok(false) => (),
+                    Err(error) => {
+                        self.stop_for_failure(error);
+                    }
+                }
+            }
+            if let Some(intent) = &maintenance {
+                if let Some(harness) = &self.harness {
+                    match harness.try_lock() {
+                        Ok(harness) => {
+                            let mut worker = harness.worker();
+                            drop(harness);
+                            match intent.try_cleanup(&mut worker) {
+                                Ok(true) => {
+                                    maintenance = None;
+                                    progressed = true;
+                                    self.notify_work();
+                                }
+                                Ok(false) => (),
+                                Err(error) => {
+                                    fail_cleanup(self, error.to_string());
+                                    maintenance = None;
+                                }
+                            }
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => (),
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            fail_cleanup(self, "harness lock poisoned".into());
+                            maintenance = None;
+                        }
+                    }
+                } else {
+                    fail_cleanup(self, "missing maintenance harness".into());
+                    maintenance = None;
+                }
+            }
+            let stopped_now = stopped
+                || self
+                    .reservation_stop
+                    .load(std::sync::atomic::Ordering::Acquire);
+            let graph_pending = maintenance.is_some()
+                || !self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+            if !stopped_now
+                && (!self
+                    .registry_replacing
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    || graph_pending)
+                && active < WORKERS
+            {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64;
+                let pending = !self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+                let reservation = match self.scheduler.lock() {
+                    Ok(mut scheduler) => {
+                        if self
+                            .registry_replacing
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            && maintenance.is_none()
+                            && !pending
+                        {
+                            Err(task_scheduler::Error::Busy)
+                        } else if maintenance.is_some()
+                            || pending
+                            || scheduler.has_published_outcomes().unwrap_or(true)
+                        {
+                            scheduler.reserve_independent_root().map(|value| {
+                                value
+                                    .map(task_scheduler::TickReservation::Invocation)
+                                    .unwrap_or(task_scheduler::TickReservation::Progress(false))
+                            })
+                        } else {
+                            scheduler.try_reserve_tick(now)
+                        }
+                    }
+                    Err(_) => Err(task_scheduler::Error::Poisoned),
+                };
+                match reservation {
+                    Ok(task_scheduler::TickReservation::Invocation(job)) => {
+                        active += 1;
+                        if let Err(mpsc::SendError(job)) =
+                            pool.jobs.as_ref().expect("pool open").send(job)
+                        {
+                            active -= 1;
+                            self.stop_for_failure("task worker pool disconnected".into());
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                job.execute()
+                            })) {
+                                Ok(Ok(completed)) => {
+                                    self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                        task_scheduler::PendingSettlement::Unprepared(completed),
+                                    )
+                                }
+                                Ok(Err(_)) => (),
+                                Err(payload) => crate::extension::discard_panic_payload(payload),
+                            }
+                        }
+                        progressed = true;
+                    }
+                    Ok(task_scheduler::TickReservation::Maintenance(intent)) => {
+                        maintenance = Some(intent);
+                        progressed = true;
+                    }
+                    Ok(task_scheduler::TickReservation::Progress(value)) => progressed |= value,
+                    Err(task_scheduler::Error::Busy) => (),
+                    Err(task_scheduler::Error::Stopped)
+                        if active > 0
+                            || self
+                                .reservation_stop
+                                .load(std::sync::atomic::Ordering::Acquire) => {}
+                    Err(error) => fail_cleanup(self, error.to_string()),
+                }
+            }
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let stopping = state.stop;
+            let failed_now = state.failure.is_some() || failed;
+            drop(state);
+            let remaining = !self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if stopping
+                && active == 0
+                && (failed_now
+                    || (!remaining && maintenance.is_none())
+                    || self.cleanup_stop.is_cancelled())
+            {
+                break;
+            }
+            if !progressed {
+                match pool.done.recv_timeout(Duration::from_millis(100)) {
+                    Ok(event) => pool.inbox.push_back(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
+                    Err(mpsc::RecvTimeoutError::Disconnected) if active != 0 => {
+                        self.stop_for_failure("task worker pool disconnected".into());
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => (),
+                }
+            }
+        }
+        // Drop joins every worker and transfers any unconsumed completed
+        // outcomes even if the coordinator is unwinding.
+        drop(pool);
+    }
+
     pub(crate) fn wake_snapshot(
         &self,
         now_millis: i64,
@@ -765,6 +1018,7 @@ impl Shared {
 
     // The serial driver owns every completed invocation until settlement or
     // transfer to the pending queue. Scheduler operations remain serialized.
+    #[cfg(test)]
     fn tick_and_record_failure(&self, now: i64) -> Result<bool, String> {
         let mut scheduler = self
             .scheduler
@@ -845,12 +1099,13 @@ impl Shared {
     }
 
     fn retry_pending(&self) -> Result<bool, String> {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .expect("pending checked by coordinator");
+        let pending = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.is_empty() {
+                return Ok(false);
+            }
+            pending.remove(0)
+        };
         let result = match self.scheduler.lock() {
             Ok(mut scheduler) => scheduler.try_resume_pending(pending),
             Err(_) => {
@@ -1073,6 +1328,682 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn replacement_drains_pool_before_starting_more_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (fifth_tx, fifth_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = release.clone();
+        let old_fifth = fifth_tx.clone();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", false, move |task: &Task| {
+            if task.id() == Uuid::from_u128(5) {
+                old_fifth.send("old").unwrap();
+                return Ok(task_scheduler::Step::Succeed(json!(null)));
+            }
+            entered_tx.send(task.id()).unwrap();
+            let (lock, wake) = &*gate;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = wake.wait(ready).unwrap();
+            }
+            Ok(task_scheduler::Step::Succeed(json!(null)))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        for id in 1..=5 {
+            scheduler
+                .submit(
+                    &Task::new(
+                        Uuid::from_u128(id),
+                        TaskOwner::Conversation(Uuid::from_u128(id + 10)),
+                        Checkpoint {
+                            phase: "start".into(),
+                            data: json!({}),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered("work".into(), false),
+                )
+                .unwrap();
+        }
+        let driver = Arc::new(Driver::start(scheduler));
+        for _ in 0..4 {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let replacing = driver.clone();
+        let replacement = thread::spawn(move || {
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("work", false, move |_: &Task| {
+                fifth_tx.send("new").unwrap();
+                Ok(task_scheduler::Step::Succeed(json!(null)))
+            });
+            replacing.replace_registry(registry)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver
+            .shared
+            .registry_replacing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        replacement.join().unwrap().unwrap();
+        assert_eq!(
+            fifth_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "new"
+        );
+        Arc::try_unwrap(driver).ok().unwrap().shutdown().unwrap();
+    }
+
+    #[test]
+    fn bounded_workers_overlap_and_shutdown_joins_both() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = release.clone();
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("work", false, move |task: &Task| {
+            count.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(task.id()).unwrap();
+            let (lock, wake) = &*gate;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = wake.wait(ready).unwrap();
+            }
+            Ok(task_scheduler::Step::Succeed(json!("done")))
+        });
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        for id in [1, 2] {
+            let task = Task::new(
+                Uuid::from_u128(id),
+                TaskOwner::Conversation(Uuid::from_u128(10 + id)),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), false);
+            scheduler.submit(&task).unwrap();
+        }
+        let driver = Driver::start(scheduler);
+        let mut entered = [
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ];
+        entered.sort();
+        assert_eq!(entered, [Uuid::from_u128(1), Uuid::from_u128(2)]);
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || done_tx.send(driver.shutdown_with_pending()).unwrap());
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        let report = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        shutdown.join().unwrap();
+        assert!(report.failure().is_none());
+        assert!(report.pending().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for id in [1, 2] {
+            assert_eq!(
+                TaskStore::new(owner.store())
+                    .load(Uuid::from_u128(id))
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                &TaskState::Succeeded(json!("done"))
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_workers_progress_independent_root_during_busy_graph_cleanup() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Blocked {
+            entered: mpsc::Sender<Uuid>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl task_scheduler::Handler for Blocked {
+            fn run(&self, _: &Task) -> Result<task_scheduler::Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<task_scheduler::Step, String> {
+                let address = Address {
+                    scope: "pool-busy".into(),
+                    name: "doc".into(),
+                    key: task.id().to_string(),
+                };
+                docs.get(&address).unwrap();
+                docs.put(
+                    &address,
+                    json!({"value":"discard"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                self.entered.send(task.id()).unwrap();
+                let (lock, wake) = &*self.release;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = wake.wait(ready).unwrap();
+                }
+                Ok(task_scheduler::Step::Succeed(json!("discard")))
+            }
+        }
+        for mode in ["failfast", "tasktool"] {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = Harness::open_paused(
+                dir.path().join("db"),
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (other_tx, other_rx) = mpsc::channel();
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("parent", false, |_: &Task| {
+                Ok(task_scheduler::Step::Succeed(json!(null)))
+            });
+            registry.register_with_abort(
+                "nested",
+                false,
+                Blocked {
+                    entered: entered_tx,
+                    release: release.clone(),
+                },
+                |_: &Task| Ok(task_scheduler::Step::Succeed(json!(null))),
+            );
+            registry.register("other", false, move |_: &Task| {
+                other_tx.send(()).unwrap();
+                Ok(task_scheduler::Step::Succeed(json!("other")))
+            });
+            let replacement_registry = registry.clone();
+            let scheduler = harness.attach_tasks(registry).unwrap();
+            let owner = scheduler.owner();
+            let cp = Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            };
+            let mut parent = Task::new(
+                Uuid::from_u128(1),
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("parent".into(), false);
+            if mode == "tasktool" {
+                parent = parent.into_task_tool();
+            }
+            parent.start().unwrap();
+            if mode == "failfast" {
+                parent
+                    .wait(WaitFor::TasksFailFast(vec![
+                        Uuid::from_u128(2),
+                        Uuid::from_u128(3),
+                    ]))
+                    .unwrap();
+            } else {
+                parent.wait(WaitFor::Signal("hold".into())).unwrap();
+            }
+            let mut a = Task::new(
+                Uuid::from_u128(2),
+                TaskOwner::Task(parent.id()),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered("nested".into(), false);
+            let mut b = Task::new(
+                Uuid::from_u128(3),
+                TaskOwner::Task(parent.id()),
+                cp.clone(),
+                3,
+            )
+            .unwrap()
+            .registered(
+                if mode == "tasktool" {
+                    "nested"
+                } else {
+                    "missing"
+                }
+                .into(),
+                false,
+            );
+            if mode == "tasktool" {
+                a = a.into_task_tool();
+                b = b.into_task_tool();
+            }
+            let tasks = TaskStore::new(owner.store());
+            tasks
+                .save(&[Save::Create(&parent), Save::Create(&a), Save::Create(&b)])
+                .unwrap();
+            let driver = Arc::new(Driver::start_with_harness(scheduler, harness.worker()));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if mode == "tasktool" {
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let control = owner.conversation_controls().get(Uuid::from_u128(99));
+            let poll = control.gate.lock().unwrap();
+            if mode == "failfast" {
+                let current = tasks.load(b.id()).unwrap().unwrap();
+                tasks
+                    .update(&current, |task| {
+                        task.start()?;
+                        task.fail("failed".into())
+                    })
+                    .unwrap();
+            } else {
+                let current = tasks.load(parent.id()).unwrap().unwrap();
+                tasks
+                    .update(&current, |task| {
+                        task.wake()?;
+                        task.start()?;
+                        task.hold_success(json!("parent"))
+                    })
+                    .unwrap();
+            }
+            {
+                let (lock, wake) = &*release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while driver.shared.pending.lock().unwrap().is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no pending outcome: {mode}"
+                );
+                thread::yield_now();
+            }
+            let replacing = driver.clone();
+            let (replaced_tx, replaced_rx) = mpsc::channel();
+            let replacement = thread::spawn(move || {
+                replaced_tx
+                    .send(replacing.replace_registry(replacement_registry))
+                    .unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !driver
+                .shared
+                .registry_replacing
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                assert!(std::time::Instant::now() < deadline);
+                thread::yield_now();
+            }
+            let other = Task::new(
+                Uuid::from_u128(4),
+                TaskOwner::Conversation(Uuid::from_u128(10)),
+                cp,
+                3,
+            )
+            .unwrap()
+            .registered("other".into(), false);
+            {
+                let _gate = owner.task_gate().lock().unwrap();
+                tasks.save(&[Save::Create(&other)]).unwrap();
+            }
+            driver.shared.notify_work();
+            other_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("independent root did not execute");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(
+                    tasks.load(other.id()).unwrap().unwrap().task.state(),
+                    TaskState::Succeeded(_)
+                ) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "independent result stalled: {mode}"
+                );
+                thread::yield_now();
+            }
+            let address = Address {
+                scope: "pool-busy".into(),
+                name: "doc".into(),
+                key: a.id().to_string(),
+            };
+            assert!(
+                Documents::new(owner.store())
+                    .get(&address)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                replaced_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(poll);
+            replaced_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            replacement.join().unwrap();
+            let report = Arc::try_unwrap(driver)
+                .ok()
+                .unwrap()
+                .shutdown_with_pending()
+                .unwrap();
+            assert!(
+                report.failure().is_none(),
+                "{}",
+                report.failure().unwrap_or("")
+            );
+            assert!(report.pending().is_empty());
+            assert!(
+                Documents::new(owner.store())
+                    .get(&address)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!matches!(
+                tasks.load(a.id()).unwrap().unwrap().task.state(),
+                TaskState::Succeeded(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn bounded_workers_retain_results_after_settlement_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a_enter, a_seen) = mpsc::channel();
+        let (a_go, a_wait) = mpsc::channel();
+        let (b_enter, b_seen) = mpsc::channel();
+        let (b_go, b_wait) = mpsc::channel();
+        let a_wait = Mutex::new(a_wait);
+        let b_wait = Mutex::new(b_wait);
+        let mut registry = task_scheduler::Registry::default();
+        registry.register("a", false, move |_: &Task| {
+            a_enter.send(()).unwrap();
+            a_wait.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("a")))
+        });
+        registry.register("b", false, move |_: &Task| {
+            b_enter.send(()).unwrap();
+            b_wait.lock().unwrap().recv().unwrap();
+            Ok(task_scheduler::Step::Succeed(json!("b")))
+        });
+        let mut scheduler =
+            task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        for (id, kind) in [(1, "a"), (2, "b")] {
+            scheduler
+                .submit(
+                    &Task::new(
+                        Uuid::from_u128(id),
+                        TaskOwner::Conversation(Uuid::from_u128(id + 10)),
+                        Checkpoint {
+                            phase: "start".into(),
+                            data: json!({}),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered(kind.into(), false),
+                )
+                .unwrap();
+        }
+        scheduler.set_result_commit_hook(Arc::new(|_, _| panic!("settlement panic")));
+        let driver = Driver::start(scheduler);
+        a_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        b_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        a_go.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.shared.state.lock().unwrap().stop {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        b_go.send(()).unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_some());
+        assert_eq!(report.pending().len(), 2);
+        for id in [1, 2] {
+            assert!(report.pending().iter().any(|item| item.task_id() == Uuid::from_u128(id) && item.completed().is_some()));
+        }
+    }
+
+    #[test]
+    fn bounded_workers_drain_independent_result_after_handler_panic() {
+        use crate::document::{Address, TaskDocuments};
+        struct Staged {
+            address: Address,
+            entered: mpsc::Sender<()>,
+            go: Mutex<mpsc::Receiver<()>>,
+        }
+        impl task_scheduler::Handler for Staged {
+            fn run(&self, _: &Task) -> Result<task_scheduler::Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<task_scheduler::Step, String> {
+                docs.get(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value": "kept"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                self.entered.send(()).unwrap();
+                self.go.lock().unwrap().recv().unwrap();
+                Ok(task_scheduler::Step::Succeed(json!("kept")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (a_enter, a_seen) = mpsc::channel();
+        let (a_go, a_wait) = mpsc::channel();
+        let (b_enter, b_seen) = mpsc::channel();
+        let (b_go, b_wait) = mpsc::channel();
+        let a_wait = Mutex::new(a_wait);
+        let address = Address {
+            scope: "pool".into(),
+            name: "panic".into(),
+            key: "".into(),
+        };
+        let mut registry = task_scheduler::Registry::default();
+        registry.register(
+            "a",
+            false,
+            move |_: &Task| -> Result<task_scheduler::Step, String> {
+                a_enter.send(()).unwrap();
+                a_wait.lock().unwrap().recv().unwrap();
+                panic!("handler panic")
+            },
+        );
+        registry.register(
+            "b",
+            false,
+            Staged {
+                address: address.clone(),
+                entered: b_enter,
+                go: Mutex::new(b_wait),
+            },
+        );
+        let scheduler = task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let owner = scheduler.owner();
+        for (id, kind) in [(1, "a"), (2, "b")] {
+            scheduler
+                .submit(
+                    &Task::new(
+                        Uuid::from_u128(id),
+                        TaskOwner::Conversation(Uuid::from_u128(id + 10)),
+                        Checkpoint {
+                            phase: "start".into(),
+                            data: json!({}),
+                        },
+                        3,
+                    )
+                    .unwrap()
+                    .registered(kind.into(), false),
+                )
+                .unwrap();
+        }
+        let driver = Driver::start(scheduler);
+        a_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        b_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        a_go.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !driver.shared.state.lock().unwrap().stop {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        b_go.send(()).unwrap();
+        let report = driver.shutdown_with_pending().unwrap();
+        assert!(report.failure().is_some());
+        assert!(report.pending().is_empty());
+        assert_eq!(
+            crate::document::Documents::new(owner.store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            json!("kept")
+        );
+    }
+
+    #[test]
+    fn bounded_workers_drain_known_failure_and_retain_unknown_results() {
+        for unknown in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (a_enter_tx, a_enter_rx) = mpsc::channel();
+            let (a_go_tx, a_go_rx) = mpsc::channel();
+            let (b_enter_tx, b_enter_rx) = mpsc::channel();
+            let (b_go_tx, b_go_rx) = mpsc::channel();
+            let a_go_rx = Mutex::new(a_go_rx);
+            let b_go_rx = Mutex::new(b_go_rx);
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("a", false, move |_: &Task| {
+                a_enter_tx.send(()).unwrap();
+                a_go_rx.lock().unwrap().recv().unwrap();
+                if unknown {
+                    Ok(task_scheduler::Step::Succeed(json!("a")))
+                } else {
+                    Err("handler failed".into())
+                }
+            });
+            registry.register("b", false, move |_: &Task| {
+                b_enter_tx.send(()).unwrap();
+                b_go_rx.lock().unwrap().recv().unwrap();
+                Ok(task_scheduler::Step::Succeed(json!("b")))
+            });
+            let mut scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let owner = scheduler.owner();
+            for (id, kind) in [(1, "a"), (2, "b")] {
+                scheduler
+                    .submit(
+                        &Task::new(
+                            Uuid::from_u128(id),
+                            TaskOwner::Conversation(Uuid::from_u128(id + 10)),
+                            Checkpoint {
+                                phase: "start".into(),
+                                data: json!({}),
+                            },
+                            3,
+                        )
+                        .unwrap()
+                        .registered(kind.into(), false),
+                    )
+                    .unwrap();
+            }
+            if unknown {
+                scheduler.inject_unknown_post_commit();
+            }
+            let driver = Driver::start(scheduler);
+            a_enter_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            b_enter_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            a_go_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !driver.shared.state.lock().unwrap().stop {
+                assert!(std::time::Instant::now() < deadline);
+                thread::yield_now();
+            }
+            b_go_tx.send(()).unwrap();
+            let report = driver.shutdown_with_pending().unwrap();
+            assert!(report.failure().is_some());
+            if unknown {
+                assert_eq!(report.pending().len(), 2);
+                assert!(
+                    report
+                        .pending()
+                        .iter()
+                        .any(|item| item.task_id() == Uuid::from_u128(1))
+                );
+                assert!(
+                    report
+                        .pending()
+                        .iter()
+                        .any(|item| item.task_id() == Uuid::from_u128(2)
+                            && item.completed().is_some())
+                );
+                assert_eq!(
+                    TaskStore::new(owner.store())
+                        .load(Uuid::from_u128(2))
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Running
+                );
+            } else {
+                assert!(report.pending().is_empty());
+                assert_eq!(
+                    TaskStore::new(owner.store())
+                        .load(Uuid::from_u128(2))
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Succeeded(json!("b"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn shutdown_fences_migration_and_last_reservation_check() {
@@ -1537,15 +2468,21 @@ mod tests {
         drop(driver);
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while weak.upgrade().is_some() {
+        // A failed Weak::upgrade only means the strong count reached zero;
+        // Shared::drop can still be transferring its pending outcomes.
+        let mut outcomes = Vec::new();
+        let index = loop {
+            outcomes.extend(Driver::take_abandoned_pending());
+            if let Some(index) = outcomes
+                .iter()
+                .position(|pending| pending.task_id() == task.id())
+            {
+                break index;
+            }
             assert!(std::time::Instant::now() < deadline);
             thread::yield_now();
-        }
-        let mut outcomes = Driver::take_abandoned_pending();
-        let index = outcomes
-            .iter()
-            .position(|pending| pending.task_id() == task.id())
-            .expect("abandoned outcome retained");
+        };
+        assert!(weak.upgrade().is_none());
         let pending = outcomes.swap_remove(index);
         assert!(matches!(
             task_scheduler::Scheduler::attach(owner.clone(), registry.clone()),
@@ -1669,6 +2606,8 @@ mod tests {
                 state: Mutex::new(State::default()),
                 wake_reader: scheduler.wake_reader(),
                 activity: scheduler.worker_activity(),
+                registry_gate: Mutex::new(()),
+                registry_replacing: std::sync::atomic::AtomicBool::new(false),
                 reservation_stop: scheduler.reservation_stop_token(),
                 failure_publication: scheduler.failure_publication(),
                 scheduler: Mutex::new(scheduler),
@@ -1835,6 +2774,8 @@ mod tests {
             state: Mutex::new(State::default()),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            registry_gate: Mutex::new(()),
+            registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
@@ -2055,6 +2996,8 @@ mod tests {
             owner,
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            registry_gate: Mutex::new(()),
+            registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
@@ -2156,6 +3099,8 @@ mod tests {
             state: Mutex::new(State::default()),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            registry_gate: Mutex::new(()),
+            registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
@@ -2232,6 +3177,8 @@ mod tests {
             }),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            registry_gate: Mutex::new(()),
+            registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
@@ -2516,6 +3463,8 @@ mod tests {
             }),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            registry_gate: Mutex::new(()),
+            registry_replacing: std::sync::atomic::AtomicBool::new(false),
             reservation_stop: scheduler.reservation_stop_token(),
             failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),

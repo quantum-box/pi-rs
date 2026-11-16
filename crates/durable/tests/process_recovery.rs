@@ -539,3 +539,81 @@ fn fail_fast_kill_before_mark_recovers_without_replaying_handler() {
             .is_none()
     );
 }
+
+#[test]
+fn bounded_driver_kill_child() {
+    let Ok(path) = std::env::var("PI_BOUNDED_DRIVER_KILL_DB") else {
+        return;
+    };
+    let mut registry = Registry::default();
+    registry.register("work", false, |task: &Task| {
+        println!("BOUNDED_RESERVED_{}", task.id());
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    });
+    let scheduler = Scheduler::open(path, registry).unwrap();
+    for id in [1u128, 2] {
+        let task = Task::new(
+            Uuid::from_u128(id),
+            TaskOwner::Conversation(Uuid::from_u128(id + 10)),
+            checkpoint("first"),
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), false);
+        scheduler.submit(&task).unwrap();
+    }
+    let _driver = pi_rs_durable::task_driver::Driver::start(scheduler);
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn bounded_driver_kill_recovers_two_nonreplay_safe_attempts_without_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "bounded_driver_kill_child", "--nocapture"])
+            .env("PI_BOUNDED_DRIVER_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut found = std::collections::HashSet::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            for id in [1u128, 2] {
+                if line.contains(&format!("BOUNDED_RESERVED_{}", Uuid::from_u128(id))) {
+                    found.insert(id);
+                }
+            }
+            if found.len() == 2 {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("both workers did not overlap");
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+    let mut registry = Registry::default();
+    registry.register("work", false, |_: &Task| -> Result<Step, String> {
+        panic!("non-replay-safe handler reran")
+    });
+    let mut scheduler = Scheduler::open(&path, registry).unwrap();
+    for id in [1u128, 2] {
+        assert!(
+            matches!(scheduler.get(Uuid::from_u128(id)).unwrap().unwrap().state(), TaskState::Failed(reason) if reason.contains("outcome requires reconciliation"))
+        );
+    }
+    assert!(!scheduler.tick(0).unwrap());
+}
