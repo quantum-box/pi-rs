@@ -8452,10 +8452,7 @@ impl Harness {
                     else {
                         continue;
                     };
-                    loop {
-                        let Some(identity) = position.entry_identity() else {
-                            break;
-                        };
+                    while let Some(identity) = position.entry_identity() {
                         if !visited.insert(identity) {
                             break;
                         }
@@ -9610,7 +9607,9 @@ impl Harness {
                     .map(|(_, commit, origin)| (origin, commit)),
             };
             if let Some((origin, commit)) = origin_commit {
-                if !prior_anchors.contains_key(&(origin, commit)) {
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    prior_anchors.entry((origin, commit))
+                {
                     let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
                     let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
                     let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
@@ -9627,14 +9626,11 @@ impl Harness {
                         key: event,
                         expected: Expected::Version(version),
                     });
-                    prior_anchors.insert(
-                        (origin, commit),
-                        PriorAnchorEvidence {
-                            fork,
-                            transcript: value.get("_transcript").cloned(),
-                            shared: None,
-                        },
-                    );
+                    slot.insert(PriorAnchorEvidence {
+                        fork,
+                        transcript: value.get("_transcript").cloned(),
+                        shared: None,
+                    });
                 }
                 let anchor = prior_anchors
                     .get_mut(&(origin, commit))
