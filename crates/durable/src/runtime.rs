@@ -3218,6 +3218,110 @@ impl PreparedConversationSave {
         Ok(())
     }
 }
+/// Collect newly settled submissions from the complete candidate batch.
+/// The caller must assemble deliveries against the same task and signal
+/// candidates before committing, so a notification cannot overwrite them.
+type SettlementNotification = (SubmissionNotify, serde_json::Value, (Uuid, Uuid));
+
+pub(crate) fn submission_settlements(
+    store: &durable_store::Store,
+    mutations: &[Mutation],
+) -> Result<Vec<SettlementNotification>, Error> {
+    let mut settling = Vec::new();
+    for mutation in mutations {
+        let Mutation::Put { key, value } = mutation else {
+            continue;
+        };
+        let Some(suffix) = key.strip_prefix(b"runtime/conversation/") else {
+            continue;
+        };
+        if std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .is_none()
+        {
+            continue;
+        }
+        let candidate: Conversation = serde_json::from_slice(value)?;
+        if candidate.submission_notifications.is_empty() {
+            continue;
+        }
+        let previous: Option<Conversation> = store
+            .get(key)?
+            .map(|entry| serde_json::from_slice(&entry.value))
+            .transpose()?;
+        for submission in &candidate.submissions {
+            let Some(notify) = candidate.submission_notifications.get(&submission.id) else {
+                continue;
+            };
+            if !matches!(
+                submission.status,
+                Status::Done { .. } | Status::Unanswered { .. }
+            ) || previous.as_ref().is_some_and(|old| {
+                old.submissions.iter().any(|prior| {
+                    prior.id == submission.id
+                        && matches!(
+                            prior.status,
+                            Status::Done { .. } | Status::Unanswered { .. }
+                        )
+                })
+            }) {
+                continue;
+            }
+            let (status, answer, reason) = match &submission.status {
+                Status::Done { answer } => ("done", Some(answer), None),
+                Status::Unanswered { reason } => ("unanswered", None, Some(reason)),
+                _ => unreachable!(),
+            };
+            let mut record = serde_json::json!({
+                "id": submission.id, "conversationId": candidate.id,
+                "type": submission.kind, "status": status, "notify": notify,
+            });
+            if let Some(request_id) = &submission.request_id {
+                record["requestId"] = serde_json::json!(request_id);
+            }
+            if let Some(answer) = answer {
+                record["answer"] = serde_json::json!(answer);
+            }
+            if let Some(answer_id) = candidate.answer_ids.get(&submission.id) {
+                record["answerId"] = serde_json::json!(answer_id);
+            }
+            if let Some(reason) = reason {
+                record["reason"] = serde_json::json!(reason);
+            }
+            settling.push((notify.clone(), record, (candidate.id, submission.id)));
+        }
+        for write in &candidate.application_writes {
+            let Some(notify) = candidate.submission_notifications.get(&write.id) else {
+                continue;
+            };
+            if !(write.placed || write.withdrawn)
+                || previous.as_ref().is_some_and(|old| {
+                    old.application_writes
+                        .iter()
+                        .any(|prior| prior.id == write.id && (prior.placed || prior.withdrawn))
+                })
+            {
+                continue;
+            }
+            let mut record = serde_json::json!({
+                "id": write.id, "conversationId": candidate.id, "type": "write",
+                "status": if write.withdrawn { "unanswered" } else { "done" }, "notify": notify,
+            });
+            if let Some(request_id) = &write.request_id {
+                record["requestId"] = serde_json::json!(request_id);
+            }
+            if write.withdrawn {
+                record["reason"] = serde_json::json!("aborted");
+            } else {
+                record["entry"] = serde_json::json!(write.id);
+            }
+            settling.push((notify.clone(), record, (candidate.id, write.id)));
+        }
+    }
+    Ok(settling)
+}
+
 /// Prepare an unchanged runtime snapshot and an ordered task-entry proof.
 /// The caller composes this batch with the task's ancestry and entry checks.
 pub(crate) fn prepare_ordered_task_checkpoint(
@@ -3818,6 +3922,161 @@ impl crate::session_transaction::SessionTransaction<'_> {
         self.table_written = true;
         self.update_entry_boundary();
         Ok(id)
+    }
+}
+
+const TASK_INPUT_WAKE_PREFIX: &[u8] = b"runtime/task-input-wake/";
+fn task_input_wake_key(id: Uuid) -> Vec<u8> {
+    format!("runtime/task-input-wake/{id}").into_bytes()
+}
+
+pub(crate) fn validate_task_input(
+    store: &durable_store::Store,
+    bytes: &[u8],
+    request_id: &str,
+    content: &str,
+) -> Result<(), crate::document::Error> {
+    let state: Conversation = serde_json::from_slice(bytes)?;
+    let idle = !state.abort_requested
+        && matches!(state.phase, Phase::Idle)
+        && state.active.is_none()
+        && state.pending_resets.is_empty()
+        && state.pending_independent_summary.is_none()
+        && !state
+            .application_writes
+            .iter()
+            .any(|w| !w.placed && !w.withdrawn)
+        && !state
+            .submissions
+            .iter()
+            .any(|s| matches!(s.status, Status::Queued | Status::Running));
+    let mut tx = crate::session_transaction::SessionTransaction::new(
+        store,
+        state,
+        None,
+        true,
+        true,
+        None,
+        Arc::new(|| 0),
+    )?;
+    tx.submit_input(
+        Some(request_id.to_owned()),
+        content.to_owned(),
+        AdmissionOptions::default(),
+        None,
+    )?;
+    if tx.table_written && !idle {
+        return Err(crate::document::Error::InvalidSessionAdmission(
+            "conversation is not idle".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl Harness {
+    pub(crate) fn validate_task_input_context(
+        &self,
+        id: Uuid,
+        snapshot: &[u8],
+    ) -> Result<(), crate::document::Error> {
+        use crate::document::Error as DError;
+        let mut state: Conversation = serde_json::from_slice(snapshot)?;
+        if state.id != id {
+            return Err(DError::InvalidSessionAdmission(
+                "conversation identity mismatch".into(),
+            ));
+        }
+        self.hydrate(&mut state)
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        if !self.supports_context_blocks(&state) {
+            return Err(DError::InvalidSessionAdmission(
+                "unsupported context blocks".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_task_input(
+        &self,
+        intent: &crate::document::TaskInputIntent,
+    ) -> Result<crate::task_store::OwnedBatch, crate::document::Error> {
+        use crate::document::Error as DError;
+        // Keep all nested reset proofs obtained while hydrating and preparing
+        // this candidate until their checks are attached to its task commit.
+        let _proof_scope = ResetProofScope::enter();
+        let key = Self::key(intent.conversation);
+        let (state, version) = self
+            .load(intent.conversation)
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        if version != intent.version {
+            return Err(durable_store::Error::Conflict { key }.into());
+        }
+        // Recheck the exact persisted state and the selected adapter's capabilities.
+        let record = self
+            .owner
+            .store()
+            .get(&key)?
+            .ok_or_else(|| DError::InvalidSessionAdmission("conversation missing".into()))?;
+        if record.version != version {
+            return Err(durable_store::Error::Conflict { key }.into());
+        }
+        validate_task_input(
+            self.owner.store(),
+            &record.value,
+            &intent.request_id,
+            &intent.content,
+        )?;
+        let supports = self.supports_context_blocks(&state);
+        let mut tx = crate::session_transaction::SessionTransaction::new(
+            self.owner.store(),
+            state,
+            None,
+            true,
+            supports,
+            self.provider_adapter.clone(),
+            self.clock.clone(),
+        )?;
+        tx.submit_input(
+            Some(intent.request_id.clone()),
+            intent.content.clone(),
+            AdmissionOptions::default(),
+            None,
+        )?;
+        let (state, batch, changed, tasks, children) = tx.into_parts()?;
+        if !tasks.is_empty()
+            || !children.is_empty()
+            || !batch.checks.is_empty()
+            || !batch.mutations.is_empty()
+        {
+            return Err(DError::InvalidBatch);
+        }
+        if !changed {
+            let mut checks = vec![Check {
+                key,
+                expected: Expected::Version(version),
+            }];
+            merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
+            return Ok(crate::task_store::OwnedBatch {
+                checks,
+                mutations: vec![],
+            });
+        }
+        let prepared = self
+            .prepare_save(&state, Expected::Version(version))
+            .map_err(|e| DError::InvalidSessionAdmission(e.to_string()))?;
+        let wake_key = task_input_wake_key(intent.conversation);
+        let wake = self.owner.store().get(&wake_key)?;
+        let mut checks = prepared.checks;
+        merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
+        let mut mutations = prepared.mutations;
+        checks.push(Check {
+            key: wake_key.clone(),
+            expected: wake.map_or(Expected::Missing, |entry| Expected::Version(entry.version)),
+        });
+        mutations.push(Mutation::Put {
+            key: wake_key,
+            value: Vec::new(),
+        });
+        Ok(crate::task_store::OwnedBatch { checks, mutations })
     }
 }
 
@@ -6696,98 +6955,7 @@ impl Harness {
         // Assemble notification deliveries only after every conversation and
         // graph participant has staged its candidate writes. The original
         // checks still fence the observations used by this assembly.
-        let mut settling = Vec::new();
-        for mutation in &batch.mutations {
-            let Mutation::Put { key, value } = mutation else {
-                continue;
-            };
-            let Some(suffix) = key.strip_prefix(b"runtime/conversation/") else {
-                continue;
-            };
-            if std::str::from_utf8(suffix)
-                .ok()
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .is_none()
-            {
-                continue;
-            }
-            let candidate: Conversation = serde_json::from_slice(value)?;
-            if candidate.submission_notifications.is_empty() {
-                continue;
-            }
-            let previous: Option<Conversation> = store
-                .get(key)?
-                .map(|entry| serde_json::from_slice(&entry.value))
-                .transpose()?;
-            for submission in &candidate.submissions {
-                let Some(notify) = candidate.submission_notifications.get(&submission.id) else {
-                    continue;
-                };
-                if !matches!(
-                    submission.status,
-                    Status::Done { .. } | Status::Unanswered { .. }
-                ) || previous.as_ref().is_some_and(|old| {
-                    old.submissions.iter().any(|prior| {
-                        prior.id == submission.id
-                            && matches!(
-                                prior.status,
-                                Status::Done { .. } | Status::Unanswered { .. }
-                            )
-                    })
-                }) {
-                    continue;
-                }
-                let (status, answer, reason) = match &submission.status {
-                    Status::Done { answer } => ("done", Some(answer), None),
-                    Status::Unanswered { reason } => ("unanswered", None, Some(reason)),
-                    _ => unreachable!(),
-                };
-                let mut record = serde_json::json!({
-                    "id": submission.id, "conversationId": candidate.id,
-                    "type": submission.kind, "status": status, "notify": notify,
-                });
-                if let Some(request_id) = &submission.request_id {
-                    record["requestId"] = serde_json::json!(request_id);
-                }
-                if let Some(answer) = answer {
-                    record["answer"] = serde_json::json!(answer);
-                }
-                if let Some(answer_id) = candidate.answer_ids.get(&submission.id) {
-                    record["answerId"] = serde_json::json!(answer_id);
-                }
-                if let Some(reason) = reason {
-                    record["reason"] = serde_json::json!(reason);
-                }
-                settling.push((notify.clone(), record, (candidate.id, submission.id)));
-            }
-            for write in &candidate.application_writes {
-                let Some(notify) = candidate.submission_notifications.get(&write.id) else {
-                    continue;
-                };
-                if !(write.placed || write.withdrawn)
-                    || previous.as_ref().is_some_and(|old| {
-                        old.application_writes
-                            .iter()
-                            .any(|prior| prior.id == write.id && (prior.placed || prior.withdrawn))
-                    })
-                {
-                    continue;
-                }
-                let mut record = serde_json::json!({
-                    "id": write.id, "conversationId": candidate.id, "type": "write",
-                    "status": if write.withdrawn { "unanswered" } else { "done" }, "notify": notify,
-                });
-                if let Some(request_id) = &write.request_id {
-                    record["requestId"] = serde_json::json!(request_id);
-                }
-                if write.withdrawn {
-                    record["reason"] = serde_json::json!("aborted");
-                } else {
-                    record["entry"] = serde_json::json!(write.id);
-                }
-                settling.push((notify.clone(), record, (candidate.id, write.id)));
-            }
-        }
+        let settling = submission_settlements(store, &batch.mutations)?;
         // Retry only observations added by notification assembly. The
         // original conversation, document, graph and prefix fences never move.
         let mut attempts = 0;
@@ -10925,26 +11093,29 @@ impl Harness {
                 .map_err(|_| ())
                 .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
             match driver {
-                Ok(Some(driver)) => driver.with_session_child(&children, &tasks, id, |boundary| {
-                    if !changed {
-                        owner.store().commit_with_prefix_put_fence(
-                            &documents.checks,
+                Ok(Some(driver)) => {
+                    driver.with_session_child(&children, &tasks, id, |boundary, checks| {
+                        Self::merge_session_owner_checks(&mut documents.checks, checks);
+                        if !changed {
+                            owner.store().commit_with_prefix_put_fence(
+                                &documents.checks,
+                                &[],
+                                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                                boundary,
+                            )?;
+                            return Ok(());
+                        }
+                        self.save_composed_locked_with_fence(
+                            &state,
+                            Expected::Version(version),
+                            None,
                             &[],
-                            &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
-                            boundary,
-                        )?;
-                        return Ok(());
-                    }
-                    self.save_composed_locked_with_fence(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &[],
-                        &[],
-                        Some(&documents),
-                        Some(boundary),
-                    )
-                }),
+                            &[],
+                            Some(&documents),
+                            Some(boundary),
+                        )
+                    })
+                }
                 Ok(None) => Err(Error::Invalid("task driver is not running".into())),
                 Err(_) => Err(Error::Failed),
             }
@@ -11015,26 +11186,29 @@ impl Harness {
                 .map_err(|_| ())
                 .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
             match driver {
-                Ok(Some(driver)) => driver.with_session_child(&children, &tasks, id, |boundary| {
-                    if !changed {
-                        owner.store().commit_with_prefix_put_fence(
-                            &documents.checks,
+                Ok(Some(driver)) => {
+                    driver.with_session_child(&children, &tasks, id, |boundary, checks| {
+                        Self::merge_session_owner_checks(&mut documents.checks, checks);
+                        if !changed {
+                            owner.store().commit_with_prefix_put_fence(
+                                &documents.checks,
+                                &[],
+                                &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
+                                boundary,
+                            )?;
+                            return Ok(());
+                        }
+                        self.save_composed_locked_with_fence(
+                            &state,
+                            Expected::Version(version),
+                            None,
                             &[],
-                            &[crate::task_store::PREFIX, crate::ownership_edge::PREFIX],
-                            boundary,
-                        )?;
-                        return Ok(());
-                    }
-                    self.save_composed_locked_with_fence(
-                        &state,
-                        Expected::Version(version),
-                        None,
-                        &[],
-                        &[],
-                        Some(&documents),
-                        Some(boundary),
-                    )
-                }),
+                            &[],
+                            Some(&documents),
+                            Some(boundary),
+                        )
+                    })
+                }
                 Ok(None) => Err(Error::Invalid("task driver is not running".into())),
                 Err(_) => Err(Error::Failed),
             }
@@ -11044,6 +11218,25 @@ impl Harness {
         self.merge_admissions = merge;
         saved?;
         Ok(result)
+    }
+
+    fn merge_session_owner_checks(checks: &mut Vec<Check>, owner_checks: Vec<Check>) {
+        for check in owner_checks {
+            if let Some(existing) = checks.iter_mut().find(|old| old.key == check.key) {
+                match (&existing.expected, &check.expected) {
+                    (Expected::Missing, Expected::MissingUnchangedSince(_)) => {
+                        existing.expected = check.expected;
+                    }
+                    (Expected::MissingUnchangedSince(a), Expected::MissingUnchangedSince(b)) => {
+                        existing.expected = Expected::MissingUnchangedSince((*a).min(*b));
+                    }
+                    (a, b) if a == b => (),
+                    _ => checks.push(check),
+                }
+            } else {
+                checks.push(check);
+            }
+        }
     }
 
     fn commit_session_candidate(
@@ -19654,6 +19847,8 @@ impl Scheduler {
         self.reporter = Some(tokio::spawn(async move {
             let mut active: HashMap<Vec<u8>, tokio::task::JoinHandle<Result<(), Error>>> =
                 HashMap::new();
+            let mut wake_versions: HashMap<Vec<u8>, u64> = HashMap::new();
+            let mut blocked_wakes: HashMap<Vec<u8>, u64> = HashMap::new();
             loop {
                 let done: Vec<_> = active
                     .iter()
@@ -19662,22 +19857,100 @@ impl Scheduler {
                     .collect();
                 for key in done {
                     if let Some(task) = active.remove(&key) {
+                        let version = wake_versions.remove(&key);
                         match task.await {
-                            Ok(Ok(())) => (),
+                            Ok(Ok(())) => {
+                                blocked_wakes.remove(&key);
+                            }
                             Ok(Err(Error::Interrupted)) if cancel.is_cancelled() => (),
                             Ok(Err(e)) => {
+                                if let Some(version) = version {
+                                    blocked_wakes.insert(key, version);
+                                }
                                 *errors.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(e.to_string())
+                                    Some(e.to_string());
                             }
                             Err(e) => {
+                                if let Some(version) = version {
+                                    blocked_wakes.insert(key, version);
+                                }
                                 *errors.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(e.to_string())
+                                    Some(e.to_string());
                             }
                         }
                     }
                 }
                 if cancel.is_cancelled() {
                     break;
+                }
+                // Task-side admission persists a wake in the same commit as the
+                // input. Retain it until the worker has driven the conversation;
+                // startup can therefore recover even if this process dies here.
+                match source.owner.store().list(TASK_INPUT_WAKE_PREFIX) {
+                    Ok(pending) => {
+                        for (key, entry) in pending {
+                            if active.contains_key(&key)
+                                || blocked_wakes.get(&key) == Some(&entry.version)
+                            {
+                                continue;
+                            }
+                            let Some(id) = key
+                                .strip_prefix(TASK_INPUT_WAKE_PREFIX)
+                                .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                                .and_then(|text| Uuid::parse_str(text).ok())
+                            else {
+                                continue;
+                            };
+                            let mut worker = source.worker();
+                            let worker_errors = worker_errors.clone();
+                            let reporter_stop = cancel.clone();
+                            let wake_key = key.clone();
+                            wake_versions.insert(key.clone(), entry.version);
+                            active.insert(
+                                key,
+                                tokio::spawn(async move {
+                                    let control = worker.owner.conversation_controls().get(id);
+                                    let lock = control.worker;
+                                    worker.execution_gate = Some(control.gate);
+                                    let activity = worker.activity.enter_at(
+                                        crate::worker_activity::WorkerKind::Conversation,
+                                        id,
+                                        crate::worker_activity::WorkerPhase::Queued,
+                                    );
+                                    let mut guard = Some(tokio::select! {
+                                        biased;
+                                        _ = reporter_stop.cancelled() => return Ok(()),
+                                        guard = lock.lock() => guard,
+                                    });
+                                    drive_scheduled(
+                                        &mut worker,
+                                        id,
+                                        &control.cancel,
+                                        &lock,
+                                        &mut guard,
+                                        Some(&worker_errors),
+                                        activity,
+                                    )
+                                    .await?;
+                                    match worker.owner.store().commit(
+                                        &[Check {
+                                            key: wake_key.clone(),
+                                            expected: Expected::Version(entry.version),
+                                        }],
+                                        &[Mutation::Delete { key: wake_key }],
+                                    ) {
+                                        Ok(()) | Err(durable_store::Error::Conflict { .. }) => {
+                                            Ok(())
+                                        }
+                                        Err(error) => Err(error.into()),
+                                    }
+                                }),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        *errors.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string())
+                    }
                 }
                 match source.pending_reporters() {
                     Ok(pending) => {

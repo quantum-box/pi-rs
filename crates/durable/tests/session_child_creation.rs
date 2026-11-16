@@ -222,6 +222,30 @@ fn child_kill_fixture() {
     let path = std::path::Path::new(&path);
     let mut h = Harness::open_paused(path, options()).unwrap();
     let c = h.create_conversation(config()).unwrap();
+    if std::env::var("PI_SESSION_CHILD_OWNED").as_deref() == Ok("1") {
+        use pi_rs_durable::{
+            ownership_edge::{Edge, EdgeStore, Mode},
+            task_store::Save,
+        };
+        let root = h.create_conversation(config()).unwrap();
+        let store = Store::open(path).unwrap();
+        let ts = TaskStore::new(&store);
+        let owner = task(TaskOwner::Conversation(root), "unknown", 0);
+        ts.save(&[Save::Create(&owner)]).unwrap();
+        let edge = Edge {
+            task: owner.id(),
+            task_owner: owner.owner().clone(),
+            child: c,
+            mode: Mode::Foreground,
+        };
+        let prepared = EdgeStore::new(&store).prepare_create(&edge).unwrap();
+        store.commit(&prepared.checks, &prepared.mutations).unwrap();
+        let snapshot = ts.load(owner.id()).unwrap().unwrap();
+        ts.update(&snapshot, |task| task.start()).unwrap();
+        let snapshot = ts.load(owner.id()).unwrap().unwrap();
+        ts.update(&snapshot, |task| task.succeed(json!(null)))
+            .unwrap();
+    }
     let (driver, started, _release) = driver(&h);
     let parent = task(TaskOwner::Conversation(c), "parent", 0);
     driver.submit(&parent).unwrap();
@@ -258,63 +282,66 @@ fn keyed_child_survives_kill_and_new_parent_attempt() {
             let _ = self.0.wait();
         }
     }
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db");
-    let mut process = KillOnDrop(
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_kill_fixture", "--nocapture"])
-            .env("PI_SESSION_CHILD_KILL_DB", &path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let output = process.0.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(output).lines() {
-            let line = line.unwrap();
-            if let Some((_, ids)) = line.split_once("CHILD_COMMITTED ") {
-                let _ = tx.send(ids.to_string());
-                break;
+    for owned in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut process = KillOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_kill_fixture", "--nocapture"])
+                .env("PI_SESSION_CHILD_KILL_DB", &path)
+                .env("PI_SESSION_CHILD_OWNED", if owned { "1" } else { "0" })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let output = process.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let line = line.unwrap();
+                if let Some((_, ids)) = line.split_once("CHILD_COMMITTED ") {
+                    let _ = tx.send(ids.to_string());
+                    break;
+                }
             }
-        }
-    });
-    let ids = rx.recv_timeout(Duration::from_secs(30)).unwrap();
-    let ids = ids
-        .split_whitespace()
-        .map(|s| Uuid::parse_str(s).unwrap())
-        .collect::<Vec<_>>();
-    process.0.kill().unwrap();
-    process.0.wait().unwrap();
-    let mut h = Harness::open_paused(&path, options()).unwrap();
-    let (driver, started, release) = driver(&h);
-    started.recv_timeout(Duration::from_secs(10)).unwrap();
-    let store = Store::open(&path).unwrap();
-    let snapshot = TaskStore::new(&store).load(ids[1]).unwrap().unwrap();
-    let candidate = task(TaskOwner::Task(ids[1]), "child", 1);
-    let found = h
-        .session_transaction(ids[0], |tx| {
-            tx.create_keyed_child(&snapshot, "restart", candidate.clone())
-        })
-        .unwrap();
-    assert_eq!(found, ids[2]);
-    assert!(
-        TaskStore::new(&store)
-            .load(candidate.id())
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        Documents::new(&store)
-            .get(&address())
-            .unwrap()
-            .unwrap()
-            .value["n"],
-        7
-    );
-    release.send(()).unwrap();
-    driver.shutdown().unwrap();
+        });
+        let ids = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let ids = ids
+            .split_whitespace()
+            .map(|s| Uuid::parse_str(s).unwrap())
+            .collect::<Vec<_>>();
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (driver, started, release) = driver(&h);
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let store = Store::open(&path).unwrap();
+        let snapshot = TaskStore::new(&store).load(ids[1]).unwrap().unwrap();
+        let candidate = task(TaskOwner::Task(ids[1]), "child", 1);
+        let found = h
+            .session_transaction(ids[0], |tx| {
+                tx.create_keyed_child(&snapshot, "restart", candidate.clone())
+            })
+            .unwrap();
+        assert_eq!(found, ids[2]);
+        assert!(
+            TaskStore::new(&store)
+                .load(candidate.id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            Documents::new(&store)
+                .get(&address())
+                .unwrap()
+                .unwrap()
+                .value["n"],
+            7
+        );
+        release.send(()).unwrap();
+        driver.shutdown().unwrap();
+    }
 }
 
 #[test]
@@ -490,7 +517,7 @@ async fn async_child_transaction_uses_same_attempt_fence() {
 }
 
 #[test]
-fn task_owned_conversation_is_explicitly_rejected() {
+fn task_owned_conversation_accepts_children_and_recovers() {
     use pi_rs_durable::{
         ownership_edge::{Edge, EdgeStore, Mode},
         task_store::Save,
@@ -528,11 +555,87 @@ fn task_owned_conversation_is_explicitly_rejected() {
     started.recv_timeout(Duration::from_secs(10)).unwrap();
     let snapshot = TaskStore::new(&store).load(parent.id()).unwrap().unwrap();
     let child = task(TaskOwner::Task(parent.id()), "child", 1);
-    let result = h.session_transaction(c, |tx| tx.create_child_task(&snapshot, child.clone()));
-    assert!(result.is_err());
+    // A different persisted attempt must invalidate the callback and all of its writes.
+    let mut parent_key = b"durable/task/".to_vec();
+    parent_key.extend_from_slice(parent.id().as_bytes());
+    let original = store.get(&parent_key).unwrap().unwrap();
+    let stale = h.session_transaction(c, |tx| {
+        tx.create_child_task(&snapshot, child.clone())?;
+        tx.put_document(
+            &address(),
+            json!({"stale": true}).as_object().unwrap().clone(),
+        )?;
+        let mut value: serde_json::Value = serde_json::from_slice(&original.value)?;
+        value["attempt_id"] = json!(Uuid::new_v4());
+        store.commit(
+            &[durable_store::Check {
+                key: parent_key.clone(),
+                expected: durable_store::Expected::Version(original.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: parent_key.clone(),
+                value: serde_json::to_vec(&value)?,
+            }],
+        )?;
+        Ok(())
+    });
+    assert!(stale.is_err());
     assert!(TaskStore::new(&store).load(child.id()).unwrap().is_none());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    let changed = store.get(&parent_key).unwrap().unwrap();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: parent_key.clone(),
+                expected: durable_store::Expected::Version(changed.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: parent_key,
+                value: original.value,
+            }],
+        )
+        .unwrap();
+    let snapshot = TaskStore::new(&store).load(parent.id()).unwrap().unwrap();
+    let result = h.session_transaction(c, |tx| {
+        let token = pi_rs_durable::task_store::SignalToken::new("test", 1).unwrap();
+        assert_eq!(
+            tx.signal(child.id(), &token, "early", json!(1))?,
+            pi_rs_durable::task_store::SignalResult::NotFound
+        );
+        let submission = tx.submit_write(
+            None,
+            "note".into(),
+            None,
+            Some(pi_rs_durable::runtime::SubmissionNotify {
+                task_id: child.id(),
+                key: "done".into(),
+            }),
+        )?;
+        tx.create_child_task(&snapshot, child.clone())?;
+        tx.put_document(
+            &address(),
+            json!({"saved": true}).as_object().unwrap().clone(),
+        )?;
+        Ok(submission)
+    });
+    let submission = result.unwrap();
+    assert!(TaskStore::new(&store).load(child.id()).unwrap().is_some());
+    let notification = TaskStore::new(&store)
+        .read_typed_signal(
+            child.id(),
+            &pi_rs_durable::runtime::submission_settled_signal(),
+            "done",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(notification["id"], json!(submission));
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
     release.send(()).unwrap();
     driver.shutdown().unwrap();
+    drop(h);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    assert!(reopened.conversation(c).is_ok());
+    assert!(TaskStore::new(&store).load(child.id()).unwrap().is_some());
 }
 
 #[test]
@@ -635,7 +738,9 @@ fn signal_deadline_conflict_rolls_back_child() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let mut h = Harness::open_paused(&path, options()).unwrap();
-    h.set_signal_clock(Arc::new(|| 0));
+    // Keep the scheduler from expiring the key on its own wall clock,
+    // while the transaction still observes a short monotonic deadline.
+    h.set_signal_clock(Arc::new(|| i64::MAX - 100));
     let c = h.create_conversation(config()).unwrap();
     let (driver, started, release) = driver(&h);
     let parent = task(TaskOwner::Conversation(c), "parent", 0);
@@ -653,7 +758,7 @@ fn signal_deadline_conflict_rolls_back_child() {
     tasks
         .update(&tasks.load(other.id()).unwrap().unwrap(), |task| {
             task.wait(WaitFor::TypedSleep {
-                until_millis: Some(1),
+                until_millis: Some(i64::MAX),
                 signals: vec![token.key("a").unwrap()],
             })
         })
@@ -666,7 +771,7 @@ fn signal_deadline_conflict_rolls_back_child() {
         );
         tx.create_child_task(&snapshot, child.clone())?;
         tx.put_document(&address(), json!({"n":1}).as_object().unwrap().clone())?;
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(150));
         Ok(())
     });
     assert!(result.is_err());
@@ -1349,4 +1454,304 @@ fn staged_child_signal_missing_observation_rejects_create_delete_aba() {
     assert!(Documents::new(&store).get(&address()).unwrap().is_none());
     release.send(()).unwrap();
     driver.shutdown().unwrap();
+}
+
+#[test]
+fn owned_conversation_admission_observes_failure_abort_and_background_boundary() {
+    use durable_store::{Check, Expected, Mutation};
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore, Mode},
+        task_store::Save,
+    };
+    for (mode, failed, succeeds) in [
+        (Mode::Foreground, true, false),
+        (Mode::Foreground, false, false),
+        (Mode::Background, true, true),
+        (Mode::Background, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let root = h.create_conversation(config()).unwrap();
+        let c = h.create_conversation(config()).unwrap();
+        let store = Store::open(&path).unwrap();
+        let owner = task(TaskOwner::Conversation(root), "unknown", 0);
+        let ts = TaskStore::new(&store);
+        ts.save(&[Save::Create(&owner)]).unwrap();
+        let edge = Edge {
+            task: owner.id(),
+            task_owner: owner.owner().clone(),
+            child: c,
+            mode,
+        };
+        let prepared = EdgeStore::new(&store).prepare_create(&edge).unwrap();
+        store.commit(&prepared.checks, &prepared.mutations).unwrap();
+        let snapshot = ts.load(owner.id()).unwrap().unwrap();
+        ts.update(&snapshot, |task| task.start()).unwrap();
+        let snapshot = ts.load(owner.id()).unwrap().unwrap();
+        ts.update(&snapshot, |task| task.succeed(json!(null)))
+            .unwrap();
+        let (driver, started, release) = driver(&h);
+        let parent = task(TaskOwner::Conversation(c), "parent", 0);
+        driver.submit(&parent).unwrap();
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let snapshot = ts.load(parent.id()).unwrap().unwrap();
+        let child = task(TaskOwner::Task(parent.id()), "child", 1);
+        let mut owner_key = b"durable/task/".to_vec();
+        owner_key.extend_from_slice(owner.id().as_bytes());
+        let original = store.get(&owner_key).unwrap().unwrap();
+        let result = h.session_transaction(c, |tx| {
+            let token = pi_rs_durable::task_store::SignalToken::new("test", 1).unwrap();
+            assert_eq!(
+                tx.signal(child.id(), &token, "early", json!(1))?,
+                pi_rs_durable::task_store::SignalResult::NotFound
+            );
+            tx.submit_write(
+                None,
+                "notice".into(),
+                None,
+                Some(pi_rs_durable::runtime::SubmissionNotify {
+                    task_id: child.id(),
+                    key: "done".into(),
+                }),
+            )?;
+            tx.create_keyed_child(&snapshot, "child", child.clone())?;
+            tx.put_document(&address(), json!({"value": 1}).as_object().unwrap().clone())?;
+            tx.append_entry("note", None)?;
+            let value = if failed {
+                let mut failed_owner = owner.clone();
+                failed_owner.start().unwrap();
+                failed_owner.fail("failed".into()).unwrap();
+                serde_json::to_vec(&failed_owner)?
+            } else {
+                let mut value: serde_json::Value = serde_json::from_slice(&original.value)?;
+                value["abort_requested"] = json!(true);
+                serde_json::to_vec(&value)?
+            };
+            store.commit(
+                &[Check {
+                    key: owner_key.clone(),
+                    expected: Expected::Version(original.version),
+                }],
+                &[Mutation::Put {
+                    key: owner_key.clone(),
+                    value,
+                }],
+            )?;
+            Ok(())
+        });
+        assert_eq!(
+            result.is_ok(),
+            succeeds,
+            "{mode:?}, failed={failed}: {result:?}"
+        );
+        assert_eq!(ts.load(child.id()).unwrap().is_some(), succeeds);
+        assert_eq!(
+            ts.read_typed_signal(
+                child.id(),
+                &pi_rs_durable::runtime::submission_settled_signal(),
+                "done"
+            )
+            .unwrap()
+            .is_some(),
+            succeeds
+        );
+        assert_eq!(
+            Documents::new(&store).get(&address()).unwrap().is_some(),
+            succeeds
+        );
+        assert_eq!(
+            !h.conversation(c).unwrap().application_writes.is_empty(),
+            succeeds
+        );
+        // Restore the anchor so the driver can finish without an unrelated cleanup race.
+        let current = store.get(&owner_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: owner_key.clone(),
+                    expected: Expected::Version(current.version),
+                }],
+                &[Mutation::Put {
+                    key: owner_key,
+                    value: original.value,
+                }],
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        driver.shutdown().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn async_owned_conversation_transaction_commits_child_and_document() {
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore, Mode},
+        task_store::Save,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let root = h.create_conversation(config()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let ts = TaskStore::new(&store);
+    let owner = task(TaskOwner::Conversation(root), "unknown", 0);
+    ts.save(&[Save::Create(&owner)]).unwrap();
+    let edge = Edge {
+        task: owner.id(),
+        task_owner: owner.owner().clone(),
+        child: c,
+        mode: Mode::Foreground,
+    };
+    let prepared = EdgeStore::new(&store).prepare_create(&edge).unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    let snapshot = ts.load(owner.id()).unwrap().unwrap();
+    ts.update(&snapshot, |task| task.start()).unwrap();
+    let snapshot = ts.load(owner.id()).unwrap().unwrap();
+    ts.update(&snapshot, |task| task.succeed(json!(null)))
+        .unwrap();
+    let (driver, started, release) = driver(&h);
+    let parent = task(TaskOwner::Conversation(c), "parent", 0);
+    driver.submit(&parent).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let snapshot = ts.load(parent.id()).unwrap().unwrap();
+    let child = task(TaskOwner::Task(parent.id()), "child", 1);
+    let child_id = child.id();
+    h.session_transaction_async(c, move |tx| {
+        Box::pin(async move {
+            tx.create_child_task(&snapshot, child)?;
+            tokio::task::yield_now().await;
+            tx.put_document(
+                &address(),
+                json!({"async": true}).as_object().unwrap().clone(),
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    assert!(ts.load(child_id).unwrap().is_some());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn succeeded_multilevel_owners_allow_admission_after_reopen() {
+    use durable_store::{Check, Expected, Mutation};
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore, Mode},
+        task_store::Save,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let root = h.create_conversation(config()).unwrap();
+    let conversation = h.create_conversation(config()).unwrap();
+    let store = Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    let ancestor = task(TaskOwner::Conversation(root), "unknown", 0);
+    let owner = task(TaskOwner::Task(ancestor.id()), "unknown", 1);
+    tasks
+        .save(&[Save::Create(&ancestor), Save::Create(&owner)])
+        .unwrap();
+    let edge = Edge {
+        task: owner.id(),
+        task_owner: owner.owner().clone(),
+        child: conversation,
+        mode: Mode::Foreground,
+    };
+    let prepared = EdgeStore::new(&store).prepare_create(&edge).unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    for id in [owner.id(), ancestor.id()] {
+        let snapshot = tasks.load(id).unwrap().unwrap();
+        tasks.update(&snapshot, |task| task.start()).unwrap();
+        let snapshot = tasks.load(id).unwrap().unwrap();
+        tasks
+            .update(&snapshot, |task| task.succeed(json!(null)))
+            .unwrap();
+    }
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let parent = task(TaskOwner::Conversation(conversation), "parent", 0);
+    driver.submit(&parent).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let snapshot = tasks.load(parent.id()).unwrap().unwrap();
+    let child = task(TaskOwner::Task(parent.id()), "child", 1);
+    let mut ancestor_key = b"durable/task/".to_vec();
+    ancestor_key.extend_from_slice(ancestor.id().as_bytes());
+    for mode in 0..3 {
+        let original = store.get(&ancestor_key).unwrap().unwrap();
+        let result = h.session_transaction(conversation, |tx| {
+            tx.create_child_task(&snapshot, child.clone())?;
+            tx.put_document(
+                &address(),
+                json!({"staged": true}).as_object().unwrap().clone(),
+            )?;
+            let value = match mode {
+                0 => {
+                    let mut bad = ancestor.clone();
+                    bad.start().unwrap();
+                    bad.fail("failure".into()).unwrap();
+                    serde_json::to_vec(&bad)?
+                }
+                1 => {
+                    let mut bad = ancestor.clone();
+                    bad.cancel().unwrap();
+                    serde_json::to_vec(&bad)?
+                }
+                _ => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&original.value)?;
+                    value["abort_requested"] = json!(true);
+                    serde_json::to_vec(&value)?
+                }
+            };
+            store.commit(
+                &[Check {
+                    key: ancestor_key.clone(),
+                    expected: Expected::Version(original.version),
+                }],
+                &[Mutation::Put {
+                    key: ancestor_key.clone(),
+                    value,
+                }],
+            )?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(tasks.load(child.id()).unwrap().is_none());
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        let current = store.get(&ancestor_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: ancestor_key.clone(),
+                    expected: Expected::Version(current.version),
+                }],
+                &[Mutation::Put {
+                    key: ancestor_key.clone(),
+                    value: original.value,
+                }],
+            )
+            .unwrap();
+    }
+    h.session_transaction(conversation, |tx| {
+        tx.create_child_task(&snapshot, child.clone())?;
+        tx.put_document(
+            &address(),
+            json!({"saved": true}).as_object().unwrap().clone(),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(tasks.load(child.id()).unwrap().is_some());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+    drop(h);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    assert!(reopened.conversation(conversation).is_ok());
+    assert!(tasks.load(child.id()).unwrap().is_some());
 }

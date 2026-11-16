@@ -2093,3 +2093,81 @@ fn atomic_failure_preserves_abort_policy_and_publishes_task_notification() {
     assert_eq!(child.resets[0].id, first);
     assert!(child.submission_notifications.is_empty());
 }
+
+#[test]
+fn task_input_on_reset_fork_fences_original_proof() {
+    for duplicate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id, _, steps) = setup_with_adapter(&path, true);
+        h.set_after_failed_run(id, AfterFailedRun::Continue)
+            .unwrap();
+        h.submit(id, None, "replacement".into()).unwrap();
+        let (mut checkpoint, version) = h.load(id).unwrap();
+        let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+        checkpoint.phase = Phase::FailedModel {
+            turns: 0,
+            request_id: Uuid::new_v4(),
+            reason: "error".into(),
+            decision: ModelFailureDecision::Stop,
+        };
+        h.save(&checkpoint, Expected::Version(version)).unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        finish_failure(&mut failure, "error".into(), FailureCause::ModelError);
+        h.save(&failure, Expected::Version(version)).unwrap();
+        let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+        if duplicate {
+            h.submit(fork, Some("task-request".into()), "input".into())
+                .unwrap();
+        }
+        let record = h.owner.store().get(&Harness::key(fork)).unwrap().unwrap();
+        let intent = crate::document::TaskInputIntent {
+            conversation: fork,
+            version: record.version,
+            request_id: "task-request".into(),
+            content: "input".into(),
+        };
+        // Reuse an active traversal, as happens when task admission is composed
+        // with a caller that has already authenticated a nested reset cut.
+        let scope = ResetProofScope::enter();
+        let (_, entry) = h
+            .owner
+            .store()
+            .list(b"runtime/reset-manifest/")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        let cursor = serde_json::from_value(value["cuts"][0]["cursor"].clone()).unwrap();
+        let observation = value["anchor_observation"].as_u64().unwrap();
+        h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+        let batch = h.prepare_task_input(&intent).unwrap();
+        drop(scope);
+        let manifest = batch
+            .checks
+            .iter()
+            .find(|check| {
+                check.key.starts_with(b"runtime/reset-manifest/")
+                    && matches!(check.expected, Expected::Version(_))
+            })
+            .expect("reset proof must be retained")
+            .key
+            .clone();
+        let value = h.owner.store().get(&manifest).unwrap().unwrap().value;
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: manifest,
+                    value,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            h.owner.store().commit(&batch.checks, &batch.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+    }
+}

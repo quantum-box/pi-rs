@@ -529,6 +529,7 @@ pub struct DetachedInvocation {
     running: task_store::StoredTask,
     handler: Arc<dyn Handler>,
     abort: bool,
+    validator: Option<crate::runtime::Harness>,
     lease: InvocationLease,
 }
 
@@ -955,6 +956,7 @@ impl DetachedInvocation {
             running,
             handler,
             abort,
+            validator,
             lease,
         } = self;
         let result = if abort {
@@ -975,6 +977,7 @@ impl DetachedInvocation {
         } else {
             let owner = &lease.attachment.owner;
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
+            documents.set_input_validator(validator.as_ref());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler.run_with_documents(&running.task, &mut documents)
             }));
@@ -1341,6 +1344,7 @@ impl Scheduler {
             running,
             handler,
             abort,
+            validator: self.validator.as_ref().map(|harness| harness.worker()),
             lease: InvocationLease {
                 attachment: self.attachment.clone(),
                 state: self.live_invocations.clone(),
@@ -3850,7 +3854,21 @@ impl Scheduler {
         if self.inject_preparation_error == 1 {
             return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
         }
-        let document_result = documents.prepare(&running);
+        let document_result = documents.prepare(&running).and_then(|mut prepared| {
+            if let Some(intent) = &prepared.task_input {
+                let harness = self.validator.as_ref().ok_or_else(|| {
+                    crate::document::Error::InvalidSessionAdmission(
+                        "task input requires an attached harness".into(),
+                    )
+                })?;
+                let batch = harness.prepare_task_input(intent)?;
+                let mut combined = crate::document::Transaction::new();
+                combined.append(prepared.document_batch)?;
+                combined.append(batch)?;
+                prepared.document_batch = combined.into_owned_batch()?;
+            }
+            Ok(prepared)
+        });
         #[cfg(test)]
         if self.inject_preparation_error == 2 {
             return Err(task_store::Error::Store(durable_store::Error::LockPoisoned).into());
@@ -5006,6 +5024,149 @@ mod tests {
             phase: phase.into(),
             data: json!(null),
         }
+    }
+
+    #[test]
+    fn task_input_snapshot_race_replays_without_stopping_scheduler() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{Config, Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Racing {
+            path: std::path::PathBuf,
+            conversation: Uuid,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Racing {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+                docs.submit_input_with_snapshot_hook("race".into(), "hello".into(), || {
+                    if first {
+                        let store = durable_store::Store::open(&self.path).unwrap();
+                        let key = Harness::key(self.conversation);
+                        let old = store.get(&key).unwrap().unwrap();
+                        store
+                            .commit(
+                                &[durable_store::Check {
+                                    key: key.clone(),
+                                    expected: durable_store::Expected::Version(old.version),
+                                }],
+                                &[durable_store::Mutation::Put {
+                                    key,
+                                    value: old.value,
+                                }],
+                            )
+                            .unwrap();
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                let address = Address {
+                    scope: "test".into(),
+                    name: "snapshot-race".into(),
+                    key: "".into(),
+                };
+                docs.get(&address).map_err(|e| e.to_string())?;
+                docs.put(&address, json!({"done":true}).as_object().unwrap().clone())
+                    .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(
+            &path,
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let conversation = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register(
+            "race",
+            true,
+            Racing {
+                path: path.clone(),
+                conversation,
+                calls: calls.clone(),
+            },
+        );
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            cp("start"),
+            3,
+        )
+        .unwrap()
+        .registered("race".into(), true);
+        scheduler.submit(&task).unwrap();
+        assert!(scheduler.tick(0).unwrap());
+        assert!(
+            harness
+                .conversation(conversation)
+                .unwrap()
+                .submissions
+                .is_empty()
+        );
+        let address = Address {
+            scope: "test".into(),
+            name: "snapshot-race".into(),
+            key: "".into(),
+        };
+        assert!(
+            Documents::new(&durable_store::Store::open(&path).unwrap())
+                .get(&address)
+                .unwrap()
+                .is_none()
+        );
+        assert!(scheduler.tick(0).unwrap());
+        assert!(matches!(
+            scheduler.get(task.id()).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            harness
+                .conversation(conversation)
+                .unwrap()
+                .submissions
+                .len(),
+            1
+        );
+        assert!(
+            Documents::new(&durable_store::Store::open(&path).unwrap())
+                .get(&address)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
