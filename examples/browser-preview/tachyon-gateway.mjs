@@ -1,5 +1,6 @@
 // Adapts the browser SDK's text gateway contract to Tachyon Model Gateway.
 // Credentials stay in the caller's browser and are sent only to the fixed API.
+const OPENAI_URL = 'https://api.openai.com/v1/responses';
 const API_URL = 'https://api.n1.tachy.one/v1/ai/chat/completions';
 const OPERATOR_ID = 'tn_01kxz0ytmhnab5vh53011cwctj';
 const MODEL = 'openai/gpt-6-luna';
@@ -41,8 +42,9 @@ async function readStream(response, onDelta) {
   } finally { reader.releaseLock(); }
 }
 
-export function createGatewayFetch({ fetchImpl, getToken, getProvider = () => 'tachyon', getLocalModel = () => '', getBrowserModel = () => '0.6b', onError, onDelta = () => {}, onProgress = () => {}, origin }) {
+export function createGatewayFetch({ fetchImpl, getToken, getProvider = () => 'tachyon', getLocalModel = () => '', getBrowserModel = () => '0.6b', getOpenAIKey = () => '', getOpenAIModel = () => 'gpt-6.1-terra', onError, onDelta = () => {}, onProgress = () => {}, origin }) {
   let browserWorker, loadedBrowserModel;
+  const openAIOutputs = new Map();
   return async function gatewayFetch(request, options) {
     if (!(request instanceof Request) || new URL(request.url).origin !== origin || new URL(request.url).pathname !== '/demo-gateway') {
       return fetchImpl(request, options);
@@ -50,12 +52,12 @@ export function createGatewayFetch({ fetchImpl, getToken, getProvider = () => 't
     const provider = getProvider();
     const local = provider === 'ollama';
     const browser = provider === 'browser';
-    if (!local && !browser && provider !== 'tachyon') throw new Error('unknown provider');
-    const token = local || browser ? '' : getToken().trim();
+    if (!local && !browser && provider !== 'tachyon' && provider !== 'openai') throw new Error('unknown provider');
+    const token = local || browser ? '' : provider === 'openai' ? getOpenAIKey().trim() : getToken().trim();
     const localModel = local ? getLocalModel().trim() : '';
     if (local && !localModel) { onError('Ollama のモデル名を入力してください。'); throw new Error('Ollama model required'); }
     if (!local && !browser && !token) {
-      onError('Tachyon アクセストークンを入力してください。');
+      onError(provider === 'openai' ? 'OpenAI API キーを入力してください。' : 'Tachyon アクセストークンを入力してください。');
       throw new Error('Tachyon authentication required');
     }
     const source = await request.clone().json();
@@ -79,6 +81,53 @@ export function createGatewayFetch({ fetchImpl, getToken, getProvider = () => 't
         };
         worker.postMessage({messages:source.messages, tools:source.tools, model:selectedModel});
       });
+    }
+    if (provider === 'openai') {
+      const selectedModel = getOpenAIModel().trim();
+      if (!selectedModel) { onError('OpenAI のモデル名を入力してください。'); throw new Error('OpenAI model required'); }
+      const messages = source.messages.flatMap(message => {
+        if (message.role === 'tool') return [{type:'function_call_output', call_id:message.call_id, output:message.content}];
+        if (!['system', 'user', 'assistant'].includes(message.role) || typeof message.content !== 'string') throw new Error('テキスト会話のみ対応しています');
+        if (message.role === 'assistant' && message.calls?.length) {
+          const cached = openAIOutputs.get(message.calls[0].id);
+          if (cached && message.calls.every(call => openAIOutputs.get(call.id) === cached)) return cached;
+          return [...(message.content ? [{role:'assistant',content:message.content}] : []), ...message.calls.map(call => ({type:'function_call',call_id:call.id,name:call.name,arguments:call.arguments}))];
+        }
+        return [{role:message.role, content:message.content}];
+      });
+      let response;
+      try {
+        response = await fetchImpl(OPENAI_URL, {method:'POST', headers:{'content-type':'application/json', authorization:`Bearer ${token}`}, body:JSON.stringify({model:selectedModel, input:messages, store:false, ...(source.tools?.length ? {tools:source.tools.map(tool => ({type:'function', ...tool, strict:false}))} : {})}), signal:request.signal, credentials:'omit', redirect:'error'});
+      } catch (error) {
+        if (error?.name !== 'AbortError') onError('OpenAI への通信に失敗しました。ネットワークやブラウザの接続制限を確認してください。');
+        throw error;
+      }
+      if (!response.ok) {
+        const hint = response.status === 401 ? 'API キーを確認してください。' : response.status === 403 ? 'プロジェクトの権限を確認してください。' : response.status === 404 ? 'モデル名と利用権限を確認してください。' : response.status === 429 ? '利用枠とレート制限を確認してください。' : 'モデル名と利用権限を確認してください。';
+        onError(`OpenAI がエラーを返しました（HTTP ${response.status}）。${hint}`);
+        return new Response('', {status:response.status});
+      }
+      try {
+        const raw = await response.text();
+        if (new TextEncoder().encode(raw).length > MAX_RESPONSE_BYTES) throw new Error('応答が大きすぎます');
+        const result = JSON.parse(raw);
+        if (result.status !== 'completed' || !Array.isArray(result.output)) throw new Error('OpenAI の応答が完了しませんでした');
+        const calls = [], textParts = [];
+        for (const item of result.output) {
+          if (item.type === 'function_call') {
+            if (typeof item.call_id !== 'string' || typeof item.name !== 'string' || typeof item.arguments !== 'string') throw new Error('OpenAI のツール呼び出しが不正です');
+            calls.push({id:item.call_id, name:item.name, arguments:item.arguments});
+          } else if (item.type === 'message') {
+            for (const part of item.content || []) if (part.type === 'output_text' && typeof part.text === 'string') textParts.push(part.text);
+          }
+        }
+        if (calls.length) for (const call of calls) openAIOutputs.set(call.id, result.output);
+        if (!calls.length && !textParts.length) throw new Error('OpenAI の応答にテキストがありません');
+        return Response.json({text:textParts.join(''), calls});
+      } catch (error) {
+        if (error?.name !== 'AbortError') onError('OpenAI から予期しない応答を受け取りました。モデルの対応状況と応答形式を確認してください。');
+        throw error;
+      }
     }
     const messages = source.messages.map(message => {
       if (!['system', 'user', 'assistant'].includes(message.role) || typeof message.content !== 'string') {
