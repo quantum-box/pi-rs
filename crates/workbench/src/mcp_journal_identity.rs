@@ -34,6 +34,7 @@ const MAGIC: &[u8; 8] = b"PIJKEY01";
 const KEY_LEN: usize = 32;
 const FILE_LEN: usize = 8 + KEY_LEN + 32;
 const CONTEXT: &[u8] = b"pi-rs:mcp-journal-identity:v1";
+const RECORD_CONTEXT: &[u8] = b"pi-rs:mcp-journal-record:v1";
 
 /// Disjoint namespaces: an identifier derived for one role cannot be used as
 /// another. Generation IDs must describe the actual credential generation.
@@ -58,6 +59,26 @@ pub(crate) struct Key {
     bytes: Zeroizing<[u8; KEY_LEN]>,
 }
 impl Key {
+    /// Authenticate a canonical journal record. This does not establish that
+    /// the key or record is durable, current, or authorized for recovery.
+    pub(crate) fn authenticate_record(&self, record: &[u8]) -> [u8; 32] {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.bytes[..]).expect("HMAC accepts a 32-byte key");
+        mac.update(RECORD_CONTEXT);
+        mac.update(record);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Verify without exposing key bytes; a valid MAC alone cannot detect a
+    /// rollback to a previously valid record.
+    pub(crate) fn verify_record(&self, record: &[u8], tag: &[u8]) -> bool {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.bytes[..]).expect("HMAC accepts a 32-byte key");
+        mac.update(RECORD_CONTEXT);
+        mac.update(record);
+        mac.verify_slice(tag).is_ok()
+    }
+
     /// Length-delimited raw components are never retained. Their encoding and
     /// normalization must be agreed by callers; values can be low entropy.
     pub(crate) fn derive(&self, domain: Domain, components: &[&[u8]]) -> io::Result<[u8; 32]> {
@@ -335,6 +356,37 @@ mod tests {
                 0x94, 0xc5, 0x97, 0xc2, 0x1c, 0xa5, 0x79, 0xcd, 0x95, 0xb4, 0x17, 0x12, 0xef, 0x3e,
                 0xfd, 0xbd, 0x19, 0x36,
             ]
+        );
+    }
+
+    #[test]
+    fn record_authentication_rejects_changes_and_other_keys() {
+        let key = Key {
+            bytes: Zeroizing::new([0x42; 32]),
+        };
+        let other = Key {
+            bytes: Zeroizing::new([0x43; 32]),
+        };
+        let tag = key.authenticate_record(b"canonical record");
+        assert_eq!(
+            tag,
+            [
+                0x85, 0xda, 0x80, 0xb7, 0xba, 0x66, 0x59, 0x3e, 0xec, 0xc1, 0xf3, 0x50, 0x8e, 0x8e,
+                0xdb, 0x7d, 0x37, 0xf5, 0xef, 0xb2, 0xa8, 0x97, 0xbd, 0xda, 0x87, 0x1b, 0x5e, 0xf2,
+                0xc9, 0x25, 0x00, 0x51
+            ]
+        );
+        assert!(key.verify_record(b"canonical record", &tag));
+        let mut corrupted = tag;
+        corrupted[0] ^= 1;
+        assert!(!key.verify_record(b"canonical record", &corrupted));
+        assert!(!key.verify_record(b"modified record", &tag));
+        assert!(!other.verify_record(b"canonical record", &tag));
+        assert!(!key.verify_record(b"canonical record", &tag[..31]));
+        assert_ne!(
+            tag,
+            key.derive(Domain::Credential, &[b"canonical record"])
+                .unwrap()
         );
     }
     #[test]
