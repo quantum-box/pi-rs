@@ -17436,11 +17436,9 @@ fn replay_checkpoint_failure(baseline: &Conversation) -> Option<Conversation> {
             decision: ModelFailureDecision::Stop,
             ..
         } => (reason.clone(), FailureCause::ModelError),
-        Phase::AbandonedModel { restarts, .. } => (
-            "model restart limit".into(),
-            FailureCause::RestartLimit(*restarts),
-        ),
-        Phase::ModelReady { turns } => {
+        // The configured limits are not retained in the authenticated
+        // predecessor. A counter alone cannot prove a terminal decision.
+        Phase::ModelReady { .. } => {
             let has_input = matches!(
                 baseline
                     .messages
@@ -17449,11 +17447,12 @@ fn replay_checkpoint_failure(baseline: &Conversation) -> Option<Conversation> {
                     .find(|m| !matches!(m, Message::System { .. })),
                 Some(Message::User { .. } | Message::UserWithImages { .. } | Message::Tool { .. })
             );
-            if has_input {
-                ("turn limit".into(), FailureCause::TurnLimit(*turns))
-            } else {
-                ("nothing_to_answer".into(), FailureCause::NothingToAnswer)
+            // Block-capable provider availability is not authenticated by the
+            // checkpoint, and the runtime checks it before this decision.
+            if has_input || !baseline.content_blocks.is_empty() {
+                return None;
             }
+            ("nothing_to_answer".into(), FailureCause::NothingToAnswer)
         }
         _ => return None,
     };

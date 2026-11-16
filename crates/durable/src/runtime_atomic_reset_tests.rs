@@ -872,7 +872,7 @@ async fn production_atomic_failure_survives_process_kill_and_forks() {
 }
 
 #[test]
-fn production_replays_turn_and_restart_limit_failures() {
+fn below_limit_forged_atomic_failure_manifests_fail_closed() {
     for restart in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -882,6 +882,72 @@ fn production_replays_turn_and_restart_limit_failures() {
         h.submit(id, None, "replacement".into()).unwrap();
         let (mut checkpoint, version) = h.load(id).unwrap();
         let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+        checkpoint.phase = if restart {
+            Phase::AbandonedModel {
+                turns: 0,
+                request_id: Uuid::new_v4(),
+                restarts: 0,
+            }
+        } else {
+            Phase::ModelReady { turns: 0 }
+        };
+        h.save(&checkpoint, Expected::Version(version)).unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        if restart {
+            finish_failure(
+                &mut failure,
+                "model restart limit".into(),
+                FailureCause::RestartLimit(0),
+            );
+        } else {
+            finish_failure(
+                &mut failure,
+                "turn limit".into(),
+                FailureCause::TurnLimit(0),
+            );
+        }
+        assert!(
+            h.atomic_failure_reset_steps(&failure, &Expected::Version(version))
+                .unwrap()
+                .is_none()
+        );
+        // Bypass production admission to emulate an impossible same-commit
+        // manifest and transcript from an untrusted storage writer.
+        let batch = h
+            .prepare_atomic_failure_reset_save(&failure, version, &steps)
+            .unwrap();
+        let bytes = batch
+            .mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cursor = serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
+        let observation = manifest["anchor_observation"].as_u64().unwrap();
+        h.commit_conversation_save(batch).unwrap();
+        assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+        assert!(h.fork_by_entry_id(id, occurrence).is_err());
+    }
+}
+
+#[test]
+fn limit_failures_keep_staged_reset_path() {
+    for restart in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id, _, _) = setup(&path);
+        h.set_after_failed_run(id, AfterFailedRun::Continue)
+            .unwrap();
+        h.submit(id, None, "replacement".into()).unwrap();
+        let (mut checkpoint, version) = h.load(id).unwrap();
         checkpoint.phase = if restart {
             Phase::AbandonedModel {
                 turns: 0,
@@ -907,23 +973,15 @@ fn production_replays_turn_and_restart_limit_failures() {
             );
         }
         h.save(&failure, Expected::Version(version)).unwrap();
-        drop(h);
-        let mut h = Harness::open_paused(&path, options()).unwrap();
         let state = h.conversation(id).unwrap();
-        assert_eq!(state.resets.len(), 2);
-        assert_eq!(
-            state.run_failure.unwrap().reason,
-            if restart {
-                "restart_limit"
-            } else {
-                "turn_limit"
-            }
-        );
-        let fork = h.fork_by_entry_id(id, occurrence).unwrap();
-        assert_eq!(
-            h.conversation(fork).unwrap().resets[0].id,
-            steps[0].reset_id
-        );
+        assert!(state.resets.is_empty());
+        assert_eq!(state.pending_resets.len(), 2);
+        assert!(matches!(state.phase, Phase::Idle));
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let state = h.conversation(id).unwrap();
+        assert!(state.resets.is_empty());
+        assert_eq!(state.pending_resets.len(), 2);
     }
 }
 
