@@ -14910,17 +14910,28 @@ mod standalone_foreground_cleanup_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let mut harness = Harness::open_paused(&path, options()).unwrap();
-        let conversation = harness
-            .create_conversation(Config {
-                model: "stub".into(),
-                system_prompt: String::new(),
-                max_output_tokens: 10,
-            })
-            .unwrap();
-        harness.request_abort(conversation).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = harness.create_conversation(cfg.clone()).unwrap();
+        let conversation = harness.create_conversation(cfg).unwrap();
+        let root = task(1, TaskOwner::Conversation(owner), "parent");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&root)]).unwrap();
+        let edge = Edge {
+            task: root.id(),
+            task_owner: root.owner().clone(),
+            child: conversation,
+            mode: Mode::Foreground,
+        };
+        let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
         drop(harness);
         let mut scheduler =
             Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        scheduler.request_abort(root.id()).unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(
@@ -15014,5 +15025,119 @@ mod standalone_foreground_cleanup_tests {
                 .abort_requested
         );
         assert!(!scheduler.tick(0).unwrap());
+    }
+    #[tokio::test]
+    async fn unrelated_marked_cleanup_error_is_not_executed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct FailingUsage(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for FailingUsage {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                panic!("model must not run")
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(ModelError::Model("unrelated usage failed".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let a = harness.create_conversation(cfg.clone()).unwrap();
+        let b = harness.create_conversation(cfg.clone()).unwrap();
+        let (unrelated, owned) = if a.to_string() < b.to_string() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let owner = harness.create_conversation(cfg).unwrap();
+        harness.request_abort(unrelated).unwrap();
+        let root = task(1, TaskOwner::Conversation(owner), "parent");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&root)]).unwrap();
+        let edge = Edge {
+            task: root.id(),
+            task_owner: root.owner().clone(),
+            child: owned,
+            mode: Mode::Foreground,
+        };
+        let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        drop(harness);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime_options = options();
+        runtime_options.model = Arc::new(FailingUsage(calls.clone()));
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), runtime_options).unwrap();
+        scheduler.request_abort(root.id()).unwrap();
+        let key = format!("runtime/conversation/{unrelated}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut state: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        state["phase"] =
+            json!({"ModelRunning": {"turns":0, "request_id":Uuid::new_v4(), "restarts":0}});
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&state).unwrap(),
+            }],
+        )
+        .unwrap();
+        for _ in 0..10 {
+            if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(unrelated)
+                .unwrap()
+                .abort_requested
+        );
+        assert!(
+            !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(owned)
+                .unwrap()
+                .abort_requested
+        );
+        assert!(!scheduler.tick(0).unwrap());
+        // Verify the unrelated fixture fails if a worker tries to settle it.
+        assert!(
+            scheduler
+                .validator
+                .as_mut()
+                .unwrap()
+                .resume_conversation(unrelated, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

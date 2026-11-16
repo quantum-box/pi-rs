@@ -13005,7 +13005,57 @@ impl Harness {
         &self,
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
-        for id in self.conversations()? {
+        let tasks = crate::task_store::TaskStore::new(self.owner.store())
+            .list()
+            .map_err(|error| Error::Invalid(format!("task lookup: {error}")))?;
+        let edges = crate::ownership_edge::EdgeStore::new(self.owner.store());
+        let mut pending: Vec<_> = tasks
+            .iter()
+            .filter(|record| {
+                !record.task.is_terminal()
+                    && (record.task.abort_requested()
+                        || matches!(
+                            record.task.state(),
+                            crate::task::TaskState::CompletingFailed(_)
+                        ))
+            })
+            .map(|record| record.task.id())
+            .collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut conversations = std::collections::BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let anchor = tasks
+                .iter()
+                .find(|record| record.task.id() == id)
+                .ok_or_else(|| Error::Invalid("missing task owner".into()))?;
+            pending.extend(tasks.iter().filter_map(|record| {
+                (record.task.owner() == &crate::task::TaskOwner::Task(id)
+                    && !record.task.is_background())
+                .then_some(record.task.id())
+            }));
+            for edge in edges
+                .children(id)
+                .map_err(|error| Error::Invalid(format!("ownership edges: {error}")))?
+            {
+                if edge.edge.task_owner != *anchor.task.owner() {
+                    return Err(Error::Invalid("ownership edge owner mismatch".into()));
+                }
+                if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                    continue;
+                }
+                let child = edge.edge.child;
+                conversations.insert(child);
+                pending.extend(tasks.iter().filter_map(|record| {
+                    (record.task.owner() == &crate::task::TaskOwner::Conversation(child)
+                        && !record.task.is_background())
+                    .then_some(record.task.id())
+                }));
+            }
+        }
+        for id in conversations {
             let (observed, _) = self.load(id)?;
             if !observed.abort_requested {
                 continue;
