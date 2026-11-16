@@ -108,14 +108,10 @@ impl Settings {
         self.value.get(key)?.as_bool()
     }
     pub fn http_idle_timeout_ms(&self) -> u64 {
-        match self.value.get("httpIdleTimeoutMs") {
-            Some(Value::String(value)) if value == "disabled" => 0,
-            Some(Value::Number(value)) => value
-                .as_f64()
-                .unwrap_or(300_000.0)
-                .clamp(0.0, 2_147_483_647.0) as u64,
-            _ => 300_000,
-        }
+        self.value
+            .get("httpIdleTimeoutMs")
+            .and_then(parse_http_idle_timeout)
+            .unwrap_or(300_000)
     }
     pub fn http_idle_timeout(&self) -> Option<std::time::Duration> {
         let value = self.http_idle_timeout_ms();
@@ -381,6 +377,49 @@ impl Settings {
     }
 }
 
+fn parse_http_idle_timeout(value: &Value) -> Option<u64> {
+    let number = match value {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(value) => {
+            let value = value.trim_matches(|ch: char| matches!(ch, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'));
+            if value.eq_ignore_ascii_case("disabled") {
+                return Some(0);
+            }
+            if value.is_empty() {
+                return None;
+            }
+            let digits = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .map(|digits| (digits, 16))
+                .or_else(|| {
+                    value
+                        .strip_prefix("0b")
+                        .or_else(|| value.strip_prefix("0B"))
+                        .map(|digits| (digits, 2))
+                })
+                .or_else(|| {
+                    value
+                        .strip_prefix("0o")
+                        .or_else(|| value.strip_prefix("0O"))
+                        .map(|digits| (digits, 8))
+                });
+            if let Some((digits, radix)) = digits {
+                if digits.is_empty() {
+                    return None;
+                }
+                digits.chars().try_fold(0.0, |number, digit| {
+                    Some(number * f64::from(radix) + f64::from(digit.to_digit(radix)?))
+                })?
+            } else {
+                value.parse::<f64>().ok()?
+            }
+        }
+        _ => return None,
+    };
+    (number.is_finite() && number >= 0.0).then(|| number.min(2_147_483_647.0) as u64)
+}
+
 /// Validate implemented settings while retaining extension-owned and future keys.
 pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
     static SCHEMA: std::sync::LazyLock<jsonschema::Validator> = std::sync::LazyLock::new(|| {
@@ -396,6 +435,14 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
             path.display(),
             error.instance_path,
             error
+        )));
+    }
+    if let Some(timeout) = normalized.get("httpIdleTimeoutMs")
+        && parse_http_idle_timeout(timeout).is_none()
+    {
+        return Err(Error::Config(format!(
+            "{}/httpIdleTimeoutMs: invalid HTTP idle timeout",
+            path.display()
         )));
     }
     Ok(())
@@ -1217,6 +1264,29 @@ mod tests {
         assert!(settings.http_idle_timeout().is_none());
         settings.value = serde_json::json!({"httpIdleTimeoutMs": 0});
         assert!(settings.http_idle_timeout().is_none());
+        for (input, expected) in [
+            (" Disabled ", 0),
+            ("\u{feff} 60000.9 ", 60000),
+            ("0x10", 16),
+            ("0b101", 5),
+            ("0o10", 8),
+            ("1e3", 1000),
+        ] {
+            settings.value = serde_json::json!({"httpIdleTimeoutMs": input});
+            super::validate_settings(&settings.value, std::path::Path::new("settings.json"))
+                .unwrap();
+            assert_eq!(settings.http_idle_timeout_ms(), expected, "{input:?}");
+        }
+        for input in ["", " ", "-1", "NaN", "Infinity", "0x", "10ms"] {
+            assert!(
+                super::validate_settings(
+                    &serde_json::json!({"httpIdleTimeoutMs":input}),
+                    std::path::Path::new("settings.json")
+                )
+                .is_err(),
+                "{input:?}"
+            );
+        }
         assert!(
             super::validate_settings(
                 &serde_json::json!({"httpIdleTimeoutMs": -1}),
