@@ -1254,6 +1254,255 @@ fn reset_proof_replays_each_prior_cut_once_per_traversal() {
     assert!(h.prove_failure_reset_cut(id, &first, observation).is_err());
 }
 
+#[tokio::test]
+async fn limit_decisions_produce_atomic_failure_and_historical_forks() {
+    for restart in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, id, _, steps) = setup_with_adapter(&path, true);
+        h.set_after_failed_run(id, AfterFailedRun::Continue)
+            .unwrap();
+        let replacement = h.submit(id, None, "replacement".into()).unwrap();
+        let (mut state, version) = h.load(id).unwrap();
+        let occurrence = state.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+        state.phase = if restart {
+            Phase::AbandonedModel {
+                turns: 0,
+                request_id: Uuid::new_v4(),
+                restarts: 3,
+            }
+        } else {
+            Phase::ModelReady { turns: 5 }
+        };
+        h.save(&state, Expected::Version(version)).unwrap();
+        h.drive(id, &CancellationToken::new()).await.unwrap();
+        let state = h.conversation(id).unwrap();
+        assert!(matches!(
+            state
+                .submissions
+                .iter()
+                .find(|s| s.id == replacement)
+                .unwrap()
+                .status,
+            Status::Done { .. }
+        ));
+        let page = crate::observer::Observer::new(h.owner.store(), id)
+            .read(
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(128).unwrap(),
+            )
+            .unwrap();
+        let decision = page
+            .records
+            .iter()
+            .find_map(|r| {
+                let key = format!("runtime/fork/{id}/{:020}", r.cursor.0);
+                let entry = h.owner.store().get(key.as_bytes()).unwrap()?;
+                let value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+                value["phase"].get("LimitFailure").cloned()
+            })
+            .expect("missing persisted terminal decision");
+        assert_eq!(decision["count"], if restart { 3 } else { 5 });
+        assert_eq!(decision["limit"], if restart { 3 } else { 5 });
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+        assert_eq!(
+            h.conversation(fork).unwrap().resets[0].id,
+            steps[0].reset_id
+        );
+        let source = format!(
+            "runtime/fork/{id}/{:020}",
+            decision["source_observation"].as_u64().unwrap()
+        )
+        .into_bytes();
+        let value = h.owner.store().get(&source).unwrap().unwrap().value;
+        h.owner
+            .store()
+            .commit(&[], &[Mutation::Put { key: source, value }])
+            .unwrap();
+        assert!(h.fork_by_entry_id(id, occurrence).is_err());
+    }
+}
+
+#[test]
+fn malformed_limit_decisions_do_not_authorize_forged_manifests() {
+    for (count, limit) in [(0, 3), (4, 5), (0, 0), (1, 1)] {
+        for restart in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (mut h, id, _, steps) = setup(&path);
+            h.set_after_failed_run(id, AfterFailedRun::Continue)
+                .unwrap();
+            h.submit(id, None, "replacement".into()).unwrap();
+            let (mut checkpoint, version) = h.load(id).unwrap();
+            let source_observation = h.limit_source_observation(id, version).unwrap().unwrap();
+            checkpoint.phase = Phase::LimitFailure {
+                kind: if restart {
+                    LimitFailureKind::Restart
+                } else {
+                    LimitFailureKind::Turn
+                },
+                count,
+                limit,
+                source_observation,
+                source_root_version: version,
+            };
+            h.save(&checkpoint, Expected::Version(version)).unwrap();
+            let (mut failure, version) = h.load(id).unwrap();
+            if restart {
+                finish_failure(
+                    &mut failure,
+                    "model restart limit".into(),
+                    FailureCause::RestartLimit(count),
+                );
+            } else {
+                finish_failure(
+                    &mut failure,
+                    "turn limit".into(),
+                    FailureCause::TurnLimit(count),
+                );
+            }
+            assert!(
+                h.atomic_failure_reset_steps(&failure, &Expected::Version(version))
+                    .unwrap()
+                    .is_none()
+            );
+            let batch = h
+                .prepare_atomic_failure_reset_save(&failure, version, &steps)
+                .unwrap();
+            let bytes = batch
+                .mutations
+                .iter()
+                .find_map(|mutation| match mutation {
+                    Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let cursor = serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
+            let observation = manifest["anchor_observation"].as_u64().unwrap();
+            h.commit_conversation_save(batch).unwrap();
+            assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+            drop(h);
+            let h = Harness::open_paused(&path, options()).unwrap();
+            assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn limit_decision_kill_child() {
+    use std::io::Write;
+    let Ok(path) = std::env::var("PI_LIMIT_DECISION_KILL_DB") else {
+        return;
+    };
+    let restart = std::env::var("PI_LIMIT_DECISION_KIND").unwrap() == "restart";
+    let (mut h, id, _, steps) = setup_with_adapter(std::path::Path::new(&path), true);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut checkpoint, version) = h.load(id).unwrap();
+    let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    checkpoint.phase = if restart {
+        Phase::AbandonedModel {
+            turns: 0,
+            request_id: Uuid::new_v4(),
+            restarts: 3,
+        }
+    } else {
+        Phase::ModelReady { turns: 5 }
+    };
+    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    let (mut checkpoint, version) = h.load(id).unwrap();
+    let source_observation = h.limit_source_observation(id, version).unwrap().unwrap();
+    checkpoint.phase = Phase::LimitFailure {
+        kind: if restart {
+            LimitFailureKind::Restart
+        } else {
+            LimitFailureKind::Turn
+        },
+        count: if restart { 3 } else { 5 },
+        limit: if restart { 3 } else { 5 },
+        source_observation,
+        source_root_version: version,
+    };
+    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    println!("LIMIT_DECISION_COMMITTED {id} {occurrence} {replacement}");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn killed_limit_decision_resumes_with_saved_limit_and_forks() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    for kind in ["turn", "restart"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::runtime_atomic_reset_tests::limit_decision_kill_child",
+                "--nocapture",
+            ])
+            .env("PI_LIMIT_DECISION_KILL_DB", &path)
+            .env("PI_LIMIT_DECISION_KIND", kind)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some((_, rest)) = line.split_once("LIMIT_DECISION_COMMITTED ") {
+                    let _ = tx.send(rest.to_owned());
+                    break;
+                }
+            }
+        });
+        let marker = rx.recv_timeout(std::time::Duration::from_secs(20));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let marker = marker.expect("child did not commit decision");
+        let mut fields = marker.split_whitespace();
+        let id = Uuid::parse_str(fields.next().unwrap()).unwrap();
+        let occurrence = Uuid::parse_str(fields.next().unwrap()).unwrap();
+        let replacement = Uuid::parse_str(fields.next().unwrap()).unwrap();
+        let mut changed = options();
+        changed.max_turns = 100;
+        changed.restart_limit = 100;
+        let mut h = Harness::open_paused(&path, changed).unwrap();
+        h.install_provider_adapter(Arc::new(BlockAdapter)).unwrap();
+        h.submit(id, None, "after decision".into()).unwrap();
+        h.reset_with_blocks(
+            id,
+            Some("later reset".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"later"})]],
+        )
+        .unwrap();
+        h.drive(id, &CancellationToken::new()).await.unwrap();
+        assert!(matches!(
+            h.conversation(id)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == replacement)
+                .unwrap()
+                .status,
+            Status::Done { .. }
+        ));
+        let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+        assert_eq!(h.conversation(fork).unwrap().resets.len(), 1);
+    }
+}
+
 #[test]
 fn atomic_reset_save_fences_predecessor_proofs_until_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -1344,4 +1593,161 @@ fn atomic_reset_save_fences_predecessor_proofs_until_commit() {
     let state = h.conversation(id).unwrap();
     assert_eq!(state.resets.len(), 2);
     assert_eq!(state.pending_resets.len(), 2);
+}
+
+#[test]
+fn stale_counter_checkpoint_cannot_authorize_limit_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "replacement".into()).unwrap();
+    let (mut source, version) = h.load(id).unwrap();
+    source.phase = Phase::ModelReady { turns: 5 };
+    h.save(&source, Expected::Version(version)).unwrap();
+    let (_, source_version) = h.load(id).unwrap();
+    let source_observation = h
+        .limit_source_observation(id, source_version)
+        .unwrap()
+        .unwrap();
+    h.submit(id, None, "intervening admission".into()).unwrap();
+    let (mut forged, version) = h.load(id).unwrap();
+    forged.phase = Phase::LimitFailure {
+        kind: LimitFailureKind::Turn,
+        count: 5,
+        limit: 5,
+        source_observation,
+        source_root_version: source_version,
+    };
+    h.save(&forged, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(
+        &mut failure,
+        "turn limit".into(),
+        FailureCause::TurnLimit(5),
+    );
+    assert!(
+        h.atomic_failure_reset_steps(&failure, &Expected::Version(version))
+            .unwrap()
+            .is_none()
+    );
+    let batch = h
+        .prepare_atomic_failure_reset_save(&failure, version, &steps)
+        .unwrap();
+    let bytes = batch
+        .mutations
+        .iter()
+        .find_map(|mutation| match mutation {
+            Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let cursor = serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
+    let observation = manifest["anchor_observation"].as_u64().unwrap();
+    h.commit_conversation_save(batch).unwrap();
+    assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+}
+
+#[tokio::test]
+async fn limit_decision_retries_admissions_before_recording_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup_with_adapter(&path, true);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "replacement".into()).unwrap();
+    let (mut source, version) = h.load(id).unwrap();
+    source.phase = Phase::ModelReady { turns: 5 };
+    h.save(&source, Expected::Version(version)).unwrap();
+    let mut admission = h.worker();
+    RESET_PROOF_BEFORE_SAVE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                admission
+                    .reset_with_blocks(
+                        id,
+                        Some("racing reset".into()),
+                        vec![vec![serde_json::json!({"type":"text","text":"racing"})]],
+                    )
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }))
+    });
+    h.drive(id, &CancellationToken::new()).await.unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.resets.len(), 3);
+    assert_eq!(state.resets[0].id, steps[0].reset_id);
+    assert_eq!(state.resets[1].id, steps[1].reset_id);
+    assert_eq!(state.resets[2].handoff.as_deref(), Some("racing reset"));
+}
+
+#[test]
+fn limit_failure_atomic_save_fences_counter_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, _) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "replacement".into()).unwrap();
+    let (mut source, version) = h.load(id).unwrap();
+    source.phase = Phase::ModelReady { turns: 5 };
+    h.save(&source, Expected::Version(version)).unwrap();
+    let (mut decision, source_version) = h.load(id).unwrap();
+    let source_observation = h
+        .limit_source_observation(id, source_version)
+        .unwrap()
+        .unwrap();
+    decision.phase = Phase::LimitFailure {
+        kind: LimitFailureKind::Turn,
+        count: 5,
+        limit: 5,
+        source_observation,
+        source_root_version: source_version,
+    };
+    h.save(&decision, Expected::Version(source_version))
+        .unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(
+        &mut failure,
+        "turn limit".into(),
+        FailureCause::TurnLimit(5),
+    );
+    let source_key = format!("runtime/fork/{id}/{source_observation:020}").into_bytes();
+    let owner = h.owner.clone();
+    RESET_PROOF_BEFORE_SAVE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                let value = owner.store().get(&source_key).unwrap().unwrap().value;
+                owner
+                    .store()
+                    .commit(
+                        &[],
+                        &[Mutation::Put {
+                            key: source_key,
+                            value,
+                        }],
+                    )
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }))
+    });
+    assert!(matches!(
+        h.save(&failure, Expected::Version(version)),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    let state = h.conversation(id).unwrap();
+    assert!(state.resets.is_empty());
+    assert_eq!(state.pending_resets.len(), 2);
+    assert!(matches!(state.phase, Phase::LimitFailure { .. }));
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().pending_resets.len(), 2);
 }

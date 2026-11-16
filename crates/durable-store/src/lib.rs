@@ -958,6 +958,19 @@ impl Store {
         )?)
     }
 
+    /// First tracked put of a key strictly after a store commit sequence.
+    pub fn next_commit_for_key(&self, key: &[u8], after: u64) -> Result<Option<u64>, Error> {
+        if after > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT MIN(sequence) FROM durable_commit_versions WHERE key=?1 AND sequence>?2",
+            params![key, after],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Find the immutable fork snapshot from the last tracked runtime write at
     /// or before `sequence`. A write lacking a matching snapshot fails closed.
     pub fn runtime_snapshot_at(
@@ -1603,6 +1616,43 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod document_history_tests {
     use super::*;
+
+    #[test]
+    fn next_key_commit_skips_unrelated_writes_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path).unwrap();
+        let put = |key: &[u8]| Mutation::Put {
+            key: key.to_vec(),
+            value: vec![1],
+        };
+        store.commit(&[], &[put(b"root")]).unwrap();
+        let first = store
+            .commit_for_version(b"root", store.get(b"root").unwrap().unwrap().version)
+            .unwrap()
+            .unwrap();
+        store.commit(&[], &[put(b"other")]).unwrap();
+        store.commit(&[], &[put(b"root")]).unwrap();
+        let second = store
+            .commit_for_version(b"root", store.get(b"root").unwrap().unwrap().version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.next_commit_for_key(b"root", first).unwrap(),
+            Some(second)
+        );
+        assert_eq!(store.next_commit_for_key(b"root", second).unwrap(), None);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.next_commit_for_key(b"root", first).unwrap(),
+            Some(second)
+        );
+        assert!(matches!(
+            reopened.next_commit_for_key(b"root", u64::MAX),
+            Err(Error::InvalidSnapshot)
+        ));
+    }
 
     #[test]
     fn prefix_put_fence_is_atomic_and_survives_reopen() {

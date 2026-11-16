@@ -307,6 +307,15 @@ enum Phase {
         reason: String,
         decision: ModelFailureDecision,
     },
+    /// A host-selected terminal limit decision. The configured bound is
+    /// retained so recovery and historical replay do not infer it from a counter.
+    LimitFailure {
+        kind: LimitFailureKind,
+        count: u32,
+        limit: u32,
+        source_observation: u64,
+        source_root_version: u64,
+    },
     RetryWait {
         turns: u32,
     },
@@ -475,6 +484,12 @@ fn dispatch_identity(tool: &Arc<dyn pi_rs_core::Tool>) -> Result<DispatchIdentit
         None => Ok(DispatchIdentity::Other),
     }
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum LimitFailureKind {
+    Turn,
+    Restart,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum ModelFailureDecision {
     Retry,
@@ -1241,6 +1256,7 @@ pub fn conversation_wake(
         Phase::ModelReady { .. }
         | Phase::AbandonedModel { .. }
         | Phase::FailedModel { .. }
+        | Phase::LimitFailure { .. }
         | Phase::CompactionHook { .. }
         | Phase::CompactionReady { .. }
         | Phase::CompactionAbandoned { .. }
@@ -2529,6 +2545,8 @@ fn cached_reset_proof_checks(owner: &Arc<OwnedStore>) -> Vec<Check> {
     })
 }
 
+type AtomicFailureResetSelection = (u64, Vec<ResetDerivationStep>, Vec<Check>);
+
 struct AtomicResetPlan<'a> {
     steps: &'a [ResetDerivationStep],
     cuts: &'a [Conversation],
@@ -3785,6 +3803,13 @@ impl Harness {
         };
         self.save_composed_locked(state, expected, wake, children, &[], None)
     }
+    fn save_limit_checkpoint(&mut self, state: &Conversation, version: u64) -> Result<(), Error> {
+        let merge = self.merge_admissions;
+        self.merge_admissions = false;
+        let result = self.save(state, Expected::Version(version));
+        self.merge_admissions = merge;
+        result
+    }
     fn save_hook_children(
         &mut self,
         state: &Conversation,
@@ -3852,9 +3877,12 @@ impl Harness {
             } else {
                 None
             };
-            let atomic_prepared = if let Some((version, steps)) = atomic {
+            let atomic_prepared = if let Some((version, steps, source_checks)) = atomic {
                 match self.prepare_atomic_failure_reset_save(&state, version, &steps) {
-                    Ok(batch) => Some(batch),
+                    Ok(mut batch) => {
+                        merge_reset_proof_checks(&mut batch.checks, source_checks);
+                        Some(batch)
+                    }
                     // An admission can race preparation. The ordinary CAS below
                     // enters the existing admission merge and rebuilds the plan.
                     Err(Error::Storage(durable_store::Error::Conflict { .. })) => None,
@@ -4126,7 +4154,7 @@ impl Harness {
         &self,
         failure: &Conversation,
         expected: &Expected,
-    ) -> Result<Option<(u64, Vec<ResetDerivationStep>)>, Error> {
+    ) -> Result<Option<AtomicFailureResetSelection>, Error> {
         let Expected::Version(version) = expected else {
             return Ok(None);
         };
@@ -4149,6 +4177,15 @@ impl Harness {
         }
         let Some(mut replay) = replay_checkpoint_failure(baseline) else {
             return Ok(None);
+        };
+        let source_checks = if matches!(baseline.phase, Phase::LimitFailure { .. }) {
+            match self.validate_limit_source(baseline, *version) {
+                Ok(checks) => checks,
+                Err(Error::Fork(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
         };
         if serde_json::to_value(&replay)? != serde_json::to_value(failure)?
             || replay.messages != failure.messages
@@ -4174,7 +4211,7 @@ impl Harness {
         }) {
             return Ok(None);
         }
-        Ok(Some((*version, steps)))
+        Ok(Some((*version, steps, source_checks)))
     }
 
     /// Stage a replayable failure, ordered reset cuts and the next input.
@@ -7395,6 +7432,8 @@ impl Harness {
         }
         let predecessor_cursor = baseline.transcript.clone().ok_or_else(invalid)?;
         let predecessor_generation = baseline.context_generation;
+        let limit_source_checks =
+            self.validate_limit_source(&baseline, hints.predecessor_root_version)?;
         baseline = replay_checkpoint_failure(&baseline).ok_or_else(invalid)?;
         apply_failed_run_policy(&mut baseline);
         let steps: Vec<_> = hints
@@ -7474,6 +7513,7 @@ impl Harness {
         let mut chain = positions.clone();
         chain.push(anchor_cursor.clone());
         let mut checks = candidate.checks;
+        checks.extend(limit_source_checks);
         checks.extend(transcript.atomic_append_checks(&anchor_key, &predecessor_cursor, &chain)?);
         // The predecessor's occurrence proof reads its entire immutable chain.
         // Fence those records and their runtime anchors too: otherwise an old
@@ -7733,6 +7773,161 @@ impl Harness {
             .document_cut(key.as_bytes())?
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
         Ok((baseline, revision))
+    }
+
+    // Locate the canonical snapshot of the state on which a limit decision
+    // was made. Legacy roots without commit evidence retain staged settlement.
+    fn limit_source_observation(&self, id: Uuid, version: u64) -> Result<Option<u64>, Error> {
+        let store = self.owner.store();
+        let root = Self::key(id);
+        let Some(sequence) = store.commit_for_version(&root, version)? else {
+            return Ok(None);
+        };
+        let prefix = format!("runtime/fork/{id}/");
+        let Some(key) = store.runtime_canonical_snapshot_at(&root, prefix.as_bytes(), sequence)?
+        else {
+            return Ok(None);
+        };
+        let observation = std::str::from_utf8(
+            key.strip_prefix(prefix.as_bytes())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if key != format!("runtime/fork/{id}/{observation:020}").as_bytes() {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        match self.authenticate_fork_anchor(id, observation) {
+            Ok(()) => Ok(Some(observation)),
+            Err(Error::Fork(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    // Bind the terminal decision to an earlier authenticated runtime snapshot
+    // with the same transcript and actual counter. Fence that evidence with
+    // any fork authorized by the decision.
+    fn validate_limit_source(
+        &self,
+        baseline: &Conversation,
+        version: u64,
+    ) -> Result<Vec<Check>, Error> {
+        let Phase::LimitFailure {
+            kind,
+            count,
+            limit,
+            source_observation,
+            source_root_version,
+        } = &baseline.phase
+        else {
+            return Ok(Vec::new());
+        };
+        if *limit == 0 || count < limit {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let store = self.owner.store();
+        let root = Self::key(baseline.id);
+        let source_seq = store
+            .commit_for_version(&root, *source_root_version)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let current_seq = store
+            .commit_for_version(&root, version)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let decision_seq = store
+            .next_commit_for_key(&root, source_seq)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if decision_seq > current_seq
+            || self.limit_source_observation(baseline.id, *source_root_version)?
+                != Some(*source_observation)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let prefix = format!("runtime/fork/{}/", baseline.id);
+        let decision_key = store
+            .runtime_canonical_snapshot_at(&root, prefix.as_bytes(), decision_seq)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let decision_observation = std::str::from_utf8(
+            decision_key
+                .strip_prefix(prefix.as_bytes())
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        if decision_key
+            != format!("runtime/fork/{}/{decision_observation:020}", baseline.id).as_bytes()
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        self.authenticate_fork_anchor(baseline.id, decision_observation)?;
+        let decision = store
+            .get(&decision_key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let decision_value: serde_json::Value = serde_json::from_slice(&decision.value)?;
+        if decision_value.get("phase") != Some(&serde_json::to_value(&baseline.phase)?)
+            || decision_value.get("_transcript")
+                != Some(&serde_json::to_value(&baseline.transcript)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut decision_event = b"durable/observer/".to_vec();
+        decision_event.extend_from_slice(baseline.id.as_bytes());
+        decision_event.extend_from_slice(b"/r");
+        decision_event.extend_from_slice(&decision_observation.to_be_bytes());
+        let decision_event_version = store
+            .get(&decision_event)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        let key = format!("runtime/fork/{}/{source_observation:020}", baseline.id).into_bytes();
+        let source = store
+            .get(&key)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&source.value)?;
+        let phase: Phase = serde_json::from_value(
+            snapshot
+                .get("phase")
+                .cloned()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?,
+        )?;
+        let same_counter = match (kind, phase) {
+            (LimitFailureKind::Turn, Phase::ModelReady { turns }) => turns == *count,
+            (LimitFailureKind::Restart, Phase::AbandonedModel { restarts, .. }) => {
+                restarts == *count
+            }
+            _ => false,
+        };
+        if !same_counter
+            || snapshot.get("_transcript") != Some(&serde_json::to_value(&baseline.transcript)?)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(baseline.id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&source_observation.to_be_bytes());
+        let event_version = store
+            .get(&event)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?
+            .version;
+        Ok(vec![
+            Check {
+                key,
+                expected: Expected::Version(source.version),
+            },
+            Check {
+                key: event,
+                expected: Expected::Version(event_version),
+            },
+            Check {
+                key: decision_key,
+                expected: Expected::Version(decision.version),
+            },
+            Check {
+                key: decision_event,
+                expected: Expected::Version(decision_event_version),
+            },
+        ])
     }
 
     // A matching observer payload alone is not evidence of a runtime commit:
@@ -11522,7 +11717,23 @@ impl Harness {
                             FailureCause::NothingToAnswer,
                         );
                     } else if turns >= self.options.max_turns {
-                        finish_failure(&mut c, "turn limit".into(), FailureCause::TurnLimit(turns));
+                        if let Some(source_observation) =
+                            self.limit_source_observation(id, version)?
+                        {
+                            c.phase = Phase::LimitFailure {
+                                kind: LimitFailureKind::Turn,
+                                count: turns,
+                                limit: self.options.max_turns,
+                                source_observation,
+                                source_root_version: version,
+                            };
+                        } else {
+                            finish_failure(
+                                &mut c,
+                                "turn limit".into(),
+                                FailureCause::TurnLimit(turns),
+                            );
+                        }
                     } else {
                         if !c.auto_compaction_attempted
                             && (c.content_blocks.is_empty()
@@ -11595,6 +11806,14 @@ impl Harness {
                             request_id: Uuid::new_v4(),
                             restarts: 0,
                         };
+                    }
+                    if matches!(c.phase, Phase::LimitFailure { .. }) {
+                        match self.save_limit_checkpoint(&c, version) {
+                            Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -11975,6 +12194,27 @@ impl Harness {
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
+                Phase::LimitFailure {
+                    kind, count, limit, ..
+                } => {
+                    if limit == 0 || count < limit {
+                        return Err(Error::Invalid("invalid persisted limit decision".into()));
+                    }
+                    self.validate_limit_source(&c, version)?;
+                    match kind {
+                        LimitFailureKind::Turn => finish_failure(
+                            &mut c,
+                            "turn limit".into(),
+                            FailureCause::TurnLimit(count),
+                        ),
+                        LimitFailureKind::Restart => finish_failure(
+                            &mut c,
+                            "model restart limit".into(),
+                            FailureCause::RestartLimit(count),
+                        ),
+                    }
+                    self.save(&c, Expected::Version(version))?;
+                }
                 Phase::RetryWait { turns } => {
                     match c.retry_state.poll(unix_ms()) {
                         Decision::WaitUntil(deadline) => {
@@ -12013,17 +12253,37 @@ impl Harness {
                         }
                     }
                     if restarts >= self.options.restart_limit {
-                        finish_failure(
-                            &mut c,
-                            "model restart limit".into(),
-                            FailureCause::RestartLimit(restarts),
-                        );
+                        if let Some(source_observation) =
+                            self.limit_source_observation(id, version)?
+                        {
+                            c.phase = Phase::LimitFailure {
+                                kind: LimitFailureKind::Restart,
+                                count: restarts,
+                                limit: self.options.restart_limit,
+                                source_observation,
+                                source_root_version: version,
+                            };
+                        } else {
+                            finish_failure(
+                                &mut c,
+                                "model restart limit".into(),
+                                FailureCause::RestartLimit(restarts),
+                            );
+                        }
                     } else {
                         c.phase = Phase::ModelRunning {
                             turns,
                             request_id: Uuid::new_v4(),
                             restarts,
                         };
+                    }
+                    if matches!(c.phase, Phase::LimitFailure { .. }) {
+                        match self.save_limit_checkpoint(&c, version) {
+                            Ok(()) | Err(Error::Storage(durable_store::Error::Conflict { .. })) => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -17566,8 +17826,16 @@ fn replay_checkpoint_failure(baseline: &Conversation) -> Option<Conversation> {
             decision: ModelFailureDecision::Stop,
             ..
         } => (reason.clone(), FailureCause::ModelError),
-        // The configured limits are not retained in the authenticated
-        // predecessor. A counter alone cannot prove a terminal decision.
+        Phase::LimitFailure {
+            kind, count, limit, ..
+        } if *limit > 0 && *count >= *limit => match kind {
+            LimitFailureKind::Turn => ("turn limit".into(), FailureCause::TurnLimit(*count)),
+            LimitFailureKind::Restart => (
+                "model restart limit".into(),
+                FailureCause::RestartLimit(*count),
+            ),
+        },
+        // Legacy checkpoints have no authenticated terminal limit decision.
         Phase::ModelReady { .. } => {
             let has_input = matches!(
                 baseline
