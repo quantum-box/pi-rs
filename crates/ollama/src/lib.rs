@@ -165,7 +165,12 @@ impl Ollama {
         declarations: &[pi_rs_core::ToolDeclaration],
         context: &pi_rs_core::ToolDispatchContext,
     ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
-        let prepared = self.prepare_tool_request(request.clone(), declarations)?;
+        let client = if context.summary {
+            self.clone().without_cache()
+        } else {
+            self.clone().with_session_cache_key(&context.external_id)
+        };
+        let prepared = client.prepare_tool_request(request.clone(), declarations)?;
         let snapshot = pi_rs_core::ToolDecisionSnapshot::capture(
             context,
             request,
@@ -808,11 +813,14 @@ impl Model for Ollama {
         &self,
         _request_id: uuid::Uuid,
         _session_id: uuid::Uuid,
-        _external_id: &str,
+        external_id: &str,
         request: ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<pi_rs_core::DetailedModelStream> {
-        let prepared = self.prepare_tool_request(request, declarations)?;
+        let prepared = self
+            .clone()
+            .with_session_cache_key(external_id)
+            .prepare_tool_request(request, declarations)?;
         let stream = prepared
             .client
             .stream_with_wire_tools(prepared.request, Some(prepared.wire_tools))
@@ -829,7 +837,10 @@ impl Model for Ollama {
         request: ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
     ) -> Result<pi_rs_core::DetailedModelStream> {
-        let prepared = self.prepare_tool_request(request, declarations)?;
+        let prepared = self
+            .clone()
+            .without_cache()
+            .prepare_tool_request(request, declarations)?;
         let stream = prepared
             .client
             .stream_with_wire_tools(prepared.request, Some(prepared.wire_tools))
@@ -2712,7 +2723,7 @@ mod constrained_chat_tests {
     #[tokio::test]
     async fn constrained_chat_prepared_wire_matches_decision_in_session_and_summary() {
         use std::io::{Read, Write};
-        for summary in [false, true] {
+        for (summary, direct) in [(false, false), (true, false), (false, true), (true, true)] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let worker = std::thread::spawn(move || {
@@ -2746,7 +2757,10 @@ mod constrained_chat_tests {
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                 body
             });
-            let client = model(Some(true), &format!("http://{address}"));
+            let client = model(Some(true), &format!("http://{address}"))
+                .with_prompt_cache_policy(true, true)
+                .with_session_cache_key("stale")
+                .with_cache_retention(CacheRetention::Short);
             let (request, declaration) = fixture(
                 StrictToolPolicy::Require,
                 json!({"type":"object", "properties":{"optional":{"type":"string"}}}),
@@ -2764,7 +2778,7 @@ mod constrained_chat_tests {
                 &*prepared,
                 &context,
                 &request,
-                &[declaration],
+                std::slice::from_ref(&declaration),
             )
             .unwrap();
             let expected = prepared.reservation_request().tools[0].parameters.clone();
@@ -2772,11 +2786,44 @@ mod constrained_chat_tests {
                 prepared.effective_tools()[0].sampling,
                 EffectiveToolSampling::StrictJsonSchema { .. }
             ));
-            let events = prepared.dispatch().await.unwrap().collect::<Vec<_>>().await;
+            let stream = if !direct {
+                prepared.dispatch().await.unwrap()
+            } else if summary {
+                client
+                    .stream_detailed_summary_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        request.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                client
+                    .stream_detailed_with_tool_declarations(
+                        context.request_id,
+                        context.session_id,
+                        &context.external_id,
+                        request.clone(),
+                        std::slice::from_ref(&declaration),
+                    )
+                    .await
+                    .unwrap()
+            };
+            let events = stream.collect::<Vec<_>>().await;
             assert!(events.into_iter().all(|event| event.is_ok()));
             let body = worker.join().unwrap();
             assert_eq!(body["tools"][0]["function"]["parameters"], expected);
             assert_eq!(body["tools"][0]["function"]["strict"], true);
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                (!summary).then_some("session")
+            );
+            assert_eq!(
+                body.get("prompt_cache_retention").and_then(Value::as_str),
+                (!summary).then_some("24h")
+            );
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
         }
     }
 }

@@ -3817,9 +3817,12 @@ constraints for declaration-aware and prepared dispatch. It enables strict mode
 only when `supportsStrictMode` is explicitly true, preserves `strict: false`
 for unconstrained or preferred fallback tools when supported, and omits the
 field otherwise. Required constraints fail before dispatch when unsupported
-or unsafe to normalize. Prepared session and summary dispatch bind decisions
-and budget estimates to the transformed wire schemas; callers must normalize
-strict arguments before validation. The native agent is not wired to this
+or unsafe to normalize. Prepared session and summary dispatch, including through resolved and deferred
+Workbench clients, bind decisions and budget estimates to the transformed wire
+schemas. Session dispatch applies the configured prompt-cache policy and
+external session key; summary dispatch suppresses automatic cache controls,
+prompt-cache keys, and retention. Callers must normalize strict arguments
+before validation. The native agent is not wired to this
 prepared path. Grammar declarations in Chat Completions currently fall back to
 ordinary function tools; custom grammar tools and their streaming/replay remain
 unsupported. No provider-side strict-limit retry is implemented on this path.
