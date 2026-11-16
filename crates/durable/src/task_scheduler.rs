@@ -1286,6 +1286,9 @@ pub struct Scheduler {
     wake_reader: WakeReader,
     registry: Registry,
     validator: Option<crate::runtime::Harness>,
+    cleanup_jobs: tokio::task::JoinSet<(Uuid, Result<bool, crate::runtime::Error>)>,
+    cleanup_running: HashSet<Uuid>,
+    cleanup_failures: HashMap<Uuid, String>,
     poisoned: Arc<std::sync::atomic::AtomicBool>,
     reservations_stopped: bool,
     reservation_stop: Arc<std::sync::atomic::AtomicBool>,
@@ -2644,6 +2647,9 @@ impl Scheduler {
             wake_reader,
             registry,
             validator: None,
+            cleanup_jobs: tokio::task::JoinSet::new(),
+            cleanup_running: HashSet::new(),
+            cleanup_failures: HashMap::new(),
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reservations_stopped: false,
             reservation_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3231,45 +3237,105 @@ impl Scheduler {
         }
     }
 
-    /// Drive one task step and one persisted conversation-abort cleanup step.
-    /// This does not execute retained queued inputs. Requires a conversation
-    /// runtime attached with `open_with_conversation_runtime` or `Harness`.
+    /// Failures of individual conversation cleanup callbacks, keyed by conversation.
+    /// The corresponding durable abort remains marked until this scheduler is reopened.
+    pub fn conversation_cleanup_failures(&self) -> &HashMap<Uuid, String> {
+        &self.cleanup_failures
+    }
+
+    /// Drive one task step and schedule bounded, independent conversation cleanup.
+    /// Retained queued inputs are never executed by these cleanup workers.
     pub async fn tick_with_conversation_cleanup(
         &mut self,
         now_millis: i64,
         cancel: &pi_rs_core::CancellationToken,
     ) -> Result<bool, Error> {
+        const MAX_CLEANUPS: usize = 8;
         if self.validator.is_none() {
             return Err(Error::Handler(
                 "conversation runtime is not attached".into(),
             ));
         }
-        let progress = self.tick(now_millis)?;
-        struct CleanupGuard {
-            poisoned: Arc<std::sync::atomic::AtomicBool>,
-            complete: bool,
+        if cancel.is_cancelled() {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(Error::Handler("conversation cleanup interrupted".into()));
         }
-        impl Drop for CleanupGuard {
-            fn drop(&mut self) {
-                if !self.complete {
-                    self.poisoned
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-        }
-        let mut guard = CleanupGuard {
-            poisoned: self.poisoned.clone(),
-            complete: false,
-        };
-        let cleanup = self
+        let mut progress = self.tick(now_millis)?;
+        let candidates = self
             .validator
             .as_ref()
             .unwrap()
-            .settle_one_owned_abort(cancel)
-            .await
-            .map_err(|error| Error::Handler(format!("conversation cleanup: {error}")))?;
-        guard.complete = true;
-        Ok(progress || cleanup)
+            .owned_abort_candidates()
+            .map_err(|error| Error::Handler(format!("conversation cleanup discovery: {error}")))?;
+        for id in candidates {
+            if self.cleanup_running.len() >= MAX_CLEANUPS {
+                break;
+            }
+            if self.cleanup_running.contains(&id) || self.cleanup_failures.contains_key(&id) {
+                continue;
+            }
+            let worker = self.validator.as_ref().unwrap().worker();
+            // Keep the scheduler attachment until a cancelled worker has actually stopped.
+            let attachment = self.attachment.clone();
+            let cancel = cancel.clone();
+            self.cleanup_running.insert(id);
+            self.cleanup_jobs.spawn(async move {
+                let _attachment = attachment;
+                (id, worker.settle_owned_abort(id, &cancel).await)
+            });
+            progress = true;
+        }
+        if !self.cleanup_running.is_empty() {
+            // A dropped tick still fences the scheduler: a cleanup callback may
+            // have made an external effect whose result is not yet observed.
+            struct CleanupGuard {
+                poisoned: Arc<std::sync::atomic::AtomicBool>,
+                complete: bool,
+            }
+            impl Drop for CleanupGuard {
+                fn drop(&mut self) {
+                    if !self.complete {
+                        self.poisoned
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+            let mut guard = CleanupGuard {
+                poisoned: self.poisoned.clone(),
+                complete: false,
+            };
+            tokio::task::yield_now().await;
+            while let Some(result) = self.cleanup_jobs.try_join_next() {
+                match result {
+                    Ok((id, Ok(changed))) => {
+                        self.cleanup_running.remove(&id);
+                        progress |= changed;
+                    }
+                    Ok((
+                        _,
+                        Err(
+                            error @ (crate::runtime::Error::Storage(_)
+                            | crate::runtime::Error::Failed),
+                        ),
+                    )) => {
+                        return Err(Error::Handler(format!("conversation cleanup: {error}")));
+                    }
+                    Ok((id, Err(error))) => {
+                        self.cleanup_running.remove(&id);
+                        self.cleanup_failures.insert(id, error.to_string());
+                    }
+                    Err(error) => {
+                        return Err(Error::Handler(format!(
+                            "conversation cleanup worker: {error}"
+                        )));
+                    }
+                }
+            }
+            guard.complete = true;
+            progress |= !self.cleanup_running.is_empty();
+        }
+        Ok(progress)
     }
 
     /// Reserve at most one invocation; run it outside the scheduler mutex.
@@ -3511,6 +3577,9 @@ impl Scheduler {
                 for child in &tasks {
                     if child.task.owner() != &TaskOwner::Task(id)
                         || child.task.is_background()
+                        // A terminal anchor can lead back to the live root
+                        // even after the graph no longer reports a live cycle.
+                        || seen.contains(&child.task.id())
                         || graph.cyclic_task_edge(id, child.task.id())
                     {
                         continue;
@@ -15151,5 +15220,214 @@ mod standalone_foreground_cleanup_tests {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn independent_aborted_child_of_successful_completing_owner_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = harness.create_conversation(cfg.clone()).unwrap();
+        let child = harness.create_conversation(cfg).unwrap();
+        harness.submit(child, None, "active".into()).unwrap();
+        let root = task(1, TaskOwner::Conversation(owner), "success");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db).save(&[Save::Create(&root)]).unwrap();
+        let edge = Edge {
+            task: root.id(),
+            task_owner: root.owner().clone(),
+            child,
+            mode: Mode::Foreground,
+        };
+        let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let mut definitions = Registry::default();
+        definitions.register("success", true, |_: &Task| Ok(Step::Succeed(json!("done"))));
+        drop(harness);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, definitions.clone(), options())
+                .unwrap();
+        for _ in 0..4 {
+            scheduler.tick(0).unwrap();
+            if matches!(
+                scheduler.get(root.id()).unwrap().unwrap().state(),
+                TaskState::Completing(_)
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            TaskState::Completing(_)
+        ));
+        scheduler
+            .validator
+            .as_mut()
+            .unwrap()
+            .request_abort(child)
+            .unwrap();
+        drop(scheduler);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, definitions, options()).unwrap();
+        for _ in 0..50 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if scheduler.get(root.id()).unwrap().unwrap().is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(
+            scheduler.get(root.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("done"))
+        );
+        assert!(
+            !scheduler
+                .validator
+                .as_ref()
+                .unwrap()
+                .conversation(child)
+                .unwrap()
+                .abort_requested
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_owned_graph_callback_error_or_delay_does_not_block_other_graph() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ControlledUsage {
+            request: Uuid,
+            fail: bool,
+            entered: Arc<AtomicUsize>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl Model for ControlledUsage {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                panic!("model must not run")
+            }
+            async fn record_usage(
+                &self,
+                request: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                assert_eq!(request, self.request);
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                if self.fail {
+                    return Err(ModelError::Model("usage failed".into()));
+                }
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(&path, options()).unwrap();
+            let cfg = Config {
+                model: "stub".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            };
+            let owner = harness.create_conversation(cfg.clone()).unwrap();
+            let a = harness.create_conversation(cfg.clone()).unwrap();
+            let b = harness.create_conversation(cfg).unwrap();
+            let (slow, fast) = if a < b { (a, b) } else { (b, a) };
+            let first = task(1, TaskOwner::Conversation(owner), "parent");
+            let second = task(2, TaskOwner::Conversation(owner), "parent");
+            let db = Store::open(&path).unwrap();
+            TaskStore::new(&db)
+                .save(&[Save::Create(&first), Save::Create(&second)])
+                .unwrap();
+            for (task, child) in [(&first, slow), (&second, fast)] {
+                let edge = Edge {
+                    task: task.id(),
+                    task_owner: task.owner().clone(),
+                    child,
+                    mode: Mode::Foreground,
+                };
+                let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+                db.commit(&batch.checks, &batch.mutations).unwrap();
+            }
+            drop(harness);
+            let request = Uuid::new_v4();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut opts = options();
+            opts.model = Arc::new(ControlledUsage {
+                request,
+                fail,
+                entered: entered.clone(),
+                release: release.clone(),
+            });
+            let mut scheduler =
+                Scheduler::open_with_conversation_runtime(&path, registry(), opts).unwrap();
+            scheduler.request_abort(first.id()).unwrap();
+            scheduler.request_abort(second.id()).unwrap();
+            let key = format!("runtime/conversation/{slow}").into_bytes();
+            let entry = db.get(&key).unwrap().unwrap();
+            let mut state: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+            state["phase"] =
+                json!({"ModelRunning": {"turns":0, "request_id":request, "restarts":0}});
+            db.commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&state).unwrap(),
+                }],
+            )
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                for _ in 0..100 {
+                    scheduler
+                        .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                        .await
+                        .unwrap();
+                    if entered.load(Ordering::SeqCst) > 0
+                        && scheduler.get(second.id()).unwrap().unwrap().is_terminal()
+                    {
+                        return;
+                    }
+                }
+                panic!("independent graph did not complete");
+            })
+            .await
+            .expect("other graph stalled");
+            assert_eq!(
+                scheduler.get(second.id()).unwrap().unwrap().state(),
+                &TaskState::Cancelled
+            );
+            assert!(!scheduler.get(first.id()).unwrap().unwrap().is_terminal());
+            if fail {
+                assert!(
+                    scheduler
+                        .conversation_cleanup_failures()
+                        .contains_key(&slow)
+                );
+            } else {
+                release.notify_one();
+                for _ in 0..50 {
+                    scheduler
+                        .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                        .await
+                        .unwrap();
+                    if scheduler.get(first.id()).unwrap().unwrap().is_terminal() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    scheduler.get(first.id()).unwrap().unwrap().state(),
+                    &TaskState::Cancelled
+                );
+            }
+        }
     }
 }

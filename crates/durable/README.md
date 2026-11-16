@@ -34,19 +34,25 @@ again when the driver is restarted. Shutdown can interrupt cleanup; blocked effe
 still require reconciliation. To enable the same cleanup from the standalone task
 scheduler, use `task_scheduler::Scheduler::open_with_conversation_runtime` with
 runtime options. It shares one exclusive store owner with its attached harness.
-`tick_with_conversation_cleanup` drives one task step and at most one marked
-conversation cleanup step for foreground conversations owned by aborting or
-failed tasks, without executing retained queued input. Busy conversation workers
-are skipped and can be retried on a later tick. Unrelated conversation aborts
-are left to their own runtime workers. A reset retained in a failed-idle
-conversation remains queued for a later boundary and does not hold its failed
-task owner open. A cleanup error or cancelled
-cleanup or a dropped cleanup future poisons the task scheduler; drop it and reopen before retrying. Hosts needing
+`tick_with_conversation_cleanup` drives one task step and schedules up to eight
+independent marked task-owned conversation cleanups without executing retained
+queued input. A child marked independently is discovered even if its owner is
+completing successfully. Busy workers are retried. Callback errors are exposed
+by `conversation_cleanup_failures`; that conversation remains marked and is
+retried after reopening, while other graphs continue. Storage failures, cancelled
+or dropped cleanup ticks poison the scheduler and require reopening. Dropping the
+scheduler cancels its cleanup jobs; their attachments remain held until the jobs
+actually stop. Eight indefinitely blocked callbacks can occupy all cleanup slots,
+so the bound does not guarantee progress under arbitrary callback saturation.
+A reset retained in a failed-idle conversation remains queued for a later boundary
+and does not hold its failed task owner open. Hosts needing
 additional provider or extension configuration can configure a `Harness` and use
 `Harness::attach_tasks` instead; the scheduler retains a shared harness worker.
 A `task_driver::Driver`
-started from that scheduler runs its cleanup coordinator automatically. Plain
-`Scheduler::open` has no conversation runtime and still rejects foreground aborts.
+started from that scheduler runs its cleanup coordinator automatically. The
+driver's coordinator still stops the driver on any cleanup failure; per-conversation
+failure isolation described above applies to manual ticks. Plain `Scheduler::open`
+has no conversation runtime and still rejects foreground aborts.
 
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before

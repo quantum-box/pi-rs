@@ -1869,8 +1869,7 @@ impl Conversation {
     // like a kept input; it must not hold its failed owner open indefinitely.
     pub(crate) fn is_failure_cleanup_busy(&self) -> bool {
         if matches!(self.phase, Phase::FailedIdle) {
-            self.active.is_some()
-                || self.submissions.iter().any(|s| s.status == Status::Running)
+            self.active.is_some() || self.submissions.iter().any(|s| s.status == Status::Running)
         } else {
             self.is_idle_wait_busy()
         }
@@ -13010,83 +13009,53 @@ impl Harness {
         }
         Ok(())
     }
-    // Drive only already-marked abort cleanup, never retained queued input.
-    pub(crate) async fn settle_one_owned_abort(
-        &self,
-        cancel: &CancellationToken,
-    ) -> Result<bool, Error> {
+    // Discover marked owned conversations independently of task state: a child
+    // may be aborted while its owner is successfully completing, or after an
+    // anchor has terminated. Standalone root conversations have no task edge.
+    pub(crate) fn owned_abort_candidates(&self) -> Result<Vec<Uuid>, Error> {
         let tasks = crate::task_store::TaskStore::new(self.owner.store())
             .list()
             .map_err(|error| Error::Invalid(format!("task lookup: {error}")))?;
         let edges = crate::ownership_edge::EdgeStore::new(self.owner.store());
-        let mut pending: Vec<_> = tasks
-            .iter()
-            .filter(|record| {
-                !record.task.is_terminal()
-                    && (record.task.abort_requested()
-                        || matches!(
-                            record.task.state(),
-                            crate::task::TaskState::CompletingFailed(_)
-                        ))
-            })
-            .map(|record| record.task.id())
-            .collect();
-        let mut visited = std::collections::HashSet::new();
-        let mut conversations = std::collections::BTreeSet::new();
-        while let Some(id) = pending.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            let anchor = tasks
-                .iter()
-                .find(|record| record.task.id() == id)
-                .ok_or_else(|| Error::Invalid("missing task owner".into()))?;
-            pending.extend(tasks.iter().filter_map(|record| {
-                (record.task.owner() == &crate::task::TaskOwner::Task(id)
-                    && !record.task.is_background())
-                .then_some(record.task.id())
-            }));
+        let mut candidates = std::collections::BTreeSet::new();
+        for anchor in &tasks {
             for edge in edges
-                .children(id)
+                .children(anchor.task.id())
                 .map_err(|error| Error::Invalid(format!("ownership edges: {error}")))?
             {
                 if edge.edge.task_owner != *anchor.task.owner() {
                     return Err(Error::Invalid("ownership edge owner mismatch".into()));
                 }
-                if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
-                    continue;
+                if self.load(edge.edge.child)?.0.abort_requested {
+                    candidates.insert(edge.edge.child);
                 }
-                let child = edge.edge.child;
-                conversations.insert(child);
-                pending.extend(tasks.iter().filter_map(|record| {
-                    (record.task.owner() == &crate::task::TaskOwner::Conversation(child)
-                        && !record.task.is_background())
-                    .then_some(record.task.id())
-                }));
             }
         }
-        for id in conversations {
-            let (observed, _) = self.load(id)?;
-            if !observed.abort_requested {
-                continue;
-            }
-            if cancel.is_cancelled() {
-                return Err(Error::Interrupted);
-            }
-            let control = self.owner.conversation_controls().get(id);
-            let Ok(_worker) = control.worker.try_lock() else {
-                continue;
-            };
-            let mut worker = self.worker();
-            worker.execution_gate = Some(control.gate.clone());
-            let (conversation, version) = worker.load(id)?;
-            if conversation.abort_requested
-                && worker.settle_abort(conversation, version, cancel).await?
-            {
-                return Ok(true);
-            }
+        Ok(candidates.into_iter().collect())
+    }
+
+    // Run one marked conversation only; a separate worker isolates callbacks
+    // and locks from other independently owned graphs.
+    pub(crate) async fn settle_owned_abort(
+        &self,
+        id: Uuid,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted);
         }
-        Ok(false)
+        let control = self.owner.conversation_controls().get(id);
+        let Ok(_worker) = control.worker.try_lock() else {
+            return Ok(false);
+        };
+        let mut worker = self.worker();
+        worker.execution_gate = Some(control.gate.clone());
+        let (conversation, version) = worker.load(id)?;
+        if conversation.abort_requested {
+            worker.settle_abort(conversation, version, cancel).await
+        } else {
+            Ok(false)
+        }
     }
 
     fn task_tool_result(
