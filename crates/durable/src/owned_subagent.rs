@@ -40,6 +40,7 @@ fn reservation_key(task: Uuid, name: &str) -> Vec<u8> {
     key.extend_from_slice(name.as_bytes());
     key
 }
+pub(crate) const NOTIFICATION_BINDING_PREFIX: &[u8] = b"durable/owned-subagent-notify/";
 /// Reserved destinations are permanent, including after settlement and reopen.
 pub(crate) fn notification_binding_key(notify: &SubmissionNotify) -> Vec<u8> {
     use std::fmt::Write;

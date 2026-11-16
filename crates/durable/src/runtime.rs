@@ -3060,14 +3060,28 @@ pub(crate) struct PreparedConversationSave {
 }
 
 impl PreparedConversationSave {
-    /// Reject overlapping keys: store checks observe the pre-commit state, so
-    /// independently prepared writes to the same key cannot safely be combined.
-    pub(crate) fn extend(&mut self, other: Self) -> Result<(), Error> {
+    /// Share identical read-only reservation checks; reject every other overlap.
+    pub(crate) fn extend(&mut self, mut other: Self) -> Result<(), Error> {
         if !Arc::ptr_eq(&self.owner, &other.owner) {
             return Err(Error::Invalid(
                 "prepared saves belong to different stores".into(),
             ));
         }
+        // Both signal authorization and notification admission fence the same
+        // reservation. Sharing that exact observation is safe only when neither
+        // participant changes the reservation itself.
+        other.checks.retain(|check| {
+            let mutated = self
+                .mutations
+                .iter()
+                .chain(&other.mutations)
+                .any(|mutation| match mutation {
+                    Mutation::Put { key, .. } | Mutation::Delete { key } => key == &check.key,
+                });
+            !(check.key.starts_with(crate::owned_subagent::NOTIFICATION_BINDING_PREFIX)
+                && !mutated
+                && self.checks.iter().any(|existing| existing == check))
+        });
         let keys: std::collections::HashSet<&[u8]> = self
             .checks
             .iter()
@@ -5980,8 +5994,8 @@ impl Harness {
         self.prepare_conversation_save(state, expected, None, &[], &[])
     }
 
-    /// Prepare independent saves against one store snapshot. Any overlap is
-    /// rejected, and callers must discard the whole batch after a conflict.
+    /// Prepare independent saves against one store snapshot. Only identical,
+    /// read-only reservation checks can overlap; conflicts discard the batch.
     pub(crate) fn prepare_saves(
         &self,
         saves: &[(&Conversation, Expected)],
@@ -19692,6 +19706,45 @@ fn valid_schema(schema: &serde_json::Value, arguments: &serde_json::Value) -> bo
 
 #[cfg(test)]
 mod scheduler_tests {
+    #[test]
+    fn prepared_save_reservation_checks_only_share_identical_read_fences() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Arc::new(OwnedStore::open(dir.path().join("db")).unwrap());
+        let key = crate::owned_subagent::notification_binding_key(&SubmissionNotify {
+            task_id: Uuid::new_v4(),
+            key: "same".into(),
+        });
+        let make = |expected, mutations| PreparedConversationSave {
+            owner: owner.clone(),
+            checks: vec![Check {
+                key: key.clone(),
+                expected,
+            }],
+            mutations,
+        };
+        let mut batch = make(Expected::Missing, vec![]);
+        batch.extend(make(Expected::Missing, vec![])).unwrap();
+        assert_eq!(batch.checks.len(), 1);
+        assert!(batch.extend(make(Expected::Version(1), vec![])).is_err());
+        assert!(
+            batch
+                .extend(make(Expected::MissingBefore(Instant::now()), vec![]))
+                .is_err()
+        );
+        let write = Mutation::Put {
+            key: key.clone(),
+            value: vec![],
+        };
+        assert!(
+            batch
+                .extend(make(Expected::Missing, vec![write.clone()]))
+                .is_err()
+        );
+        let mut writer = make(Expected::Missing, vec![write]);
+        assert!(writer.extend(make(Expected::Missing, vec![])).is_err());
+    }
+
     #[test]
     fn notification_deadline_retry_preserves_missing_aba_fence() {
         use super::*;
