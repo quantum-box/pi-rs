@@ -967,6 +967,16 @@ Unlike upstream registration-level caller metadata, these overrides are
 conversation-scoped and apply by name, including to a replacement registered
 under that name; hosts must maintain the policy when registrations change.
 
+For a closer upstream snapshot, `ensure_task_owned_subagent_inheriting_settings`,
+`submit_task_owned_subagent_inheriting_settings`, and
+`submit_task_owned_subagent_notified_inheriting_settings` also capture the
+nearest owner's model, system prompt and output limit with its tool settings.
+Private v3 provenance binds the configuration source; retries and reopening keep
+the committed snapshot. The parent must select no extensions or provider adapter.
+Environment, queues and history are not copied. Scheduler counterparts schedule
+submitted children after the snapshot commits. The public `Admission` shape is
+unchanged.
+
 For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
 `submit_task_owned_subagent_inheriting_tools` opt in to copying the nearest
 owning conversation's enabled tools, model-facing selection and tool filters.
