@@ -1806,6 +1806,15 @@ impl Conversation {
         self.active.is_some()
             || !self.pending_resets.is_empty()
             || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
+            || self
+                .submissions
+                .iter()
+                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+    }
+    fn is_idle_wait_busy(&self) -> bool {
+        self.active.is_some()
+            || !self.pending_resets.is_empty()
+            || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
             || self.submissions.iter().any(|s| {
                 matches!(s.status, Status::Running)
                     || (s.status == Status::Queued && !matches!(self.phase, Phase::FailedIdle))
@@ -15765,7 +15774,7 @@ impl Scheduler {
                 }
                 let entry = snapshots.get(&Harness::key(id)).ok_or(Error::NotFound)?;
                 let conversation: Conversation = serde_json::from_slice(&entry.value)?;
-                busy |= conversation.is_working() || conversation.abort_requested;
+                busy |= conversation.is_idle_wait_busy() || conversation.abort_requested;
                 busy |= summaries.iter().any(|summary| {
                     summary.operation.auto_place()
                         && summary.operation.session_id() == id
