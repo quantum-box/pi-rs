@@ -65,6 +65,34 @@ fn inheritance_v2_key(task: Uuid, name: &str) -> Vec<u8> {
     key
 }
 
+// Internal metadata leaves the public Admission struct source-compatible.
+#[derive(Serialize, Deserialize)]
+struct StoredAdmission {
+    #[serde(flatten)]
+    admission: Admission,
+    #[serde(default, skip_serializing_if = "is_false")]
+    inherit_parent_config: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inheritance_policy_version: Option<u8>,
+}
+
+fn inheritance_v3_key(task: Uuid, name: &str) -> Vec<u8> {
+    let mut key = format!("durable/owned-subagent-policy-provenance-v3/{task}/").into_bytes();
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InheritanceV3 {
+    admission: Admission,
+    inherit_parent_config: bool,
+    parent: Uuid,
+    parent_version: u64,
+    parent_extensions_empty: bool,
+    parent_provider_adapter_absent: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InheritanceV2 {
@@ -83,12 +111,16 @@ pub(crate) fn check_inheritance_provenance(
     store: &durable_store::Store,
 ) -> Result<bool, durable_store::Error> {
     for (key, entry) in store.list(b"durable/owned-subagent/")? {
-        let Ok(admission) = serde_json::from_slice::<Admission>(&entry.value) else {
+        let Ok(stored) = serde_json::from_slice::<StoredAdmission>(&entry.value) else {
             return Ok(false);
         };
+        let admission = stored.admission;
         if admission.key.is_empty()
             || key != reservation_key(admission.task, &admission.key)
             || admission.task_owner == TaskOwner::Conversation(admission.child)
+            || stored.inherit_parent_config
+            || (admission.inherit_parent_tools && stored.inheritance_policy_version != Some(3))
+            || (!admission.inherit_parent_tools && stored.inheritance_policy_version.is_some())
             || crate::runtime::validate_config(&admission.config).is_err()
             || crate::runtime::validate_allowed_tools(&admission.allowed_tools).is_err()
             || admission.submission.as_ref().is_some_and(|submission| {
@@ -102,7 +134,11 @@ pub(crate) fn check_inheritance_provenance(
         {
             return Ok(false);
         }
+        let policy_entry = store.get(&inheritance_v3_key(admission.task, &admission.key))?;
         if !admission.inherit_parent_tools {
+            if policy_entry.is_some() {
+                return Ok(false);
+            }
             continue;
         }
         let Some(entry) = store.get(&inheritance_v2_key(admission.task, &admission.key))? else {
@@ -112,6 +148,21 @@ pub(crate) fn check_inheritance_provenance(
             return Ok(false);
         };
         if provenance.admission != admission || provenance.parent == admission.child {
+            return Ok(false);
+        }
+        let Some(entry) = policy_entry else {
+            return Ok(false);
+        };
+        let Ok(policy) = serde_json::from_slice::<InheritanceV3>(&entry.value) else {
+            return Ok(false);
+        };
+        if policy.admission != admission
+            || policy.inherit_parent_config
+            || policy.parent != provenance.parent
+            || policy.parent_version != provenance.parent_version
+            || !policy.parent_extensions_empty
+            || !policy.parent_provider_adapter_absent
+        {
             return Ok(false);
         }
     }
@@ -418,12 +469,17 @@ impl Harness {
         }
         let key = reservation_key(task, name);
         let provenance_key = inheritance_v2_key(task, name);
+        let policy_key = inheritance_v3_key(task, name);
         let mut inherited_conflicts = 0;
         loop {
             let store = self.subagent_store()?;
             if let Some(entry) = store.get(&key)? {
-                let a: Admission = serde_json::from_slice(&entry.value)?;
-                if a.task != task
+                let stored: StoredAdmission = serde_json::from_slice(&entry.value)?;
+                let a = stored.admission;
+                if stored.inherit_parent_config
+                    || (inherit_parent_tools && stored.inheritance_policy_version != Some(3))
+                    || (!inherit_parent_tools && stored.inheritance_policy_version.is_some())
+                    || a.task != task
                     || a.task_owner != owner
                     || a.key != name
                     || a.config != config
@@ -444,7 +500,19 @@ impl Harness {
                     if provenance.admission != a || provenance.parent == a.child {
                         return Err(invalid());
                     }
-                } else if provenance.is_some() {
+                    let entry = store.get(&policy_key)?.ok_or_else(invalid)?;
+                    let policy: InheritanceV3 =
+                        serde_json::from_slice(&entry.value).map_err(|_| invalid())?;
+                    if policy.admission != a
+                        || policy.inherit_parent_config
+                        || policy.parent != provenance.parent
+                        || policy.parent_version != provenance.parent_version
+                        || !policy.parent_extensions_empty
+                        || !policy.parent_provider_adapter_absent
+                    {
+                        return Err(invalid());
+                    }
+                } else if provenance.is_some() || store.get(&policy_key)?.is_some() {
                     return Err(invalid());
                 }
                 if let Some(notify) = &notify {
@@ -479,7 +547,7 @@ impl Harness {
                 }
                 return Ok(a);
             }
-            if store.get(&provenance_key)?.is_some() {
+            if store.get(&provenance_key)?.is_some() || store.get(&policy_key)?.is_some() {
                 return Err(invalid());
             }
             let tk = task_store::key(task);
@@ -562,7 +630,7 @@ impl Harness {
                 let (parent, parent_checks) = owning_conversation(store, &owner)?;
                 // Even an extension that is not currently model-facing may shadow a
                 // host tool with the same name. Never copy settings in that case.
-                if !parent.extensions.is_empty() {
+                if !parent.extensions.is_empty() || parent.provider_adapter.is_some() {
                     return Err(invalid());
                 }
                 let parent_version = match parent_checks.last().map(|check| &check.expected) {
@@ -619,7 +687,11 @@ impl Harness {
                 },
                 Mutation::Put {
                     key: key.clone(),
-                    value: serde_json::to_vec(&a)?,
+                    value: serde_json::to_vec(&StoredAdmission {
+                        admission: a.clone(),
+                        inherit_parent_config: false,
+                        inheritance_policy_version: inherit_parent_tools.then_some(3),
+                    })?,
                 },
                 Mutation::Put {
                     key: ek,
@@ -630,10 +702,25 @@ impl Harness {
                 key: provenance_key.clone(),
                 expected: Expected::Missing,
             });
+            checks.push(Check {
+                key: policy_key.clone(),
+                expected: Expected::Missing,
+            });
             if let Some(provenance) = &provenance {
                 mutations.push(Mutation::Put {
                     key: provenance_key.clone(),
                     value: serde_json::to_vec(provenance)?,
+                });
+                mutations.push(Mutation::Put {
+                    key: policy_key.clone(),
+                    value: serde_json::to_vec(&InheritanceV3 {
+                        admission: a.clone(),
+                        inherit_parent_config: false,
+                        parent: provenance.parent,
+                        parent_version: provenance.parent_version,
+                        parent_extensions_empty: true,
+                        parent_provider_adapter_absent: true,
+                    })?,
                 });
             }
             if let Some((_, revision_key, expected)) = &boundary {
@@ -1393,6 +1480,242 @@ mod tests {
         let child = h.conversation(admission.child).unwrap();
         assert_eq!(child.allowed_tools, Some(vec!["beta".into()]));
         assert!(admission.submission.is_some());
+    }
+
+    struct GuardedAdapter;
+    #[async_trait]
+    impl crate::model::ProviderAdapter for GuardedAdapter {
+        fn id(&self) -> &str {
+            "guarded/v1"
+        }
+        async fn prepare(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+        ) -> Result<serde_json::Value, ModelError> {
+            unreachable!()
+        }
+        fn validate(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+            _: &serde_json::Value,
+        ) -> Result<(), ModelError> {
+            unreachable!()
+        }
+        async fn dispatch(
+            &self,
+            _: &crate::model::ProviderAttempt,
+            _: &ModelRequest,
+            _: serde_json::Value,
+        ) -> Result<ModelStream, ModelError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn adapter_selection_is_fenced_and_inherited_admission_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(Arc::new(GuardedAdapter))
+            .unwrap();
+        let (task, owner) = setup(&mut h);
+        let TaskOwner::Conversation(parent) = owner.clone() else {
+            unreachable!()
+        };
+        let mut concurrent = h.worker();
+        BEFORE_INHERITED_ADMISSION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                concurrent.select_provider_adapter(parent, true).unwrap();
+            }))
+        });
+        assert!(
+            h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner.clone(),
+                "race",
+                config(),
+                "work".into(),
+                "answer".into()
+            )
+            .is_err()
+        );
+        let store = h.subagent_store().unwrap();
+        assert!(store.get(&reservation_key(task, "race")).unwrap().is_none());
+        assert!(
+            store
+                .get(&inheritance_v2_key(task, "race"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&inheritance_v3_key(task, "race"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&notification_binding_key(&SubmissionNotify {
+                    task_id: task,
+                    key: "answer".into()
+                }))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.ensure_task_owned_subagent_inheriting_tools(
+                task,
+                owner.clone(),
+                "denied",
+                config(),
+                Mode::Foreground
+            )
+            .is_err()
+        );
+        h.ensure_task_owned_subagent(task, owner.clone(), "ordinary", config(), Mode::Background)
+            .unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        assert!(
+            h.ensure_task_owned_subagent_inheriting_tools(
+                task,
+                owner,
+                "after-reopen",
+                config(),
+                Mode::Foreground
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_queued_child_and_duplicate_admission_are_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.install_provider_adapter(Arc::new(GuardedAdapter))
+            .unwrap();
+        let (task, owner) = setup(&mut h);
+        let TaskOwner::Conversation(parent) = owner.clone() else {
+            unreachable!()
+        };
+        let a = h
+            .submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner.clone(),
+                "child",
+                config(),
+                "queued".into(),
+                "answer".into(),
+            )
+            .unwrap();
+        h.select_provider_adapter(parent, true).unwrap();
+        let store = h.subagent_store().unwrap();
+        let reservation = reservation_key(task, "child");
+        let entry = store.get(&reservation).unwrap().unwrap();
+        let policy = inheritance_v3_key(task, "child");
+        let policy_entry = store.get(&policy).unwrap().unwrap();
+        // Recreate the exact v2 storage shape, which has no adapter evidence.
+        store
+            .commit(
+                &[
+                    Check {
+                        key: reservation.clone(),
+                        expected: Expected::Version(entry.version),
+                    },
+                    Check {
+                        key: policy.clone(),
+                        expected: Expected::Version(policy_entry.version),
+                    },
+                ],
+                &[
+                    Mutation::Put {
+                        key: reservation.clone(),
+                        value: serde_json::to_vec(&a).unwrap(),
+                    },
+                    Mutation::Delete { key: policy },
+                ],
+            )
+            .unwrap();
+        let child_before = store.get(&child_key(a.child)).unwrap().unwrap();
+        let task_before = store.get(&task_store::key(task)).unwrap().unwrap();
+        assert!(
+            h.submit_task_owned_subagent_notified_inheriting_tools(
+                task,
+                owner,
+                "child",
+                config(),
+                "queued".into(),
+                "answer".into()
+            )
+            .is_err()
+        );
+        drop(h);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+        assert!(matches!(
+            crate::task_scheduler::Scheduler::open(&path, Default::default()),
+            Err(crate::task_scheduler::Error::UntrustedToolInheritance)
+        ));
+        let raw = durable_store::owner::OwnedStore::open(&path).unwrap();
+        let store = raw.store();
+        let child_after = store.get(&child_key(a.child)).unwrap().unwrap();
+        let task_after = store.get(&task_store::key(task)).unwrap().unwrap();
+        assert_eq!(
+            (child_after.version, child_after.value),
+            (child_before.version, child_before.value)
+        );
+        assert_eq!(
+            (task_after.version, task_after.value),
+            (task_before.version, task_before.value)
+        );
+        drop(raw);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+    }
+
+    #[test]
+    fn v3_policy_tampering_quarantines_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        h.ensure_task_owned_subagent_inheriting_tools(
+            task,
+            owner,
+            "child",
+            config(),
+            Mode::Foreground,
+        )
+        .unwrap();
+        let store = h.subagent_store().unwrap();
+        let key = inheritance_v3_key(task, "child");
+        let entry = store.get(&key).unwrap().unwrap();
+        let mut policy: InheritanceV3 = serde_json::from_slice(&entry.value).unwrap();
+        policy.parent_provider_adapter_absent = false;
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&policy).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
     }
 
     #[test]

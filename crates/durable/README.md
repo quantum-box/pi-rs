@@ -976,8 +976,9 @@ ownership edge, inherited snapshot and provenance. The scheduler counterpart
 schedules only after commit. The key, input and signal destination are permanent;
 matching retries recover the same submission after abort or reopen, and competing
 destinations cannot both commit. Parent changes are fenced before publication.
-The parent must have no selected extensions: admission rejects any extension,
-even one whose tool names appear restricted, because names can shadow host tools.
+The parent must have no selected extensions or provider adapter. Extensions can
+shadow host tools, and omitting an adapter can bypass authorization, budget or
+endpoint restrictions. Both conditions are checked on the fenced snapshot.
 The parent snapshot and ownership chain are fenced in the child transaction;
 concurrent changes cause a retry. The committed settings are a snapshot, not a
 live link. A separately versioned provenance record binds each new reservation;
@@ -988,11 +989,19 @@ non-inheriting APIs retain their existing defaults.
 
 Before conversation recovery or task scheduler attachment, the runtime scans
 owned-subagent reservations and refuses to open if an inheritance-marked record
-lacks matching v2 provenance. This quarantines the entire affected store before
+lacks matching v2 and v3 provenance. This quarantines the entire affected store before
 any queued conversation or task can dispatch; malformed reservations also fail
 closed. No records are migrated or repaired automatically. An unmarked record
 cannot prove that its child settings were not copied by other code or from an
 older store: hosts must review such pre-copied stores before opening them.
+Upgrade consequence: inherited v2 reservations do not prove the parent lacked a
+provider adapter, so their presence quarantines the whole store before any
+conversation or task dispatch, including duplicate admission. A host must review
+and reconcile affected stores before use; there is no automatic migration. New
+inherited reservations commit v3 policy provenance with their v2 record, proving
+the fenced parent snapshot had no selected extensions or adapter. Non-inheriting
+legacy reservations remain supported. Unmarked experimental or externally copied
+children cannot be identified reliably and pre-existing stores require host review.
 Direct store writers and executors outside this ownership protocol are not fenced.
 
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
