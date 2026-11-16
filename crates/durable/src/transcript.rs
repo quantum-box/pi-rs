@@ -171,9 +171,31 @@ impl<'a> Transcript<'a> {
         blocks: Option<Vec<MessageContentBlocks>>,
         create: bool,
     ) -> Result<(Batch, Cursor), Error> {
-        if blocks
-            .as_ref()
-            .is_some_and(|blocks| !valid_block_bindings(value, blocks))
+        let (batch, mut positions) = self.prepare_writes(&[(value.clone(), blocks)], create)?;
+        Ok((batch, positions.pop().expect("one transcript record")))
+    }
+
+    /// Prepare ordered immutable entries under one checked head update.
+    /// Positions correspond to the input records and can be used to fork at
+    /// an intermediate entry after the batch commits. An empty batch is invalid.
+    pub fn prepare_append_batch(
+        &self,
+        records: &[(Value, Option<Vec<MessageContentBlocks>>)],
+    ) -> Result<(Batch, Vec<Cursor>), Error> {
+        self.prepare_writes(records, false)
+    }
+
+    fn prepare_writes(
+        &self,
+        records: &[(Value, Option<Vec<MessageContentBlocks>>)],
+        create: bool,
+    ) -> Result<(Batch, Vec<Cursor>), Error> {
+        if records.is_empty()
+            || records.iter().any(|(value, blocks)| {
+                blocks
+                    .as_ref()
+                    .is_some_and(|blocks| !valid_block_bindings(value, blocks))
+            })
         {
             return Err(Error::Corrupt);
         }
@@ -192,55 +214,57 @@ impl<'a> Transcript<'a> {
         if let Some(tip) = head.tip {
             self.load_entry(tip)?;
         }
-        let sequence = head
-            .tip
-            .map_or(Some(1), |t| t.sequence.checked_add(1))
-            .ok_or(Error::SequenceExhausted)?;
-        let tip = Link {
-            id: Uuid::new_v4(),
-            sequence,
-        };
-        let entry = Entry {
-            format: if blocks.is_some() { 2 } else { 1 },
-            id: tip.id,
-            sequence,
-            previous: head.tip,
-            value: value.clone(),
-            content_blocks: blocks,
-        };
-        let hk = head_key(self.id);
-        let ek = entry_key(tip.id);
-        Ok((
-            Batch {
-                checks: vec![
-                    Check {
-                        key: hk.clone(),
-                        expected,
-                    },
-                    Check {
-                        key: ek.clone(),
-                        expected: Expected::Missing,
-                    },
-                ],
-                mutations: vec![
-                    Mutation::Put {
-                        key: ek,
-                        value: encode(&entry)?,
-                    },
-                    Mutation::Put {
-                        key: hk,
-                        value: encode(&Head {
-                            format: 1,
-                            tip: Some(tip),
-                        })?,
-                    },
-                ],
-            },
-            Cursor {
+        let head_key = head_key(self.id);
+        let mut checks = vec![Check {
+            key: head_key.clone(),
+            expected,
+        }];
+        let mut mutations = Vec::with_capacity(records.len() + 1);
+        let mut positions = Vec::with_capacity(records.len());
+        let mut previous = head.tip;
+        let mut keys = std::collections::HashSet::new();
+        for (value, blocks) in records {
+            let sequence = previous
+                .map_or(Some(1), |link| link.sequence.checked_add(1))
+                .ok_or(Error::SequenceExhausted)?;
+            let tip = Link {
+                id: Uuid::new_v4(),
+                sequence,
+            };
+            let key = entry_key(tip.id);
+            if !keys.insert(tip.id) {
+                return Err(Error::Corrupt);
+            }
+            let entry = Entry {
+                format: if blocks.is_some() { 2 } else { 1 },
+                id: tip.id,
+                sequence,
+                previous,
+                value: value.clone(),
+                content_blocks: blocks.clone(),
+            };
+            checks.push(Check {
+                key: key.clone(),
+                expected: Expected::Missing,
+            });
+            mutations.push(Mutation::Put {
+                key,
+                value: encode(&entry)?,
+            });
+            positions.push(Cursor {
                 transcript: self.id,
                 next: Some(tip),
-            },
-        ))
+            });
+            previous = Some(tip);
+        }
+        mutations.push(Mutation::Put {
+            key: head_key,
+            value: encode(&Head {
+                format: 1,
+                tip: previous,
+            })?,
+        });
+        Ok((Batch { checks, mutations }, positions))
     }
 
     /// Fork the current head. A simultaneous source append makes this batch
@@ -591,6 +615,94 @@ mod tests {
                 return result;
             }
         }
+    }
+
+    #[test]
+    fn ordered_batch_is_atomic_and_forkable_at_each_block_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let id = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let binding = |message_id, text: &str| MessageContentBlocks {
+            message_id,
+            blocks: vec![json!({"type":"text", "text":text})],
+        };
+        let record = |message_id| json!({"ReplaceV2":{"ids":[message_id],"messages":[{"role":"user","content":""}],"commit":1,"origin":id}});
+        let records = vec![
+            (record(first), Some(vec![binding(first, "first")])),
+            (record(second), Some(vec![binding(second, "second")])),
+        ];
+        let db = Store::open(&path).unwrap();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        let before = t.snapshot().unwrap();
+        let (batch, cursors) = t.prepare_append_batch(&records).unwrap();
+        assert!(
+            t.read_with_blocks(&before, NonZeroUsize::MIN)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(matches!(
+            t.read_with_blocks(&cursors[0], NonZeroUsize::MIN),
+            Err(Error::Corrupt)
+        ));
+        commit(&db, batch);
+        let (fork, _) = t.prepare_fork_at(&cursors[0], child).unwrap();
+        commit(&db, fork);
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        let t = Transcript::new(&db, id);
+        let page = t
+            .read_with_blocks(&t.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(
+            page.records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(page.records[0].content_blocks, records[1].1);
+        assert_eq!(page.records[1].content_blocks, records[0].1);
+        let fork = Transcript::new(&db, child);
+        let page = fork
+            .read_with_blocks(&fork.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].content_blocks, records[0].1);
+    }
+
+    #[test]
+    fn ordered_batch_rejects_invalid_records_and_stale_head_without_partial_entries() {
+        let db = Store::memory().unwrap();
+        let id = Uuid::new_v4();
+        create(&db, id);
+        let t = Transcript::new(&db, id);
+        assert!(matches!(t.prepare_append_batch(&[]), Err(Error::Corrupt)));
+        let invalid = vec![(json!({"ok": true}), None), (json!(null), Some(vec![]))];
+        assert!(matches!(
+            t.prepare_append_batch(&invalid),
+            Err(Error::Corrupt)
+        ));
+        let (stale, positions) = t
+            .prepare_append_batch(&[(json!({"a":1}), None), (json!({"b":2}), None)])
+            .unwrap();
+        append(&db, id, json!({"winner": true}));
+        assert!(matches!(
+            db.commit(&stale.checks, &stale.mutations),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        for cursor in positions {
+            assert!(matches!(
+                t.read_with_blocks(&cursor, NonZeroUsize::MIN),
+                Err(Error::Corrupt)
+            ));
+        }
+        let page = t
+            .read_with_blocks(&t.snapshot().unwrap(), NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].value, json!({"winner": true}));
     }
 
     #[test]
