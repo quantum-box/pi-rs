@@ -233,6 +233,19 @@ impl Fixture {
         finish_immediately: bool,
     ) -> Self {
         let fast: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(json!("fast-result"))));
+        Self::with_mode_and_fast(
+            parent_replay_safe,
+            finish_after_first,
+            finish_immediately,
+            fast,
+        )
+    }
+    fn with_mode_and_fast(
+        parent_replay_safe: bool,
+        finish_after_first: bool,
+        finish_immediately: bool,
+        fast: Arc<dyn Handler>,
+    ) -> Self {
         let slow: Arc<dyn Handler> = Arc::new(Slow);
         let fast_tool = Arc::new(TaskTool::new(
             spec("fast-tool"),
@@ -780,7 +793,17 @@ async fn task_tool_child_kill_worker() {
         return;
     };
     let root = std::path::PathBuf::from(root);
-    let f = Fixture::with_parent_policy(false);
+    let (release_fast, wait_fast) = std::sync::mpsc::channel::<()>();
+    let wait_fast = Mutex::new(wait_fast);
+    let fast: Arc<dyn Handler> = Arc::new(move |_: &Task| {
+        wait_fast
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|error| format!("fast fixture gate: {error}"))?;
+        Ok(Step::Succeed(json!("fast-result")))
+    });
+    let f = Fixture::with_mode_and_fast(false, false, false, fast);
     let mut scheduler = Scheduler::open(root.join("db"), f.options()).unwrap();
     let driver = scheduler.start_tasks(f.registry()).unwrap();
     let conversation = scheduler
@@ -791,23 +814,67 @@ async fn task_tool_child_kill_worker() {
         })
         .unwrap();
     scheduler.submit(conversation, None, "work".into()).unwrap();
-    until(|| {
-        f.ids
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|(parent, _, slow)| {
-                driver
-                    .get(*parent)
-                    .unwrap()
-                    .is_some_and(|t| t.checkpoint().phase == "second")
-                    && driver
-                        .get(*slow)
-                        .unwrap()
-                        .is_some_and(|t| matches!(t.state(), TaskState::Waiting(_)))
-            })
-    })
-    .await;
+    let diagnostics = || {
+        let ids = *f.ids.lock().unwrap();
+        let store = durable_store::Store::open(root.join("db")).unwrap();
+        let tasks = pi_rs_durable::task_store::TaskStore::new(&store).list();
+        let status = ids
+            .map(|(parent, fast, slow)| (driver.get(parent), driver.get(fast), driver.get(slow)));
+        format!(
+            "ids={ids:?}, driver={status:?}, workers={:?}, tasks={tasks:?}, conversation={:?}",
+            driver.worker_activity().snapshot(),
+            scheduler.conversation(conversation)
+        )
+    };
+    let check_parent = || {
+        let parent = f.ids.lock().unwrap().as_ref().map(|ids| ids.0);
+        if let Some(parent) = parent {
+            let status = driver.get(parent);
+            if status.as_ref().is_err() || matches!(&status, Ok(Some(task)) if task.is_terminal()) {
+                let detail = diagnostics();
+                let _ = std::fs::write(root.join("worker-diagnostics"), &detail);
+                panic!("worker parent or driver failed: {detail}");
+            }
+        }
+    };
+    // A slow-child read fences the unsafe parent's first transition. Establish
+    // the slow wait before fast finishes so that read cannot race its startup.
+    let slow_ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            check_parent();
+            let ready = f.ids.lock().unwrap().as_ref().is_some_and(|(_, _, slow)| {
+                matches!(driver.get(*slow), Ok(Some(task)) if matches!(task.state(), TaskState::Waiting(_)))
+            });
+            if ready { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await;
+    if slow_ready.is_err() {
+        panic!("slow child did not park: {}", diagnostics());
+    }
+    let (_, fast_id, slow_id) = f.ids.lock().unwrap().unwrap();
+    assert!(
+        matches!(driver.get(slow_id), Ok(Some(task)) if matches!(task.state(), TaskState::Waiting(_)))
+    );
+    assert!(matches!(driver.get(fast_id), Ok(Some(task)) if !task.is_terminal()));
+    release_fast.send(()).unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            check_parent();
+            let ready = f.ids.lock().unwrap().as_ref().is_some_and(|(parent, _, slow)| {
+                matches!(driver.get(*parent), Ok(Some(task)) if task.checkpoint().phase == "second")
+                    && matches!(driver.get(*slow), Ok(Some(task)) if matches!(task.state(), TaskState::Waiting(_)))
+            });
+            if ready { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await;
+    if ready.is_err() {
+        panic!("parent did not park: {}", diagnostics());
+    }
+    if std::env::var_os("PI_TASK_TOOL_DIAGNOSTICS").is_some() {
+        std::fs::write(root.join("worker-diagnostics"), diagnostics()).unwrap();
+    }
     let (parent, fast, slow) = f.ids.lock().unwrap().unwrap();
     std::fs::write(
         root.join("ready.tmp"),
@@ -835,9 +902,37 @@ async fn killed_task_tool_parent_reopens_its_keyed_children_and_wakes() {
             .spawn()
             .unwrap(),
     );
-    until(|| root.join("ready").exists()).await;
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if root.join("ready").exists() {
+                return Ok(());
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                return Err(status);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if !matches!(ready, Ok(Ok(()))) {
+        let status = child.0.try_wait();
+        let worker_diagnostics = std::fs::read_to_string(root.join("worker-diagnostics"));
+        let tasks = durable_store::Store::open(root.join("db"))
+            .ok()
+            .map(|store| pi_rs_durable::task_store::TaskStore::new(&store).list());
+        panic!(
+            "worker readiness failed: wait={ready:?}, exit={status:?}, worker={worker_diagnostics:?}, tasks={tasks:?}"
+        );
+    }
     child.0.kill().unwrap();
-    child.0.wait().unwrap();
+    let killed = child.0.wait().unwrap();
+    if std::env::var_os("PI_TASK_TOOL_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "worker ready: {}",
+            std::fs::read_to_string(root.join("worker-diagnostics")).unwrap()
+        );
+        eprintln!("fixture worker exit: {killed:?}");
+    }
     let ids = std::fs::read_to_string(root.join("ready")).unwrap();
     let mut ids = ids.lines().map(|id| id.parse::<Uuid>().unwrap());
     let conversation = ids.next().unwrap();
