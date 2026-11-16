@@ -922,12 +922,13 @@ pub fn validate_legacy_tool_declarations(
     request: &ModelRequest,
     declarations: &[crate::ToolDeclaration],
 ) -> Result<()> {
+    let mut names = std::collections::BTreeSet::new();
     if request.tools.len() != declarations.len()
         || request
             .tools
             .iter()
             .zip(declarations)
-            .any(|(spec, declaration)| spec != &declaration.spec)
+            .any(|(spec, declaration)| spec != &declaration.spec || !names.insert(&spec.name))
     {
         return Err(Error::Config(
             "tool declarations do not match the effective request".into(),
@@ -993,6 +994,17 @@ mod declaration_dispatch_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        let duplicate = ModelRequest {
+            tools: vec![request.tools[0].clone(), request.tools[0].clone()],
+            ..request.clone()
+        };
+        assert!(
+            validate_legacy_tool_declarations(
+                &duplicate,
+                &[declaration.clone(), declaration.clone()]
+            )
+            .is_err()
         );
         assert!(
             model

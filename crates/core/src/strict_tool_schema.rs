@@ -106,6 +106,67 @@ pub struct EffectiveToolDeclaration {
     pub sampling: EffectiveToolSampling,
 }
 
+/// Validate effective decisions against the final request and declarations.
+/// This rejects downgraded required constraints, stale schemas and unknown
+/// normalization versions before a request is dispatched or recorded.
+pub fn validate_effective_tool_declarations(
+    request: &crate::ModelRequest,
+    declarations: &[ToolDeclaration],
+    effective: &[EffectiveToolDeclaration],
+) -> Result<(), StrictSchemaError> {
+    if request.tools.len() != declarations.len() || declarations.len() != effective.len() {
+        return Err(StrictSchemaError(
+            "tool declaration count does not match the request".into(),
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for ((spec, declaration), decision) in request.tools.iter().zip(declarations).zip(effective) {
+        if spec != &declaration.spec || spec != &decision.spec || !names.insert(&spec.name) {
+            return Err(StrictSchemaError(
+                "tool declarations do not match the effective request".into(),
+            ));
+        }
+        match (&declaration.constrained_sampling, &decision.sampling) {
+            (
+                Some(ToolConstraint::JsonSchema {
+                    strict: StrictToolPolicy::Require,
+                }),
+                EffectiveToolSampling::Unconstrained,
+            ) => {
+                return Err(StrictSchemaError(format!(
+                    "required strict constraint for tool {:?} was not applied",
+                    spec.name
+                )));
+            }
+            (
+                Some(ToolConstraint::JsonSchema { .. }),
+                EffectiveToolSampling::StrictJsonSchema {
+                    original_schema,
+                    normalization_version,
+                },
+            ) => {
+                if original_schema != &spec.parameters
+                    || *normalization_version != STRICT_TOOL_NORMALIZATION_VERSION
+                {
+                    return Err(StrictSchemaError(format!(
+                        "invalid strict normalization decision for tool {:?}",
+                        spec.name
+                    )));
+                }
+                null_normalization_plan(original_schema)?;
+            }
+            (_, EffectiveToolSampling::StrictJsonSchema { .. }) => {
+                return Err(StrictSchemaError(format!(
+                    "unrequested strict constraint for tool {:?}",
+                    spec.name
+                )));
+            }
+            (_, EffectiveToolSampling::Unconstrained) => {}
+        }
+    }
+    Ok(())
+}
+
 fn deserialize_constraint<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<ToolConstraint>, D::Error> {
@@ -452,6 +513,126 @@ fn make_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_decisions_cannot_downgrade_or_change_tool_identity() {
+        let spec = crate::ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = crate::ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let declaration = ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Require,
+            }),
+        };
+        let mut effective = EffectiveToolDeclaration {
+            spec,
+            sampling: EffectiveToolSampling::Unconstrained,
+        };
+        let mut preferred = declaration.clone();
+        preferred.constrained_sampling = Some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Prefer,
+        });
+        assert!(
+            validate_effective_tool_declarations(
+                &request,
+                &[preferred],
+                std::slice::from_ref(&effective)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_effective_tool_declarations(
+                &request,
+                std::slice::from_ref(&declaration),
+                std::slice::from_ref(&effective)
+            )
+            .is_err()
+        );
+        effective.sampling = EffectiveToolSampling::StrictJsonSchema {
+            original_schema: request.tools[0].parameters.clone(),
+            normalization_version: STRICT_TOOL_NORMALIZATION_VERSION,
+        };
+        assert!(
+            validate_effective_tool_declarations(
+                &request,
+                std::slice::from_ref(&declaration),
+                std::slice::from_ref(&effective)
+            )
+            .is_ok()
+        );
+        let mut disabled = declaration.clone();
+        disabled.constrained_sampling = Some(ToolConstraint::Disabled);
+        assert!(
+            validate_effective_tool_declarations(
+                &request,
+                &[disabled],
+                std::slice::from_ref(&effective)
+            )
+            .is_err()
+        );
+        let duplicate_request = crate::ModelRequest {
+            tools: vec![request.tools[0].clone(), request.tools[0].clone()],
+            ..request.clone()
+        };
+        assert!(
+            validate_effective_tool_declarations(
+                &duplicate_request,
+                &[declaration.clone(), declaration.clone()],
+                &[effective.clone(), effective.clone()]
+            )
+            .is_err()
+        );
+        if let EffectiveToolSampling::StrictJsonSchema {
+            normalization_version,
+            ..
+        } = &mut effective.sampling
+        {
+            *normalization_version += 1;
+        }
+        assert!(
+            validate_effective_tool_declarations(
+                &request,
+                std::slice::from_ref(&declaration),
+                std::slice::from_ref(&effective)
+            )
+            .is_err()
+        );
+        if let EffectiveToolSampling::StrictJsonSchema {
+            normalization_version,
+            original_schema,
+        } = &mut effective.sampling
+        {
+            *normalization_version = STRICT_TOOL_NORMALIZATION_VERSION;
+            *original_schema = json!({"type":"object","properties":{"stale":{"type":"string"}}});
+        }
+        assert!(
+            validate_effective_tool_declarations(
+                &request,
+                std::slice::from_ref(&declaration),
+                std::slice::from_ref(&effective)
+            )
+            .is_err()
+        );
+        if let EffectiveToolSampling::StrictJsonSchema {
+            original_schema, ..
+        } = &mut effective.sampling
+        {
+            *original_schema = request.tools[0].parameters.clone();
+        }
+        effective.spec.name = "other".into();
+        assert!(
+            validate_effective_tool_declarations(&request, &[declaration], &[effective]).is_err()
+        );
+    }
 
     #[test]
     fn normalizes_only_optional_nulls_on_a_copy() {

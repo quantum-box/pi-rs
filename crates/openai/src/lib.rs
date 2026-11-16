@@ -687,6 +687,8 @@ fn resolved_constrained_tools(
             sampling,
         });
     }
+    pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
+        .map_err(|error| Error::Config(error.to_string()))?;
     Ok((wire, effective))
 }
 
