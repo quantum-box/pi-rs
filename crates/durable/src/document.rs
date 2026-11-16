@@ -3993,6 +3993,7 @@ mod detached_task_documents_tests {
         // then prepare it using the existing borrowed scheduler sequence.
         let mut reference = TaskDocuments {
             store,
+            input_validator: docs.input_validator,
             revision: docs.revision,
             reads: docs.reads.clone(),
             writes: docs.writes.clone(),
@@ -4002,6 +4003,7 @@ mod detached_task_documents_tests {
             entry_initial_len: docs.entry_initial_len,
             runtime_cut: docs.runtime_cut,
             runtime_config: docs.runtime_config.clone(),
+            task_input: docs.task_input.clone(),
             signals: StagedSignals {
                 batch: OwnedBatch {
                     checks: docs.signals.batch.checks.clone(),
