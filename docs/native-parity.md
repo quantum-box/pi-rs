@@ -589,8 +589,9 @@ The echoed JSON value retains Rust's parsed integer precision, which can differ
 from JavaScript for integers outside the safe range; out-of-range JSON numbers
 such as `1e400` are rejected by the native parser.
 Malformed JSON produces a `parse` response with a
-parser diagnostic. When the native parser reaches an unfinished numeric fraction
-or exponent at the end of a record, it uses Pi's V8 wording and UTF-16 position. Earlier
+parser diagnostic. When the native parser reaches an unfinished numeric fraction,
+exponent, or leading minus at the end of a record, it uses Pi's V8 wording and
+UTF-16 position. Earlier
 errors, including lone surrogates and out-of-range numbers, retain their own
 diagnostics. Unescaped string control characters reached
 by the parser use Pi's V8 wording and UTF-16 positions, including controls after a lone
@@ -5148,7 +5149,7 @@ Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, missing values, and numeric
-fractions and exponents cut off at EOF. Offsets
+fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.

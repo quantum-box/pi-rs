@@ -964,6 +964,44 @@ mod jsonl_framing_tests {
         assert!(read_rpc_line(&mut input).unwrap().is_none());
     }
     #[test]
+    fn minus_at_eof_uses_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":-", "position 6 (line 1 column 7)"),
+            ("[ -", "position 3 (line 1 column 4)"),
+            ("{\"😀\":-", "position 7 (line 1 column 8)"),
+            ("[\r\n -", "position 5 (line 2 column 3)"),
+            ("-", "position 1 (line 1 column 2)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("No number after minus sign in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            ("[1e-", "Exponent part is missing a number in JSON"),
+            ("{\"n\":1.", "Unterminated fractional number in JSON"),
+            ("[1,] -", "trailing comma"),
+            ("{\"bad\":,\"n\":-", "expected value"),
+            ("[01,-", "invalid number"),
+            ("[1e400,-", "number out of range"),
+            (r#"["\ud800",-"#, "unexpected end of hex escape"),
+            ("{\"n\":\"-", "Unterminated string in JSON"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            (r#"{"n":-2}"#, serde_json::json!({"n":-2})),
+            (r#"{"n":-2.5e-3}"#, serde_json::json!({"n":-0.0025})),
+            (r#"{"n":"-"}"#, serde_json::json!({"n":"-"})),
+        ] {
+            assert_eq!(parse_request(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
     fn unfinished_fractions_at_eof_use_v8_positions_without_masking_errors() {
         for (input, expected) in [
             ("{\"n\":1.", "position 7 (line 1 column 8)"),
@@ -1324,9 +1362,9 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
-    // An unfinished fraction or exponent at EOF is diagnosed separately by V8. Only
-    // project it when serde reached the end while parsing a value: an earlier
-    // syntax error, or an exponent-like suffix inside a string, must win.
+    // V8 distinguishes unfinished numbers at EOF. Only project these errors
+    // when serde reached the end while parsing a value, so earlier errors and
+    // number-like suffixes inside strings retain their own diagnostics.
     if error.is_eof()
         && message.starts_with("EOF while parsing a value")
         && serde_error_offset(line, error) == Some(line.len())
@@ -1347,6 +1385,8 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
             && bytes[exponent_end - 2].is_ascii_digit()
         {
             Some("Exponent part is missing a number in JSON")
+        } else if bytes.last() == Some(&b'-') {
+            Some("No number after minus sign in JSON")
         } else {
             None
         };
