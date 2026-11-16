@@ -11,12 +11,28 @@ pub enum InputMode {
     FollowUp,
 }
 
+/// What a conversation abort does to an input that is still queued.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnAbort {
+    #[default]
+    Withdraw,
+    Keep,
+}
+
+impl OnAbort {
+    pub(crate) fn is_withdraw(&self) -> bool {
+        *self == Self::Withdraw
+    }
+}
+
 /// Optional input admission policies. Defaults preserve ordinary follow-up admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionOptions {
     pub mode: InputMode,
     pub reject_when_busy: bool,
     pub reject_when_idle: bool,
+    pub on_abort: OnAbort,
 }
 
 impl Default for AdmissionOptions {
@@ -25,6 +41,7 @@ impl Default for AdmissionOptions {
             mode: InputMode::FollowUp,
             reject_when_busy: false,
             reject_when_idle: false,
+            on_abort: OnAbort::Withdraw,
         }
     }
 }
@@ -51,6 +68,8 @@ pub struct Submission {
     pub request_id: Option<String>,
     pub content: String,
     pub mode: InputMode,
+    #[serde(default, skip_serializing_if = "OnAbort::is_withdraw")]
+    pub on_abort: OnAbort,
     pub status: SubmissionStatus,
 }
 
@@ -127,6 +146,7 @@ impl ConversationState {
             request_id,
             content,
             mode: options.mode,
+            on_abort: options.on_abort,
             status: SubmissionStatus::Queued,
         });
         // A queued follow-up prevents a later submission jumping the queue.

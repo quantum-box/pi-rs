@@ -3,7 +3,7 @@ use futures_util::{StreamExt, stream};
 use pi_rs_core::{CancellationToken, Error, Model, ModelEvent, ModelRequest, ModelStream};
 use pi_rs_durable::{
     recovery::UncertainPolicy,
-    runtime::{AfterFailedRun, Config, Harness, Options, Status},
+    runtime::{AdmissionOptions, AfterFailedRun, Config, Harness, OnAbort, Options, Status},
 };
 use std::sync::{
     Arc,
@@ -60,7 +60,15 @@ async fn policies_survive_reopen_and_preserve_request_identity() {
         }
         let first = h.submit(id, Some("first".into()), "first".into()).unwrap();
         let queued = h
-            .submit(id, Some("queued".into()), "queued".into())
+            .submit_with_options(
+                id,
+                Some("queued".into()),
+                "queued".into(),
+                AdmissionOptions {
+                    on_abort: OnAbort::Keep,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(
             h.submit(id, Some("queued".into()), "different".into())

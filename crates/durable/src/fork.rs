@@ -315,6 +315,7 @@ mod tests {
             content: "q".into(),
             image_notes: Vec::new(),
             input_blocks: None,
+            on_abort: crate::state::OnAbort::Withdraw,
             status: Status::Queued,
         });
         assert!(matches!(extract(id, &record(&s)), Err(Error::Unsettled)));

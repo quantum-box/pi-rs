@@ -591,3 +591,139 @@ async fn abort_withdraws_inputs_but_retains_queued_reset() {
     );
     s.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn keep_queued_input_survives_abort_and_reopen_then_is_answered() {
+    use pi_rs_durable::runtime::{AdmissionOptions, OnAbort, WithdrawResult};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = Arc::new(ModelBarrier {
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut s = Scheduler::open(&path, opts(model.clone(), vec![])).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    s.submit(id, None, "hold".into()).unwrap();
+    wait_permit(&model.started).await;
+    let kept = s
+        .submit_with_options(
+            id,
+            Some("kept".into()),
+            "kept".into(),
+            AdmissionOptions {
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let explicit = s
+        .submit_with_options(
+            id,
+            None,
+            "explicit".into(),
+            AdmissionOptions {
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        s.withdraw_submission(id, explicit).unwrap(),
+        WithdrawResult::Aborted
+    ));
+    let withdrawn = s.submit(id, None, "withdraw".into()).unwrap();
+    let result = s.abort_and_wait_withdrawn(id).await.unwrap();
+    assert_eq!(result.withdrawn.len(), 1);
+    assert_eq!(result.withdrawn[0].submission.id, withdrawn);
+    assert_eq!(
+        s.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|x| x.id == kept)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    s.shutdown().await.unwrap();
+    let mut s = Scheduler::open(&path, opts(model.clone(), vec![])).unwrap();
+    assert_eq!(
+        s.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|x| x.id == kept)
+            .unwrap()
+            .on_abort,
+        OnAbort::Keep
+    );
+    model.release.add_permits(10);
+    let next = s.submit(id, None, "next".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), s.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let c = s.conversation(id).unwrap();
+    assert!(matches!(
+        c.submissions.iter().find(|x| x.id == kept).unwrap().status,
+        Status::Done { .. }
+    ));
+    assert!(matches!(
+        c.submissions.iter().find(|x| x.id == next).unwrap().status,
+        Status::Done { .. }
+    ));
+    let users: Vec<_> = c
+        .messages
+        .iter()
+        .filter_map(|m| {
+            if let Message::User { content } = m {
+                Some(content.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(users.iter().position(|v| *v == "kept") < users.iter().position(|v| *v == "next"));
+    s.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn keep_queued_input_is_placed_after_a_queued_write_on_abort() {
+    use pi_rs_durable::runtime::{AdmissionOptions, OnAbort};
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ModelBarrier {
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut s = Scheduler::open(dir.path().join("db"), opts(model.clone(), vec![])).unwrap();
+    let id = s.create_conversation(config()).unwrap();
+    s.submit(id, None, "hold".into()).unwrap();
+    wait_permit(&model.started).await;
+    s.reset(id, None).unwrap();
+    let write = s.submit_write(id, None, "notice".into(), None).unwrap();
+    let kept = s
+        .submit_with_options(
+            id,
+            None,
+            "kept".into(),
+            AdmissionOptions {
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    s.abort_and_wait(id).await.unwrap();
+    let c = s.conversation(id).unwrap();
+    assert!(
+        c.application_writes
+            .iter()
+            .find(|w| w.id == write)
+            .unwrap()
+            .placed
+    );
+    assert!(matches!(
+        c.submissions.iter().find(|x| x.id == kept).unwrap().status,
+        Status::Done { .. }
+    ));
+    s.shutdown().await.unwrap();
+}

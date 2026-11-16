@@ -20,7 +20,7 @@ checked. Rejections persist nothing, and concurrent admissions recheck their
 policies after a version conflict. A duplicate input request ID is resolved before content validation. The runtime
 does not expose upstream's submit-in-commit API.
 
-`Scheduler::abort` durably withdraws queued inputs and fences further local
+`Scheduler::abort` durably withdraws queued inputs unless marked `OnAbort::Keep` and fences further local
 dispatch for that conversation; `abort_and_wait` also waits for its workers.
 Queued resets remain. Uncertain dispatched effects require reconciliation, even
 for replay-safe tools; cancellation cannot undo an external effect. Reporter
@@ -1075,7 +1075,7 @@ queued reset preceding the summary is placed first and makes the summary stale;
 queued inputs follow the selected writes. The placement ticket records the version at summary admission and
 commits with the conversation's pending marker. Later writes follow that marker.
 The marker and its preceding reset IDs survive reopen. Conversation abort
-withdraws queued inputs but preserves a summary already admitted as a write;
+withdraws queued inputs unless marked `OnAbort::Keep` but preserves a summary already admitted as a write;
 an explicit operation abort withdraws it. Recovery requires the matching
 provider identity. Use `Scheduler::open_with_summary_recovery_and_tasks` to
 install the extension and task registries, adapter and summary provider before
@@ -1861,8 +1861,7 @@ Hosts must keep adapter profile configuration stable during admission.
 `submit_fitted_user_blocks_with_options` also admits steering or follow-up
 blocks while busy. The fitted payload and occurrence ID are durable while
 queued, use the existing queue ordering and rejection policies, and are not
-refitted at placement or after a model change. Abort withdraws queued inputs
-under the existing rules. Reusing a request ID returns the original result.
+refitted at placement or after a model change. Conversation abort withdraws queued inputs by default. Set `AdmissionOptions::on_abort` to `OnAbort::Keep` to retain a queued input across aborts and cascades; explicit withdrawal still removes it. Failed runs follow `AfterFailedRun` independently. Reusing a request ID returns the original result.
 `reset_with_fitted_blocks` fits each reset addition using the admission-time
 model and preserves the existing reset ordering. Its optional reset request ID
 has a separate conversation-scoped deduplication namespace; retries return the

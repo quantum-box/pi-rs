@@ -2,7 +2,7 @@
 //!
 //! A committed phase is the authority for recovery. External calls never run
 //! inside storage transactions. Independent conversations can run concurrently.
-pub use crate::state::{AdmissionError, AdmissionOptions, InputMode};
+pub use crate::state::{AdmissionError, AdmissionOptions, InputMode, OnAbort};
 /// Host-attested identities for the summary model and usage settlement service.
 /// They must change whenever dispatch or request-ID settlement semantics change.
 pub use crate::summary_store::ProviderIdentity as SummaryProviderIdentity;
@@ -283,6 +283,9 @@ pub struct Submission {
     /// Ordered fitted input, including its durable occurrence identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_blocks: Option<crate::transcript::MessageContentBlocks>,
+    /// Policy for a conversation abort while this input is queued.
+    #[serde(default, skip_serializing_if = "OnAbort::is_withdraw")]
+    pub on_abort: OnAbort,
     pub status: Status,
 }
 
@@ -1786,6 +1789,7 @@ impl Conversation {
             content: content.clone(),
             image_notes: Vec::new(),
             input_blocks: None,
+            on_abort: OnAbort::Withdraw,
             status: Status::Running,
         });
         self.input_modes.insert(id, InputMode::FollowUp);
@@ -3386,6 +3390,7 @@ impl crate::session_transaction::SessionTransaction<'_> {
             content: content.clone(),
             image_notes: Vec::new(),
             input_blocks: None,
+            on_abort: options.on_abort,
             status: if place_now {
                 Status::Running
             } else {
@@ -3587,6 +3592,7 @@ impl crate::session_transaction::SessionTransaction<'_> {
             content: String::new(),
             image_notes: Vec::new(),
             input_blocks: None,
+            on_abort: OnAbort::Withdraw,
             status: Status::Running,
         });
         if let Some(notify) = notify {
@@ -9547,6 +9553,7 @@ impl Harness {
                 message_id: Uuid::new_v4(),
                 blocks: output.clone(),
             }),
+            on_abort: options.on_abort,
             status: if place_now {
                 Status::Running
             } else {
@@ -10026,6 +10033,7 @@ impl Harness {
                 content: content.clone(),
                 image_notes: Vec::new(),
                 input_blocks: None,
+                on_abort: options.on_abort,
                 status: if place_now {
                     Status::Running
                 } else {
@@ -10198,6 +10206,7 @@ impl Harness {
                 content: String::new(),
                 image_notes: Vec::new(),
                 input_blocks: None,
+                on_abort: OnAbort::Withdraw,
                 status: Status::Running,
             });
             if let Some(notify) = &notify {
@@ -10464,7 +10473,7 @@ impl Harness {
             let mut withdrawn = Vec::new();
             for (state, _) in &mut states {
                 for submission in &mut state.submissions {
-                    if submission.status == Status::Queued {
+                    if submission.status == Status::Queued && submission.on_abort != OnAbort::Keep {
                         withdrawn.push(WithdrawnInput {
                             conversation_id: state.id,
                             mode: state
@@ -19123,8 +19132,13 @@ fn apply_failed_run_policy(c: &mut Conversation) {
     }
 }
 fn finish_abort(c: &mut Conversation) {
+    // Kept inputs remain parked like the default failed-run queue until a
+    // later admission or ordered write starts a new boundary.
     finish_failure(c, "aborted".into(), FailureCause::Aborted);
-    if c.submissions.iter().any(|s| s.status == Status::Queued) {
+    if c.application_writes
+        .iter()
+        .any(|write| !write.placed && !write.withdrawn)
+    {
         c.phase = Phase::Idle;
     }
 }
@@ -24653,6 +24667,7 @@ mod scheduler_tests {
                 content: content.into(),
                 image_notes: Vec::new(),
                 input_blocks: None,
+                on_abort: OnAbort::Withdraw,
                 status: Status::Queued,
             });
         }
@@ -24775,6 +24790,7 @@ mod scheduler_tests {
             content: "queued".into(),
             image_notes: Vec::new(),
             input_blocks: None,
+            on_abort: OnAbort::Withdraw,
             status: Status::Queued,
         });
         assert!(admission_only(&base, &latest).unwrap());

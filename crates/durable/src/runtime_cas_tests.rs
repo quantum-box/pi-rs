@@ -5949,3 +5949,100 @@ fn host_only_redaction_notice_does_not_hide_explicit_identical_diagnostic() {
         Some("output_redacted")
     );
 }
+
+#[test]
+fn keep_abort_cascade_retries_concurrent_admission_and_recovers() {
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let root = h.create_conversation(config.clone()).unwrap();
+    let child = h.create_conversation(config).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(root),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        },
+        4,
+    )
+    .unwrap();
+    let store = h.subagent_store().unwrap();
+    TaskStore::new(store).save(&[Save::Create(&task)]).unwrap();
+    let edge = Edge {
+        task: task.id(),
+        task_owner: TaskOwner::Conversation(root),
+        child,
+        mode: Mode::Foreground,
+    };
+    let batch = EdgeStore::new(store).prepare_create(&edge).unwrap();
+    store.commit(&batch.checks, &batch.mutations).unwrap();
+    h.submit(child, None, "active".into()).unwrap();
+    let ordinary = h.submit(child, None, "ordinary".into()).unwrap();
+    let mut writer = h.worker();
+    let mut kept = None;
+    let mut attempts = 0;
+    h.abort_owned_graph_impl_with(Some(root), None, None, false, || {
+        attempts += 1;
+        if attempts == 1 {
+            kept = Some(
+                writer
+                    .submit_with_options(
+                        child,
+                        Some("kept".into()),
+                        "kept".into(),
+                        AdmissionOptions {
+                            on_abort: OnAbort::Keep,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+    })
+    .unwrap();
+    assert!(attempts >= 2);
+    let kept = kept.unwrap();
+    drop(writer);
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(child).unwrap();
+    assert!(state.abort_requested);
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == kept)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == kept)
+            .unwrap()
+            .on_abort,
+        OnAbort::Keep
+    );
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == ordinary)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+}
