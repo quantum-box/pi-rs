@@ -1039,24 +1039,27 @@ impl Profiles {
             .static_headers(provider, token)
     }
 
-    /// Only user-configured compatibility applies to non-chat adapters.
-    pub fn explicit_strict_tool_support(
+    /// Explicit settings only; bundled chat defaults do not apply to Google.
+    pub fn google_strict_tool_policy(
         &self,
         provider: &Provider,
-        model_id: &str,
-    ) -> Option<bool> {
-        let profile = self.entries.get(provider.id())?;
-        let provider_value = profile.compat.chat.supports_strict_mode();
-        let model_value = profile
-            .models
-            .iter()
-            .find(|model| model.id == model_id)
-            .and_then(|model| model.metadata.compat.chat.supports_strict_mode());
-        let override_value = profile
-            .overrides
-            .get(model_id)
-            .and_then(|model| model.compat.chat.supports_strict_mode());
-        override_value.or(model_value).or(provider_value)
+    ) -> (Option<bool>, BTreeMap<String, bool>) {
+        let Some(profile) = self.entries.get(provider.id()) else {
+            return (None, BTreeMap::new());
+        };
+        let default = profile.compat.chat.supports_strict_mode();
+        let mut models = BTreeMap::new();
+        for model in &profile.models {
+            if let Some(value) = model.metadata.compat.chat.supports_strict_mode() {
+                models.insert(model.id.clone(), value);
+            }
+        }
+        for (id, model) in &profile.overrides {
+            if let Some(value) = model.compat.chat.supports_strict_mode() {
+                models.insert(id.clone(), value);
+            }
+        }
+        (default, models)
     }
 
     pub fn chat_compatibility(

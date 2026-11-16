@@ -1121,12 +1121,12 @@ impl Client {
                     } else {
                         None
                     };
+                let (strict_default, strict_models) = args
+                    .model_profiles
+                    .google_strict_tool_policy(&args.provider);
                 Self::Google(
                     client
-                        .with_strict_tool_support(
-                            args.model_profiles
-                                .explicit_strict_tool_support(&args.provider, &args.model),
-                        )
+                        .with_strict_tool_policy(strict_default, strict_models)
                         .with_thinking(mapped.as_deref().or(selected))
                         .with_disabled_thinking_fallback(fallback.as_deref())
                         .with_reasoning_support(metadata.as_ref().and_then(|model| model.reasoning))
@@ -1534,6 +1534,146 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn google_before_request_rewrite_resolves_final_model_strict_policy() {
+        use clap::Parser;
+        use pi_rs::Extension;
+        struct Rewrite(&'static str);
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite-model"
+            }
+            async fn before_request(
+                &self,
+                request: &mut pi_rs::ContextRequest<'_>,
+                _: pi_rs::RequestPurpose,
+                _: Option<&pi_rs::ExtensionState>,
+            ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
+                request.model = self.0.into();
+                Ok(pi_rs::ContextChange::Changed)
+            }
+        }
+        for deferred in [false, true] {
+            for (original, final_model, overrides, expected) in [
+                ("gemini-2-test", "gemini-3-test", json!({}), true),
+                ("gemini-3-test", "gemini-2-test", json!({}), false),
+                (
+                    "gemini-2-test",
+                    "gemini-3-test",
+                    json!({"gemini-2-test":{"compat":{"supportsStrictMode":true}}, "gemini-3-test":{"compat":{"supportsStrictMode":false}}}),
+                    false,
+                ),
+                (
+                    "gemini-3-test",
+                    "gemini-2-test",
+                    json!({"gemini-2-test":{"compat":{"supportsStrictMode":true}}, "gemini-3-test":{"compat":{"supportsStrictMode":false}}}),
+                    true,
+                ),
+                (
+                    "gemini-2-test",
+                    "gemini-3-test",
+                    json!({"gemini-2-test":{"compat":{"supportsStrictMode":false}}}),
+                    true,
+                ),
+                (
+                    "gemini-3-test",
+                    "gemini-2-test",
+                    json!({"gemini-3-test":{"compat":{"supportsStrictMode":true}}}),
+                    false,
+                ),
+            ] {
+                let endpoint = "http://localhost:9876";
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"together":{
+                    "api":"openai-completions", "baseUrl":endpoint,
+                    "models":[{"id":"gemini-2-test", "api":"google-generative-ai", "baseUrl":endpoint}, {"id":"gemini-3-test", "api":"google-generative-ai", "baseUrl":endpoint}],
+                    "modelOverrides":overrides
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("together").unwrap();
+                args.model = original.into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Google,
+                        endpoint,
+                        Some(Credential::Literal("key".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Google(pi_rs::google::Google::new(endpoint, "key").unwrap())
+                }
+                .with_model_options(&args, false)
+                .unwrap()
+                .with_context_probes(false);
+                let model = super::super::image_policy::WorkbenchModel {
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                };
+                let mut request = ModelRequest {
+                    model: original.into(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 10,
+                };
+                Rewrite(final_model)
+                    .before_request(
+                        &mut pi_rs::ContextRequest::new(&mut request),
+                        pi_rs::RequestPurpose::Turn,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let ctx = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let bound_model = model.prepare_context(&request).await.unwrap().unwrap();
+                for policy in [
+                    pi_rs::StrictToolPolicy::Prefer,
+                    pi_rs::StrictToolPolicy::Require,
+                ] {
+                    let decl = pi_rs::ToolDeclaration {
+                        spec: spec.clone(),
+                        constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                            strict: policy,
+                        }),
+                    };
+                    let result = bound_model
+                        .prepare_tool_dispatch(&request, &[decl], &ctx)
+                        .await;
+                    if !expected && matches!(policy, pi_rs::StrictToolPolicy::Require) {
+                        assert!(
+                            result.is_err(),
+                            "required strict must fail: {original} -> {final_model}, deferred={deferred}"
+                        );
+                    } else {
+                        let prepared = result.unwrap().unwrap();
+                        assert_eq!(
+                            matches!(
+                                prepared.effective_tools()[0].sampling,
+                                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                            ),
+                            expected,
+                            "{original} -> {final_model}, deferred={deferred}"
+                        );
+                        assert_eq!(prepared.dispatch_request().model, final_model);
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn google_strict_support_uses_only_explicit_overrides_in_direct_and_deferred_clients() {

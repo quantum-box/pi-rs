@@ -54,6 +54,7 @@ pub struct Google {
     disabled_thinking_fallback: Option<String>,
     reasoning_supported: Option<bool>,
     strict_tool_support: Option<bool>,
+    strict_tool_models: BTreeMap<String, bool>,
     bound_tools: Option<(Vec<Value>, bool)>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
@@ -102,6 +103,7 @@ impl Google {
             disabled_thinking_fallback: None,
             reasoning_supported: None,
             strict_tool_support: None,
+            strict_tool_models: BTreeMap::new(),
             bound_tools: None,
             progress: None,
             reasoning: None,
@@ -180,6 +182,18 @@ impl Google {
     /// Override model-derived strict tool support for compatible endpoints.
     pub fn with_strict_tool_support(mut self, supported: Option<bool>) -> Self {
         self.strict_tool_support = supported;
+        self.strict_tool_models.clear();
+        self
+    }
+
+    /// Bind provider defaults and model-specific overrides for the final request model.
+    pub fn with_strict_tool_policy(
+        mut self,
+        default: Option<bool>,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.strict_tool_support = default;
+        self.strict_tool_models = models;
         self
     }
 
@@ -201,7 +215,11 @@ impl Google {
             ));
         }
         let supported = self
-            .strict_tool_support
+            .strict_tool_models
+            .get(&request.model)
+            .or_else(|| self.strict_tool_models.get(model_id(&request.model)))
+            .copied()
+            .or(self.strict_tool_support)
             .unwrap_or_else(|| gemini_major(model_id(&request.model)).is_some_and(|v| v >= 3));
         let mut effective = Vec::new();
         let mut schemas = Vec::new();
@@ -1015,6 +1033,15 @@ impl Model for Google {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
+        if !self.strict_tool_models.is_empty() {
+            let mut base = self.clone();
+            base.strict_tool_models.clear();
+            return pi_rs_core::protected_model_fingerprint(&(
+                "google-model-strict-v1",
+                base.context_identity(),
+                &self.strict_tool_models,
+            ));
+        }
         if let Some(supported) = self.strict_tool_support {
             return pi_rs_core::protected_model_fingerprint(&(
                 "google-strict-v1",
@@ -1692,6 +1719,23 @@ mod tests {
             expected_fallback
         );
         assert_eq!(expected_fallback["properties"]["tag"]["enum"], json!(["a"]));
+    }
+
+    #[test]
+    fn google_model_strict_policy_changes_context_identity() {
+        let base = Google::new("http://localhost:9", "key").unwrap();
+        let policy = base
+            .clone()
+            .with_strict_tool_policy(None, [("gemini-3-pro".into(), false)].into_iter().collect());
+        let changed = base
+            .clone()
+            .with_strict_tool_policy(None, [("gemini-3-pro".into(), true)].into_iter().collect());
+        assert_ne!(base.context_identity(), policy.context_identity());
+        assert_ne!(policy.context_identity(), changed.context_identity());
+        assert_eq!(
+            base.context_identity(),
+            policy.with_strict_tool_support(None).context_identity()
+        );
     }
 
     #[test]

@@ -5419,3 +5419,6 @@ strict decision, because those APIs cannot retain it for tool normalization;
 callers that need strict sampling must use prepared dispatch. The Google context
 identity is versioned for the `const` wire conversion, so usage measured with
 the previous declaration format is not reused as a budget anchor.
+Google resolves provider and per-model strict-support overrides against the final
+request model after `before_request` hooks, including for deferred clients; an
+unconfigured final model uses the provider default or Gemini-version inference.
