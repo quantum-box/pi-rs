@@ -4131,6 +4131,7 @@ pub(crate) fn validate_task_submissions(
     store: &durable_store::Store,
     bytes: &[u8],
     admissions: &mut [crate::document::TaskAdmission],
+    cross_conversation: bool,
 ) -> Result<(), crate::document::Error> {
     let state: Conversation = serde_json::from_slice(bytes)?;
     let mut tx = crate::session_transaction::SessionTransaction::new(
@@ -4142,7 +4143,42 @@ pub(crate) fn validate_task_submissions(
         None,
         Arc::new(|| 0),
     )?;
+    let mut notification_keys = std::collections::HashMap::new();
     for item in admissions {
+        if cross_conversation && let Some(notify) = &item.notify {
+            let key = (notify.task_id, notify.key.clone());
+            if let Some(previous) = notification_keys.get(&key) {
+                if item.request_id.is_none() || previous != &item.request_id {
+                    return Err(crate::document::Error::InvalidSessionAdmission(
+                        "distinct submissions cannot share a notification key".into(),
+                    ));
+                }
+            } else {
+                notification_keys.insert(key, item.request_id.clone());
+            }
+        }
+        if cross_conversation && let Some(request_id) = &item.request_id {
+            let existing_id = tx
+                .state
+                .submissions
+                .iter()
+                .find(|submission| submission.request_id.as_ref() == Some(request_id))
+                .map(|submission| submission.id)
+                .or_else(|| {
+                    tx.state
+                        .application_writes
+                        .iter()
+                        .find(|write| write.request_id.as_ref() == Some(request_id))
+                        .map(|write| write.id)
+                });
+            if existing_id
+                .is_some_and(|id| tx.state.submission_notification(id) != item.notify.as_ref())
+            {
+                return Err(crate::document::Error::InvalidSessionAdmission(
+                    "duplicate request has a different settlement notification".into(),
+                ));
+            }
+        }
         // Task admission evaluates each draft against the preceding candidate,
         // without exposing that staged table state through the session API.
         tx.table_written = false;
@@ -4275,6 +4311,7 @@ impl Harness {
             self.owner.store(),
             &record.value,
             &mut intent.admissions.clone(),
+            intent.cross_conversation,
         ) {
             check_task_notification_binding(self.owner.store(), intent)?;
             return Err(error);

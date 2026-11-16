@@ -4309,3 +4309,502 @@ async fn cross_session_committed_action_wake_survives_kill_and_drives_after_reop
         scheduler.shutdown().await.unwrap();
     }
 }
+
+struct CrossUnkeyedBatch {
+    target: Uuid,
+    fail: bool,
+    staged: Option<std::sync::mpsc::Sender<()>>,
+    release: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+fn cross_unkeyed_batch(target: Uuid) -> CrossUnkeyedBatch {
+    CrossUnkeyedBatch {
+        target,
+        fail: false,
+        staged: None,
+        release: None,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+impl Handler for CrossUnkeyedBatch {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        let notify = |key: &str| {
+            Some(SubmissionNotify {
+                task_id: task.id(),
+                key: key.into(),
+            })
+        };
+        if let Err(error) = docs.submit_write_to_session_conversation_without_request_id(
+            self.target,
+            "app.one".into(),
+            Some(json!(1)),
+            notify("one"),
+        ) {
+            return Ok(Step::Fail(error.to_string()));
+        }
+        docs.submit_write_to_session_conversation_without_request_id(
+            self.target,
+            "app.two".into(),
+            Some(json!(2)),
+            notify("two"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_write_to_session_conversation(
+            self.target,
+            "stable".into(),
+            "app.stable".into(),
+            Some(json!(3)),
+            notify("stable"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_write_to_session_conversation(
+            self.target,
+            "stable".into(),
+            "app.ignored".into(),
+            Some(json!(4)),
+            notify("stable"),
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(
+            docs.submit_write_to_session_conversation(
+                self.target,
+                "stable".into(),
+                "app.ignored".into(),
+                None,
+                notify("different")
+            )
+            .is_err()
+        );
+        assert!(
+            docs.submit_write_to_session_conversation_without_request_id(
+                self.target,
+                "app.collision".into(),
+                None,
+                notify("one")
+            )
+            .is_err()
+        );
+        docs.submit_continue_to_session_conversation_without_request_id(
+            self.target,
+            notify("continue"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_input_to_session_conversation_without_request_id(
+            self.target,
+            "input one".into(),
+            AdmissionOptions::default(),
+            notify("input-one"),
+        )
+        .map_err(|e| e.to_string())?;
+        docs.submit_input_to_session_conversation_without_request_id(
+            self.target,
+            "input two".into(),
+            AdmissionOptions::default(),
+            notify("input-two"),
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(
+            docs.submit_continue_to_session_conversation_without_request_id(self.target, None)
+                .is_err()
+        );
+        assert!(
+            docs.submit_write_to_session_conversation_without_request_id(
+                Uuid::new_v4(),
+                "app.other".into(),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            docs.submit_input_without_request_id("owner".into(), AdmissionOptions::default(), None)
+                .is_err()
+        );
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"batch":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if let Some(staged) = &self.staged {
+                staged.send(()).unwrap();
+            }
+            if let Some(release) = &self.release {
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if self.fail {
+            return Ok(Step::Fail("rollback".into()));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("input-two").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn cross_session_unkeyed_batch_orders_notifies_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    h.set_after_failed_run(target, pi_rs_durable::runtime::AfterFailedRun::Continue)
+        .unwrap();
+    let mut registry = Registry::default();
+    registry.register("batch", true, cross_unkeyed_batch(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "batch");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Waiting(_)));
+    let before = h.conversation(target).unwrap();
+    assert_eq!(before.application_writes.len(), 3);
+    assert_eq!(before.submissions.len(), 3);
+    assert!(before.application_writes[0].request_id.is_none());
+    assert!(before.application_writes[1].request_id.is_none());
+    assert_ne!(
+        before.application_writes[0].id,
+        before.application_writes[1].id
+    );
+    assert_eq!(
+        before.application_writes[2].request_id.as_deref(),
+        Some("stable")
+    );
+    assert_eq!(before.application_writes[2].data, Some(json!(3)));
+    assert!(before.submissions.iter().all(|s| s.request_id.is_none()));
+    assert_ne!(before.submissions[1].id, before.submissions[2].id);
+    assert_eq!(before.submissions[0].status, Status::Running);
+    assert_eq!(before.submissions[1].status, Status::Queued);
+    assert_eq!(before.submissions[2].status, Status::Queued);
+    let store = Store::open(&path).unwrap();
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+    for key in ["one", "two", "stable"] {
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(child.id(), &submission_settled_signal(), key)
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), "input-two")
+            .unwrap()
+            .is_none()
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("batch", true, cross_unkeyed_batch(target));
+    let driver = h.start_tasks(registry).unwrap();
+    h.resume_conversation(target, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    for key in ["one", "two", "stable", "continue", "input-one", "input-two"] {
+        assert!(
+            TaskStore::new(&store)
+                .read_typed_signal(child.id(), &submission_settled_signal(), key)
+                .unwrap()
+                .is_some(),
+            "missing {key}"
+        );
+    }
+    let after = h.conversation(target).unwrap();
+    assert_eq!(after.application_writes.len(), 3);
+    assert_eq!(after.submissions.len(), 3);
+    assert!(h.conversation(owner).unwrap().submissions.is_empty());
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_unkeyed_batch_rollback_and_membership_replay() {
+    for fail in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, session) = cross_setup(&path);
+        let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut handler = cross_unkeyed_batch(target);
+        handler.fail = fail;
+        handler.staged = Some(staged_tx);
+        handler.release = Some(std::sync::Mutex::new(release_rx));
+        let calls = handler.calls.clone();
+        let mut registry = Registry::default();
+        registry.register("batch", true, handler);
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "batch");
+        driver.submit(&child).unwrap();
+        staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let store = Store::open(&path).unwrap();
+        assert!(h.conversation(target).unwrap().submissions.is_empty());
+        assert!(
+            h.conversation(target)
+                .unwrap()
+                .application_writes
+                .is_empty()
+        );
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        if !fail {
+            let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+            membership.revoke(session, target).unwrap();
+            membership.enroll(session, target).unwrap();
+        }
+        release_tx.send(()).unwrap();
+        wait_task(&path, child.id(), |s| {
+            if fail {
+                matches!(s, TaskState::Failed(_))
+            } else {
+                matches!(s, TaskState::Waiting(_))
+            }
+        });
+        let state = h.conversation(target).unwrap();
+        assert_eq!(state.application_writes.len(), if fail { 0 } else { 3 });
+        assert_eq!(state.submissions.len(), if fail { 0 } else { 3 });
+        assert_eq!(
+            Documents::new(&store).get(&address()).unwrap().is_some(),
+            !fail
+        );
+        if !fail {
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        driver.shutdown().unwrap();
+    }
+}
+
+#[cfg(unix)]
+struct KillCrossUnkeyed(Uuid);
+#[cfg(unix)]
+impl Handler for KillCrossUnkeyed {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use std::io::Write;
+        cross_unkeyed_batch(self.0).run_with_documents(task, docs)?;
+        println!("CROSS_UNKEYED_STAGED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cross_unkeyed_kill_worker() {
+    let Ok(path) = std::env::var("CROSS_UNKEYED_DB") else {
+        return;
+    };
+    let owner = std::env::var("CROSS_UNKEYED_OWNER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let target = std::env::var("CROSS_UNKEYED_TARGET")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let h = Harness::open_paused(path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("batch", true, KillCrossUnkeyed(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = Task::new(
+        Uuid::from_u128(10031),
+        TaskOwner::Conversation(owner),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("batch".into(), true);
+    driver.submit(&child).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cross_session_unkeyed_batch_kill_replays_once() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, session) = cross_setup(&path);
+    drop(h);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cross_unkeyed_kill_worker", "--nocapture"])
+        .env("CROSS_UNKEYED_DB", &path)
+        .env("CROSS_UNKEYED_OWNER", owner.to_string())
+        .env("CROSS_UNKEYED_TARGET", target.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if line.contains("CROSS_UNKEYED_STAGED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    let reached = rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    reached.expect("child did not stage batch");
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(target).unwrap().submissions.is_empty());
+    assert!(
+        h.conversation(target)
+            .unwrap()
+            .application_writes
+            .is_empty()
+    );
+    let store = Store::open(&path).unwrap();
+    let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+    membership.revoke(session, target).unwrap();
+    membership.enroll(session, target).unwrap();
+    let mut registry = Registry::default();
+    registry.register("batch", true, cross_unkeyed_batch(target));
+    let driver = h.start_tasks(registry).unwrap();
+    wait_task(&path, Uuid::from_u128(10031), |s| {
+        matches!(s, TaskState::Waiting(_))
+    });
+    let state = h.conversation(target).unwrap();
+    assert_eq!(state.application_writes.len(), 3);
+    assert_eq!(state.submissions.len(), 3);
+    assert!(state.submissions.iter().all(|s| s.request_id.is_none()));
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(target).unwrap();
+    assert_eq!(state.application_writes.len(), 3);
+    assert_eq!(state.submissions.len(), 3);
+}
+
+#[test]
+fn cross_session_unkeyed_batch_abort_discards_all_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut handler = cross_unkeyed_batch(target);
+    handler.staged = Some(staged_tx);
+    handler.release = Some(std::sync::Mutex::new(release_rx));
+    let mut registry = Registry::default();
+    registry.register("batch", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "batch");
+    driver.submit(&child).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    h.request_abort(target).unwrap();
+    release_tx.send(()).unwrap();
+    wait_task(&path, child.id(), |s| {
+        matches!(s, TaskState::Failed(_) | TaskState::Cancelled)
+    });
+    let state = h.conversation(target).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    let store = Store::open(&path).unwrap();
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    driver.shutdown().unwrap();
+}
+
+struct CrossUnkeyedLimit(Uuid);
+impl Handler for CrossUnkeyedLimit {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        for n in 0..16 {
+            docs.submit_write_to_session_conversation_without_request_id(
+                self.0,
+                "app.limit".into(),
+                Some(json!(n)),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        assert!(
+            docs.submit_write_to_session_conversation_without_request_id(
+                self.0,
+                "app.overflow".into(),
+                None,
+                None
+            )
+            .is_err()
+        );
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+#[test]
+fn cross_session_unkeyed_batch_limit_retains_first_sixteen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, owner, target, _) = cross_setup(&path);
+    let mut registry = Registry::default();
+    registry.register("limit", true, CrossUnkeyedLimit(target));
+    let driver = h.start_tasks(registry).unwrap();
+    let child = task(owner, "limit");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |state| {
+        matches!(state, TaskState::Succeeded(_))
+    });
+    let state = h.conversation(target).unwrap();
+    assert_eq!(state.application_writes.len(), 16);
+    assert!(
+        state
+            .application_writes
+            .iter()
+            .all(|write| write.request_id.is_none())
+    );
+    assert_eq!(
+        state
+            .application_writes
+            .iter()
+            .map(|write| write.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        16
+    );
+    assert_eq!(
+        state
+            .application_writes
+            .iter()
+            .map(|write| write.data.clone())
+            .collect::<Vec<_>>(),
+        (0..16).map(|n| Some(json!(n))).collect::<Vec<_>>()
+    );
+    driver.shutdown().unwrap();
+}

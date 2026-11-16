@@ -2408,7 +2408,8 @@ impl<'a> TaskDocuments<'a> {
     }
     /// Stage one input for a different conversation explicitly enrolled by the
     /// host in the same session as this task's owning conversation. This is the
-    /// only admission allowed in the step; UUIDs alone convey no authority.
+    /// admissions in the step must target the same conversation; UUIDs alone
+    /// convey no authority.
     pub fn submit_input_to_session_conversation(
         &mut self,
         target: uuid::Uuid,
@@ -2419,7 +2420,7 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<(), Error> {
         self.stage_session_submission(
             target,
-            request_id,
+            Some(request_id),
             TaskSubmissionDraft::Input { content, options },
             notify,
         )
@@ -2432,7 +2433,12 @@ impl<'a> TaskDocuments<'a> {
         request_id: String,
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
-        self.stage_session_submission(target, request_id, TaskSubmissionDraft::Continue, notify)
+        self.stage_session_submission(
+            target,
+            Some(request_id),
+            TaskSubmissionDraft::Continue,
+            notify,
+        )
     }
 
     /// Stage one keyed display-only write for an explicitly same-session conversation.
@@ -2446,7 +2452,48 @@ impl<'a> TaskDocuments<'a> {
     ) -> Result<(), Error> {
         self.stage_session_submission(
             target,
-            request_id,
+            Some(request_id),
+            TaskSubmissionDraft::Write { kind, data },
+            notify,
+        )
+    }
+
+    /// Stage a distinct input without a request ID for a same-session target.
+    pub fn submit_input_to_session_conversation_without_request_id(
+        &mut self,
+        target: uuid::Uuid,
+        content: String,
+        options: crate::state::AdmissionOptions,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_session_submission(
+            target,
+            None,
+            TaskSubmissionDraft::Input { content, options },
+            notify,
+        )
+    }
+
+    /// Stage a distinct continue without a request ID for a same-session target.
+    pub fn submit_continue_to_session_conversation_without_request_id(
+        &mut self,
+        target: uuid::Uuid,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_session_submission(target, None, TaskSubmissionDraft::Continue, notify)
+    }
+
+    /// Stage a distinct display write without a request ID for a same-session target.
+    pub fn submit_write_to_session_conversation_without_request_id(
+        &mut self,
+        target: uuid::Uuid,
+        kind: String,
+        data: Option<Value>,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_session_submission(
+            target,
+            None,
             TaskSubmissionDraft::Write { kind, data },
             notify,
         )
@@ -2455,7 +2502,7 @@ impl<'a> TaskDocuments<'a> {
     fn stage_session_submission(
         &mut self,
         target: uuid::Uuid,
-        request_id: String,
+        request_id: Option<String>,
         draft: TaskSubmissionDraft,
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
@@ -2467,7 +2514,7 @@ impl<'a> TaskDocuments<'a> {
                 "cross-conversation notification must target the submitting task".into(),
             ));
         }
-        self.stage_submission(Some(target), Some(request_id), draft, notify, || {})
+        self.stage_submission(Some(target), request_id, draft, notify, || {})
     }
 
     /// Stage a text input in the task's owning conversation. The request ID
@@ -2626,9 +2673,11 @@ impl<'a> TaskDocuments<'a> {
             return Err(Error::InvalidSessionAdmission("request ID required".into()));
         }
         if let Some(intent) = &self.task_input {
-            if target.is_some() || intent.cross_conversation {
+            if target.is_some() != intent.cross_conversation
+                || target.is_some_and(|target| target != intent.conversation)
+            {
                 return Err(Error::InvalidSessionAdmission(
-                    "cross-conversation submission must be the only admission in a step".into(),
+                    "all admissions in a step must use the same conversation".into(),
                 ));
             }
             if intent.admissions.len() >= 16 {
@@ -2645,8 +2694,12 @@ impl<'a> TaskDocuments<'a> {
             });
             let snapshot = intent.snapshot.clone();
             let conversation = intent.conversation;
-            let result =
-                crate::runtime::validate_task_submissions(self.store, &snapshot, &mut admissions);
+            let result = crate::runtime::validate_task_submissions(
+                self.store,
+                &snapshot,
+                &mut admissions,
+                intent.cross_conversation,
+            );
             result.map_err(|error| self.remember_task_input_error(error))?;
             if admissions.iter().any(|item| {
                 matches!(
@@ -2756,26 +2809,6 @@ impl<'a> TaskDocuments<'a> {
                     })?;
             }
             let state: crate::runtime::Conversation = serde_json::from_slice(&record.value)?;
-            let existing_id = state
-                .submissions
-                .iter()
-                .find(|submission| submission.request_id.as_ref() == request_id.as_ref())
-                .map(|submission| submission.id)
-                .or_else(|| {
-                    state
-                        .application_writes
-                        .iter()
-                        .find(|write| write.request_id.as_ref() == request_id.as_ref())
-                        .map(|write| write.id)
-                });
-            if cross_conversation
-                && let Some(existing) = existing_id
-                && state.submission_notification(existing) != notify.as_ref()
-            {
-                return Err(Error::InvalidSessionAdmission(
-                    "duplicate request has a different settlement notification".into(),
-                ));
-            }
             if state.id != conversation || state.abort_requested {
                 return Err(Error::InvalidSessionAdmission(
                     "conversation is aborting or invalid".into(),
@@ -2787,7 +2820,12 @@ impl<'a> TaskDocuments<'a> {
                 notify,
                 notification_binding: None,
             }];
-            crate::runtime::validate_task_submissions(self.store, &record.value, &mut admissions)?;
+            crate::runtime::validate_task_submissions(
+                self.store,
+                &record.value,
+                &mut admissions,
+                cross_conversation,
+            )?;
             if matches!(
                 admissions[0].draft,
                 TaskSubmissionDraft::Input { .. } | TaskSubmissionDraft::Continue
