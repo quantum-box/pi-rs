@@ -47,10 +47,512 @@ fn turn_model_arguments(
     }
 }
 
+// Reserved identity namespace for tools which cannot be polled. Pollable tool
+// identities may never use this prefix, including across a restart.
+const NON_POLLABLE_IDENTITY: &str = "pi-rs:non-pollable:v1";
+
+pub(super) fn turn_recovery_identity(tool: &RegisteredTool) -> Result<String> {
+    if !tool.tool.can_poll() {
+        return Ok(NON_POLLABLE_IDENTITY.into());
+    }
+    match tool.tool.recovery_identity() {
+        Some(identity) if !identity.is_empty() && !identity.starts_with("pi-rs:non-pollable:") => {
+            Ok(identity)
+        }
+        _ => Err(Error::Session(
+            "pollable constrained tool has no stable recovery identity".into(),
+        )),
+    }
+}
+
+// Preflight the same durable reply provenance that the journal checks again at
+// start. This must run before argument preparation and extension hooks.
+fn turn_active_decision(
+    session: &Session,
+    invocations: &[Invocation],
+) -> Result<Option<crate::ToolDecisionSnapshot>> {
+    if invocations.is_empty() {
+        return Ok(None);
+    }
+    let branch = session.branch();
+    let latest_request = branch
+        .iter()
+        .rev()
+        .find(|record| matches!(record.event, Event::ModelRequested { .. }));
+    let assistant = branch
+        .iter()
+        .rev()
+        .find(|record| matches!(record.event, Event::Assistant { .. }));
+    let latest_marked = match latest_request {
+        Some(record) => !matches!(
+            session.recorded_tool_decision(record.id)?,
+            crate::RecordedToolDecision::Legacy
+        ),
+        None => false,
+    };
+    let Some(assistant) = assistant else {
+        return if latest_marked {
+            Err(Error::Session(
+                "missing assistant reply for tool decision".into(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let Event::Assistant {
+        content,
+        invocations: recorded,
+        request_id,
+        ..
+    } = &assistant.event
+    else {
+        unreachable!()
+    };
+    if recorded != invocations
+        && branch.iter().any(|record| {
+            matches!(
+                &record.event,
+                Event::ModelRequested {
+                    tool_decision: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        return Err(Error::Session(
+            "tool invocations do not match the active assistant reply".into(),
+        ));
+    }
+    let Some(request_id) = *request_id else {
+        return if latest_marked {
+            Err(Error::Session(
+                "missing tool decision request identity".into(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let Some(request) = branch.iter().find(|record| matches!(&record.event, Event::ModelRequested { request_id: Some(id), .. } if *id == request_id)) else {
+        return if latest_marked { Err(Error::Session("missing tool decision request".into())) } else { Ok(None) };
+    };
+    let decision = match session.active_tool_decision(request_id)? {
+        crate::RecordedToolDecision::Legacy if !latest_marked => return Ok(None),
+        crate::RecordedToolDecision::Current(decision) => decision,
+        _ => return Err(Error::Session("tool decision is not current".into())),
+    };
+    if decision.context().summary
+        || decision.context().session_id != session.session_id()
+        || recorded != invocations
+        || request.run_id != session.current_run_id()
+        || assistant.run_id != request.run_id
+        || latest_request.map(|r| r.id) != Some(request.id)
+    {
+        return Err(Error::Session(
+            "tool decision does not match active turn".into(),
+        ));
+    }
+    let Event::ModelRequested {
+        max_output_tokens, ..
+    } = &request.event
+    else {
+        unreachable!()
+    };
+    let validated = decision
+        .validate_recorded(
+            decision.context(),
+            decision.request_sha256(),
+            decision.dispatch_sha256(),
+            decision.binding_sha256(),
+        )
+        .map_err(|_| Error::Session("invalid active tool decision".into()))?;
+    let mut completions = branch.iter().filter(|record| matches!(&record.event, Event::ModelFinished { request_id: id, .. } if *id == request_id));
+    let completion = completions
+        .next()
+        .ok_or_else(|| Error::Session("missing model completion".into()))?;
+    let Event::ModelFinished {
+        metadata,
+        failure: None,
+        partial,
+        reply: Some(reply),
+        ..
+    } = &completion.event
+    else {
+        return Err(Error::Session(
+            "model completion has no successful reply".into(),
+        ));
+    };
+    let advertised: Vec<_> = validated
+        .effective_tools()
+        .iter()
+        .map(|tool| tool.spec.name.as_str())
+        .collect();
+    if completions.next().is_some() || request.id >= completion.id || completion.id >= assistant.id
+        || completion.run_id != request.run_id || metadata.finish_reason.as_deref() == Some("length")
+        || !partial.is_empty() || reply.max_output_tokens != *max_output_tokens
+        || reply.advertised_tools.iter().map(String::as_str).collect::<Vec<_>>() != advertised
+        || &reply.content != content || reply.invocations != *recorded
+        || branch.iter().filter(|record| matches!(&record.event, Event::Assistant { request_id: Some(id), .. } if *id == request_id)).count() != 1
+        || branch.iter().any(|record| record.id > request.id && record.id != assistant.id && matches!(&record.event, Event::Assistant { .. }))
+    {
+        return Err(Error::Session("tool decision reply provenance mismatch".into()));
+    }
+    let mut ids = HashSet::new();
+    for invocation in invocations {
+        if !ids.insert(invocation.operation_id)
+            || branch.iter().any(|record| match &record.event {
+                Event::Assistant { invocations, .. } if record.id != assistant.id => invocations
+                    .iter()
+                    .any(|other| other.operation_id == invocation.operation_id),
+                Event::ToolPlanned {
+                    invocation: other, ..
+                } => other.operation_id == invocation.operation_id,
+                Event::ToolStarted { operation_id, .. }
+                | Event::ToolFinished { operation_id, .. }
+                | Event::ToolReconciled { operation_id, .. } => {
+                    *operation_id == invocation.operation_id
+                }
+                _ => false,
+            })
+        {
+            return Err(Error::Session(
+                "ambiguous tool invocation provenance".into(),
+            ));
+        }
+    }
+    Ok(Some(decision))
+}
+
+fn turn_is_strict(decision: &crate::ToolDecisionSnapshot, spec: &ToolSpec) -> Result<bool> {
+    let validated = decision
+        .validate_recorded(
+            decision.context(),
+            decision.request_sha256(),
+            decision.dispatch_sha256(),
+            decision.binding_sha256(),
+        )
+        .map_err(|_| Error::Session("invalid tool decision".into()))?;
+    let effective = validated
+        .effective_tools()
+        .iter()
+        .find(|entry| &entry.spec == spec)
+        .ok_or_else(|| Error::Session("tool does not match request decision".into()))?;
+    Ok(matches!(
+        effective.sampling,
+        crate::EffectiveToolSampling::StrictJsonSchema { .. }
+    ))
+}
+
 #[cfg(test)]
 mod strict_argument_tests {
     use super::*;
     use serde_json::json;
+
+    struct FixtureTool {
+        pollable: bool,
+        pending: bool,
+        identity: Option<&'static str>,
+        seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Tool for FixtureTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object", "properties":{"path":{"type":"string"},"limit":{"type":"integer"}}, "required":["path"]}),
+            }
+        }
+        fn can_poll(&self) -> bool {
+            self.pollable
+        }
+        fn recovery_identity(&self) -> Option<String> {
+            self.identity.map(str::to_owned)
+        }
+        async fn prepare_arguments(
+            &self,
+            args: serde_json::Value,
+        ) -> crate::ExtensionResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(args.clone());
+            Ok(args)
+        }
+        async fn invoke(&self, args: serde_json::Value, _: ToolContext) -> Outcome {
+            self.seen.lock().unwrap().push(args);
+            if self.pending {
+                Outcome::Pending {
+                    reference: "job".into(),
+                }
+            } else {
+                Outcome::Succeeded("ok".into())
+            }
+        }
+    }
+
+    struct FixtureExtension(Arc<FixtureTool>);
+    #[async_trait::async_trait]
+    impl crate::Extension for FixtureExtension {
+        fn id(&self) -> &str {
+            "fixture"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![self.0.clone()]
+        }
+        async fn tool_call(
+            &self,
+            _: &str,
+            args: &mut serde_json::Value,
+            _: &ToolContext,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Decision> {
+            args["path"] = json!("authorized");
+            Ok(Decision::Allow)
+        }
+    }
+    struct FixtureModel;
+    #[async_trait::async_trait]
+    impl Model for FixtureModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            unreachable!()
+        }
+    }
+
+    fn recorded_turn(session: &mut Session, spec: ToolSpec, strict: bool) -> Invocation {
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: false,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let sampling = if strict {
+            crate::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+            }
+        } else {
+            crate::EffectiveToolSampling::Unconstrained
+        };
+        let decision = crate::ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[crate::EffectiveToolDeclaration {
+                spec: spec.clone(),
+                sampling,
+            }],
+        )
+        .unwrap();
+        let event = Event::ModelRequested {
+            model: request.model.clone(),
+            messages: 0,
+            tools: 1,
+            max_output_tokens: 10,
+            request_id: Some(context.request_id),
+            context_head: Some(session.head()),
+            context_sha256: Some(decision.request_sha256().into()),
+            context_transformed: Some(false),
+            context_configuration_sha256: None,
+            tool_decision: None,
+        };
+        session
+            .append_tool_decision_request(event, &decision, &request, &request, &[declaration])
+            .unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: spec.name.clone(),
+                arguments: r#"{"path":"file","limit":null}"#.into(),
+            },
+        };
+        session
+            .append(Event::ModelFinished {
+                request_id: context.request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    advertised_tools: vec![spec.name],
+                    max_output_tokens: 10,
+                }),
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: Some(context.request_id),
+            })
+            .unwrap();
+        invocation
+    }
+
+    async fn run_fixture(
+        pollable: bool,
+        identity: Option<&'static str>,
+        strict: bool,
+        pending: bool,
+    ) -> (Result<()>, Session, Invocation, Arc<FixtureTool>) {
+        let tool = Arc::new(FixtureTool {
+            pollable,
+            pending,
+            identity,
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FixtureExtension(tool.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = recorded_turn(&mut session, crate::Tool::spec(tool.as_ref()), strict);
+        let agent = Agent {
+            model: &FixtureModel,
+            model_name: "model",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let cancellation = CancellationToken::new();
+        let advertised = HashSet::from(["read".to_owned()]);
+        let scope = DispatchScope {
+            cancellation: &cancellation,
+            advertised: &advertised,
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut observer = |_: Notification<'_>| {};
+        let result = agent
+            .dispatch_turn::<String>(
+                &mut session,
+                std::slice::from_ref(&invocation),
+                &scope,
+                &mut ExtensionStates::new(),
+                &mut observer,
+                None,
+            )
+            .await;
+        (result, session, invocation, tool)
+    }
+
+    #[tokio::test]
+    async fn strict_execution_persists_exact_authorized_arguments() {
+        let (result, session, invocation, tool) = run_fixture(false, None, true, false).await;
+        result.unwrap();
+        assert_eq!(
+            *tool.seen.lock().unwrap(),
+            vec![json!({"path":"file"}), json!({"path":"authorized"})]
+        );
+        assert!(invocation.call.arguments.contains("null"));
+        let start = session.records().iter().find(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id)).unwrap();
+        assert_eq!(
+            session
+                .recorded_tool_execution(
+                    start.id,
+                    "fixture",
+                    &crate::Tool::spec(tool.as_ref()),
+                    NON_POLLABLE_IDENTITY
+                )
+                .unwrap(),
+            Some(json!({"path":"authorized"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn pollable_without_identity_fails_before_preparation() {
+        for identity in [None, Some("pi-rs:non-pollable:v1")] {
+            let (result, session, _, tool) = run_fixture(true, identity, true, false).await;
+            assert!(result.is_err());
+            assert!(tool.seen.lock().unwrap().is_empty());
+            assert!(
+                !session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::ToolStarted { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefer_fallback_preserves_raw_arguments() {
+        let (result, session, _, tool) = run_fixture(false, None, false, false).await;
+        result.unwrap();
+        assert_eq!(
+            *tool.seen.lock().unwrap(),
+            vec![json!({"path":"file","limit":null})]
+        );
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::ToolStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn pollable_tool_waits_for_snapshot_aware_recovery() {
+        let (result, session, invocation, tool) =
+            run_fixture(true, Some("backend:v1"), true, false).await;
+        assert!(result.is_err());
+        assert!(tool.seen.lock().unwrap().is_empty());
+        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id)));
+    }
+
+    #[tokio::test]
+    async fn unexpected_pending_requires_reconciliation() {
+        let (result, session, invocation, _) = run_fixture(false, None, true, true).await;
+        assert!(result.is_err());
+        assert!(
+            session
+                .operations()
+                .iter()
+                .any(|(call, state)| call.operation_id == invocation.operation_id
+                    && matches!(state, OperationState::Finished(Outcome::Unknown(_))))
+        );
+    }
+
+    #[test]
+    fn rejects_forged_invocation_and_superseded_turn_before_hooks() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let tool = FixtureTool {
+            pollable: false,
+            pending: false,
+            identity: None,
+            seen: Arc::default(),
+        };
+        let invocation = recorded_turn(&mut session, crate::Tool::spec(&tool), true);
+        assert!(
+            turn_active_decision(&session, std::slice::from_ref(&invocation))
+                .unwrap()
+                .is_some()
+        );
+        let mut forged = invocation.clone();
+        forged.call.arguments = "{}".into();
+        assert!(turn_active_decision(&session, &[forged]).is_err());
+        session
+            .append(Event::Assistant {
+                content: "later".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        assert!(turn_active_decision(&session, &[invocation]).is_err());
+    }
 
     #[test]
     fn uses_actual_sampling_and_rejects_changed_tool_specs() {
@@ -230,6 +732,7 @@ impl Agent<'_> {
         invocation: &Invocation,
         advertised: &HashSet<String>,
         cancel: &CancellationToken,
+        decision: Option<&crate::ToolDecisionSnapshot>,
     ) -> Result<TurnNormalized> {
         let call = &invocation.call;
         let Some(tool) = registry
@@ -242,9 +745,30 @@ impl Agent<'_> {
                 "tool is not registered or advertised".into(),
             ));
         };
-        // Until the caller provides proven request provenance, use the legacy
-        // path. Strict decisions must never be inferred from a tool preference.
-        let args = match turn_model_arguments(invocation, &tool.spec, None) {
+        let validated = decision
+            .map(|decision| {
+                decision.validate_recorded(
+                    decision.context(),
+                    decision.request_sha256(),
+                    decision.dispatch_sha256(),
+                    decision.binding_sha256(),
+                )
+            })
+            .transpose()
+            .map_err(|_| Error::Session("invalid tool decision".into()))?;
+        if let Some(decision) = decision
+            && turn_is_strict(decision, &tool.spec)?
+        {
+            // Fail before launching any member of a prepared parallel group.
+            turn_recovery_identity(&tool)?;
+            // Remove only when pending recovery consumes the durable snapshot.
+            if tool.tool.can_poll() {
+                return Err(Error::Session(
+                    "strict pollable tools require snapshot-aware recovery".into(),
+                ));
+            }
+        }
+        let args = match turn_model_arguments(invocation, &tool.spec, validated.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
                 return Ok(TurnNormalized::Skipped(format!(
@@ -319,7 +843,8 @@ impl Agent<'_> {
         cancel: &CancellationToken,
     ) -> Result<TurnPreparation> {
         let normalized =
-            Self::turn_normalize(registry, tool_timeout, invocation, advertised, cancel).await?;
+            Self::turn_normalize(registry, tool_timeout, invocation, advertised, cancel, None)
+                .await?;
         Self::turn_finish_preparation(
             registry,
             tool_timeout,
@@ -672,6 +1197,11 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
+        let turn_decision = if scope.depth == 0 {
+            turn_active_decision(session, invocations)?.map(Arc::new)
+        } else {
+            None
+        };
         let observe_tools = self.registry.extensions.iter().any(|extension| {
             extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
         });
@@ -865,6 +1395,11 @@ impl Agent<'_> {
                     let model_timeout = self.limits.model_timeout;
                     let tool_timeout = self.limits.tool_timeout;
                     let hook_host = lifecycle_host.clone();
+                    let decision = if calls[index].lane.is_none() {
+                        turn_decision.clone()
+                    } else {
+                        None
+                    };
                     futures.push(async move {
                         let mut errors = Vec::new();
                         if observe_tools {
@@ -876,7 +1411,7 @@ impl Agent<'_> {
                             let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
                             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&registry, event, &state_snapshot, model_timeout, &mut collect, hook_host) => {} }
                         }
-                        let result = Self::turn_normalize(&registry, tool_timeout, &invocation, &advertised, &cancel).await;
+                        let result = Self::turn_normalize(&registry, tool_timeout, &invocation, &advertised, &cancel, decision.as_deref()).await;
                         TurnEvent::Normalized(index, result, errors)
                     }.boxed());
                     if !parallel {
@@ -1158,7 +1693,24 @@ impl Agent<'_> {
                                     continue;
                                 }
                                 let ran = matches!(&prepared, TurnPreparation::Ready { .. });
-                                if ran { commit(session, Event::ToolStarted { operation_id: calls[index].invocation.operation_id, tool_execution: None }, observer)?; }
+                                if let TurnPreparation::Ready { tool, args, .. } = &prepared {
+                                    let strict_decision = if calls[index].lane.is_none() {
+                                        match turn_decision.as_ref() {
+                                            Some(decision) if turn_is_strict(decision, &tool.spec)? => Some(decision),
+                                            _ => None,
+                                        }
+                                    } else { None };
+                                    if let Some(decision) = strict_decision {
+                                        let identity = turn_recovery_identity(tool)?;
+                                        let invocation = &calls[index].invocation;
+                                        let request_id = decision.context().request_id;
+                                        let snapshot = crate::ToolExecutionSnapshot::capture(request_id, invocation, &tool.owner, &tool.spec, &identity, decision.binding_sha256(), args.clone())?;
+                                        let record = session.append_tool_execution_started(request_id, invocation.operation_id, &snapshot, &tool.owner, &tool.spec, &identity)?;
+                                        observer(Notification::Committed(record));
+                                    } else {
+                                        commit(session, Event::ToolStarted { operation_id: calls[index].invocation.operation_id, tool_execution: None }, observer)?;
+                                    }
+                                }
                                 let cancellation = match &prepared { TurnPreparation::Ready { context, .. } => context.cancellation.clone(), TurnPreparation::Skipped(_) => calls[index].cancellation.child_token() };
                                 let (updates, mut progress_input) = mpsc::channel::<TurnProgress>(32);
                                 let (finish_progress, mut finish_signal) = oneshot::channel();
@@ -1205,7 +1757,22 @@ impl Agent<'_> {
                                 let flush = updates.clone();
                                 futures.push(async move { let invoke = async move { let start = crate::runtime::Monotonic::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); (reply, duration) }; let ((reply, duration), errors) = futures_util::future::join(invoke, progress_worker).await; TurnEvent::Ran(index, reply, duration, errors) }.boxed());
                     }
-                    TurnEvent::Ran(index, reply, duration, errors) => { for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); } calls[index].phase = TurnPhase::Done(Box::new(reply), duration); }
+                    TurnEvent::Ran(index, mut reply, duration, errors) => {
+                        for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
+                        // A supposedly non-pollable strict tool may still return
+                        // Pending. Do not create a pending record that the old
+                        // recovery path might later poll using raw arguments.
+                        if let Outcome::Pending { reference } = &reply.outcome
+                            && calls[index].lane.is_none()
+                            && let Some(decision) = turn_decision.as_ref()
+                            && let Some(tool) = self.registry.tools.get(&calls[index].invocation.call.name)
+                            && turn_is_strict(decision, &tool.spec)?
+                        {
+                            reply.outcome = Outcome::Unknown(format!("non-pollable strict tool returned pending ({reference}); reconciliation required"));
+                            reply.state = None;
+                        }
+                        calls[index].phase = TurnPhase::Done(Box::new(reply), duration);
+                    }
                     TurnEvent::Transformed(index, reply, duration, errors, replaced) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
                         let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), !replaced);
