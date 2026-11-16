@@ -1112,7 +1112,7 @@ impl<'a> Documents<'a> {
 /// An all-or-nothing collection of checked writes. Identical checks may be
 /// shared, but writes must be unique and ownership insertions must not
 /// invalidate another component's view of the graph.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Transaction {
     checks: Vec<Check>,
     mutations: Vec<Mutation>,
@@ -1349,12 +1349,15 @@ impl Transaction {
     pub(crate) fn mutations(&self) -> &[Mutation] {
         &self.mutations
     }
+    pub(crate) fn checks(&self) -> &[Check] {
+        &self.checks
+    }
 
     pub(crate) fn assemble_submission_notifications(
         self,
         store: &Store,
-        settlements: Vec<crate::runtime::SettlementNotification>,
-        now: i64,
+        settlements: &[crate::runtime::SettlementNotification],
+        now: &[i64],
     ) -> Result<Self, Error> {
         if settlements.is_empty() {
             return Ok(self);
@@ -1365,14 +1368,17 @@ impl Transaction {
             mutations: self.mutations,
         })?;
         let token = crate::runtime::submission_settled_signal();
-        for (notify, value, settlement) in settlements {
+        if settlements.len() != now.len() {
+            return Err(Error::InvalidBatch);
+        }
+        for ((notify, value, settlement), now) in settlements.iter().zip(now) {
             if host.signal_submission_at(
                 notify.task_id,
                 &token,
                 &notify.key,
-                value,
-                now,
-                settlement,
+                value.clone(),
+                *now,
+                *settlement,
             )? == crate::task_store::SignalResult::Invalid
             {
                 return Err(Error::InvalidSessionAdmission(

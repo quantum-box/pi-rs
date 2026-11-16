@@ -107,7 +107,7 @@ const FORK_DOCUMENT_ATTEMPTS: usize = 8;
 // A notification can strengthen an existing task CAS with a deadline. If
 // only that added deadline expired, reassemble the notification while keeping
 // the original CAS (including any original deadline) unchanged.
-fn notification_deadline_only_conflict(
+pub(crate) fn notification_deadline_only_conflict(
     store: &durable_store::Store,
     key: &[u8],
     original: &Expected,

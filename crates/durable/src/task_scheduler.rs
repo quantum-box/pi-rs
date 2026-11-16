@@ -552,9 +552,43 @@ pub struct CompletedInvocation {
 // Own the exact checked transaction and the observations needed to revalidate
 // it after graph-only conflicts. The invocation lease remains with its caller.
 /// A checked transaction and its graph revalidation state.
+struct TaskNotificationAssembly {
+    original: crate::document::Transaction,
+    settlements: Vec<crate::runtime::SettlementNotification>,
+    clocks: Vec<Option<(i64, std::time::Instant)>>,
+    retries: usize,
+}
+
+impl TaskNotificationAssembly {
+    fn assemble(
+        &mut self,
+        store: &durable_store::Store,
+        harness: &crate::runtime::Harness,
+    ) -> Result<crate::document::Transaction, crate::document::Error> {
+        let mut samples = Vec::with_capacity(self.settlements.len());
+        for clock in &mut self.clocks {
+            let sample = harness.task_submission_clock();
+            let (anchor, started) =
+                clock.get_or_insert_with(|| (sample, std::time::Instant::now()));
+            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            let projected = anchor.saturating_add(elapsed);
+            let now = sample.max(projected);
+            if sample > projected {
+                *anchor = sample;
+                *started = std::time::Instant::now();
+            }
+            samples.push(now);
+        }
+        self.original
+            .clone()
+            .assemble_submission_notifications(store, &self.settlements, &samples)
+    }
+}
+
 pub struct PreparedSettlement {
     attachment: Arc<Attachment>,
     transaction: crate::document::Transaction,
+    notifications: Option<TaskNotificationAssembly>,
     running: task_store::StoredTask,
     candidate: task_store::StoredTask,
     wait_targets: Vec<Uuid>,
@@ -810,6 +844,15 @@ impl PreparedSettlement {
                 &self.candidate.task,
                 &candidate,
             )?;
+            if let Some(notifications) = &mut self.notifications {
+                notifications.original.rebase_task_candidate(
+                    self.running.task.id(),
+                    self.running.version,
+                    latest.version,
+                    &self.candidate.task,
+                    &candidate,
+                )?;
+            }
             self.running = latest;
             self.candidate.task = candidate;
         }
@@ -3976,43 +4019,50 @@ impl Scheduler {
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
+        let mut notifications = None;
         if has_task_submission && let Some(harness) = &self.validator {
             let settlements =
                 crate::runtime::submission_settlements(owner.store(), transaction.mutations())
                     .map_err(|error| {
                         crate::document::Error::InvalidSessionAdmission(error.to_string())
                     })?;
-            transaction = match transaction.assemble_submission_notifications(
-                owner.store(),
-                settlements,
-                harness.task_submission_clock(),
-            ) {
-                Ok(transaction) => transaction,
-                Err(
-                    error @ (crate::document::Error::Signal(
-                        task_store::Error::SignalKeyMismatch
-                        | task_store::Error::SignalMismatch
-                        | task_store::Error::SignalKeyConsumed
-                        | task_store::Error::InvalidSignalPayload,
-                    )
-                    | crate::document::Error::InvalidSessionAdmission(_)),
-                ) => {
-                    return self.finish_running_failure(
-                        &running,
-                        error.to_string(),
-                        &owner,
-                        _gate,
-                        nonblocking_abort,
-                        deferred,
-                    );
-                }
-                Err(error) => return Err(error.into()),
-            };
+            if !settlements.is_empty() {
+                let mut assembly = TaskNotificationAssembly {
+                    original: transaction.clone(),
+                    clocks: vec![None; settlements.len()],
+                    settlements,
+                    retries: 0,
+                };
+                transaction = match assembly.assemble(owner.store(), harness) {
+                    Ok(transaction) => transaction,
+                    Err(
+                        error @ (crate::document::Error::Signal(
+                            task_store::Error::SignalKeyMismatch
+                            | task_store::Error::SignalMismatch
+                            | task_store::Error::SignalKeyConsumed
+                            | task_store::Error::InvalidSignalPayload,
+                        )
+                        | crate::document::Error::InvalidSessionAdmission(_)),
+                    ) => {
+                        return self.finish_running_failure(
+                            &running,
+                            error.to_string(),
+                            &owner,
+                            _gate,
+                            nonblocking_abort,
+                            deferred,
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                notifications = Some(assembly);
+            }
         }
         let _ = wait_graph_fence;
         let mut prepared = PreparedSettlement {
             attachment: self.attachment.clone(),
             transaction,
+            notifications,
             running,
             candidate: next,
             wait_targets: retry_wait,
@@ -4070,6 +4120,41 @@ impl Scheduler {
                 break result;
             };
             prepared.commit_uncertain = false;
+            if let Some(assembly) = &mut prepared.notifications
+                && assembly.retries < 3
+                && assembly
+                    .settlements
+                    .iter()
+                    .any(|(notify, _, _)| task_store::key(notify.task_id) == *key)
+            {
+                let old = assembly
+                    .original
+                    .checks()
+                    .iter()
+                    .find(|check| check.key == *key);
+                let new = prepared
+                    .transaction
+                    .checks()
+                    .iter()
+                    .find(|check| check.key == *key);
+                let retry = match (old, new) {
+                    (None, Some(_)) => true,
+                    (Some(old), Some(new)) => crate::runtime::notification_deadline_only_conflict(
+                        owner.store(),
+                        key,
+                        &old.expected,
+                        &new.expected,
+                    )
+                    .map_err(task_store::Error::from)?,
+                    _ => false,
+                };
+                if retry {
+                    let harness = self.validator.as_ref().ok_or(Error::Ownership)?;
+                    prepared.transaction = assembly.assemble(owner.store(), harness)?;
+                    assembly.retries += 1;
+                    continue;
+                }
+            }
             if !(key == task_store::PREFIX
                 || key == crate::ownership_edge::PREFIX
                 || key == b"runtime/conversation/")
@@ -5057,6 +5142,184 @@ mod tests {
         Checkpoint {
             phase: phase.into(),
             data: json!(null),
+        }
+    }
+
+    #[test]
+    fn task_write_notification_deadline_reassembles_without_weakening_original_fence() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{
+            Config, Harness, Options, SubmissionNotify, submission_settled_signal,
+        };
+        use crate::task_store::{Save, SignalState, SignalToken, TaskStore};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Write {
+            target: Uuid,
+            original_deadline: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Handler for Write {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                docs.submit_write(
+                    "deadline-write".into(),
+                    "app.note".into(),
+                    None,
+                    Some(SubmissionNotify {
+                        task_id: self.target,
+                        key: "settled".into(),
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+                if self.original_deadline {
+                    docs.signal_at(
+                        self.target,
+                        &SignalToken::new("other", 1).unwrap(),
+                        "other",
+                        json!(1),
+                        0,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                let address = Address {
+                    scope: "test".into(),
+                    name: "deadline".into(),
+                    key: "".into(),
+                };
+                docs.get(&address).map_err(|e| e.to_string())?;
+                docs.put(&address, json!({"done":true}).as_object().unwrap().clone())
+                    .map_err(|e| e.to_string())?;
+                Ok(Step::Succeed(json!(null)))
+            }
+        }
+        for original_deadline in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(
+                &path,
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            harness.set_signal_clock(Arc::new(|| 0));
+            let conversation = harness
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            let target = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("target"),
+                3,
+            )
+            .unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let tasks = TaskStore::new(&store);
+            tasks.save(&[Save::Create(&target)]).unwrap();
+            tasks
+                .reserve(&tasks.load(target.id()).unwrap().unwrap())
+                .unwrap();
+            tasks
+                .update(&tasks.load(target.id()).unwrap().unwrap(), |task| {
+                    task.wait(WaitFor::TypedSleep {
+                        until_millis: Some(20),
+                        signals: vec![
+                            submission_settled_signal().key("settled").unwrap(),
+                            SignalToken::new("other", 1).unwrap().key("other").unwrap(),
+                        ],
+                    })
+                })
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry.register(
+                "deadline-write",
+                false,
+                Write {
+                    target: target.id(),
+                    original_deadline,
+                    calls: calls.clone(),
+                },
+            );
+            let mut scheduler = harness.attach_tasks(registry).unwrap();
+            let writer = Task::new(
+                Uuid::new_v4(),
+                TaskOwner::Conversation(conversation),
+                cp("writer"),
+                3,
+            )
+            .unwrap()
+            .registered("deadline-write".into(), false);
+            scheduler.submit(&writer).unwrap();
+            let commits = Arc::new(AtomicUsize::new(0));
+            let observed = commits.clone();
+            scheduler.set_result_commit_hook(Arc::new(move |_, _| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+            }));
+            assert!(scheduler.tick(0).unwrap());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let current = scheduler.get(writer.id()).unwrap().unwrap();
+            let address = Address {
+                scope: "test".into(),
+                name: "deadline".into(),
+                key: "".into(),
+            };
+            let document = Documents::new(&store).get(&address).unwrap();
+            let signal = tasks
+                .read_typed_signal_state(target.id(), &submission_settled_signal(), "settled")
+                .unwrap();
+            if original_deadline {
+                assert!(matches!(current.state(), TaskState::Failed(_)));
+                assert!(document.is_none());
+                assert!(signal.is_none());
+                assert!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .is_empty()
+                );
+                assert_eq!(commits.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(current.state(), TaskState::Succeeded(_)));
+                assert!(document.is_some());
+                assert!(matches!(signal, Some(SignalState::Expired)));
+                assert_eq!(
+                    harness
+                        .conversation(conversation)
+                        .unwrap()
+                        .application_writes
+                        .len(),
+                    1
+                );
+                assert_eq!(commits.load(Ordering::SeqCst), 2);
+            }
         }
     }
 
@@ -6891,6 +7154,7 @@ mod tests {
         let settlement = PreparedSettlement {
             attachment: second.attachment.clone(),
             transaction: crate::document::Transaction::new(),
+            notifications: None,
             candidate: running.clone(),
             running,
             wait_targets: vec![],
@@ -11633,6 +11897,7 @@ mod tests {
             let mut prepared = PreparedSettlement {
                 attachment: scheduler.attachment.clone(),
                 transaction,
+                notifications: None,
                 running: running.clone(),
                 candidate,
                 wait_targets: vec![],
@@ -11768,6 +12033,7 @@ mod tests {
         let mut prepared = PreparedSettlement {
             attachment: scheduler.attachment.clone(),
             transaction,
+            notifications: None,
             running,
             candidate,
             wait_targets: vec![],
