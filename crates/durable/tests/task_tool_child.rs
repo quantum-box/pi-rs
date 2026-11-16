@@ -156,9 +156,6 @@ impl Handler for Parent {
             if task.ended_children() != Some(&[a_id][..]) {
                 return Err("wrong first wake".into());
             }
-            if b.result(task, docs)?.is_some() {
-                return Err("unfinished child reported a result".into());
-            }
             let foreign: NestedTaskCall = serde_json::from_value(json!({
                 "parent": Uuid::new_v4(), "task_id": a_id
             }))
@@ -170,7 +167,12 @@ impl Handler for Parent {
                 return Err("wrong fast result".into());
             }
             if self.finish_after_first {
+                // This path only needs the first result. Reading the still-running
+                // sibling would fence completion against its unrelated progress.
                 return Ok(Step::Succeed(json!("early result")));
+            }
+            if b.result(task, docs)?.is_some() {
+                return Err("unfinished child reported a result".into());
             }
             return Ok(Step::Wait {
                 checkpoint: Checkpoint {
@@ -674,6 +676,17 @@ async fn killed_nested_cleanup_reopens_and_finishes_before_parent() {
     let conversation = ids.next().unwrap();
     let parent = ids.next().unwrap();
     let nested = ids.next().unwrap();
+    let store = durable_store::Store::open(root.join("db")).unwrap();
+    let before = pi_rs_durable::task_store::TaskStore::new(&store)
+        .load(parent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.task.state(),
+        &TaskState::Completing(json!("early result")),
+        "cleanup must start with the successful result durably held"
+    );
+    drop(store);
     let f = Fixture::with_options(false, true);
     let mut scheduler = Scheduler::open(root.join("db"), f.options()).unwrap();
     let driver = scheduler.start_tasks(f.registry()).unwrap();
@@ -685,8 +698,11 @@ async fn killed_nested_cleanup_reopens_and_finishes_before_parent() {
         driver.get(nested).unwrap().unwrap().state(),
         TaskState::Cancelled
     ));
+    let parent_state = driver.get(parent).unwrap().unwrap();
     assert!(
-        matches!(driver.get(parent).unwrap().unwrap().state(), TaskState::Succeeded(v) if v == &json!("early result"))
+        matches!(parent_state.state(), TaskState::Succeeded(v) if v == &json!("early result")),
+        "parent={parent_state:?}, conversation={:?}",
+        scheduler.conversation(conversation).unwrap()
     );
     scheduler.shutdown().await.unwrap();
     driver.shutdown().unwrap();
