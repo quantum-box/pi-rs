@@ -611,6 +611,23 @@ independently of its extension and can replace a previous export. The
 destination is written atomically, and the active session file is protected
 from being replaced by its own export. The export uses the native renderer.
 
+Cancelled model turns with streamed text remain visible in RPC `get_messages`
+after settlement and session reopen. Marked partials have stable entries in
+`get_entries` and `get_tree`; `edit_context` can replace or omit their displayed
+content without adding it to model context. This display-only editing differs
+from Pi's general context-edit projection. Shared Pi transcripts reimport aborted
+messages as failed assistant records; resume does not treat them as completed
+answers, and the agent excludes both their original and edited content from later
+model requests, generated branch summaries, and local
+or hosted review prompts. `conversation_at` remains a display/history snapshot;
+model-bound callers use `model_conversation_at`. Compaction and tree extension
+hooks receive raw journal records, which can include cancelled partials; an
+enabled extension controls how it uses those records. Interrupted summaries
+remain private from the RPC message projection; older
+journals without a turn marker retain their prior history projection. Native
+history retains text only, so interrupted thinking and incomplete tool-call
+blocks are not reconstructed after reopen.
+
 `get_last_assistant_text` and `/copy` use the active transcript. Both skip
 empty aborted assistant messages, concatenate the selected message's text
 blocks, and trim the result. The RPC response omits `text` when the selected
