@@ -3234,6 +3234,9 @@ are recreated; compaction boundaries and retained record metadata are remapped.
 New Pi imports record conversion provenance. Forking rejects ambiguous legacy
 ownership or inconsistent provenance when it cannot safely reconstruct the
 selected history.
+Provenance replay also rejects a source that branches before its parent source's
+conversion completes, or declares a conflicting existing Pi parent. Genuine
+orphans and parents removed when forking labels remain supported.
 Interactive and startup branch forks retain imported conversion provenance and
 compaction metadata when saving and reopening the fork.
 
