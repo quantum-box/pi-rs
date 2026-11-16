@@ -660,6 +660,8 @@ struct ProjectedModel {
     dispatches: Arc<AtomicUsize>,
     large: Arc<AtomicBool>,
     strict: Arc<AtomicBool>,
+    large_prompt: Arc<AtomicBool>,
+    estimates: Arc<AtomicUsize>,
 }
 struct ProjectedDispatch {
     inner: FallbackDispatch,
@@ -680,7 +682,21 @@ impl PreparedToolDispatch for ProjectedDispatch {
         &self.reservation
     }
     async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream> {
-        Box::new(self.inner).dispatch().await
+        self.inner.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures_util::stream::iter(vec![
+            Ok(DetailedModelEvent::from(
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Text("done".into())),
+            )),
+            Ok(DetailedModelEvent::from(
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(pi_rs_core::Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    }),
+                }),
+            )),
+        ])))
     }
 }
 #[async_trait::async_trait]
@@ -692,10 +708,12 @@ impl Model for ProjectedModel {
         Some("projection-test".into())
     }
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.estimates.fetch_add(1, Ordering::SeqCst);
         if request
             .tools
             .first()
             .is_some_and(|t| t.description == "large-projection")
+            || request.messages.iter().any(|m| matches!(m, pi_rs_core::Message::System { content } if content == "large-effective-prompt"))
         {
             1000
         } else {
@@ -723,9 +741,24 @@ impl Model for ProjectedModel {
                 },
             })
             .collect::<Vec<_>>();
-        let snapshot = ToolDecisionSnapshot::capture(context, request, declarations, &effective)
-            .map_err(|e| pi_rs_core::Error::Config(e.to_string()))?;
-        let mut reservation = request.clone();
+        let mut dispatch_request = request.clone();
+        if self.large_prompt.load(Ordering::SeqCst) {
+            dispatch_request.messages.insert(
+                0,
+                pi_rs_core::Message::System {
+                    content: "large-effective-prompt".into(),
+                },
+            );
+        }
+        let snapshot = ToolDecisionSnapshot::capture_dispatch(
+            context,
+            request,
+            &dispatch_request,
+            declarations,
+            &effective,
+        )
+        .map_err(|e| pi_rs_core::Error::Config(e.to_string()))?;
+        let mut reservation = dispatch_request.clone();
         if self.large.load(Ordering::SeqCst) {
             reservation.tools[0].description = "large-projection".into();
         }
@@ -733,7 +766,7 @@ impl Model for ProjectedModel {
             inner: FallbackDispatch {
                 calls: self.dispatches.clone(),
                 committed: None,
-                request: request.clone(),
+                request: dispatch_request,
                 snapshot,
                 effective,
             },
@@ -752,6 +785,8 @@ async fn prepared_projection_controls_budget_and_is_prepared_once() {
         dispatches: dispatches.clone(),
         large: large.clone(),
         strict: Arc::new(AtomicBool::new(false)),
+        large_prompt: Arc::new(AtomicBool::new(false)),
+        estimates: Arc::new(AtomicUsize::new(0)),
     });
     let mut registry = Registry::default();
     registry
@@ -790,6 +825,8 @@ async fn prepared_projection_changes_configuration_identity() {
         dispatches: dispatches.clone(),
         large: large.clone(),
         strict: strict.clone(),
+        large_prompt: Arc::new(AtomicBool::new(false)),
+        estimates: Arc::new(AtomicUsize::new(0)),
     });
     let mut registry = Registry::default();
     registry
@@ -827,4 +864,56 @@ async fn prepared_projection_changes_configuration_identity() {
     assert_ne!(hashes[1], hashes[2]);
     assert_eq!(prepares.load(Ordering::SeqCst), 3);
     assert_eq!(dispatches.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn changed_effective_system_prompt_invalidates_measured_budget_anchor() {
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let estimates = Arc::new(AtomicUsize::new(0));
+    let large_prompt = Arc::new(AtomicBool::new(false));
+    let model = Arc::new(ProjectedModel {
+        prepares,
+        dispatches: dispatches.clone(),
+        large: Arc::new(AtomicBool::new(false)),
+        strict: Arc::new(AtomicBool::new(false)),
+        large_prompt: large_prompt.clone(),
+        estimates: estimates.clone(),
+    });
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ConstrainedExtension(StrictToolPolicy::Prefer)))
+        .unwrap();
+    let mut session = SessionBuilder::new(model, "fixture")
+        .registry(registry)
+        .limits(pi_rs_core::Limits {
+            context_window: Some(100),
+            output_tokens_per_request: 1,
+            ..Default::default()
+        })
+        .in_memory()
+        .unwrap();
+    session
+        .controls()
+        .set_auto_compaction_enabled(false)
+        .unwrap();
+    assert_eq!(session.prompt("first").await.unwrap(), "done");
+    let after_first = estimates.load(Ordering::SeqCst);
+    assert_eq!(session.prompt("second").await.unwrap(), "done");
+    assert_eq!(
+        estimates.load(Ordering::SeqCst),
+        after_first,
+        "unchanged configuration should reuse measured usage"
+    );
+    large_prompt.store(true, Ordering::SeqCst);
+    assert!(session.prompt("third").await.is_err());
+    assert!(
+        estimates.load(Ordering::SeqCst) > after_first,
+        "changed effective prompt must be estimated again"
+    );
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        2,
+        "oversized effective prompt must not dispatch"
+    );
 }

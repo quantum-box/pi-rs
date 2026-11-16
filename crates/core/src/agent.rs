@@ -7224,10 +7224,11 @@ fn prepared_configuration_hash(
     match prepared {
         None => Some(base),
         Some(dispatch) => crate::protected_model_fingerprint(&(
-            "prepared-tool-configuration-v1",
+            "prepared-tool-configuration-v2",
             base,
             dispatch.effective_tools(),
-            &dispatch.reservation_request().tools,
+            request_configuration_hash(model, dispatch.dispatch_request())?,
+            request_configuration_hash(model, dispatch.reservation_request())?,
         )),
     }
 }
