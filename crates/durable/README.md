@@ -997,6 +997,15 @@ retries return the committed child across reopen, even if the parent later chang
 As with other admissions, storage errors require reopen before retry. The normal
 non-inheriting APIs retain their existing defaults.
 
+`Harness::scan_task_owned_subagents` and its scheduler counterpart provide a
+bounded read-only scan of the ownership edges for a task. Each call examines at
+most 1–256 edges in child UUID order; because the budget includes other tasks'
+edges, a page may be empty while still carrying a continuation. Round-trip the
+cursor only for the same task. Each page observes a separate storage snapshot;
+concurrent changes can be missed between pages. The scan is for discovery and
+must not authorize a graph write or replace atomic keyed admission. Malformed or
+oversized edges encountered in the scanned range fail the page closed.
+
 Before conversation recovery or task scheduler attachment, the runtime scans
 owned-subagent reservations and refuses to open if an inheritance-marked record
 lacks matching v2 and v3 provenance. This quarantines the entire affected store before

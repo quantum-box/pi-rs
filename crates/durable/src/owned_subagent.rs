@@ -29,6 +29,23 @@ pub struct Admission {
     pub submission: Option<InitialSubmission>,
 }
 
+/// Opaque continuation for one task's owned-conversation scan. Serialize and
+/// round-trip it unchanged; cursors cannot be reused for another task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedChildCursor {
+    task: Uuid,
+    last_child: Uuid,
+}
+
+/// One bounded scan page. Empty pages may have a continuation because the
+/// budget counts all examined ownership edges, including other tasks' edges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedChildPage {
+    pub items: Vec<Edge>,
+    pub next: Option<OwnedChildCursor>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitialSubmission {
     pub id: Uuid,
@@ -226,6 +243,56 @@ thread_local! {
 }
 
 impl Harness {
+    /// Scan at most `scan_budget` (1..=256) ownership edges for one task.
+    /// Each page is a separate snapshot and must not authorize graph writes.
+    pub fn scan_task_owned_subagents(
+        &self,
+        task: Uuid,
+        cursor: Option<&OwnedChildCursor>,
+        scan_budget: usize,
+    ) -> Result<OwnedChildPage, Error> {
+        if !(1..=256).contains(&scan_budget) || cursor.is_some_and(|cursor| cursor.task != task) {
+            return Err(Error::Invalid(
+                "invalid owned child scan cursor or budget".into(),
+            ));
+        }
+        let after = cursor.map_or_else(
+            || ownership_edge::PREFIX.to_vec(),
+            |cursor| ownership_edge::edge_key(cursor.last_child),
+        );
+        let rows = self.subagent_store()?.prefix_page_bounded(
+            ownership_edge::PREFIX,
+            &after,
+            scan_budget,
+            ownership_edge::PREFIX.len() + 16,
+            4096,
+        )?;
+        let full = rows.len() == scan_budget;
+        let mut items = Vec::new();
+        let mut last = None;
+        for (key, entry) in rows {
+            let edge = ownership_edge::decode(&key, entry)
+                .map_err(|error| match error {
+                    ownership_edge::Error::Store(e) => Error::from(e),
+                    ownership_edge::Error::Json(e) => Error::from(e),
+                    _ => Error::Invalid("invalid owned conversation edge".into()),
+                })?
+                .edge;
+            last = Some(edge.child);
+            if edge.task == task {
+                items.push(edge);
+            }
+        }
+        Ok(OwnedChildPage {
+            items,
+            next: if full {
+                last.map(|last_child| OwnedChildCursor { task, last_child })
+            } else {
+                None
+            },
+        })
+    }
+
     /// Atomically creates an empty child, its immutable ownership edge and its
     /// reservation, while advancing the task's storage version. Retrying the
     /// same key and parameters returns the original child, including after an
@@ -870,6 +937,17 @@ impl Harness {
     }
 }
 impl Scheduler {
+    /// Read one bounded page of a task's owned conversations.
+    pub fn scan_task_owned_subagents(
+        &mut self,
+        task: Uuid,
+        cursor: Option<&OwnedChildCursor>,
+        scan_budget: usize,
+    ) -> Result<OwnedChildPage, Error> {
+        self.subagent_harness()
+            .scan_task_owned_subagents(task, cursor, scan_budget)
+    }
+
     /// Commit ownership and initial input before scheduling the child. Reopening
     /// also schedules committed children if the process stops before scheduling.
     pub fn submit_task_owned_subagent(
@@ -1137,6 +1215,109 @@ mod tests {
             .save(&[Save::Create(&task)])
             .unwrap();
         (task.id(), owner)
+    }
+
+    #[test]
+    fn owned_child_scan_is_bounded_task_scoped_and_resumable_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let (other_task, other_owner) = setup(&mut h);
+        let mut expected = Vec::new();
+        for index in 0..5 {
+            expected.push(
+                h.ensure_task_owned_subagent(
+                    task,
+                    owner.clone(),
+                    &format!("ours-{index}"),
+                    config(),
+                    Mode::Foreground,
+                )
+                .unwrap()
+                .child,
+            );
+        }
+        for index in 0..4 {
+            h.ensure_task_owned_subagent(
+                other_task,
+                other_owner.clone(),
+                &format!("other-{index}"),
+                config(),
+                Mode::Background,
+            )
+            .unwrap();
+        }
+        expected.sort();
+        assert!(h.scan_task_owned_subagents(task, None, 0).is_err());
+        assert!(h.scan_task_owned_subagents(task, None, 257).is_err());
+        let first = h.scan_task_owned_subagents(task, None, 1).unwrap();
+        let cursor = first.next.clone().unwrap();
+        assert!(
+            h.scan_task_owned_subagents(other_task, Some(&cursor), 1)
+                .is_err()
+        );
+        let encoded = serde_json::to_vec(&cursor).unwrap();
+        let cursor: OwnedChildCursor = serde_json::from_slice(&encoded).unwrap();
+        let mut found: Vec<_> = first.items.into_iter().map(|edge| edge.child).collect();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let mut cursor = Some(cursor);
+        let mut pages = 0;
+        while let Some(current) = cursor {
+            let page = h
+                .scan_task_owned_subagents(task, Some(&current), 2)
+                .unwrap();
+            assert!(page.items.iter().all(|edge| edge.task == task));
+            found.extend(page.items.into_iter().map(|edge| edge.child));
+            cursor = page.next;
+            pages += 1;
+            assert!(pages <= 6);
+        }
+        assert_eq!(found, expected);
+        let empty = h
+            .scan_task_owned_subagents(Uuid::new_v4(), None, 1)
+            .unwrap();
+        assert!(empty.items.is_empty() && empty.next.is_some());
+    }
+
+    #[test]
+    fn owned_child_scan_rejects_malformed_and_oversized_edges() {
+        for value in [b"{}".to_vec(), vec![b'x'; 4097]] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+            let (task, _) = setup(&mut h);
+            let key = ownership_edge::edge_key(Uuid::nil());
+            h.subagent_store()
+                .unwrap()
+                .commit(
+                    &[Check {
+                        key: key.clone(),
+                        expected: Expected::Missing,
+                    }],
+                    &[Mutation::Put { key, value }],
+                )
+                .unwrap();
+            assert!(h.scan_task_owned_subagents(task, None, 1).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_child_scan_is_available_on_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let a = h
+            .ensure_task_owned_subagent(task, owner, "child", config(), Mode::Background)
+            .unwrap();
+        drop(h);
+        let mut scheduler = Scheduler::open(&path, options()).unwrap();
+        let page = scheduler.scan_task_owned_subagents(task, None, 2).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].child, a.child);
+        assert!(page.next.is_none());
+        scheduler.shutdown().await.unwrap();
     }
 
     #[test]

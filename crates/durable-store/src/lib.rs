@@ -629,6 +629,53 @@ impl Store {
         })?;
         rows.map(|row| row?.ok_or(Error::InvalidSnapshot)).collect()
     }
+    /// Read a bounded lexicographic page without allocating oversized keys or values.
+    /// `after` is exclusive. A full page may require a final empty read.
+    pub fn prefix_page_bounded(
+        &self,
+        prefix: &[u8],
+        after: &[u8],
+        limit: usize,
+        max_key_bytes: usize,
+        max_value_bytes: usize,
+    ) -> Result<Vec<(Vec<u8>, Entry)>, Error> {
+        if limit == 0 || limit > 256 || max_key_bytes < prefix.len() || max_value_bytes == 0 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let limit = i64::try_from(limit).map_err(|_| Error::InvalidSnapshot)?;
+        let key_cap = i64::try_from(max_key_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let value_cap = i64::try_from(max_value_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let end = prefix_end(prefix);
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let query = if end.is_some() {
+            "SELECT CASE WHEN length(key)<=?5 THEN key END, CASE WHEN length(value)<=?6 THEN value END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4"
+        } else {
+            "SELECT CASE WHEN length(key)<=?5 THEN key END, CASE WHEN length(value)<=?6 THEN value END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND ?3 IS NULL ORDER BY key LIMIT ?4"
+        };
+        let mut stmt = conn.prepare(query)?;
+        let rows = stmt.query_map(
+            params![prefix, after, end, limit, key_cap, value_cap],
+            |r| {
+                Ok((
+                    r.get::<_, Option<Vec<u8>>>(0)?,
+                    r.get::<_, Option<Vec<u8>>>(1)?,
+                    r.get::<_, u64>(2)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (key, value, version) = row?;
+            Ok((
+                key.ok_or(Error::InvalidSnapshot)?,
+                Entry {
+                    value: value.ok_or(Error::InvalidSnapshot)?,
+                    version,
+                },
+            ))
+        })
+        .collect()
+    }
+
     /// Read multiple key ranges from one SQLite snapshot.
     pub fn list_prefixes(&self, prefixes: &[&[u8]]) -> Result<Vec<(Vec<u8>, Entry)>, Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
