@@ -557,3 +557,135 @@ fn owner_chain_from_inner(
         }
     }
 }
+
+/// Fence the foreground owners whose failure or abort would cancel `target`.
+/// Background edges delimit that cancellation scope. The caller separately
+/// validates and fences the target conversation snapshot itself.
+pub(crate) fn target_foreground_admission_checks(
+    store: &Store,
+    target: Uuid,
+) -> Result<Vec<Check>, Error> {
+    use crate::task::WaitFor;
+    let boundary = store.put_version()?;
+    let mut checks = Vec::new();
+    let mut conversations = HashSet::new();
+    let mut tasks = HashSet::new();
+    let mut next = TaskOwner::Conversation(target);
+    let mut expected_owner = None;
+    let mut child_task = None;
+    loop {
+        checks.push(abort_fence_check(store, &next)?);
+        match next {
+            TaskOwner::Conversation(id) => {
+                if !conversations.insert(id) {
+                    return Err(Error::Invalid);
+                }
+                let cleanup = crate::runtime::owned_cleanup_key(id);
+                if store.get(&cleanup)?.is_some() {
+                    return Err(Error::Invalid);
+                }
+                checks.push(Check {
+                    key: cleanup,
+                    expected: Expected::MissingUnchangedSince(boundary),
+                });
+                if id != target {
+                    let key = child_key(id);
+                    let entry = store.get(&key)?.ok_or(Error::Invalid)?;
+                    crate::session_membership::validate_conversation(id, &entry.value)
+                        .map_err(|_| Error::Invalid)?;
+                    checks.push(Check {
+                        key,
+                        expected: Expected::Version(entry.version),
+                    });
+                }
+                let key = edge_key(id);
+                let Some(entry) = store.get(&key)? else {
+                    checks.push(Check {
+                        key,
+                        expected: Expected::MissingUnchangedSince(boundary),
+                    });
+                    return Ok(checks);
+                };
+                let edge = decode(&key, entry)?;
+                checks.push(Check {
+                    key,
+                    expected: Expected::Version(edge.version),
+                });
+                if edge.edge.mode == Mode::Background {
+                    let owner = TaskStore::new(store)
+                        .load(edge.edge.task)?
+                        .ok_or(Error::Invalid)?;
+                    if owner.task.owner() != &edge.edge.task_owner {
+                        return Err(Error::Invalid);
+                    }
+                    checks.push(Check {
+                        key: task_store::key(edge.edge.task),
+                        expected: Expected::Version(owner.version),
+                    });
+                    return Ok(checks);
+                }
+                expected_owner = Some(edge.edge.task_owner);
+                child_task = None;
+                next = TaskOwner::Task(edge.edge.task);
+            }
+            TaskOwner::Task(id) => {
+                if !tasks.insert(id) {
+                    return Err(Error::Invalid);
+                }
+                let stored = TaskStore::new(store).load(id)?.ok_or(Error::Invalid)?;
+                if expected_owner
+                    .take()
+                    .is_some_and(|owner| owner != *stored.task.owner())
+                    || stored.task.abort_requested()
+                    || matches!(
+                        stored.task.state(),
+                        TaskState::CompletingFailed(_)
+                            | TaskState::Failed(_)
+                            | TaskState::Cancelled
+                    )
+                    || (stored.task.is_terminal() && child_task.is_some())
+                {
+                    return Err(Error::Invalid);
+                }
+                checks.push(Check {
+                    key: task_store::key(id),
+                    expected: Expected::Version(stored.version),
+                });
+                if let (Some(child), TaskState::Waiting(WaitFor::TasksFailFast(ids))) =
+                    (child_task, stored.task.state())
+                    && ids.contains(&child)
+                {
+                    let mut unique = HashSet::new();
+                    for sibling in ids {
+                        if !unique.insert(*sibling) {
+                            return Err(Error::Invalid);
+                        }
+                        let sibling = TaskStore::new(store)
+                            .load(*sibling)?
+                            .ok_or(Error::Invalid)?;
+                        if sibling.task.owner() != &TaskOwner::Task(id) {
+                            return Err(Error::Invalid);
+                        }
+                        if matches!(
+                            sibling.task.state(),
+                            TaskState::CompletingFailed(_)
+                                | TaskState::Failed(_)
+                                | TaskState::Cancelled
+                        ) {
+                            return Err(Error::Invalid);
+                        }
+                        checks.push(Check {
+                            key: task_store::key(sibling.task.id()),
+                            expected: Expected::Version(sibling.version),
+                        });
+                    }
+                }
+                if stored.task.is_background() {
+                    return Ok(checks);
+                }
+                child_task = Some(id);
+                next = stored.task.owner().clone();
+            }
+        }
+    }
+}

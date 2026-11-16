@@ -1124,7 +1124,7 @@ pub struct Transaction {
     acquisitions: Vec<durable_store::TaskDocumentAcquisition>,
 }
 
-// Independently prepared task and signal-revision observations can race.
+// Independently prepared task, ownership, conversation and signal observations can race.
 // Compose their fences before appending batches so disagreement becomes a
 // normal commit conflict.
 fn merge_task_expected(a: &Expected, b: &Expected) -> Expected {
@@ -1164,6 +1164,10 @@ pub(crate) fn reconcile_task_checks(documents: &mut OwnedBatch, graph: &mut Owne
     for other in &mut graph.checks {
         if !other.key.starts_with(crate::task_store::PREFIX)
             && !other.key.starts_with(b"durable/signal-revision/")
+            && !other.key.starts_with(crate::ownership_edge::PREFIX)
+            && !other.key.starts_with(b"durable/ownership-abort-fence/v1/")
+            && !other.key.starts_with(b"runtime/conversation/")
+            && !other.key.starts_with(b"runtime/owned-cleanup-attempt/")
         {
             continue;
         }
@@ -2657,6 +2661,30 @@ impl<'a> TaskDocuments<'a> {
             let proof = crate::session_membership::task_pair(self.store, conversation, target)
                 .map_err(|error| self.remember_task_input_error(error))?;
             ancestry_checks.extend(proof);
+            let target_checks =
+                crate::ownership_edge::target_foreground_admission_checks(self.store, target)
+                    .map_err(|error| {
+                        let error = match error {
+                            crate::ownership_edge::Error::Store(error)
+                            | crate::ownership_edge::Error::Task(
+                                crate::task_store::Error::Store(error),
+                            ) => Error::Store(error),
+                            _ => Error::InvalidSessionAdmission(
+                                "target foreground ownership is unavailable".into(),
+                            ),
+                        };
+                        self.remember_task_input_error(error)
+                    })?;
+            for check in target_checks {
+                if let Some(existing) = ancestry_checks
+                    .iter_mut()
+                    .find(|item| item.key == check.key)
+                {
+                    existing.expected = merge_task_expected(&existing.expected, &check.expected);
+                } else {
+                    ancestry_checks.push(check);
+                }
+            }
             target
         } else {
             conversation
@@ -2678,6 +2706,17 @@ impl<'a> TaskDocuments<'a> {
                     })?;
             }
             let state: crate::runtime::Conversation = serde_json::from_slice(&record.value)?;
+            if cross_conversation
+                && let Some(existing) = state
+                    .submissions
+                    .iter()
+                    .find(|submission| submission.request_id.as_ref() == request_id.as_ref())
+                && state.submission_notification(existing.id) != notify.as_ref()
+            {
+                return Err(Error::InvalidSessionAdmission(
+                    "duplicate request has a different settlement notification".into(),
+                ));
+            }
             if state.id != conversation || state.abort_requested {
                 return Err(Error::InvalidSessionAdmission(
                     "conversation is aborting or invalid".into(),
