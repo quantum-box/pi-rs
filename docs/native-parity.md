@@ -140,9 +140,13 @@ reject malformed path escapes and encoded separators, as Pi does.
 ChatGPT plan credentials respect `auth check --no-refresh` and the explicit
 minimum lifetime for bearer-token export. A refreshed credential is saved
 before a short lifetime is reported, preserving refresh-token rotation. In a
-live check, a saved credential was observed expired before a successful text
-inference and had a future expiry afterward. New-account browser login, other
-account configurations and broader live acceptance remain open.
+live check with an expired saved credential, an instrumented local build marked
+its own successful refresh persistence before returning `READY` from a text
+inference. The saved access and refresh values both changed and the expiry was
+in the future afterward. The probe preserved credentials on authorization
+failure; its successful refresh path was otherwise unchanged. New-account
+browser login, other account configurations and broader live acceptance remain
+open.
 
 `pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
 servers, and `--description` for either transport. HTTP headers can be combined
