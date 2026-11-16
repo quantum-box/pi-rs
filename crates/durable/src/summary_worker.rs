@@ -27,17 +27,13 @@ pub(crate) enum Error {
 }
 
 #[cfg(test)]
-pub(crate) fn before_settlement_hooks() -> &'static std::sync::Mutex<
+type SettlementHooks = std::sync::Mutex<
     std::collections::HashMap<Uuid, (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
-> {
-    static HOOKS: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                Uuid,
-                (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>),
-            >,
-        >,
-    > = std::sync::OnceLock::new();
+>;
+
+#[cfg(test)]
+pub(crate) fn before_settlement_hooks() -> &'static SettlementHooks {
+    static HOOKS: std::sync::OnceLock<SettlementHooks> = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
 
@@ -101,9 +97,7 @@ pub(crate) async fn run_for_cleanup(
             (None, None) => (),
             (Some(marker), Some(attempt))
                 if serde_json::from_slice::<Uuid>(&marker.value).ok() == Some(attempt) =>
-            {
-                ()
-            }
+            {}
             _ => return Err(Error::CleanupUncertain),
         }
         if !provider.valid() || snap.operation.provider() != Some(&provider) {
