@@ -618,3 +618,68 @@ fn stream_new_and_default_handle_journal_partial_and_invalid_sources() {
         assert!(error.to_string().contains("invalid imported Pi parent ID"));
     }
 }
+
+#[test]
+fn stream_rejects_invalid_record_identity_without_panicking() {
+    for make in [
+        pi_rs_core::pi_import::StreamVerifier::new,
+        pi_rs_core::pi_import::StreamVerifier::default,
+    ] {
+        for (id, parent) in [
+            (2, Some(0)),
+            (2, Some(2)),
+            (2, Some(3)),
+            (2, Some(u64::MAX)),
+            (3, Some(1)),
+            (0, Some(1)),
+        ] {
+            let records = vec![created(), record(id, parent, user("bad"))];
+            let result = make().advance(&records, &Default::default(), true);
+            assert!(result.is_err(), "id={id}, parent={parent:?}: {result:?}");
+        }
+        let mut verifier = make();
+        assert_eq!(
+            verifier
+                .advance(&[created()], &Default::default(), false)
+                .unwrap(),
+            None
+        );
+        let records = vec![created(), record(2, Some(u64::MAX), user("bad"))];
+        assert!(
+            verifier
+                .advance(&records, &Default::default(), false)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn stream_rejects_invalid_identity_inside_staged_conversion() {
+    for make in [
+        pi_rs_core::pi_import::StreamVerifier::new,
+        pi_rs_core::pi_import::StreamVerifier::default,
+    ] {
+        let mut verifier = make();
+        let mut records = vec![
+            created(),
+            record(
+                2,
+                Some(1),
+                source(
+                    json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"one"}}),
+                ),
+            ),
+        ];
+        let metadata = [(2, json!({"pi_rs_import_conversion_count_v1":1}))]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            verifier.advance(&records, &metadata, false).unwrap(),
+            Some(3)
+        );
+        assert!(verifier.advance(&records[..1], &metadata, false).is_err());
+        records.push(record(99, Some(2), user("one")));
+        assert!(verifier.advance(&records, &metadata, false).is_err());
+        assert!(verifier.counts().is_empty());
+    }
+}

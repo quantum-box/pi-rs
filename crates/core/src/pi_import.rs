@@ -230,6 +230,7 @@ fn conversion_equal(
 /// mapping and persistent branch snapshots are retained across entries.
 pub struct StreamVerifier {
     processed: usize,
+    validated_records: usize,
     nearest: Vec<Option<u64>>,
     completed: Vec<bool>,
     source_ids: BTreeMap<String, u64>,
@@ -259,6 +260,7 @@ impl Default for StreamVerifier {
     fn default() -> Self {
         Self {
             processed: 0,
+            validated_records: 0,
             nearest: vec![None],
             completed: vec![false],
             source_ids: Default::default(),
@@ -303,12 +305,36 @@ impl StreamVerifier {
 
     /// Verify as much of `records` as possible. A returned ID is the last
     /// record needed for the pending conversion; no ownership is committed yet.
+    /// Each call must supply an unchanged prefix followed by any new records.
+    /// New records must have sequential one-based IDs and only prior parents.
     pub fn advance(
         &mut self,
         records: &[crate::Record],
         metadata: &BTreeMap<u64, Value>,
         authoritative: bool,
     ) -> Result<Option<u64>> {
+        if records.len() < self.validated_records {
+            return Err(Error::Session(
+                "Pi stream record prefix was truncated".into(),
+            ));
+        }
+        let start = self.validated_records.min(records.len());
+        for (index, record) in records.iter().enumerate().skip(start) {
+            let expected = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| Error::Session("invalid Pi stream record ID".into()))?;
+            if record.id != expected {
+                return Err(Error::Session("invalid Pi stream record ID".into()));
+            }
+            if record
+                .parent
+                .is_some_and(|parent| parent == 0 || parent >= expected)
+            {
+                return Err(Error::Session("invalid Pi stream record parent".into()));
+            }
+        }
+        self.validated_records = records.len();
         if authoritative && self.authoritative_source_count.is_none() {
             self.authoritative_source_count = Some(records.iter().filter(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi")).count());
         }
