@@ -4298,7 +4298,10 @@ async fn continue_failure_boundary_survives_restart_and_historical_forks() {
     let (mut state, version) = h.load(id).unwrap();
     finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
     h.save(&state, Expected::Version(version)).unwrap();
-    assert!(matches!(h.conversation(id).unwrap().phase, Phase::Idle));
+    assert!(matches!(
+        h.conversation(id).unwrap().phase,
+        Phase::ModelReady { turns: 0 }
+    ));
     assert!(matches!(
         h.submit_continue(id, None),
         Err(Error::Admission(AdmissionError::Busy))
@@ -4335,7 +4338,7 @@ async fn continue_failure_boundary_survives_restart_and_historical_forks() {
             .find(|s| s.id == queued)
             .unwrap()
             .status,
-        Status::Queued
+        Status::Running
     );
     assert!(matches!(
         h.submit_continue(id, None),
@@ -4374,6 +4377,7 @@ fn withdrawn_auto_continuation_does_not_fence_future_continue() {
         .unwrap();
     h.submit(id, None, "active".into()).unwrap();
     let queued = h.submit(id, None, "queued".into()).unwrap();
+    h.reset(id, Some("ordered reset".into())).unwrap();
     let (mut state, version) = h.load(id).unwrap();
     finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
     h.save(&state, Expected::Version(version)).unwrap();
@@ -4458,6 +4462,10 @@ async fn pending_auto_continuation_fences_continue_after_process_kill() {
     let id = ids.next().unwrap();
     let queued = ids.next().unwrap();
     let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        h.withdraw_submission(id, queued).unwrap(),
+        WithdrawResult::AlreadyPlaced
+    );
     assert!(matches!(
         h.submit_continue(id, None),
         Err(Error::Admission(AdmissionError::Busy))
@@ -4494,6 +4502,7 @@ async fn abort_of_pending_auto_continuation_finishes_before_new_continue() {
         .unwrap();
     h.submit(id, None, "active".into()).unwrap();
     let queued = h.submit(id, None, "queued".into()).unwrap();
+    h.reset(id, Some("ordered reset".into())).unwrap();
     let (mut state, version) = h.load(id).unwrap();
     finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
     h.save(&state, Expected::Version(version)).unwrap();
@@ -5275,4 +5284,216 @@ fn withdrawal_of_new_write_survives_stale_worker_placing_its_reset() {
         .unwrap();
     assert!(removed.withdrawn && !removed.placed);
     assert!(!placed.withdrawn && placed.placed);
+}
+
+fn atomic_failure_replacement_fixture() -> (tempfile::TempDir, Harness, Uuid, Uuid) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "failed".into()).unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    (dir, h, id, replacement)
+}
+
+#[test]
+fn failed_run_replacement_is_placed_at_failure_commit() {
+    let (_dir, mut h, id, replacement) = atomic_failure_replacement_fixture();
+    assert_eq!(
+        h.withdraw_submission(id, replacement).unwrap(),
+        WithdrawResult::AlreadyPlaced
+    );
+}
+
+#[tokio::test]
+async fn abort_after_failure_settlement_aborts_replacement_run() {
+    let (_dir, mut h, id, replacement) = atomic_failure_replacement_fixture();
+    h.request_abort(id).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    let failure = c.run_failure.unwrap();
+    assert_eq!(failure.reason, "aborted");
+    assert_eq!(failure.inputs, vec![replacement]);
+}
+
+#[test]
+fn later_steer_does_not_join_initial_replacement_inputs() {
+    let (_dir, mut h, id, replacement) = atomic_failure_replacement_fixture();
+    let steer = h
+        .submit_with_mode(id, None, "later steer".into(), InputMode::Steer)
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    assert_eq!(
+        c.submissions.iter().find(|s| s.id == steer).unwrap().status,
+        Status::Queued
+    );
+}
+
+#[tokio::test]
+async fn failed_run_with_two_block_resets_preserves_order_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let queued = h.submit(id, None, "queued".into()).unwrap();
+    let first = vec![serde_json::json!({"type":"text", "text":"first"})];
+    let second = vec![serde_json::json!({"type":"text", "text":"second"})];
+    let (r1, ids1) = h
+        .reset_with_blocks(id, Some("one".into()), vec![first.clone()])
+        .unwrap();
+    let (r2, ids2) = h
+        .reset_with_blocks(id, Some("two".into()), vec![second.clone()])
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == queued)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    // The test model has no block adapter; both resets should be committed
+    // before dispatch rejects that unsupported configuration.
+    assert!(
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .is_err()
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(
+        c.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![r1, r2]
+    );
+    assert_eq!(c.content_blocks[&1].message_id, ids2[0]);
+    assert_eq!(c.content_blocks[&1].blocks, second);
+    let old = h.fork_by_entry_id(id, ids1[0]).unwrap();
+    assert_eq!(
+        h.conversation(old).unwrap().content_blocks[&1].blocks,
+        first
+    );
+}
+
+#[test]
+fn atomic_failure_boundary_respects_per_mode_queue_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.set_queue_modes(
+        id,
+        QueueModes {
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+        },
+    )
+    .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let steer1 = h
+        .submit_with_mode(id, None, "steer1".into(), InputMode::Steer)
+        .unwrap();
+    let steer2 = h
+        .submit_with_mode(id, None, "steer2".into(), InputMode::Steer)
+        .unwrap();
+    let follow1 = h.submit(id, None, "follow1".into()).unwrap();
+    let follow2 = h.submit(id, None, "follow2".into()).unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
+    h.save(&state, Expected::Version(version)).unwrap();
+    let c = h.conversation(id).unwrap();
+    for (sid, status) in [
+        (steer1, Status::Running),
+        (steer2, Status::Queued),
+        (follow1, Status::Running),
+        (follow2, Status::Queued),
+    ] {
+        assert_eq!(
+            c.submissions.iter().find(|s| s.id == sid).unwrap().status,
+            status
+        );
+    }
+}
+
+#[test]
+fn atomic_failure_boundary_retries_with_latest_inbox_and_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = owner
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: "".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    owner
+        .set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    owner.submit(id, None, "active".into()).unwrap();
+    let first = owner.submit(id, None, "first".into()).unwrap();
+    let mut worker = owner.worker();
+    let (mut stale, version) = worker.load(id).unwrap();
+    finish_failure(&mut stale, "failure".into(), FailureCause::ModelError);
+    let second = owner.submit(id, None, "second".into()).unwrap();
+    owner
+        .set_queue_modes(
+            id,
+            QueueModes {
+                steering_mode: QueueMode::All,
+                follow_up_mode: QueueMode::All,
+            },
+        )
+        .unwrap();
+    worker.save(&stale, Expected::Version(version)).unwrap();
+    let c = owner.conversation(id).unwrap();
+    for sid in [first, second] {
+        assert_eq!(
+            c.submissions.iter().find(|s| s.id == sid).unwrap().status,
+            Status::Running
+        );
+    }
+    assert_eq!(c.run_failure.unwrap().reason, "model_error");
 }
