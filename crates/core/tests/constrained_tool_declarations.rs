@@ -1,12 +1,14 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use pi_rs_core::{
-    ContextChange, ContextRequest, Extension, ExtensionResult, ExtensionState, Model, ModelEvent,
-    ModelRequest, ModelStream, Outcome, Registry, Result, SessionBuilder, StrictToolPolicy, Tool,
-    ToolConstraint, ToolContext, ToolSpec,
+    ContextChange, ContextRequest, DetailedModelEvent, DetailedModelStream,
+    EffectiveToolDeclaration, EffectiveToolSampling, Event, Extension, ExtensionResult,
+    ExtensionState, Model, ModelEvent, ModelRequest, ModelStream, Outcome, PreparedToolDispatch,
+    RecordedToolDecision, Registry, Result, SessionBuilder, StrictToolPolicy, Tool, ToolConstraint,
+    ToolContext, ToolDecisionSnapshot, ToolDeclaration, ToolDispatchContext, ToolSpec,
 };
 use serde_json::{Value, json};
 
@@ -69,6 +71,181 @@ impl Model for CountingModel {
             }),
         ])))
     }
+}
+
+struct PreparedFallbackModel(Arc<AtomicUsize>, Option<Arc<AtomicBool>>);
+struct FallbackDispatch {
+    calls: Arc<AtomicUsize>,
+    committed: Option<Arc<AtomicBool>>,
+    request: ModelRequest,
+    snapshot: ToolDecisionSnapshot,
+    effective: Vec<EffectiveToolDeclaration>,
+}
+#[async_trait::async_trait]
+impl PreparedToolDispatch for FallbackDispatch {
+    fn effective_tools(&self) -> &[EffectiveToolDeclaration] {
+        &self.effective
+    }
+    fn decision_snapshot(&self) -> &ToolDecisionSnapshot {
+        &self.snapshot
+    }
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request
+    }
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.request
+    }
+    async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream> {
+        if let Some(committed) = &self.committed {
+            assert!(
+                committed.load(Ordering::SeqCst),
+                "dispatch before record commit"
+            );
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::pin(futures_util::stream::iter(vec![
+            Ok(DetailedModelEvent::from(
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Text("done".into())),
+            )),
+            Ok(DetailedModelEvent::from(
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            )),
+        ])))
+    }
+}
+#[async_trait::async_trait]
+impl Model for PreparedFallbackModel {
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        panic!("prepared dispatch must be used")
+    }
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[ToolDeclaration],
+        context: &ToolDispatchContext,
+    ) -> Result<Option<Box<dyn PreparedToolDispatch + 'a>>> {
+        let effective = declarations
+            .iter()
+            .map(|declaration| EffectiveToolDeclaration {
+                spec: declaration.spec.clone(),
+                sampling: EffectiveToolSampling::Unconstrained,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = ToolDecisionSnapshot::capture(context, request, declarations, &effective)
+            .map_err(|error| pi_rs_core::Error::Config(error.to_string()))?;
+        Ok(Some(Box::new(FallbackDispatch {
+            calls: self.0.clone(),
+            committed: self.1.clone(),
+            request: request.clone(),
+            snapshot,
+            effective,
+        })))
+    }
+}
+
+#[tokio::test]
+async fn preferred_prepared_fallback_is_dispatched_and_journaled() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ConstrainedExtension(StrictToolPolicy::Prefer)))
+        .unwrap();
+    let mut session = SessionBuilder::new(
+        Arc::new(PreparedFallbackModel(calls.clone(), None)),
+        "fixture",
+    )
+    .registry(registry)
+    .in_memory()
+    .unwrap();
+    assert_eq!(session.prompt("test").await.unwrap(), "done");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let journal = session.journal().unwrap();
+    let request_id = journal
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::ModelRequested { request_id, .. } => *request_id,
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(
+        journal.active_tool_decision(request_id).unwrap(),
+        RecordedToolDecision::Current(_)
+    ));
+}
+
+#[tokio::test]
+async fn prepared_dispatch_waits_for_atomic_decision_commit() {
+    use pi_rs_core::{
+        Agent, CancellationToken, Limits, MemoryStore, Record, Session, SessionStore,
+    };
+
+    struct ObservedStore {
+        inner: MemoryStore,
+        committed: Arc<AtomicBool>,
+    }
+    impl SessionStore for ObservedStore {
+        fn load(&mut self) -> Result<Vec<Record>> {
+            self.inner.load()
+        }
+        fn append(&mut self, record: &Record) -> Result<()> {
+            self.inner.append(record)
+        }
+        fn supports_record_metadata(&self) -> bool {
+            true
+        }
+        fn load_record_metadata(&mut self) -> Result<std::collections::BTreeMap<u64, Value>> {
+            self.inner.load_record_metadata()
+        }
+        fn append_with_metadata(
+            &mut self,
+            record: &Record,
+            metadata: Option<&Value>,
+        ) -> Result<()> {
+            self.inner.append_with_metadata(record, metadata)?;
+            if metadata.is_some_and(|value| value.get("toolDecision").is_some()) {
+                self.committed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+    let committed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = PreparedFallbackModel(calls.clone(), Some(committed.clone()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ConstrainedExtension(StrictToolPolicy::Prefer)))
+        .unwrap();
+    let mut session = Session::with_store(ObservedStore {
+        inner: MemoryStore::default(),
+        committed,
+    })
+    .unwrap();
+    let agent = Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "",
+        limits: Limits::default(),
+    };
+    let (_sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    assert_eq!(
+        agent
+            .run(
+                &mut session,
+                Some("test".into()),
+                &mut receiver,
+                &CancellationToken::new(),
+                &mut |_| {}
+            )
+            .await
+            .unwrap(),
+        "done"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

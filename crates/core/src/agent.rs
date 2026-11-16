@@ -2695,20 +2695,61 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<ReplyAttempt> {
-        // Until prepared dispatch decisions are journaled and replayable,
-        // do not silently downgrade a registered required constraint.
         let declarations = self.registry.declarations_for_request(&request);
-        if declarations.iter().any(|declaration| {
-            matches!(
-                declaration.constrained_sampling,
-                Some(crate::ToolConstraint::JsonSchema {
-                    strict: crate::StrictToolPolicy::Require
-                })
-            )
-        }) {
-            crate::validate_legacy_tool_declarations(&request, &declarations)?;
-        }
         let request_id = Uuid::new_v4();
+        let dispatch_context = crate::ToolDispatchContext {
+            request_id,
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: !retain_reply,
+        };
+        let constrained = declarations.iter().any(|declaration| {
+            declaration
+                .constrained_sampling
+                .as_ref()
+                .is_some_and(|constraint| !matches!(constraint, crate::ToolConstraint::Disabled))
+        });
+        let prepared = if constrained {
+            let preparing = platform_time::timeout(
+                self.limits.model_timeout,
+                self.model
+                    .prepare_tool_dispatch(&request, &declarations, &dispatch_context),
+            );
+            tokio::pin!(preparing);
+            let prepared = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = &mut preparing => break result.map_err(|_| Error::RetryableModel("tool dispatch preparation timed out".into()))??,
+                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                }
+            };
+            if let Some(prepared) = &prepared {
+                crate::validate_prepared_tool_dispatch(
+                    prepared.as_ref(),
+                    &dispatch_context,
+                    &request,
+                    &declarations,
+                )?;
+                // Until the scheduler and pending-operation recovery consume
+                // the recorded decision, strict execution must fail closed.
+                if prepared.effective_tools().iter().any(|tool| {
+                    matches!(
+                        tool.sampling,
+                        crate::EffectiveToolSampling::StrictJsonSchema { .. }
+                    )
+                }) {
+                    return Err(Error::Config(
+                        "strict tool execution is not yet available".into(),
+                    ));
+                }
+            } else {
+                crate::validate_legacy_tool_declarations(&request, &declarations)?;
+            }
+            prepared
+        } else {
+            None
+        };
         let allowance = request.max_output_tokens;
         let advertised_tools =
             retain_reply.then(|| request.tools.iter().map(|tool| tool.name.clone()).collect());
@@ -2717,22 +2758,30 @@ impl Agent<'_> {
         if !retain_reply {
             observer(Notification::SummaryRequest);
         }
-        commit(
-            session,
-            Event::ModelRequested {
-                model: request.model.clone(),
-                messages: request.messages.len(),
-                tools: request.tools.len(),
-                max_output_tokens: allowance,
-                request_id: Some(request_id),
-                context_head: Some(context_head),
-                context_sha256: Some(context_sha256),
-                context_transformed: Some(transformed),
-                context_configuration_sha256: request_configuration_hash(self.model, &request),
-                tool_decision: None,
-            },
-            observer,
-        )?;
+        let requested = Event::ModelRequested {
+            model: request.model.clone(),
+            messages: request.messages.len(),
+            tools: request.tools.len(),
+            max_output_tokens: allowance,
+            request_id: Some(request_id),
+            context_head: Some(context_head),
+            context_sha256: Some(context_sha256),
+            context_transformed: Some(transformed),
+            context_configuration_sha256: request_configuration_hash(self.model, &request),
+            tool_decision: None,
+        };
+        if let Some(prepared) = &prepared {
+            let record = session.append_tool_decision_request(
+                requested,
+                prepared.decision_snapshot(),
+                &request,
+                prepared.dispatch_request(),
+                &declarations,
+            )?;
+            observer(Notification::Committed(record));
+        } else {
+            commit(session, requested, observer)?;
+        }
         observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
         const MAX_ENRICHED_ITEMS: usize = 256;
@@ -2753,16 +2802,23 @@ impl Agent<'_> {
         let collect = async {
             let session_id = session.session_id();
             let external_id = session.external_session_id();
-            let opening = if retain_reply {
-                self.model.stream_detailed_in_session_with_identity(
-                    request_id,
-                    session_id,
-                    &external_id,
-                    request,
-                )
-            } else {
-                self.model
-                    .stream_detailed_for_summary(request_id, session_id, request)
+            let opening = async {
+                if let Some(prepared) = prepared {
+                    prepared.dispatch().await
+                } else if retain_reply {
+                    self.model
+                        .stream_detailed_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            &external_id,
+                            request,
+                        )
+                        .await
+                } else {
+                    self.model
+                        .stream_detailed_for_summary(request_id, session_id, request)
+                        .await
+                }
             };
             tokio::pin!(opening);
             let mut stream = loop {
