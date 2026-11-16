@@ -514,8 +514,9 @@ fn export_ownership_respects_native_commands_and_option_values() {
         .arg(&source)
         .output()
         .unwrap();
+    let help = String::from_utf8_lossy(&native.stdout);
     assert!(
-        String::from_utf8_lossy(&native.stdout).contains("Usage: pi mcp"),
+        help.contains("Usage: pi mcp") || help.contains("Usage: pi.exe mcp"),
         "{native:?}"
     );
     assert!(!dir.path().join("pi-session-source.html").exists());
@@ -682,5 +683,79 @@ fn repeated_export_destination_cannot_overwrite_any_earlier_input() {
             assert_eq!(std::fs::read(&earlier).unwrap(), earlier_before);
             assert_eq!(std::fs::read(&selected).unwrap(), selected_before);
         }
+    }
+}
+
+#[test]
+fn export_preserves_custom_flag_value_named_like_native_command() {
+    for help in [false, true] {
+        for custom_value in ["run", "mcp", "export"] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("session.jsonl");
+            write_export_session(&source, "exported marker");
+            let before = std::fs::read(&source).unwrap();
+            let sentinel = dir.path().join(custom_value);
+            std::fs::write(&sentinel, "do not overwrite").unwrap();
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
+            cmd.current_dir(dir.path())
+                .env("PI_RS_HOME", dir.path())
+                .arg("report.html")
+                .args(["--custom", custom_value, "--export"])
+                .arg(&source);
+            if help {
+                cmd.arg("--help");
+            }
+            let result = cmd.output().unwrap();
+            assert!(result.status.success(), "{help} {custom_value}: {result:?}");
+            assert!(
+                std::fs::read_to_string(dir.path().join("report.html"))
+                    .unwrap()
+                    .contains("exported marker")
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), before);
+            assert_eq!(
+                std::fs::read_to_string(sentinel).unwrap(),
+                "do not overwrite"
+            );
+        }
+    }
+}
+
+#[test]
+fn short_tools_equals_validates_the_value_for_help_and_version() {
+    for flag in ["--help", "--version"] {
+        for tools in ["-t=+read,-bash", "-pt=+read,-bash"] {
+            let result = run(&[tools, flag]);
+            assert!(result.status.success(), "{tools} {flag}: {result:?}");
+            assert!(result.stderr.is_empty(), "{result:?}");
+            assert!(!result.stdout.is_empty());
+        }
+        let invalid = run(&["-t=read,+bash", flag]);
+        assert!(!invalid.status.success(), "{invalid:?}");
+        assert!(invalid.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&invalid.stderr).contains("cannot be mixed"));
+    }
+}
+
+#[test]
+fn export_with_help_validates_short_tools_equals_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("session.jsonl");
+    write_export_session(&source, "marker");
+    for (tools, valid) in [("-t=+read,-bash", true), ("-t=read,+bash", false)] {
+        let destination = dir
+            .path()
+            .join(if valid { "valid.html" } else { "invalid.html" });
+        let result = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(dir.path())
+            .env("PI_RS_HOME", dir.path())
+            .arg("--export")
+            .arg(&source)
+            .arg(&destination)
+            .args([tools, "--help"])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.success(), valid, "{tools}: {result:?}");
+        assert_eq!(destination.exists(), valid);
     }
 }

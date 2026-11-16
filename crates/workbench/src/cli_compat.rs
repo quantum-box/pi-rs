@@ -624,9 +624,10 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
                 {
                     break;
                 }
-                // Attach dash-prefixed values so a second normalization does not
-                // mistake them for metadata, while retaining native validation.
-                if unconditional && next_bytes.starts_with(b"-") {
+                // Preserve value ownership when projection removes preceding
+                // messages, which can otherwise make a custom flag's value look
+                // like a native subcommand during the second normalization.
+                if unknown_long || (unconditional && next_bytes.starts_with(b"-")) {
                     let last = validation.last_mut().expect("option");
                     if text.starts_with("--") {
                         last.push("=");
@@ -826,7 +827,7 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
                                             None
                                         }
                                     } else {
-                                        Some(remainder)
+                                        Some(remainder.strip_prefix('=').unwrap_or(remainder))
                                     };
                                     if let Some(value) = value
                                         && let Err(error) = validate_tool_list(value)
@@ -910,6 +911,39 @@ fn option_values(command: &Command, option: &str) -> (usize, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_projection_preserves_consumed_custom_flag_value() {
+        for value in ["run", "mcp", "export"] {
+            let args = [
+                "pi",
+                "report.html",
+                "--custom",
+                value,
+                "--export",
+                "session.jsonl",
+            ]
+            .map(OsString::from);
+            let plan = export_plan(&args).unwrap();
+            let (_, flags) = parse(plan.validation_args).unwrap();
+            assert_eq!(
+                flags.get("custom"),
+                Some(&ExtensionFlagValue::String(value.into()))
+            );
+            assert_eq!(
+                plan.output.unwrap(),
+                std::path::PathBuf::from("report.html")
+            );
+        }
+        let args =
+            ["pi", "report.html", "--custom", "--export", "session.jsonl"].map(OsString::from);
+        let plan = export_plan(&args).unwrap();
+        let (_, flags) = parse(plan.validation_args).unwrap();
+        assert_eq!(
+            flags.get("custom"),
+            Some(&ExtensionFlagValue::Boolean(true))
+        );
+    }
 
     #[cfg(unix)]
     #[test]
