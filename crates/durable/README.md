@@ -907,6 +907,19 @@ Unlike upstream registration-level caller metadata, these overrides are
 conversation-scoped and apply by name, including to a replacement registered
 under that name; hosts must maintain the policy when registrations change.
 
+For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
+`submit_task_owned_subagent_inheriting_tools` opt in to a snapshot of the owning
+task's conversation tool selection, model selection, filters, deferred names,
+caller overrides and output schemas. Task ancestry and the source conversation
+version are checked in the child-creation commit; a concurrent change causes a
+fresh snapshot, with at most eight commit attempts per call. The reservation binds this choice, and replay returns the same
+child even after the parent's settings change or the store reopens. Ancestry must
+lead to an existing conversation. Explicit `Config` remains supplied by the host;
+extensions, provider adapter, queue settings and other agent state are not copied.
+The notified admission API does not yet combine notification with this inheritance.
+The other admission APIs retain their existing non-inheriting behavior. Unlike
+upstream's default task-owned agent copy, this selection is opt-in.
+
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
 children, `ensure_task_owned_subagent_restricted` and
