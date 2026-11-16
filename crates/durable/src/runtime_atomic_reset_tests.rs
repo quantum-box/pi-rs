@@ -178,6 +178,111 @@ fn add_many_resets(h: &mut Harness, id: Uuid) {
 }
 
 #[test]
+fn chunked_failure_settlement_and_historical_fork_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut stopped, version) = h.load(id).unwrap();
+    let occurrence = stopped.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    stopped.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "model error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&stopped, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    RESET_FORCE_CHUNKED.with(|flag| flag.set(true));
+    let result = h.save(&failure, Expected::Version(version));
+    RESET_FORCE_CHUNKED.with(|flag| flag.set(false));
+    result.unwrap();
+    assert_eq!(
+        h.conversation(id)
+            .unwrap()
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().resets[0].id,
+        steps[0].reset_id
+    );
+    let prefix = format!("runtime/reset-batch/{id}/");
+    let chunk = h
+        .owner
+        .store()
+        .prefix_keys_bounded(prefix.as_bytes(), 4, prefix.len() + 64)
+        .unwrap()
+        .into_iter()
+        .find(|key| key.len() > prefix.len() + 36)
+        .unwrap();
+    let value = h.owner.store().get(&chunk).unwrap().unwrap().value;
+    h.owner
+        .store()
+        .commit(&[], &[Mutation::Put { key: chunk, value }])
+        .unwrap();
+    assert!(h.fork_by_entry_id(id, occurrence).is_err());
+}
+
+#[test]
+fn oversized_reset_settlement_and_fork_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut stopped, version) = h.load(id).unwrap();
+    let occurrence = stopped.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    for _ in stopped.pending_resets.len()..=crate::reset_manifest::MAX_SHARED_CUTS {
+        stopped
+            .pending_resets
+            .push(crate::reset::Reset::new(Uuid::new_v4(), None));
+    }
+    stopped.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "model error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&stopped, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    h.save(&failure, Expected::Version(version)).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(
+        state.resets.len(),
+        crate::reset_manifest::MAX_SHARED_CUTS + 1
+    );
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().resets[0].id,
+        steps[0].reset_id
+    );
+}
+
+#[test]
 fn large_atomic_failure_shared_evidence_reopens_and_fences_tampering() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
@@ -252,7 +357,37 @@ fn large_atomic_failure_shared_evidence_reopens_and_fences_tampering() {
     let cursor: crate::transcript::Cursor =
         serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
     let observation = manifest["anchor_observation"].as_u64().unwrap();
+    {
+        let _scope = ResetProofScope::enter();
+        RESET_PROOF_REPLAYS.with(|count| count.set(0));
+        RESET_PROOF_TRANSITIONS.with(|count| count.set(0));
+        let cuts = manifest["cuts"].as_array().unwrap();
+        h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+        RESET_PROOF_CHECK_WORK.with(|count| count.set(0));
+        for cut in cuts.iter().rev() {
+            let cursor = serde_json::from_value(cut["cursor"].clone()).unwrap();
+            h.verify_failure_reset_cut(id, &cursor, observation)
+                .unwrap();
+        }
+        assert_eq!(RESET_PROOF_TRANSITIONS.with(std::cell::Cell::get), 66);
+        assert_eq!(
+            RESET_PROOF_CHECK_WORK.with(std::cell::Cell::get),
+            2 * cuts.len()
+        );
+        RESET_PROOF_TRANSITIONS.with(|count| count.set(0));
+        for (index, cut) in cuts.iter().enumerate().rev().chain(cuts.iter().enumerate()) {
+            let cursor = serde_json::from_value(cut["cursor"].clone()).unwrap();
+            let (state, _, _) = h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+            assert_eq!(state.resets.len(), index + 1);
+        }
+        assert_eq!(RESET_PROOF_REPLAYS.with(std::cell::Cell::get), 1);
+        assert!(RESET_PROOF_TRANSITIONS.with(std::cell::Cell::get) <= 130);
+    }
+    let _scope = ResetProofScope::enter();
     let (_, _, checks) = h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+    let later: crate::transcript::Cursor =
+        serde_json::from_value(manifest["cuts"][65]["cursor"].clone()).unwrap();
+    h.verify_failure_reset_cut(id, &later, observation).unwrap();
     assert!(checks.iter().any(|c| c.key == shared[0].0));
     let mut tampered = manifest.clone();
     tampered["cuts"][0]["state_sha256"] = serde_json::json!("0".repeat(64));
@@ -267,7 +402,9 @@ fn large_atomic_failure_shared_evidence_reopens_and_fences_tampering() {
         )
         .unwrap();
     assert!(h.owner.store().commit(&checks, &[]).is_err());
+    assert!(h.verify_failure_reset_cut(id, &later, observation).is_err());
     assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+    drop(_scope);
     drop(h);
     let mut h = Harness::open_paused(&path, options()).unwrap();
     assert!(h.fork_by_entry_id(id, occurrence).is_err());
@@ -965,6 +1102,7 @@ fn atomic_failure_kill_child() {
     h.save(&stopped, Expected::Version(version)).unwrap();
     let (mut failure, version) = h.load(id).unwrap();
     finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    RESET_FORCE_CHUNKED.with(|flag| flag.set(true));
     h.save(&failure, Expected::Version(version)).unwrap();
     println!(
         "ATOMIC_FAILURE_COMMITTED {id} {occurrence} {}",
