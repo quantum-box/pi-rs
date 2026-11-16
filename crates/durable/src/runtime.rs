@@ -3112,6 +3112,108 @@ impl PreparedConversationSave {
         Ok(())
     }
 }
+/// Collect newly settled submissions from the complete candidate batch.
+/// The caller must assemble deliveries against the same task and signal
+/// candidates before committing, so a notification cannot overwrite them.
+pub(crate) fn submission_settlements(
+    store: &durable_store::Store,
+    mutations: &[Mutation],
+) -> Result<Vec<(SubmissionNotify, serde_json::Value, (Uuid, Uuid))>, Error> {
+    let mut settling = Vec::new();
+    for mutation in mutations {
+        let Mutation::Put { key, value } = mutation else {
+            continue;
+        };
+        let Some(suffix) = key.strip_prefix(b"runtime/conversation/") else {
+            continue;
+        };
+        if std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .is_none()
+        {
+            continue;
+        }
+        let candidate: Conversation = serde_json::from_slice(value)?;
+        if candidate.submission_notifications.is_empty() {
+            continue;
+        }
+        let previous: Option<Conversation> = store
+            .get(key)?
+            .map(|entry| serde_json::from_slice(&entry.value))
+            .transpose()?;
+        for submission in &candidate.submissions {
+            let Some(notify) = candidate.submission_notifications.get(&submission.id) else {
+                continue;
+            };
+            if !matches!(
+                submission.status,
+                Status::Done { .. } | Status::Unanswered { .. }
+            ) || previous.as_ref().is_some_and(|old| {
+                old.submissions.iter().any(|prior| {
+                    prior.id == submission.id
+                        && matches!(
+                            prior.status,
+                            Status::Done { .. } | Status::Unanswered { .. }
+                        )
+                })
+            }) {
+                continue;
+            }
+            let (status, answer, reason) = match &submission.status {
+                Status::Done { answer } => ("done", Some(answer), None),
+                Status::Unanswered { reason } => ("unanswered", None, Some(reason)),
+                _ => unreachable!(),
+            };
+            let mut record = serde_json::json!({
+                "id": submission.id, "conversationId": candidate.id,
+                "type": submission.kind, "status": status, "notify": notify,
+            });
+            if let Some(request_id) = &submission.request_id {
+                record["requestId"] = serde_json::json!(request_id);
+            }
+            if let Some(answer) = answer {
+                record["answer"] = serde_json::json!(answer);
+            }
+            if let Some(answer_id) = candidate.answer_ids.get(&submission.id) {
+                record["answerId"] = serde_json::json!(answer_id);
+            }
+            if let Some(reason) = reason {
+                record["reason"] = serde_json::json!(reason);
+            }
+            settling.push((notify.clone(), record, (candidate.id, submission.id)));
+        }
+        for write in &candidate.application_writes {
+            let Some(notify) = candidate.submission_notifications.get(&write.id) else {
+                continue;
+            };
+            if !(write.placed || write.withdrawn)
+                || previous.as_ref().is_some_and(|old| {
+                    old.application_writes
+                        .iter()
+                        .any(|prior| prior.id == write.id && (prior.placed || prior.withdrawn))
+                })
+            {
+                continue;
+            }
+            let mut record = serde_json::json!({
+                "id": write.id, "conversationId": candidate.id, "type": "write",
+                "status": if write.withdrawn { "unanswered" } else { "done" }, "notify": notify,
+            });
+            if let Some(request_id) = &write.request_id {
+                record["requestId"] = serde_json::json!(request_id);
+            }
+            if write.withdrawn {
+                record["reason"] = serde_json::json!("aborted");
+            } else {
+                record["entry"] = serde_json::json!(write.id);
+            }
+            settling.push((notify.clone(), record, (candidate.id, write.id)));
+        }
+    }
+    Ok(settling)
+}
+
 /// Prepare an unchanged runtime snapshot and an ordered task-entry proof.
 /// The caller composes this batch with the task's ancestry and entry checks.
 pub(crate) fn prepare_ordered_task_checkpoint(
@@ -6053,98 +6155,7 @@ impl Harness {
         // Assemble notification deliveries only after every conversation and
         // graph participant has staged its candidate writes. The original
         // checks still fence the observations used by this assembly.
-        let mut settling = Vec::new();
-        for mutation in &batch.mutations {
-            let Mutation::Put { key, value } = mutation else {
-                continue;
-            };
-            let Some(suffix) = key.strip_prefix(b"runtime/conversation/") else {
-                continue;
-            };
-            if std::str::from_utf8(suffix)
-                .ok()
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .is_none()
-            {
-                continue;
-            }
-            let candidate: Conversation = serde_json::from_slice(value)?;
-            if candidate.submission_notifications.is_empty() {
-                continue;
-            }
-            let previous: Option<Conversation> = store
-                .get(key)?
-                .map(|entry| serde_json::from_slice(&entry.value))
-                .transpose()?;
-            for submission in &candidate.submissions {
-                let Some(notify) = candidate.submission_notifications.get(&submission.id) else {
-                    continue;
-                };
-                if !matches!(
-                    submission.status,
-                    Status::Done { .. } | Status::Unanswered { .. }
-                ) || previous.as_ref().is_some_and(|old| {
-                    old.submissions.iter().any(|prior| {
-                        prior.id == submission.id
-                            && matches!(
-                                prior.status,
-                                Status::Done { .. } | Status::Unanswered { .. }
-                            )
-                    })
-                }) {
-                    continue;
-                }
-                let (status, answer, reason) = match &submission.status {
-                    Status::Done { answer } => ("done", Some(answer), None),
-                    Status::Unanswered { reason } => ("unanswered", None, Some(reason)),
-                    _ => unreachable!(),
-                };
-                let mut record = serde_json::json!({
-                    "id": submission.id, "conversationId": candidate.id,
-                    "type": submission.kind, "status": status, "notify": notify,
-                });
-                if let Some(request_id) = &submission.request_id {
-                    record["requestId"] = serde_json::json!(request_id);
-                }
-                if let Some(answer) = answer {
-                    record["answer"] = serde_json::json!(answer);
-                }
-                if let Some(answer_id) = candidate.answer_ids.get(&submission.id) {
-                    record["answerId"] = serde_json::json!(answer_id);
-                }
-                if let Some(reason) = reason {
-                    record["reason"] = serde_json::json!(reason);
-                }
-                settling.push((notify.clone(), record, (candidate.id, submission.id)));
-            }
-            for write in &candidate.application_writes {
-                let Some(notify) = candidate.submission_notifications.get(&write.id) else {
-                    continue;
-                };
-                if !(write.placed || write.withdrawn)
-                    || previous.as_ref().is_some_and(|old| {
-                        old.application_writes
-                            .iter()
-                            .any(|prior| prior.id == write.id && (prior.placed || prior.withdrawn))
-                    })
-                {
-                    continue;
-                }
-                let mut record = serde_json::json!({
-                    "id": write.id, "conversationId": candidate.id, "type": "write",
-                    "status": if write.withdrawn { "unanswered" } else { "done" }, "notify": notify,
-                });
-                if let Some(request_id) = &write.request_id {
-                    record["requestId"] = serde_json::json!(request_id);
-                }
-                if write.withdrawn {
-                    record["reason"] = serde_json::json!("aborted");
-                } else {
-                    record["entry"] = serde_json::json!(write.id);
-                }
-                settling.push((notify.clone(), record, (candidate.id, write.id)));
-            }
-        }
+        let settling = submission_settlements(store, &batch.mutations)?;
         // Retry only observations added by notification assembly. The
         // original conversation, document, graph and prefix fences never move.
         let mut attempts = 0;
