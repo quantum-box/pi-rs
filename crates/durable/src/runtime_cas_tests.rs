@@ -24,6 +24,359 @@ fn options() -> Options {
 }
 
 #[test]
+fn display_entry_forks_use_original_commit_and_reopen() {
+    use crate::document::{Address, Documents, Transaction};
+    use durable_store::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let parent = h
+        .create_conversation(Config {
+            model: "old".into(),
+            system_prompt: "original".into(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let db = Store::open(&path).unwrap();
+    let address = Address {
+        scope: parent.to_string(),
+        name: "state".into(),
+        key: String::new(),
+    };
+    let mut tx = Transaction::new();
+    tx.put(
+        &address,
+        Expected::Missing,
+        serde_json::json!({"n":1}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let first = h
+        .submit_write(
+            parent,
+            None,
+            "display.first".into(),
+            Some(serde_json::json!(1)),
+        )
+        .unwrap();
+    let mut tx = Transaction::new();
+    tx.put(
+        &address,
+        Expected::Version(Documents::new(&db).get(&address).unwrap().unwrap().version),
+        serde_json::json!({"n":2}).as_object().unwrap(),
+    )
+    .unwrap();
+    tx.commit(&db).unwrap();
+    let second = h
+        .submit_write(
+            parent,
+            None,
+            "display.second".into(),
+            Some(serde_json::json!(2)),
+        )
+        .unwrap();
+    h.reset(parent, Some("later".into())).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let child = h.fork_by_display_entry_id(parent, first).unwrap();
+    let state = h.conversation(child).unwrap();
+    assert_eq!(
+        state
+            .application_writes
+            .iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>(),
+        vec![first]
+    );
+    assert_eq!(state.config.model, "old");
+    assert!(state.resets.is_empty());
+    let child_address = Address {
+        scope: child.to_string(),
+        ..address.clone()
+    };
+    assert_eq!(h.document(&child_address).unwrap().unwrap().value["n"], 1);
+    let child2 = h.fork_by_display_entry_id(parent, second).unwrap();
+    assert_eq!(
+        h.conversation(child2)
+            .unwrap()
+            .application_writes
+            .iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    assert_eq!(
+        h.document(&Address {
+            scope: child2.to_string(),
+            ..address
+        })
+        .unwrap()
+        .unwrap()
+        .value["n"],
+        2
+    );
+    assert!(h.fork_by_display_entry_id(child, first).is_err());
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        h.conversation(child).unwrap().application_writes[0].id,
+        first
+    );
+}
+
+#[test]
+fn display_entry_fork_fences_races_and_authenticates_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let root = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let descendant = h.fork(root).unwrap();
+    let entry = h
+        .submit_write(descendant, None, "app.first".into(), None)
+        .unwrap();
+    let mut worker = h.worker();
+    DISPLAY_FORK_BEFORE_SAVE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            worker
+                .submit_write(descendant, None, "app.racing".into(), None)
+                .unwrap();
+        }));
+    });
+    assert!(matches!(
+        h.fork_by_display_entry_id(descendant, entry),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    let fork = h.fork_by_display_entry_id(descendant, entry).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().application_writes.len(), 1);
+    assert!(h.fork_by_display_entry_id(root, entry).is_err());
+    let observer = crate::observer::Observer::new(h.owner.store(), descendant);
+    let page = observer
+        .read(
+            crate::observer::Cursor(0),
+            std::num::NonZeroUsize::new(64).unwrap(),
+        )
+        .unwrap();
+    let cursor = page
+        .records
+        .iter()
+        .find(|r| {
+            r.value["application_writes"]
+                .as_array()
+                .is_some_and(|writes| writes.iter().any(|w| w["id"] == serde_json::json!(entry)))
+        })
+        .unwrap()
+        .cursor
+        .0;
+    let mut key = b"durable/observer/".to_vec();
+    key.extend_from_slice(descendant.as_bytes());
+    key.extend_from_slice(b"/r");
+    key.extend_from_slice(&cursor.to_be_bytes());
+    let stored = h.owner.store().get(&key).unwrap().unwrap();
+    h.owner
+        .store()
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(stored.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: stored.value,
+            }],
+        )
+        .unwrap();
+    assert!(h.fork_by_display_entry_id(descendant, entry).is_err());
+}
+
+#[test]
+fn display_entry_fork_rejects_unplaced_reset_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let root = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(root, None, "busy".into()).unwrap();
+    h.reset(root, Some("reset".into())).unwrap();
+    let entry = h
+        .submit_write(root, None, "app.pending".into(), None)
+        .unwrap();
+    assert!(!h.conversation(root).unwrap().application_writes[0].placed);
+    assert!(h.fork_by_display_entry_id(root, entry).is_err());
+    let settled = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let reset = h.reset(settled, Some("before entry".into())).unwrap();
+    let after = h
+        .submit_write(settled, None, "app.after-reset".into(), None)
+        .unwrap();
+    let fork = h.fork_by_display_entry_id(settled, after).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().resets.last().unwrap().id,
+        reset
+    );
+}
+
+#[test]
+fn display_entry_fork_does_not_replay_settlement_notification() {
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_store::{Save, TaskStore};
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let root = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(root),
+        Checkpoint {
+            phase: "start".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap();
+    TaskStore::new(h.owner.store())
+        .save(&[Save::Create(&task)])
+        .unwrap();
+    let entry = h
+        .submit_write_with_notification(
+            root,
+            None,
+            "app.notified".into(),
+            None,
+            SubmissionNotify {
+                task_id: task.id(),
+                key: "receipt".into(),
+            },
+        )
+        .unwrap();
+    let before = TaskStore::new(h.owner.store())
+        .read_typed_signal(task.id(), &submission_settled_signal(), "receipt")
+        .unwrap();
+    assert!(before.is_some());
+    let child = h.fork_by_display_entry_id(root, entry).unwrap();
+    assert!(
+        TaskStore::new(h.owner.store())
+            .list()
+            .unwrap()
+            .iter()
+            .all(|record| record.task.owner() != &TaskOwner::Conversation(child))
+    );
+    assert!(
+        h.conversation(child)
+            .unwrap()
+            .submission_notifications
+            .is_empty()
+    );
+    let after = TaskStore::new(h.owner.store())
+        .read_typed_signal(task.id(), &submission_settled_signal(), "receipt")
+        .unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn display_entry_fork_uses_end_of_commit_documents_for_ordered_batch() {
+    use crate::document::Address;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let root = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let address = Address {
+        scope: root.to_string(),
+        name: "state".into(),
+        key: String::new(),
+    };
+    let entry = h
+        .session_transaction(root, |tx| {
+            let id = tx.append_entry("app.single", None)?;
+            tx.put_document(
+                &address,
+                serde_json::json!({"value":"at commit"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )?;
+            Ok(id)
+        })
+        .unwrap();
+    let fork = h.fork_by_display_entry_id(root, entry).unwrap();
+    let child_address = Address {
+        scope: fork.to_string(),
+        ..address.clone()
+    };
+    assert_eq!(
+        h.document(&child_address).unwrap().unwrap().value["value"],
+        "at commit"
+    );
+    let (first, second) = h
+        .session_transaction(root, |tx| {
+            let first = tx.append_entry("app.first", None)?;
+            tx.put_document(
+                &address,
+                serde_json::json!({"value":"batch final"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )?;
+            Ok((first, tx.append_entry("app.second", None)?))
+        })
+        .unwrap();
+    let first_fork = h.fork_by_display_entry_id(root, first).unwrap();
+    let second_fork = h.fork_by_display_entry_id(root, second).unwrap();
+    assert_eq!(
+        h.conversation(first_fork)
+            .unwrap()
+            .application_writes
+            .iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>(),
+        vec![entry, first]
+    );
+    assert_eq!(
+        h.conversation(second_fork)
+            .unwrap()
+            .application_writes
+            .iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>(),
+        vec![entry, first, second]
+    );
+    for id in [first_fork, second_fork] {
+        let address = Address {
+            scope: id.to_string(),
+            ..address.clone()
+        };
+        assert_eq!(
+            h.document(&address).unwrap().unwrap().value["value"],
+            "batch final"
+        );
+    }
+}
+
+#[test]
 fn interrupted_recovery_retries_racing_stream_append() {
     for initial in [None, Some("first")] {
         let dir = tempfile::tempdir().unwrap();

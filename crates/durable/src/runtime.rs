@@ -3254,6 +3254,8 @@ thread_local! {
     static RESET_FORCE_CHUNKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static RESET_PROOF_BEFORE_SAVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static DISPLAY_FORK_BEFORE_SAVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 struct ResetProofScope(bool);
 impl ResetProofScope {
@@ -7632,9 +7634,10 @@ impl Harness {
         cursor: crate::observer::Cursor,
         prefix: Option<(usize, usize)>,
     ) -> Result<Uuid, Error> {
-        self.fork_at_selected(id, cursor, prefix, None, None)
+        self.fork_at_selected(id, cursor, prefix, None, None, None, &[])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fork_at_selected(
         &mut self,
         id: Uuid,
@@ -7642,6 +7645,8 @@ impl Harness {
         prefix: Option<(usize, usize)>,
         application_cut: Option<(u64, Uuid, Vec<crate::application_entry::ApplicationEntry>)>,
         reset_cut: Option<(Conversation, crate::transcript::Cursor, u64, Vec<Check>)>,
+        display_len: Option<usize>,
+        evidence: &[Check],
     ) -> Result<Uuid, Error> {
         self.load(id)?;
         if cursor.0 == 0 {
@@ -7673,6 +7678,16 @@ impl Harness {
             }
         }
         let mut value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+        if let Some(len) = display_len {
+            let writes = value
+                .pointer_mut("/documents/pi-rs~1runtime~1application-writes")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            if len == 0 || len > writes.len() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            writes.truncate(len);
+        }
         if let Some((cut, position, _, _)) = &reset_cut {
             value["_transcript"] = serde_json::to_value(position)?;
             value["config"] = serde_json::to_value(&cut.config)?;
@@ -7894,6 +7909,7 @@ impl Harness {
                 state.id,
                 revision,
             )?;
+            batch.checks.extend_from_slice(evidence);
             if let Some((_, _, _, checks)) = &reset_cut {
                 batch.checks.extend(checks.clone());
             }
@@ -8179,7 +8195,175 @@ impl Harness {
             None,
             Some((revision, id, visible)),
             None,
+            None,
+            &[],
         )
+    }
+
+    /// Fork a locally placed display write in an append-only batch that is the
+    /// sole visible change in its tracked runtime commit. Inherited and
+    /// ambiguous cuts are rejected until their placement can be authenticated.
+    pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        let (_, root_version) = self.load(id)?;
+        let store = self.owner.store();
+        if entry_id.is_nil() || store.legacy_version_boundary()? != 0 {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let root = Self::key(id);
+        let prefix = format!("runtime/fork/{id}/");
+        let observer = crate::observer::Observer::new(store, id);
+        let mut cursor = crate::observer::Cursor(0);
+        let mut checks = vec![Check {
+            key: root.clone(),
+            expected: Expected::Version(root_version),
+        }];
+        let mut prior: Option<(
+            serde_json::Value,
+            serde_json::Value,
+            Vec<ApplicationWrite>,
+            u64,
+        )> = None;
+        let mut count = 0usize;
+        let mut previous_sequence = None;
+        loop {
+            let page = observer.read(cursor, std::num::NonZeroUsize::new(64).unwrap())?;
+            for record in &page.records {
+                count += 1;
+                if count > 256 || record.cursor.0 != count as u64 {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let position = record.cursor.0;
+                let mut event_key = b"durable/observer/".to_vec();
+                event_key.extend_from_slice(id.as_bytes());
+                event_key.extend_from_slice(b"/r");
+                event_key.extend_from_slice(&position.to_be_bytes());
+                let event = store
+                    .get(&event_key)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let fork_key = format!("runtime/fork/{id}/{position:020}").into_bytes();
+                let fork = store
+                    .get(&fork_key)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let sequence = store
+                    .commit_for_version(&event_key, event.version)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                let revision = store
+                    .document_cut_for_version(&fork_key, fork.version)?
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if store.commit_for_version(&fork_key, fork.version)? != Some(sequence)
+                    || !store.runtime_snapshot_exact_at(
+                        &root,
+                        prefix.as_bytes(),
+                        &fork_key,
+                        sequence,
+                    )?
+                    || Some(revision) != store.document_cut(&fork_key)?
+                    || (prior.is_none() && store.first_commit_for_key(&root)? != Some(sequence))
+                    || previous_sequence.is_some_and(|previous| previous >= sequence)
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                if let Some(previous) = previous_sequence
+                    && store.next_commit_for_key(&root, previous)? != Some(sequence)
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                previous_sequence = Some(sequence);
+                // Verify the event and fork agree before using either as evidence.
+                self.committed_view_frame(id, position)?;
+                let mut snapshot: serde_json::Value = serde_json::from_slice(&fork.value)?;
+                let mut observed: serde_json::Value = serde_json::from_slice(&event.value)?;
+                let writes: Vec<ApplicationWrite> = serde_json::from_value(
+                    snapshot
+                        .pointer("/documents/pi-rs~1runtime~1application-writes")
+                        .cloned()
+                        .ok_or(crate::fork::Error::InvalidSnapshot)?,
+                )?;
+                let mut ids = std::collections::HashSet::new();
+                if writes.iter().any(|w| w.id.is_nil() || !ids.insert(w.id)) {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                let placed: Vec<_> = writes
+                    .iter()
+                    .filter(|w| w.placed && !w.withdrawn)
+                    .cloned()
+                    .collect();
+                if prior.is_none() && !placed.is_empty() {
+                    // A copied prefix has no authenticated display-entry lineage.
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                snapshot
+                    .pointer_mut("/documents")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?
+                    .remove("pi-rs/runtime/application-writes");
+                observed
+                    .as_object_mut()
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?
+                    .remove("application_writes");
+                checks.push(Check {
+                    key: event_key,
+                    expected: Expected::Version(event.version),
+                });
+                checks.push(Check {
+                    key: fork_key,
+                    expected: Expected::Version(fork.version),
+                });
+                if let Some((before_snapshot, before_event, before_writes, before_revision)) =
+                    &prior
+                {
+                    let old_placed: Vec<_> = before_writes
+                        .iter()
+                        .filter(|w| w.placed && !w.withdrawn)
+                        .cloned()
+                        .collect();
+                    if !placed.starts_with(&old_placed) {
+                        return Err(crate::fork::Error::InvalidSnapshot.into());
+                    }
+                    if let Some(index) = placed.iter().position(|w| w.id == entry_id) {
+                        if index < old_placed.len()
+                            || before_writes.iter().any(|w| !w.placed || w.withdrawn)
+                            || writes.iter().any(|w| !w.placed || w.withdrawn)
+                            || writes.len() <= before_writes.len()
+                            || !writes.starts_with(before_writes)
+                            || snapshot != *before_snapshot
+                            || observed != *before_event
+                        {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        // A task application log can change without a runtime
+                        // observation; its same-commit order is not proven here.
+                        let app_key = crate::application_entry::key(id);
+                        let before = store.application_entries_at(&app_key, *before_revision)?;
+                        let after = store.application_entries_at(&app_key, revision)?;
+                        if before.map(|entry| entry.value) != after.map(|entry| entry.value) {
+                            return Err(crate::fork::Error::InvalidSnapshot.into());
+                        }
+                        #[cfg(test)]
+                        DISPLAY_FORK_BEFORE_SAVE.with(|hook| {
+                            if let Some(hook) = hook.borrow_mut().take() {
+                                hook();
+                            }
+                        });
+                        return self.fork_at_selected(
+                            id,
+                            record.cursor,
+                            None,
+                            None,
+                            None,
+                            Some(index + 1),
+                            &checks,
+                        );
+                    }
+                }
+                prior = Some((snapshot, observed, writes, revision));
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        Err(crate::fork::Error::InvalidCursor.into())
     }
 
     /// Fork at the commit that first exposed this complete message batch.
@@ -8278,6 +8462,8 @@ impl Harness {
                 None,
                 None,
                 Some((cut, position.cursor, revision, checks)),
+                None,
+                &[],
             );
         }
         let key = format!("runtime/fork/{}/{:020}", id, record.cursor.0);
@@ -19355,6 +19541,9 @@ impl Scheduler {
     }
     pub fn fork_at_application_entry(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         self.harness.fork_at_application_entry(id, entry_id)
+    }
+    pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
+        self.harness.fork_by_display_entry_id(id, entry_id)
     }
     pub fn fork_by_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         self.harness.fork_by_entry_id(id, entry_id)
