@@ -1075,6 +1075,240 @@ mod tests {
         );
     }
 
+    struct FailingModel;
+    #[async_trait]
+    impl Model for FailingModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+            Err(ModelError::Model("failed".into()))
+        }
+    }
+
+    async fn parked_owned_inputs(h: &mut Harness, settle: bool) -> (Uuid, Uuid, Uuid, Uuid) {
+        use crate::runtime::{AdmissionOptions, OnAbort, Status};
+        let parent = h.create_conversation(config()).unwrap();
+        let owner = TaskOwner::Conversation(parent);
+        let root = Task::new(
+            Uuid::new_v4(),
+            owner.clone(),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::Value::Null,
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parked-root".into(), true);
+        TaskStore::new(h.owner.store())
+            .save(&[Save::Create(&root)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(root.id(), owner, "fg", config(), Mode::Foreground)
+            .unwrap()
+            .child;
+        h.submit(child, None, "first".into()).unwrap();
+        let ordinary = h.submit(child, None, "ordinary".into()).unwrap();
+        let kept = h
+            .submit_with_options(
+                child,
+                None,
+                "kept".into(),
+                AdmissionOptions {
+                    on_abort: OnAbort::Keep,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if settle {
+            h.resume_conversation(child, &pi_rs_core::CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        let c = h.conversation(child).unwrap();
+        assert_eq!(
+            c.submissions
+                .iter()
+                .find(|s| s.id == ordinary)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+        assert_eq!(
+            c.submissions.iter().find(|s| s.id == kept).unwrap().status,
+            Status::Queued
+        );
+        (root.id(), child, ordinary, kept)
+    }
+
+    #[tokio::test]
+    async fn parked_owned_inputs_do_not_hold_success_across_reopen() {
+        use crate::runtime::Status;
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut opts = options();
+        opts.model = Arc::new(FailingModel);
+        let mut h = Harness::open_paused(&path, opts.clone()).unwrap();
+        let (root, child, ordinary, kept) = parked_owned_inputs(&mut h, false).await;
+        let mut registry = Registry::default();
+        registry.register("parked-root", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!("done")))
+        });
+        let mut scheduler = h.attach_tasks(registry.clone()).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root).unwrap().unwrap().state(),
+            &TaskState::Completing(serde_json::json!("done"))
+        );
+        h.resume_conversation(child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        drop(scheduler);
+        drop(h);
+        let h = Harness::open_paused(&path, opts).unwrap();
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root).unwrap().unwrap().state(),
+            &TaskState::Succeeded(serde_json::json!("done"))
+        );
+        let c = h.conversation(child).unwrap();
+        for id in [ordinary, kept] {
+            assert_eq!(
+                c.submissions.iter().find(|s| s.id == id).unwrap().status,
+                Status::Queued
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_owner_cascades_parked_inputs_and_drains_kept_after_reopen() {
+        use crate::runtime::Status;
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut opts = options();
+        opts.model = Arc::new(FailingModel);
+        let mut h = Harness::open_paused(&path, opts.clone()).unwrap();
+        let (root, child, ordinary, kept) = parked_owned_inputs(&mut h, true).await;
+        let mut registry = Registry::default();
+        registry.register("parked-root", true, |_: &Task| {
+            Ok(Step::Fail("failure".into()))
+        });
+        let mut scheduler = h.attach_tasks(registry.clone()).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root).unwrap().unwrap().state(),
+            &TaskState::CompletingFailed("failure".into())
+        );
+        drop(scheduler);
+        drop(h);
+        let h = Harness::open_paused(&path, opts.clone()).unwrap();
+        let mut scheduler = h.attach_tasks(registry.clone()).unwrap();
+        scheduler.tick(0).unwrap();
+        let c = h.conversation(child).unwrap();
+        assert!(c.abort_requested);
+        assert_eq!(
+            c.submissions
+                .iter()
+                .find(|s| s.id == ordinary)
+                .unwrap()
+                .status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
+        assert_eq!(
+            c.submissions.iter().find(|s| s.id == kept).unwrap().status,
+            Status::Queued
+        );
+        drop(scheduler);
+        drop(h);
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        h.resume_conversation(child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        scheduler.tick(0).unwrap();
+        assert_eq!(
+            scheduler.get(root).unwrap().unwrap().state(),
+            &TaskState::Failed("failure".into())
+        );
+        assert_eq!(
+            h.conversation(child)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == kept)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_owner_abort_with_parked_inputs_survives_reopen() {
+        use crate::runtime::Status;
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Step};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut opts = options();
+        opts.model = Arc::new(FailingModel);
+        let mut h = Harness::open_paused(&path, opts.clone()).unwrap();
+        let (root, child, ordinary, kept) = parked_owned_inputs(&mut h, true).await;
+        h.request_abort_task(root).unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, opts).unwrap();
+        let c = h.conversation(child).unwrap();
+        assert_eq!(
+            c.submissions
+                .iter()
+                .find(|s| s.id == ordinary)
+                .unwrap()
+                .status,
+            Status::Unanswered {
+                reason: "aborted".into()
+            }
+        );
+        assert_eq!(
+            c.submissions.iter().find(|s| s.id == kept).unwrap().status,
+            Status::Queued
+        );
+        h.resume_conversation(child, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.register("parked-root", true, |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!(null)))
+        });
+        registry.set_abort("parked-root", |_: &Task| {
+            Ok(Step::Succeed(serde_json::json!(null)))
+        });
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        for _ in 0..4 {
+            if scheduler.get(root).unwrap().unwrap().is_terminal() {
+                break;
+            }
+            scheduler.tick(0).unwrap();
+        }
+        assert_eq!(
+            scheduler.get(root).unwrap().unwrap().state(),
+            &TaskState::Cancelled
+        );
+        assert_eq!(
+            h.conversation(child)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == kept)
+                .unwrap()
+                .status,
+            Status::Queued
+        );
+    }
+
     #[tokio::test]
     async fn fail_fast_waits_for_sibling_owned_conversation_cleanup() {
         use crate::task::{TaskState, WaitFor};

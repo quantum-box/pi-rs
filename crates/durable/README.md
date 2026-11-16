@@ -585,6 +585,10 @@ still reject foreground conversation children because they cannot drive or cance
 their workers. A blocked uncertain operation requires reconciliation, and a task
 driver must be running to drain tasks.
 
+Inputs parked after a failed child run do not hold their task owner open. Before
+a failed owner finishes, its foreground cascade withdraws parked inputs unless
+they use `OnAbort::Keep`; kept inputs remain queued without holding completion.
+
 As a pi-rs extension, `abort_and_wait_withdrawn` returns the queued inputs withdrawn by its abort
 commit, including each conversation, original mode and submission. The
 `abort_and_wait_with_background_withdrawn` variant crosses background boundaries.

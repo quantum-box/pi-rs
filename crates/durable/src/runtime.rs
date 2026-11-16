@@ -1814,7 +1814,7 @@ impl Conversation {
                 .iter()
                 .any(|s| matches!(s.status, Status::Queued | Status::Running))
     }
-    fn is_idle_wait_busy(&self) -> bool {
+    pub(crate) fn is_idle_wait_busy(&self) -> bool {
         self.active.is_some()
             || !self.pending_resets.is_empty()
             || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
@@ -1822,6 +1822,11 @@ impl Conversation {
                 matches!(s.status, Status::Running)
                     || (s.status == Status::Queued && !matches!(self.phase, Phase::FailedIdle))
             })
+    }
+    pub(crate) fn has_abortable_queued_inputs(&self) -> bool {
+        self.submissions
+            .iter()
+            .any(|s| s.status == Status::Queued && s.on_abort != OnAbort::Keep)
     }
     /// The most recent attempt for the currently running, pending, blocked or
     /// finishing operation. Legacy records may have no known attempt identity.
