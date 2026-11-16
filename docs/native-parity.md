@@ -674,6 +674,8 @@ layout cases still need comparison.
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Empty terminal-identification environment variables do not advertise OSC 8
+support or indicate a tmux session.
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
 styling and the same terminal-dependent behavior. Bare URLs stop before CJK
 punctuation while explicit links retain it in their destination. Markdown
@@ -1740,6 +1742,10 @@ results in both terminal modes. Image normalization shares the local read
 implementation, preserves alpha and avoids upscaling. Kitty uploads are reused
 on redraw and resize. Fullscreen exit releases owned images, while regular
 mode retains them in scrollback. Unsupported terminals retain text notices.
+Empty terminal-identification environment variables do not enable image
+protocols or imply an active tmux session, matching Pi's detection behavior.
+`PI_IMAGE_PROTOCOL` is case-insensitive, and `TERM=xterm-kitty` alone does not
+override another terminal's image protocol.
 
 A PTY fixture verifies both protocols, user and tool images, cached redraw,
 cleanup and terminal restoration. Protocol bytes were checked without a GUI
