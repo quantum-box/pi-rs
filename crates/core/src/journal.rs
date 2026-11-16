@@ -1041,11 +1041,17 @@ impl Session {
                 "tool execution requires a current decision".into(),
             ));
         };
+        if decision.context().summary {
+            return Err(Error::Session(
+                "summary request cannot authorize tool execution".into(),
+            ));
+        }
         let branch = self.branch();
         let request_record = branch.iter().find(|record| matches!(&record.event, Event::ModelRequested { request_id: Some(id), .. } if *id == request_id))
             .ok_or_else(|| Error::Session("missing tool execution request".into()))?;
         let Event::ModelRequested {
             tool_decision: Some(marker),
+            max_output_tokens,
             ..
         } = &request_record.event
         else {
@@ -1071,6 +1077,81 @@ impl Session {
         {
             return Err(Error::Session(
                 "registered tool is not in the request decision".into(),
+            ));
+        }
+        // A request, even with a valid decision, does not authorize a fabricated
+        // assistant entry. Require its unique durable successful completion and
+        // the exact assistant projection before accepting any invocation.
+        let mut completions = branch.iter().filter(|record| {
+            matches!(&record.event,
+            Event::ModelFinished { request_id: id, .. } if *id == request_id)
+        });
+        let completion = completions
+            .next()
+            .ok_or_else(|| Error::Session("missing model completion".into()))?;
+        if completions.next().is_some()
+            || completion.id <= request_record.id
+            || completion.id >= before
+            || completion.run_id != run_id
+        {
+            return Err(Error::Session("ambiguous model completion".into()));
+        }
+        let Event::ModelFinished {
+            metadata,
+            failure: None,
+            partial,
+            reply: Some(reply),
+            ..
+        } = &completion.event
+        else {
+            return Err(Error::Session(
+                "model completion has no successful reply".into(),
+            ));
+        };
+        let advertised: Vec<_> = validated
+            .effective_tools()
+            .iter()
+            .map(|tool| tool.spec.name.as_str())
+            .collect();
+        if metadata.finish_reason.as_deref() == Some("length")
+            || !partial.is_empty()
+            || reply.max_output_tokens != *max_output_tokens
+            || reply
+                .advertised_tools
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                != advertised
+        {
+            return Err(Error::Session(
+                "invalid or truncated model completion".into(),
+            ));
+        }
+        let mut assistants = branch.iter().filter(|record| {
+            matches!(&record.event,
+            Event::Assistant { request_id: Some(id), .. } if *id == request_id)
+        });
+        let assistant = assistants
+            .next()
+            .ok_or_else(|| Error::Session("missing assistant reply".into()))?;
+        if assistants.next().is_some()
+            || assistant.id <= completion.id
+            || assistant.id >= before
+            || assistant.run_id != run_id
+        {
+            return Err(Error::Session("ambiguous assistant reply".into()));
+        }
+        let Event::Assistant {
+            content,
+            invocations,
+            ..
+        } = &assistant.event
+        else {
+            unreachable!()
+        };
+        if *content != reply.content || *invocations != reply.invocations {
+            return Err(Error::Session(
+                "assistant does not match model completion".into(),
             ));
         }
         let mut found = None;
@@ -6593,6 +6674,18 @@ mod durable_tool_decision_tests {
         crate::ModelRequest,
         Vec<crate::ToolDeclaration>,
     ) {
+        fixture_with_summary(session, false)
+    }
+
+    fn fixture_with_summary(
+        session: &Session,
+        summary: bool,
+    ) -> (
+        Event,
+        crate::ToolDecisionSnapshot,
+        crate::ModelRequest,
+        Vec<crate::ToolDeclaration>,
+    ) {
         let spec = crate::ToolSpec {
             name: "read".into(),
             description: "read a file".into(),
@@ -6608,7 +6701,7 @@ mod durable_tool_decision_tests {
             request_id: Uuid::new_v4(),
             session_id: session.session_id(),
             external_id: session.external_session_id(),
-            summary: false,
+            summary,
         };
         let declaration = crate::ToolDeclaration {
             spec: spec.clone(),
@@ -7003,7 +7096,19 @@ mod durable_tool_decision_tests {
         crate::ToolSpec,
         crate::ToolExecutionSnapshot,
     ) {
-        let (event, decision, request, declarations) = fixture(session);
+        execution_fixture_with_summary(session, false)
+    }
+
+    fn execution_fixture_with_summary(
+        session: &mut Session,
+        summary: bool,
+    ) -> (
+        Uuid,
+        crate::Invocation,
+        crate::ToolSpec,
+        crate::ToolExecutionSnapshot,
+    ) {
+        let (event, decision, request, declarations) = fixture_with_summary(session, summary);
         let request_id = decision.context().request_id;
         let spec = request.tools[0].clone();
         session
@@ -7017,6 +7122,21 @@ mod durable_tool_decision_tests {
                 arguments: "{}".into(),
             },
         };
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    advertised_tools: vec![spec.name.clone()],
+                    max_output_tokens: request.max_output_tokens,
+                }),
+            })
+            .unwrap();
         session
             .append(Event::Assistant {
                 content: "".into(),
@@ -7344,5 +7464,178 @@ mod durable_tool_decision_tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn tool_execution_requires_matching_unique_successful_completion_at_append_and_lookup() {
+        for case in [
+            "missing",
+            "failure",
+            "reply_missing",
+            "length",
+            "partial",
+            "content",
+            "invocations",
+            "advertised",
+            "budget",
+            "wrong_run",
+            "wrong_request",
+            "wrong_order",
+            "duplicate",
+        ] {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            let (request, invocation, spec, execution) = execution_fixture(&mut session);
+            let start = session
+                .append_tool_execution_started(
+                    request,
+                    invocation.operation_id,
+                    &execution,
+                    "owner",
+                    &spec,
+                    "backend-v1",
+                )
+                .unwrap()
+                .id;
+            let mut records = session.records().to_vec();
+            let completion = records
+                .iter_mut()
+                .find(|record| matches!(record.event, Event::ModelFinished { .. }))
+                .unwrap();
+            if case == "wrong_run" {
+                completion.run_id = Some(Uuid::new_v4());
+            }
+            if case == "missing" {
+                completion.event = Event::SessionInfo {
+                    name: None,
+                    cwd: None,
+                };
+            } else if let Event::ModelFinished {
+                request_id,
+                metadata,
+                failure,
+                partial,
+                reply,
+                ..
+            } = &mut completion.event
+            {
+                match case {
+                    "wrong_request" => *request_id = Uuid::new_v4(),
+                    "failure" => *failure = Some(ModelFailure::Failed),
+                    "reply_missing" => *reply = None,
+                    "length" => metadata.finish_reason = Some("length".into()),
+                    "partial" => *partial = "incomplete".into(),
+                    "content" => reply.as_mut().unwrap().content = "different".into(),
+                    "invocations" => {
+                        reply.as_mut().unwrap().invocations[0].call.arguments = "{\"x\":1}".into()
+                    }
+                    "advertised" => reply.as_mut().unwrap().advertised_tools.clear(),
+                    "budget" => reply.as_mut().unwrap().max_output_tokens += 1,
+                    _ => {}
+                }
+            }
+            if case == "wrong_order" {
+                let completion_index = records
+                    .iter()
+                    .position(|r| matches!(r.event, Event::ModelFinished { .. }))
+                    .unwrap();
+                let assistant_index = records
+                    .iter()
+                    .position(|r| matches!(r.event, Event::Assistant { .. }))
+                    .unwrap();
+                let completion_event = records[completion_index].event.clone();
+                records[completion_index].event = records[assistant_index].event.clone();
+                records[assistant_index].event = completion_event;
+            }
+            let mut metadata = session.record_metadata.clone();
+            let mut lookup =
+                Session::from_records_with_metadata(records.clone(), metadata.clone()).unwrap();
+            if case == "duplicate" {
+                let event = records
+                    .iter()
+                    .find(|r| matches!(r.event, Event::ModelFinished { .. }))
+                    .unwrap()
+                    .event
+                    .clone();
+                lookup.append(event).unwrap();
+            }
+            assert!(
+                lookup
+                    .recorded_tool_execution(start, "owner", &spec, "backend-v1")
+                    .is_err(),
+                "lookup accepted {case}"
+            );
+            records.pop();
+            metadata.remove(&start);
+            let mut append = Session::from_records_with_metadata(records, metadata).unwrap();
+            if case == "duplicate" {
+                let event = append
+                    .records()
+                    .iter()
+                    .find(|r| matches!(r.event, Event::ModelFinished { .. }))
+                    .unwrap()
+                    .event
+                    .clone();
+                append.append(event).unwrap();
+            }
+            assert!(
+                append
+                    .append_tool_execution_started(
+                        request,
+                        invocation.operation_id,
+                        &execution,
+                        "owner",
+                        &spec,
+                        "backend-v1"
+                    )
+                    .is_err(),
+                "append accepted {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_execution_rejects_summary_at_append_and_lookup() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (request, invocation, spec, execution) =
+            execution_fixture_with_summary(&mut session, true);
+        let error = session
+            .append_tool_execution_started(
+                request,
+                invocation.operation_id,
+                &execution,
+                "owner",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("summary request"));
+        let RecordedToolDecision::Current(decision) =
+            session.active_tool_decision(request).unwrap()
+        else {
+            panic!("missing decision")
+        };
+        let marker = ToolExecutionMarker {
+            version: 1,
+            origin_session_id: session.session_id(),
+            request_id: request,
+            decision_sha256: decision.binding_sha256().into(),
+            binding_sha256: execution.binding_sha256().into(),
+        };
+        let metadata = serde_json::json!({"toolExecution": ToolExecutionMetadata { version: 1, snapshot: execution }});
+        let id = session
+            .append_inner_with_metadata(
+                Event::ToolStarted {
+                    operation_id: invocation.operation_id,
+                    tool_execution: Some(marker),
+                },
+                true,
+                Some(metadata),
+            )
+            .unwrap()
+            .id;
+        let error = session
+            .recorded_tool_execution(id, "owner", &spec, "backend-v1")
+            .unwrap_err();
+        assert!(error.to_string().contains("summary request"));
     }
 }
