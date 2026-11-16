@@ -5497,3 +5497,52 @@ fn atomic_failure_boundary_retries_with_latest_inbox_and_modes() {
     }
     assert_eq!(c.run_failure.unwrap().reason, "model_error");
 }
+
+#[test]
+fn historical_fork_rejects_anchor_rewritten_in_another_commit() {
+    for mode in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: "".into(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let occurrence = h
+            .append_user_blocks(id, vec![serde_json::json!({"type":"text", "text":"cut"})])
+            .unwrap();
+        let cursor = h
+            .history(
+                id,
+                crate::observer::Cursor(0),
+                std::num::NonZeroUsize::new(100).unwrap(),
+            )
+            .unwrap()
+            .records
+            .last()
+            .unwrap()
+            .cursor;
+        h.fork_by_entry_id(id, occurrence).unwrap();
+        let mut observer = b"durable/observer/".to_vec();
+        observer.extend_from_slice(id.as_bytes());
+        observer.extend_from_slice(b"/r");
+        observer.extend_from_slice(&cursor.0.to_be_bytes());
+        let fork = format!("runtime/fork/{id}/{:020}", cursor.0).into_bytes();
+        let keys = match mode {
+            0 => vec![observer],
+            1 => vec![fork],
+            _ => vec![observer, fork],
+        };
+        let changes: Vec<_> = keys
+            .into_iter()
+            .map(|key| {
+                let value = h.owner.store().get(&key).unwrap().unwrap().value;
+                Mutation::Put { key, value }
+            })
+            .collect();
+        h.owner.store().commit(&[], &changes).unwrap();
+        assert!(h.fork_by_entry_id(id, occurrence).is_err());
+    }
+}

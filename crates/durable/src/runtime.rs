@@ -5604,6 +5604,7 @@ impl Harness {
         if origin != id {
             return Err(crate::fork::Error::InvalidSnapshot.into());
         }
+        self.authenticate_fork_anchor(origin, commit)?;
         let count = position
             .remaining
             .ok_or(crate::fork::Error::InvalidCursor)?;
@@ -6494,6 +6495,42 @@ impl Harness {
         Ok((active, created))
     }
 
+    // A matching observer payload alone is not evidence of a runtime commit:
+    // both reserved records must be the versions written by the same commit.
+    fn authenticate_fork_anchor(&self, origin: Uuid, commit: u64) -> Result<(), Error> {
+        if commit == 0 {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let mut observation = b"durable/observer/".to_vec();
+        observation.extend_from_slice(origin.as_bytes());
+        observation.extend_from_slice(b"/r");
+        observation.extend_from_slice(&commit.to_be_bytes());
+        let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+        let store = self.owner.store();
+        let event = store
+            .get(&observation)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let snapshot = store
+            .get(&fork)?
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+        let Some(sequence) = store.commit_for_version(&observation, event.version)? else {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        };
+        if Some(sequence) != store.commit_for_version(&fork, snapshot.version)?
+            || store.document_cut(&fork)?.is_none()
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        let root = format!("runtime/conversation/{origin}");
+        let prefix = format!("runtime/fork/{origin}/");
+        if store.runtime_snapshot_at(root.as_bytes(), prefix.as_bytes(), sequence)?
+            != Some((sequence, fork))
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        Ok(())
+    }
+
     fn verify_occurrence_origin(
         &self,
         transcript_id: Uuid,
@@ -6501,6 +6538,7 @@ impl Harness {
         origin: Uuid,
         commit: u64,
     ) -> Result<(), Error> {
+        self.authenticate_fork_anchor(origin, commit)?;
         let after = commit
             .checked_sub(1)
             .ok_or(crate::fork::Error::InvalidSnapshot)?;
