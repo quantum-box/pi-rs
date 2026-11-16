@@ -1105,6 +1105,39 @@ fn candidate_task_signals_commit_together_and_reopen() {
 }
 
 #[test]
+fn builtin_notification_rechecks_staged_generic_version() {
+    let store = Store::memory().unwrap();
+    let id = setup(&store, None);
+    let generic = SignalToken::new("pi.submission-settled", 2).unwrap();
+    let builtin = pi_rs_durable::runtime::submission_settled_signal();
+    let value = json!({"id":Uuid::new_v4(), "conversationId":Uuid::new_v4(), "type":"input", "status":"unanswered", "reason":"failed"});
+    let mut tx = HostTransaction::new(&store);
+    put(&mut tx, 1);
+    assert_eq!(
+        tx.signal_at(id, &generic, "same", json!({"legacy":true}), 0)
+            .unwrap(),
+        SignalResult::Delivered
+    );
+    assert!(matches!(
+        tx.signal_at(id, &builtin, "same", value, 0),
+        Err(Error::Signal(
+            pi_rs_durable::task_store::Error::NewerSignalVersion {
+                stored: 2,
+                current: 1
+            }
+        ))
+    ));
+    drop(tx);
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(id, &generic, "same")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn candidate_terminal_and_abort_override_stored_live_task() {
     for abort in [false, true] {
         let store = Store::memory().unwrap();

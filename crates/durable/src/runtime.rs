@@ -18414,9 +18414,92 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn submission_notify_invalid_receipt_version_rolls_back_settlement() {
+        use crate::task::{Checkpoint, Task, TaskOwner};
+        use crate::task_store::{Save, Signal, TaskStore};
+        for expired in [false, true] {
+            for version in [0, 2] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut h = Harness::open_paused(dir.path().join("db"), options(placement_model()))
+                    .unwrap();
+                let conversation = h.create_conversation(config()).unwrap();
+                let task = Task::new(
+                    Uuid::new_v4(),
+                    TaskOwner::Conversation(conversation),
+                    Checkpoint {
+                        phase: "start".into(),
+                        data: serde_json::Value::Null,
+                    },
+                    3,
+                )
+                .unwrap();
+                TaskStore::new(h.owner.store())
+                    .save(&[Save::Create(&task)])
+                    .unwrap();
+                let payload = serde_json::json!({"id":Uuid::new_v4(), "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"prior"});
+                let receipt = Signal::new_typed(
+                    Uuid::new_v4(),
+                    task.id(),
+                    &submission_settled_signal(),
+                    "same",
+                    payload,
+                )
+                .unwrap();
+                let mut value = serde_json::to_value(&receipt).unwrap();
+                value["typed"]["version"] = serde_json::json!(version);
+                if expired {
+                    value["expired"] = serde_json::json!(true);
+                    value["payload"] = serde_json::Value::Null;
+                }
+                let mut key = b"durable/signal/".to_vec();
+                key.extend_from_slice(task.id().as_bytes());
+                key.extend_from_slice(receipt.id.as_bytes());
+                let encoded = serde_json::to_vec(&value).unwrap();
+                h.owner
+                    .store()
+                    .commit(
+                        &[],
+                        &[Mutation::Put {
+                            key: key.clone(),
+                            value: encoded.clone(),
+                        }],
+                    )
+                    .unwrap();
+                h.submit(conversation, None, "active".into()).unwrap();
+                let id = h
+                    .submit_with_notification(
+                        conversation,
+                        None,
+                        "queued".into(),
+                        AdmissionOptions::default(),
+                        SubmissionNotify {
+                            task_id: task.id(),
+                            key: "same".into(),
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(h.withdraw_submission(conversation, id), Err(Error::Document(crate::document::Error::Signal(crate::task_store::Error::NewerSignalVersion { stored, current: 1 }))) if stored == version)
+                );
+                assert_eq!(
+                    h.conversation(conversation)
+                        .unwrap()
+                        .submissions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .unwrap()
+                        .status,
+                    Status::Queued
+                );
+                assert_eq!(h.owner.store().get(&key).unwrap().unwrap().value, encoded);
+            }
+        }
+    }
+
+    #[test]
     fn submission_notify_rejects_incompatible_existing_receipt() {
         use crate::task::{Checkpoint, Task, TaskOwner};
-        use crate::task_store::{Save, SignalResult, SignalToken, TaskStore};
+        use crate::task_store::{Save, Signal, SignalToken, TaskStore};
         let dir = tempfile::tempdir().unwrap();
         let mut h =
             Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
@@ -18433,17 +18516,23 @@ mod scheduler_tests {
         .unwrap();
         let ts = TaskStore::new(h.owner.store());
         ts.save(&[Save::Create(&task)]).unwrap();
-        assert_eq!(
-            ts.deliver_signal_at(
-                task.id(),
-                &SignalToken::new("pi.submission-settled", 1).unwrap(),
-                "bad",
-                serde_json::json!({"id":"invalid", "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"prior"}),
-                0
+        // Simulate a receipt written by an older unconstrained v1 token.
+        let legacy = Signal::new_typed(Uuid::new_v4(), task.id(), &SignalToken::new("pi.submission-settled", 2).unwrap(), "bad", serde_json::json!({"id":"invalid", "conversationId":conversation, "type":"input", "status":"unanswered", "reason":"prior"})).unwrap();
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value["typed"]["version"] = serde_json::json!(1);
+        let mut key = b"durable/signal/".to_vec();
+        key.extend_from_slice(task.id().as_bytes());
+        key.extend_from_slice(legacy.id.as_bytes());
+        h.owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&value).unwrap(),
+                }],
             )
-            .unwrap(),
-            SignalResult::Delivered
-        );
+            .unwrap();
         h.submit(conversation, None, "active".into()).unwrap();
         let id = h
             .submit_with_notification(

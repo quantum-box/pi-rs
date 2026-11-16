@@ -14,6 +14,8 @@ use uuid::Uuid;
 pub(crate) const PREFIX: &[u8] = b"durable/task/";
 const SIGNAL_PREFIX: &[u8] = b"durable/signal/";
 const SIGNAL_REVISION_PREFIX: &[u8] = b"durable/signal-revision/";
+const SUBMISSION_SETTLED_NAME: &str = "pi.submission-settled";
+const SUBMISSION_SETTLED_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -288,6 +290,13 @@ impl Signal {
     ) -> Result<Self, Error> {
         let key = token.key(key)?;
         let payload = token.read_value(payload, token.version)?;
+        // A caller can construct an unconstrained token with the built-in
+        // identity. Never let it bypass the built-in payload schema.
+        if token.name() == SUBMISSION_SETTLED_NAME && token.version() == SUBMISSION_SETTLED_VERSION
+        {
+            crate::runtime::submission_settled_signal()
+                .read_value(payload.clone(), SUBMISSION_SETTLED_VERSION)?;
+        }
         Ok(Self {
             id,
             task_id,
@@ -845,14 +854,16 @@ impl<'a> TaskStore<'a> {
                 _ => (),
             }
         }
-        if token.name() == "pi.submission-settled" {
+        let builtin = token.name() == SUBMISSION_SETTLED_NAME
+            && token.version() == SUBMISSION_SETTLED_VERSION;
+        if builtin {
             for (receipt_key, receipt) in &receipts {
                 if receipt.task_id != task_id || *receipt_key != signal_key(task_id, receipt.id) {
                     return Err(Error::InvalidKey);
                 }
             }
         }
-        if token.name() == "pi.submission-settled"
+        if builtin
             && receipts
                 .values()
                 .filter(|old| old.typed_key() == signal.typed_key())
@@ -866,8 +877,18 @@ impl<'a> TaskStore<'a> {
                 // A legacy unconstrained token can have written this reserved
                 // built-in key. Do not let an incompatible value silently
                 // impersonate a settled submission during notification.
-                if token.name() == "pi.submission-settled" && !old.expired {
-                    token.read_value(old.payload.clone(), old.typed.as_ref().unwrap().version)?;
+                if builtin {
+                    let version = old.typed.as_ref().expect("matching typed key").version;
+                    if version != SUBMISSION_SETTLED_VERSION {
+                        return Err(Error::NewerSignalVersion {
+                            stored: version,
+                            current: SUBMISSION_SETTLED_VERSION,
+                        });
+                    }
+                    if !old.expired {
+                        crate::runtime::submission_settled_signal()
+                            .read_value(old.payload.clone(), version)?;
+                    }
                 }
                 return Ok((
                     if old.expired {
@@ -1610,6 +1631,94 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn submission_builtin_uses_canonical_schema_without_changing_generic_versions() {
+        let db = Store::memory().unwrap();
+        let ts = TaskStore::new(&db);
+        let t = task(1, 3);
+        ts.save(&[Save::Create(&t)]).unwrap();
+        let v1 = SignalToken::new(SUBMISSION_SETTLED_NAME, 1).unwrap();
+        let v2 = SignalToken::new(SUBMISSION_SETTLED_NAME, 2).unwrap();
+        let valid = json!({"id":Uuid::new_v4(), "conversationId":Uuid::new_v4(), "type":"input", "status":"unanswered", "reason":"failed"});
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &v1, "forged", json!({"id":"invalid"}), 0)
+                .unwrap(),
+            SignalResult::Invalid
+        );
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &v1, "valid", valid.clone(), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &v1, "valid", valid.clone(), 0)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        // A generic v2 caller still gets Duplicate for a v1 key, without a migration.
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &v2, "valid", json!({"arbitrary":true}), 0)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &v2, "generic", json!({"arbitrary":true}), 0)
+                .unwrap(),
+            SignalResult::Delivered
+        );
+        assert_eq!(
+            ts.deliver_signal_at(t.id(), &v2, "generic", json!(null), 0)
+                .unwrap(),
+            SignalResult::Duplicate
+        );
+    }
+
+    #[test]
+    fn builtin_expired_receipts_require_version_one() {
+        for version in [0, 1, 2, u32::MAX] {
+            let db = Store::memory().unwrap();
+            let ts = TaskStore::new(&db);
+            let t = task(1, 3);
+            ts.save(&[Save::Create(&t)]).unwrap();
+            let token = crate::runtime::submission_settled_signal();
+            let receipt = Signal {
+                id: Uuid::new_v4(),
+                task_id: t.id(),
+                name: token.name().into(),
+                payload: Value::Null,
+                consumed: false,
+                expired: true,
+                typed: Some(TypedSignal {
+                    key: token.key("expired").unwrap(),
+                    version,
+                }),
+            };
+            db.commit(
+                &[],
+                &[Mutation::Put {
+                    key: signal_key(t.id(), receipt.id),
+                    value: serde_json::to_vec(&receipt).unwrap(),
+                }],
+            )
+            .unwrap();
+            let value = json!({"id":Uuid::new_v4(), "conversationId":Uuid::new_v4(), "type":"input", "status":"unanswered", "reason":"failed"});
+            let result = ts.deliver_signal_at(t.id(), &token, "expired", value, 0);
+            if version == 1 {
+                assert_eq!(result.unwrap(), SignalResult::Closed);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::NewerSignalVersion { stored, current: 1 }) if stored == version)
+                );
+            }
+            let generic = SignalToken::new(SUBMISSION_SETTLED_NAME, 2).unwrap();
+            assert_eq!(
+                ts.deliver_signal_at(t.id(), &generic, "expired", json!(null), 0)
+                    .unwrap(),
+                SignalResult::Closed
+            );
+        }
     }
 
     fn owned(id: u128, parent: u128) -> Task {

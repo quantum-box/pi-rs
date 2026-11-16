@@ -1674,7 +1674,11 @@ impl StagedSignals {
         mutations: &[Mutation],
     ) -> Result<crate::task_store::SignalResult, Error> {
         let identity = (task_id, token.name().to_owned(), key.to_owned());
-        if let Some(previous) = self.keys.get(&identity).copied() {
+        // A generic token of another version can have staged this same key.
+        // Built-in delivery must inspect that candidate, not trust the cached
+        // status produced under the other token's schema.
+        let builtin = token.name() == "pi.submission-settled" && token.version() == 1;
+        if !builtin && let Some(previous) = self.keys.get(&identity).copied() {
             match previous {
                 StagedSignalStatus::NotFound => {
                     return Ok(crate::task_store::SignalResult::NotFound);
@@ -1710,6 +1714,11 @@ impl StagedSignals {
         }
         let target = crate::task_store::key(task_id);
         let tasks = crate::task_store::TaskStore::new(store);
+        let overlay = if builtin && mutations.is_empty() {
+            &self.batch.mutations
+        } else {
+            mutations
+        };
         let (result, mut batch, equivalent_version) = loop {
             let (result, batch) = tasks.prepare_signal_at_overlay(
                 task_id,
@@ -1718,7 +1727,7 @@ impl StagedSignals {
                 value.clone(),
                 || now_millis,
                 candidate.clone(),
-                mutations,
+                overlay,
             )?;
             let Some(task) = invocation.filter(|task| {
                 task.id() == task_id
