@@ -977,6 +977,17 @@ Environment, queues and history are not copied. Scheduler counterparts schedule
 submitted children after the snapshot commits. The public `Admission` shape is
 unchanged.
 
+`Harness::pin_provider_adapter` is an opt-in process-local replacement fence for
+an already installed adapter. Call it on a paused Harness before creating workers;
+it fails if workers already exist. While that Harness family remains alive, an
+attempt to install a different adapter allocation fails even if it uses the same
+ID; reinstalling the same allocation is allowed. The pin is not persisted and
+must be applied again after reopening. It cannot detect changes inside an adapter
+or prove implementation identity across processes. The host remains responsible
+for protecting mutable credentials, authorization, budgets and endpoint policy.
+This fence does not enable adapter inheritance for task-owned children, and it
+does not change unpinned adapter installation. No identity token is stored.
+
 For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
 `submit_task_owned_subagent_inheriting_tools` opt in to copying the nearest
 owning conversation's enabled tools, model-facing selection and tool filters.

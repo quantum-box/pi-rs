@@ -3109,6 +3109,8 @@ pub struct Harness {
     options: Options,
     tools: HashMap<String, RegisteredTool>,
     provider_adapter: Option<Arc<dyn crate::model::ProviderAdapter>>,
+    // Shared only inside this Harness family; no identity or secret is persisted.
+    provider_adapter_pin: Arc<std::sync::Mutex<Option<Arc<dyn crate::model::ProviderAdapter>>>>,
     summary_provider: Option<SummaryProviderIdentity>,
     extensions: Arc<std::sync::RwLock<crate::extension::Registry>>,
     failed: bool,
@@ -4508,6 +4510,7 @@ impl Harness {
             options,
             tools,
             provider_adapter: None,
+            provider_adapter_pin: Arc::new(std::sync::Mutex::new(None)),
             summary_provider: None,
             extensions: Arc::new(std::sync::RwLock::new(crate::extension::Registry::default())),
             failed: false,
@@ -4532,6 +4535,7 @@ impl Harness {
             options: self.options.clone(),
             tools: self.tools.clone(),
             provider_adapter: self.provider_adapter.clone(),
+            provider_adapter_pin: self.provider_adapter_pin.clone(),
             summary_provider: self.summary_provider.clone(),
             extensions: self.extensions.clone(),
             failed: false,
@@ -4867,7 +4871,51 @@ impl Harness {
                 "tool-result metadata requires durable tool blocks".into(),
             ));
         }
-        self.provider_adapter = Some(adapter);
+        let pin = self
+            .provider_adapter_pin
+            .lock()
+            .map_err(|_| Error::Failed)?;
+        if pin
+            .as_ref()
+            .is_some_and(|pinned| !Arc::ptr_eq(pinned, &adapter))
+        {
+            return Err(Error::Invalid(
+                "provider adapter is pinned for this runtime".into(),
+            ));
+        }
+        let previous = self.provider_adapter.replace(adapter);
+        drop(pin);
+        drop(previous);
+        Ok(())
+    }
+    /// Pin the exact installed adapter allocation for this Harness family until
+    /// it is dropped. Call before creating workers or attaching a scheduler.
+    /// This is process-local: it does not prove implementation identity after
+    /// reopen or prevent the adapter's own interior state from changing.
+    pub fn pin_provider_adapter(&mut self) -> Result<(), Error> {
+        let adapter = self
+            .provider_adapter
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("provider adapter unavailable".into()))?;
+        let mut pin = self
+            .provider_adapter_pin
+            .lock()
+            .map_err(|_| Error::Failed)?;
+        if let Some(existing) = pin.as_ref() {
+            return if Arc::ptr_eq(existing, adapter) {
+                Ok(())
+            } else {
+                Err(Error::Invalid(
+                    "provider adapter is pinned for this runtime".into(),
+                ))
+            };
+        }
+        if Arc::strong_count(&self.provider_adapter_pin) != 1 {
+            return Err(Error::Invalid(
+                "provider adapter pin requires no existing workers".into(),
+            ));
+        }
+        *pin = Some(adapter.clone());
         Ok(())
     }
     /// Resolve the current model's image profile for admission-time fitting.

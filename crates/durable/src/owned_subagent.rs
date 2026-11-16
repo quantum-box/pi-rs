@@ -2236,6 +2236,38 @@ mod tests {
     }
 
     #[test]
+    fn process_adapter_pin_rejects_existing_workers_and_fences_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let first: Arc<dyn crate::model::ProviderAdapter> = Arc::new(GuardedAdapter);
+        let replacement: Arc<dyn crate::model::ProviderAdapter> = Arc::new(GuardedAdapter);
+        h.install_provider_adapter(first.clone()).unwrap();
+        let old_worker = h.worker();
+        assert!(h.pin_provider_adapter().is_err());
+        drop(old_worker);
+        h.pin_provider_adapter().unwrap();
+        h.pin_provider_adapter().unwrap();
+        let mut worker = h.worker();
+        let barrier = Arc::new(Barrier::new(2));
+        let gate = barrier.clone();
+        let replacement_clone = replacement.clone();
+        let attempt = std::thread::spawn(move || {
+            gate.wait();
+            worker.install_provider_adapter(replacement_clone)
+        });
+        barrier.wait();
+        h.install_provider_adapter(first).unwrap();
+        assert!(attempt.join().unwrap().is_err());
+        assert!(h.install_provider_adapter(replacement.clone()).is_err());
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        // A new process/runtime has no persisted pin and must opt in again.
+        h.install_provider_adapter(replacement).unwrap();
+        h.pin_provider_adapter().unwrap();
+    }
+
+    #[test]
     fn adapter_selection_is_fenced_and_inherited_admission_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
