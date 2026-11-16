@@ -523,7 +523,8 @@ out of order, and a settings-write failure can leave the live mode changed.
 Queued input is acknowledged after it is saved. The `get_entries` and
 `get_tree` responses use Pi entry types, string IDs, parent links, and a leaf
 ID. Session records used internally for run recovery are omitted from this
-view. Set `includeNative: true` for the native entries or tree and the native
+view. `get_entries` compares `since` to string IDs without coercion and uses
+JavaScript string conversion in the not-found diagnostic. Set `includeNative: true` for the native entries or tree and the native
 leaf ID. Newly committed entries are emitted as `entry_appended` with those
 same IDs. Full malformed-JSON preview fidelity and additional session events
 remain in progress.
