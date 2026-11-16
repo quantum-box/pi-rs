@@ -964,6 +964,44 @@ mod jsonl_framing_tests {
         assert!(read_rpc_line(&mut input).unwrap().is_none());
     }
     #[test]
+    fn unfinished_exponents_at_eof_use_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":1e", "position 7 (line 1 column 8)"),
+            ("{\"n\":1e+", "position 8 (line 1 column 9)"),
+            ("{\"n\":1e-", "position 8 (line 1 column 9)"),
+            ("{\"😀\":-2E-", "position 10 (line 1 column 11)"),
+            ("[\r\n 1e+", "position 7 (line 2 column 5)"),
+            ("[\r1E", "position 4 (line 2 column 3)"),
+            ("1e", "position 2 (line 1 column 3)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Exponent part is missing a number in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for input in [
+            "[1,] 1e",
+            r#"["\ud800",1e"#,
+            "[1e400,1e",
+            "{\"bad\":,\"n\":1e",
+            "{\"n\":\"1e",
+            "{\"n\":01e",
+            "{\"n\":1e2",
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                !error.contains("Exponent part is missing a number"),
+                "{input:?}: {error}"
+            );
+        }
+        for input in [r#"{"n":1e2}"#, r#"{"n":-2E-3}"#, r#"{"n":"1e+"}"#] {
+            assert!(parse_request(input).is_ok(), "{input:?}");
+        }
+    }
+
+    #[test]
     fn truncated_json_reports_pi_eof_diagnostics() {
         for (input, expected) in [
             ("[", "Unexpected end of JSON input"),
@@ -1249,6 +1287,40 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
+    // An unfinished exponent at EOF is diagnosed separately by V8. Only
+    // project it when serde reached the end while parsing a value: an earlier
+    // syntax error, or an exponent-like suffix inside a string, must win.
+    if error.is_eof()
+        && message.starts_with("EOF while parsing a value")
+        && serde_error_offset(line, error) == Some(line.len())
+    {
+        let bytes = line.as_bytes();
+        let exponent_end = if matches!(bytes.last(), Some(b'+' | b'-')) {
+            bytes.len().saturating_sub(1)
+        } else {
+            bytes.len()
+        };
+        if exponent_end >= 2
+            && matches!(bytes[exponent_end - 1], b'e' | b'E')
+            && bytes[exponent_end - 2].is_ascii_digit()
+        {
+            let position = line.encode_utf16().count();
+            let row = line.bytes().filter(|byte| *byte == b'\r').count()
+                + line.bytes().filter(|byte| *byte == b'\n').count()
+                - line.matches("\r\n").count()
+                + 1;
+            let column = line
+                .rsplit(['\r', '\n'])
+                .next()
+                .unwrap_or_default()
+                .encode_utf16()
+                .count()
+                + 1;
+            return format!(
+                "Exponent part is missing a number in JSON at position {position} (line {row} column {column})"
+            );
+        }
+    }
     if let Some((offset, start)) = json_string_control_offset(line)
         && (message.starts_with("control character")
             || ((message.starts_with("lone leading surrogate in hex escape")
