@@ -157,6 +157,8 @@ pub enum Status {
 pub struct RunFailure {
     pub inputs: Vec<Uuid>,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Durable outcome of an idle manual compaction operation.
@@ -753,9 +755,11 @@ pub struct Conversation {
     #[serde(default)]
     compaction_return_turns: Option<u32>,
     active: Option<Uuid>,
-    /// Most recent failed run; lifecycle clearing is not yet implemented.
+    /// Most recent failed run, retained through its automatic replacement run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_failure: Option<RunFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failure_continuation_inputs: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_attempt: Option<ToolAttempt>,
     #[serde(default)]
@@ -4922,6 +4926,7 @@ impl Harness {
             compaction_return_turns: None,
             active: None,
             run_failure: None,
+            failure_continuation_inputs: Vec::new(),
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,
@@ -5240,6 +5245,7 @@ impl Harness {
             compaction_return_turns: None,
             active: None,
             run_failure: None,
+            failure_continuation_inputs: Vec::new(),
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,
@@ -7996,6 +8002,7 @@ impl Harness {
         state.input_modes.insert(sid, options.mode);
         if place_now {
             state.run_failure = None;
+            state.failure_continuation_inputs.clear();
             state.active = Some(sid);
             let binding = state
                 .submissions
@@ -8399,6 +8406,7 @@ impl Harness {
             c.input_modes.insert(sid, options.mode);
             if place_now {
                 c.run_failure = None;
+                c.failure_continuation_inputs.clear();
                 c.active = Some(sid);
                 c.messages.push(Message::User {
                     content: content.clone(),
@@ -8539,6 +8547,7 @@ impl Harness {
                 status: Status::Running,
             });
             c.run_failure = None;
+            c.failure_continuation_inputs.clear();
             c.active = Some(sid);
             c.auto_compaction_attempted = false;
             c.retry_state = RetryState::default();
@@ -10207,9 +10216,13 @@ impl Harness {
                                 | Message::Tool { .. }
                         )
                     ) {
-                        finish_failure(&mut c, "nothing_to_answer".into());
+                        finish_failure(
+                            &mut c,
+                            "nothing_to_answer".into(),
+                            FailureCause::NothingToAnswer,
+                        );
                     } else if turns >= self.options.max_turns {
-                        finish_failure(&mut c, "turn limit".into());
+                        finish_failure(&mut c, "turn limit".into(), FailureCause::TurnLimit(turns));
                     } else {
                         if !c.auto_compaction_attempted
                             && (c.content_blocks.is_empty()
@@ -10656,7 +10669,9 @@ impl Harness {
                         ModelFailureDecision::Overflow => {
                             start_overflow_compaction(self, &mut c, turns, reason)?
                         }
-                        ModelFailureDecision::Stop => finish_failure(&mut c, reason),
+                        ModelFailureDecision::Stop => {
+                            finish_failure(&mut c, reason, FailureCause::ModelError)
+                        }
                     }
                     self.save(&c, Expected::Version(version))?;
                 }
@@ -10698,7 +10713,11 @@ impl Harness {
                         }
                     }
                     if restarts >= self.options.restart_limit {
-                        finish_failure(&mut c, "model restart limit".into());
+                        finish_failure(
+                            &mut c,
+                            "model restart limit".into(),
+                            FailureCause::RestartLimit(restarts),
+                        );
                     } else {
                         c.phase = Phase::ModelRunning {
                             turns,
@@ -10797,7 +10816,11 @@ impl Harness {
                                 "tool call truncated before dispatch",
                             )?;
                         }
-                        finish_failure(&mut c, "truncated tool calls".into());
+                        finish_failure(
+                            &mut c,
+                            "truncated tool calls".into(),
+                            FailureCause::ModelError,
+                        );
                     } else {
                         c.messages.push(response.assistant_message());
                         if response.calls.is_empty() {
@@ -10963,7 +10986,7 @@ impl Harness {
                             operation_id: Uuid::new_v4(),
                         };
                     } else if !c.pending_resets.is_empty() {
-                        finish_failure(&mut c, "reset".into());
+                        finish_failure(&mut c, "reset".into(), FailureCause::Reset);
                         c.phase = Phase::Idle;
                         for marker in take_reset_batch(&mut c) {
                             place_reset(&mut c, marker);
@@ -15615,7 +15638,7 @@ fn start_overflow_compaction(
     reason: String,
 ) -> Result<(), Error> {
     if c.overflow_compaction_attempted {
-        finish_failure(c, reason);
+        finish_failure(c, reason, FailureCause::ModelError);
         return Ok(());
     }
     c.overflow_compaction_attempted = true;
@@ -15629,7 +15652,7 @@ fn start_overflow_compaction(
             reason: crate::extension::CompactionReason::Overflow,
         };
     } else {
-        finish_failure(c, reason);
+        finish_failure(c, reason, FailureCause::ModelError);
     }
     Ok(())
 }
@@ -16052,6 +16075,7 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
     let mut steer = false;
     let mut follow = false;
     let mut placed = false;
+    let mut continued_failure = false;
     for submission in &mut c.submissions {
         if submission.status != Status::Queued {
             continue;
@@ -16071,6 +16095,7 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
         }
         *seen = true;
         placed = true;
+        continued_failure |= c.failure_continuation_inputs.contains(&submission.id);
         submission.status = Status::Running;
         c.active.get_or_insert(submission.id);
         let message = Message::User {
@@ -16088,8 +16113,11 @@ fn place_queued(c: &mut Conversation, final_boundary: bool) -> bool {
             }
         }
     }
-    if placed && starting_run {
-        c.run_failure = None;
+    if starting_run {
+        if placed && !continued_failure {
+            c.run_failure = None;
+        }
+        c.failure_continuation_inputs.clear();
     }
     placed
 }
@@ -16110,7 +16138,15 @@ fn finish_answer(c: &mut Conversation, answer: String) {
 fn apply_failed_run_policy(c: &mut Conversation) {
     match c.after_failed_run {
         AfterFailedRun::Keep => {}
-        AfterFailedRun::Continue => c.phase = Phase::Idle,
+        AfterFailedRun::Continue => {
+            c.failure_continuation_inputs = c
+                .submissions
+                .iter()
+                .filter(|s| s.status == Status::Queued)
+                .map(|s| s.id)
+                .collect();
+            c.phase = Phase::Idle;
+        }
         AfterFailedRun::Withdraw => {
             for s in &mut c.submissions {
                 if s.status == Status::Queued {
@@ -16123,12 +16159,48 @@ fn apply_failed_run_policy(c: &mut Conversation) {
     }
 }
 fn finish_abort(c: &mut Conversation) {
-    finish_failure(c, "aborted".into());
+    finish_failure(c, "aborted".into(), FailureCause::Aborted);
     if c.submissions.iter().any(|s| s.status == Status::Queued) {
         c.phase = Phase::Idle;
     }
 }
-fn finish_failure(c: &mut Conversation, reason: String) {
+enum FailureCause {
+    ModelError,
+    Aborted,
+    Reset,
+    TurnLimit(u32),
+    NothingToAnswer,
+    RestartLimit(u32),
+}
+
+fn finish_failure(c: &mut Conversation, reason: String, cause: FailureCause) {
+    c.failure_continuation_inputs.clear();
+    let (classification, detail) = match cause {
+        FailureCause::ModelError => ("model_error", Some(reason.clone())),
+        FailureCause::Aborted => ("aborted", None),
+        FailureCause::Reset => ("reset", None),
+        FailureCause::NothingToAnswer => ("nothing_to_answer", None),
+        FailureCause::TurnLimit(turns) => (
+            "turn_limit",
+            Some(format!(
+                "{turns} {}",
+                if turns == 1 { "turn" } else { "turns" }
+            )),
+        ),
+        FailureCause::RestartLimit(restarts) => {
+            let count = if restarts == 1 {
+                "once".to_string()
+            } else {
+                format!("{restarts} times in a row")
+            };
+            (
+                "restart_limit",
+                Some(format!(
+                    "The generation was interrupted {count} in its model request phase"
+                )),
+            )
+        }
+    };
     let inputs: Vec<_> = c
         .submissions
         .iter()
@@ -16138,7 +16210,8 @@ fn finish_failure(c: &mut Conversation, reason: String) {
     if !inputs.is_empty() {
         c.run_failure = Some(RunFailure {
             inputs,
-            reason: reason.clone(),
+            reason: classification.into(),
+            detail,
         });
     }
     c.active = None;
@@ -16169,19 +16242,55 @@ mod scheduler_tests {
         let mut c = Harness::empty_conversation(Uuid::new_v4(), config());
         let id = Uuid::new_v4();
         c.admit_initial_input(id, "work".into());
-        finish_failure(&mut c, "model failed".into());
+        finish_failure(&mut c, "model failed".into(), FailureCause::ModelError);
         let saved = serde_json::to_vec(&c).unwrap();
         let restored: Conversation = serde_json::from_slice(&saved).unwrap();
         assert_eq!(
             restored.run_failure,
             Some(RunFailure {
                 inputs: vec![id],
-                reason: "model failed".into(),
+                reason: "model_error".into(),
+                detail: Some("model failed".into()),
             })
         );
         assert!(
             matches!(&restored.submissions[0].status, Status::Unanswered { reason } if reason == "model failed")
         );
+    }
+
+    #[test]
+    fn failed_continuation_marker_survives_serialization_and_cannot_attach_to_new_input() {
+        let mut c = Harness::empty_conversation(Uuid::new_v4(), config());
+        let first = Uuid::new_v4();
+        let queued = Uuid::new_v4();
+        c.admit_initial_input(first, "first".into());
+        let mut next = c.submissions[0].clone();
+        next.id = queued;
+        next.status = Status::Queued;
+        c.submissions.push(next);
+        c.after_failed_run = AfterFailedRun::Continue;
+        finish_failure(&mut c, "failure".into(), FailureCause::ModelError);
+        apply_failed_run_policy(&mut c);
+        let mut restored: Conversation =
+            serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(place_queued(&mut restored, true));
+        assert_eq!(restored.run_failure.as_ref().unwrap().inputs, vec![first]);
+        assert!(restored.failure_continuation_inputs.is_empty());
+        c.submissions[1].status = Status::Unanswered {
+            reason: "withdrawn".into(),
+        };
+        let mut unrelated = c.submissions[1].clone();
+        unrelated.id = Uuid::new_v4();
+        unrelated.status = Status::Queued;
+        c.submissions.push(unrelated);
+        assert!(place_queued(&mut c, true));
+        assert!(c.run_failure.is_none());
+        let legacy: RunFailure = serde_json::from_value(
+            serde_json::json!({"inputs": [], "reason": "old provider message"}),
+        )
+        .unwrap();
+        assert_eq!(legacy.reason, "old provider message");
+        assert_eq!(legacy.detail, None);
     }
 
     #[test]
@@ -19644,6 +19753,7 @@ mod scheduler_tests {
             compaction_return_turns: None,
             active: None,
             run_failure: None,
+            failure_continuation_inputs: Vec::new(),
             tool_attempt: None,
             abort_requested: false,
             nested_resume: None,

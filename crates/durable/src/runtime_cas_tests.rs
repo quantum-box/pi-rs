@@ -523,7 +523,7 @@ fn admission_policies_race_and_recover_with_idempotency() {
     ));
     // Settling the active run makes idle rejection apply even with retained queued work.
     let (mut state, version) = reopened.load(id).unwrap();
-    finish_failure(&mut state, "failure".into());
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
     reopened.save(&state, Expected::Version(version)).unwrap();
     assert_eq!(
         reopened
@@ -4235,7 +4235,7 @@ fn failed_policy_retries_with_latest_setting_and_inbox() {
     let existing = owner.submit(id, None, "existing".into()).unwrap();
     let mut worker = owner.worker();
     let (mut stale, version) = worker.load(id).unwrap();
-    finish_failure(&mut stale, "failure".into());
+    finish_failure(&mut stale, "failure".into(), FailureCause::ModelError);
     owner.withdraw_submission(id, existing).unwrap();
     let added = owner.submit(id, None, "added".into()).unwrap();
     owner
@@ -4296,7 +4296,7 @@ async fn continue_failure_boundary_survives_restart_and_historical_forks() {
     h.submit(id, None, "active".into()).unwrap();
     let queued = h.submit(id, None, "queued".into()).unwrap();
     let (mut state, version) = h.load(id).unwrap();
-    finish_failure(&mut state, "failure".into());
+    finish_failure(&mut state, "failure".into(), FailureCause::ModelError);
     h.save(&state, Expected::Version(version)).unwrap();
     assert!(matches!(h.conversation(id).unwrap().phase, Phase::Idle));
     let old_fork = h.fork_at(id, before).unwrap();
@@ -4354,7 +4354,7 @@ async fn abort_wins_over_stale_failure_and_preserves_later_admissions() {
     let queued = owner.submit(id, None, "before abort".into()).unwrap();
     let mut worker = owner.worker();
     let (mut stale, version) = worker.load(id).unwrap();
-    finish_failure(&mut stale, "failure".into());
+    finish_failure(&mut stale, "failure".into(), FailureCause::ModelError);
     owner.request_abort(id).unwrap();
     let later = owner.submit(id, None, "after abort".into()).unwrap();
     assert!(worker.save(&stale, Expected::Version(version)).is_err());

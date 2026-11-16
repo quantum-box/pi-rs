@@ -76,11 +76,7 @@ async fn policies_survive_reopen_and_preserve_request_identity() {
             c.submissions.iter().find(|s| s.id == first).unwrap().status,
             Status::Unanswered { .. }
         ));
-        if policy == AfterFailedRun::Continue {
-            assert!(c.run_failure.is_none());
-        } else {
-            assert!(c.run_failure.is_some());
-        }
+        assert!(c.run_failure.is_some());
         let status = &c
             .submissions
             .iter()
