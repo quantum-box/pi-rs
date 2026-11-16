@@ -941,7 +941,9 @@ submission settlement signal. A successful child answer becomes the tool result;
 an unanswered child becomes a tool error. Child work may itself park on a
 task signal, allowing the parent and child to survive a shutdown and reopen.
 Reopen with the same parent, child configuration, tool allowlist, extension
-registry and task definitions. A changed foreground binding is rejected while
+registry and task definitions. The child configuration must have a nonempty
+model and a positive output-token limit; invalid configurations are rejected
+when opening the runtime. A changed foreground binding is rejected while
 an invocation is pending. The child starts with the supplied tool allowlist and
 no selected extensions; `None` leaves global tools unrestricted. Parent abort
 crosses the foreground ownership edge. This is separate from the named

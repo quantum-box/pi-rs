@@ -206,6 +206,13 @@ pub struct Config {
     pub max_output_tokens: u32,
 }
 
+pub(crate) fn validate_config(config: &Config) -> Result<(), Error> {
+    if config.model.is_empty() || config.max_output_tokens == 0 {
+        return Err(Error::Invalid("model and output limit required".into()));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Status {
     Queued,
@@ -6245,9 +6252,7 @@ impl Harness {
         id: Uuid,
         config: Config,
     ) -> Result<Uuid, Error> {
-        if config.model.is_empty() || config.max_output_tokens == 0 {
-            return Err(Error::Invalid("model and output limit required".into()));
-        }
+        validate_config(&config)?;
         let state = Self::empty_conversation(id, config);
         self.save(&state, Expected::Missing)?;
         Ok(id)
@@ -16279,6 +16284,9 @@ impl Scheduler {
     ) -> Result<(Self, Option<crate::task_driver::Driver>), Error> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Invalid("scheduler requires a Tokio runtime".into()))?;
+        if let Some((_, config, _)) = &foreground {
+            validate_config(config)?;
+        }
         if summary_provider
             .as_ref()
             .is_some_and(|identity| !identity.valid())

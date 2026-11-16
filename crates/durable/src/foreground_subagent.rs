@@ -244,6 +244,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_child_config_is_rejected_before_runtime_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let options = || Options {
+            model: Arc::new(ModelStub {
+                parent_dispatches: dispatches.clone(),
+                child_dispatches: dispatches.clone(),
+            }),
+            tools: vec![],
+            restart_limit: 5,
+            max_turns: 4,
+            uncertain_policy: UncertainPolicy::RequireReconciliation,
+        };
+        let mut initial = Harness::open_paused(&path, options()).unwrap();
+        let parent = initial.create_conversation(config()).unwrap();
+        drop(initial);
+        for invalid in [
+            Config {
+                model: String::new(),
+                ..config()
+            },
+            Config {
+                max_output_tokens: 0,
+                ..config()
+            },
+        ] {
+            assert!(matches!(
+                crate::runtime::Scheduler::open_with_foreground_subagent(
+                    &path,
+                    options(),
+                    crate::extension::Registry::default(),
+                    Registry::default(),
+                    parent,
+                    invalid.clone(),
+                    Some(vec![]),
+                ),
+                Err(crate::runtime::Error::Invalid(_))
+            ));
+            assert!(matches!(
+                RuntimeOwner::open_with_foreground_subagent(
+                    &path,
+                    options(),
+                    crate::extension::Registry::default(),
+                    Registry::default(),
+                    parent,
+                    invalid,
+                    Some(vec![]),
+                ),
+                Err(crate::runtime::Error::Invalid(_))
+            ));
+        }
+        let initial = Harness::open_paused(&path, options()).unwrap();
+        assert!(initial.conversation(parent).unwrap().submissions.is_empty());
+        assert!(
+            TaskStore::new(initial.subagent_store().unwrap())
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        drop(initial);
+        let owner = RuntimeOwner::open_with_foreground_subagent(
+            &path,
+            options(),
+            crate::extension::Registry::default(),
+            Registry::default(),
+            parent,
+            config(),
+            Some(vec![]),
+        )
+        .unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn foreground_arguments_report_whitespace_and_accept_multibyte_boundaries() {
         struct ArgumentModel {
             input: String,
@@ -455,6 +531,31 @@ mod tests {
             caller
         );
         owner.shutdown().await.unwrap();
+        for invalid in [
+            Config {
+                model: String::new(),
+                ..config()
+            },
+            Config {
+                max_output_tokens: 0,
+                ..config()
+            },
+        ] {
+            assert!(matches!(
+                RuntimeOwner::open_with_foreground_subagent(
+                    &path,
+                    options(),
+                    crate::extension::Registry::default(),
+                    tasks(),
+                    parent,
+                    invalid,
+                    Some(vec!["ask_person".into()]),
+                ),
+                Err(crate::runtime::Error::Invalid(_))
+            ));
+        }
+        assert_eq!(parent_dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(child_dispatches.load(Ordering::SeqCst), 1);
         assert!(
             RuntimeOwner::open_with_foreground_subagent(
                 &path,

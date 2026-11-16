@@ -176,9 +176,10 @@ impl Harness {
         notify: Option<SubmissionNotify>,
     ) -> Result<Admission, Error> {
         crate::runtime::validate_allowed_tools(&allowed_tools)?;
-        if name.is_empty() || config.model.is_empty() || config.max_output_tokens == 0 {
+        if name.is_empty() {
             return Err(invalid());
         }
+        crate::runtime::validate_config(&config).map_err(|_| invalid())?;
         // Serialize admission with the scheduler's post-handler graph decision.
         let owner_store = self.owner.clone();
         let _gate = owner_store.task_gate().lock().map_err(|_| Error::Failed)?;
