@@ -105,6 +105,15 @@ pub(crate) fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
     format!("runtime/owned-cleanup-attempt/{id}").into_bytes()
 }
 
+#[cfg(test)]
+pub(crate) fn cleanup_marker_hooks()
+-> &'static std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
 // Bound synchronous retries so unrelated sustained writes cannot block a caller forever.
 const FORK_DOCUMENT_ATTEMPTS: usize = 8;
 
@@ -13108,6 +13117,15 @@ impl Harness {
         if !conversation.abort_requested {
             return Ok(false);
         }
+        #[cfg(test)]
+        if let Some(entered) = cleanup_marker_hooks().lock().unwrap().remove(&id) {
+            entered.add_permits(1);
+        }
+        let summary_guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Interrupted),
+            guard = control.summary_execution.write() => guard,
+        };
         let store = self.owner.store();
         let key = owned_cleanup_key(id);
         let attempt = Uuid::new_v4();
@@ -13136,6 +13154,7 @@ impl Harness {
             Err(durable_store::Error::Conflict { .. }) => return Ok(false),
             Err(error) => return Err(error.into()),
         }
+        drop(summary_guard);
         let result = worker
             .settle_abort(conversation, version, cancel, Some(attempt))
             .await;

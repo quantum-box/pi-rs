@@ -2467,3 +2467,117 @@ async fn killed_standalone_summary_cleanup_blocks_recovery_and_explicit_resume()
     ));
     recovered.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cleanup_marker_waits_for_summary_before_usage_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let model = TestModel::new(0);
+    let mut scheduler = open_manual(&path, opts(model.clone())).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    create(&scheduler, id, conversation);
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let executor = Uuid::new_v4();
+    store
+        .reserve(
+            id,
+            store.get(id).unwrap().unwrap().version,
+            executor,
+            Uuid::new_v4(),
+        )
+        .unwrap();
+    store
+        .start(id, store.get(id).unwrap().unwrap().version, executor)
+        .unwrap();
+    store
+        .complete(
+            id,
+            store.get(id).unwrap().unwrap().version,
+            executor,
+            crate::model::CompletedGeneration {
+                content: "summary".into(),
+                calls: vec![],
+                usage: Some(Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                }),
+                metadata: ModelMetadata::default(),
+            },
+        )
+        .unwrap();
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    crate::summary_worker::before_settlement_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, (entered.clone(), release.clone()));
+    let run_owner = owner.clone();
+    let run_model = model.clone();
+    let summary = tokio::spawn(async move {
+        crate::summary_worker::run(
+            run_owner,
+            run_model,
+            id,
+            CancellationToken::new(),
+            identity(),
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let key = Harness::key(conversation);
+    let entry = owner.store().get(&key).unwrap().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+    value["abort_requested"] = serde_json::json!(true);
+    owner
+        .store()
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+    let control = owner.conversation_controls().get(conversation);
+    let lock = control.worker.clone().lock_owned().await;
+    let cleanup_entered = Arc::new(Semaphore::new(0));
+    cleanup_marker_hooks()
+        .lock()
+        .unwrap()
+        .insert(conversation, cleanup_entered.clone());
+    let worker = scheduler.harness.worker();
+    let cleanup = tokio::spawn(async move {
+        worker
+            .settle_owned_abort(conversation, &CancellationToken::new(), lock)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), cleanup_entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(
+        owner
+            .store()
+            .get(&owned_cleanup_key(conversation))
+            .unwrap()
+            .is_none()
+    );
+    assert!(model.settlements.lock().unwrap().is_empty());
+    release.add_permits(1);
+    summary.await.unwrap().unwrap();
+    cleanup.await.unwrap().unwrap();
+    assert_eq!(model.settlements.lock().unwrap().len(), 1);
+    drop(owner);
+    scheduler.shutdown().await.unwrap();
+}

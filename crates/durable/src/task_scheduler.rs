@@ -3633,23 +3633,29 @@ impl Scheduler {
                 if pending {
                     break;
                 }
-                for edge in crate::ownership_edge::EdgeStore::new(owner.store())
-                    .children(id)
-                    .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
-                {
-                    if edge.edge.mode != crate::ownership_edge::Mode::Foreground {
+                if graph.uncertain_task(id) {
+                    pending = true;
+                    break;
+                }
+                for edge in graph.task_edges(id) {
+                    if edge.mode != crate::ownership_edge::Mode::Foreground {
                         continue;
                     }
-                    let key = format!("runtime/conversation/{}", edge.edge.child);
+                    let key = format!("runtime/conversation/{}", edge.child);
                     let entry = owner
                         .store()
                         .get(key.as_bytes())
-                        .map_err(task_store::Error::from)?
-                        .ok_or(Error::Ownership)?;
-                    let child: crate::runtime::Conversation =
-                        serde_json::from_slice(&entry.value).map_err(task_store::Error::from)?;
-                    if child.id != edge.edge.child || edge.edge.task_owner != *anchor.task.owner() {
-                        return Err(Error::Ownership);
+                        .map_err(task_store::Error::from)?;
+                    let child = entry.and_then(|entry| {
+                        serde_json::from_slice::<crate::runtime::Conversation>(&entry.value).ok()
+                    });
+                    let Some(child) = child else {
+                        pending = true;
+                        break;
+                    };
+                    if child.id != edge.child || edge.task_owner != *anchor.task.owner() {
+                        pending = true;
+                        break;
                     }
                     if child.abort_requested && !graph.cyclic_conversation_edge(id, child.id) {
                         pending = true;
@@ -15868,6 +15874,9 @@ mod standalone_foreground_cleanup_tests {
                 })
                 .unwrap();
         }
+        let aborted = task(99, TaskOwner::Conversation(owner), "parent");
+        TaskStore::new(&db).save(&[Save::Create(&aborted)]).unwrap();
+        h.request_abort_task(aborted.id()).unwrap();
         h.request_abort(children[2]).unwrap();
         drop(h);
         let mut scheduler =
@@ -15923,10 +15932,85 @@ mod standalone_foreground_cleanup_tests {
                 .unwrap()
                 .abort_requested
             {
+                // The opaque edge could belong to any task; no abort handler
+                // may run until the host repairs it.
+                assert!(
+                    scheduler
+                        .get(aborted.id())
+                        .unwrap()
+                        .unwrap()
+                        .abort_requested()
+                );
                 return;
             }
         }
         panic!("unrelated invalid candidates blocked cleanup");
+    }
+
+    #[tokio::test]
+    async fn missing_owned_child_holds_its_task_but_not_an_unrelated_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let broken = task(1, TaskOwner::Conversation(root), "parent");
+        let independent = task(2, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        TaskStore::new(&db)
+            .save(&[Save::Create(&broken), Save::Create(&independent)])
+            .unwrap();
+        let edge = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: broken.id(),
+                task_owner: broken.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        db.commit(&edge.checks, &edge.mutations).unwrap();
+        h.request_abort_task(broken.id()).unwrap();
+        h.request_abort_task(independent.id()).unwrap();
+        drop(h);
+        let mut scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        let key = format!("runtime/conversation/{child}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Delete { key }],
+        )
+        .unwrap();
+        for _ in 0..20 {
+            scheduler
+                .tick_with_conversation_cleanup(0, &CancellationToken::new())
+                .await
+                .unwrap();
+            if scheduler
+                .get(independent.id())
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+            {
+                break;
+            }
+        }
+        assert!(
+            scheduler
+                .get(independent.id())
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+        );
+        assert!(!scheduler.get(broken.id()).unwrap().unwrap().is_terminal());
     }
 
     #[tokio::test]

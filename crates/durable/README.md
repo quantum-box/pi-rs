@@ -41,8 +41,11 @@ completing successfully. Busy workers consume no slot; candidates rotate so
 repeatedly blocked conversations cannot monopolize admission. Each cleanup step
 has a 30-second timeout. Callback failures and timeouts are exposed by
 `conversation_cleanup_failures`, and the affected conversation stays marked while
-other graphs continue. Before each standalone cleanup step, the runtime commits an attempt marker
-fenced by the conversation version. Timeout, cancellation, crash, callback
+other graphs continue. Before each standalone cleanup step, the runtime waits for active summaries to
+leave their shared execution fence, then commits an attempt marker fenced by the
+conversation version. A timeout while waiting for that fence starts no cleanup
+attempt and creates no marker; the existing summary remains governed by its own
+recovery and request-ID settlement contract. Timeout, cancellation, crash, callback
 failure, or a crash after the callback succeeds can leave the marker and block
 all subsequent abort cleanup and independent-summary execution for that conversation,
 including automatic recovery and explicit resume after reopen. Blocked summaries
@@ -52,7 +55,14 @@ call `reconcile_owned_cleanup` on the task scheduler or harness. Reconciliation
 requires the cleanup worker to be stopped; it does not itself inspect or reverse
 external effects. Even a crash before dispatch can require reconciliation. An
 unrelated missing owned conversation, malformed edge, or invalid abort mark is skipped during
-candidate discovery; the affected graph requires separate repair. Storage failures, worker panics,
+candidate discovery; the affected graph requires separate repair. Task abort
+settlement also isolates edges whose affected task can be identified. If an edge
+is too malformed to identify its owner, all task abort settlements remain parked
+until repair because the runtime cannot prove which task owns it; independent
+conversation cleanup can still proceed. Summary execution shares a per-conversation
+read fence, and cleanup marker creation takes its write fence, so a summary that
+already passed the marker check finishes before the marker is created. Different
+summaries in the same conversation can still run concurrently. Storage failures, worker panics,
 cancelled or dropped cleanup ticks poison the scheduler and require reopening.
 Dropping the scheduler cancels its cleanup jobs; their attachments remain held
 until the jobs actually stop. Timeouts require callbacks to yield to the async

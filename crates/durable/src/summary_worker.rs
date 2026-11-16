@@ -26,6 +26,21 @@ pub(crate) enum Error {
     Hook(String),
 }
 
+#[cfg(test)]
+pub(crate) fn before_settlement_hooks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<Uuid, (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                Uuid,
+                (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
 fn snapshot(store: &SummaryStore<'_>, id: Uuid) -> Result<Snapshot, Error> {
     Ok(store.get(id)?.ok_or(summary_store::Error::NotFound)?)
 }
@@ -53,12 +68,19 @@ pub(crate) async fn run_for_cleanup(
     hook_harness: Option<&crate::runtime::Harness>,
     cleanup_attempt: Option<Uuid>,
 ) -> Result<(), Error> {
+    let store = SummaryStore::new(owner.store());
+    let session = snapshot(&store, id)?.operation.session_id();
+    let control = owner.conversation_controls().get(session);
+    let _session_guard = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Error::Interrupted),
+        guard = control.summary_execution.read() => guard,
+    };
     let _guard = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(Error::Interrupted),
         guard = owner.summary_guard(id) => guard,
     };
-    let store = SummaryStore::new(owner.store());
     let executor = Uuid::new_v4();
     let mut observed_active = false;
     loop {
@@ -66,6 +88,9 @@ pub(crate) async fn run_for_cleanup(
             return Err(Error::Interrupted);
         }
         let snap = snapshot(&store, id)?;
+        if snap.operation.session_id() != session {
+            return Err(Error::Identity);
+        }
         let marker = owner
             .store()
             .get(&crate::runtime::owned_cleanup_key(
@@ -203,6 +228,14 @@ async fn settle_one(
     };
     let request = attempt.request_id;
     let report = snap.operation.settlement_report(request)?;
+    #[cfg(test)]
+    {
+        let hook = before_settlement_hooks().lock().unwrap().remove(&id);
+        if let Some((entered, release)) = hook {
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+        }
+    }
     let settlement = async {
         match accounting.filter(|(id, _)| *id == request && !attempt.unconfirmed) {
             Some((_, generation)) => {
