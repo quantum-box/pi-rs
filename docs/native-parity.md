@@ -3668,7 +3668,9 @@ the redacted flag without a synthetic delta. Unlike Pi, they omit the opaque
 thinking signature. Legacy model and agent observers continue to receive the
 placeholder delta. RPC `get_messages` reconstructs signed Anthropic block order
 from validated replay, retains the redacted flag, and omits opaque signatures
-from history. Unsigned text-only responses are still collapsed into one text block.
+from history. For unsigned responses, validated display-layout metadata preserves
+block order in RPC history, entries, and shared sessions. If layout metadata is
+unavailable or does not match the message, projection falls back to aggregated text.
 Unlike Pi, the native agent has separate 1 MiB cumulative budgets for reasoning
 deltas and provider-supplied finalized reasoning. When the finalized budget is
 exceeded, block-end notifications contain only that block's observed deltas;
