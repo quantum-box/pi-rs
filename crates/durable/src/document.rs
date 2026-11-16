@@ -1385,15 +1385,14 @@ impl Transaction {
         if !matches!(old, Expected::Missing | Expected::Version(_))
             || !matches!(new, Expected::Missing | Expected::Version(_))
             || self.mutations.iter().any(|mutation| match mutation {
-                Mutation::Put { key: written, .. }
-                | Mutation::Delete { key: written } => written == key,
+                Mutation::Put { key: written, .. } | Mutation::Delete { key: written } => {
+                    written == key
+                }
             })
         {
             return false;
         }
-        let Some(check) =
-            self.checks.iter_mut().find(|check| check.key == key)
-        else {
+        let Some(check) = self.checks.iter_mut().find(|check| check.key == key) else {
             return false;
         };
         if &check.expected != old {
@@ -3150,9 +3149,10 @@ impl<'a> TaskDocuments<'a> {
             && self.task_input.as_ref().is_some_and(|intent| {
                 intent.admissions.iter().any(|item| {
                     item.notification_binding.is_some()
-                        && item.notify.as_ref().is_some_and(|notify| {
-                            notify.task_id == task_id && notify.key == key
-                        })
+                        && item
+                            .notify
+                            .as_ref()
+                            .is_some_and(|notify| notify.task_id == task_id && notify.key == key)
                 })
             })
         {

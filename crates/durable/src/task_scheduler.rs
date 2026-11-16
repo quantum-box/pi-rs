@@ -568,10 +568,10 @@ impl TaskNotificationAssembly {
         store: &durable_store::Store,
         key: &[u8],
     ) -> Result<bool, crate::document::Error> {
-        let Some((task, destinations)) =
-            self.reservation_only.iter().find(|(task, _)| {
-                task_store::signal_revision_key(**task) == key
-            })
+        let Some((task, destinations)) = self
+            .reservation_only
+            .iter()
+            .find(|(task, _)| task_store::signal_revision_key(**task) == key)
         else {
             return Ok(false);
         };
@@ -601,10 +601,9 @@ impl TaskNotificationAssembly {
                 Err(_) => return Ok(false),
             }
         }
-        let expected = revision
-            .map_or(durable_store::Expected::Missing, |entry| {
-                durable_store::Expected::Version(entry.version)
-            });
+        let expected = revision.map_or(durable_store::Expected::Missing, |entry| {
+            durable_store::Expected::Version(entry.version)
+        });
         Ok(self
             .original
             .refresh_reservation_revision(key, &old, expected))
@@ -4268,8 +4267,17 @@ impl Scheduler {
                     }
                     let Some(notify) = &item.notify else { continue };
                     let revision = task_store::signal_revision_key(notify.task_id);
-                    if !prepared.document_batch.checks.iter().chain(prepared.transaction.checks()).any(|check| check.key == revision) {
-                        reservation_only.entry(notify.task_id).or_default().push(notify.clone());
+                    if !prepared
+                        .document_batch
+                        .checks
+                        .iter()
+                        .chain(prepared.transaction.checks())
+                        .any(|check| check.key == revision)
+                    {
+                        reservation_only
+                            .entry(notify.task_id)
+                            .or_default()
+                            .push(notify.clone());
                     }
                 }
                 let harness = self.validator.as_ref().ok_or_else(|| {
@@ -4530,24 +4538,25 @@ impl Scheduler {
                     .checks()
                     .iter()
                     .find(|check| check.key == *key);
-                let retry = refreshed || match (old, new) {
-                    (None, Some(_)) => true,
-                    (Some(old), Some(new))
-                        if assembly
-                            .settlements
-                            .iter()
-                            .any(|(notify, _, _)| task_store::key(notify.task_id) == *key) =>
-                    {
-                        crate::runtime::notification_deadline_only_conflict(
-                            owner.store(),
-                            key,
-                            &old.expected,
-                            &new.expected,
-                        )
-                        .map_err(task_store::Error::from)?
-                    }
-                    _ => false,
-                };
+                let retry = refreshed
+                    || match (old, new) {
+                        (None, Some(_)) => true,
+                        (Some(old), Some(new))
+                            if assembly
+                                .settlements
+                                .iter()
+                                .any(|(notify, _, _)| task_store::key(notify.task_id) == *key) =>
+                        {
+                            crate::runtime::notification_deadline_only_conflict(
+                                owner.store(),
+                                key,
+                                &old.expected,
+                                &new.expected,
+                            )
+                            .map_err(task_store::Error::from)?
+                        }
+                        _ => false,
+                    };
                 if retry {
                     if assembly.retries >= 3 {
                         // The original checked transaction has not committed.
@@ -18655,13 +18664,14 @@ mod standalone_foreground_cleanup_tests {
                     key: "collision".into(),
                 });
                 let result = if self.local {
-                    docs.submit_write_without_request_id(
+                    docs.submit_write_without_request_id("app.reservation".into(), None, notify)
+                } else {
+                    docs.submit_write_to_session_conversation_without_request_id(
+                        self.target,
                         "app.reservation".into(),
                         None,
                         notify,
                     )
-                } else {
-                    docs.submit_write_to_session_conversation_without_request_id(self.target, "app.reservation".into(), None, notify)
                 };
                 if attempt > 0 {
                     assert!(result.is_err());
@@ -18695,8 +18705,7 @@ mod standalone_foreground_cleanup_tests {
                     tools: vec![],
                     restart_limit: 3,
                     max_turns: 3,
-                    uncertain_policy:
-                        crate::recovery::UncertainPolicy::InterruptedResult,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
                 },
             )
             .unwrap();
@@ -18712,8 +18721,7 @@ mod standalone_foreground_cleanup_tests {
                 harness.create_conversation(config()).unwrap()
             };
             let store = durable_store::Store::open(&path).unwrap();
-            let sessions =
-                crate::session_membership::SessionMembership::new(&store);
+            let sessions = crate::session_membership::SessionMembership::new(&store);
             let session = sessions.create().unwrap();
             sessions.enroll(session, owner).unwrap();
             if !local {
@@ -18755,12 +18763,7 @@ mod standalone_foreground_cleanup_tests {
         }));
             for _ in 0..8 {
                 scheduler.tick(0).unwrap();
-                if scheduler
-                    .get(writer.id())
-                    .unwrap()
-                    .unwrap()
-                    .is_terminal()
-                {
+                if scheduler.get(writer.id()).unwrap().unwrap().is_terminal() {
                     break;
                 }
             }
@@ -18781,9 +18784,7 @@ mod standalone_foreground_cleanup_tests {
                 name: "reservation-fence".into(),
                 key: "".into(),
             };
-            assert!(
-                Documents::new(&store).get(&address).unwrap().is_none()
-            );
+            assert!(Documents::new(&store).get(&address).unwrap().is_none());
             let binding = format!(
                 "durable/owned-subagent-notify/{}/636f6c6c6973696f6e",
                 writer.id()
@@ -18791,15 +18792,10 @@ mod standalone_foreground_cleanup_tests {
             assert!(store.get(binding.as_bytes()).unwrap().is_none());
             assert!(
                 TaskStore::new(&store)
-                    .read_typed_signal(
-                        writer.id(),
-                        &submission_settled_signal(),
-                        "collision"
-                    )
+                    .read_typed_signal(writer.id(), &submission_settled_signal(), "collision")
                     .unwrap()
                     .is_some()
             );
         }
     }
-
 }

@@ -4429,9 +4429,7 @@ impl Harness {
         if !reservations.is_empty() {
             checks.push(Check {
                 key: b"runtime/conversation/".to_vec(),
-                expected: Expected::PrefixUnchangedSince(
-                    reservation_boundary,
-                ),
+                expected: Expected::PrefixUnchangedSince(reservation_boundary),
             });
             for (id, notify) in reservations {
                 let revision_key = crate::task_store::signal_revision_key(notify.task_id);

@@ -2348,7 +2348,10 @@ fn killed_staged_write_recovers_once_with_notification() {
     let h = Harness::open_paused(&path, options()).unwrap();
     assert!(h.conversation(id).unwrap().application_writes.is_empty());
     let store = Store::open(&path).unwrap();
-    let binding = format!("durable/owned-subagent-notify/{}/736574746c6564", Uuid::from_u128(2001));
+    let binding = format!(
+        "durable/owned-subagent-notify/{}/736574746c6564",
+        Uuid::from_u128(2001)
+    );
     assert!(store.get(binding.as_bytes()).unwrap().is_none());
     assert!(Documents::new(&store).get(&address()).unwrap().is_none());
     drop(store);
@@ -2591,7 +2594,10 @@ impl Handler for ConflictingSignal {
         )
         .map_err(|e| e.to_string())?;
         let value = json!({"id":id,"conversationId":conversation,"type":"write","status":"done","entry":id});
-        assert!(docs.signal_at(task.id(), &submission_settled_signal(), "settled", value, 0).is_err());
+        assert!(
+            docs.signal_at(task.id(), &submission_settled_signal(), "settled", value, 0)
+                .is_err()
+        );
         Ok(Step::Wait {
             checkpoint: Checkpoint {
                 phase: "waiting".into(),
@@ -2625,7 +2631,12 @@ fn staged_signal_cannot_replace_write_notification() {
         .read_typed_signal(task.id(), &submission_settled_signal(), "settled")
         .unwrap()
         .unwrap();
-    assert_eq!(receipt["id"], h.conversation(id).unwrap().application_writes[0].id.to_string());
+    assert_eq!(
+        receipt["id"],
+        h.conversation(id).unwrap().application_writes[0]
+            .id
+            .to_string()
+    );
     let other = Task::new(
         Uuid::new_v4(),
         TaskOwner::Conversation(id),
@@ -5401,7 +5412,8 @@ impl Handler for LocalReservationSteps {
                 TaskOwner::Conversation(id) => *id,
                 _ => unreachable!(),
             };
-            let value = json!({"id":id,"conversationId":owner,"type":"write","status":"done","entry":id});
+            let value =
+                json!({"id":id,"conversationId":owner,"type":"write","status":"done","entry":id});
             docs.signal_at(
                 task.id(),
                 &submission_settled_signal(),
@@ -5417,12 +5429,8 @@ impl Handler for LocalReservationSteps {
         }
         for key in ["receipt", "pending", "unrelated"] {
             assert!(
-                docs.submit_write_without_request_id(
-                    "app.collision".into(),
-                    None,
-                    notify(key)
-                )
-                .is_err(),
+                docs.submit_write_without_request_id("app.collision".into(), None, notify(key))
+                    .is_err(),
                 "{key}"
             );
         }
@@ -5443,11 +5451,7 @@ fn local_notification_reservations_survive_steps_and_reopen() {
     let path = dir.path().join("db");
     let (h, conversation) = setup(&path);
     let mut registry = Registry::default();
-    registry.register(
-        "local-reservations",
-        true,
-        LocalReservationSteps,
-    );
+    registry.register("local-reservations", true, LocalReservationSteps);
     let mut scheduler = h.attach_tasks(registry).unwrap();
     let child = task(conversation, "local-reservations");
     scheduler.submit(&child).unwrap();
@@ -5459,22 +5463,14 @@ fn local_notification_reservations_survive_steps_and_reopen() {
     for key in ["receipt", "unrelated"] {
         assert!(
             TaskStore::new(&store)
-                .read_typed_signal(
-                    child.id(),
-                    &submission_settled_signal(),
-                    key
-                )
+                .read_typed_signal(child.id(), &submission_settled_signal(), key)
                 .unwrap()
                 .is_some()
         );
     }
     assert!(
         TaskStore::new(&store)
-            .read_typed_signal(
-                child.id(),
-                &submission_settled_signal(),
-                "pending"
-            )
+            .read_typed_signal(child.id(), &submission_settled_signal(), "pending")
             .unwrap()
             .is_none()
     );
@@ -5482,11 +5478,7 @@ fn local_notification_reservations_survive_steps_and_reopen() {
     drop(h);
     let h = Harness::open_paused(&path, options()).unwrap();
     let mut registry = Registry::default();
-    registry.register(
-        "local-reservations",
-        true,
-        LocalReservationSteps,
-    );
+    registry.register("local-reservations", true, LocalReservationSteps);
     let mut scheduler = h.attach_tasks(registry).unwrap();
     assert!(scheduler.tick(0).unwrap());
     assert!(matches!(
@@ -5525,19 +5517,14 @@ impl Handler for LocalReservationRace {
                 key: "local-race".into(),
             }),
         );
-        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
             assert!(result.is_err());
             return Ok(Step::Succeed(json!(null)));
         }
         result.map_err(|e| e.to_string())?;
         docs.get(&address()).map_err(|e| e.to_string())?;
-        docs.put(
-            &address(),
-            json!({"no":true}).as_object().unwrap().clone(),
-        )
-        .map_err(|e| e.to_string())?;
+        docs.put(&address(), json!({"no":true}).as_object().unwrap().clone())
+            .map_err(|e| e.to_string())?;
         self.staged.send(()).unwrap();
         self.release
             .lock()
@@ -5607,9 +5594,7 @@ fn local_reservation_races_existing_pending_and_receipt() {
                 .application_writes
                 .is_empty()
         );
-        assert!(
-            Documents::new(&store).get(&address()).unwrap().is_none()
-        );
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
         driver.shutdown().unwrap();
     }
 }
@@ -5638,8 +5623,7 @@ impl Handler for LegacyDuplicate {
     }
 }
 #[test]
-fn local_keyed_duplicate_preserves_legacy_notification_without_binding()
-{
+fn local_keyed_duplicate_preserves_legacy_notification_without_binding() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let (mut h, conversation) = setup(&path);
@@ -5661,10 +5645,7 @@ fn local_keyed_duplicate_preserves_legacy_notification_without_binding()
         )
         .unwrap();
     let store = Store::open(&path).unwrap();
-    let key = format!(
-        "durable/owned-subagent-notify/{}/6c6567616379",
-        child.id()
-    );
+    let key = format!("durable/owned-subagent-notify/{}/6c6567616379", child.id());
     assert!(store.get(key.as_bytes()).unwrap().is_none());
     assert!(scheduler.tick(0).unwrap());
     assert!(matches!(
@@ -5711,11 +5692,7 @@ fn local_reservation_fails_closed_on_malformed_signal_storage() {
     let path = dir.path().join("db");
     let (h, conversation) = setup(&path);
     let mut registry = Registry::default();
-    registry.register(
-        "malformed-receipt",
-        true,
-        RejectMalformedReceipt,
-    );
+    registry.register("malformed-receipt", true, RejectMalformedReceipt);
     let mut scheduler = h.attach_tasks(registry).unwrap();
     let child = task(conversation, "malformed-receipt");
     scheduler.submit(&child).unwrap();
