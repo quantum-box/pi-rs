@@ -5251,6 +5251,10 @@ impl Harness {
         // Retry only observations added by notification assembly. The
         // original conversation, document, graph and prefix fences never move.
         let mut attempts = 0;
+        // Each delivery keeps a monotonic clock anchor across retries, advancing
+        // it when a later wall-clock sample is ahead. Reassembly must not
+        // grant a fresh deadline when the supplied clock freezes or retreats.
+        let mut notification_clocks: Vec<Option<(i64, Instant)>> = vec![None; settling.len()];
         let result = loop {
             let mut assembled = crate::task_store::OwnedBatch {
                 checks: batch.checks.clone(),
@@ -5260,14 +5264,19 @@ impl Harness {
                 let mut host = crate::document::HostTransaction::new(store);
                 host.append_runtime_candidate(assembled)?;
                 let token = submission_settled_signal();
-                for (notify, value) in &settling {
-                    if host.signal_at(
-                        notify.task_id,
-                        &token,
-                        &notify.key,
-                        value.clone(),
-                        (self.clock)(),
-                    )? == crate::task_store::SignalResult::Invalid
+                for (index, (notify, value)) in settling.iter().enumerate() {
+                    let sample = (self.clock)();
+                    let (anchor, started) =
+                        notification_clocks[index].get_or_insert_with(|| (sample, Instant::now()));
+                    let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                    let projected = anchor.saturating_add(elapsed);
+                    let now = sample.max(projected);
+                    if sample > projected {
+                        *anchor = sample;
+                        *started = Instant::now();
+                    }
+                    if host.signal_at(notify.task_id, &token, &notify.key, value.clone(), now)?
+                        == crate::task_store::SignalResult::Invalid
                     {
                         return Err(Error::Invalid("invalid submission notification".into()));
                     }
@@ -18647,130 +18656,136 @@ mod scheduler_tests {
         use std::sync::atomic::AtomicI64;
         for create in [false, true] {
             for original_deadline in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join("db");
-                let model = placement_model();
-                let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
-                let conversation = h.create_conversation(config()).unwrap();
-                let mut task = Task::new(
-                    Uuid::new_v4(),
-                    TaskOwner::Conversation(conversation),
-                    Checkpoint {
-                        phase: "start".into(),
-                        data: serde_json::json!(null),
-                    },
-                    3,
-                )
-                .unwrap();
-                let ts = TaskStore::new(h.owner.store());
-                if !create {
-                    ts.save(&[Save::Create(&task)]).unwrap();
-                    ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
-                    ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
-                        task.wait(WaitFor::TypedSleep {
-                            until_millis: Some(1),
-                            signals: vec![submission_settled_signal().key("deadline").unwrap()],
-                        })
-                    })
-                    .unwrap();
-                    task = ts.load(task.id()).unwrap().unwrap().task;
-                } else {
-                    task.start().unwrap();
-                    task.wait(WaitFor::TypedSleep {
-                        until_millis: Some(1),
-                        signals: vec![submission_settled_signal().key("deadline").unwrap()],
-                    })
-                    .unwrap();
-                }
-                task = task.registered("deadline-candidate".into(), true);
-                h.submit(conversation, None, "active".into()).unwrap();
-                let id = h
-                    .submit_with_notification(
-                        conversation,
-                        None,
-                        "queued".into(),
-                        AdmissionOptions::default(),
-                        SubmissionNotify {
-                            task_id: task.id(),
-                            key: "deadline".into(),
+                for clock_after_conflict in [101, 100, 0] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("db");
+                    let model = placement_model();
+                    let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+                    let conversation = h.create_conversation(config()).unwrap();
+                    let mut task = Task::new(
+                        Uuid::new_v4(),
+                        TaskOwner::Conversation(conversation),
+                        Checkpoint {
+                            phase: "start".into(),
+                            data: serde_json::json!(null),
                         },
+                        3,
                     )
                     .unwrap();
-                let (mut candidate, version) = h.load(conversation).unwrap();
-                candidate
-                    .submissions
-                    .iter_mut()
-                    .find(|s| s.id == id)
-                    .unwrap()
-                    .status = Status::Unanswered {
-                    reason: "aborted".into(),
-                };
-                let mut batch = h
-                    .prepare_save(&candidate, Expected::Version(version))
-                    .unwrap();
-                let ts = TaskStore::new(h.owner.store());
-                let mut graph = if create {
-                    ts.prepare_save(&[Save::Create(&task)]).unwrap()
-                } else {
-                    let mut stored = ts.load(task.id()).unwrap().unwrap();
-                    stored.task = task.clone();
-                    ts.prepare_save(&[Save::Update(&stored)]).unwrap()
-                };
-                let target = crate::task_store::key(task.id());
-                if original_deadline {
-                    let check = graph
-                        .checks
-                        .iter_mut()
-                        .find(|check| check.key == target)
+                    let ts = TaskStore::new(h.owner.store());
+                    if !create {
+                        ts.save(&[Save::Create(&task)]).unwrap();
+                        ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+                        ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+                            task.wait(WaitFor::TypedSleep {
+                                until_millis: Some(101),
+                                signals: vec![submission_settled_signal().key("deadline").unwrap()],
+                            })
+                        })
                         .unwrap();
-                    let boundary = Instant::now() + Duration::from_secs(60);
-                    check.expected = match check.expected {
-                        Expected::Missing => Expected::MissingBefore(boundary),
-                        Expected::Version(v) => Expected::VersionBefore(v, boundary),
-                        _ => panic!("unexpected graph check"),
-                    };
-                }
-                batch.checks.extend(graph.checks);
-                batch.mutations.extend(graph.mutations);
-                let clock = Arc::new(AtomicI64::new(0));
-                let source = clock.clone();
-                h.set_signal_clock(Arc::new(move || source.load(Ordering::SeqCst)));
-                let mut calls = 0;
-                h.commit_conversation_save_with_hook(batch, None, |attempt| {
-                    calls += 1;
-                    if attempt == 0 {
-                        clock.store(1, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(5));
+                        task = ts.load(task.id()).unwrap().unwrap().task;
+                    } else {
+                        task.start().unwrap();
+                        task.wait(WaitFor::TypedSleep {
+                            until_millis: Some(101),
+                            signals: vec![submission_settled_signal().key("deadline").unwrap()],
+                        })
+                        .unwrap();
                     }
-                })
-                .unwrap();
-                assert_eq!(calls, 2, "create={create} timed={original_deadline}");
-                drop(h);
-                let h = Harness::open_paused(&path, options(model)).unwrap();
-                let ts = TaskStore::new(h.owner.store());
-                assert_eq!(
-                    ts.load(task.id()).unwrap().unwrap().task.state(),
-                    task.state()
-                );
-                assert_eq!(
-                    ts.load(task.id()).unwrap().unwrap().task.kind(),
-                    Some("deadline-candidate")
-                );
-                assert_eq!(
-                    ts.read_typed_signal_state(task.id(), &submission_settled_signal(), "deadline")
-                        .unwrap(),
-                    Some(SignalState::Expired)
-                );
-                assert!(matches!(
-                    h.conversation(conversation)
-                        .unwrap()
+                    task = task.registered("deadline-candidate".into(), true);
+                    h.submit(conversation, None, "active".into()).unwrap();
+                    let id = h
+                        .submit_with_notification(
+                            conversation,
+                            None,
+                            "queued".into(),
+                            AdmissionOptions::default(),
+                            SubmissionNotify {
+                                task_id: task.id(),
+                                key: "deadline".into(),
+                            },
+                        )
+                        .unwrap();
+                    let (mut candidate, version) = h.load(conversation).unwrap();
+                    candidate
                         .submissions
-                        .iter()
+                        .iter_mut()
                         .find(|s| s.id == id)
                         .unwrap()
-                        .status,
-                    Status::Unanswered { .. }
-                ));
+                        .status = Status::Unanswered {
+                        reason: "aborted".into(),
+                    };
+                    let mut batch = h
+                        .prepare_save(&candidate, Expected::Version(version))
+                        .unwrap();
+                    let ts = TaskStore::new(h.owner.store());
+                    let mut graph = if create {
+                        ts.prepare_save(&[Save::Create(&task)]).unwrap()
+                    } else {
+                        let mut stored = ts.load(task.id()).unwrap().unwrap();
+                        stored.task = task.clone();
+                        ts.prepare_save(&[Save::Update(&stored)]).unwrap()
+                    };
+                    let target = crate::task_store::key(task.id());
+                    if original_deadline {
+                        let check = graph
+                            .checks
+                            .iter_mut()
+                            .find(|check| check.key == target)
+                            .unwrap();
+                        let boundary = Instant::now() + Duration::from_secs(60);
+                        check.expected = match check.expected {
+                            Expected::Missing => Expected::MissingBefore(boundary),
+                            Expected::Version(v) => Expected::VersionBefore(v, boundary),
+                            _ => panic!("unexpected graph check"),
+                        };
+                    }
+                    batch.checks.extend(graph.checks);
+                    batch.mutations.extend(graph.mutations);
+                    let clock = Arc::new(AtomicI64::new(100));
+                    let source = clock.clone();
+                    h.set_signal_clock(Arc::new(move || source.load(Ordering::SeqCst)));
+                    let mut calls = 0;
+                    h.commit_conversation_save_with_hook(batch, None, |attempt| {
+                        calls += 1;
+                        if attempt == 0 {
+                            clock.store(clock_after_conflict, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    })
+                    .unwrap();
+                    assert_eq!(calls, 2, "create={create} timed={original_deadline}");
+                    drop(h);
+                    let h = Harness::open_paused(&path, options(model)).unwrap();
+                    let ts = TaskStore::new(h.owner.store());
+                    assert_eq!(
+                        ts.load(task.id()).unwrap().unwrap().task.state(),
+                        task.state()
+                    );
+                    assert_eq!(
+                        ts.load(task.id()).unwrap().unwrap().task.kind(),
+                        Some("deadline-candidate")
+                    );
+                    assert_eq!(
+                        ts.read_typed_signal_state(
+                            task.id(),
+                            &submission_settled_signal(),
+                            "deadline"
+                        )
+                        .unwrap(),
+                        Some(SignalState::Expired)
+                    );
+                    assert!(matches!(
+                        h.conversation(conversation)
+                            .unwrap()
+                            .submissions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .unwrap()
+                            .status,
+                        Status::Unanswered { .. }
+                    ));
+                }
             }
         }
     }
@@ -18781,10 +18796,9 @@ mod scheduler_tests {
         use crate::task_store::{Save, TaskStore};
         use std::sync::atomic::AtomicI64;
         // Concurrent version, abort, an already-expired original deadline,
-        // a notification deadline that crosses on every attempt, and an
-        // original deadline that crosses after notification reassembly, and
+        // an original deadline that crosses after notification reassembly, and
         // a concurrent graph put that invalidates the original prefix fence.
-        for mode in 0..6 {
+        for mode in [0, 1, 2, 4, 5] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("db");
             let model = placement_model();
@@ -18869,9 +18883,7 @@ mod scheduler_tests {
             let mut calls = 0;
             let result = h.commit_conversation_save_with_hook(batch, prefix_fence, |attempt| {
                 calls += 1;
-                if mode != 3 {
-                    clock.store(1, Ordering::SeqCst);
-                }
+                clock.store(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(5));
                 if mode == 4 && attempt == 1 {
                     std::thread::sleep(
@@ -18913,17 +18925,7 @@ mod scheduler_tests {
                 result,
                 Err(Error::Storage(durable_store::Error::Conflict { .. }))
             ));
-            assert_eq!(
-                calls,
-                if mode == 3 {
-                    4
-                } else if mode == 4 {
-                    2
-                } else {
-                    1
-                },
-                "mode={mode}"
-            );
+            assert_eq!(calls, if mode == 4 { 2 } else { 1 }, "mode={mode}");
             drop(owner);
             drop(h);
             let h = Harness::open_paused(&path, options(model)).unwrap();
@@ -18948,6 +18950,188 @@ mod scheduler_tests {
                 Status::Queued
             );
         }
+    }
+
+    #[test]
+    fn submission_notify_retry_does_not_expire_future_deadline_early() {
+        use crate::task::{Checkpoint, Task, TaskOwner, WaitFor};
+        use crate::task_store::{Save, SignalResult, SignalState, SignalToken, TaskStore};
+        use std::sync::atomic::AtomicI64;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let model = placement_model();
+        let mut h = Harness::open_paused(&path, options(model.clone())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        ts.save(&[Save::Create(&task)]).unwrap();
+        ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+        ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+            task.wait(WaitFor::TypedSleep {
+                until_millis: Some(10_000),
+                signals: vec![submission_settled_signal().key("deadline").unwrap()],
+            })
+        })
+        .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "deadline".into(),
+                },
+            )
+            .unwrap();
+        let (mut candidate, version) = h.load(conversation).unwrap();
+        candidate
+            .submissions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .status = Status::Unanswered {
+            reason: "aborted".into(),
+        };
+        let batch = h
+            .prepare_save(&candidate, Expected::Version(version))
+            .unwrap();
+        let clock = Arc::new(AtomicI64::new(100));
+        let source = clock.clone();
+        h.set_signal_clock(Arc::new(move || source.load(Ordering::SeqCst)));
+        let owner = h.owner.clone();
+        let mut calls = 0;
+        h.commit_conversation_save_with_hook(batch, None, |attempt| {
+            calls += 1;
+            if attempt == 0 {
+                clock.store(-100_000, Ordering::SeqCst);
+                let ts = TaskStore::new(owner.store());
+                assert_eq!(
+                    ts.deliver_signal_at(
+                        task.id(),
+                        &SignalToken::new("other", 1).unwrap(),
+                        "key",
+                        serde_json::json!(1),
+                        100
+                    )
+                    .unwrap(),
+                    SignalResult::Delivered
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        drop(owner);
+        drop(h);
+        let h = Harness::open_paused(&path, options(model)).unwrap();
+        assert!(matches!(
+            TaskStore::new(h.owner.store())
+                .read_typed_signal_state(task.id(), &submission_settled_signal(), "deadline")
+                .unwrap(),
+            Some(SignalState::Value(_))
+        ));
+    }
+
+    #[test]
+    fn submission_notify_retry_preserves_later_forward_clock_sample() {
+        use crate::task::{Checkpoint, Task, TaskOwner, WaitFor};
+        use crate::task_store::{Save, SignalResult, SignalState, SignalToken, TaskStore};
+        use std::sync::atomic::AtomicI64;
+        let dir = tempfile::tempdir().unwrap();
+        let mut h =
+            Harness::open_paused(dir.path().join("db"), options(placement_model())).unwrap();
+        let conversation = h.create_conversation(config()).unwrap();
+        let task = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(conversation),
+            Checkpoint {
+                phase: "start".into(),
+                data: serde_json::json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        let ts = TaskStore::new(h.owner.store());
+        ts.save(&[Save::Create(&task)]).unwrap();
+        ts.reserve(&ts.load(task.id()).unwrap().unwrap()).unwrap();
+        ts.update(&ts.load(task.id()).unwrap().unwrap(), |task| {
+            task.wait(WaitFor::TypedSleep {
+                until_millis: Some(1000),
+                signals: vec![submission_settled_signal().key("deadline").unwrap()],
+            })
+        })
+        .unwrap();
+        h.submit(conversation, None, "active".into()).unwrap();
+        let id = h
+            .submit_with_notification(
+                conversation,
+                None,
+                "queued".into(),
+                AdmissionOptions::default(),
+                SubmissionNotify {
+                    task_id: task.id(),
+                    key: "deadline".into(),
+                },
+            )
+            .unwrap();
+        let (mut candidate, version) = h.load(conversation).unwrap();
+        candidate
+            .submissions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .status = Status::Unanswered {
+            reason: "aborted".into(),
+        };
+        let batch = h
+            .prepare_save(&candidate, Expected::Version(version))
+            .unwrap();
+        let clock = Arc::new(AtomicI64::new(100));
+        let source = clock.clone();
+        h.set_signal_clock(Arc::new(move || source.load(Ordering::SeqCst)));
+        let owner = h.owner.clone();
+        let mut calls = 0;
+        h.commit_conversation_save_with_hook(batch, None, |attempt| {
+            calls += 1;
+            if attempt == 0 {
+                clock.store(999, Ordering::SeqCst);
+                let ts = TaskStore::new(owner.store());
+                assert_eq!(
+                    ts.deliver_signal_at(
+                        task.id(),
+                        &SignalToken::new("other", 1).unwrap(),
+                        "key",
+                        serde_json::json!(1),
+                        100
+                    )
+                    .unwrap(),
+                    SignalResult::Delivered
+                );
+            } else if attempt == 1 {
+                clock.store(0, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(
+            TaskStore::new(h.owner.store())
+                .read_typed_signal_state(task.id(), &submission_settled_signal(), "deadline")
+                .unwrap(),
+            Some(SignalState::Expired)
+        );
     }
 
     #[test]
