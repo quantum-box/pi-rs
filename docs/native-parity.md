@@ -4564,6 +4564,16 @@ them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
 
+### Chat Completions prompt cache keys
+
+Chat Completions models honor `promptCacheKeyMode`: `enabled` uses the
+session key, `disabled` omits the automatic key, and `auto` uses it for
+OpenAI endpoints or supported long retention. Supported long retention also
+sends the 24-hour retention request. Provider and model overrides merge, and
+summary requests omit automatic keys and retention. Explicit sampling fields
+retain precedence. Native Ollama keeps long retention disabled by default as a
+pi-rs extension; its explicit compatibility setting can enable it.
+
 ### Responses prompt cache key configuration
 
 Responses model compatibility accepts `promptCacheKeyMode` as `auto`,

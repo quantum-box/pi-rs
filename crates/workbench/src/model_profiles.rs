@@ -1120,6 +1120,67 @@ impl Profiles {
         )
     }
 
+    pub fn chat_prompt_cache_policy(
+        &self,
+        provider: &Provider,
+        model_id: &str,
+        model: Option<&ModelMetadata>,
+        endpoint: &str,
+        long_requested: bool,
+    ) -> (bool, bool) {
+        let compat = self.cache_compatibility(provider, model);
+        let raw = self
+            .entries
+            .get(provider.id())
+            .and_then(|profile| {
+                let selected = profile
+                    .model_endpoints
+                    .get(model_id)
+                    .map_or(profile.endpoint.as_str(), String::as_str);
+                if selected != endpoint {
+                    return None;
+                }
+                profile
+                    .models
+                    .iter()
+                    .find(|item| item.id == model_id)
+                    .and_then(|item| item.base_url.as_deref())
+                    .or(profile.base_url.as_deref())
+            })
+            .unwrap_or(endpoint);
+        let long_supported = compat.supports_long_cache_retention.unwrap_or_else(|| {
+            provider != &Provider::Ollama
+                && !matches!(
+                    provider.id(),
+                    "together"
+                        | "cloudflare-workers-ai"
+                        | "cloudflare-ai-gateway"
+                        | "nvidia"
+                        | "ant-ling"
+                )
+                && ![
+                    "api.together.ai",
+                    "api.together.xyz",
+                    "api.cloudflare.com",
+                    "gateway.ai.cloudflare.com",
+                    "integrate.api.nvidia.com",
+                    "api.ant-ling.com",
+                ]
+                .iter()
+                .any(|needle| raw.contains(needle))
+        });
+        let long = long_requested && long_supported;
+        let key_enabled = match compat
+            .prompt_cache_key_mode
+            .unwrap_or(PromptCacheKeyMode::Auto)
+        {
+            PromptCacheKeyMode::Disabled => false,
+            PromptCacheKeyMode::Enabled => true,
+            PromptCacheKeyMode::Auto => raw.contains("api.openai.com") || long,
+        };
+        (key_enabled, long)
+    }
+
     pub fn chat_cache_support(
         &self,
         provider: &Provider,
@@ -1662,6 +1723,51 @@ mod tests {
                 .levels(Adapter::ChatCompletions)
                 .unwrap()
                 .contains(&"off".into())
+        );
+    }
+
+    #[test]
+    fn chat_prompt_cache_policy_matches_modes_and_long_retention_support() {
+        let profiles = Profiles::parse(&json!({"providers":{
+            "test":{"api":"openai-completions", "baseUrl":"https://example.test/v1", "models":[
+                {"id":"auto"}, {"id":"enabled", "compat":{"promptCacheKeyMode":"enabled"}},
+                {"id":"disabled", "compat":{"promptCacheKeyMode":"disabled"}},
+                {"id":"no-long", "compat":{"supportsLongCacheRetention":false}}
+            ]}
+        }}))
+        .unwrap();
+        let provider = profiles.provider("test").unwrap();
+        for (id, endpoint, request_long, expected) in [
+            ("auto", "https://example.test/v1", false, (false, false)),
+            ("auto", "https://example.test/v1", true, (true, true)),
+            ("auto", "https://api.openai.com/v1", false, (true, false)),
+            ("enabled", "https://example.test/v1", false, (true, false)),
+            ("disabled", "https://example.test/v1", true, (false, true)),
+            ("no-long", "https://example.test/v1", true, (false, false)),
+            ("auto", "https://api.together.ai/v1", true, (false, false)),
+        ] {
+            let model = profiles.model(&provider, id).unwrap();
+            assert_eq!(
+                profiles.chat_prompt_cache_policy(
+                    &provider,
+                    id,
+                    Some(&model),
+                    endpoint,
+                    request_long
+                ),
+                expected
+            );
+        }
+        let ollama = profiles.provider("ollama").unwrap();
+        assert_eq!(
+            profiles.chat_prompt_cache_policy(
+                &ollama,
+                "m",
+                None,
+                "http://localhost:11434/v1",
+                true
+            ),
+            (false, false)
         );
     }
 
