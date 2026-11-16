@@ -645,6 +645,13 @@ async fn keep_queued_input_survives_abort_and_reopen_then_is_answered() {
             .status,
         Status::Queued
     );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        s.wait_for_idle(id, &pi_rs_core::CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     s.shutdown().await.unwrap();
     let mut s = Scheduler::open(&path, opts(model.clone(), vec![])).unwrap();
     assert_eq!(

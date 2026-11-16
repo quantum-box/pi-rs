@@ -1806,10 +1806,10 @@ impl Conversation {
         self.active.is_some()
             || !self.pending_resets.is_empty()
             || !matches!(self.phase, Phase::Idle | Phase::FailedIdle)
-            || self
-                .submissions
-                .iter()
-                .any(|s| matches!(s.status, Status::Queued | Status::Running))
+            || self.submissions.iter().any(|s| {
+                matches!(s.status, Status::Running)
+                    || (s.status == Status::Queued && !matches!(self.phase, Phase::FailedIdle))
+            })
     }
     /// The most recent attempt for the currently running, pending, blocked or
     /// finishing operation. Legacy records may have no known attempt identity.

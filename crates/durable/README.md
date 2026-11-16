@@ -1470,7 +1470,9 @@ polls storage every 100 ms, so it may lag a terminal commit; unlike upstream's
 registered notifications, it also polls for driver shutdown and failure.
 
 `Scheduler::wait_for_idle(conversation_id, &cancel)` waits for the conversation's
-queued and running submissions, pending resets, and foreground owned tasks and child conversations.
+running and runnable queued submissions, pending resets, and foreground owned tasks and child conversations.
+Inputs parked after a failed or aborted run do not prevent idle; a later input or
+ordered write can resume their placement.
 It traverses terminal task anchors, but does not cross background boundaries.
 Cancellation or dropping the future stops only the wait. Unknown conversations
 return an error. Live generic tasks require a running task driver, including after
