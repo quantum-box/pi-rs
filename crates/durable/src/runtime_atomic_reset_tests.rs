@@ -136,7 +136,7 @@ fn atomic_writer_publishes_cuts_and_manifest_together_and_reopens() {
                 context_generation: step.context_generation,
                 write_limit: u64::MAX,
                 cursor: as_manifest_cursor(cursor),
-                state_sha256: reset_baseline_digest(
+                state_sha256: reset_cut_digest(
                     &serde_json::json!({"state":cut,"blocks":cut.content_blocks}),
                 )
                 .unwrap(),
@@ -383,7 +383,7 @@ fn post_failure_candidate_places_resets_and_replacement_in_one_commit() {
     {
         assert_eq!(
             saved["state_sha256"],
-            reset_baseline_digest(
+            reset_cut_digest(
                 &serde_json::json!({"state":expected,"blocks":expected.content_blocks})
             )
             .unwrap()
@@ -500,4 +500,42 @@ fn post_failure_writer_rolls_back_on_document_conflict() {
         Status::Queued
     );
     assert!(current.run_failure.is_none());
+}
+
+#[test]
+fn stopped_model_failure_reset_cut_proof_reopens_and_fences_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue).unwrap();
+    h.submit(id, None, "replacement".into()).unwrap();
+    let (mut stopped, version) = h.load(id).unwrap();
+    stopped.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "model error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&stopped, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    let batch = h.prepare_atomic_failure_reset_save(&failure, version, &steps).unwrap();
+    let bytes = batch.mutations.iter().find_map(|mutation| match mutation {
+        Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => Some(value.clone()),
+        _ => None,
+    }).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let cursor: crate::transcript::Cursor = serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
+    let observation = manifest["anchor_observation"].as_u64().unwrap();
+    h.commit_conversation_save(batch).unwrap();
+    let (cut, _, _) = h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+    assert_eq!(cut.resets.iter().map(|r| r.id).collect::<Vec<_>>(), vec![steps[0].reset_id]);
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let (_, _, checks) = h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+    let predecessor = checks.iter().find(|check| check.key.starts_with(format!("runtime/fork/{id}/").as_bytes()) && check.key != format!("runtime/fork/{id}/{observation:020}").as_bytes()).unwrap();
+    let value = h.owner.store().get(&predecessor.key).unwrap().unwrap().value;
+    h.owner.store().commit(&[], &[Mutation::Put { key: predecessor.key.clone(), value }]).unwrap();
+    assert!(h.owner.store().commit(&checks, &[]).is_err());
+    assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
 }

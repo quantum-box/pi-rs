@@ -4655,7 +4655,7 @@ impl Harness {
                             .map_err(|_| Error::Invalid("reset write limit".into()))?
                     },
                     cursor: manifest_cursor(cursor)?,
-                    state_sha256: reset_baseline_digest(&value)?,
+                    state_sha256: reset_cut_digest(&value)?,
                 });
             }
             let anchor_cursor = positions
@@ -6959,6 +6959,123 @@ impl Harness {
             // introduced. Current-version derivation remains supported.
             derive_ordered_reset_states(&baseline, steps)
         }
+    }
+
+    // Prove a failure/reset cut from independently authenticated predecessor
+    // state. The returned checks must be committed with any dependent fork.
+    #[allow(dead_code)]
+    fn prove_failure_reset_cut(
+        &self,
+        id: Uuid,
+        target: &crate::transcript::Cursor,
+        observation: u64,
+    ) -> Result<(Conversation, u64, Vec<Check>), Error> {
+        use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
+        let invalid = || Error::from(crate::fork::Error::InvalidSnapshot);
+        let store = self.owner.store();
+        let anchor_key = format!("runtime/fork/{id}/{observation:020}").into_bytes();
+        let revision = store.document_cut(&anchor_key)?.ok_or_else(invalid)?;
+        let candidate = crate::reset_manifest::lookup_candidate(store, id, target, observation, revision)
+            .map_err(|_| invalid())?.ok_or_else(invalid)?;
+        let hints = candidate.replay_hints().map_err(|_| invalid())?;
+        let (mut baseline, _) = self.authenticated_reset_baseline(id, hints.predecessor_observation)?;
+        let predecessor_key = format!("runtime/fork/{id}/{:020}", hints.predecessor_observation).into_bytes();
+        let predecessor = store.get(&predecessor_key)?.ok_or_else(invalid)?;
+        let root_key = Self::key(id);
+        let sequence = store.commit_for_version(&predecessor_key, predecessor.version)?.ok_or_else(invalid)?;
+        if store.commit_for_version(&root_key, hints.predecessor_root_version)? != Some(sequence)
+            || baseline.abort_requested || baseline.after_failed_run != AfterFailedRun::Continue
+        {
+            return Err(invalid());
+        }
+        let reason = match &baseline.phase {
+            Phase::FailedModel { reason, decision: ModelFailureDecision::Stop, .. } => reason.clone(),
+            _ => return Err(invalid()),
+        };
+        let predecessor_cursor = baseline.transcript.clone().ok_or_else(invalid)?;
+        let predecessor_generation = baseline.context_generation;
+        finish_failure(&mut baseline, reason, FailureCause::ModelError);
+        apply_failed_run_policy(&mut baseline);
+        let steps: Vec<_> = hints.cuts.iter().map(|cut| Ok(ResetDerivationStep {
+            reset_id: cut.reset_id,
+            context_generation: cut.context_generation,
+            write_limit: if cut.write_limit == u64::MAX { usize::MAX } else {
+                usize::try_from(cut.write_limit).map_err(|_| invalid())?
+            },
+        })).collect::<Result<_, Error>>()?;
+        let cuts = derive_ordered_reset_states(&baseline, &steps)?;
+        let anchor = store.get(&anchor_key)?.ok_or_else(invalid)?;
+        let anchor_value: serde_json::Value = serde_json::from_slice(&anchor.value)?;
+        let anchor_cursor: crate::transcript::Cursor = serde_json::from_value(
+            anchor_value.get("_transcript").cloned().ok_or_else(invalid)?
+        )?;
+        let cursor = |c: &crate::transcript::Cursor| -> Result<ManifestCursor, Error> {
+            Ok(serde_json::from_value(serde_json::to_value(c)?)?)
+        };
+        let positions: Vec<crate::transcript::Cursor> = hints.cuts.iter()
+            .map(|cut| serde_json::from_value(serde_json::to_value(&cut.cursor)?).map_err(Error::from))
+            .collect::<Result<_, _>>()?;
+        let expected = ExpectedBinding {
+            conversation_id: id,
+            predecessor_observation: hints.predecessor_observation,
+            predecessor_root_version: hints.predecessor_root_version,
+            anchor_observation: observation,
+            document_revision: revision,
+            predecessor_context_generation: predecessor_generation,
+            predecessor_cursor: cursor(&predecessor_cursor)?,
+            anchor_cursor: cursor(&anchor_cursor)?,
+            cuts: steps.iter().zip(&cuts).zip(&positions).map(|((step, cut), position)| Ok(ResetCut {
+                reset_id: step.reset_id,
+                context_generation: step.context_generation,
+                write_limit: if step.write_limit == usize::MAX { u64::MAX } else { step.write_limit as u64 },
+                cursor: cursor(position)?,
+                state_sha256: reset_cut_digest(&serde_json::json!({"state":cut,"blocks":cut.content_blocks}))?,
+            })).collect::<Result<_, Error>>()?,
+        };
+        ResetManifest::decode(&candidate.bytes, &expected).map_err(|_| invalid())?;
+        let selected = positions.iter().position(|position| position == target).ok_or_else(invalid)?;
+        // Failure continuation produces exactly one trailing append.
+        if positions.last() == Some(&anchor_cursor) { return Err(invalid()); }
+        let transcript = crate::transcript::Transcript::new(store, id);
+        let mut chain = positions.clone();
+        chain.push(anchor_cursor.clone());
+        let mut checks = candidate.checks;
+        checks.extend(transcript.atomic_append_checks(&anchor_key, &predecessor_cursor, &chain)?);
+        let (_, mut seen) = self.resolved_occurrences_with_ids(id, predecessor_cursor)?;
+        for (position, cut) in positions.iter().zip(&cuts) {
+            let page = transcript.read_with_blocks(position, std::num::NonZeroUsize::MIN)?;
+            let record = page.records.first().ok_or_else(invalid)?;
+            let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+            let TranscriptChange::ReplaceV2 { messages, ids, commit, origin } = change else { return Err(invalid()) };
+            if messages != cut.messages || commit != observation || origin != id || ids.len() != messages.len()
+                || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
+                || cut.content_blocks.iter().any(|(index, binding)| ids.get(*index) != Some(&binding.message_id))
+                || record.content_blocks.clone().unwrap_or_default() != cut.content_blocks.values().cloned().collect::<Vec<_>>()
+            { return Err(invalid()); }
+        }
+        let last = cuts.last().ok_or_else(invalid)?;
+        let mut continuation = last.clone();
+        let failure = continuation.run_failure.clone();
+        if !place_queued(&mut continuation, true) { return Err(invalid()); }
+        continuation.run_failure = failure;
+        let page = transcript.read_with_blocks(&anchor_cursor, std::num::NonZeroUsize::MIN)?;
+        let record = page.records.first().ok_or_else(invalid)?;
+        let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+        let TranscriptChange::AppendV2 { messages, ids, commit, origin } = change else { return Err(invalid()) };
+        if commit != observation || origin != id || ids.len() != messages.len()
+            || messages != continuation.messages[last.messages.len()..]
+            || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
+            || record.content_blocks.clone().unwrap_or_default() != continuation.content_blocks.range(last.messages.len()..).map(|(_, b)| b.clone()).collect::<Vec<_>>()
+        { return Err(invalid()); }
+        let mut event_key = b"durable/observer/".to_vec();
+        event_key.extend_from_slice(id.as_bytes());
+        event_key.extend_from_slice(b"/r");
+        event_key.extend_from_slice(&hints.predecessor_observation.to_be_bytes());
+        let event = store.get(&event_key)?.ok_or_else(invalid)?;
+        checks.push(Check { key: predecessor_key, expected: Expected::Version(predecessor.version) });
+        checks.push(Check { key: event_key, expected: Expected::Version(event.version) });
+        store.commit(&checks, &[])?;
+        Ok((cuts[selected].clone(), revision, checks))
     }
 
     // Read a captured predecessor after the live root has advanced. The
@@ -16589,6 +16706,14 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
 fn reset_baseline_digest(value: &serde_json::Value) -> Result<String, Error> {
     use sha2::{Digest, Sha256};
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+// Reset cut states contain HashMaps whose iteration order can change after
+// reopen. Canonicalize recursively before hashing so replay is deterministic.
+fn reset_cut_digest(value: &serde_json::Value) -> Result<String, Error> {
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    reset_baseline_digest(&canonical)
 }
 
 // Derive reset cuts from a caller-authenticated baseline without writing storage.
