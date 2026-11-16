@@ -3080,7 +3080,9 @@ impl PreparedConversationSave {
                 .any(|mutation| match mutation {
                     Mutation::Put { key, .. } | Mutation::Delete { key } => key == &check.key,
                 });
-            !(check.key.starts_with(crate::owned_subagent::NOTIFICATION_BINDING_PREFIX)
+            !(check
+                .key
+                .starts_with(crate::owned_subagent::NOTIFICATION_BINDING_PREFIX)
                 && !mutated
                 && self.checks.iter().any(|existing| existing == check))
         });
