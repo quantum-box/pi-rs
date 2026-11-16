@@ -2172,7 +2172,12 @@ impl NestedHost {
         // The block-aware projection is authoritative. Never keep the earlier
         // text-bearing outcome alongside a rewritten block result: callers can
         // observe both, and the diagnostic fallback also reads that outcome.
-        let blocks_changed = blocks.output != original_blocks.output;
+        // A rich hook may replace text while keeping structured metadata. The
+        // core outcome cannot carry both channels, so preserve the final text
+        // blocks even when the later block hook leaves them unchanged.
+        let blocks_changed = blocks.output != original_blocks.output
+            || ((rewritten || rich_output_replaced)
+                && matches!(outcome, Outcome::Structured { .. }));
         let projected_structured =
             if blocks_changed && matches!(outcome, Outcome::Structured { .. }) {
                 Some(outcome.clone())
@@ -3580,5 +3585,84 @@ mod tests {
         assert!(
             matches!(replay_finalized(&schemas, "child", &restored).unwrap(), Outcome::Failed(reason) if reason.starts_with("invalid_structured_output:"))
         );
+    }
+    #[tokio::test]
+    async fn rich_structured_projection_reattaches_to_parent_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = Uuid::new_v4();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make_host = || {
+            let mut schemas = std::collections::BTreeMap::new();
+            schemas.insert(
+                "fake".to_owned(),
+                json!({"type":"object","required":["secret"]}),
+            );
+            NestedHost::new_with_schemas(
+                Arc::new(OwnedStore::open(&path).unwrap()),
+                root,
+                vec![RegisteredTool {
+                    tool: Arc::new(Fake {
+                        calls: calls.clone(),
+                        pending: false,
+                    }),
+                    replay: ReplayPolicy::Unsafe,
+                }],
+                CancellationToken::new(),
+                Duration::from_secs(10),
+                2,
+                (schemas, None),
+            )
+            .unwrap()
+        };
+        let h = make_host();
+        let record = Record {
+            name: "fake".into(),
+            arguments: json!({}),
+            prepared: json!({}),
+            before_pending: false,
+            before_gate: None,
+            policy: ReplayPolicy::Unsafe,
+            durable_identity: None,
+            operation_id: Uuid::new_v4(),
+            outcome: Some(Outcome::Succeeded("redacted".into())),
+            staged_outcome: None,
+            hooks_required: true,
+            hook_snapshot: None,
+            output_blocks: Some(vec![json!({"type":"text","text":"redacted"})]),
+            projected_structured: Some(Outcome::Structured {
+                data: json!({"secret":"private"}),
+                attachments: vec![],
+            }),
+            diagnostics: vec![],
+            derived_diagnostics: vec![],
+            diagnostic_provenance: true,
+            diagnostic_keys: Default::default(),
+            resolution: None,
+        };
+        let key = h.explicit_key(root, "key");
+        h.shared
+            .owner
+            .store()
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        let h = make_host();
+        for _ in 0..2 {
+            let result = h.call_keyed_result("key", "fake", json!({}), true).await;
+            assert_eq!(result.outcome, Outcome::Succeeded("redacted".into()));
+            assert_eq!(
+                result.output_blocks,
+                Some(vec![json!({"type":"text","text":"redacted"})])
+            );
+            assert!(!format!("{result:?}").contains("private"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

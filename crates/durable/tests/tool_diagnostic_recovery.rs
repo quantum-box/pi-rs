@@ -1857,3 +1857,166 @@ async fn nested_explicit_diagnostics_survive_projection_and_redaction() {
         }
     }
 }
+
+#[tokio::test]
+async fn nested_rich_redaction_hides_structured_data_from_parent_and_model() {
+    use pi_rs_durable::extension::{ToolBlockResult, ToolCall as HookCall, ToolResult};
+    use std::sync::Mutex;
+    struct Capture(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for Capture {
+        async fn stream(&self, request: ModelRequest) -> pi_rs_core::Result<ModelStream> {
+            self.0.lock().unwrap().push(request.clone());
+            FakeModel("parent").stream(request).await
+        }
+    }
+    struct ChildTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl KeyedTool for ChildTool {
+        fn spec(&self) -> ToolSpec {
+            spec("child")
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Structured {
+                data: json!({"secret":"private structured value"}),
+                attachments: vec![],
+            }
+            .into()
+        }
+    }
+    struct ParentTool;
+    #[async_trait::async_trait]
+    impl KeyedTool for ParentTool {
+        fn spec(&self) -> ToolSpec {
+            spec("parent")
+        }
+        async fn invoke(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            host: KeyedHost,
+        ) -> pi_rs_core::ToolReply {
+            for _ in 0..2 {
+                let result = host.call_keyed_with_blocks("key", "child", json!({})).await;
+                assert_eq!(result.outcome, Outcome::Succeeded("redacted".into()));
+                assert_eq!(
+                    result.output_blocks,
+                    Some(vec![json!({"type":"text","text":"redacted"})])
+                );
+                assert!(!format!("{result:?}").contains("private structured value"));
+            }
+            let result = host.call_keyed_with_blocks("key", "child", json!({})).await;
+            result.outcome.into()
+        }
+    }
+    struct Redact;
+    #[async_trait::async_trait]
+    impl Hook for Redact {
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            true
+        }
+        async fn after_tool_blocks(
+            &self,
+            call: &HookCall,
+            result: &ToolBlockResult,
+            nested: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            if nested && call.name == "child" {
+                assert_eq!(
+                    result.extra["structuredOutput"]["secret"],
+                    "private structured value"
+                );
+            }
+            Ok(None)
+        }
+        async fn after_tool_result(
+            &self,
+            call: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            if call.name != "child" {
+                return Ok(None);
+            }
+            assert_eq!(
+                result.structured_output.as_ref().unwrap()["secret"],
+                "private structured value"
+            );
+            let mut result = result.clone();
+            result.output = "redacted".into();
+            Ok(Some(result))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(Capture(requests.clone())),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(ParentTool)).register(ReplayPolicy::Safe),
+            Arc::new(KeyedToolAdapter::new(ChildTool(calls.clone())))
+                .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(Extension {
+        name: "redact".into(),
+        hooks: vec![Arc::new(Redact)],
+        ..Default::default()
+    })
+    .unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    h.select_extensions(id, vec!["redact".into()]).unwrap();
+    h.set_tool_output_schema(id, "child".into(), Some(json!({"type":"object","properties":{"secret":{"type":"string"}},"required":["secret"]}))).unwrap();
+    h.submit_and_run(id, None, "go".into(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let requests = requests.lock().unwrap();
+    let tool = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .find_map(|m| match m {
+            Message::Tool { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(tool, "redacted");
+    assert!(!format!("{requests:?}").contains("private structured value"));
+    drop(requests);
+    let before = h.conversation(id).unwrap();
+    assert!(!format!("{before:?}").contains("private structured value"));
+    let history = h
+        .history(
+            id,
+            pi_rs_durable::observer::Cursor(0),
+            std::num::NonZeroUsize::new(1000).unwrap(),
+        )
+        .unwrap();
+    assert!(!format!("{:?}", history.records).contains("private structured value"));
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().messages, before.messages);
+    assert!(!format!("{:?}", h.conversation(id).unwrap()).contains("private structured value"));
+    drop(h);
+    let store = durable_store::Store::open(&path).unwrap();
+    let entries = store.list(b"nested/").unwrap();
+    assert!(
+        entries.iter().any(
+            |(_, entry)| String::from_utf8_lossy(&entry.value).contains("projected_structured")
+        )
+    );
+}
