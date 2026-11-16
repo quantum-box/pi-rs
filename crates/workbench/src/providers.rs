@@ -3072,9 +3072,9 @@ mod contention_tests {
     #[tokio::test]
     async fn deferred_legacy_preparation_does_not_resolve_credentials() {
         let client = Client::deferred(
-            Provider::named("anthropic").unwrap(),
-            Adapter::Anthropic,
-            "https://api.anthropic.com/v1/messages",
+            Provider::Radius,
+            Adapter::PiMessages,
+            "https://example.invalid/v1/messages",
             None,
             RequestHeaders::default(),
         );
