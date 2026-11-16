@@ -17,6 +17,9 @@
 //! management are NOT implemented: callers must supply fixed-length values that
 //! do not reveal secrets or low-entropy identifiers. This is not enforced by
 //! the type. Recovery, integration and Windows support are not implemented. Incomplete records
+//! Effective-auth fingerprint derivation and reading actual configuration are
+//! not implemented. The target records the expected effective auth state at
+//! completion, including any intended configuration changes.
 //! must block new work until a separately designed recovery policy resolves them.
 //! An absent record alone is not evidence that no transaction ever existed.
 //!
@@ -36,9 +39,9 @@ use std::{
 
 const NAME: &str = "mcp-oauth-transaction.journal";
 const MAGIC: &[u8; 8] = b"PIMCPJNL";
-const VERSION: u8 = 3;
-// Header + six tagged 32-byte IDs + the previous-generation presence byte.
-const PREFIX_LEN: usize = 10 + 6 * 33 + 1;
+const VERSION: u8 = 4;
+// Header + seven tagged 32-byte IDs + the previous-generation presence byte.
+const PREFIX_LEN: usize = 10 + 7 * 33 + 1;
 const RECORD_LEN: usize = PREFIX_LEN + 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +101,8 @@ pub(crate) struct Target {
     pub(crate) credential: OpaqueId,
     pub(crate) store: OpaqueId,
     pub(crate) config: OpaqueId,
+    /// Fingerprint of the expected effective authentication configuration after commit.
+    pub(crate) auth_fingerprint: OpaqueId,
     pub(crate) previous_generation: Option<OpaqueId>,
     pub(crate) new_generation: OpaqueId,
 }
@@ -108,13 +113,45 @@ pub(crate) struct TargetScope {
     pub(crate) store: OpaqueId,
     pub(crate) config: OpaqueId,
 }
-/// Read-only recovery information. This is not a capability to advance or
-/// clear the journal; recovery must first validate the credential store.
+/// Snapshot returned by inspection; it does not by itself authorize recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inspection {
     pub(crate) stage: Stage,
     pub(crate) previous_generation: Option<OpaqueId>,
     pub(crate) new_generation: OpaqueId,
+    #[cfg(test)]
+    record: Record,
+}
+/// Test-only model of a caller-asserted observation. Production recovery is
+/// unavailable until real credential/config verification and both lock
+/// lifetimes are bound to a capability by the authentication implementation.
+/// This type is not proof: the constructor cannot verify the external inputs.
+/// The caller must independently authenticate the store and config identity,
+/// read the effective auth settings and actual credential generation, and hold
+/// both the shared config gate and the
+/// credential lock continuously from observation through clearing. Unknown or
+/// missing generations or fingerprints must be passed as None and are rejected.
+#[cfg(test)]
+pub(crate) struct VerifiedObservation {
+    scope: TargetScope,
+    generation: OpaqueId,
+    auth_fingerprint: OpaqueId,
+}
+#[cfg(test)]
+impl VerifiedObservation {
+    pub(crate) fn from_caller_verified(
+        scope: TargetScope,
+        generation: Option<OpaqueId>,
+        auth_fingerprint: Option<OpaqueId>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            scope,
+            generation: generation
+                .ok_or_else(|| invalid("actual credential generation is unknown"))?,
+            auth_fingerprint: auth_fingerprint
+                .ok_or_else(|| invalid("effective authentication fingerprint is unknown"))?,
+        })
+    }
 }
 impl Target {
     pub(crate) fn scope(self) -> TargetScope {
@@ -191,6 +228,8 @@ impl Record {
         );
         bytes.push(6);
         bytes.extend_from_slice(&self.identity.target.new_generation.0);
+        bytes.push(7);
+        bytes.extend_from_slice(&self.identity.target.auth_fingerprint.0);
         debug_assert_eq!(bytes.len(), PREFIX_LEN);
         let checksum = Sha256::digest(&bytes);
         bytes.extend_from_slice(&checksum);
@@ -243,10 +282,18 @@ impl Record {
         offset += 1;
         let new_generation =
             OpaqueId::new(bytes[offset..offset + 32].try_into().expect("fixed length"))?;
+        offset += 32;
+        if bytes[offset] != 7 {
+            return Err(invalid("unknown or misplaced auth fingerprint kind"));
+        }
+        offset += 1;
+        let auth_fingerprint =
+            OpaqueId::new(bytes[offset..offset + 32].try_into().expect("fixed length"))?;
         let target = Target {
             credential,
             store,
             config,
+            auth_fingerprint,
             previous_generation,
             new_generation,
         };
@@ -413,6 +460,8 @@ impl Journal {
                 stage: record.stage,
                 previous_generation: record.identity.target.previous_generation,
                 new_generation: record.identity.target.new_generation,
+                #[cfg(test)]
+                record,
             })),
             None => Ok(None),
         }
@@ -491,6 +540,31 @@ impl Journal {
         {
             Err(unsupported())
         }
+    }
+    /// Recovery-only clear of an inspected complete journal. The inspection is
+    /// bound to the entire original record (including transaction ID). Re-read
+    /// it before removal so stale inspections and changed stages fail closed.
+    /// The caller-supplied observation is an assertion, not independently
+    /// verified here; freshness depends on the locks described on its type.
+    #[cfg(test)]
+    pub(crate) fn clear_inspected_complete(
+        &self,
+        inspection: Inspection,
+        observed: VerifiedObservation,
+    ) -> io::Result<()> {
+        let expected = inspection.record;
+        if expected.stage != Stage::Complete {
+            return Err(invalid("cannot recover an incomplete transaction"));
+        }
+        if observed.scope != expected.identity.target.scope()
+            || observed.generation != expected.identity.target.new_generation
+            || observed.auth_fingerprint != expected.identity.target.auth_fingerprint
+        {
+            return Err(conflict(
+                "verified state does not match complete transaction",
+            ));
+        }
+        self.clear_complete(expected.identity, expected)
     }
     fn write(&self, record: Record) -> io::Result<()> {
         self.check_ready()?;
@@ -590,6 +664,7 @@ mod tests {
             credential: id(2),
             store: id(3),
             config: id(4),
+            auth_fingerprint: id(8),
             previous_generation: Some(id(5)),
             new_generation: id(6),
         }
@@ -676,6 +751,7 @@ mod tests {
                 stage: Stage::Prepared,
                 previous_generation: target().previous_generation,
                 new_generation: target().new_generation,
+                record,
             })
         );
         assert_eq!(record.identity().target(), target());
@@ -692,6 +768,155 @@ mod tests {
             reopened.read_matching(record.identity()).unwrap(),
             Some(record)
         );
+    }
+
+    #[test]
+    fn recovery_clears_complete_after_restart_with_verified_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::new(dir.path()).unwrap();
+        complete(&j, target());
+        drop(j);
+        let reopened = Journal::new(dir.path()).unwrap();
+        let inspection = reopened.inspect_scope(target().scope()).unwrap().unwrap();
+        let observed = VerifiedObservation::from_caller_verified(
+            target().scope(),
+            Some(target().new_generation),
+            Some(target().auth_fingerprint),
+        )
+        .unwrap();
+        reopened
+            .clear_inspected_complete(inspection, observed)
+            .unwrap();
+        assert!(reopened.inspect_scope(target().scope()).unwrap().is_none());
+    }
+    #[test]
+    fn recovery_refuses_incomplete_unknown_or_different_live_state() {
+        for stage in [
+            Stage::Prepared,
+            Stage::ConfigInProgress,
+            Stage::CredentialsInProgress,
+            Stage::Complete,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let j = Journal::new(dir.path()).unwrap();
+            let mut r = j.begin(target()).unwrap();
+            for next in [
+                Stage::ConfigInProgress,
+                Stage::CredentialsInProgress,
+                Stage::Complete,
+            ] {
+                if r.stage == stage {
+                    break;
+                }
+                r = j.advance(r.identity(), r, next).unwrap();
+            }
+            let original = std::fs::read(&j.path).unwrap();
+            let inspection = j.inspect_scope(target().scope()).unwrap().unwrap();
+            assert!(
+                VerifiedObservation::from_caller_verified(
+                    target().scope(),
+                    None,
+                    Some(target().auth_fingerprint)
+                )
+                .is_err()
+            );
+            let mut wrong = target().scope();
+            for field in 0..3 {
+                match field {
+                    0 => wrong.credential = id(7),
+                    1 => wrong.store = id(7),
+                    _ => wrong.config = id(7),
+                }
+                let obs = VerifiedObservation::from_caller_verified(
+                    wrong,
+                    Some(target().new_generation),
+                    Some(target().auth_fingerprint),
+                )
+                .unwrap();
+                assert!(j.clear_inspected_complete(inspection, obs).is_err());
+                wrong = target().scope();
+            }
+            let wrong_generation = VerifiedObservation::from_caller_verified(
+                target().scope(),
+                Some(id(7)),
+                Some(target().auth_fingerprint),
+            )
+            .unwrap();
+            assert!(
+                j.clear_inspected_complete(inspection, wrong_generation)
+                    .is_err()
+            );
+            if stage != Stage::Complete {
+                let obs = VerifiedObservation::from_caller_verified(
+                    target().scope(),
+                    Some(target().new_generation),
+                    Some(target().auth_fingerprint),
+                )
+                .unwrap();
+                assert!(j.clear_inspected_complete(inspection, obs).is_err());
+            }
+            assert_eq!(std::fs::read(&j.path).unwrap(), original);
+        }
+    }
+    #[test]
+    fn recovery_refuses_stale_or_replaced_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::new(dir.path()).unwrap();
+        let old = complete(&j, target());
+        let inspection = j.inspect_scope(target().scope()).unwrap().unwrap();
+        j.clear_complete(old.identity(), old).unwrap();
+        let new = complete(&j, target());
+        assert_ne!(old.identity(), new.identity());
+        let before = std::fs::read(&j.path).unwrap();
+        let observed = VerifiedObservation::from_caller_verified(
+            target().scope(),
+            Some(target().new_generation),
+            Some(target().auth_fingerprint),
+        )
+        .unwrap();
+        assert!(j.clear_inspected_complete(inspection, observed).is_err());
+        assert_eq!(std::fs::read(&j.path).unwrap(), before);
+        assert_eq!(j.read_matching(new.identity()).unwrap(), Some(new));
+    }
+    #[test]
+    fn recovery_rejects_changed_or_unknown_effective_auth_in_same_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::new(dir.path()).unwrap();
+        let record = complete(&j, target());
+        let inspection = j.inspect_scope(target().scope()).unwrap().unwrap();
+        let before = std::fs::read(&j.path).unwrap();
+        assert!(
+            VerifiedObservation::from_caller_verified(
+                target().scope(),
+                Some(target().new_generation),
+                None
+            )
+            .is_err()
+        );
+        let changed = VerifiedObservation::from_caller_verified(
+            target().scope(),
+            Some(target().new_generation),
+            Some(id(9)),
+        )
+        .unwrap();
+        assert!(j.clear_inspected_complete(inspection, changed).is_err());
+        assert_eq!(std::fs::read(&j.path).unwrap(), before);
+        let mut different = record.identity();
+        different.target.auth_fingerprint = id(9);
+        assert!(j.read_matching(different).is_err());
+        drop(j);
+        let reopened = Journal::new(dir.path()).unwrap();
+        let inspection = reopened.inspect_scope(target().scope()).unwrap().unwrap();
+        let matching = VerifiedObservation::from_caller_verified(
+            target().scope(),
+            Some(target().new_generation),
+            Some(target().auth_fingerprint),
+        )
+        .unwrap();
+        reopened
+            .clear_inspected_complete(inspection, matching)
+            .unwrap();
+        assert!(reopened.read().unwrap().is_none());
     }
 
     #[test]
@@ -753,7 +978,7 @@ mod tests {
             assert!(j.read_matching(identity).is_err());
             assert!(j.begin(target()).is_err());
         }
-        for version in [1, 2, 99] {
+        for version in [1, 2, 3, 99] {
             let mut old = valid.clone();
             old[8] = version;
             let checksum = Sha256::digest(&old[..PREFIX_LEN]);
@@ -761,7 +986,14 @@ mod tests {
             std::fs::write(&j.path, old).unwrap();
             assert!(j.read_matching(identity).is_err());
         }
-        for offset in [10, 43, 76, 109, 142, 176] {
+        // Version 3 did not have the tagged auth fingerprint.
+        let mut v3 = valid[..209].to_vec();
+        v3[8] = 3;
+        let checksum = Sha256::digest(&v3);
+        v3.extend_from_slice(&checksum);
+        std::fs::write(&j.path, v3).unwrap();
+        assert!(j.read_matching(identity).is_err());
+        for offset in [10, 43, 76, 109, 142, 176, 209] {
             let mut corrupt = valid.clone();
             corrupt[offset] = 99;
             let checksum = Sha256::digest(&corrupt[..PREFIX_LEN]);
