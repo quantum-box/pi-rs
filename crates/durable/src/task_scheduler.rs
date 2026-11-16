@@ -575,9 +575,7 @@ impl TaskNotificationAssembly {
         }
         let Some(old) = self.original.checks().iter().find_map(|check| {
             if check.key == b"runtime/conversation/"
-                && let durable_store::Expected::PrefixUnchangedSince(
-                    boundary,
-                ) = check.expected
+                && let durable_store::Expected::PrefixUnchangedSince(boundary) = check.expected
             {
                 return Some(boundary);
             }
@@ -589,17 +587,15 @@ impl TaskNotificationAssembly {
         // after it will still conflict at the final atomic commit.
         let boundary = store.put_version()?;
         for notify in &self.reservation_destinations {
-            match crate::runtime::check_submission_destination(
-                store, notify,
-            ) {
+            match crate::runtime::check_submission_destination(store, notify) {
                 Ok(true) => {}
                 Ok(false) => return Ok(false),
                 Err(crate::document::Error::Store(error)) => {
                     return Err(error.into());
                 }
-                Err(crate::document::Error::Signal(
-                    task_store::Error::Store(error),
-                )) => return Err(error.into()),
+                Err(crate::document::Error::Signal(task_store::Error::Store(error))) => {
+                    return Err(error.into());
+                }
                 Err(_) => return Ok(false),
             }
         }
@@ -633,7 +629,7 @@ impl TaskNotificationAssembly {
         let tasks = task_store::TaskStore::new(store);
         if let Some(keys) = self.reservation_wait.get(task) {
             match tasks.validate_typed_wait_keys(*task, keys) {
-                Ok(()) => {},
+                Ok(()) => {}
                 Err(task_store::Error::Store(error)) => return Err(error.into()),
                 Err(_) => return Ok(false),
             }
@@ -4315,7 +4311,10 @@ impl Scheduler {
         let mut reservation_conversations_only = false;
         let document_result = documents.prepare(&running).and_then(|mut prepared| {
             if let Some(intent) = &prepared.task_input {
-                reservation_conversations_only = !prepared.document_batch.checks.iter()
+                reservation_conversations_only = !prepared
+                    .document_batch
+                    .checks
+                    .iter()
                     .chain(prepared.transaction.checks())
                     .chain(intent.ancestry_checks.iter())
                     .any(|check| check.key == b"runtime/conversation/");
@@ -4485,14 +4484,19 @@ impl Scheduler {
             }
             let keys = match next.task.state() {
                 TaskState::Waiting(WaitFor::TypedSignal(key)) => vec![key.clone()],
-                TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) if !signals.is_empty() => signals.clone(),
+                TaskState::Waiting(WaitFor::TypedSleep { signals, .. }) if !signals.is_empty() => {
+                    signals.clone()
+                }
                 _ => return false,
             };
             reservation_wait.insert(*task, keys);
             true
         });
         reservation_conversations_only &= !reservation_destinations.is_empty()
-            && !graph.checks.iter().any(|check| check.key == b"runtime/conversation/");
+            && !graph
+                .checks
+                .iter()
+                .any(|check| check.key == b"runtime/conversation/");
         crate::document::reconcile_task_checks(&mut document_batch, &mut graph);
         transaction.append(document_batch)?;
         transaction.append(graph)?;
@@ -4618,7 +4622,10 @@ impl Scheduler {
                 && (assembly.settlements.iter().any(|(notify, _, _)| {
                     task_store::key(notify.task_id) == *key
                         || task_store::signal_revision_key(notify.task_id) == *key
-                }) || assembly.reservation_only.keys().any(|task| task_store::signal_revision_key(*task) == *key))
+                }) || assembly
+                    .reservation_only
+                    .keys()
+                    .any(|task| task_store::signal_revision_key(*task) == *key))
             {
                 let refreshed = assembly.refresh_reservation_revision(owner.store(), key)?;
                 let old = assembly
@@ -18892,30 +18899,21 @@ mod standalone_foreground_cleanup_tests {
         }
     }
 
-
     #[test]
-    fn queued_reservation_rebuilds_unrelated_signal_and_conversation_conflicts()
-     {
+    fn queued_reservation_rebuilds_unrelated_signal_and_conversation_conflicts() {
         use crate::document::{Address, Documents, TaskDocuments};
         use crate::runtime::{
-            AdmissionOptions, Config, Harness, Options, Status,
-            SubmissionNotify, submission_settled_signal,
+            AdmissionOptions, Config, Harness, Options, Status, SubmissionNotify,
+            submission_settled_signal,
         };
-        use crate::task_store::{
-            Signal, SignalResult, SignalToken, TaskStore,
-        };
+        use crate::task_store::{Signal, SignalResult, SignalToken, TaskStore};
         use async_trait::async_trait;
-        use pi_rs_core::{
-            Error as ModelError, Model, ModelRequest, ModelStream,
-        };
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         struct Stub;
         #[async_trait]
         impl Model for Stub {
-            async fn stream(
-                &self,
-                _: ModelRequest,
-            ) -> Result<ModelStream, ModelError> {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
                 unreachable!()
             }
         }
@@ -18940,10 +18938,20 @@ mod standalone_foreground_cleanup_tests {
                     key: "queued".into(),
                 });
                 if self.local {
-                    docs.submit_input_without_request_id("queued".into(), AdmissionOptions::default(), notify)
+                    docs.submit_input_without_request_id(
+                        "queued".into(),
+                        AdmissionOptions::default(),
+                        notify,
+                    )
                 } else {
-                    docs.submit_input_to_session_conversation_without_request_id(self.target, "queued".into(), AdmissionOptions::default(), notify)
-                }.map_err(|e| e.to_string())?;
+                    docs.submit_input_to_session_conversation_without_request_id(
+                        self.target,
+                        "queued".into(),
+                        AdmissionOptions::default(),
+                        notify,
+                    )
+                }
+                .map_err(|e| e.to_string())?;
                 let address = Address {
                     scope: "test".into(),
                     name: "queued-proof".into(),
@@ -18956,16 +18964,9 @@ mod standalone_foreground_cleanup_tests {
                 )
                 .map_err(|e| e.to_string())?;
                 if self.observe {
-                    let token =
-                        SignalToken::new("handler-observation", 1).unwrap();
-                    docs.signal_at(
-                        task.id(),
-                        &token,
-                        "handler",
-                        json!(3),
-                        0,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let token = SignalToken::new("handler-observation", 1).unwrap();
+                    docs.signal_at(task.id(), &token, "handler", json!(3), 0)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(Step::Wait {
                     checkpoint: Checkpoint {
@@ -18975,9 +18976,7 @@ mod standalone_foreground_cleanup_tests {
                     condition: WaitFor::TypedSleep {
                         until_millis: None,
                         signals: vec![
-                            submission_settled_signal()
-                                .key("queued")
-                                .unwrap(),
+                            submission_settled_signal().key("queued").unwrap(),
                             SignalToken::new("unrelated", 1)
                                 .unwrap()
                                 .key("consumed")
@@ -18997,21 +18996,29 @@ mod standalone_foreground_cleanup_tests {
                     let signal_race = mode == 1 || mode == 2;
                     let dir = tempfile::tempdir().unwrap();
                     let path = dir.path().join("db");
-                    let mut harness = Harness::open_paused(&path, Options { model: Arc::new(Stub), tools: vec![], restart_limit: 3, max_turns: 3, uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult }).unwrap();
+                    let mut harness = Harness::open_paused(
+                        &path,
+                        Options {
+                            model: Arc::new(Stub),
+                            tools: vec![],
+                            restart_limit: 3,
+                            max_turns: 3,
+                            uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                        },
+                    )
+                    .unwrap();
                     let config = || Config {
                         model: "test".into(),
                         system_prompt: String::new(),
                         max_output_tokens: 10,
                     };
-                    let owner =
-                        harness.create_conversation(config()).unwrap();
+                    let owner = harness.create_conversation(config()).unwrap();
                     let target = if local {
                         owner
                     } else {
                         harness.create_conversation(config()).unwrap()
                     };
-                    let unrelated =
-                        harness.create_conversation(config()).unwrap();
+                    let unrelated = harness.create_conversation(config()).unwrap();
                     harness.submit(target, None, "busy".into()).unwrap();
                     let store = durable_store::Store::open(&path).unwrap();
                     if !local {
@@ -19032,8 +19039,7 @@ mod standalone_foreground_cleanup_tests {
                             calls: calls.clone(),
                         },
                     );
-                    let mut scheduler =
-                        harness.attach_tasks(registry).unwrap();
+                    let mut scheduler = harness.attach_tasks(registry).unwrap();
                     let task = Task::new(
                         Uuid::new_v4(),
                         TaskOwner::Conversation(owner),
@@ -19049,38 +19055,77 @@ mod standalone_foreground_cleanup_tests {
                     let once = Arc::new(AtomicBool::new(false));
                     let task_id = task.id();
                     scheduler.set_result_commit_hook(Arc::new(move |_, store| {
-                        if once.swap(true, Ordering::SeqCst) { return; }
+                        if once.swap(true, Ordering::SeqCst) {
+                            return;
+                        }
                         if mode == 3 {
                             let id = Uuid::new_v4();
                             let token = SignalToken::new("unrelated", 1).unwrap();
-                            let signal = Signal::new_typed(id, task_id, &token, "consumed", json!(7)).unwrap();
+                            let signal =
+                                Signal::new_typed(id, task_id, &token, "consumed", json!(7))
+                                    .unwrap();
                             let mut value = serde_json::to_value(signal).unwrap();
                             value["consumed"] = json!(true);
                             let mut signal_key = b"durable/signal/".to_vec();
                             signal_key.extend_from_slice(task_id.as_bytes());
                             signal_key.extend_from_slice(id.as_bytes());
-                            store.commit(&[], &[
-                                durable_store::Mutation::Put { key: signal_key, value: serde_json::to_vec(&value).unwrap() },
-                                durable_store::Mutation::Put { key: task_store::signal_revision_key(task_id), value: vec![] },
-                            ]).unwrap();
+                            store
+                                .commit(
+                                    &[],
+                                    &[
+                                        durable_store::Mutation::Put {
+                                            key: signal_key,
+                                            value: serde_json::to_vec(&value).unwrap(),
+                                        },
+                                        durable_store::Mutation::Put {
+                                            key: task_store::signal_revision_key(task_id),
+                                            value: vec![],
+                                        },
+                                    ],
+                                )
+                                .unwrap();
                         } else if signal_race {
                             let token = SignalToken::new("unrelated", 1).unwrap();
-                            assert_eq!(TaskStore::new(store).deliver_signal_at(task_id, &token, "other", json!(7), 0).unwrap(), SignalResult::Delivered);
+                            assert_eq!(
+                                TaskStore::new(store)
+                                    .deliver_signal_at(task_id, &token, "other", json!(7), 0)
+                                    .unwrap(),
+                                SignalResult::Delivered
+                            );
                         } else {
                             let key = format!("runtime/conversation/{unrelated}").into_bytes();
                             let entry = store.get(&key).unwrap().unwrap();
-                            store.commit(&[durable_store::Check { key: key.clone(), expected: durable_store::Expected::Version(entry.version) }], &[durable_store::Mutation::Put { key, value: entry.value }]).unwrap();
+                            store
+                                .commit(
+                                    &[durable_store::Check {
+                                        key: key.clone(),
+                                        expected: durable_store::Expected::Version(entry.version),
+                                    }],
+                                    &[durable_store::Mutation::Put {
+                                        key,
+                                        value: entry.value,
+                                    }],
+                                )
+                                .unwrap();
                             if mode == 4 {
-                                let address = Address { scope: "test".into(), name: "queued-proof".into(), key: "".into() };
+                                let address = Address {
+                                    scope: "test".into(),
+                                    name: "queued-proof".into(),
+                                    key: "".into(),
+                                };
                                 let mut tx = crate::document::Transaction::new();
-                                tx.put(&address, durable_store::Expected::Missing, json!({"external":true}).as_object().unwrap()).unwrap();
+                                tx.put(
+                                    &address,
+                                    durable_store::Expected::Missing,
+                                    json!({"external":true}).as_object().unwrap(),
+                                )
+                                .unwrap();
                                 tx.commit(store).unwrap();
                             }
                         }
                     }));
                     assert!(scheduler.tick(0).unwrap());
-                    let current =
-                        scheduler.get(task.id()).unwrap().unwrap();
+                    let current = scheduler.get(task.id()).unwrap().unwrap();
                     if mode >= 2 {
                         assert!(
                             matches!(current.state(), TaskState::Failed(_)),
@@ -19088,24 +19133,10 @@ mod standalone_foreground_cleanup_tests {
                             current.state()
                         );
                         assert_eq!(calls.load(Ordering::SeqCst), 1);
-                        assert_eq!(
-                            harness
-                                .conversation(target)
-                                .unwrap()
-                                .submissions
-                                .len(),
-                            1
-                        );
-                        let binding = format!(
-                            "durable/owned-subagent-notify/{}/717565756564",
-                            task.id()
-                        );
-                        assert!(
-                            store
-                                .get(binding.as_bytes())
-                                .unwrap()
-                                .is_none()
-                        );
+                        assert_eq!(harness.conversation(target).unwrap().submissions.len(), 1);
+                        let binding =
+                            format!("durable/owned-subagent-notify/{}/717565756564", task.id());
+                        assert!(store.get(binding.as_bytes()).unwrap().is_none());
                         continue;
                     }
                     assert!(
@@ -19117,16 +19148,10 @@ mod standalone_foreground_cleanup_tests {
                     let state = harness.conversation(target).unwrap();
                     assert_eq!(state.submissions.len(), 2);
                     assert_eq!(state.submissions[1].status, Status::Queued);
-                    let binding = format!(
-                        "durable/owned-subagent-notify/{}/717565756564",
-                        task.id()
-                    );
+                    let binding =
+                        format!("durable/owned-subagent-notify/{}/717565756564", task.id());
                     let bound: (Uuid, Uuid) = serde_json::from_slice(
-                        &store
-                            .get(binding.as_bytes())
-                            .unwrap()
-                            .unwrap()
-                            .value,
+                        &store.get(binding.as_bytes()).unwrap().unwrap().value,
                     )
                     .unwrap();
                     assert_eq!(bound, (target, state.submissions[1].id));
@@ -19135,15 +19160,9 @@ mod standalone_foreground_cleanup_tests {
                         name: "queued-proof".into(),
                         key: "".into(),
                     };
-                    assert!(
-                        Documents::new(&store)
-                            .get(&address)
-                            .unwrap()
-                            .is_some()
-                    );
+                    assert!(Documents::new(&store).get(&address).unwrap().is_some());
                 }
             }
         }
     }
-
 }
