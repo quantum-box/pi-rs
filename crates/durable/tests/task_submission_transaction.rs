@@ -3536,3 +3536,529 @@ fn cross_session_target_cleanup_marker_fences_prepared_input() {
     assert!(Documents::new(&store).get(&address()).unwrap().is_none());
     driver.shutdown().unwrap();
 }
+
+struct CrossAction {
+    target: Uuid,
+    write: bool,
+    fail: bool,
+    staged: Option<std::sync::mpsc::Sender<()>>,
+    release: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+fn cross_action(target: Uuid, write: bool) -> CrossAction {
+    CrossAction {
+        target,
+        write,
+        fail: false,
+        staged: None,
+        release: None,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+impl Handler for CrossAction {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        let notify = Some(SubmissionNotify {
+            task_id: task.id(),
+            key: "action-settled".into(),
+        });
+        let result = if self.write {
+            docs.submit_write_to_session_conversation(
+                self.target,
+                "cross-action".into(),
+                "app.cross".into(),
+                Some(json!({"n":1})),
+                notify,
+            )
+        } else {
+            docs.submit_continue_to_session_conversation(self.target, "cross-action".into(), notify)
+        };
+        if let Err(error) = result {
+            return Ok(Step::Fail(error.to_string()));
+        }
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"action":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if let Some(staged) = &self.staged {
+                staged.send(()).unwrap();
+            }
+            if let Some(release) = &self.release {
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if self.fail {
+            return Ok(Step::Fail("rollback".into()));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("action-settled").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn cross_session_continue_and_write_settle_atomically_and_reopen() {
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, _) = cross_setup(&path);
+        let mut registry = Registry::default();
+        registry.register("action", true, cross_action(target, write));
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "action");
+        driver.submit(&child).unwrap();
+        wait_task(&path, child.id(), |s| {
+            if write {
+                matches!(s, TaskState::Succeeded(_))
+            } else {
+                matches!(s, TaskState::Waiting(_))
+            }
+        });
+        let store = Store::open(&path).unwrap();
+        assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+        assert!(h.conversation(owner).unwrap().submissions.is_empty());
+        if write {
+            assert_eq!(h.conversation(target).unwrap().application_writes.len(), 1);
+        } else {
+            assert_eq!(h.conversation(target).unwrap().submissions.len(), 1);
+        }
+        driver.shutdown().unwrap();
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        if !write {
+            let mut registry = Registry::default();
+            registry.register("action", true, cross_action(target, write));
+            let driver = h.start_tasks(registry).unwrap();
+            h.resume_conversation(target, &CancellationToken::new())
+                .await
+                .unwrap();
+            wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+            driver.shutdown().unwrap();
+        }
+        let signal = TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), "action-settled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal["type"], if write { "write" } else { "continue" });
+        assert_eq!(
+            h.conversation(target).unwrap().application_writes.len(),
+            usize::from(write)
+        );
+        assert_eq!(
+            h.conversation(target).unwrap().submissions.len(),
+            usize::from(!write)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_session_continue_busy_and_write_after_two_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, owner, target, _) = cross_setup(&path);
+    h.submit(target, None, "initial".into()).unwrap();
+    let first = h.reset(target, None).unwrap();
+    let second = h.reset(target, None).unwrap();
+    let mut registry = Registry::default();
+    registry.register("continue", true, cross_action(target, false));
+    registry.register("write", true, cross_action(target, true));
+    let driver = h.start_tasks(registry).unwrap();
+    let rejected = task(owner, "continue");
+    driver.submit(&rejected).unwrap();
+    wait_task(&path, rejected.id(), |s| matches!(s, TaskState::Failed(_)));
+    let child = task(owner, "write");
+    driver.submit(&child).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Waiting(_)));
+    let state = h.conversation(target).unwrap();
+    assert_eq!(state.submissions.len(), 1);
+    assert_eq!(state.application_writes.len(), 1);
+    assert!(!state.application_writes[0].placed);
+    assert_eq!(state.application_writes[0].after_reset, Some(second));
+    driver.shutdown().unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("write", true, cross_action(target, true));
+    let driver = h.start_tasks(registry).unwrap();
+    h.resume_conversation(target, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    let state = h.conversation(target).unwrap();
+    assert_eq!(
+        state.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [first, second]
+    );
+    assert!(state.application_writes[0].placed);
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn cross_session_action_rollback_and_duplicate_notification_rejection() {
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (mut h, owner, target, _) = cross_setup(&path);
+        let mut handler = cross_action(target, write);
+        handler.fail = true;
+        let mut registry = Registry::default();
+        registry.register("action", true, handler);
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "action");
+        driver.submit(&child).unwrap();
+        wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+        let store = Store::open(&path).unwrap();
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        assert!(h.conversation(target).unwrap().submissions.is_empty());
+        assert!(
+            h.conversation(target)
+                .unwrap()
+                .application_writes
+                .is_empty()
+        );
+        driver.shutdown().unwrap();
+        if write {
+            h.submit_write(target, Some("cross-action".into()), "app.host".into(), None)
+                .unwrap();
+        } else {
+            h.submit_continue(target, Some("cross-action".into()))
+                .unwrap();
+        }
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let mut registry = Registry::default();
+        registry.register("action", true, cross_action(target, write));
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "action");
+        driver.submit(&child).unwrap();
+        wait_task(&path, child.id(), |s| matches!(s, TaskState::Failed(_)));
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        let state = h.conversation(target).unwrap();
+        assert_eq!(state.application_writes.len(), usize::from(write));
+        assert_eq!(state.submissions.len(), usize::from(!write));
+        driver.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn cross_session_actions_replay_revocation_and_reject_abort() {
+    for write in [false, true] {
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (mut h, owner, target, session) = cross_setup(&path);
+            let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut handler = cross_action(target, write);
+            handler.staged = Some(staged_tx);
+            handler.release = Some(std::sync::Mutex::new(release_rx));
+            let calls = handler.calls.clone();
+            let mut registry = Registry::default();
+            registry.register("action", true, handler);
+            let driver = h.start_tasks(registry).unwrap();
+            let child = task(owner, "action");
+            driver.submit(&child).unwrap();
+            staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let store = Store::open(&path).unwrap();
+            if abort {
+                h.request_abort(target).unwrap();
+            } else {
+                let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+                membership.revoke(session, target).unwrap();
+                membership.enroll(session, target).unwrap();
+            }
+            assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+            release_tx.send(()).unwrap();
+            wait_task(&path, child.id(), |s| {
+                if abort {
+                    matches!(s, TaskState::Failed(_))
+                } else if write {
+                    matches!(s, TaskState::Succeeded(_))
+                } else {
+                    matches!(s, TaskState::Waiting(_))
+                }
+            });
+            if abort {
+                assert!(h.conversation(target).unwrap().submissions.is_empty());
+                assert!(
+                    h.conversation(target)
+                        .unwrap()
+                        .application_writes
+                        .is_empty()
+                );
+                assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+            } else {
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+                let state = h.conversation(target).unwrap();
+                assert_eq!(state.submissions.len(), usize::from(!write));
+                assert_eq!(state.application_writes.len(), usize::from(write));
+            }
+            driver.shutdown().unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+struct KillCrossAction {
+    target: Uuid,
+    write: bool,
+}
+#[cfg(unix)]
+impl Handler for KillCrossAction {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use std::io::Write;
+        cross_action(self.target, self.write).run_with_documents(task, docs)?;
+        println!("CROSS_ACTION_STAGED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cross_session_action_kill_worker() {
+    let Ok(path) = std::env::var("CROSS_ACTION_DB") else {
+        return;
+    };
+    let owner = std::env::var("CROSS_ACTION_OWNER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let target = std::env::var("CROSS_ACTION_TARGET")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let write = std::env::var("CROSS_ACTION_WRITE").unwrap() == "1";
+    let h = Harness::open_paused(path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("action", true, KillCrossAction { target, write });
+    let driver = h.start_tasks(registry).unwrap();
+    let child = Task::new(
+        Uuid::from_u128(9998),
+        TaskOwner::Conversation(owner),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("action".into(), true);
+    driver.submit(&child).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn cross_session_actions_recover_once_after_process_kill() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, _) = cross_setup(&path);
+        drop(h);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cross_session_action_kill_worker", "--nocapture"])
+            .env("CROSS_ACTION_DB", &path)
+            .env("CROSS_ACTION_OWNER", owner.to_string())
+            .env("CROSS_ACTION_TARGET", target.to_string())
+            .env("CROSS_ACTION_WRITE", if write { "1" } else { "0" })
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line.contains("CROSS_ACTION_STAGED") {
+                    let _ = tx.send(());
+                    break;
+                }
+            }
+        });
+        let reached = rx.recv_timeout(Duration::from_secs(20));
+        let _ = child.kill();
+        let _ = child.wait();
+        reached.expect("worker did not stage action");
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let state = h.conversation(target).unwrap();
+        assert!(state.submissions.is_empty());
+        assert!(state.application_writes.is_empty());
+        let mut registry = Registry::default();
+        registry.register("action", true, cross_action(target, write));
+        let driver = h.start_tasks(registry).unwrap();
+        wait_task(&path, Uuid::from_u128(9998), |s| {
+            if write {
+                matches!(s, TaskState::Succeeded(_))
+            } else {
+                matches!(s, TaskState::Waiting(_))
+            }
+        });
+        let state = h.conversation(target).unwrap();
+        assert_eq!(state.submissions.len(), usize::from(!write));
+        assert_eq!(state.application_writes.len(), usize::from(write));
+        driver.shutdown().unwrap();
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        let state = h.conversation(target).unwrap();
+        assert_eq!(state.submissions.len(), usize::from(!write));
+        assert_eq!(state.application_writes.len(), usize::from(write));
+    }
+}
+
+#[test]
+fn cross_session_actions_fence_target_foreground_failure() {
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, _) = cross_setup(&path);
+        let store = Store::open(&path).unwrap();
+        let parent = cross_attach_target_owner(
+            &store,
+            owner,
+            target,
+            pi_rs_durable::ownership_edge::Mode::Foreground,
+        );
+        let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut handler = cross_action(target, write);
+        handler.staged = Some(staged_tx);
+        handler.release = Some(std::sync::Mutex::new(release_rx));
+        let mut registry = Registry::default();
+        registry.register("action", true, handler);
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "action");
+        driver.submit(&child).unwrap();
+        staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cross_mark_completing_failed(&store, parent);
+        release_tx.send(()).unwrap();
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Failed(_) | TaskState::Cancelled)
+        });
+        let target_state = h.conversation(target).unwrap();
+        assert!(target_state.submissions.is_empty());
+        assert!(target_state.application_writes.is_empty());
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        driver.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn cross_session_actions_unsafe_attempts_do_not_replay_on_conflict() {
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, session) = cross_setup(&path);
+        let store = Store::open(&path).unwrap();
+        let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut handler = cross_action(target, write);
+        handler.staged = Some(staged_tx);
+        handler.release = Some(std::sync::Mutex::new(release_rx));
+        let calls = handler.calls.clone();
+        let mut registry = Registry::default();
+        registry.register("action-unsafe", false, handler);
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "action-unsafe").registered("action-unsafe".into(), false);
+        driver.submit(&child).unwrap();
+        staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let membership = pi_rs_durable::session_membership::SessionMembership::new(&store);
+        membership.revoke(session, target).unwrap();
+        membership.enroll(session, target).unwrap();
+        release_tx.send(()).unwrap();
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Failed(_))
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let state = h.conversation(target).unwrap();
+        assert!(state.submissions.is_empty());
+        assert!(state.application_writes.is_empty());
+        assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+        driver.shutdown().unwrap();
+    }
+}
+
+struct CrossActionForeign {
+    target: Uuid,
+    write: bool,
+}
+impl Handler for CrossActionForeign {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(&self, _: &Task, docs: &mut TaskDocuments<'_>) -> Result<Step, String> {
+        let notify = Some(SubmissionNotify {
+            task_id: Uuid::new_v4(),
+            key: "foreign".into(),
+        });
+        let result = if self.write {
+            docs.submit_write_to_session_conversation(
+                self.target,
+                "action".into(),
+                "app.cross".into(),
+                None,
+                notify,
+            )
+        } else {
+            docs.submit_continue_to_session_conversation(self.target, "action".into(), notify)
+        };
+        assert!(result.is_err());
+        Ok(Step::Succeed(json!(null)))
+    }
+}
+#[test]
+fn cross_session_actions_reject_foreign_notification_destination() {
+    for write in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (h, owner, target, _) = cross_setup(&path);
+        let mut registry = Registry::default();
+        registry.register("foreign", true, CrossActionForeign { target, write });
+        let driver = h.start_tasks(registry).unwrap();
+        let child = task(owner, "foreign");
+        driver.submit(&child).unwrap();
+        wait_task(&path, child.id(), |state| {
+            matches!(state, TaskState::Succeeded(_))
+        });
+        let state = h.conversation(target).unwrap();
+        assert!(state.submissions.is_empty());
+        assert!(state.application_writes.is_empty());
+        driver.shutdown().unwrap();
+    }
+}
