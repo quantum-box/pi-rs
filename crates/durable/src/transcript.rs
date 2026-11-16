@@ -22,7 +22,7 @@ use std::num::NonZeroUsize;
 use uuid::Uuid;
 
 const PREFIX: &[u8] = b"durable/transcript/";
-const DISPLAY_FORK_RECORD_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const DISPLAY_FORK_RECORD_LIMIT: usize = 8 * 1024 * 1024;
 
 thread_local! {
     static BOUNDED_FORK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -35,6 +35,9 @@ thread_local! {
 /// Restrict transcript entry reads for the entire synchronous display fork,
 /// including nested hydration and reset proof reconstruction.
 pub(crate) struct BoundedForkReads;
+pub(crate) fn bounded_fork_reads() -> bool {
+    BOUNDED_FORK_READS.with(|depth| depth.get() != 0)
+}
 impl BoundedForkReads {
     pub(crate) fn enter() -> Self {
         BOUNDED_FORK_READS.with(|depth| depth.set(depth.get() + 1));

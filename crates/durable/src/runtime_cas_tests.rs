@@ -277,6 +277,65 @@ fn display_entry_fork_fences_source_transcript_rewrite() {
 }
 
 #[test]
+fn display_entry_fork_bounds_runtime_and_observer_values_before_parsing() {
+    for kind in ["root", "event", "lookahead", "fork"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let root = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let display = h.submit_write(root, None, "app.note".into(), None).unwrap();
+        let key = match kind {
+            "root" => Harness::key(root),
+            "fork" => format!("runtime/fork/{root}/{:020}", 1).into_bytes(),
+            _ => {
+                let mut key = b"durable/observer/".to_vec();
+                key.extend_from_slice(root.as_bytes());
+                key.extend_from_slice(b"/r");
+                key.extend_from_slice(&(if kind == "event" { 1u64 } else { 2u64 }).to_be_bytes());
+                key
+            }
+        };
+        let old = h.owner.store().get(&key).unwrap().unwrap();
+        let mut value = old.value;
+        value.resize(crate::transcript::DISPLAY_FORK_RECORD_LIMIT + 1, b' ');
+        h.owner
+            .store()
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(old.version),
+                }],
+                &[Mutation::Put {
+                    key: key.clone(),
+                    value,
+                }],
+            )
+            .unwrap();
+        let err = h.fork_by_display_entry_id(root, display).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Storage(durable_store::Error::DocumentFrameTooLarge)
+                    | Error::Observer(crate::observer::Error::Store(
+                        durable_store::Error::DocumentFrameTooLarge
+                    ))
+            ),
+            "{kind}: {err:?}"
+        );
+        // The limit is scoped to display forks, including after an error.
+        assert!(
+            h.owner.store().get(&key).unwrap().unwrap().value.len()
+                > crate::transcript::DISPLAY_FORK_RECORD_LIMIT
+        );
+    }
+}
+
+#[test]
 fn display_entry_fork_bounds_transcript_before_hydration_and_proof() {
     for ancestor in [false, true] {
         let dir = tempfile::tempdir().unwrap();

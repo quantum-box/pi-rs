@@ -8296,6 +8296,15 @@ impl Harness {
     /// ambiguous cuts are rejected until their placement can be authenticated.
     pub fn fork_by_display_entry_id(&mut self, id: Uuid, entry_id: Uuid) -> Result<Uuid, Error> {
         let _bounded_reads = crate::transcript::BoundedForkReads::enter();
+        let _bounded_runtime_reads = durable_store::BoundedReadScope::enter(
+            &[
+                b"runtime/conversation/",
+                b"runtime/fork/",
+                b"durable/observer/",
+                b"runtime/tool-result-pending/",
+            ],
+            crate::transcript::DISPLAY_FORK_RECORD_LIMIT,
+        );
         let _proof_scope = ResetProofScope::enter();
         let (_, root_version) = self.load(id)?;
         let store = self.owner.store();

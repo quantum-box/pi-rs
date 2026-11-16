@@ -221,6 +221,13 @@ impl<'a> Observer<'a> {
 
     /// Read up to `limit` records strictly after `after` from one snapshot.
     pub fn read(&self, after: Cursor, limit: NonZeroUsize) -> Result<Page, Error> {
+        // Display-fork validation may inspect an arbitrary number of records,
+        // but should hold only one record and its lookahead at a time.
+        let limit = if crate::transcript::bounded_fork_reads() {
+            NonZeroUsize::MIN
+        } else {
+            limit
+        };
         let mut prefix = stream_prefix_with(self.prefix, self.stream);
         prefix.push(b'r');
         let (head, entries) = self.store.page_with_metadata(

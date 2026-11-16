@@ -9,7 +9,7 @@
 pub mod controls;
 pub mod owner;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     fmt,
     path::Path,
@@ -28,6 +28,46 @@ pub type DocumentChange = (Vec<u8>, Option<Entry>);
 pub type DocumentCommit = (u64, Vec<DocumentChange>);
 type BoundedHistoryRow = (Option<Vec<u8>>, Option<u64>, Option<u64>);
 type BoundedChangeRow = (u64, Option<Vec<u8>>, Option<u64>, Option<u64>);
+
+thread_local! {
+    static READ_LIMITS: std::cell::RefCell<Vec<(std::rc::Rc<()>, Vec<Vec<u8>>, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Synchronously limit individual values read from selected namespaces.
+/// Nested scopes use the smallest applicable limit and are restored on drop.
+pub struct BoundedReadScope(std::rc::Rc<()>);
+impl BoundedReadScope {
+    pub fn enter(prefixes: &[&[u8]], max_bytes: usize) -> Self {
+        let token = std::rc::Rc::new(());
+        READ_LIMITS.with(|limits| {
+            limits.borrow_mut().push((
+                token.clone(),
+                prefixes.iter().map(|prefix| prefix.to_vec()).collect(),
+                max_bytes,
+            ))
+        });
+        Self(token)
+    }
+}
+impl Drop for BoundedReadScope {
+    fn drop(&mut self) {
+        READ_LIMITS.with(|limits| {
+            limits
+                .borrow_mut()
+                .retain(|(token, _, _)| !std::rc::Rc::ptr_eq(token, &self.0));
+        });
+    }
+}
+fn read_limit(key: &[u8]) -> Option<usize> {
+    READ_LIMITS.with(|limits| {
+        limits
+            .borrow()
+            .iter()
+            .filter(|(_, prefixes, _)| prefixes.iter().any(|prefix| key.starts_with(prefix)))
+            .map(|(_, _, limit)| *limit)
+            .min()
+    })
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
     pub key: Vec<u8>,
@@ -565,6 +605,9 @@ impl Store {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Entry>, Error> {
+        if let Some(limit) = read_limit(key) {
+            return self.get_bounded(key, limit);
+        }
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         Ok(conn
             .query_row(
@@ -707,39 +750,49 @@ impl Store {
         after: &[u8],
         limit: usize,
     ) -> Result<MetadataPage, Error> {
+        let value_limit = read_limit(prefix);
+        let metadata_limit = read_limit(metadata_key);
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let metadata = tx
+        let metadata: Option<(Option<Vec<u8>>, u64)> = tx
             .query_row(
-                "SELECT value, version FROM durable_store_entries WHERE key=?1",
-                [metadata_key],
-                |r| {
-                    Ok(Entry {
-                        value: r.get(0)?,
-                        version: r.get(1)?,
-                    })
-                },
+                "SELECT CASE WHEN ?2 IS NULL OR length(value)<=?2 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key=?1",
+                params![metadata_key, metadata_limit.map(|v| i64::try_from(v).unwrap_or(i64::MAX))],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let metadata = metadata
+            .map(|(value, version)| {
+                Ok::<_, Error>(Entry {
+                    value: value.ok_or(Error::DocumentFrameTooLarge)?,
+                    version,
+                })
+            })
+            .transpose()?;
         let end = prefix_end(prefix);
         let rows = {
             let query = if end.is_some() {
-                "SELECT key, value, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4"
+                "SELECT key, CASE WHEN ?5 IS NULL OR length(value)<=?5 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4"
             } else {
-                "SELECT key, value, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND ?3 IS NULL ORDER BY key LIMIT ?4"
+                "SELECT key, CASE WHEN ?5 IS NULL OR length(value)<=?5 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND ?3 IS NULL ORDER BY key LIMIT ?4"
             };
             let mut stmt = tx.prepare(query)?;
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-            let rows = stmt.query_map(params![prefix, after, end, limit], |r| {
+            let cap = value_limit.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+            let rows = stmt.query_map(params![prefix, after, end, limit, cap], |r| {
+                Ok((r.get(0)?, r.get::<_, Option<Vec<u8>>>(1)?, r.get(2)?))
+            })?;
+            rows.map(|row| {
+                let (key, value, version) = row?;
                 Ok((
-                    r.get(0)?,
+                    key,
                     Entry {
-                        value: r.get(1)?,
-                        version: r.get(2)?,
+                        value: value.ok_or(Error::DocumentFrameTooLarge)?,
+                        version,
                     },
                 ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
+            })
+            .collect::<Result<Vec<_>, Error>>()?
         };
         tx.commit()?;
         Ok((metadata, rows))
@@ -1701,6 +1754,45 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod document_history_tests {
     use super::*;
+
+    #[test]
+    fn scoped_read_limits_cover_pages_and_restore_out_of_order() {
+        let db = Store::memory().unwrap();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: b"test/head".to_vec(),
+                    value: b"1234".to_vec(),
+                },
+                Mutation::Put {
+                    key: b"test/record".to_vec(),
+                    value: b"12345".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let outer = BoundedReadScope::enter(&[b"test/"], 6);
+        let inner = BoundedReadScope::enter(&[b"test/"], 4);
+        drop(outer);
+        assert!(matches!(
+            db.get(b"test/record"),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+        assert!(matches!(
+            db.page_with_metadata(b"test/head", b"test/r", b"test/", 2),
+            Err(Error::DocumentFrameTooLarge)
+        ));
+        drop(inner);
+        assert_eq!(db.get(b"test/record").unwrap().unwrap().value, b"12345");
+        assert_eq!(
+            db.page_with_metadata(b"test/head", b"test/r", b"test/", 2)
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn missing_unchanged_since_detects_exact_key_aba_and_deadline() {
