@@ -1572,6 +1572,33 @@ impl<'a> HostTransaction<'a> {
         value: Value,
         now_millis: i64,
     ) -> Result<crate::task_store::SignalResult, Error> {
+        self.signal_at_inner(task_id, token, key, value, now_millis, None)
+    }
+
+    // Only the runtime's settlement commit may supply this authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn signal_submission_at(
+        &mut self,
+        task_id: uuid::Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+        settlement: (uuid::Uuid, uuid::Uuid),
+    ) -> Result<crate::task_store::SignalResult, Error> {
+        self.signal_at_inner(task_id, token, key, value, now_millis, Some(settlement))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signal_at_inner(
+        &mut self,
+        task_id: uuid::Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+        now_millis: i64,
+        settlement: Option<(uuid::Uuid, uuid::Uuid)>,
+    ) -> Result<crate::task_store::SignalResult, Error> {
         let target = crate::task_store::key(task_id);
         if self.wake_targets.contains(&target) {
             return Err(Error::SignalComposition);
@@ -1592,6 +1619,7 @@ impl<'a> HostTransaction<'a> {
         let previous_mutations = self.signals.batch.mutations.len();
         let result = self.signals.signal_at_overlay(
             self.store, task_id, token, key, value, now_millis, None, candidate, &mutations,
+            settlement,
         )?;
         if self.signals.batch.mutations.len() != previous_mutations {
             self.effect_signal_targets.insert(target.clone());
@@ -1758,6 +1786,7 @@ impl StagedSignals {
             invocation,
             None,
             &[],
+            None,
         )
     }
 
@@ -1773,6 +1802,7 @@ impl StagedSignals {
         invocation: Option<&crate::task::Task>,
         candidate: Option<Option<crate::task::Task>>,
         mutations: &[Mutation],
+        settlement: Option<(uuid::Uuid, uuid::Uuid)>,
     ) -> Result<crate::task_store::SignalResult, Error> {
         let identity = (task_id, token.name().to_owned(), key.to_owned());
         // A generic token of another version can have staged this same key.
@@ -1829,6 +1859,7 @@ impl StagedSignals {
                 || now_millis,
                 candidate.clone(),
                 overlay,
+                settlement,
             )?;
             let Some(task) = invocation.filter(|task| {
                 task.id() == task_id

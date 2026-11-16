@@ -629,7 +629,11 @@ impl<'a> TaskStore<'a> {
 
     // Fence a foreground submission's exclusive destination against any
     // typed-signal writer, including an already prepared concurrent delivery.
-    fn foreground_binding_check(&self, signal: &Signal) -> Result<Option<Check>, Error> {
+    fn foreground_binding_check(
+        &self,
+        signal: &Signal,
+        settlement: Option<(Uuid, Uuid)>,
+    ) -> Result<Option<Check>, Error> {
         let Some(typed) = signal
             .typed
             .as_ref()
@@ -645,7 +649,8 @@ impl<'a> TaskStore<'a> {
         let entry = self.store.get(&key)?;
         if let Some(entry) = &entry {
             let (conversation, submission): (Uuid, Uuid) = serde_json::from_slice(&entry.value)?;
-            if signal.payload.get("id") != Some(&serde_json::json!(submission))
+            if settlement != Some((conversation, submission))
+                || signal.payload.get("id") != Some(&serde_json::json!(submission))
                 || signal.payload.get("conversationId") != Some(&serde_json::json!(conversation))
                 || typed.version != SUBMISSION_SETTLED_VERSION
             {
@@ -675,7 +680,7 @@ impl<'a> TaskStore<'a> {
         let mut fresh = signal.clone();
         fresh.consumed = false;
         loop {
-            let binding = self.foreground_binding_check(&fresh)?;
+            let binding = self.foreground_binding_check(&fresh, None)?;
             if let Some(entry) = self.store.get(&k)? {
                 let old: Signal = serde_json::from_slice(&entry.value)?;
                 if builtin {
@@ -850,7 +855,7 @@ impl<'a> TaskStore<'a> {
         value: Value,
         now: impl FnMut() -> i64,
     ) -> Result<(SignalResult, OwnedBatch), Error> {
-        self.prepare_signal_at_overlay(task_id, token, key_text, value, now, None, &[])
+        self.prepare_signal_at_overlay(task_id, token, key_text, value, now, None, &[], None)
     }
 
     /// Prepare against the transaction's candidate target and signal writes,
@@ -865,6 +870,7 @@ impl<'a> TaskStore<'a> {
         mut now: impl FnMut() -> i64,
         candidate: Option<Option<Task>>,
         mutations: &[Mutation],
+        settlement: Option<(Uuid, Uuid)>,
     ) -> Result<(SignalResult, OwnedBatch), Error> {
         let clock_start = std::time::Instant::now();
         let stored = self.load(task_id)?;
@@ -896,7 +902,7 @@ impl<'a> TaskStore<'a> {
             Err(Error::InvalidSignalPayload) => return Ok((SignalResult::Invalid, batch)),
             Err(error) => return Err(error),
         };
-        if let Some(check) = self.foreground_binding_check(&signal)? {
+        if let Some(check) = self.foreground_binding_check(&signal, settlement)? {
             batch.checks.push(check);
         }
         let revision_key = signal_revision_key(task_id);

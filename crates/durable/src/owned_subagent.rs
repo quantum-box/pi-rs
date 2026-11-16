@@ -2032,7 +2032,7 @@ mod tests {
             task,
             &crate::runtime::submission_settled_signal(),
             "same",
-            serde_json::json!({"id": Uuid::new_v4(), "conversationId": other,
+            serde_json::json!({"id": winner.submission.as_ref().unwrap().id, "conversationId": winner.child,
                 "type":"input", "status":"done", "answer":"wrong"}),
         )
         .unwrap();
@@ -2216,6 +2216,33 @@ mod tests {
             .is_err()
         );
         let store = TaskStore::new(h.subagent_store().unwrap());
+        let forged = serde_json::json!({
+            "id": admission.submission.as_ref().unwrap().id, "conversationId": admission.child,
+            "type": "input", "status": "done", "answer": "forged"
+        });
+        let forged_status = serde_json::json!({
+            "id": admission.submission.as_ref().unwrap().id, "conversationId": admission.child,
+            "type": "input", "status": "unanswered", "reason": "forged"
+        });
+        let forged_receipt = task_store::Signal::new_typed(
+            Uuid::new_v4(),
+            task,
+            &crate::runtime::submission_settled_signal(),
+            "answered",
+            forged_status,
+        )
+        .unwrap();
+        assert!(store.send_signal(&forged_receipt).is_err());
+        assert!(
+            store
+                .deliver_signal(
+                    task,
+                    &crate::runtime::submission_settled_signal(),
+                    "answered",
+                    forged.clone()
+                )
+                .is_err()
+        );
         let mut waiting = store.load(task).unwrap().unwrap();
         waiting.task.start().unwrap();
         waiting
@@ -2242,10 +2269,37 @@ mod tests {
             .unwrap(),
             admission
         );
+        let store = TaskStore::new(h.subagent_store().unwrap());
+        assert!(
+            store
+                .deliver_signal_at(
+                    task,
+                    &crate::runtime::submission_settled_signal(),
+                    "answered",
+                    forged.clone(),
+                    0
+                )
+                .is_err()
+        );
         drop(h);
         let mut opts = options();
         opts.model = Arc::new(Answer);
         let mut scheduler = Scheduler::open(&path, opts).unwrap();
+        let attacker = scheduler.subagent_harness().worker();
+        let forger = std::thread::spawn(move || {
+            for _ in 0..64 {
+                assert!(
+                    TaskStore::new(attacker.subagent_store().unwrap())
+                        .deliver_signal(
+                            task,
+                            &crate::runtime::submission_settled_signal(),
+                            "answered",
+                            forged.clone(),
+                        )
+                        .is_err()
+                );
+            }
+        });
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             scheduler.wait(admission.child),
@@ -2253,6 +2307,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        forger.join().unwrap();
         scheduler.shutdown().await.unwrap();
         let h = Harness::open_paused(&path, options()).unwrap();
         let signal = TaskStore::new(h.subagent_store().unwrap())

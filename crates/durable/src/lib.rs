@@ -16,6 +16,7 @@ pub mod document;
 mod executor_handoff;
 pub mod extension;
 pub mod fork;
+pub mod foreground_subagent;
 pub mod images;
 #[allow(dead_code)] // Storage foundation; not wired into tool execution yet.
 mod keyed_child;
