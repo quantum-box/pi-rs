@@ -308,6 +308,33 @@ struct InvocationState {
     failed_handlers: HashSet<Uuid>,
 }
 
+/// Shared publication gate used by the driver without taking the scheduler mutex.
+#[derive(Clone)]
+pub(crate) struct FailurePublication {
+    fence: Arc<Mutex<()>>,
+    state: Arc<Mutex<InvocationState>>,
+}
+
+impl FailurePublication {
+    /// Cleanup errors and panics may follow an unknown durable commit. Publish
+    /// poison and the driver stop under the same fence as task settlement.
+    pub(crate) fn indeterminate(&self, publish_stop: impl FnOnce()) {
+        let _guard = self.fence.lock().unwrap_or_else(|e| e.into_inner());
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poisoned = true;
+        publish_stop();
+    }
+
+    pub(crate) fn try_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, std::sync::TryLockError<std::sync::MutexGuard<'_, ()>>>
+    {
+        self.fence.try_lock()
+    }
+}
+
 // Retain the attachment and activity until settlement or abandonment. Dropping
 // an unretired invocation forces recovery rather than guessing its outcome.
 /// The in-process guard for a reserved invocation.
@@ -658,8 +685,9 @@ impl DetachedInvocation {
         self.running.task.id()
     }
 
-    /// Run without holding the scheduler mutex. A panic abandons the attempt
-    /// and poisons the scheduler; abort handler panics retain existing semantics.
+    /// Run without holding the scheduler mutex. A handler panic publishes a
+    /// known failed attempt; other unretired exits poison the scheduler. Abort
+    /// handler panics retain existing semantics.
     pub fn execute(self) -> Result<CompletedInvocation, Error> {
         let Self {
             running,
@@ -685,7 +713,27 @@ impl DetachedInvocation {
         } else {
             let owner = &lease.attachment.owner;
             let mut documents = crate::document::TaskDocuments::new(owner.store(), &running.task)?;
-            let result = handler.run_with_documents(&running.task, &mut documents);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.run_with_documents(&running.task, &mut documents)
+            }));
+            let result = match result {
+                Ok(result) => result,
+                Err(payload) => {
+                    let mut lease = lease;
+                    {
+                        let _fence = lease
+                            .failure_fence
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let mut state = lease.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.handler_failed = true;
+                        state.failed_handlers.insert(running.task.id());
+                        lease.retired = true;
+                    }
+                    drop(lease);
+                    std::panic::resume_unwind(payload);
+                }
+            };
             let documents = documents.detach(owner.clone(), &running)?;
             if result.is_err() && !running.task.is_task_tool() {
                 let _fence = lease.failure_fence.lock().map_err(|_| Error::Poisoned)?;
@@ -1817,6 +1865,12 @@ impl Scheduler {
     }
     fn ts(&self) -> TaskStore<'_> {
         TaskStore::new(self.attachment.owner.store())
+    }
+    pub(crate) fn failure_publication(&self) -> FailurePublication {
+        FailurePublication {
+            fence: self.failure_fence.clone(),
+            state: self.live_invocations.clone(),
+        }
     }
     pub(crate) fn check(&self) -> Result<(), Error> {
         let state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
@@ -5093,7 +5147,7 @@ mod tests {
         }));
         scheduler.settle_invocation(b).unwrap();
         assert!(a.join().is_err());
-        assert!(matches!(scheduler.reserve_tick(0), Err(Error::Poisoned)));
+        assert!(matches!(scheduler.reserve_tick(0), Err(Error::Stopped)));
         assert_eq!(
             scheduler
                 .ts()
@@ -5108,12 +5162,37 @@ mod tests {
 
     #[test]
     fn published_handler_panic_retains_other_result() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        struct Staged(Address);
+        impl Handler for Staged {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.get(&self.0).unwrap();
+                docs.put(
+                    &self.0,
+                    json!({"value": "retained"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("done")))
+            }
+        }
+        let address = Address {
+            scope: "panic".into(),
+            name: "drain".into(),
+            key: "".into(),
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut registry = Registry::default();
         registry.register("panic", false, |_: &Task| -> Result<Step, String> {
             panic!("handler panic")
         });
-        registry.register("work", false, |_: &Task| Ok(Step::Succeed(json!("done"))));
+        registry.register("work", false, Staged(address.clone()));
         let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
         let owner = TaskOwner::Conversation(Uuid::from_u128(9));
         scheduler
@@ -5128,14 +5207,8 @@ mod tests {
         };
         let b = b.execute().unwrap();
         assert!(std::thread::spawn(move || a.execute()).join().is_err());
-        let b = match scheduler.settle_invocation(b) {
-            Err(SettlementError::Rejected {
-                error: Error::Poisoned,
-                completed,
-            }) => completed,
-            result => panic!("expected retained B: {result:?}"),
-        };
-        assert_eq!(b.task_id(), Uuid::from_u128(2));
+        scheduler.settle_invocation(b).unwrap();
+        assert!(matches!(scheduler.reserve_tick(0), Err(Error::Stopped)));
         assert_eq!(
             scheduler
                 .ts()
@@ -5144,7 +5217,15 @@ mod tests {
                 .unwrap()
                 .task
                 .state(),
-            &TaskState::Running
+            &TaskState::Succeeded(json!("done"))
+        );
+        assert_eq!(
+            Documents::new(scheduler.owner().store())
+                .get(&address)
+                .unwrap()
+                .unwrap()
+                .value["value"],
+            json!("retained")
         );
     }
 

@@ -35,6 +35,7 @@ pub enum Error {
 }
 pub(crate) struct Shared {
     scheduler: Mutex<task_scheduler::Scheduler>,
+    failure_publication: task_scheduler::FailurePublication,
     activity: crate::worker_activity::WorkerActivity,
     wake_reader: task_scheduler::WakeReader,
     owner: Arc<OwnedStore>,
@@ -97,6 +98,7 @@ impl Driver {
         // Seed the subscription so recovery before subscription cannot be missed.
         let _ = notify_tx.try_send(());
         let shared = Arc::new(Shared {
+            failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             activity,
             wake_reader,
@@ -118,11 +120,13 @@ impl Driver {
             struct CloseOnExit(Arc<Shared>);
             impl Drop for CloseOnExit {
                 fn drop(&mut self) {
-                    if std::thread::panicking()
-                        && let Ok(mut state) = self.0.state.lock()
-                    {
-                        state.stop = true;
-                        state.failure = Some("task worker panicked".into());
+                    if std::thread::panicking() {
+                        self.0.failure_publication.indeterminate(|| {
+                            if let Ok(mut state) = self.0.state.lock() {
+                                state.stop = true;
+                                state.failure = Some("task worker panicked".into());
+                            }
+                        });
                     }
                     self.0.activity.notify();
                     self.0.close_notifications();
@@ -167,7 +171,15 @@ impl Driver {
         });
         let cleanup = shared.harness.as_ref().map(|_| {
             let shared = shared.clone();
-            thread::spawn(move || cleanup_loop(shared))
+            thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cleanup_loop(shared.clone())
+                }));
+                if let Err(payload) = result {
+                    fail_cleanup(&shared, "cleanup worker panicked".into());
+                    std::panic::resume_unwind(payload);
+                }
+            })
         });
         Self {
             shared,
@@ -549,11 +561,13 @@ fn cleanup_loop(shared: Arc<Shared>) {
     });
 }
 fn fail_cleanup(shared: &Shared, error: String) {
-    if let Ok(mut state) = shared.state.lock() {
-        state.failure = Some(error);
-        state.stop = true;
-        shared.wake.notify_all();
-    }
+    shared.failure_publication.indeterminate(|| {
+        if let Ok(mut state) = shared.state.lock() {
+            state.failure = Some(error);
+            state.stop = true;
+            shared.wake.notify_all();
+        }
+    });
     shared.activity.notify();
     shared.cleanup_stop.cancel();
     shared.close_notifications();
@@ -614,6 +628,13 @@ impl Shared {
             std::sync::TryLockError::WouldBlock => QuiescentError::Busy,
             std::sync::TryLockError::Poisoned(_) => QuiescentError::Poisoned,
         })?;
+        let _failure = self
+            .failure_publication
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => QuiescentError::Busy,
+                std::sync::TryLockError::Poisoned(_) => QuiescentError::Poisoned,
+            })?;
         if !scheduler.check_quiescent()? {
             return Err(QuiescentError::Busy);
         }
@@ -782,6 +803,125 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn cleanup_failure_and_task_commit_are_serialized_in_both_orders() {
+        for failure_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("work", false, |_: &Task| {
+                Ok(task_scheduler::Step::Succeed(json!("done")))
+            });
+            let mut scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let owner = scheduler.owner();
+            let task = Task::new(
+                Uuid::from_u128(1),
+                TaskOwner::Conversation(Uuid::from_u128(2)),
+                Checkpoint {
+                    phase: "start".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("work".into(), false);
+            scheduler.submit(&task).unwrap();
+            let task_scheduler::TickReservation::Invocation(invocation) =
+                scheduler.reserve_tick(0).unwrap()
+            else {
+                panic!("invocation")
+            };
+            let completed = invocation.execute().unwrap();
+            let shared = Arc::new(Shared {
+                owner: owner.clone(),
+                state: Mutex::new(State::default()),
+                wake_reader: scheduler.wake_reader(),
+                activity: scheduler.worker_activity(),
+                failure_publication: scheduler.failure_publication(),
+                scheduler: Mutex::new(scheduler),
+                wake: Condvar::new(),
+                harness: None,
+                cleanup_stop: pi_rs_core::CancellationToken::new(),
+                notifications: Mutex::new(None),
+                subscription: Mutex::new(None),
+            });
+            if failure_first {
+                fail_cleanup(&shared, "unknown cleanup outcome".into());
+                let rejected = shared
+                    .scheduler
+                    .lock()
+                    .unwrap()
+                    .settle_invocation(completed);
+                assert!(matches!(
+                    rejected,
+                    Err(task_scheduler::SettlementError::Rejected {
+                        error: task_scheduler::Error::Poisoned,
+                        ..
+                    })
+                ));
+                assert_eq!(
+                    TaskStore::new(owner.store())
+                        .load(task.id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Running
+                );
+                drop(rejected);
+            } else {
+                let task_gate = owner.task_gate().lock().unwrap();
+                let committing = shared.clone();
+                let commit = thread::spawn(move || {
+                    committing
+                        .scheduler
+                        .lock()
+                        .unwrap()
+                        .settle_invocation(completed)
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while shared.failure_publication.try_lock().is_ok() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "settlement did not acquire failure fence"
+                    );
+                    thread::yield_now();
+                }
+                let failing = shared.clone();
+                let (started_tx, started_rx) = mpsc::channel();
+                let (done_tx, done_rx) = mpsc::channel();
+                let failure = thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    fail_cleanup(&failing, "unknown cleanup outcome".into());
+                    done_tx.send(()).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(
+                    done_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                drop(task_gate);
+                assert!(commit.join().unwrap().unwrap());
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                failure.join().unwrap();
+                assert_eq!(
+                    TaskStore::new(owner.store())
+                        .load(task.id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Succeeded(json!("done"))
+                );
+            }
+            assert!(shared.state.lock().unwrap().stop);
+            assert!(matches!(
+                shared.scheduler.lock().unwrap().reserve_tick(0),
+                Err(task_scheduler::Error::Poisoned)
+            ));
+        }
+    }
+
+    #[test]
     fn quiescent_commit_waits_for_handler_retirement_and_fences_abort_reopen() {
         use crate::executor_handoff::{self, Binding};
         use crate::runtime::{Harness, ToolAttempt};
@@ -860,6 +1000,7 @@ mod tests {
             state: Mutex::new(State::default()),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: None,
@@ -1077,6 +1218,7 @@ mod tests {
             owner,
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
@@ -1175,6 +1317,7 @@ mod tests {
             state: Mutex::new(State::default()),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: None,
@@ -1248,6 +1391,7 @@ mod tests {
             }),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: None,
@@ -1529,6 +1673,7 @@ mod tests {
             }),
             wake_reader: scheduler.wake_reader(),
             activity: scheduler.worker_activity(),
+            failure_publication: scheduler.failure_publication(),
             scheduler: Mutex::new(scheduler),
             wake: Condvar::new(),
             harness: Some(Mutex::new(harness.worker())),
