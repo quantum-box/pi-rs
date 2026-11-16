@@ -1497,7 +1497,7 @@ task, and ownership records, so its cost grows with the store's graph size.
 Both schedulers expose `blocked_tasks` as a polling snapshot of nonterminal tasks,
 including their IDs, kinds, owners and current reasons; `blocked_reason` also
 inspects an individual record. The background driver's `replace_registry` waits
-for the current synchronous handler to finish, updates admission policies at the
+for current synchronous handlers to finish, updates admission policies at the
 same boundary, and wakes its worker. Lifecycle hook children are committed only
 when their selected handler identity, replay policy, and version still match the
 registry; replacement cannot interleave with that validation and commit. Calling
