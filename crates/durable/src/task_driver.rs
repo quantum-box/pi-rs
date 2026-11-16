@@ -1272,6 +1272,113 @@ impl Shared {
         }
         result
     }
+    // Capture every ownership link, including links beyond a background boundary,
+    // while applying cancellation only to the foreground part of the chain.
+    // The caller holds both the task gate and the failure publication ledger.
+    fn session_owner_checks(
+        store: &durable_store::Store,
+        conversation: Uuid,
+        boundary: u64,
+    ) -> Result<Vec<durable_store::Check>, crate::runtime::Error> {
+        use crate::ownership_edge::{self, EdgeStore, Mode};
+        use durable_store::{Check, Expected};
+        let invalid = || {
+            crate::runtime::Error::Invalid(
+                "invalid or aborting conversation ownership chain".into(),
+            )
+        };
+        let tasks = TaskStore::new(store);
+        let edges = EdgeStore::new(store);
+        let mut next = TaskOwner::Conversation(conversation);
+        let mut seen = std::collections::HashSet::new();
+        let mut checks = Vec::new();
+        let mut foreground = true;
+        let mut from_conversation = false;
+        loop {
+            let identity = match &next {
+                TaskOwner::Task(id) => (true, *id),
+                TaskOwner::Conversation(id) => (false, *id),
+            };
+            if !seen.insert(identity) {
+                return Err(invalid());
+            }
+            if foreground {
+                let mut check = ownership_edge::abort_fence_check(store, &next)?;
+                if check.expected == Expected::Missing {
+                    check.expected = Expected::MissingUnchangedSince(boundary);
+                }
+                checks.push(check);
+            }
+            match next {
+                TaskOwner::Conversation(id) => {
+                    let key = format!("runtime/conversation/{id}").into_bytes();
+                    let entry = store.get(&key)?.ok_or_else(invalid)?;
+                    let state: crate::runtime::Conversation =
+                        serde_json::from_slice(&entry.value).map_err(|_| invalid())?;
+                    if state.id != id || (foreground && state.abort_requested) {
+                        return Err(invalid());
+                    }
+                    // The transaction already checks its own conversation version.
+                    if id != conversation {
+                        checks.push(Check {
+                            key,
+                            expected: Expected::Version(entry.version),
+                        });
+                    }
+                    let key = ownership_edge::edge_key(id);
+                    let Some(edge) = edges.get(id).map_err(|_| invalid())? else {
+                        checks.push(Check {
+                            key,
+                            expected: Expected::MissingUnchangedSince(boundary),
+                        });
+                        break;
+                    };
+                    checks.push(Check {
+                        key,
+                        expected: Expected::Version(edge.version),
+                    });
+                    let owner = tasks
+                        .load(edge.edge.task)
+                        .map_err(|_| invalid())?
+                        .ok_or_else(invalid)?;
+                    if owner.task.owner() != &edge.edge.task_owner {
+                        return Err(invalid());
+                    }
+                    if edge.edge.mode == Mode::Background {
+                        foreground = false;
+                    }
+                    next = TaskOwner::Task(edge.edge.task);
+                    from_conversation = true;
+                }
+                TaskOwner::Task(id) => {
+                    let stored = tasks.load(id).map_err(|_| invalid())?.ok_or_else(invalid)?;
+                    if foreground {
+                        let successful_anchor = from_conversation
+                            && matches!(stored.task.state(), TaskState::Succeeded(_));
+                        if stored.task.abort_requested()
+                            || matches!(stored.task.state(), TaskState::CompletingFailed(_))
+                            || (stored.task.is_terminal() && !successful_anchor)
+                            || task_scheduler::pending_abort_root_for_running(&tasks, id, false)
+                                .map_err(|_| invalid())?
+                                .is_some()
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                    checks.push(Check {
+                        key: task_store::key(id),
+                        expected: Expected::Version(stored.version),
+                    });
+                    if stored.task.is_background() {
+                        foreground = false;
+                    }
+                    next = stored.task.owner().clone();
+                    from_conversation = false;
+                }
+            }
+        }
+        Ok(checks)
+    }
     /// Validate a live parent attempt, registry and ownership graph while holding
     /// the same admission gate used by executor finalization.
     pub(crate) fn with_session_child<T>(
@@ -1279,7 +1386,7 @@ impl Shared {
         intents: &[crate::session_transaction::SessionChild],
         roots: &[Task],
         conversation: Uuid,
-        f: impl FnOnce(u64) -> Result<T, crate::runtime::Error>,
+        f: impl FnOnce(u64, Vec<durable_store::Check>) -> Result<T, crate::runtime::Error>,
     ) -> Result<T, crate::runtime::Error> {
         let state = self
             .state
@@ -1352,17 +1459,15 @@ impl Shared {
             return Err(crate::runtime::Error::TaskPublicationBusy);
         }
         let boundary = store.put_version()?;
-        // A task-owned conversation requires validating its owner's complete
-        // abort chain. Until that path is available, reject it explicitly.
-        if crate::ownership_edge::EdgeStore::new(store)
+        let owner_checks = if crate::ownership_edge::EdgeStore::new(store)
             .get(conversation)
             .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
             .is_some()
         {
-            return Err(crate::runtime::Error::Invalid(
-                "owned conversation child admission is unsupported".into(),
-            ));
-        }
+            Self::session_owner_checks(store, conversation, boundary)?
+        } else {
+            Vec::new()
+        };
         let mut candidates = std::collections::HashMap::new();
         for task in roots.iter().chain(
             intents
@@ -1501,7 +1606,7 @@ impl Shared {
                 .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?;
             }
         }
-        let result = f(boundary);
+        let result = f(boundary, owner_checks);
         if result.is_ok() {
             self.notify_work();
         }
@@ -1601,6 +1706,126 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn owned_session_chain_checks_fence_abort_and_graph_aba() {
+        use crate::ownership_edge::{self, Edge, Mode};
+        use durable_store::{Check, Expected, Mutation};
+        let dir = tempfile::tempdir().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let ancestor = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(root),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        let owner = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Task(ancestor.id()),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("work".into(), true);
+        TaskStore::new(&store)
+            .save(&[Save::Create(&ancestor), Save::Create(&owner)])
+            .unwrap();
+        let config = crate::runtime::Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let edge = Edge {
+            task: owner.id(),
+            task_owner: owner.owner().clone(),
+            child,
+            mode: Mode::Foreground,
+        };
+        let edge_key = ownership_edge::edge_key(child);
+        let root_key = format!("runtime/conversation/{root}").into_bytes();
+        let child_key = format!("runtime/conversation/{child}").into_bytes();
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: root_key,
+                        value: serde_json::to_vec(&crate::runtime::Harness::empty_conversation(
+                            root,
+                            config.clone(),
+                        ))
+                        .unwrap(),
+                    },
+                    Mutation::Put {
+                        key: child_key,
+                        value: serde_json::to_vec(&crate::runtime::Harness::empty_conversation(
+                            child, config,
+                        ))
+                        .unwrap(),
+                    },
+                    Mutation::Put {
+                        key: edge_key.clone(),
+                        value: serde_json::to_vec(&edge).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let boundary = store.put_version().unwrap();
+        let checks = Shared::session_owner_checks(&store, child, boundary).unwrap();
+        let (abort_check, abort_write) =
+            ownership_edge::prepare_abort_fence(&store, &TaskOwner::Task(ancestor.id())).unwrap();
+        store.commit(&[abort_check], &[abort_write]).unwrap();
+        assert!(
+            store
+                .commit_with_prefix_put_fence(
+                    &checks,
+                    &[],
+                    &[task_store::PREFIX, ownership_edge::PREFIX],
+                    boundary
+                )
+                .is_err()
+        );
+        let boundary = store.put_version().unwrap();
+        let checks = Shared::session_owner_checks(&store, child, boundary).unwrap();
+        let old = store.get(&edge_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: edge_key.clone(),
+                    expected: Expected::Version(old.version),
+                }],
+                &[
+                    Mutation::Delete {
+                        key: edge_key.clone(),
+                    },
+                    Mutation::Put {
+                        key: edge_key,
+                        value: old.value,
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .commit_with_prefix_put_fence(
+                    &checks,
+                    &[],
+                    &[task_store::PREFIX, ownership_edge::PREFIX],
+                    boundary
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn published_handler_failure_fences_admissions_before_running_record_settles() {
         for outcome in 0..3 {
             let dir = tempfile::tempdir().unwrap();
@@ -1698,7 +1923,7 @@ mod tests {
             );
             assert!(
                 shared
-                    .with_session_child(&[before], &[], conversation, |_| Ok(()))
+                    .with_session_child(&[before], &[], conversation, |_, _| Ok(()))
                     .is_ok()
             );
             assert!(
@@ -1740,7 +1965,7 @@ mod tests {
             let intent = crate::session_transaction::SessionChild::test_intent(snapshot, direct);
             assert!(
                 shared
-                    .with_session_child(&[intent], &[], conversation, |_| Ok(()))
+                    .with_session_child(&[intent], &[], conversation, |_, _| Ok(()))
                     .is_err()
             );
             let child = make_task(3, TaskOwner::Conversation(owned_conversation));
@@ -1751,7 +1976,7 @@ mod tests {
                         &[],
                         std::slice::from_ref(&child),
                         owned_conversation,
-                        |_| Ok(())
+                        |_, _| Ok(())
                     )
                     .is_err()
             );
