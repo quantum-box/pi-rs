@@ -182,11 +182,11 @@ fn conversion_equal(
         "compacted" | "branch_summary" => paths.push("/usage_metadata/request_id".to_owned()),
         _ => {}
     }
-    if kind == "assistant" {
-        if let Some(invocations) = expected["invocations"].as_array() {
-            for index in 0..invocations.len() {
-                paths.push(format!("/invocations/{index}/operation_id"));
-            }
+    if kind == "assistant"
+        && let Some(invocations) = expected["invocations"].as_array()
+    {
+        for index in 0..invocations.len() {
+            paths.push(format!("/invocations/{index}/operation_id"));
         }
     }
     for path in paths {
@@ -453,7 +453,7 @@ impl StreamVerifier {
                     )
                     .then_some(record.id + offset as u64 + 1)
                 })
-                .last();
+                .next_back();
             let StagedConversion {
                 name, mut branch, ..
             } = self.pending.take().expect("staged source");
