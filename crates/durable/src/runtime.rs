@@ -8672,6 +8672,7 @@ impl Harness {
             background,
             nested_parent,
             None,
+            None,
             before_commit,
         )
         .map(|result| result.expect("unconditional abort always has a result"))
@@ -8696,6 +8697,29 @@ impl Harness {
             false,
             None,
             Some(running),
+            None,
+            || {},
+        )
+        .map(|result| result.map(|(conversations, _, _)| conversations))
+    }
+
+    /// Recheck a deferred scheduling intent under the task gate on every
+    /// graph retry. The caller has already acquired the poll and failure fences.
+    pub(crate) fn abort_maintenance_checked(
+        &mut self,
+        intent: crate::task_scheduler::MaintenanceIntent,
+    ) -> Result<Option<Vec<Uuid>>, Error> {
+        let owner = self.owner.clone();
+        let gate = owner.task_gate().lock().map_err(|_| Error::Failed)?;
+        self.abort_owned_graph_impl_roots_locked(
+            &gate,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some(intent),
             || {},
         )
         .map(|result| result.map(|(conversations, _, _)| conversations))
@@ -8711,6 +8735,7 @@ impl Harness {
         background: bool,
         nested_parent: Option<Uuid>,
         pending_running: Option<Uuid>,
+        maintenance: Option<crate::task_scheduler::MaintenanceIntent>,
         mut before_commit: impl FnMut(),
     ) -> Result<Option<OwnedGraphAbort>, Error> {
         use crate::ownership_edge::{EdgeStore, Mode};
@@ -8722,6 +8747,17 @@ impl Harness {
             // Capture before discovery; creation can commit without rewriting
             // the observed owner. The checked prefixes catch such phantoms.
             let graph_version = store.put_version()?;
+            let (fixed_task, nested_parent) = if let Some(intent) = maintenance {
+                let ts = crate::task_store::TaskStore::new(store);
+                match crate::task_scheduler::resolve_maintenance(&ts, intent)
+                    .map_err(|e| Error::Invalid(format!("maintenance intent: {e}")))?
+                {
+                    Some(selected) => selected,
+                    None => return Ok(None),
+                }
+            } else {
+                (fixed_task, nested_parent)
+            };
             let task = if let Some(running) = pending_running {
                 let ts = crate::task_store::TaskStore::new(store);
                 match crate::task_scheduler::pending_abort_root_for_running(&ts, running, false)

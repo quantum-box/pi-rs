@@ -362,6 +362,67 @@ impl Drop for InvocationLease {
 pub enum TickReservation {
     Progress(bool),
     Invocation(Box<DetachedInvocation>),
+    /// Graph maintenance must be attempted outside scheduler and failure locks.
+    Maintenance(PendingMaintenance),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MaintenanceIntent {
+    Nested(Uuid),
+    Failed(Uuid),
+    FailFast(Uuid),
+}
+
+/// A graph intent retained when a nonblocking reservation needs cleanup.
+pub struct PendingMaintenance {
+    attachment: Arc<Attachment>,
+    fence: Arc<Mutex<()>>,
+    state: Arc<Mutex<InvocationState>>,
+    scheduler_poison: Arc<std::sync::atomic::AtomicBool>,
+    intent: MaintenanceIntent,
+}
+
+impl PendingMaintenance {
+    /// Try the poll fences before the failure fence; busy makes no mutation.
+    /// Call without the scheduler mutex or a task or poll gate.
+    pub fn try_cleanup(&self, harness: &mut crate::runtime::Harness) -> Result<bool, Error> {
+        let owner = &self.attachment.owner;
+        if !Arc::ptr_eq(owner, &harness.owner) {
+            return Err(Error::Ownership);
+        }
+        match owner.conversation_controls().try_fence(|| {
+            let _guard = match self.fence.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+            };
+            {
+                let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+                if state.poisoned
+                    || self
+                        .scheduler_poison
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(Error::Poisoned);
+                }
+                if state.handler_failed {
+                    return Err(Error::Busy);
+                }
+            }
+            match harness.abort_maintenance_checked(self.intent) {
+                Ok(affected) => Ok(affected.unwrap_or_default()),
+                Err(error) => {
+                    self.state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                    Err(Error::Handler(format!("maintenance abort: {error}")))
+                }
+            }
+        }) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => Ok(false),
+            Err(durable_store::controls::FenceError::Poisoned) => Err(Error::Poisoned),
+            Err(durable_store::controls::FenceError::Commit(error)) => Err(error),
+        }
+    }
 }
 
 /// An exclusive in-process reservation. Dropping it without settlement poisons
@@ -2352,6 +2413,9 @@ impl Scheduler {
         };
         match reservation {
             TickReservation::Progress(progress) => Ok(progress),
+            TickReservation::Maintenance(_) => {
+                unreachable!("serial reservation does not defer maintenance")
+            }
             TickReservation::Invocation(invocation) => self
                 .settle_invocation(invocation.execute()?)
                 .map_err(|failure| match failure {
@@ -2373,8 +2437,39 @@ impl Scheduler {
 
     /// Reserve at most one invocation; run it outside the scheduler mutex.
     pub fn reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
+        self.reserve_tick_inner(now_millis, false)
+    }
+
+    /// Reserve without waiting for conversation poll fences. A maintenance
+    /// value must be retried outside the scheduler mutex when a fence is busy.
+    pub fn try_reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
+        self.reserve_tick_inner(now_millis, true)
+    }
+
+    fn deferred_maintenance(&self, intent: MaintenanceIntent) -> TickReservation {
+        TickReservation::Maintenance(PendingMaintenance {
+            attachment: self.attachment.clone(),
+            fence: self.failure_fence.clone(),
+            state: self.live_invocations.clone(),
+            scheduler_poison: self.poisoned.clone(),
+            intent,
+        })
+    }
+
+    fn reserve_tick_inner(
+        &mut self,
+        now_millis: i64,
+        nonblocking: bool,
+    ) -> Result<TickReservation, Error> {
         let fence = self.failure_fence.clone();
-        let _failure_guard = fence.lock().map_err(|_| Error::Poisoned)?;
+        let _failure_guard = if nonblocking {
+            fence.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => Error::Busy,
+                std::sync::TryLockError::Poisoned(_) => Error::Poisoned,
+            })?
+        } else {
+            fence.lock().map_err(|_| Error::Poisoned)?
+        };
         self.check()?;
         if self.reservations_stopped {
             return Err(Error::Stopped);
@@ -2396,6 +2491,11 @@ impl Scheduler {
             let live = has_live_owned(owner.store(), snapshot.task.id(), &held_tasks)?;
             if snapshot.task.is_task_tool() && has_unmarked_nested(snapshot.task.id(), &held_tasks)
             {
+                if nonblocking && self.validator.is_some() {
+                    return Ok(
+                        self.deferred_maintenance(MaintenanceIntent::Nested(snapshot.task.id()))
+                    );
+                }
                 if let Some(harness) = self.validator.as_mut() {
                     drop(gate);
                     owner
@@ -2414,6 +2514,11 @@ impl Scheduler {
             {
                 // A held failure is cancellation intent. Persist the mark and
                 // cascade before letting any descendant execute again.
+                if nonblocking && self.validator.is_some() {
+                    return Ok(
+                        self.deferred_maintenance(MaintenanceIntent::Failed(snapshot.task.id()))
+                    );
+                }
                 if let Some(harness) = self.validator.as_mut() {
                     drop(gate);
                     owner
@@ -2453,6 +2558,11 @@ impl Scheduler {
             {
                 // Mark one entire ownership graph, then rescan. In particular,
                 // a Running handler must return before its record can settle.
+                if nonblocking && self.validator.is_some() {
+                    return Ok(
+                        self.deferred_maintenance(MaintenanceIntent::FailFast(snapshot.task.id()))
+                    );
+                }
                 if let Some(harness) = self.validator.as_mut() {
                     drop(gate);
                     let result = owner
@@ -3777,6 +3887,48 @@ fn validate_wait_graph(
     Ok(())
 }
 
+pub(crate) type MaintenanceRoots = (Option<Uuid>, Option<Uuid>);
+
+pub(crate) fn resolve_maintenance(
+    ts: &TaskStore<'_>,
+    intent: MaintenanceIntent,
+) -> Result<Option<MaintenanceRoots>, Error> {
+    let records = ts.list()?;
+    let id = match intent {
+        MaintenanceIntent::Nested(id)
+        | MaintenanceIntent::Failed(id)
+        | MaintenanceIntent::FailFast(id) => id,
+    };
+    let Some(parent) = records.iter().find(|item| item.task.id() == id) else {
+        return Ok(None);
+    };
+    match intent {
+        MaintenanceIntent::Nested(_)
+            if parent.task.is_task_tool()
+                && parent.task.is_completing()
+                && has_unmarked_nested(id, &records) =>
+        {
+            Ok(Some((None, Some(id))))
+        }
+        MaintenanceIntent::Failed(_)
+            if !parent.task.is_task_tool()
+                && !parent.task.abort_requested()
+                && matches!(parent.task.state(), TaskState::CompletingFailed(_))
+                && has_live_owned(ts.store(), id, &records)? =>
+        {
+            Ok(Some((Some(id), None)))
+        }
+        MaintenanceIntent::FailFast(_) if !parent.task.abort_requested() => {
+            if let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = parent.task.state() {
+                Ok(failed_sibling_to_abort(ts, parent, ids)?.map(|root| (Some(root), None)))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 // A TaskTool may own unrelated generic tasks; only TaskTool children are
 // cancelled by normal tool settlement. All roots are marked in one commit.
 fn has_unmarked_nested(parent: Uuid, tasks: &[task_store::StoredTask]) -> bool {
@@ -4130,6 +4282,367 @@ mod tests {
                     .abort_requested(),
                 !stale
             );
+        }
+    }
+
+    #[test]
+    fn deferred_nested_cleanup_marks_two_live_handlers_before_their_results() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::sync::{Condvar, mpsc};
+        use std::time::Duration;
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Blocked {
+            entered: mpsc::Sender<Uuid>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Handler for Blocked {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                let address = Address {
+                    scope: "maintenance".into(),
+                    name: "result".into(),
+                    key: task.id().to_string(),
+                };
+                docs.get(&address).unwrap();
+                docs.put(
+                    &address,
+                    json!({"value": "must discard"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+                self.entered.send(task.id()).unwrap();
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                Ok(Step::Succeed(json!("must discard")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let harness = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register(
+            "nested",
+            false,
+            Blocked {
+                entered: entered_tx,
+                release: release.clone(),
+            },
+        );
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        )
+        .into_task_tool();
+        parent.start().unwrap();
+        let a = task(2, TaskOwner::Task(parent.id()), "nested", false, 3).into_task_tool();
+        let b = task(3, TaskOwner::Task(parent.id()), "nested", false, 3).into_task_tool();
+        scheduler
+            .ts()
+            .save(&[Save::Create(&parent), Save::Create(&a), Save::Create(&b)])
+            .unwrap();
+        let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        scheduler
+            .ts()
+            .update(&current, |task| task.wait(WaitFor::Signal("resume".into())))
+            .unwrap();
+        let TickReservation::Invocation(a_invocation) = scheduler.try_reserve_tick(0).unwrap()
+        else {
+            panic!("A")
+        };
+        let TickReservation::Invocation(b_invocation) = scheduler.try_reserve_tick(0).unwrap()
+        else {
+            panic!("B")
+        };
+        let a_thread = std::thread::spawn(move || a_invocation.execute().unwrap());
+        let b_thread = std::thread::spawn(move || b_invocation.execute().unwrap());
+        let mut entered = [
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ];
+        entered.sort();
+        assert_eq!(entered, [a.id(), b.id()]);
+        let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
+        scheduler
+            .ts()
+            .update(&current, |task| {
+                task.wake()?;
+                task.start()?;
+                task.hold_success(json!("parent"))
+            })
+            .unwrap();
+        let owner = scheduler.owner();
+        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let poll = control.gate.lock().unwrap();
+        let TickReservation::Maintenance(pending) = scheduler.try_reserve_tick(0).unwrap() else {
+            panic!("maintenance")
+        };
+        let mut cleanup = harness.worker();
+        assert!(!pending.try_cleanup(&mut cleanup).unwrap());
+        drop(poll);
+        assert!(pending.try_cleanup(&mut cleanup).unwrap());
+        for id in [a.id(), b.id()] {
+            assert!(
+                scheduler
+                    .ts()
+                    .load(id)
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested()
+            );
+        }
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        scheduler
+            .try_settle_invocation(a_thread.join().unwrap())
+            .unwrap();
+        scheduler
+            .try_settle_invocation(b_thread.join().unwrap())
+            .unwrap();
+        for id in [a.id(), b.id()] {
+            let current = scheduler.ts().load(id).unwrap().unwrap().task;
+            assert_eq!(current.state(), &TaskState::Ready);
+            assert!(current.abort_requested());
+            let address = Address {
+                scope: "maintenance".into(),
+                name: "result".into(),
+                key: id.to_string(),
+            };
+            assert!(
+                Documents::new(owner.store())
+                    .get(&address)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_maintenance_rechecks_graph_and_allows_independent_progress() {
+        use crate::runtime::{Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        for kind in ["nested", "failed", "failfast"] {
+            for stale in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let harness = Harness::open_paused(
+                    dir.path().join("db"),
+                    Options {
+                        model: Arc::new(Stub),
+                        tools: vec![],
+                        restart_limit: 3,
+                        max_turns: 3,
+                        uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                    },
+                )
+                .unwrap();
+                let mut registry = Registry::default();
+                registry.register("independent", false, |_: &Task| {
+                    Ok(Step::Succeed(json!("independent")))
+                });
+                let mut scheduler = harness.attach_tasks(registry).unwrap();
+                let mut parent = task(
+                    1,
+                    TaskOwner::Conversation(Uuid::from_u128(9)),
+                    "missing",
+                    false,
+                    3,
+                );
+                if kind == "nested" {
+                    parent = parent.into_task_tool();
+                }
+                parent.start().unwrap();
+                let mut a = task(2, TaskOwner::Task(parent.id()), "missing", false, 3);
+                let mut b = task(3, TaskOwner::Task(parent.id()), "missing", false, 3);
+                if kind == "nested" {
+                    a = a.into_task_tool();
+                    b = b.into_task_tool();
+                }
+                a.start().unwrap();
+                b.start().unwrap();
+                let mut failed = task(4, TaskOwner::Task(parent.id()), "missing", false, 3);
+                failed.start().unwrap();
+                failed.fail("failed".into()).unwrap();
+                let independent = task(
+                    5,
+                    TaskOwner::Conversation(Uuid::from_u128(10)),
+                    "independent",
+                    false,
+                    3,
+                );
+                let generic = task(7, TaskOwner::Task(parent.id()), "missing", false, 3);
+                scheduler
+                    .ts()
+                    .save(&[
+                        Save::Create(&parent),
+                        Save::Create(&a),
+                        Save::Create(&b),
+                        Save::Create(&failed),
+                        Save::Create(&independent),
+                        Save::Create(&generic),
+                    ])
+                    .unwrap();
+                let parent_record = scheduler.ts().load(parent.id()).unwrap().unwrap();
+                scheduler
+                    .ts()
+                    .update(&parent_record, |task| match kind {
+                        "nested" => task.hold_success(json!("held")),
+                        "failed" => task.hold_failure("held".into()),
+                        _ => task.wait(WaitFor::TasksFailFast(vec![
+                            Uuid::from_u128(2),
+                            Uuid::from_u128(3),
+                            Uuid::from_u128(4),
+                        ])),
+                    })
+                    .unwrap();
+                let owner = scheduler.owner();
+                let control = owner.conversation_controls().get(Uuid::from_u128(99));
+                let poll = control.gate.lock().unwrap();
+                let TickReservation::Maintenance(pending) = scheduler.try_reserve_tick(0).unwrap()
+                else {
+                    panic!("maintenance: {kind}")
+                };
+                let mut cleanup = harness.worker();
+                assert!(!pending.try_cleanup(&mut cleanup).unwrap());
+                let invocation = scheduler.reserve_independent_root().unwrap().unwrap();
+                assert_eq!(invocation.task_id(), independent.id());
+                scheduler
+                    .settle_invocation(invocation.execute().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    scheduler
+                        .ts()
+                        .load(independent.id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .state(),
+                    &TaskState::Succeeded(json!("independent"))
+                );
+                let admitted =
+                    task(6, TaskOwner::Task(parent.id()), "missing", false, 3).into_task_tool();
+                if kind == "nested" {
+                    // Simulate a raw concurrent writer bypassing TaskStore admission;
+                    // the graph snapshot must still include the newly visible root.
+                    let key = task_store::key(admitted.id());
+                    owner
+                        .store()
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Missing,
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: serde_json::to_vec(&admitted).unwrap(),
+                            }],
+                        )
+                        .unwrap();
+                }
+                if stale {
+                    let current = scheduler.ts().load(parent.id()).unwrap().unwrap();
+                    scheduler
+                        .ts()
+                        .update(&current, |task| {
+                            if kind == "failfast" {
+                                task.wake()
+                            } else {
+                                task.finalize()
+                            }
+                        })
+                        .unwrap();
+                }
+                drop(poll);
+                assert!(pending.try_cleanup(&mut cleanup).unwrap());
+                let a_marked = scheduler
+                    .ts()
+                    .load(a.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested();
+                let b_marked = scheduler
+                    .ts()
+                    .load(b.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested();
+                if stale {
+                    assert!(!a_marked && !b_marked);
+                } else if kind == "failfast" {
+                    assert!(a_marked ^ b_marked);
+                } else {
+                    assert!(a_marked && b_marked);
+                }
+                if kind == "nested" {
+                    assert_eq!(
+                        scheduler
+                            .ts()
+                            .load(admitted.id())
+                            .unwrap()
+                            .unwrap()
+                            .task
+                            .abort_requested(),
+                        !stale
+                    );
+                    assert!(
+                        !scheduler
+                            .ts()
+                            .load(generic.id())
+                            .unwrap()
+                            .unwrap()
+                            .task
+                            .abort_requested()
+                    );
+                }
+            }
         }
     }
 
