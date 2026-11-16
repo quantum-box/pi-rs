@@ -369,7 +369,11 @@ The present Rust path has different boundaries:
 
 One bounded intermediate park is supported: a replay-safe root can invoke a
 replay-safe keyed direct child which checkpoints while one to eight keyed descendants are
-pending. Both invocations return normally without state or controls; the root
+pending or already completed, with at least one pending. Completed results are
+version-checked in the park transaction and replayed from the journal, including
+results from replay-unsafe descendants. After an any wake, re-parking also
+version-checks the previously completed siblings, including resolved jobs.
+Only pending descendants appear in the wake IDs. Both invocations return normally without state or controls; the root
 also checkpoints and parks, and must explicitly re-enter the same child after
 wake. An all-settled park wakes after every descendant settles; an explicit
 `suspend_pending_any_with_checkpoint` wakes when at least one settles. Its

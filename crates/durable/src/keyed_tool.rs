@@ -203,7 +203,9 @@ impl KeyedHost {
     /// require `KeyedTool::unsafe_park_version` and its replay contract. The
     /// invocation must return normally without state or controls. A replay-safe,
     /// keyed direct child of a replay-safe root may also park one to eight keyed
-    /// pending descendants this way, provided hooks are absent. The root must itself
+    /// pending descendants this way, provided hooks are absent. Already
+    /// completed keyed descendants are retained and replayed from their journal;
+    /// the wake IDs name only the descendants that were pending at park. The root must itself
     /// park with a checkpoint and re-enter that child on wake. This is not an
     /// independently scheduled child or general nested parking.
     pub fn suspend_pending_with_checkpoint(&self, checkpoint: Value) -> Result<(), String> {

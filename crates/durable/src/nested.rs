@@ -87,6 +87,7 @@ struct ChildParkRequest {
     checkpoint: Value,
     leaves: Vec<ChildParkLeaf>,
     any: bool,
+    completed_checks: Vec<Check>,
 }
 struct ChildParkLeaf {
     leaf_key: Vec<u8>,
@@ -1498,36 +1499,50 @@ impl NestedHost {
             return Err("nested child park requires one to eight keyed descendants".into());
         }
         let mut leaves = Vec::new();
+        let mut completed_checks = Vec::new();
+        let mut seen = HashSet::new();
         for (leaf_key, leaf) in entries {
             if !leaf_key[prefix.len()..].starts_with(b"k") {
                 return Err("nested child park requires keyed descendants".into());
             }
             let record: Record = serde_json::from_slice(&leaf.value).map_err(|e| e.to_string())?;
-            let Some(Outcome::Pending { reference }) = &record.outcome else {
-                if self.child_wake.is_some()
-                    && record.resolution.is_some()
-                    && record.outcome.as_ref() == record.resolution.as_ref().map(|r| &r.outcome)
-                {
-                    continue;
-                }
-                return Err("nested descendant is not pending".into());
-            };
             if record.before_pending
                 || record.before_gate.is_some()
                 || record.child_park.is_some()
                 || record.staged_outcome.is_some()
-                || leaves
-                    .iter()
-                    .any(|job: &ChildParkLeaf| job.operation_id == record.operation_id)
+                || record.hooks_required
+                || !seen.insert(record.operation_id)
             {
                 return Err("unsupported nested descendant state".into());
             }
-            leaves.push(ChildParkLeaf {
-                leaf_key,
-                leaf_version: leaf.version,
-                operation_id: record.operation_id,
-                reference: reference.clone(),
-            });
+            match &record.outcome {
+                Some(Outcome::Pending { reference }) if record.resolution.is_none() => {
+                    leaves.push(ChildParkLeaf {
+                        leaf_key,
+                        leaf_version: leaf.version,
+                        operation_id: record.operation_id,
+                        reference: reference.clone(),
+                    });
+                }
+                Some(
+                    outcome @ (Outcome::Succeeded(_)
+                    | Outcome::SucceededWithDetails { .. }
+                    | Outcome::Failed(_)
+                    | Outcome::Skipped(_)
+                    | Outcome::Truncated { .. }
+                    | Outcome::Structured { .. }),
+                ) if record
+                    .resolution
+                    .as_ref()
+                    .is_none_or(|resolution| &resolution.outcome == outcome) =>
+                {
+                    completed_checks.push(Check {
+                        key: leaf_key,
+                        expected: Expected::Version(leaf.version),
+                    });
+                }
+                _ => return Err("nested descendant is uncertain".into()),
+            }
         }
         if leaves.is_empty() {
             return Err("nested child park requires a pending descendant".into());
@@ -1559,6 +1574,7 @@ impl NestedHost {
             checkpoint,
             leaves,
             any,
+            completed_checks,
         });
         lifecycle.closed.insert(self.parent);
         Ok(())
@@ -2616,6 +2632,7 @@ impl NestedHost {
             key: leaf.leaf_key,
             expected: Expected::Version(leaf.leaf_version),
         }));
+        checks.extend(request.completed_checks);
         let mut mutations = batch.mutations;
         mutations.push(Mutation::Put {
             key: key.to_vec(),
