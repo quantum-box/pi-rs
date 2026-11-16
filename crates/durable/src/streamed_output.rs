@@ -69,10 +69,14 @@ pub(crate) fn decode_checkpoint(
 pub(crate) fn encode_checkpoint(
     checkpoint: &crate::output::OutputCheckpoint,
     selected: Option<crate::output::Retain>,
+    limits: Option<crate::output::OutputLimits>,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut value = serde_json::to_value(checkpoint)?;
     if let Some(retain) = selected {
         value["selected_retention"] = serde_json::to_value(retain)?;
+    }
+    if let Some(limits) = limits {
+        value["result_limits"] = serde_json::to_value(limits)?;
     }
     serde_json::to_vec(&value)
 }
@@ -93,4 +97,20 @@ pub(crate) fn load_selected_checkpoint(
         return Ok(None);
     };
     Ok(Some((checkpoint, serde_json::from_value(retain.clone())?)))
+}
+
+/// Read final adapter limits from a sidecar while retaining its CAS version.
+pub(crate) fn result_limits(
+    entry: &durable_store::Entry,
+) -> Result<Option<crate::output::OutputLimits>, Box<dyn std::error::Error + Send + Sync>> {
+    decode_checkpoint(entry.clone())?;
+    let value: serde_json::Value = serde_json::from_slice(&entry.value)?;
+    let Some(value) = value.get("result_limits") else {
+        return Ok(None);
+    };
+    let limits: crate::output::OutputLimits = serde_json::from_value(value.clone())?;
+    if limits.max_bytes > crate::keyed_tool::MAX_STREAMED_OUTPUT_BYTES {
+        return Err("invalid bounded result limits".into());
+    }
+    Ok(Some(limits))
 }

@@ -12,7 +12,7 @@ pub enum Retain {
 }
 
 /// Independent UTF-8 byte and line limits. Either may be zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutputLimits {
     pub max_bytes: usize,
     pub max_lines: usize,

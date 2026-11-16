@@ -1134,6 +1134,96 @@ fn hide_pending_tool_output(state: &mut Conversation) {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BoundedResultProof {
+    attempt_id: Uuid,
+    limits: crate::output::OutputLimits,
+}
+
+fn bounded_result_key(conversation: Uuid, operation: Uuid) -> Vec<u8> {
+    format!("runtime/bounded-tool-result/{conversation}/{operation}").into_bytes()
+}
+
+fn bounded_result_limits(
+    owner: &OwnedStore,
+    conversation: &Conversation,
+    operation: Uuid,
+) -> Result<Option<crate::output::OutputLimits>, Error> {
+    let Some(attempt) = conversation
+        .tool_attempt()
+        .filter(|attempt| attempt.operation_id == operation)
+    else {
+        return Ok(None);
+    };
+    let Some(entry) = owner
+        .store()
+        .get(&bounded_result_key(conversation.id, operation))?
+    else {
+        return Ok(None);
+    };
+    let proof: BoundedResultProof = serde_json::from_slice(&entry.value)?;
+    if proof.attempt_id != attempt.attempt_id
+        || proof.limits.max_bytes > crate::keyed_tool::MAX_STREAMED_OUTPUT_BYTES
+    {
+        return Err(Error::Invalid("invalid bounded tool result proof".into()));
+    }
+    Ok(Some(proof.limits))
+}
+
+fn bound_tool_output(
+    blocks: &mut Vec<serde_json::Value>,
+    limits: crate::output::OutputLimits,
+) -> Option<ToolDiagnostic> {
+    let positions: Vec<_> = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .then(|| {
+                    block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| (index, text))
+                })
+                .flatten()
+        })
+        .collect();
+    let joined: String = positions.iter().map(|(_, text)| *text).collect();
+    let bounded = crate::output::bound_output(&joined, limits);
+    if bounded.dropped_bytes == 0 {
+        return None;
+    }
+    let kept = bounded.text.to_owned();
+    let bytes = bounded.dropped_bytes;
+    let lines = bounded.dropped_lines;
+    let selected = match limits.retain {
+        crate::output::Retain::Head => positions.first(),
+        crate::output::Retain::Tail => positions.last(),
+    }?
+    .0;
+    let mut replacement = Vec::with_capacity(blocks.len());
+    for (index, mut block) in std::mem::take(blocks).into_iter().enumerate() {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+            if index == selected {
+                block["text"] = serde_json::Value::String(kept.clone());
+                replacement.push(block);
+            }
+        } else {
+            replacement.push(block);
+        }
+    }
+    *blocks = replacement;
+    let end = match limits.retain {
+        crate::output::Retain::Head => "beginning",
+        crate::output::Retain::Tail => "end",
+    };
+    Some(ToolDiagnostic {
+        severity: DiagnosticSeverity::Warn,
+        code: Some("truncated".into()),
+        message: format!("Output truncated to its {end}: {lines} lines, {bytes} bytes dropped"),
+    })
+}
+
 fn bounded_success_diagnostic(
     owner: &OwnedStore,
     conversation: &Conversation,
@@ -1846,14 +1936,14 @@ struct RuntimeStreamOutput {
 #[async_trait::async_trait]
 impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
     async fn record(&self, text: &str) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, None, None)
+        self.record_inner(text, None, None, None)
     }
     async fn record_bounded(
         &self,
         text: &str,
         checkpoint: &crate::output::OutputCheckpoint,
     ) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, Some(checkpoint), None)
+        self.record_inner(text, Some(checkpoint), None, None)
     }
     async fn record_bounded_selected(
         &self,
@@ -1861,7 +1951,21 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
         checkpoint: &crate::output::OutputCheckpoint,
         retain: crate::output::Retain,
     ) -> pi_rs_core::ExtensionResult<()> {
-        self.record_inner(text, Some(checkpoint), Some(retain))
+        self.record_inner(text, Some(checkpoint), Some(retain), None)
+    }
+    async fn record_bounded_final(
+        &self,
+        text: &str,
+        checkpoint: &crate::output::OutputCheckpoint,
+        limits: crate::output::OutputLimits,
+        selected: bool,
+    ) -> pi_rs_core::ExtensionResult<()> {
+        self.record_inner(
+            text,
+            Some(checkpoint),
+            selected.then_some(limits.retain),
+            Some(limits),
+        )
     }
 }
 impl RuntimeStreamOutput {
@@ -1870,6 +1974,7 @@ impl RuntimeStreamOutput {
         text: &str,
         checkpoint: Option<&crate::output::OutputCheckpoint>,
         selected: Option<crate::output::Retain>,
+        limits: Option<crate::output::OutputLimits>,
     ) -> pi_rs_core::ExtensionResult<()> {
         let _lease = self
             .source
@@ -1932,7 +2037,9 @@ impl RuntimeStreamOutput {
                     });
                     mutations.push(Mutation::Put {
                         key: checkpoint_key,
-                        value: crate::streamed_output::encode_checkpoint(checkpoint, selected)?,
+                        value: crate::streamed_output::encode_checkpoint(
+                            checkpoint, selected, limits,
+                        )?,
                     });
                 }
                 match store.commit(&checks, &mutations) {
@@ -5294,6 +5401,48 @@ impl Harness {
             key: key.clone(),
             value,
         }];
+        // A final adapter sidecar alone is not a committed outcome. Bind its
+        // limits to this normal result transition; recovery paths cannot create
+        // the proof and therefore never truncate interruption error text.
+        if !self.recovering
+            && !state.abort_requested
+            && let Some(previous) = old
+            && matches!(
+                previous.phase,
+                Phase::ToolRunning {
+                    replay_ready: false,
+                    ..
+                }
+            )
+            && let Phase::ToolFinished { operation_id, .. } = &state.phase
+            && let Some(attempt) = state
+                .tool_attempt()
+                .filter(|a| a.operation_id == *operation_id)
+            && previous.tool_attempt() == Some(attempt)
+        {
+            let checkpoint_key = crate::streamed_output::checkpoint_key(attempt.attempt_id);
+            if let Some(entry) = self.owner.store().get(&checkpoint_key)?
+                && let Some(limits) = crate::streamed_output::result_limits(&entry)
+                    .map_err(|error| Error::Invalid(format!("bounded stream limits: {error}")))?
+            {
+                checks.push(Check {
+                    key: checkpoint_key,
+                    expected: Expected::Version(entry.version),
+                });
+                let proof_key = bounded_result_key(state.id, *operation_id);
+                checks.push(Check {
+                    key: proof_key.clone(),
+                    expected: Expected::Missing,
+                });
+                mutations.push(Mutation::Put {
+                    key: proof_key,
+                    value: serde_json::to_vec(&BoundedResultProof {
+                        attempt_id: attempt.attempt_id,
+                        limits,
+                    })?,
+                });
+            }
+        }
         let old_pending = old.and_then(|prior| prior.pending_tool_result.as_ref());
         let new_pending = state.pending_tool_result.as_ref();
         if old_pending != new_pending {
@@ -10910,6 +11059,11 @@ impl Harness {
                 } else {
                     None
                 };
+                let limits = if c.extensions.is_empty() {
+                    bounded_result_limits(&self.owner, &c, operation_id)?
+                } else {
+                    None
+                };
                 if let Some(mut metadata) = c.pending_tool_result.take() {
                     if !metadata.is_error
                         && let Some(diagnostic) = truncation
@@ -10923,6 +11077,13 @@ impl Harness {
                             "hook_not_completed",
                             "tool result metadata withheld because after-tool hooks did not complete",
                         );
+                    }
+                    if let Some(limits) = limits {
+                        let mut blocks = vec![serde_json::json!({"type":"text", "text":content})];
+                        if let Some(diagnostic) = bound_tool_output(&mut blocks, limits) {
+                            append_harness_diagnostic(&mut metadata, diagnostic);
+                        }
+                        content = blocks[0]["text"].as_str().unwrap_or_default().to_owned();
                     }
                     if let Some(diagnostic) = render_truncation_diagnostics(&metadata) {
                         append_diagnostic_text(&mut content, &diagnostic);
@@ -13864,6 +14025,7 @@ impl Harness {
                     arguments,
                     content,
                 } => {
+                    let result_limits = bounded_result_limits(&self.owner, &c, operation_id)?;
                     let original_metadata = c.pending_tool_result.as_ref().or_else(|| {
                         c.tool_results
                             .iter()
@@ -14084,6 +14246,8 @@ impl Harness {
                     }
                     retained_output_unchanged &=
                         block_result.output == original_block_result.output;
+                    let bounded = result_limits
+                        .and_then(|limits| bound_tool_output(&mut block_result.output, limits));
                     if let Some(metadata) = c
                         .tool_results
                         .iter_mut()
@@ -14092,6 +14256,9 @@ impl Harness {
                         if retained_output_unchanged
                             && let Some(diagnostic) = truncation.or(interrupted_truncation)
                         {
+                            append_harness_diagnostic(metadata, diagnostic);
+                        }
+                        if let Some(diagnostic) = bounded {
                             append_harness_diagnostic(metadata, diagnostic);
                         }
                         if let Some(diagnostic) = render_truncation_diagnostics(metadata) {

@@ -5754,3 +5754,33 @@ fn atomic_failure_boundary_retries_with_latest_inbox_and_modes() {
     }
     assert_eq!(c.run_failure.unwrap().reason, "model_error");
 }
+
+#[test]
+fn bounded_tool_blocks_preserve_nontext_order_and_bound_combined_text() {
+    use crate::output::{OutputLimits, Retain};
+    let mut blocks = vec![
+        serde_json::json!({"type":"text", "text":"abc"}),
+        serde_json::json!({"type":"image", "data":"image", "mimeType":"image/png"}),
+        serde_json::json!({"type":"text", "text":"def"}),
+    ];
+    let diagnostic = bound_tool_output(
+        &mut blocks,
+        OutputLimits {
+            max_bytes: 4,
+            max_lines: 10,
+            retain: Retain::Tail,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        blocks,
+        vec![
+            serde_json::json!({"type":"image", "data":"image", "mimeType":"image/png"}),
+            serde_json::json!({"type":"text", "text":"cdef"})
+        ]
+    );
+    assert_eq!(
+        diagnostic.message,
+        "Output truncated to its end: 0 lines, 2 bytes dropped"
+    );
+}

@@ -277,6 +277,20 @@ pub(crate) trait StreamSink: Send + Sync {
     ) -> ExtensionResult<()> {
         self.record_bounded(text, checkpoint).await
     }
+    async fn record_bounded_final(
+        &self,
+        text: &str,
+        checkpoint: &crate::output::OutputCheckpoint,
+        limits: crate::output::OutputLimits,
+        selected: bool,
+    ) -> ExtensionResult<()> {
+        if selected {
+            self.record_bounded_selected(text, checkpoint, limits.retain)
+                .await
+        } else {
+            self.record_bounded(text, checkpoint).await
+        }
+    }
 }
 
 /// An explicit durable-only result. `None` selects this attempt's streamed text;
@@ -577,21 +591,15 @@ impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
             let mut candidate = state.buffer.clone();
             candidate.end();
             let checkpoint = candidate.checkpoint();
-            let result = if matches!(&reply, StreamedReply::Success { output: None, .. }) {
-                inner
-                    .sink
-                    .record_bounded_selected(
-                        &checkpoint.current.text,
-                        &checkpoint,
-                        self.limits.retain,
-                    )
-                    .await
-            } else {
-                inner
-                    .sink
-                    .record_bounded(&checkpoint.current.text, &checkpoint)
-                    .await
-            };
+            let result = inner
+                .sink
+                .record_bounded_final(
+                    &checkpoint.current.text,
+                    &checkpoint,
+                    self.limits,
+                    matches!(&reply, StreamedReply::Success { output: None, .. }),
+                )
+                .await;
             if result.is_err() {
                 state.failed = true;
             } else {

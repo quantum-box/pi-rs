@@ -182,18 +182,26 @@ For opt-in durable streaming, wrap a `BoundedStreamedTool` in
 stream's byte limit must be at most 64 KiB. `append` and `append_bytes` commit
 the sanitized retained window before returning; `snapshot` exposes dropped
 counts while the invocation runs. Returning `StreamedReply::Success` with
-`output: None` uses the retained window. Explicit replies keep their ordinary
-meaning. When a successful tool selects its retained stream, the runtime adds a
+`output: None` uses the retained window. Explicit replies keep their status and
+state while their output is subject to the limits below. When a successful tool
+selects its retained stream, the runtime adds a
 `truncated` warning after result hooks if the retained output was not replaced.
 The warning appears in both result metadata and a model-visible `<harness>`
 text section. Interrupted recovery does the same; warnings are not duplicated
-on reopen. Other diagnostic classes remain metadata only. Explicit output does not acquire the stream's warning, even if its text matches.
-Structured and block hook outputs are compared by value, since their Rust API
-does not expose upstream's output-object identity. Explicit output is not
-automatically bounded. Sidecars written before selection markers cannot prove
+on reopen. Other diagnostic classes remain metadata only. Explicit output does
+not acquire the stream's warning, even if its text matches.
+After all result hooks, explicit output and hook-replaced text are bounded using
+the adapter's configured limits; a separate warning reports any bytes dropped.
+For block results, text blocks are joined for the limit and non-text blocks keep
+their order. Structured and block hook outputs are compared by value, since their
+Rust API does not expose upstream's output-object identity. Result-limit proofs
+are recorded with normal result commits; older already-finished results lacking
+a proof are not retroactively bounded. These small result-limit proof records
+are not automatically deleted. Sidecars written before selection markers cannot prove
 whether an already-finished result used the stream, so they do not gain a
 success warning on upgrade. A versioned sidecar checkpoints dropped counts and
-pending UTF-8 bytes atomically with retained text. On interruption, recovery flushes an incomplete byte
+pending UTF-8 bytes atomically with retained text. On interruption, recovery
+flushes an incomplete byte
 sequence as U+FFFD and adds a `truncated` warning when bytes were dropped. The
 existing text record remains readable, and older streams without a sidecar retain
 their prior recovery behavior. The sidecar stores the recovery projection, not

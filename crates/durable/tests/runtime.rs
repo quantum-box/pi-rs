@@ -3036,3 +3036,363 @@ async fn interrupted_stream_hook_replacement_controls_model_warning_after_reopen
         );
     }
 }
+
+#[tokio::test]
+async fn bounded_explicit_output_and_hook_replacements_reach_model() {
+    use pi_rs_durable::extension::{
+        Context, Extension, Hook, ToolBlockResult, ToolCall as HookCall, ToolResult,
+    };
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    struct Explicit {
+        mode: &'static str,
+    }
+    #[async_trait]
+    impl BoundedStreamedTool for Explicit {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            output.append("discard\nseed\nlast\n").await.unwrap();
+            match self.mode {
+                "same" => StreamedReply::Success {
+                    output: Some("seed\nlast\n".into()),
+                    state: None,
+                },
+                "reply" => {
+                    StreamedReply::Explicit(Outcome::Succeeded("aa\nbb\ncc\n".into()).into())
+                }
+                "failed" => StreamedReply::Explicit(Outcome::Failed("aa\nbb\ncc\n".into()).into()),
+                "empty" => StreamedReply::Success {
+                    output: Some(String::new()),
+                    state: None,
+                },
+                "utf8" => StreamedReply::Success {
+                    output: Some("ééé".into()),
+                    state: None,
+                },
+                "fallback" => StreamedReply::Success {
+                    output: None,
+                    state: None,
+                },
+                _ => StreamedReply::Success {
+                    output: Some("aa\nbb\ncc\n".into()),
+                    state: None,
+                },
+            }
+        }
+    }
+    struct Rewrite(&'static str);
+    #[async_trait]
+    impl Hook for Rewrite {
+        async fn after_tool(
+            &self,
+            _: &HookCall,
+            result: &serde_json::Value,
+            _: &Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            if self.0 == "legacy" {
+                assert_eq!(result.as_str(), Some("aa\nbb\ncc\n"));
+                return Ok(Some(json!("x\ny\nz\n")));
+            }
+            Ok(None)
+        }
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            if self.0 == "result" {
+                let mut result = result.clone();
+                result.output = "x\ny\nz\n".into();
+                return Ok(Some(result));
+            }
+            Ok(None)
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            self.0 == "blocks"
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            result: &ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            let mut result = result.clone();
+            result.output = vec![json!({"type":"text", "text":"x\ny\nz\n"})];
+            Ok(Some(result))
+        }
+    }
+    for (retain, mode, hook, expected_text, expected_warning) in [
+        (
+            Retain::Head,
+            "explicit",
+            "none",
+            "aa\nbb\n",
+            Some("beginning: 1 lines, 3 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "explicit",
+            "none",
+            "bb\ncc\n",
+            Some("end: 1 lines, 3 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "reply",
+            "none",
+            "bb\ncc\n",
+            Some("end: 1 lines, 3 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "failed",
+            "none",
+            "bb\ncc\n",
+            Some("end: 1 lines, 16 bytes dropped"),
+        ),
+        (Retain::Tail, "same", "none", "seed\nlast\n", None),
+        (Retain::Tail, "empty", "none", "", None),
+        (
+            Retain::Head,
+            "utf8",
+            "none",
+            "éé",
+            Some("beginning: 0 lines, 2 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "utf8",
+            "none",
+            "éé",
+            Some("end: 0 lines, 2 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "explicit",
+            "legacy",
+            "y\nz\n",
+            Some("end: 1 lines, 2 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "fallback",
+            "result",
+            "y\nz\n",
+            Some("end: 1 lines, 2 bytes dropped"),
+        ),
+        (
+            Retain::Tail,
+            "fallback",
+            "blocks",
+            "y\nz\n",
+            Some("end: 1 lines, 2 bytes dropped"),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = || Options {
+            model: Arc::new(RecordingModel {
+                inner: FakeModel {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                },
+                observed_tools: observed.clone(),
+            }),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                    tool: Explicit { mode },
+                    limits: OutputLimits {
+                        max_bytes: if mode == "utf8" { 5 } else { 64 },
+                        max_lines: 2,
+                        retain,
+                    },
+                }))
+                .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.install_extension(Extension {
+            name: "rewrite".into(),
+            hooks: vec![Arc::new(Rewrite(hook))],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["rewrite".into()]).unwrap();
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        let expected = match expected_warning {
+            Some(warning) => format!(
+                "{expected_text}{}<harness>\n[warn] Output truncated to its {warning}\n</harness>",
+                if expected_text.is_empty() || expected_text.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                },
+            ),
+            None => expected_text.to_owned(),
+        };
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![expected.clone()],
+            "{retain:?} {mode} {hook}"
+        );
+        let c = h.conversation(id).unwrap();
+        let diagnostics = &c.tool_results.last().unwrap().diagnostics;
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code.as_deref() == Some("truncated"))
+                .count(),
+            usize::from(expected_warning.is_some())
+        );
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(
+            h.conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content, .. } if content == &expected))
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_explicit_output_survives_hook_process_crash() {
+    use pi_rs_durable::extension::{Context, Extension, Hook, ToolCall as HookCall};
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    struct ToolOnce(Arc<AtomicUsize>);
+    #[async_trait]
+    impl BoundedStreamedTool for ToolOnce {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            _: BoundedStreamOutput,
+        ) -> StreamedReply {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            StreamedReply::Success {
+                output: Some("aa\nbb\ncc\n".into()),
+                state: None,
+            }
+        }
+    }
+    struct CrashOrReplace(bool);
+    #[async_trait]
+    impl Hook for CrashOrReplace {
+        async fn after_tool(
+            &self,
+            _: &HookCall,
+            result: &serde_json::Value,
+            _: &Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            assert_eq!(result.as_str(), Some("aa\nbb\ncc\n"));
+            if self.0 {
+                std::process::abort();
+            }
+            Ok(Some(json!("x\ny\nz\n")))
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(RecordingModel {
+            inner: FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            },
+            observed_tools: observed.clone(),
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: ToolOnce(calls.clone()),
+                limits: OutputLimits {
+                    max_bytes: 64,
+                    max_lines: 2,
+                    retain: Retain::Tail,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let extension = |crash| Extension {
+        name: "crash-hook".into(),
+        hooks: vec![Arc::new(CrashOrReplace(crash))],
+        ..Default::default()
+    };
+    if let Some(path) = std::env::var_os("PI_BOUNDED_EXPLICIT_CRASH_PATH") {
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(path, options(), &cancel).await.unwrap();
+        h.install_extension(extension(true)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["crash-hook".into()]).unwrap();
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        panic!("hook did not crash");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "bounded_explicit_output_survives_hook_process_crash",
+            "--nocapture",
+        ])
+        .env("PI_BOUNDED_EXPLICIT_CRASH_PATH", &path)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(extension(false)).unwrap();
+    h.resume(&CancellationToken::new()).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let messages = observed.lock().unwrap().clone();
+    assert_eq!(
+        messages,
+        vec![
+            "y\nz\n<harness>\n[warn] Output truncated to its end: 1 lines, 2 bytes dropped\n</harness>"
+        ]
+    );
+}
