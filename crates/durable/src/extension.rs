@@ -187,6 +187,33 @@ pub struct ToolResult {
     pub attachments: Vec<pi_rs_core::AttachmentRef>,
     pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
 }
+/// Describes whether a hook deliberately replaced the output channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputProvenance {
+    /// Preserve the incoming output; changed values are still treated as replacements.
+    Retained,
+    /// A new output, including when it compares equal to the incoming output.
+    Replaced,
+    /// Infer replacement by comparing output values (the legacy default).
+    Infer,
+}
+
+fn output_replaced<T: PartialEq>(before: &T, after: &T, provenance: OutputProvenance) -> bool {
+    before != after || provenance == OutputProvenance::Replaced
+}
+
+fn remove_cloned_derived_diagnostics(
+    before: &[crate::runtime::ToolDiagnostic],
+    after: &mut Vec<crate::runtime::ToolDiagnostic>,
+) {
+    after.retain(|diagnostic| {
+        !matches!(
+            diagnostic.code.as_deref(),
+            Some("tool_failed" | "tool_skipped")
+        ) || !before.contains(diagnostic)
+    });
+}
+
 /// A block-aware tool result for hosts that can persist and deliver ordered output.
 /// Unknown result fields are retained when a hook rewrites the output.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -309,6 +336,31 @@ pub trait Hook: Send + Sync {
         _ctx: &Context<'_>,
     ) -> Result<Option<ToolResult>, String> {
         Ok(None)
+    }
+    /// Override to declare output provenance, including an equal-valued replacement.
+    async fn after_tool_result_with_provenance(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        ctx: &Context<'_>,
+    ) -> Result<Option<(ToolResult, OutputProvenance)>, String> {
+        Ok(self
+            .after_tool_result(call, result, ctx)
+            .await?
+            .map(|value| (value, OutputProvenance::Infer)))
+    }
+    /// Declare provenance for block hooks; the default compares output values.
+    async fn after_tool_blocks_with_provenance(
+        &self,
+        call: &ToolCall,
+        result: &ToolBlockResult,
+        nested: bool,
+        ctx: &Context<'_>,
+    ) -> Result<Option<(ToolBlockResult, OutputProvenance)>, String> {
+        Ok(self
+            .after_tool_blocks(call, result, nested, ctx)
+            .await?
+            .map(|value| (value, OutputProvenance::Infer)))
     }
     /// Opt in to the runtime block hook after legacy and structured hooks have run.
     fn supports_runtime_tool_blocks(&self) -> bool {
@@ -717,15 +769,40 @@ impl Resolved {
     pub async fn after_tool_result(
         &self,
         call: &ToolCall,
-        mut result: ToolResult,
+        result: ToolResult,
         ctx: &Context<'_>,
     ) -> (ToolResult, bool, Vec<Report>) {
+        let (result, changed, _, reports) = self
+            .after_tool_result_with_provenance(call, result, ctx)
+            .await;
+        (result, changed, reports)
+    }
+    pub(crate) async fn after_tool_result_with_provenance(
+        &self,
+        call: &ToolCall,
+        mut result: ToolResult,
+        ctx: &Context<'_>,
+    ) -> (ToolResult, bool, bool, Vec<Report>) {
         let mut reports = Vec::new();
         let mut replaced = false;
+        let mut output_changed = false;
         for extension in &self.extensions {
             for hook in &extension.hooks {
-                match protect(async { hook.after_tool_result(call, &result, ctx).await }).await {
-                    Ok(Some(value)) => {
+                match protect(async {
+                    hook.after_tool_result_with_provenance(call, &result, ctx)
+                        .await
+                })
+                .await
+                {
+                    Ok(Some((mut value, provenance))) => {
+                        let output_is_replaced =
+                            output_replaced(&result.output, &value.output, provenance);
+                        if output_is_replaced {
+                            remove_cloned_derived_diagnostics(
+                                &result.diagnostics,
+                                &mut value.diagnostics,
+                            );
+                        }
                         let valid_diagnostics = value.diagnostics.len() <= 32
                             && value.diagnostics.iter().all(|d| {
                                 d.message.len() <= 4096
@@ -739,6 +816,7 @@ impl Resolved {
                         ))
                         .is_ok_and(|bytes| bytes.len() <= 65_536);
                         if valid_diagnostics && bounded {
+                            output_changed |= output_is_replaced;
                             result = value;
                             replaced = true;
                         } else {
@@ -756,7 +834,7 @@ impl Resolved {
                 }
             }
         }
-        (result, replaced, reports)
+        (result, replaced, output_changed, reports)
     }
     /// Run ordered block-aware hooks. The caller must durably persist the returned
     /// result before exposing it to a model. Harness uses its own opt-in chain
@@ -817,16 +895,27 @@ impl Resolved {
             for hook in &extension.hooks {
                 match protect(async {
                     if hook.supports_runtime_tool_blocks() {
-                        hook.after_tool_blocks(call, &result, nested, ctx).await
+                        hook.after_tool_blocks_with_provenance(call, &result, nested, ctx)
+                            .await
                     } else {
                         Ok(None)
                     }
                 })
                 .await
                 {
-                    Ok(Some(value)) if value.valid() && value.extra == result.extra => {
+                    Ok(Some((mut value, provenance)))
+                        if value.valid() && value.extra == result.extra =>
+                    {
+                        let output_is_replaced =
+                            output_replaced(&result.output, &value.output, provenance);
+                        if output_is_replaced {
+                            remove_cloned_derived_diagnostics(
+                                &result.diagnostics,
+                                &mut value.diagnostics,
+                            );
+                        }
                         result = value;
-                        replaced = true;
+                        replaced |= output_is_replaced;
                     }
                     Ok(Some(_)) => reports.push(failure(
                         &extension.name,

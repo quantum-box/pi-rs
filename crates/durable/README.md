@@ -194,9 +194,7 @@ the parent explicitly forwards them. Explicit output does not acquire the stream
 After all result hooks, explicit output and hook-replaced text are bounded using
 the adapter's configured limits; a separate warning reports any bytes dropped.
 For block results, text blocks are joined for the limit and non-text blocks keep
-their order. A rich or block hook returning `Some` is treated as an output
-replacement even if its output compares equal; return `None` to preserve the
-stream's truncation provenance. Result-limit proofs
+their order. Rich and block hooks infer output replacement by comparing output values, so metadata-only updates preserve stream truncation provenance. Override `after_tool_result_with_provenance` or `after_tool_blocks_with_provenance` and return `OutputProvenance::Replaced` to mark an equal-valued replacement explicitly. When output is replaced, unchanged derived failure/skip diagnostics are withheld; hooks may provide rewritten diagnostics. When bounded output is truncated, the duplicated derived failure/skip reason is withheld and the bounded output and truncation warning remain model-visible. Result-limit proofs
 are recorded with normal result commits; older already-finished results lacking
 a proof are not retroactively bounded. These small result-limit proof records
 are not automatically deleted. Sidecars written before selection markers cannot prove

@@ -11125,6 +11125,12 @@ impl Harness {
                         if let Some(diagnostic) =
                             bound_tool_output(&mut blocks, limits.limits, limits.prebounded)
                         {
+                            metadata.diagnostics.retain(|item| {
+                                !matches!(
+                                    item.code.as_deref(),
+                                    Some("tool_failed" | "tool_skipped")
+                                )
+                            });
                             append_harness_diagnostic(&mut metadata, diagnostic);
                         }
                         content = blocks[0]["text"].as_str().unwrap_or_default().to_owned();
@@ -14151,6 +14157,19 @@ impl Harness {
                                 "tool metadata withheld after output replacement",
                             );
                         }
+                        if let Some(proof) = &result_limits
+                            && (proof.prebounded.is_some()
+                                || crate::output::bound_output(&content, proof.limits)
+                                    .dropped_bytes
+                                    > 0)
+                        {
+                            metadata.diagnostics.retain(|item| {
+                                !matches!(
+                                    item.code.as_deref(),
+                                    Some("tool_failed" | "tool_skipped")
+                                )
+                            });
+                        }
                         let value = crate::extension::ToolResult {
                             output: content.clone(),
                             is_error: metadata.is_error,
@@ -14159,8 +14178,8 @@ impl Harness {
                             attachments: metadata.attachments.clone(),
                             diagnostics: metadata.diagnostics.clone(),
                         };
-                        let (value, explicitly_replaced, reports) = fenced_poll(
-                            selected.after_tool_result(&hook_call, value, &context),
+                        let (value, result_changed, explicitly_replaced, reports) = fenced_poll(
+                            selected.after_tool_result_with_provenance(&hook_call, value, &context),
                             self.execution_gate.as_ref(),
                             cancel,
                         )
@@ -14177,8 +14196,8 @@ impl Harness {
                             "after_tool_result",
                             reports,
                         )?;
-                        if explicitly_replaced {
-                            retained_output_unchanged = false;
+                        if result_changed {
+                            retained_output_unchanged &= !explicitly_replaced;
                             content = value.output;
                             metadata.is_error = value.is_error;
                             metadata.details = value.details;
@@ -14308,6 +14327,12 @@ impl Harness {
                             append_harness_diagnostic(metadata, diagnostic);
                         }
                         if let Some(diagnostic) = bounded {
+                            metadata.diagnostics.retain(|item| {
+                                !matches!(
+                                    item.code.as_deref(),
+                                    Some("tool_failed" | "tool_skipped")
+                                )
+                            });
                             append_harness_diagnostic(metadata, diagnostic);
                         }
                         if let Some(diagnostic) = render_tool_diagnostics(&metadata.diagnostics) {

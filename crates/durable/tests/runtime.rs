@@ -2624,7 +2624,10 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
             Ok((self.kind == "legacy-replace").then(|| json!("replacement")))
         }
         fn supports_runtime_tool_blocks(&self) -> bool {
-            matches!(self.kind, "blocks-replace" | "blocks-same")
+            matches!(
+                self.kind,
+                "blocks-replace" | "blocks-same" | "blocks-default"
+            )
         }
         async fn after_tool_blocks(
             &self,
@@ -2634,10 +2637,64 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
             _: &Context<'_>,
         ) -> Result<Option<ToolBlockResult>, String> {
             let mut replacement = result.clone();
+            if self.kind == "blocks-default" {
+                replacement
+                    .diagnostics
+                    .push(pi_rs_durable::runtime::ToolDiagnostic {
+                        severity: pi_rs_durable::runtime::DiagnosticSeverity::Info,
+                        message: "block metadata".into(),
+                        code: None,
+                    });
+            }
             if self.kind == "blocks-replace" {
                 replacement.output = vec![json!({"type":"text", "text":"replacement"})];
             }
             Ok(Some(replacement))
+        }
+        async fn after_tool_blocks_with_provenance(
+            &self,
+            call: &HookCall,
+            result: &ToolBlockResult,
+            nested: bool,
+            ctx: &Context<'_>,
+        ) -> Result<Option<(ToolBlockResult, pi_rs_durable::extension::OutputProvenance)>, String>
+        {
+            use pi_rs_durable::extension::OutputProvenance;
+            Ok(self
+                .after_tool_blocks(call, result, nested, ctx)
+                .await?
+                .map(|value| {
+                    (
+                        value,
+                        if self.kind == "blocks-same" {
+                            OutputProvenance::Replaced
+                        } else {
+                            OutputProvenance::Infer
+                        },
+                    )
+                }))
+        }
+        async fn after_tool_result_with_provenance(
+            &self,
+            call: &HookCall,
+            result: &ToolResult,
+            ctx: &Context<'_>,
+        ) -> Result<Option<(ToolResult, pi_rs_durable::extension::OutputProvenance)>, String>
+        {
+            use pi_rs_durable::extension::OutputProvenance;
+            Ok(self
+                .after_tool_result(call, result, ctx)
+                .await?
+                .map(|value| {
+                    (
+                        value,
+                        if self.kind == "rich-same" {
+                            OutputProvenance::Replaced
+                        } else {
+                            OutputProvenance::Infer
+                        },
+                    )
+                }))
         }
         async fn after_tool_result(
             &self,
@@ -2670,10 +2727,11 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
     }
     for (retain, explicit, kind, expected) in [
         (Retain::Head, false, "none", true),
-        (Retain::Tail, false, "metadata-only", false),
+        (Retain::Tail, false, "metadata-only", true),
         (Retain::Tail, false, "rich-same", false),
         (Retain::Tail, false, "blocks-same", false),
-        (Retain::Tail, false, "flag-only", false),
+        (Retain::Tail, false, "blocks-default", true),
+        (Retain::Tail, false, "flag-only", true),
         (Retain::Tail, false, "legacy-replace", false),
         (Retain::Tail, false, "legacy-same", false),
         (Retain::Tail, false, "blocks-replace", false),
@@ -2772,7 +2830,7 @@ async fn bounded_success_diagnostic_respects_output_selection_and_hooks() {
             if !content.ends_with('\n') {
                 content.push('\n');
             }
-            content.push_str(&format!("<harness>\n[warn] Output truncated to its {}: 1 lines, 4 bytes dropped\n</harness>", if retain == Retain::Head { "beginning" } else { "end" }));
+            content.push_str(&format!("<harness>\n{}[warn] Output truncated to its {}: 1 lines, 4 bytes dropped\n</harness>", if kind == "blocks-default" { "[info] block metadata\n" } else { "" }, if retain == Retain::Head { "beginning" } else { "end" }));
         }
         let actual_model = observed.lock().unwrap().clone();
         assert_eq!(actual_model, vec![content.clone()]);
@@ -3019,10 +3077,7 @@ async fn interrupted_stream_hook_replacement_controls_model_warning_after_reopen
         let messages = observed.lock().unwrap().clone();
         assert_eq!(messages.len(), 1);
         if replace {
-            assert_eq!(
-                messages[0],
-                "replaced\n<harness>\n[error] tool interrupted and may have partially run\n</harness>"
-            );
+            assert_eq!(messages[0], "replaced");
             assert!(
                 harness
                     .conversation(id)
@@ -3271,8 +3326,6 @@ async fn bounded_explicit_output_and_hook_replacements_reach_model() {
         if hook == "legacy" {
             diagnostic_lines
                 .push("[info] tool metadata withheld after output replacement".to_owned());
-        } else if mode == "failed" {
-            diagnostic_lines.push("[error] aa\nbb\ncc\n".to_owned());
         }
         if let Some(warning) = expected_warning {
             diagnostic_lines.push(format!("[warn] Output truncated to its {warning}"));
@@ -3567,6 +3620,128 @@ async fn huge_unsafe_explicit_result_is_bounded_before_hook_crash() {
 }
 
 #[tokio::test]
+async fn failed_output_bound_survives_hook_process_crash() {
+    use pi_rs_durable::extension::{Context, Extension, Hook, ToolCall as HookCall};
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    use std::io::Write;
+    struct Huge(std::path::PathBuf);
+    #[async_trait]
+    impl BoundedStreamedTool for Huge {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            _: BoundedStreamOutput,
+        ) -> StreamedReply {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.0)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            StreamedReply::Explicit(Outcome::Failed("secret".repeat(9000)).into())
+        }
+    }
+    struct Crash(bool);
+    #[async_trait]
+    impl Hook for Crash {
+        async fn after_tool(
+            &self,
+            _: &HookCall,
+            result: &serde_json::Value,
+            _: &Context<'_>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            assert!(result.as_str().unwrap().len() > 50_000);
+            if self.0 {
+                std::process::abort();
+            }
+            Ok(None)
+        }
+    }
+    let inherited = std::env::var_os("PI_FAILED_BOUND_CRASH_PATH");
+    let dir = tempfile::tempdir().unwrap();
+    let path = inherited
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.path().join("db"));
+    let effect = path.with_extension("effects");
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let options = || Options {
+        model: Arc::new(RecordingModel {
+            inner: FakeModel {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            },
+            observed_tools: observed.clone(),
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: Huge(effect.clone()),
+                limits: OutputLimits {
+                    max_bytes: 10,
+                    max_lines: 2,
+                    retain: Retain::Tail,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let extension = |crash| Extension {
+        name: "huge-hook".into(),
+        hooks: vec![Arc::new(Crash(crash))],
+        ..Default::default()
+    };
+    if inherited.is_some() {
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.install_extension(extension(true)).unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["huge-hook".into()]).unwrap();
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        panic!("hook did not crash");
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "failed_output_bound_survives_hook_process_crash",
+            "--nocapture",
+        ])
+        .env("PI_FAILED_BOUND_CRASH_PATH", &path)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert_eq!(std::fs::read(&effect).unwrap(), b"x");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_extension(extension(false)).unwrap();
+    h.resume(&CancellationToken::new()).await.unwrap();
+    assert_eq!(std::fs::read(&effect).unwrap(), b"x");
+    let messages = observed.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].matches("Output truncated").count(), 1);
+    assert!(messages[0].len() < 256);
+    assert!(!messages[0].contains(&"secret".repeat(100)));
+}
+
+#[tokio::test]
 async fn tool_diagnostics_reach_model_after_hooks_without_leaking_nested_or_redacted_data() {
     use pi_rs_durable::extension::{Context, Extension, Hook, ToolCall as HookCall, ToolResult};
     use pi_rs_durable::keyed_tool::{KeyedHost, KeyedTool, KeyedToolAdapter};
@@ -3714,5 +3889,148 @@ async fn tool_diagnostics_reach_model_after_hooks_without_leaking_nested_or_reda
             .unwrap();
         assert_eq!(stored, expected);
         assert_eq!(stored.matches("<harness>").count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn bounded_errors_and_hook_redactions_do_not_leak_derived_diagnostics_to_model() {
+    use pi_rs_durable::extension::{
+        Context, Extension, Hook, ToolBlockResult, ToolCall as HookCall, ToolResult,
+    };
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    struct Tool {
+        huge: bool,
+        skipped: bool,
+    }
+    #[async_trait]
+    impl BoundedStreamedTool for Tool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            _: BoundedStreamOutput,
+        ) -> StreamedReply {
+            let reason = if self.huge {
+                "secret".repeat(9000)
+            } else {
+                "sensitive failure reason".into()
+            };
+            StreamedReply::Explicit(
+                if self.skipped {
+                    Outcome::Skipped(reason)
+                } else {
+                    Outcome::Failed(reason)
+                }
+                .into(),
+            )
+        }
+    }
+    struct Redact(&'static str);
+    #[async_trait]
+    impl Hook for Redact {
+        async fn after_tool_result(
+            &self,
+            _: &HookCall,
+            result: &ToolResult,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolResult>, String> {
+            if self.0 != "rich" {
+                return Ok(None);
+            }
+            let mut result = result.clone();
+            result.output = "redacted".into();
+            Ok(Some(result))
+        }
+        fn supports_runtime_tool_blocks(&self) -> bool {
+            self.0 == "blocks"
+        }
+        async fn after_tool_blocks(
+            &self,
+            _: &HookCall,
+            result: &ToolBlockResult,
+            _: bool,
+            _: &Context<'_>,
+        ) -> Result<Option<ToolBlockResult>, String> {
+            let mut result = result.clone();
+            result.output = vec![json!({"type":"text","text":"redacted"})];
+            Ok(Some(result))
+        }
+    }
+    for (huge, skipped, hook) in [
+        (true, false, "none"),
+        (true, true, "none"),
+        (false, false, "rich"),
+        (false, false, "blocks"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = || Options {
+            model: Arc::new(RecordingModel {
+                inner: FakeModel {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                },
+                observed_tools: observed.clone(),
+            }),
+            tools: vec![
+                Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                    tool: Tool { huge, skipped },
+                    limits: OutputLimits {
+                        max_bytes: if huge { 10 } else { 128 },
+                        max_lines: 100,
+                        retain: Retain::Tail,
+                    },
+                }))
+                .register(ReplayPolicy::Unsafe),
+            ],
+            restart_limit: 5,
+            max_turns: 8,
+            uncertain_policy: UncertainPolicy::InterruptedResult,
+        };
+        let cancel = CancellationToken::new();
+        let mut h = Harness::open(&path, options(), &cancel).await.unwrap();
+        h.install_extension(Extension {
+            name: "redact".into(),
+            hooks: vec![Arc::new(Redact(hook))],
+            ..Default::default()
+        })
+        .unwrap();
+        let id = h.create_conversation(config()).unwrap();
+        h.select_extensions(id, vec!["redact".into()]).unwrap();
+        h.submit_and_run(id, None, "work".into(), &cancel)
+            .await
+            .unwrap();
+        let messages = observed.lock().unwrap().clone();
+        assert_eq!(messages.len(), 1);
+        if huge {
+            assert!(messages[0].len() < 256, "{}", messages[0].len());
+            assert_eq!(messages[0].matches("Output truncated").count(), 1);
+        } else {
+            assert_eq!(messages[0], "redacted");
+            assert!(!messages[0].contains("sensitive"));
+        }
+        drop(h);
+        let h = Harness::open_paused(&path, options()).unwrap();
+        assert!(
+            h.conversation(id)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { content, .. } if content == &messages[0]))
+        );
     }
 }
