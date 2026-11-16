@@ -1,4 +1,4 @@
-**Run failure increment:** A run ending without an answer records its running submission IDs and existing reason string in `Conversation.run_failure`, persisted with settlement and exposed in conversation views. Clearing, upstream reason/detail mapping, run task IDs and `first` lineage remain unsupported.
+**Run failure increment:** A run ending without an answer records its running submission IDs and existing reason string in `Conversation.run_failure`, persisted with settlement and exposed in conversation views. A later run start clears it; a reset starting a run in the failure commit retains it. Upstream reason/detail mapping, run task IDs and `first` lineage remain unsupported.
 
 **Nested pending identity boundary:** Identity-bound nested jobs validate a host-declared implementation and tenant identity before polling and unsafe resume. Legacy unbound replay-safe jobs remain pollable for compatibility; their host must restore the original child configuration and tenant because those records cannot establish that identity. Unsafe legacy proofs without a parent identity require reconciliation. Identity declarations and updates are host responsibilities.
 
