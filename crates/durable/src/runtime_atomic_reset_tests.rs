@@ -2125,7 +2125,12 @@ fn task_input_on_reset_fork_fences_original_proof() {
             conversation: fork,
             version: record.version,
             request_id: "task-request".into(),
-            content: "input".into(),
+            draft: crate::document::TaskSubmissionDraft::Input {
+                content: "input".into(),
+                options: Default::default(),
+            },
+            notify: None,
+            notification_binding: None,
         };
         // Reuse an active traversal, as happens when task admission is composed
         // with a caller that has already authenticated a nested reset cut.
