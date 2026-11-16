@@ -910,12 +910,20 @@ under that name; hosts must maintain the policy when registrations change.
 For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
 `submit_task_owned_subagent_inheriting_tools` opt in to a snapshot of the owning
 task's conversation tool selection, model selection, filters, deferred names,
-caller overrides and output schemas. Task ancestry and the source conversation
+caller overrides and output schemas. Since selected extensions can replace tools
+or enforce hooks, this admission rejects a parent with any selected extensions.
+Admissions created by the earlier inheritance implementation lack this proof and
+cannot be loaded or replayed; they require host reconciliation. Stop older workers
+before upgrading, since they do not enforce this check. Copies or forks made from
+an unsafe child before the upgrade are not automatically identified and also
+require host review. The runtime scans the
+owning task's reservations when loading an owned conversation to identify such
+children. Task ancestry and the source conversation
 version are checked in the child-creation commit; a concurrent change causes a
 fresh snapshot, with at most eight commit attempts per call. The reservation binds this choice, and replay returns the same
 child even after the parent's settings change or the store reopens. Ancestry must
 lead to an existing conversation. Explicit `Config` remains supplied by the host;
-extensions, provider adapter, queue settings and other agent state are not copied.
+provider adapter, queue settings and other agent state are not copied.
 The notified admission API does not yet combine notification with this inheritance.
 The other admission APIs retain their existing non-inheriting behavior. Unlike
 upstream's default task-owned agent copy, this selection is opt-in.
