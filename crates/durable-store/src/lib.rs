@@ -28,9 +28,10 @@ pub type DocumentChange = (Vec<u8>, Option<Entry>);
 pub type DocumentCommit = (u64, Vec<DocumentChange>);
 type BoundedHistoryRow = (Option<Vec<u8>>, Option<u64>, Option<u64>);
 type BoundedChangeRow = (u64, Option<Vec<u8>>, Option<u64>, Option<u64>);
+type ReadLimit = (std::rc::Rc<()>, Vec<Vec<u8>>, usize);
 
 thread_local! {
-    static READ_LIMITS: std::cell::RefCell<Vec<(std::rc::Rc<()>, Vec<Vec<u8>>, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static READ_LIMITS: std::cell::RefCell<Vec<ReadLimit>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Synchronously limit individual values read from selected namespaces.
