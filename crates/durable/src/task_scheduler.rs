@@ -1074,7 +1074,8 @@ impl WakeReader {
                     }
                 }
                 TaskState::Ready
-                    if reason.is_none() && definitions.ancestors_available(task, &tasks) =>
+                    if reason.is_none()
+                        && definitions.ancestors_available(self.owner.store(), task, &tasks) =>
                 {
                     result.active = true
                 }
@@ -1114,7 +1115,8 @@ impl WakeReader {
                     };
                     let ready = ts.wait_ready(item, now_millis)?;
                     if ready
-                        && ((reason.is_none() && definitions.ancestors_available(task, &tasks))
+                        && ((reason.is_none()
+                            && definitions.ancestors_available(self.owner.store(), task, &tasks))
                             || (task.abort_requested()
                                 && !tasks.iter().any(|child| {
                                     child.task.owner() == &TaskOwner::Task(task.id())
@@ -1132,6 +1134,88 @@ impl WakeReader {
         Ok(result)
     }
 }
+// Follow task ownership through foreground conversation edges as well. A root
+// conversation may be absent in standalone task stores; an owned conversation
+// must have a valid record and a consistent edge. Invalid graphs fail closed.
+fn task_ancestors_available(
+    store: &durable_store::Store,
+    task: &Task,
+    tasks: &[task_store::StoredTask],
+    mut blocked: impl FnMut(&Task) -> bool,
+) -> bool {
+    let edges = crate::ownership_edge::EdgeStore::new(store);
+    let mut current = task;
+    let mut seen_tasks = HashSet::from([task.id()]);
+    let mut seen_conversations = HashSet::new();
+    let mut past_conversation = false;
+    loop {
+        let (parent_id, through_conversation) = match current.owner() {
+            TaskOwner::Task(id) => (*id, false),
+            TaskOwner::Conversation(id) => {
+                if !seen_conversations.insert(*id) {
+                    return false;
+                }
+                let Ok(edge) = edges.get(*id) else {
+                    return false;
+                };
+                let key = format!("runtime/conversation/{id}");
+                let Ok(entry) = store.get(key.as_bytes()) else {
+                    return false;
+                };
+                match entry {
+                    Some(entry) => {
+                        let Ok(conversation) =
+                            serde_json::from_slice::<crate::runtime::Conversation>(&entry.value)
+                        else {
+                            return false;
+                        };
+                        if conversation.id != *id || conversation.abort_requested {
+                            return false;
+                        }
+                    }
+                    None if edge.is_some() => return false,
+                    None => (),
+                }
+                let Some(edge) = edge else {
+                    return true;
+                };
+                if current.is_background()
+                    || edge.edge.mode == crate::ownership_edge::Mode::Background
+                {
+                    return true;
+                }
+                let Some(parent) = tasks.iter().find(|entry| entry.task.id() == edge.edge.task)
+                else {
+                    return false;
+                };
+                if edge.edge.task_owner != *parent.task.owner() {
+                    return false;
+                }
+                (edge.edge.task, true)
+            }
+        };
+        if !seen_tasks.insert(parent_id) {
+            return false;
+        }
+        let Some(parent) = tasks.iter().find(|entry| entry.task.id() == parent_id) else {
+            return false;
+        };
+        // A successfully finished task remains an ownership anchor for work
+        // admitted later in its foreground conversation. Keep walking above it.
+        past_conversation |= through_conversation;
+        if past_conversation && matches!(parent.task.state(), TaskState::CompletingFailed(_)) {
+            return false;
+        }
+        let successful_anchor = past_conversation
+            && matches!(parent.task.state(), TaskState::Succeeded(_))
+            && !parent.task.abort_requested();
+        if !successful_anchor && blocked(&parent.task) {
+            return false;
+        }
+        current = &parent.task;
+    }
+}
+
 impl WakeDefinitions {
     fn blocked_reason(&self, task: &Task) -> Option<BlockedReason> {
         if task.is_completing() {
@@ -1155,26 +1239,18 @@ impl WakeDefinitions {
         }
         None
     }
-    fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
-        let mut owner = task.owner();
-        let mut visited = HashSet::new();
-        while let TaskOwner::Task(id) = owner {
-            if !visited.insert(*id) {
-                return false;
-            }
-            let Some(parent) = tasks.iter().find(|entry| entry.task.id() == *id) else {
-                return false;
-            };
-            if parent.task.abort_requested()
-                || parent.task.is_terminal()
-                || parent.task.state() == &TaskState::Running
-                || self.blocked_reason(&parent.task).is_some()
-            {
-                return false;
-            }
-            owner = parent.task.owner();
-        }
-        true
+    fn ancestors_available(
+        &self,
+        store: &durable_store::Store,
+        task: &Task,
+        tasks: &[task_store::StoredTask],
+    ) -> bool {
+        task_ancestors_available(store, task, tasks, |parent| {
+            parent.abort_requested()
+                || parent.is_terminal()
+                || parent.state() == &TaskState::Running
+                || self.blocked_reason(parent).is_some()
+        })
     }
 }
 
@@ -2190,15 +2266,22 @@ impl Scheduler {
         let edges = crate::ownership_edge::EdgeStore::new(owner.store());
         let mut current = task.clone();
         let mut first = true;
+        let mut through_conversation = false;
         let mut seen_tasks = HashSet::new();
         let mut seen_conversations = HashSet::new();
         loop {
             if !seen_tasks.insert(current.id()) {
                 return Ok(false);
             }
+            let successful_anchor = through_conversation
+                && matches!(current.state(), TaskState::Succeeded(_))
+                && !current.abort_requested();
             if !first
+                && !successful_anchor
                 && (current.abort_requested()
                     || current.is_terminal()
+                    || (through_conversation
+                        && matches!(current.state(), TaskState::CompletingFailed(_)))
                     || current.state() == &TaskState::Running
                     || self.blocked_reason(&current).is_some())
             {
@@ -2259,6 +2342,7 @@ impl Scheduler {
                                 return Err(Error::Ownership);
                             }
                             current = parent.task;
+                            through_conversation = true;
                         }
                     }
                 }
@@ -4017,25 +4101,12 @@ impl Scheduler {
     /// A child must not execute while an interrupted or incompatible ancestor is
     /// still awaiting recovery; such an ancestor can later cancel the subtree.
     fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
-        let mut owner = task.owner();
-        let mut visited = HashSet::new();
-        while let TaskOwner::Task(id) = owner {
-            if !visited.insert(*id) {
-                return false;
-            }
-            let Some(parent) = tasks.iter().find(|entry| entry.task.id() == *id) else {
-                return false;
-            };
-            if parent.task.abort_requested()
-                || parent.task.is_terminal()
-                || parent.task.state() == &TaskState::Running
-                || self.blocked_reason(&parent.task).is_some()
-            {
-                return false;
-            }
-            owner = parent.task.owner();
-        }
-        true
+        task_ancestors_available(self.owner().store(), task, tasks, |parent| {
+            parent.abort_requested()
+                || parent.is_terminal()
+                || parent.state() == &TaskState::Running
+                || self.blocked_reason(parent).is_some()
+        })
     }
     /// Persist abort intent for the live subtree. The synchronous scheduler can
     /// accept this only between invocations; subsequent ticks drain children first.
@@ -13626,5 +13697,324 @@ mod tests {
             &TaskState::Waiting(WaitFor::TasksAny(vec![Uuid::from_u128(2)]))
         );
         assert!(s.get(Uuid::from_u128(2)).unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod foreground_ancestor_regressions {
+    use super::*;
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::runtime::{Config, Harness, Options};
+    use async_trait::async_trait;
+    use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Stub;
+    #[async_trait]
+    impl Model for Stub {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+            unreachable!()
+        }
+    }
+    fn options() -> Options {
+        Options {
+            model: Arc::new(Stub),
+            tools: vec![],
+            restart_limit: 3,
+            max_turns: 3,
+            uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+        }
+    }
+    fn config() -> Config {
+        Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        }
+    }
+    fn registered(id: u128, owner: TaskOwner, kind: &str) -> Task {
+        Task::new(
+            Uuid::from_u128(id),
+            owner,
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            5,
+        )
+        .unwrap()
+        .registered(kind.into(), true)
+    }
+    fn setup(path: &std::path::Path, mode: Mode, disposition: &str) -> (Uuid, Uuid) {
+        let mut harness = Harness::open_paused(path, options()).unwrap();
+        let root = harness.create_conversation(config()).unwrap();
+        let conversation = harness.create_conversation(config()).unwrap();
+        let parent = registered(1, TaskOwner::Conversation(root), "parent");
+        let parent = if disposition == "generic_failure" {
+            parent
+        } else {
+            parent.into_task_tool()
+        };
+        let child = registered(2, TaskOwner::Conversation(conversation), "child");
+        let timer = registered(3, TaskOwner::Task(child.id()), "timer");
+        let db = durable_store::Store::open(path).unwrap();
+        let store = TaskStore::new(&db);
+        store.save(&[Save::Create(&parent)]).unwrap();
+        let edge = Edge {
+            task: parent.id(),
+            task_owner: parent.owner().clone(),
+            child: conversation,
+            mode,
+        };
+        let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let snapshot = store.load(parent.id()).unwrap().unwrap();
+        store
+            .update(&snapshot, |task| {
+                task.start()?;
+                match disposition {
+                    "failure" | "generic_failure" => task.hold_failure("failed".into())?,
+                    "terminal_success" => task.succeed(json!("done"))?,
+                    "terminal_failure" => task.fail("failed".into())?,
+                    "terminal_cancel" => task.cancel()?,
+                    _ => (),
+                }
+                Ok(())
+            })
+            .unwrap();
+        // Create the conversation's work after the anchor transition, including
+        // after terminal success; this is supported by the ownership model.
+        store
+            .save(&[Save::Create(&child), Save::Create(&timer)])
+            .unwrap();
+        let snapshot = store.load(timer.id()).unwrap().unwrap();
+        store
+            .update(&snapshot, |task| {
+                task.start()?;
+                task.wait(WaitFor::DeadlineMillis(10))
+            })
+            .unwrap();
+        if disposition == "abort" {
+            harness.abort_owned_graph(None, Some(parent.id())).unwrap();
+        }
+        (parent.id(), child.id())
+    }
+    fn registry(calls: Arc<AtomicUsize>, include_parent: bool) -> Registry {
+        let mut registry = Registry::default();
+        if include_parent {
+            registry.register("parent", true, |_: &Task| {
+                Ok(Step::Wait {
+                    checkpoint: Checkpoint {
+                        phase: "wait".into(),
+                        data: json!(null),
+                    },
+                    condition: WaitFor::DeadlineMillis(1000),
+                    children: vec![],
+                })
+            });
+        }
+        registry.register_with_abort(
+            "child",
+            true,
+            move |_: &Task| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Step::Succeed(json!(null)))
+            },
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        registry.register_with_abort(
+            "timer",
+            true,
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        registry
+    }
+
+    #[test]
+    fn reopened_missing_task_tool_fences_foreground_reservation_and_wake() {
+        for mode in [Mode::Foreground, Mode::Background] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (parent, child) = setup(&path, mode, "running");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut scheduler = Scheduler::open(&path, registry(calls.clone(), false)).unwrap();
+            assert_eq!(
+                scheduler.get(parent).unwrap().unwrap().state(),
+                &TaskState::Running
+            );
+            let wake = scheduler.wake_snapshot(10).unwrap();
+            assert_eq!(wake.active, mode == Mode::Background);
+            assert!(scheduler.tick(10).unwrap()); // poll due timer, and possibly reserve child
+            if mode == Mode::Foreground {
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    scheduler.get(child).unwrap().unwrap().state(),
+                    &TaskState::Ready
+                );
+                assert!(!scheduler.wake_snapshot(10).unwrap().active);
+                assert!(!scheduler.tick(10).unwrap());
+                scheduler
+                    .replace_registry(registry(calls.clone(), true))
+                    .unwrap();
+                assert!(scheduler.wake_snapshot(10).unwrap().active);
+                for _ in 0..4 {
+                    if calls.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    scheduler.tick(10).unwrap();
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn terminal_conversation_anchors_distinguish_success_from_failure() {
+        for (disposition, allowed) in [
+            ("terminal_success", true),
+            ("terminal_failure", false),
+            ("terminal_cancel", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (_, child) = setup(&path, Mode::Foreground, disposition);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut scheduler = Scheduler::open(&path, registry(calls.clone(), false)).unwrap();
+            assert_eq!(
+                scheduler.wake_snapshot(0).unwrap().active,
+                allowed,
+                "{disposition}"
+            );
+            let independent = scheduler.reserve_independent_root().unwrap();
+            assert_eq!(independent.is_some(), allowed, "{disposition}");
+            if let Some(invocation) = independent {
+                scheduler
+                    .settle_invocation(invocation.execute().unwrap())
+                    .unwrap();
+            } else {
+                let _ = scheduler.tick(0).unwrap();
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(allowed),
+                "{disposition}"
+            );
+            if !allowed {
+                assert_eq!(
+                    scheduler.get(child).unwrap().unwrap().state(),
+                    &TaskState::Ready
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_work_traverses_successful_task_anchor_chain() {
+        for (ancestor_outcome, allowed) in
+            [("success", true), ("failure", false), ("cancel", false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut harness = Harness::open_paused(&path, options()).unwrap();
+            let root = harness.create_conversation(config()).unwrap();
+            let conversation = harness.create_conversation(config()).unwrap();
+            let db = durable_store::Store::open(&path).unwrap();
+            let tasks = TaskStore::new(&db);
+            let ancestor = registered(9, TaskOwner::Conversation(root), "missing_ancestor");
+            let anchor = registered(1, TaskOwner::Task(ancestor.id()), "missing_anchor");
+            let child = registered(2, TaskOwner::Conversation(conversation), "child");
+            let second_child = registered(3, TaskOwner::Conversation(conversation), "child");
+            tasks
+                .save(&[Save::Create(&ancestor), Save::Create(&anchor)])
+                .unwrap();
+            let edge = Edge {
+                task: anchor.id(),
+                task_owner: anchor.owner().clone(),
+                child: conversation,
+                mode: Mode::Foreground,
+            };
+            let batch = EdgeStore::new(&db).prepare_create(&edge).unwrap();
+            db.commit(&batch.checks, &batch.mutations).unwrap();
+            let snapshot = tasks.load(anchor.id()).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    task.start()?;
+                    task.succeed(json!("done"))
+                })
+                .unwrap();
+            let snapshot = tasks.load(ancestor.id()).unwrap().unwrap();
+            tasks
+                .update(&snapshot, |task| {
+                    task.start()?;
+                    match ancestor_outcome {
+                        "success" => task.succeed(json!("done")),
+                        "failure" => task.fail("failed".into()),
+                        _ => task.cancel(),
+                    }
+                })
+                .unwrap();
+            tasks
+                .save(&[Save::Create(&child), Save::Create(&second_child)])
+                .unwrap();
+            drop(harness);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut scheduler = Scheduler::open(&path, registry(calls.clone(), false)).unwrap();
+            assert_eq!(
+                scheduler.wake_snapshot(0).unwrap().active,
+                allowed,
+                "{ancestor_outcome}"
+            );
+            let invocation = scheduler.reserve_independent_root().unwrap();
+            assert_eq!(invocation.is_some(), allowed, "{ancestor_outcome}");
+            if let Some(invocation) = invocation {
+                scheduler
+                    .settle_invocation(invocation.execute().unwrap())
+                    .unwrap();
+                assert!(scheduler.tick(0).unwrap());
+            } else {
+                assert!(!scheduler.tick(0).unwrap());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), if allowed { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn foreground_child_does_not_execute_during_parent_abort_or_failure_recovery() {
+        for disposition in ["abort", "failure", "generic_failure"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let (_, child) = setup(&path, Mode::Foreground, disposition);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let harness = Harness::open_paused(&path, options()).unwrap();
+            let mut scheduler = harness
+                .attach_tasks(registry(calls.clone(), false))
+                .unwrap();
+            for _ in 0..16 {
+                if scheduler.get(child).unwrap().unwrap().is_terminal() {
+                    break;
+                }
+                scheduler.tick(10).unwrap();
+            }
+            if disposition == "failure" {
+                // This foundation does not yet cascade held TaskTool failures
+                // into owned conversations; keep the child fenced while held.
+                assert_eq!(
+                    scheduler.get(child).unwrap().unwrap().state(),
+                    &TaskState::Ready
+                );
+            } else {
+                assert!(
+                    scheduler.get(child).unwrap().unwrap().is_terminal(),
+                    "{disposition}"
+                );
+                assert_ne!(
+                    scheduler.get(child).unwrap().unwrap().state(),
+                    &TaskState::Succeeded(json!(null))
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{disposition}");
+        }
     }
 }
