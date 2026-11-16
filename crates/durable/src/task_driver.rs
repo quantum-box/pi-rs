@@ -602,7 +602,8 @@ impl Shared {
     /// The caller must hold no conversation worker, poll, registry, or task gate;
     /// try-lock only avoids waiting for the scheduler, not the other fences. The
     /// stopped flag is checked at entry; shutdown may race an already-started
-    /// commit. This cannot join detached work or authorize external effects.
+    /// commit. Live detached invocations, including completed but unsettled
+    /// outcomes, reject the commit. This cannot authorize external effects.
     #[allow(dead_code)]
     pub(crate) fn try_quiescent_commit(
         &self,
@@ -613,7 +614,9 @@ impl Shared {
             std::sync::TryLockError::WouldBlock => QuiescentError::Busy,
             std::sync::TryLockError::Poisoned(_) => QuiescentError::Poisoned,
         })?;
-        scheduler.check()?;
+        if !scheduler.check_quiescent()? {
+            return Err(QuiescentError::Busy);
+        }
         {
             let state = self.state.lock().map_err(|_| QuiescentError::Poisoned)?;
             if state.stop {
@@ -864,8 +867,12 @@ mod tests {
             notifications: Mutex::new(None),
             subscription: Mutex::new(None),
         });
-        let ticking = shared.clone();
-        let thread = thread::spawn(move || ticking.scheduler.lock().unwrap().tick(0).unwrap());
+        let task_scheduler::TickReservation::Invocation(invocation) =
+            shared.scheduler.lock().unwrap().reserve_tick(0).unwrap()
+        else {
+            panic!("expected detached reservation");
+        };
+        let thread = thread::spawn(move || invocation.execute().unwrap());
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let effect = || task_store::OwnedBatch {
             checks: vec![Check {
@@ -883,7 +890,32 @@ mod tests {
         ));
         assert!(owner.store().get(b"test/quiet").unwrap().is_none());
         release_tx.send(()).unwrap();
-        assert!(thread.join().unwrap());
+        let completed = thread.join().unwrap();
+        // A finished handler is still live until its result has settled.
+        assert!(matches!(
+            shared.try_quiescent_commit(b.clone(), effect()),
+            Err(QuiescentError::Busy)
+        ));
+        assert!(
+            shared
+                .scheduler
+                .lock()
+                .unwrap()
+                .settle_invocation(completed)
+                .unwrap()
+        );
+        let competing = Task::new(
+            Uuid::from_u128(21),
+            TaskOwner::Conversation(Uuid::from_u128(31)),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("parent".into(), true);
+        shared.scheduler.lock().unwrap().submit(&competing).unwrap();
         // Hold the task gate so the commit pauses after acquiring the scheduler
         // mutex; another tick must not enter until the checked commit finishes.
         let task_gate = owner.task_gate().lock().unwrap();
@@ -916,8 +948,39 @@ mod tests {
             thread::yield_now();
         }
         assert!(owner.store().get(b"test/quiet").unwrap().is_none());
+        let reserving = shared.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (reserved_tx, reserved_rx) = mpsc::channel();
+        let reservation_thread = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut scheduler = reserving.scheduler.lock().unwrap();
+            let task_scheduler::TickReservation::Invocation(invocation) =
+                scheduler.reserve_tick(0).unwrap()
+            else {
+                panic!("expected competing reservation")
+            };
+            reserved_tx.send(invocation.task_id()).unwrap();
+            drop(scheduler);
+            let completed = invocation.execute().unwrap();
+            reserving
+                .scheduler
+                .lock()
+                .unwrap()
+                .settle_invocation(completed)
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(
+            reserved_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
         drop(task_gate);
         commit_thread.join().unwrap().unwrap();
+        assert_eq!(
+            reserved_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            competing.id()
+        );
+        reservation_thread.join().unwrap();
         assert_eq!(
             owner.store().get(b"test/quiet").unwrap().unwrap().value,
             vec![1]

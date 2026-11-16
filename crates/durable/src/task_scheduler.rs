@@ -1823,6 +1823,19 @@ impl Scheduler {
             Ok(())
         }
     }
+    /// The scheduler mutex must remain held from this check through the
+    /// quiescent operation, so no new invocation can enter the live ledger.
+    pub(crate) fn check_quiescent(&self) -> Result<bool, Error> {
+        let state = self.live_invocations.lock().map_err(|_| Error::Poisoned)?;
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) || state.poisoned {
+            Err(Error::Poisoned)
+        } else if state.handler_failed {
+            Err(Error::Stopped)
+        } else {
+            Ok(state.attempts.is_empty())
+        }
+    }
+
     fn abort_failed_running(
         &mut self,
         owner: &Arc<OwnedStore>,
