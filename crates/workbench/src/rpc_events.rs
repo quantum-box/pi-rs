@@ -513,6 +513,13 @@ impl Stream {
     }
 
     fn update(&self, mut update: Value, events: &mut Vec<Value>) {
+        if update["type"] == "toolcall_start"
+            && let Some(index) = update["contentIndex"].as_u64()
+            && let Some(call) = self.assistant["content"].get(index as usize)
+        {
+            update["id"] = call["id"].clone();
+            update["toolName"] = call["name"].clone();
+        }
         update["partial"] = self.assistant.clone();
         events.push(json!({"type":"message_update","message":self.assistant,"assistantMessageEvent":update}));
     }
@@ -1756,6 +1763,12 @@ mod streaming_tool_tests {
             arguments: arguments.into(),
         };
         stream.tool_delta(delta(0, "call-a", "read", "{\"path\":\"fo"), &mut events);
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-a");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "read");
         assert_eq!(
             stream.assistant["content"][0]["arguments"],
             json!({"path":"fo"})
@@ -1768,6 +1781,12 @@ mod streaming_tool_tests {
             delta(1, "call-b", "write", "{\"content\":\"xy"),
             &mut events,
         );
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .collect();
+        assert_eq!(starts[1]["assistantMessageEvent"]["id"], "call-b");
+        assert_eq!(starts[1]["assistantMessageEvent"]["toolName"], "write");
         stream.tool_delta(delta(0, "", "", "o.txt\"}"), &mut events);
         assert_eq!(
             stream.assistant["content"][0]["arguments"],
@@ -1784,5 +1803,69 @@ mod streaming_tool_tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn toolcall_start_reports_identity_available_at_that_event() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        stream.tool_delta(
+            ToolCallDelta {
+                index: 0,
+                id: "call-".into(),
+                name: "re".into(),
+                arguments: String::new(),
+            },
+            &mut events,
+        );
+        stream.tool_delta(
+            ToolCallDelta {
+                index: 0,
+                id: "a".into(),
+                name: "ad".into(),
+                arguments: "{}".into(),
+            },
+            &mut events,
+        );
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "re");
+        assert_eq!(stream.assistant["content"][0]["id"], "call-a");
+        assert_eq!(stream.assistant["content"][0]["name"], "read");
+
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        stream.record(
+            Event::Assistant {
+                content: String::new(),
+                invocations: vec![Invocation {
+                    operation_id: Uuid::new_v4(),
+                    call: ToolCall {
+                        id: "call-final".into(),
+                        name: "write".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-final");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "write");
     }
 }
