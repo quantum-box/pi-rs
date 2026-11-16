@@ -395,6 +395,166 @@ impl<T: StreamedTool> KeyedTool for StreamedToolAdapter<T> {
     }
 }
 
+/// Opt-in streamed tool using bounded head or tail retention. Its retained text
+/// is checkpointed per attempt through the same fence as `StreamedToolAdapter`.
+#[async_trait::async_trait]
+pub trait BoundedStreamedTool: Send + Sync {
+    fn spec(&self) -> ToolSpec;
+    async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+        Ok(arguments)
+    }
+    async fn invoke(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+        output: BoundedStreamOutput,
+    ) -> StreamedReply;
+}
+
+struct BoundedStreamState {
+    buffer: crate::output::OutputBuffer,
+    failed: bool,
+}
+struct BoundedStreamInner {
+    open: AtomicBool,
+    state: tokio::sync::Mutex<BoundedStreamState>,
+    sink: Arc<dyn StreamSink>,
+}
+
+/// Invocation-scoped retained output. Each successful append checkpoints the
+/// current window; snapshots report attempt-local dropped counts.
+#[derive(Clone)]
+pub struct BoundedStreamOutput(Arc<BoundedStreamInner>);
+impl BoundedStreamOutput {
+    async fn update(
+        &self,
+        apply: impl FnOnce(&mut crate::output::OutputBuffer),
+    ) -> ExtensionResult<()> {
+        let mut state = self.0.state.lock().await;
+        if !self.0.open.load(Ordering::Acquire) {
+            return Err("stream is closed".into());
+        }
+        if state.failed {
+            return Err("stream recording failed".into());
+        }
+        let mut candidate = state.buffer.clone();
+        apply(&mut candidate);
+        let snapshot = candidate.snapshot();
+        if let Err(error) = self.0.sink.record(&snapshot.text).await {
+            state.failed = true;
+            return Err(error);
+        }
+        state.buffer = candidate;
+        Ok(())
+    }
+    pub async fn append(&self, text: &str) -> ExtensionResult<()> {
+        self.update(|buffer| buffer.push_str(text)).await
+    }
+    pub async fn append_bytes(&self, bytes: &[u8]) -> ExtensionResult<()> {
+        self.update(|buffer| buffer.push_bytes(bytes)).await
+    }
+    pub async fn snapshot(&self) -> ExtensionResult<crate::output::OutputSnapshot> {
+        let mut state = self.0.state.lock().await;
+        if !self.0.open.load(Ordering::Acquire) {
+            return Err("stream is closed".into());
+        }
+        if state.failed {
+            return Err("stream recording failed".into());
+        }
+        Ok(state.buffer.snapshot())
+    }
+}
+struct BoundedStreamGuard(Arc<BoundedStreamInner>);
+impl Drop for BoundedStreamGuard {
+    fn drop(&mut self) {
+        self.0.open.store(false, Ordering::Release);
+    }
+}
+
+/// Wrap with `KeyedToolAdapter` and register normally. `limits.max_bytes` may
+/// not exceed the durable stream record's 64 KiB cap.
+pub struct BoundedStreamedToolAdapter<T> {
+    pub tool: T,
+    pub limits: crate::output::OutputLimits,
+}
+#[async_trait::async_trait]
+impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+        self.tool.prepare_arguments(arguments).await
+    }
+    async fn invoke(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: KeyedHost,
+    ) -> ToolReply {
+        if self.limits.max_bytes > MAX_STREAMED_OUTPUT_BYTES {
+            return Outcome::Skipped(
+                "bounded stream byte limit exceeds durable record limit".into(),
+            )
+            .into();
+        }
+        let Some(sink) = host.stream.clone() else {
+            return Outcome::Skipped("streamed tool requires model-issued durable attempt".into())
+                .into();
+        };
+        let inner = Arc::new(BoundedStreamInner {
+            open: AtomicBool::new(true),
+            state: tokio::sync::Mutex::new(BoundedStreamState {
+                buffer: crate::output::OutputBuffer::new(self.limits),
+                failed: false,
+            }),
+            sink,
+        });
+        let guard = BoundedStreamGuard(inner.clone());
+        let reply = self
+            .tool
+            .invoke(
+                arguments,
+                context,
+                state,
+                host,
+                BoundedStreamOutput(inner.clone()),
+            )
+            .await;
+        inner.open.store(false, Ordering::Release);
+        let mut state = inner.state.lock().await;
+        if !state.failed {
+            let mut candidate = state.buffer.clone();
+            candidate.end();
+            let text = candidate.snapshot().text;
+            if inner.sink.record(&text).await.is_err() {
+                state.failed = true;
+            } else {
+                state.buffer = candidate;
+            }
+        }
+        drop(guard);
+        if state.failed {
+            return Outcome::Unknown(
+                "streamed output recording failed; reconciliation required".into(),
+            )
+            .into();
+        }
+        match reply {
+            StreamedReply::Success {
+                output,
+                state: tool_state,
+            } => ToolReply {
+                outcome: Outcome::Succeeded(output.unwrap_or_else(|| state.buffer.snapshot().text)),
+                state: tool_state,
+            },
+            StreamedReply::Explicit(reply) => reply,
+        }
+    }
+}
+
 // Weak entries keep allocations from being reused while they are registered. The
 // token belongs to the adapter, not its address or concrete Rust type.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -635,6 +795,43 @@ mod tests {
         });
         (StreamOutput(inner.clone()), StreamGuard(inner))
     }
+    #[tokio::test]
+    async fn bounded_stream_latches_sink_failure_and_fences_stale_handles() {
+        use crate::output::{OutputBuffer, OutputLimits, Retain};
+        for fail in [false, true] {
+            let sink = Arc::new(RecordingSink {
+                fail,
+                values: Mutex::new(Vec::new()),
+            });
+            let inner = Arc::new(BoundedStreamInner {
+                open: AtomicBool::new(true),
+                state: tokio::sync::Mutex::new(BoundedStreamState {
+                    buffer: OutputBuffer::new(OutputLimits {
+                        max_bytes: 3,
+                        max_lines: 1,
+                        retain: Retain::Tail,
+                    }),
+                    failed: false,
+                }),
+                sink: sink.clone(),
+            });
+            let output = BoundedStreamOutput(inner.clone());
+            let guard = BoundedStreamGuard(inner);
+            if fail {
+                assert!(output.append("abcdef").await.is_err());
+                assert!(output.append("again").await.is_err());
+                assert!(output.snapshot().await.is_err());
+            } else {
+                output.append("abcdef").await.unwrap();
+                assert_eq!(output.snapshot().await.unwrap().text, "def");
+                assert_eq!(*sink.values.lock().unwrap(), vec!["def"]);
+            }
+            drop(guard);
+            assert!(output.append("late").await.is_err());
+            assert!(output.snapshot().await.is_err());
+        }
+    }
+
     #[tokio::test]
     async fn streamed_output_bounds_utf8_and_fences_handles() {
         let sink = Arc::new(RecordingSink {

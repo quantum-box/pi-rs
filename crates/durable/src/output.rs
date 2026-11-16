@@ -1,7 +1,7 @@
-//! Opt-in limits for complete UTF-8 tool output.
+//! Opt-in bounded output for complete text and incremental streams.
 //!
-//! This implements the slice rules of upstream `boundOutput`. It does not
-//! accumulate a stream or sanitize terminal control sequences.
+//! `bound_output` retains an exact raw slice; `OutputBuffer` also decodes byte
+//! chunks and sanitizes its retained snapshot, matching upstream output rules.
 
 /// Which end of the output to retain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +118,223 @@ pub fn bound_output(text: &str, limits: OutputLimits) -> BoundedOutput<'_> {
     }
 }
 
+/// A retained snapshot. Dropped counts refer to decoded text before sanitization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputSnapshot {
+    pub text: String,
+    pub dropped_bytes: usize,
+    pub dropped_lines: usize,
+}
+
+#[derive(Clone)]
+struct Chunk {
+    text: String,
+    newlines: usize,
+}
+
+/// Incremental bounded output with the slice and sanitization rules of upstream
+/// `OutputBuffer`. Byte chunks use streaming UTF-8 replacement decoding.
+/// Memory is bounded by the window plus the largest chunk since compaction.
+#[derive(Clone)]
+pub struct OutputBuffer {
+    limits: OutputLimits,
+    chunks: std::collections::VecDeque<Chunk>,
+    stored_bytes: usize,
+    stored_newlines: usize,
+    total_bytes: usize,
+    total_newlines: usize,
+    ends_newline: bool,
+    full: bool,
+    pending: Vec<u8>,
+    started: bool,
+}
+
+impl OutputBuffer {
+    pub fn new(limits: OutputLimits) -> Self {
+        Self {
+            limits,
+            chunks: Default::default(),
+            stored_bytes: 0,
+            stored_newlines: 0,
+            total_bytes: 0,
+            total_newlines: 0,
+            ends_newline: true,
+            full: false,
+            pending: Vec::new(),
+            started: false,
+        }
+    }
+
+    pub fn stored_bytes(&self) -> usize {
+        self.stored_bytes
+    }
+
+    /// Append text, flushing an incomplete byte sequence as U+FFFD first.
+    pub fn push_str(&mut self, text: &str) {
+        self.flush_pending();
+        if !text.is_empty() {
+            self.started = true;
+        }
+        self.accept(text);
+    }
+
+    /// Append bytes, retaining an incomplete trailing UTF-8 sequence for the
+    /// next byte chunk. A byte-order mark is stripped only at stream start.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        let mut input = std::mem::take(&mut self.pending);
+        input.extend_from_slice(bytes);
+        let mut decoded = String::new();
+        let mut remaining = input.as_slice();
+        loop {
+            match std::str::from_utf8(remaining) {
+                Ok(text) => {
+                    decoded.push_str(text);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    decoded.push_str(
+                        std::str::from_utf8(&remaining[..valid]).expect("valid UTF-8 prefix"),
+                    );
+                    match error.error_len() {
+                        Some(length) => {
+                            decoded.push('\u{fffd}');
+                            remaining = &remaining[valid + length..];
+                        }
+                        None => {
+                            self.pending.extend_from_slice(&remaining[valid..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !decoded.is_empty() {
+            if !self.started && decoded.starts_with('\u{feff}') {
+                decoded.drain(..'\u{feff}'.len_utf8());
+            }
+            self.started = true;
+            self.accept(&decoded);
+        }
+    }
+
+    /// Finish a byte stream, replacing an incomplete final sequence.
+    pub fn end(&mut self) {
+        self.flush_pending();
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.started = true;
+            self.accept("\u{fffd}");
+        }
+    }
+
+    fn accept(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let newlines = text.bytes().filter(|&b| b == b'\n').count();
+        self.total_bytes = self.total_bytes.saturating_add(text.len());
+        self.total_newlines = self.total_newlines.saturating_add(newlines);
+        self.ends_newline = text.ends_with('\n');
+        if self.full {
+            return;
+        }
+        self.stored_bytes += text.len();
+        self.stored_newlines += newlines;
+        self.chunks.push_back(Chunk {
+            text: text.to_owned(),
+            newlines,
+        });
+        if self.limits.retain == Retain::Head {
+            self.full = self.stored_bytes > self.limits.max_bytes
+                || self.stored_newlines >= self.limits.max_lines;
+        } else {
+            while self.chunks.len() > 1 {
+                let first = self.chunks.front().expect("nonempty");
+                let bytes = self.stored_bytes - first.text.len();
+                let lines = self.stored_newlines - first.newlines;
+                if bytes <= self.limits.max_bytes.saturating_add(1)
+                    && lines <= self.limits.max_lines.saturating_add(1)
+                {
+                    break;
+                }
+                self.chunks.pop_front();
+                self.stored_bytes = bytes;
+                self.stored_newlines = lines;
+            }
+        }
+    }
+
+    /// Return the current sanitized window. Incomplete UTF-8 is not included
+    /// until completed, flushed by a text chunk, or ended.
+    pub fn snapshot(&mut self) -> OutputSnapshot {
+        let stored: String = self.chunks.iter().map(|c| c.text.as_str()).collect();
+        let kept = bound_output(&stored, self.limits);
+        let kept_lines = line_count(kept.text.as_bytes());
+        let snapshot = OutputSnapshot {
+            text: sanitize_output(kept.text),
+            dropped_bytes: self.total_bytes.saturating_sub(kept.bytes),
+            dropped_lines: (self.total_newlines + usize::from(!self.ends_newline))
+                .saturating_sub(kept_lines),
+        };
+        if self.limits.retain == Retain::Tail {
+            let mut byte_start = if stored.len() > self.limits.max_bytes {
+                stored.len() - self.limits.max_bytes - 1
+            } else {
+                0
+            };
+            while !stored.is_char_boundary(byte_start) {
+                byte_start -= 1;
+            }
+            let line_start = stored
+                .bytes()
+                .enumerate()
+                .rev()
+                .filter(|(_, b)| *b == b'\n')
+                .nth(self.limits.max_lines)
+                .map_or(0, |(index, _)| index);
+            let margin = &stored[byte_start.max(line_start)..];
+            self.chunks.clear();
+            self.stored_bytes = margin.len();
+            self.stored_newlines = margin.bytes().filter(|&b| b == b'\n').count();
+            if !margin.is_empty() {
+                self.chunks.push_back(Chunk {
+                    text: margin.to_owned(),
+                    newlines: self.stored_newlines,
+                });
+            }
+        } else if self.chunks.len() > 1 {
+            self.chunks.clear();
+            self.chunks.push_back(Chunk {
+                text: stored,
+                newlines: self.stored_newlines,
+            });
+        }
+        snapshot
+    }
+}
+
+/// Remove the terminal sequences and controls stripped by upstream output buffers.
+pub fn sanitize_output(text: &str) -> String {
+    use std::sync::OnceLock;
+    static ESCAPES: OnceLock<regex::Regex> = OnceLock::new();
+    let escapes = ESCAPES.get_or_init(|| regex::Regex::new(
+        r"\x1b[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b[\x20-\x2f]*[\x30-\x7e]"
+    ).expect("valid terminal escape expression"));
+    escapes
+        .replace_all(text, "")
+        .chars()
+        .filter(|c| {
+            !matches!(*c,
+                '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{fff9}'..='\u{fffb}'
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +359,98 @@ mod tests {
             expected
         );
         assert_eq!(result.bytes, result.text.len());
+    }
+
+    #[test]
+    fn streaming_utf8_bom_invalid_bytes_and_sanitization() {
+        let mut b = OutputBuffer::new(OutputLimits {
+            max_bytes: 100,
+            max_lines: 10,
+            retain: Retain::Tail,
+        });
+        b.push_bytes(&[0xef]);
+        b.push_bytes(&[0xbb, 0xbf, b'a', 0xf0, 0x9f]);
+        b.push_bytes(&[0x99, 0x82, b'\n']);
+        b.push_bytes(&[0xe2]);
+        b.push_str("x");
+        b.push_bytes(&[0xe2, 0x82]);
+        b.end();
+        assert_eq!(b.snapshot().text, "a🙂\n\u{fffd}x\u{fffd}");
+        let mut b = OutputBuffer::new(OutputLimits {
+            max_bytes: 100,
+            max_lines: 10,
+            retain: Retain::Head,
+        });
+        b.push_str("\u{feff}\x1b[3");
+        b.push_str("1mERROR\x1b[0m\n\x07");
+        let out = b.snapshot();
+        assert_eq!(out.text, "\u{feff}ERROR\n");
+        assert_eq!(out.dropped_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_matches_whole_output_across_chunks_and_snapshots() {
+        for retain in [Retain::Head, Retain::Tail] {
+            for max_bytes in 0..=16 {
+                for max_lines in 0..=4 {
+                    let limits = OutputLimits {
+                        max_bytes,
+                        max_lines,
+                        retain,
+                    };
+                    let mut b = OutputBuffer::new(limits);
+                    let mut whole = String::new();
+                    for i in 0..150 {
+                        let chunk = match i % 5 {
+                            0 => "é",
+                            1 => "x\n",
+                            2 => "🙂\n",
+                            3 => "\n",
+                            _ => "a",
+                        };
+                        whole.push_str(chunk);
+                        let bytes = chunk.as_bytes();
+                        for byte in bytes {
+                            b.push_bytes(std::slice::from_ref(byte));
+                        }
+                        if i % 3 == 0 {
+                            let expected = bound_output(&whole, limits);
+                            let actual = b.snapshot();
+                            assert_eq!(
+                                (
+                                    actual.text.as_str(),
+                                    actual.dropped_bytes,
+                                    actual.dropped_lines
+                                ),
+                                (
+                                    expected.text,
+                                    expected.dropped_bytes,
+                                    expected.dropped_lines
+                                ),
+                                "{limits:?} i={i}"
+                            );
+                        }
+                    }
+                    b.end();
+                    let expected = bound_output(&whole, limits);
+                    let actual = b.snapshot();
+                    assert_eq!(
+                        (
+                            actual.text.as_str(),
+                            actual.dropped_bytes,
+                            actual.dropped_lines
+                        ),
+                        (
+                            expected.text,
+                            expected.dropped_bytes,
+                            expected.dropped_lines
+                        ),
+                        "{limits:?}"
+                    );
+                    assert!(b.stored_bytes() <= max_bytes.saturating_add(8).max(8));
+                }
+            }
+        }
     }
 
     #[test]

@@ -2207,3 +2207,177 @@ async fn fitted_blocks_survive_save_and_reopen_without_refitting() {
     );
     assert_eq!(processor.0.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn bounded_stream_adapter_retains_and_checkpoints_tail() {
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    struct ToolWithTail;
+    #[async_trait]
+    impl BoundedStreamedTool for ToolWithTail {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            output.append("old\n").await.unwrap();
+            output.append_bytes(&[0xf0, 0x9f]).await.unwrap();
+            output.append_bytes(&[0x99, 0x82, b'\n']).await.unwrap();
+            let snapshot = output.snapshot().await.unwrap();
+            assert_eq!(
+                (
+                    snapshot.text.as_str(),
+                    snapshot.dropped_bytes,
+                    snapshot.dropped_lines
+                ),
+                ("🙂\n", 4, 1)
+            );
+            StreamedReply::Success {
+                output: None,
+                state: None,
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let options = || Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: ToolWithTail,
+                limits: OutputLimits {
+                    max_bytes: 32,
+                    max_lines: 1,
+                    retain: Retain::Tail,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let cancel = CancellationToken::new();
+    let mut harness = Harness::open(&path, options(), &cancel).await.unwrap();
+    let id = harness.create_conversation(config()).unwrap();
+    harness
+        .submit_and_run(id, None, "work".into(), &cancel)
+        .await
+        .unwrap();
+    let conversation = harness.conversation(id).unwrap();
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "🙂\n"))
+    );
+    let attempt = harness
+        .tool_attempts(
+            id,
+            pi_rs_durable::observer::Cursor(0),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        )
+        .unwrap();
+    assert!(!attempt.records.is_empty());
+    drop(harness);
+    let reopened = Harness::open_paused(&path, options()).unwrap();
+    assert!(
+        reopened
+            .conversation(id)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content == "🙂\n"))
+    );
+}
+
+#[tokio::test]
+async fn interrupted_bounded_stream_recovers_committed_tail_without_replay() {
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, Retain};
+    use pi_rs_durable::runtime::Scheduler;
+    struct Interrupted(Arc<AtomicUsize>, Arc<tokio::sync::Semaphore>);
+    #[async_trait]
+    impl BoundedStreamedTool for Interrupted {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            output.append("old\nlast").await.unwrap();
+            self.1.add_permits(1);
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let options = || Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: Interrupted(calls.clone(), started.clone()),
+                limits: OutputLimits {
+                    max_bytes: 32,
+                    max_lines: 1,
+                    retain: Retain::Tail,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    scheduler.shutdown().await.unwrap();
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(scheduler.conversation(id).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last\ntool interrupted and may have partially run")));
+    scheduler.shutdown().await.unwrap();
+}

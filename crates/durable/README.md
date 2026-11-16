@@ -164,9 +164,27 @@ let reply = Outcome::Succeeded(result.text.to_owned());
 
 Tools must call the helper explicitly and choose how to expose dropped counts;
 the runtime does not append a truncation diagnostic automatically. It processes
-materialized valid UTF-8 text, does not sanitize terminal escapes, and does not
-provide upstream's bounded incremental `OutputBuffer` or byte-chunk decoding.
-In particular it does not change the streaming adapter's strict cap below.
+materialized valid UTF-8 text and does not sanitize terminal escapes. It does
+not change the streaming adapter's strict cap below.
+
+`output::OutputBuffer` separately supports incremental UTF-8 text and byte
+chunks with head/tail retention, split-character decoding, display sanitization,
+and counts of decoded bytes and lines dropped before sanitization. `end()`
+flushes an incomplete final byte sequence as U+FFFD. Memory is bounded by the
+retained window plus the largest chunk; take snapshots to compact tail storage.
+It does not support upstream's producer-supplied skipped-output counts.
+
+For opt-in durable streaming, wrap a `BoundedStreamedTool` in
+`KeyedToolAdapter::new(BoundedStreamedToolAdapter { tool, limits })`. A bounded
+stream's byte limit must be at most 64 KiB. `append` and `append_bytes` commit
+the sanitized retained window before returning; `snapshot` exposes dropped
+counts while the invocation runs. Returning `StreamedReply::Success` with
+`output: None` uses the retained window. Explicit replies keep their ordinary
+meaning. The persisted stream contains only retained text: dropped counts and
+incremental decoder state are not recovered after interruption, and no automatic
+truncation diagnostic is emitted. An incomplete byte sequence is not persisted
+until completed or flushed at normal settlement. The separate strict adapter
+below retains its existing overflow behavior.
 
 For model-issued calls, `KeyedToolAdapter::new(StreamedToolAdapter(tool))`
 provides a separate, opt-in `StreamedTool` contract. Register the adapter as
