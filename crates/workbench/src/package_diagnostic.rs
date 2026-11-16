@@ -96,7 +96,7 @@ fn expand_diagnostic_braces(pattern: &str) -> Option<Vec<String>> {
                 1
             };
             let (first, last, width, alphabetic) = if numeric(parts[0]) && numeric(parts[1]) {
-                let padded = [parts[0], parts[1]].iter().any(|s| {
+                let padded = parts.iter().any(|s| {
                     let digits = s.strip_prefix('-').unwrap_or(s);
                     digits.len() > 1 && digits.starts_with('0')
                 });
@@ -895,6 +895,8 @@ mod tests {
             ("{3..1..-2}", vec!["3", "1"]),
             ("{1..3..0}", vec!["1", "2", "3"]),
             ("{-03..02..2}", vec!["-03", "-01", "001"]),
+            ("{-1..3..02}", vec!["-1", "01", "03"]),
+            ("{-1..3..0002}", vec!["-1", "01", "03"]),
             ("{a..e..2}", vec!["a", "c", "e"]),
             ("{z..v..2}", vec!["z", "x", "v"]),
             ("{1..2}{a,b}", vec!["1a", "1b", "2a", "2b"]),
@@ -939,6 +941,8 @@ mod tests {
         ] {
             std::fs::write(root.path().join("prompts").join(name), "fixture").unwrap();
         }
+        // Node 22 can throw a RangeError for a zero-step range. The bounded
+        // zero-step behavior is covered by the direct expansion test above.
         let patterns = [
             "prompts/{1..3}*.md",
             "prompts/{3..1}*.md",
@@ -949,7 +953,6 @@ mod tests {
             "prompts/{c..a..-2}*.md",
             "prompts/{1..2}{a,b}*.md",
             "prompts/{1,{2..3}}*.md",
-            "prompts/{1..3..0}*.md",
             "prompts/**/",
             "prompts/**/**/",
             "prompts/*/**/",
