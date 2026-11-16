@@ -3701,6 +3701,17 @@ Workbench and AIP prepared-dispatch wrappers preserve that decision, routing,
 and budget the transformed tool schemas. A versioned snapshot can bind the
 decision to a request and context, but the native agent does not yet use this
 path or persist the decision for recovery.
+The Anthropic SDK also supports explicitly prepared JSON Schema tool declarations
+when the caller enables `with_strict_tool_support(true)` for the selected model.
+Unknown capability defaults to unsupported; required constraints fail, while
+preferred constraints fall back. The adapter applies Anthropic's strict keyword
+limits, binds the effective decision and transformed schemas to the prepared
+dispatch, and exposes raw model tool arguments for caller normalization. It does
+not infer the current Pi catalog capability or wire this setting through native
+workbench configuration. Unlike Pi v1.5/current, it does not retry a rejected
+preferred strict request without strict mode: changing the wire decision after
+preparation would invalidate the recorded decision. Provider errors are returned.
+There is no claim of native agent end-to-end constrained sampling or recovery.
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
