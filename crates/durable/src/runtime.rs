@@ -101,7 +101,7 @@ pub enum Error {
     Invalid(String),
 }
 
-fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
+pub(crate) fn owned_cleanup_key(id: Uuid) -> Vec<u8> {
     format!("runtime/owned-cleanup-attempt/{id}").into_bytes()
 }
 
@@ -13267,13 +13267,14 @@ impl Harness {
                     "summary provider identity does not match abort cleanup".into(),
                 ));
             }
-            crate::summary_worker::run(
+            crate::summary_worker::run_for_cleanup(
                 self.owner.clone(),
                 self.options.model.clone(),
                 summary.operation.id(),
                 cancel.clone(),
                 provider,
                 None,
+                cleanup_attempt,
             )
             .await
             .map_err(|e| match e {
@@ -18380,7 +18381,17 @@ impl Scheduler {
             scheduler.schedule(id);
         }
         for (id, conversation) in summaries {
-            scheduler.spawn_summary(id, conversation);
+            if scheduler
+                .harness
+                .owner
+                .store()
+                .get(&owned_cleanup_key(conversation))?
+                .is_some()
+            {
+                scheduler.summary_blocked.push(id);
+            } else {
+                scheduler.spawn_summary(id, conversation);
+            }
         }
         scheduler.start_reporter();
         Ok((scheduler, driver))
@@ -19570,6 +19581,17 @@ impl Scheduler {
         if snap.operation.provider() != Some(provider) {
             return Err(Error::Invalid(
                 "summary provider identity is missing or does not match".into(),
+            ));
+        }
+        if self
+            .harness
+            .owner
+            .store()
+            .get(&owned_cleanup_key(snap.operation.session_id()))?
+            .is_some()
+        {
+            return Err(Error::Invalid(
+                "standalone cleanup outcome uncertain; reconcile before retry".into(),
             ));
         }
         self.spawn_summary(id, snap.operation.session_id());

@@ -16,6 +16,8 @@ pub(crate) enum Error {
     Model(#[from] pi_rs_core::Error),
     #[error("summary worker interrupted")]
     Interrupted,
+    #[error("standalone cleanup outcome uncertain; reconcile before retry")]
+    CleanupUncertain,
     #[error("summary provider identity is missing or does not match")]
     Identity,
     #[error("summary placement: {0}")]
@@ -39,6 +41,18 @@ pub(crate) async fn run(
     provider: summary_store::ProviderIdentity,
     hook_harness: Option<&crate::runtime::Harness>,
 ) -> Result<(), Error> {
+    run_for_cleanup(owner, model, id, cancel, provider, hook_harness, None).await
+}
+
+pub(crate) async fn run_for_cleanup(
+    owner: Arc<OwnedStore>,
+    model: Arc<dyn Model>,
+    id: Uuid,
+    cancel: CancellationToken,
+    provider: summary_store::ProviderIdentity,
+    hook_harness: Option<&crate::runtime::Harness>,
+    cleanup_attempt: Option<Uuid>,
+) -> Result<(), Error> {
     let _guard = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(Error::Interrupted),
@@ -52,6 +66,21 @@ pub(crate) async fn run(
             return Err(Error::Interrupted);
         }
         let snap = snapshot(&store, id)?;
+        let marker = owner
+            .store()
+            .get(&crate::runtime::owned_cleanup_key(
+                snap.operation.session_id(),
+            ))
+            .map_err(summary_store::Error::from)?;
+        match (marker, cleanup_attempt) {
+            (None, None) => (),
+            (Some(marker), Some(attempt))
+                if serde_json::from_slice::<Uuid>(&marker.value).ok() == Some(attempt) =>
+            {
+                ()
+            }
+            _ => return Err(Error::CleanupUncertain),
+        }
         if !provider.valid() || snap.operation.provider() != Some(&provider) {
             return Err(Error::Identity);
         }

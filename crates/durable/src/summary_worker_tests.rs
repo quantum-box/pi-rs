@@ -2338,3 +2338,132 @@ async fn killed_scheduler_reopens_and_recovers_summary() {
     assert_eq!(model.settlements.lock().unwrap().len(), 2);
     scheduler.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn standalone_summary_cleanup_kill_worker() {
+    let Ok(dir) = std::env::var("PI_SUMMARY_CLEANUP_KILL_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    let conversation =
+        Uuid::parse_str(&std::fs::read_to_string(dir.join("conversation")).unwrap()).unwrap();
+    let mut model = TestModel::new(0);
+    Arc::get_mut(&mut model).unwrap().settlement_marker = Some(dir.join("accepted"));
+    model.block_settlement.store(true, Ordering::SeqCst);
+    let mut harness = Harness::open_paused(dir.join("db"), opts(model)).unwrap();
+    harness.summary_provider = Some(identity());
+    let control = harness.owner.conversation_controls().get(conversation);
+    let lock = control.worker.lock_owned().await;
+    harness
+        .settle_owned_abort(conversation, &CancellationToken::new(), lock)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn killed_standalone_summary_cleanup_blocks_recovery_and_explicit_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut scheduler = open_manual(&path, opts(TestModel::new(0))).unwrap();
+    let conversation = placement_conversation(&mut scheduler);
+    let id = Uuid::new_v4();
+    assert!(
+        scheduler
+            .create_independent_summary_impl(id, conversation, None, 0, (true, false), None)
+            .unwrap()
+    );
+    let owner = scheduler.harness.owner.clone();
+    let store = SummaryStore::new(owner.store());
+    let executor = Uuid::new_v4();
+    store
+        .reserve(
+            id,
+            store.get(id).unwrap().unwrap().version,
+            executor,
+            Uuid::new_v4(),
+        )
+        .unwrap();
+    store
+        .start(id, store.get(id).unwrap().unwrap().version, executor)
+        .unwrap();
+    store
+        .complete(
+            id,
+            store.get(id).unwrap().unwrap().version,
+            executor,
+            crate::model::CompletedGeneration {
+                content: "summary".into(),
+                calls: vec![],
+                usage: Some(Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                }),
+                metadata: ModelMetadata::default(),
+            },
+        )
+        .unwrap();
+    scheduler.harness.request_abort(conversation).unwrap();
+    assert!(matches!(
+        store.get(id).unwrap().unwrap().operation.state(),
+        State::Aborting { .. }
+    ));
+    std::fs::write(dir.path().join("conversation"), conversation.to_string()).unwrap();
+    drop(scheduler);
+    drop(owner);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::summary_worker_tests::standalone_summary_cleanup_kill_worker",
+        ])
+        .env("PI_SUMMARY_CLEANUP_KILL_DIR", dir.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !dir.path().join("accepted").exists() {
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("cleanup did not reach summary usage settlement");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let model = TestModel::new(0);
+    let mut recovered = open_auto(&path, model.clone(), identity()).unwrap();
+    assert!(recovered.blocked_summary_recovery().contains(&id));
+    assert!(recovered.resume_independent_compaction(id).is_err());
+    assert!(recovered.abort_independent_compaction(id).await.is_err());
+    assert!(matches!(
+        crate::summary_worker::run(
+            recovered.harness.owner.clone(),
+            model.clone(),
+            id,
+            CancellationToken::new(),
+            identity(),
+            None
+        )
+        .await,
+        Err(crate::summary_worker::Error::CleanupUncertain)
+    ));
+    assert!(model.settlements.lock().unwrap().is_empty());
+    for _ in 0..50 {
+        if recovered
+            .harness
+            .reconcile_owned_cleanup(conversation)
+            .is_ok()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    recovered.resume_independent_compaction(id).unwrap();
+    recovered.wait_summary(id).await.unwrap();
+    assert_eq!(model.settlements.lock().unwrap().len(), 1);
+    assert!(matches!(
+        state(&recovered, id).operation.state(),
+        State::Aborted
+    ));
+    recovered.shutdown().await.unwrap();
+}
