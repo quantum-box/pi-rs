@@ -1455,7 +1455,9 @@ fresh QuickJS context. Scripts can call registered tools through `tools`, use
 and retain JSON values with `store` / `load`. Store changes commit with a
 successful tool result and follow journal branches. Failed scripts retain
 partial output without committing their store. Filesystem, network and Node
-APIs are absent from the script context. Memory, stack and output have explicit
+APIs are absent from the script context. Unfiltered model discovery does not
+read `auth.json`; availability checks and model calls still load credentials
+and report authentication-file errors. Memory, stack and output have explicit
 bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
 waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
