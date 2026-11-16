@@ -589,6 +589,34 @@ fn missing_or_empty_last_export_never_falls_back_to_earlier_input() {
 }
 
 #[test]
+fn earlier_empty_export_does_not_block_valid_later_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("session.jsonl");
+    let destination = dir.path().join("output.html");
+    write_export_session(&input, "valid session");
+    std::fs::write(&destination, "old output").unwrap();
+    for help in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(dir.path())
+            .env("PI_RS_HOME", dir.path())
+            .args(["--export", "", "--export"])
+            .arg(&input)
+            .arg(&destination);
+        if help {
+            command.arg("--help");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            std::fs::read_to_string(&destination)
+                .unwrap()
+                .contains("valid session")
+        );
+    }
+}
+
+#[test]
 fn repeated_export_destination_cannot_overwrite_any_earlier_input() {
     for help in [false, true] {
         for destination in [

@@ -1579,6 +1579,9 @@ fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<(
     };
     if let Some(output) = resolved_output {
         for path in protected_inputs {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
             let path = std::path::absolute(normalize(path)?)?;
             match path.canonicalize() {
                 Ok(input) => {
