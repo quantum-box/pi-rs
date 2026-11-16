@@ -1985,7 +1985,8 @@ mod tests {
             json!({"type":"object","properties":{"query":{"type":"string"}},"required":[]});
         for policy in [P::Prefer, P::Require] {
             let (req, decl) = constrained_fixture(policy, schema.clone());
-            let (wire, effective) = super::resolve_tools(&req, &[decl.clone()], true).unwrap();
+            let (wire, effective) =
+                super::resolve_tools(&req, std::slice::from_ref(&decl), true).unwrap();
             assert_eq!(wire[0]["strict"], true);
             assert_eq!(wire[0]["input_schema"]["required"], json!(["query"]));
             assert!(matches!(effective[0].sampling, S::StrictJsonSchema { .. }));
@@ -2034,7 +2035,8 @@ mod tests {
         };
         let schema = json!({"type":"object", "anyOf":[{"type":"object"}], "oneOf":[], "allOf":[], "description":"omit", "additionalProperties":false, "$defs":{"x":{"type":"string"}}, "definitions":{}});
         let (request, decl) = constrained_fixture(P::Prefer, schema);
-        let (wire, effective) = super::resolve_tools(&request, &[decl.clone()], true).unwrap();
+        let (wire, effective) =
+            super::resolve_tools(&request, std::slice::from_ref(&decl), true).unwrap();
         assert!(matches!(
             effective[0].sampling,
             pi_rs_core::EffectiveToolSampling::Unconstrained
@@ -2062,7 +2064,7 @@ mod tests {
 
         let (request, decl) =
             constrained_fixture(P::Require, json!({"type":"object","title":"strict title"}));
-        let (wire, _) = super::resolve_tools(&request, &[decl.clone()], true).unwrap();
+        let (wire, _) = super::resolve_tools(&request, std::slice::from_ref(&decl), true).unwrap();
         assert_eq!(wire[0]["strict"], true);
         assert_eq!(wire[0]["input_schema"]["properties"], json!({}));
         assert_eq!(wire[0]["input_schema"]["required"], json!([]));
@@ -2213,7 +2215,7 @@ mod tests {
             summary: false,
         };
         let prepared = client
-            .prepare_bound_tool_dispatch(&request, &[decl.clone()], &context)
+            .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&decl), &context)
             .unwrap();
         pi_rs_core::validate_prepared_tool_dispatch(prepared.as_ref(), &context, &request, &[decl])
             .unwrap();
