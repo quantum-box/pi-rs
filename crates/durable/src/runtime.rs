@@ -5395,7 +5395,7 @@ impl Harness {
         if base_version != version
             || baseline.abort_requested
             || baseline.after_failed_run != AfterFailedRun::Continue
-            || !(2..=64).contains(&baseline.pending_resets.len())
+            || baseline.pending_resets.len() < 2
             || baseline.pending_reset_blocks.is_empty()
             || baseline.pending_independent_summary.is_some()
             || !baseline
@@ -5943,7 +5943,7 @@ impl Harness {
             let steps = plan.steps;
             let cuts = plan.cuts;
             use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
-            if steps.len() < 2 || steps.len() != cuts.len() || cuts.len() > 64 {
+            if steps.len() < 2 || steps.len() != cuts.len() {
                 return Err(Error::Invalid("invalid reset batch".into()));
             }
             let previous = old.ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -6102,7 +6102,7 @@ impl Harness {
                 cuts: manifest_cuts,
             };
             let manifest = ResetManifest {
-                version: 1,
+                version: if cuts.len() > 64 { 2 } else { 1 },
                 conversation_id: binding.conversation_id,
                 predecessor_observation: binding.predecessor_observation,
                 predecessor_root_version: binding.predecessor_root_version,
@@ -6131,6 +6131,23 @@ impl Harness {
                 },
             ];
             let mut mutations = Vec::new();
+            let shared_reference = if manifest.version == 2 {
+                let batch = Uuid::new_v4();
+                let key = crate::reset_manifest::shared_key(state.id, batch);
+                checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                mutations.push(Mutation::Put {
+                    key,
+                    value: bytes.clone(),
+                });
+                Some(serde_json::to_vec(
+                    &crate::reset_manifest::SharedReference { version: 2, batch },
+                )?)
+            } else {
+                None
+            };
             for position in positions.iter().take(cuts.len()) {
                 let (entry, sequence) = position
                     .entry_identity()
@@ -6143,7 +6160,7 @@ impl Harness {
                 });
                 mutations.push(Mutation::Put {
                     key,
-                    value: bytes.clone(),
+                    value: shared_reference.as_ref().unwrap_or(&bytes).clone(),
                 });
             }
             atomic_evidence = Some((revision, checks, mutations));
@@ -7859,7 +7876,7 @@ impl Harness {
             && !ids.contains(&history.id)
         {
             let mut next = batch.next;
-            for _ in 0..64 {
+            for _ in 0..crate::reset_manifest::MAX_SHARED_CUTS {
                 let page = transcript.read_with_blocks(&next, std::num::NonZeroUsize::MIN)?;
                 let Some(record) = page.records.first() else {
                     break;
@@ -8046,7 +8063,7 @@ impl Harness {
                     else {
                         continue;
                     };
-                    for _ in 0..65 {
+                    for _ in 0..=crate::reset_manifest::MAX_SHARED_CUTS {
                         let Some(identity) = position.entry_identity() else {
                             break;
                         };

@@ -12,6 +12,10 @@ use uuid::Uuid;
 const FORMAT_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_CUTS: usize = 64;
+// Version 2 stores the batch once, with a small same-commit reference per cut.
+// Bound reads of untrusted storage independently of the number of queued resets.
+const MAX_SHARED_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SHARED_CUTS: usize = 16_384;
 const MAX_TRAILING_ENTRIES: u64 = 64;
 const MAX_FINITE_WRITE_LIMIT: u64 = 1_000_000;
 
@@ -36,6 +40,17 @@ pub(crate) enum LookupError {
 
 pub(crate) fn candidate_prefix(id: Uuid, entry: Uuid, sequence: u64) -> Vec<u8> {
     format!("runtime/reset-manifest/{id}/{entry}/{sequence:020}/").into_bytes()
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SharedReference {
+    pub(crate) version: u32,
+    pub(crate) batch: Uuid,
+}
+
+pub(crate) fn shared_key(id: Uuid, batch: Uuid) -> Vec<u8> {
+    format!("runtime/reset-batch/{id}/{batch}").into_bytes()
 }
 
 /// Find one raw candidate for this cursor and validate its storage evidence.
@@ -75,9 +90,27 @@ pub(crate) fn lookup_candidate(
     if nonce.is_nil() || nonce.to_string() != suffix {
         return Err(LookupError::Invalid);
     }
-    let manifest = store
+    let reference = store
         .get_bounded(key, MAX_MANIFEST_BYTES)?
         .ok_or(LookupError::Invalid)?;
+    let shared = match serde_json::from_slice::<SharedReference>(&reference.value) {
+        Ok(reference) if reference.version == 2 && !reference.batch.is_nil() => {
+            let batch_key = shared_key(id, reference.batch);
+            let entry = store
+                .get_bounded(&batch_key, MAX_SHARED_MANIFEST_BYTES)?
+                .ok_or(LookupError::Invalid)?;
+            Some((batch_key, entry))
+        }
+        Ok(_) => return Err(LookupError::Invalid),
+        Err(_) => None,
+    };
+    if let Some((_, batch)) = &shared {
+        let header: serde_json::Value =
+            serde_json::from_slice(&batch.value).map_err(|_| LookupError::Invalid)?;
+        if header.get("version") != Some(&serde_json::json!(2)) {
+            return Err(LookupError::Invalid);
+        }
+    }
     let root = format!("runtime/conversation/{id}").into_bytes();
     let root_entry = store
         .get_bounded(&root, 8 * 1024 * 1024)?
@@ -142,8 +175,13 @@ pub(crate) fn lookup_candidate(
     let sequence = store
         .commit_for_version(&anchor, anchor_entry.version)?
         .ok_or(LookupError::Invalid)?;
+    let shared_sequence = shared
+        .as_ref()
+        .map(|(batch_key, batch)| store.commit_for_version(batch_key, batch.version))
+        .transpose()?;
     if store.commit_for_version(&event_key, event.version)? != Some(sequence)
-        || store.commit_for_version(key, manifest.version)? != Some(sequence)
+        || store.commit_for_version(key, reference.version)? != Some(sequence)
+        || shared_sequence.is_some_and(|batch| batch != Some(sequence))
         || store.commit_for_version(&entry_key, entry_version)? != Some(sequence)
         || store.commit_for_version(&anchor_entry_key, anchor_entry_version)? != Some(sequence)
         || !store.runtime_snapshot_exact_at(&root, fork_prefix.as_bytes(), &anchor, sequence)?
@@ -173,16 +211,22 @@ pub(crate) fn lookup_candidate(
         },
         Check {
             key: key.clone(),
-            expected: Expected::Version(manifest.version),
+            expected: Expected::Version(reference.version),
         },
     ];
+    if let Some((batch_key, batch)) = &shared {
+        checks.push(Check {
+            key: batch_key.clone(),
+            expected: Expected::Version(batch.version),
+        });
+    }
     checks.push(Check {
         key: prefix,
         expected: Expected::PrefixUnchangedSince(boundary),
     });
     store.commit(&checks, &[])?;
     Ok(Some(RawCandidate {
-        bytes: manifest.value,
+        bytes: shared.map_or(reference.value, |(_, batch)| batch.value),
         checks,
     }))
 }
@@ -340,7 +384,7 @@ impl RawCandidate {
     /// Parse bounded, structurally valid hints. This is not authentication:
     /// callers must construct an independent binding and call `decode`.
     pub(crate) fn replay_hints(&self) -> Result<ReplayHints, Error> {
-        if self.bytes.len() > MAX_MANIFEST_BYTES {
+        if self.bytes.len() > MAX_SHARED_MANIFEST_BYTES {
             return Err(Error::TooLarge);
         }
         let raw: RawResetManifest =
@@ -380,18 +424,27 @@ impl ResetManifest {
         self.validate(expected)?;
         let bytes =
             serde_json::to_vec(&RawResetManifest::from(self)).map_err(|_| Error::Encoding)?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
+        if bytes.len()
+            > if self.version == 1 {
+                MAX_MANIFEST_BYTES
+            } else {
+                MAX_SHARED_MANIFEST_BYTES
+            }
+        {
             return Err(Error::TooLarge);
         }
         Ok(bytes)
     }
 
     pub(crate) fn decode(bytes: &[u8], expected: &ExpectedBinding) -> Result<Self, Error> {
-        if bytes.len() > MAX_MANIFEST_BYTES {
+        if bytes.len() > MAX_SHARED_MANIFEST_BYTES {
             return Err(Error::TooLarge);
         }
         let raw: RawResetManifest = serde_json::from_slice(bytes).map_err(|_| Error::Encoding)?;
         let manifest = Self::from(raw);
+        if manifest.version == 1 && bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::TooLarge);
+        }
         manifest.validate(expected)?;
         Ok(manifest)
     }
@@ -409,7 +462,7 @@ impl ResetManifest {
         {
             return Err(Error::Binding);
         }
-        if self.version != FORMAT_VERSION
+        if !(self.version == FORMAT_VERSION || self.version == 2)
             || self.conversation_id.is_nil()
             || self.predecessor_observation == 0
             || self.anchor_observation <= self.predecessor_observation
@@ -422,7 +475,12 @@ impl ResetManifest {
             || self.predecessor_cursor.transcript != self.conversation_id
             || self.anchor_cursor.transcript != self.conversation_id
             || self.cuts.is_empty()
-            || self.cuts.len() > MAX_CUTS
+            || self.cuts.len()
+                > if self.version == 1 {
+                    MAX_CUTS
+                } else {
+                    MAX_SHARED_CUTS
+                }
         {
             return Err(Error::Invalid);
         }
@@ -1000,7 +1058,7 @@ mod tests {
         };
         assert!(matches!(candidate.replay_hints(), Err(Error::Invalid)));
         let candidate = RawCandidate {
-            bytes: vec![b' '; MAX_MANIFEST_BYTES + 1],
+            bytes: vec![b' '; MAX_SHARED_MANIFEST_BYTES + 1],
             checks: vec![],
         };
         assert!(matches!(candidate.replay_hints(), Err(Error::TooLarge)));
@@ -1085,13 +1143,13 @@ mod tests {
         reject_structural_change(|m| m.cuts[0].state_sha256 = "a".repeat(63));
         reject_structural_change(|m| m.cuts.clear());
         reject_structural_change(|m| m.cuts = vec![m.cuts[0].clone(); MAX_CUTS + 1]);
-        reject_structural_change(|m| m.version += 1);
+        reject_structural_change(|m| m.version = 3);
         reject_structural_change(|m| m.anchor_observation = m.predecessor_observation);
         reject_structural_change(|m| m.predecessor_root_version = 0);
         reject_structural_change(|m| m.document_revision = i64::MAX as u64 + 1);
         let (_, binding) = fixture();
         assert!(matches!(
-            ResetManifest::decode(&vec![b' '; MAX_MANIFEST_BYTES + 1], &binding),
+            ResetManifest::decode(&vec![b' '; MAX_SHARED_MANIFEST_BYTES + 1], &binding),
             Err(Error::TooLarge)
         ));
     }

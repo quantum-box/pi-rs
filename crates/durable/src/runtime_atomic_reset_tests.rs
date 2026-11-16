@@ -164,6 +164,115 @@ fn setup_with_adapter(
     (h, id, version, steps)
 }
 
+fn add_many_resets(h: &mut Harness, id: Uuid) {
+    for n in 2..66 {
+        h.reset_with_blocks(
+            id,
+            Some(format!("reset {n}")),
+            vec![vec![
+                serde_json::json!({"type":"text","text":format!("block {n}")}),
+            ]],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn large_atomic_failure_shared_evidence_reopens_and_fences_tampering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    add_many_resets(&mut h, id);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    let replacement = h.submit(id, None, "replacement".into()).unwrap();
+    let (mut stopped, version) = h.load(id).unwrap();
+    let occurrence = stopped.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    stopped.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "model error".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&stopped, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "model error".into(), FailureCause::ModelError);
+    let (_, selected, _) = h
+        .atomic_failure_reset_steps(&failure, &Expected::Version(version))
+        .unwrap()
+        .unwrap();
+    let batch = h
+        .prepare_atomic_failure_reset_save(&failure, version, &selected)
+        .unwrap();
+    let references: Vec<_> = batch
+        .mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, value } if key.starts_with(b"runtime/reset-manifest/") => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect();
+    let shared: Vec<_> = batch
+        .mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, value } if key.starts_with(b"runtime/reset-batch/") => {
+                Some((key.clone(), value.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(references.len(), 66);
+    assert_eq!(shared.len(), 1);
+    assert!(
+        references
+            .iter()
+            .all(|v| v.len() < 128 && *v == references[0])
+    );
+    assert!(shared[0].1.len() < 66 * 1024);
+    h.commit_conversation_save(batch).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.resets.len(), 66);
+    assert_eq!(
+        state
+            .submissions
+            .iter()
+            .find(|s| s.id == replacement)
+            .unwrap()
+            .status,
+        Status::Running
+    );
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(h.conversation(fork).unwrap().resets.len(), 1);
+    let manifest: serde_json::Value = serde_json::from_slice(&shared[0].1).unwrap();
+    let cursor: crate::transcript::Cursor =
+        serde_json::from_value(manifest["cuts"][0]["cursor"].clone()).unwrap();
+    let observation = manifest["anchor_observation"].as_u64().unwrap();
+    let (_, _, checks) = h.prove_failure_reset_cut(id, &cursor, observation).unwrap();
+    assert!(checks.iter().any(|c| c.key == shared[0].0));
+    let mut tampered = manifest.clone();
+    tampered["cuts"][0]["state_sha256"] = serde_json::json!("0".repeat(64));
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[Mutation::Put {
+                key: shared[0].0.clone(),
+                value: serde_json::to_vec(&tampered).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(h.owner.store().commit(&checks, &[]).is_err());
+    assert!(h.prove_failure_reset_cut(id, &cursor, observation).is_err());
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.fork_by_entry_id(id, occurrence).is_err());
+}
+
 #[test]
 fn atomic_writer_publishes_cuts_and_manifest_together_and_reopens() {
     let dir = tempfile::tempdir().unwrap();
@@ -799,6 +908,7 @@ fn production_stopped_model_failure_commits_reset_chain_and_forks_after_reopen()
 fn atomic_failure_rebuilds_after_reset_admission_race() {
     let dir = tempfile::tempdir().unwrap();
     let (mut owner, id, _, steps) = setup(&dir.path().join("db"));
+    add_many_resets(&mut owner, id);
     owner
         .set_after_failed_run(id, AfterFailedRun::Continue)
         .unwrap();
@@ -823,10 +933,10 @@ fn atomic_failure_rebuilds_after_reset_admission_race() {
         .unwrap();
     worker.save(&failure, Expected::Version(version)).unwrap();
     let state = owner.conversation(id).unwrap();
-    assert_eq!(
-        state.resets.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![steps[0].reset_id, steps[1].reset_id, third]
-    );
+    assert_eq!(state.resets.len(), 67);
+    assert_eq!(state.resets[0].id, steps[0].reset_id);
+    assert_eq!(state.resets[1].id, steps[1].reset_id);
+    assert_eq!(state.resets.last().unwrap().id, third);
     assert!(matches!(state.phase, Phase::ModelReady { .. }));
 }
 
@@ -838,6 +948,9 @@ fn atomic_failure_kill_child() {
         return;
     };
     let (mut h, id, _, steps) = setup_with_adapter(std::path::Path::new(&path), true);
+    if std::env::var_os("PI_ATOMIC_FAILURE_MANY").is_some() {
+        add_many_resets(&mut h, id);
+    }
     h.set_after_failed_run(id, AfterFailedRun::Continue)
         .unwrap();
     h.submit(id, None, "replacement".into()).unwrap();
@@ -877,6 +990,7 @@ async fn production_atomic_failure_survives_process_kill_and_forks() {
             "--nocapture",
         ])
         .env("PI_ATOMIC_FAILURE_KILL_DB", &path)
+        .env("PI_ATOMIC_FAILURE_MANY", "1")
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -890,7 +1004,7 @@ async fn production_atomic_failure_survives_process_kill_and_forks() {
             }
         }
     });
-    let marker = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let marker = rx.recv_timeout(std::time::Duration::from_secs(120));
     child.kill().unwrap();
     child.wait().unwrap();
     let marker = marker.expect("child did not commit");
@@ -901,7 +1015,7 @@ async fn production_atomic_failure_survives_process_kill_and_forks() {
     let mut h = Harness::open_paused(&path, options()).unwrap();
     h.install_provider_adapter(Arc::new(BlockAdapter)).unwrap();
     let state = h.conversation(id).unwrap();
-    assert_eq!(state.resets.len(), 2);
+    assert_eq!(state.resets.len(), 66);
     assert!(matches!(state.phase, Phase::ModelReady { .. }));
     let fork = h.fork_by_entry_id(id, occurrence).unwrap();
     assert_eq!(h.conversation(fork).unwrap().resets[0].id, reset);
@@ -1922,10 +2036,11 @@ fn staged_limit_failure_fences_independent_source_before_commit() {
             "turn limit".into(),
             FailureCause::TurnLimit(5),
         );
-        assert!(
+        assert_eq!(
             h.atomic_failure_reset_steps(&failure, &Expected::Version(version))
                 .unwrap()
-                .is_none()
+                .is_some(),
+            policy == AfterFailedRun::Continue
         );
         let key = format!("runtime/fork/{id}/{evidence_observation:020}").into_bytes();
         let owner = h.owner.clone();
@@ -2065,6 +2180,7 @@ fn atomic_failure_preserves_abort_policy_and_publishes_task_notification() {
         vec![vec![serde_json::json!({"type":"text","text":"b"})]],
     )
     .unwrap();
+    add_many_resets(&mut h, id);
     let (mut checkpoint, version) = h.load(id).unwrap();
     checkpoint.phase = Phase::FailedModel {
         turns: 0,
