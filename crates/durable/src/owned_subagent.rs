@@ -1248,6 +1248,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_failure_maintenance_rechecks_parked_abortable_inputs() {
+        use crate::runtime::{Status, WithdrawResult};
+        use crate::task::TaskState;
+        use crate::task_scheduler::{Registry, Step, TickReservation};
+        for withdrawn_before_retry in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options();
+            opts.model = Arc::new(FailingModel);
+            let mut h = Harness::open_paused(dir.path().join("db"), opts).unwrap();
+            let (root, child, ordinary, kept) = parked_owned_inputs(&mut h, true).await;
+            let mut registry = Registry::default();
+            registry.register("parked-root", true, |_: &Task| {
+                Ok(Step::Fail("failure".into()))
+            });
+            let mut scheduler = h.attach_tasks(registry).unwrap();
+            let TickReservation::Invocation(invocation) = scheduler.try_reserve_tick(0).unwrap()
+            else {
+                panic!("expected detached task invocation");
+            };
+            scheduler
+                .try_settle_invocation(invocation.execute().unwrap())
+                .unwrap();
+            assert_eq!(
+                scheduler.get(root).unwrap().unwrap().state(),
+                &TaskState::CompletingFailed("failure".into())
+            );
+
+            let owner = h.owner.clone();
+            let control = owner.conversation_controls().get(child);
+            let poll = control.gate.lock().unwrap();
+            let TickReservation::Maintenance(pending) = scheduler.try_reserve_tick(0).unwrap()
+            else {
+                panic!("expected deferred failure maintenance");
+            };
+            let mut worker = h.worker();
+            assert!(!pending.try_cleanup(&mut worker).unwrap());
+            drop(poll);
+            if withdrawn_before_retry {
+                assert!(matches!(
+                    h.withdraw_submission(child, ordinary).unwrap(),
+                    WithdrawResult::Aborted
+                ));
+            }
+            assert!(pending.try_cleanup(&mut worker).unwrap());
+            let c = h.conversation(child).unwrap();
+            assert_eq!(c.abort_requested, !withdrawn_before_retry);
+            assert_eq!(
+                c.submissions
+                    .iter()
+                    .find(|s| s.id == ordinary)
+                    .unwrap()
+                    .status,
+                Status::Unanswered {
+                    reason: "aborted".into()
+                }
+            );
+            assert_eq!(
+                c.submissions.iter().find(|s| s.id == kept).unwrap().status,
+                Status::Queued
+            );
+            if !withdrawn_before_retry {
+                h.resume_conversation(child, &pi_rs_core::CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
+            scheduler.tick(0).unwrap();
+            assert_eq!(
+                scheduler.get(root).unwrap().unwrap().state(),
+                &TaskState::Failed("failure".into())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_owner_abort_with_parked_inputs_survives_reopen() {
         use crate::runtime::Status;
         use crate::task::TaskState;
