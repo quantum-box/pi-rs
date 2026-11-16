@@ -16639,6 +16639,11 @@ mod standalone_foreground_cleanup_tests {
         ));
         let mut scheduler =
             Scheduler::open_with_conversation_runtime(path, registry(), opts).unwrap();
+        if std::env::var_os("PI_CLEANUP_CRASH_DRIVER").is_some() {
+            let _driver = crate::task_driver::Driver::start(scheduler);
+            std::future::pending::<()>().await;
+            return;
+        }
         loop {
             scheduler
                 .tick_with_conversation_cleanup(0, &CancellationToken::new())
@@ -16796,6 +16801,135 @@ mod standalone_foreground_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn killed_driver_cleanup_requires_reconciliation_before_reopen_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountModel(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Model for CountModel {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+            async fn record_usage(
+                &self,
+                _: Uuid,
+                _: &pi_rs_core::UsageReport,
+            ) -> Result<(), ModelError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let ready = dir.path().join("effect-started");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let owner = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.create_conversation(cfg).unwrap();
+        let db = Store::open(&path).unwrap();
+        let parent = task(1, TaskOwner::Conversation(owner), "parent");
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&parent)]).unwrap();
+        let batch = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: parent.id(),
+                task_owner: parent.owner().clone(),
+                child,
+                mode: Mode::Foreground,
+            })
+            .unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        tasks
+            .update(&tasks.load(parent.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.succeed(json!(null))
+            })
+            .unwrap();
+        h.request_abort(child).unwrap();
+        let key = format!("runtime/conversation/{child}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        value["phase"] =
+            json!({"ModelRunning": {"turns":0, "request_id":Uuid::new_v4(), "restarts":0}});
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&value).unwrap(),
+            }],
+        )
+        .unwrap();
+        drop(h);
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task_scheduler::standalone_foreground_cleanup_tests::cleanup_crash_worker",
+                "--nocapture",
+            ])
+            .env("PI_CLEANUP_CRASH_DB", &path)
+            .env("PI_CLEANUP_CRASH_READY", &ready)
+            .env("PI_CLEANUP_CRASH_DRIVER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        process.kill().unwrap();
+        process.wait().unwrap();
+        observed.expect("child did not enter external usage settlement");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut opts = options();
+        opts.model = Arc::new(CountModel(calls.clone()));
+        let scheduler = Scheduler::open_with_conversation_runtime(&path, registry(), opts).unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if driver
+                    .conversation_cleanup_failures()
+                    .unwrap()
+                    .contains_key(&child)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver did not report uncertain cleanup");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        driver.reconcile_owned_cleanup(child).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let entry = db
+                    .get(format!("runtime/conversation/{child}").as_bytes())
+                    .unwrap()
+                    .unwrap();
+                let state: crate::runtime::Conversation =
+                    serde_json::from_slice(&entry.value).unwrap();
+                if !state.abort_requested {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver did not retry after reconciliation");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        driver.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn dangling_and_invalid_unrelated_candidates_do_not_block_valid_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -16901,6 +17035,99 @@ mod standalone_foreground_cleanup_tests {
             }
         }
         panic!("unrelated invalid candidates blocked cleanup");
+    }
+
+    #[tokio::test]
+    async fn standalone_driver_isolates_malformed_records_and_holds_broken_owner() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let broken_child = h.create_conversation(cfg.clone()).unwrap();
+        let good_child = h.create_conversation(cfg.clone()).unwrap();
+        let malformed = h.create_conversation(cfg).unwrap();
+        let broken = task(1, TaskOwner::Conversation(root), "parent");
+        let anchor = task(2, TaskOwner::Conversation(root), "parent");
+        let db = Store::open(&path).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks
+            .save(&[Save::Create(&broken), Save::Create(&anchor)])
+            .unwrap();
+        for (parent, child) in [(&broken, broken_child), (&anchor, good_child)] {
+            let edge = EdgeStore::new(&db)
+                .prepare_create(&Edge {
+                    task: parent.id(),
+                    task_owner: parent.owner().clone(),
+                    child,
+                    mode: Mode::Foreground,
+                })
+                .unwrap();
+            db.commit(&edge.checks, &edge.mutations).unwrap();
+        }
+        tasks
+            .update(&tasks.load(anchor.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.succeed(json!(null))
+            })
+            .unwrap();
+        h.request_abort_task(broken.id()).unwrap();
+        h.request_abort(good_child).unwrap();
+        drop(h);
+        let scheduler =
+            Scheduler::open_with_conversation_runtime(&path, registry(), options()).unwrap();
+        let key = format!("runtime/conversation/{malformed}").into_bytes();
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: b"broken-json".to_vec(),
+            }],
+        )
+        .unwrap();
+        let key = crate::ownership_edge::edge_key(broken_child);
+        let entry = db.get(&key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: b"broken-edge".to_vec(),
+            }],
+        )
+        .unwrap();
+        let driver = crate::task_driver::Driver::start(scheduler);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entry = db
+                    .get(format!("runtime/conversation/{good_child}").as_bytes())
+                    .unwrap()
+                    .unwrap();
+                let state: crate::runtime::Conversation =
+                    serde_json::from_slice(&entry.value).unwrap();
+                if !state.abort_requested {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("malformed unrelated records blocked valid driver cleanup");
+        let task = driver.get(broken.id()).unwrap().unwrap();
+        assert!(task.abort_requested());
+        assert!(!task.is_terminal());
+        driver.shutdown().unwrap();
     }
 
     #[tokio::test]

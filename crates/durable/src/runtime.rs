@@ -4547,6 +4547,31 @@ impl Harness {
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
+    // Driver-owned cleanup must use the same durable attempt protocol as
+    // manual standalone cleanup; a stopped future can have external effects.
+    pub(crate) async fn drive_owned_cleanup_fenced(
+        &self,
+        id: Uuid,
+        stop: &CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            let control = self.owner.conversation_controls().get(id);
+            let lock = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(()),
+                lock = control.worker.clone().lock_owned() => lock,
+            };
+            let changed = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(()),
+                result = self.settle_owned_abort(id, &control.cleanup_cancel, lock) => result?,
+            };
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
     pub(crate) fn subagent_store(&self) -> Result<&durable_store::Store, Error> {
         if self.failed
             || self.dirty.load(Ordering::Acquire)

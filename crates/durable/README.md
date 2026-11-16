@@ -75,10 +75,14 @@ additional provider or extension configuration can configure a `Harness` and use
 `Harness::attach_tasks` instead; the scheduler retains a shared harness worker.
 A `task_driver::Driver`
 started from that scheduler runs its cleanup coordinator automatically. The
-driver's coordinator still stops the driver on any cleanup failure and does not
-apply the manual coordinator's timeout or eight-worker bound; per-conversation
-failure isolation described above applies to manual ticks. Plain `Scheduler::open`
-has no conversation runtime and still rejects foreground aborts.
+driver's coordinator uses the same durable cleanup-attempt marker and isolates
+per-conversation failures. `Driver::conversation_cleanup_failures` exposes them;
+a host that has reconciled external effects can call `Driver::reconcile_owned_cleanup`
+to permit retry. Malformed unrelated conversation or ownership records are skipped
+during discovery; damaged graphs remain fenced. Storage failures and worker panics
+still stop the driver. The driver does not apply the manual coordinator's timeout
+or eight-worker bound. Plain `Scheduler::open` has no conversation runtime and still
+rejects foreground aborts.
 
 Model requests, completed responses, tool intents and results are committed
 before the next effect. Interrupted model requests settle as unconfirmed before
