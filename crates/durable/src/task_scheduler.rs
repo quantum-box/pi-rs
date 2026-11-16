@@ -4930,6 +4930,9 @@ fn has_owned_work(
     include_abortable: bool,
 ) -> Result<bool, Error> {
     let edges = crate::ownership_edge::EdgeStore::new(store);
+    let failure_cleanup = tasks.iter().any(|record| {
+        record.task.id() == root && matches!(record.task.state(), TaskState::CompletingFailed(_))
+    });
     let mut pending = vec![root];
     let mut seen = HashSet::new();
     while let Some(id) = pending.pop() {
@@ -4971,7 +4974,11 @@ fn has_owned_work(
                 return Err(Error::Ownership);
             }
             if conversation.abort_requested
-                || conversation.is_idle_wait_busy()
+                || if failure_cleanup {
+                    conversation.is_failure_cleanup_busy()
+                } else {
+                    conversation.is_idle_wait_busy()
+                }
                 || (include_abortable && conversation.has_abortable_queued_inputs())
             {
                 return Ok(true);
@@ -14560,6 +14567,9 @@ mod standalone_foreground_cleanup_tests {
             let withdrawn = harness
                 .submit(child_conversation, None, "withdraw".into())
                 .unwrap();
+            let reset = harness
+                .reset(child_conversation, Some("queued reset".into()))
+                .unwrap();
             let root = task(1, TaskOwner::Conversation(root_conversation), "parent");
             let child = task(2, TaskOwner::Conversation(child_conversation), "child");
             let db = Store::open(&path).unwrap();
@@ -14657,6 +14667,8 @@ mod standalone_foreground_cleanup_tests {
             )
             .unwrap();
             assert!(!state.abort_requested);
+            let persisted = serde_json::to_value(&state).unwrap();
+            assert_eq!(persisted["pending_resets"][0]["id"], reset.to_string());
             assert_eq!(
                 state
                     .submissions

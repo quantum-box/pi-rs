@@ -38,7 +38,9 @@ runtime options. It shares one exclusive store owner with its attached harness.
 conversation cleanup step for foreground conversations owned by aborting or
 failed tasks, without executing retained queued input. Busy conversation workers
 are skipped and can be retried on a later tick. Unrelated conversation aborts
-are left to their own runtime workers. A cleanup error or cancelled
+are left to their own runtime workers. A reset retained in a failed-idle
+conversation remains queued for a later boundary and does not hold its failed
+task owner open. A cleanup error or cancelled
 cleanup or a dropped cleanup future poisons the task scheduler; drop it and reopen before retrying. Hosts needing
 additional provider or extension configuration can configure a `Harness` and use
 `Harness::attach_tasks` instead; the scheduler retains a shared harness worker.

@@ -1865,6 +1865,16 @@ impl Conversation {
                     || (s.status == Status::Queued && !matches!(self.phase, Phase::FailedIdle))
             })
     }
+    // A reset retained by an aborted, parked conversation is future work,
+    // like a kept input; it must not hold its failed owner open indefinitely.
+    pub(crate) fn is_failure_cleanup_busy(&self) -> bool {
+        if matches!(self.phase, Phase::FailedIdle) {
+            self.active.is_some()
+                || self.submissions.iter().any(|s| s.status == Status::Running)
+        } else {
+            self.is_idle_wait_busy()
+        }
+    }
     pub(crate) fn has_abortable_queued_inputs(&self) -> bool {
         self.submissions
             .iter()
