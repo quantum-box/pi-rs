@@ -1069,3 +1069,275 @@ fn forged_internal_child_fields_are_rejected_without_losing_scope_rules() {
     release.send(()).unwrap();
     driver.shutdown().unwrap();
 }
+
+#[test]
+fn staged_roots_and_children_share_graph_and_keys_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let (driver, _started, release) = driver(&h);
+    let root_a = task(TaskOwner::Conversation(c), "child", 1);
+    let root_b = task(TaskOwner::Conversation(c), "child", 2);
+    let child_a = task(TaskOwner::Task(root_a.id()), "child", 3);
+    let child_b = task(TaskOwner::Task(root_b.id()), "child", 4);
+    let grandchild = task(TaskOwner::Task(child_a.id()), "child", 5);
+    use pi_rs_durable::{
+        runtime::{SubmissionNotify, submission_settled_signal},
+        task_store::{SignalResult, SignalToken},
+    };
+    let receipt = h
+        .session_transaction(c, |tx| {
+            assert_eq!(
+                tx.signal(
+                    child_a.id(),
+                    &SignalToken::new("test", 1).unwrap(),
+                    "early",
+                    json!(1)
+                )?,
+                SignalResult::NotFound
+            );
+            let receipt = tx.submit_write(
+                None,
+                "note".into(),
+                None,
+                Some(SubmissionNotify {
+                    task_id: child_a.id(),
+                    key: "done".into(),
+                }),
+            )?;
+            tx.put_document(&address(), json!({"n": 42}).as_object().unwrap().clone())?;
+            tx.create_task(root_a.clone())?;
+            tx.create_task(root_b.clone())?;
+            assert_eq!(
+                tx.create_keyed_child_of_staged_task(root_a.id(), "key", child_a.clone())?,
+                child_a.id()
+            );
+            assert_eq!(
+                tx.create_keyed_child_of_staged_task(
+                    root_a.id(),
+                    "key",
+                    task(TaskOwner::Task(root_a.id()), "child", 3)
+                )?,
+                child_a.id()
+            );
+            let mut invalid = serde_json::to_value(task(TaskOwner::Task(root_a.id()), "child", 3))?;
+            invalid["id"] = json!(root_a.id());
+            let invalid: Task = serde_json::from_value(invalid)?;
+            assert!(
+                tx.create_keyed_child_of_staged_task(root_a.id(), "key", invalid)
+                    .is_err()
+            );
+            tx.create_keyed_child_of_staged_task(root_b.id(), "key", child_b.clone())?;
+            tx.create_child_of_staged_task(child_a.id(), grandchild.clone())?;
+            tx.append_entry("note", None)?;
+            Ok(receipt)
+        })
+        .unwrap();
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        TaskStore::new(&store)
+            .read_typed_signal(child_a.id(), &submission_settled_signal(), "done")
+            .unwrap()
+            .unwrap()["id"],
+        json!(receipt)
+    );
+    for item in [&root_a, &root_b, &child_a, &child_b, &grandchild] {
+        assert!(TaskStore::new(&store).load(item.id()).unwrap().is_some());
+    }
+    assert_eq!(
+        Documents::new(&store)
+            .get(&address())
+            .unwrap()
+            .unwrap()
+            .value["n"],
+        42
+    );
+    assert_eq!(h.conversation(c).unwrap().application_writes.len(), 2);
+}
+
+#[test]
+fn existing_attempt_and_new_root_commit_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let parent = task(TaskOwner::Conversation(c), "parent", 0);
+    driver.submit(&parent).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let snapshot = TaskStore::new(&store).load(parent.id()).unwrap().unwrap();
+    let child = task(TaskOwner::Task(parent.id()), "child", 1);
+    let root = task(TaskOwner::Conversation(c), "child", 2);
+    let nested = task(TaskOwner::Task(root.id()), "child", 3);
+    h.session_transaction(c, |tx| {
+        tx.create_child_task(&snapshot, child.clone())?;
+        tx.create_task(root.clone())?;
+        tx.create_child_of_staged_task(root.id(), nested.clone())?;
+        Ok(())
+    })
+    .unwrap();
+    for item in [&child, &root, &nested] {
+        assert!(TaskStore::new(&store).load(item.id()).unwrap().is_some());
+    }
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn two_parent_attempts_use_separate_key_spaces_and_fence_both() {
+    use pi_rs_durable::task_store::Save;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let first = task(TaskOwner::Conversation(c), "parent", 0);
+    driver.submit(&first).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    // The worker is held in the first handler. Construct a second persisted
+    // attempt to exercise the transaction's independent parent fences.
+    let mut second = task(TaskOwner::Conversation(c), "parent", 1);
+    second.start().unwrap();
+    let mut value = serde_json::to_value(second).unwrap();
+    value["attempt_id"] = json!(Uuid::new_v4());
+    let second: Task = serde_json::from_value(value).unwrap();
+    TaskStore::new(&store)
+        .save(&[Save::Create(&second)])
+        .unwrap();
+    let first_snapshot = TaskStore::new(&store).load(first.id()).unwrap().unwrap();
+    let second_snapshot = TaskStore::new(&store).load(second.id()).unwrap().unwrap();
+    let a = task(TaskOwner::Task(first.id()), "child", 1);
+    let b = task(TaskOwner::Task(second.id()), "child", 2);
+    h.session_transaction(c, |tx| {
+        tx.create_keyed_child(&first_snapshot, "key", a.clone())?;
+        tx.create_keyed_child(&second_snapshot, "key", b.clone())?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(TaskStore::new(&store).load(a.id()).unwrap().is_some());
+    assert!(TaskStore::new(&store).load(b.id()).unwrap().is_some());
+    let first_current = TaskStore::new(&store).load(first.id()).unwrap().unwrap();
+    let second_current = TaskStore::new(&store).load(second.id()).unwrap().unwrap();
+    let a2 = task(TaskOwner::Task(first.id()), "child", 3);
+    let b2 = task(TaskOwner::Task(second.id()), "child", 4);
+    let result = h.session_transaction(c, |tx| {
+        tx.create_child_task(&first_current, a2.clone())?;
+        tx.create_child_task(&second_current, b2.clone())?;
+        tx.put_document(&address(), json!({"n": 7}).as_object().unwrap().clone())?;
+        let mut changed = second_current.clone();
+        let mut value = serde_json::to_value(&changed.task)?;
+        value["abort_requested"] = json!(true);
+        changed.task = serde_json::from_value(value)?;
+        TaskStore::new(&store).save(&[Save::Update(&changed)])?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(TaskStore::new(&store).load(a2.id()).unwrap().is_none());
+    assert!(TaskStore::new(&store).load(b2.id()).unwrap().is_none());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn staged_graph_with_orphan_waiting_on_new_parent_is_rejected_atomically() {
+    use pi_rs_durable::{task::WaitFor, task_store::Save};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let blocker = task(TaskOwner::Conversation(c), "parent", 0);
+    driver.submit(&blocker).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let root = task(TaskOwner::Conversation(c), "child", 1);
+    let child = task(TaskOwner::Task(root.id()), "child", 2);
+    let mut orphan = task(TaskOwner::Task(root.id()), "child", 3);
+    orphan.start().unwrap();
+    orphan.wait(WaitFor::Tasks(vec![root.id()])).unwrap();
+    let store = Store::open(&path).unwrap();
+    TaskStore::new(&store)
+        .save(&[Save::Create(&orphan)])
+        .unwrap();
+    let result = h.session_transaction(c, |tx| {
+        tx.create_task(root.clone())?;
+        tx.create_child_of_staged_task(root.id(), child.clone())?;
+        tx.put_document(&address(), json!({"n": 1}).as_object().unwrap().clone())?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(TaskStore::new(&store).load(root.id()).unwrap().is_none());
+    assert!(TaskStore::new(&store).load(child.id()).unwrap().is_none());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    // Remove the deliberately corrupt orphan before allowing the worker to resume.
+    let mut key = b"durable/task/".to_vec();
+    key.extend_from_slice(orphan.id().as_bytes());
+    let entry = store.get(&key).unwrap().unwrap();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Delete { key }],
+        )
+        .unwrap();
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn staged_child_signal_missing_observation_rejects_create_delete_aba() {
+    use durable_store::{Check, Expected, Mutation};
+    use pi_rs_durable::task_store::{Save, SignalResult, SignalToken};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let c = h.create_conversation(config()).unwrap();
+    let (driver, started, release) = driver(&h);
+    let blocker = task(TaskOwner::Conversation(c), "parent", 0);
+    driver.submit(&blocker).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    let store = Store::open(&path).unwrap();
+    let root = task(TaskOwner::Conversation(c), "child", 1);
+    let child = task(TaskOwner::Task(root.id()), "child", 2);
+    let result = h.session_transaction(c, |tx| {
+        assert_eq!(
+            tx.signal(
+                child.id(),
+                &SignalToken::new("aba", 1).unwrap(),
+                "x",
+                json!(1)
+            )?,
+            SignalResult::NotFound
+        );
+        TaskStore::new(&store).save(&[Save::Create(&child)])?;
+        let mut key = b"durable/task/".to_vec();
+        key.extend_from_slice(child.id().as_bytes());
+        let version = store.get(&key)?.unwrap().version;
+        store.commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(version),
+            }],
+            &[Mutation::Delete { key }],
+        )?;
+        tx.create_task(root.clone())?;
+        tx.create_keyed_child_of_staged_task(root.id(), "key", child.clone())?;
+        tx.put_document(&address(), json!({"n": 1}).as_object().unwrap().clone())?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(TaskStore::new(&store).load(root.id()).unwrap().is_none());
+    assert!(TaskStore::new(&store).load(child.id()).unwrap().is_none());
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    release.send(()).unwrap();
+    driver.shutdown().unwrap();
+}

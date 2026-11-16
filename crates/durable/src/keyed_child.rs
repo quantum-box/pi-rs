@@ -308,6 +308,60 @@ pub(crate) fn prepare(
     })
 }
 
+/// Prepare the keyed journal entry for a parent created in this same batch.
+pub(crate) fn prepare_staged_parent(
+    store: &Store,
+    parent: &Task,
+    key: &str,
+    child: &Task,
+) -> Result<crate::task_store::OwnedBatch, Error> {
+    let positive_integer = !key.starts_with('0') && key.bytes().all(|b| b.is_ascii_digit());
+    let kind = child
+        .kind()
+        .filter(|s| !s.is_empty())
+        .ok_or(Error::Invalid)?;
+    if key.is_empty()
+        || key.contains('/')
+        || key == "__proto__"
+        || positive_integer
+        || child.owner() != &TaskOwner::Task(parent.id())
+        || child.id().is_nil()
+        || child.id() == parent.id()
+        || !child.is_fresh_admission()
+        || child.is_background()
+    {
+        return Err(Error::Invalid);
+    }
+    let record_key = record_key(parent.id(), key);
+    let boundary = store.put_version()?;
+    if store.get(&record_key)?.is_some() {
+        return Err(Error::InvalidStoredChild);
+    }
+    let identity = Identity {
+        tool: kind.into(),
+        arguments: child.input().clone(),
+        replay_safe: child.replay_safe(),
+        task_kind: kind.into(),
+        task_version: child.definition_version(),
+        initial_checkpoint: child.checkpoint().clone(),
+        restart_limit: child.restart_limit(),
+        task_tool: child.is_task_tool(),
+    };
+    Ok(crate::task_store::OwnedBatch {
+        checks: vec![Check {
+            key: record_key.clone(),
+            expected: Expected::MissingUnchangedSince(boundary),
+        }],
+        mutations: vec![Mutation::Put {
+            key: record_key,
+            value: serde_json::to_vec(&Record {
+                child: child.id(),
+                identity,
+            })?,
+        }],
+    })
+}
+
 /// Prepare an unkeyed direct child and advance the live parent's graph fence.
 pub(crate) fn prepare_unkeyed(
     store: &Store,

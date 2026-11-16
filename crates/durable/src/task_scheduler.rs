@@ -2106,6 +2106,10 @@ pub(crate) fn validate_wait_graph(
             (child.task.owner() == &TaskOwner::Task(id) && !child.task.is_background())
                 .then_some((child.task.id(), true))
         }));
+        pending.extend(new_children.values().filter_map(|child| {
+            (child.owner() == &TaskOwner::Task(id) && !child.is_background())
+                .then_some((child.id(), true))
+        }));
         for edge in edges
             .children(id)
             .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?

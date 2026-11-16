@@ -698,6 +698,7 @@ impl Shared {
     pub(crate) fn with_session_child<T>(
         &self,
         intents: &[crate::session_transaction::SessionChild],
+        roots: &[Task],
         conversation: Uuid,
         f: impl FnOnce(u64) -> Result<T, crate::runtime::Error>,
     ) -> Result<T, crate::runtime::Error> {
@@ -705,35 +706,43 @@ impl Shared {
             .state
             .lock()
             .map_err(|_| crate::runtime::Error::Failed)?;
-        let parent = &intents
-            .first()
-            .ok_or_else(|| crate::runtime::Error::Invalid("missing owned task admission".into()))?
-            .parent;
         if state.stop
+            || roots.iter().any(|task| {
+                task.kind()
+                    .and_then(|kind| state.policies.get(kind))
+                    .copied()
+                    != Some((task.replay_safe(), task.definition_version()))
+                    || task.owner() != &TaskOwner::Conversation(conversation)
+                    || !task.is_fresh_admission()
+            })
             || intents.iter().any(|intent| {
                 let child = &intent.child;
-                intent.parent != *parent
-                    || child
-                        .kind()
-                        .and_then(|kind| state.policies.get(kind))
-                        .copied()
-                        != Some((child.replay_safe(), child.definition_version()))
-                    || child.owner() != &TaskOwner::Task(parent.task.id())
+                child
+                    .kind()
+                    .and_then(|kind| state.policies.get(kind))
+                    .copied()
+                    != Some((child.replay_safe(), child.definition_version()))
+                    || child.owner() != &TaskOwner::Task(intent.parent.task.id())
                     || !child.is_fresh_admission()
                     || child.id().is_nil()
                     || child.is_background()
                     || child.is_task_tool()
+                    || (!intent.staged_parent
+                        && (intent
+                            .parent
+                            .task
+                            .kind()
+                            .and_then(|kind| state.policies.get(kind))
+                            .copied()
+                            != Some((
+                                intent.parent.task.replay_safe(),
+                                intent.parent.task.definition_version(),
+                            ))
+                            || intent.parent.task.state() != &TaskState::Running
+                            || intent.parent.task.abort_requested()
+                            || intent.parent.task.attempt_id().is_none()
+                            || intent.parent.task.is_task_tool()))
             })
-            || parent
-                .task
-                .kind()
-                .and_then(|kind| state.policies.get(kind))
-                .copied()
-                != Some((parent.task.replay_safe(), parent.task.definition_version()))
-            || parent.task.state() != &TaskState::Running
-            || parent.task.abort_requested()
-            || parent.task.attempt_id().is_none()
-            || parent.task.is_task_tool()
         {
             return Err(crate::runtime::Error::Invalid(
                 "invalid owned task admission".into(),
@@ -758,80 +767,143 @@ impl Shared {
                 "owned conversation child admission is unsupported".into(),
             ));
         }
-        let mut owner = parent.task.owner().clone();
-        let mut seen = std::collections::HashSet::from([parent.task.id()]);
-        loop {
-            match owner {
-                TaskOwner::Conversation(id) if id == conversation => break,
-                TaskOwner::Conversation(_) => {
-                    return Err(crate::runtime::Error::Invalid(
-                        "parent belongs to another conversation".into(),
-                    ));
-                }
-                TaskOwner::Task(id) => {
-                    if !seen.insert(id) {
-                        return Err(crate::runtime::Error::Invalid(
-                            "cyclic task ownership".into(),
-                        ));
-                    }
-                    let ancestor = tasks
-                        .load(id)
-                        .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
-                        .ok_or_else(|| {
-                            crate::runtime::Error::Invalid("missing parent ancestor".into())
-                        })?;
-                    if ancestor.task.abort_requested()
-                        || ancestor.task.is_terminal()
-                        || matches!(ancestor.task.state(), TaskState::CompletingFailed(_))
-                    {
-                        return Err(crate::runtime::Error::Invalid(
-                            "parent ancestor is closed or aborting".into(),
-                        ));
-                    }
-                    owner = ancestor.task.owner().clone();
-                }
-            }
-        }
-        if tasks
-            .load(parent.task.id())
-            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
-            .as_ref()
-            != Some(parent)
-            || crate::task_scheduler::pending_abort_root_for_running(
-                &tasks,
-                parent.task.id(),
-                false,
-            )
-            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
-            .is_some()
-        {
-            return Err(crate::runtime::Error::Invalid(
-                "parent attempt changed or is aborting".into(),
-            ));
-        }
-        let mut children = std::collections::HashMap::new();
-        for intent in intents.iter().filter(|intent| intent.creating) {
-            let child = &intent.child;
+        let mut candidates = std::collections::HashMap::new();
+        for task in roots.iter().chain(
+            intents
+                .iter()
+                .filter(|intent| intent.creating)
+                .map(|intent| &intent.child),
+        ) {
             if tasks
-                .load(child.id())
+                .load(task.id())
                 .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
                 .is_some()
-                || children.insert(child.id(), child).is_some()
+                || candidates.insert(task.id(), task).is_some()
             {
                 return Err(crate::runtime::Error::Invalid(
-                    "child task ID already exists".into(),
+                    "task ID already exists".into(),
                 ));
             }
         }
-        if !children.is_empty() {
-            let targets: Vec<_> = children.keys().copied().collect();
-            crate::task_scheduler::validate_wait_graph(
-                store,
-                parent.task.id(),
-                &targets,
-                &children,
-            )
+        for intent in intents {
+            let parent = &intent.parent;
+            if intent.staged_parent {
+                if candidates.get(&parent.task.id()).copied() != Some(&parent.task) {
+                    return Err(crate::runtime::Error::Invalid(
+                        "staged parent changed".into(),
+                    ));
+                }
+            } else {
+                let mut owner = parent.task.owner().clone();
+                let mut seen = std::collections::HashSet::from([parent.task.id()]);
+                loop {
+                    match owner {
+                        TaskOwner::Conversation(id) if id == conversation => break,
+                        TaskOwner::Conversation(_) => {
+                            return Err(crate::runtime::Error::Invalid(
+                                "parent belongs to another conversation".into(),
+                            ));
+                        }
+                        TaskOwner::Task(id) => {
+                            if !seen.insert(id) {
+                                return Err(crate::runtime::Error::Invalid(
+                                    "cyclic task ownership".into(),
+                                ));
+                            }
+                            let ancestor = tasks
+                                .load(id)
+                                .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+                                .ok_or_else(|| {
+                                    crate::runtime::Error::Invalid("missing parent ancestor".into())
+                                })?;
+                            if ancestor.task.abort_requested()
+                                || ancestor.task.is_terminal()
+                                || matches!(ancestor.task.state(), TaskState::CompletingFailed(_))
+                            {
+                                return Err(crate::runtime::Error::Invalid(
+                                    "parent ancestor is closed or aborting".into(),
+                                ));
+                            }
+                            owner = ancestor.task.owner().clone();
+                        }
+                    }
+                }
+                if tasks
+                    .load(parent.task.id())
+                    .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+                    .as_ref()
+                    != Some(parent)
+                    || crate::task_scheduler::pending_abort_root_for_running(
+                        &tasks,
+                        parent.task.id(),
+                        false,
+                    )
+                    .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+                    .is_some()
+                {
+                    return Err(crate::runtime::Error::Invalid(
+                        "parent attempt changed or is aborting".into(),
+                    ));
+                }
+            }
+            if intent.creating {
+                crate::task_scheduler::validate_wait_graph(
+                    store,
+                    parent.task.id(),
+                    &[intent.child.id()],
+                    &candidates,
+                )
+                .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?;
+            }
+        }
+        // A fresh ID can already have orphaned descendants in the store. Check
+        // every new owner, including roots, against those descendants too.
+        let stored = tasks
+            .list()
             .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?;
+        let edges = crate::ownership_edge::EdgeStore::new(store);
+        for owner in candidates.values() {
+            let mut targets: Vec<Uuid> = stored
+                .iter()
+                .map(|item| &item.task)
+                .chain(candidates.values().copied())
+                .filter(|child| {
+                    child.owner() == &TaskOwner::Task(owner.id()) && !child.is_background()
+                })
+                .map(|child| child.id())
+                .collect();
+            for edge in edges
+                .children(owner.id())
+                .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?
+            {
+                if edge.edge.task_owner != *owner.owner() {
+                    return Err(crate::runtime::Error::Invalid(
+                        "invalid owned conversation edge".into(),
+                    ));
+                }
+                if edge.edge.mode == crate::ownership_edge::Mode::Foreground {
+                    targets.extend(
+                        stored
+                            .iter()
+                            .map(|item| &item.task)
+                            .chain(candidates.values().copied())
+                            .filter(|child| {
+                                child.owner() == &TaskOwner::Conversation(edge.edge.child)
+                                    && !child.is_background()
+                            })
+                            .map(|child| child.id()),
+                    );
+                }
+            }
+            if !targets.is_empty() {
+                crate::task_scheduler::validate_wait_graph(
+                    store,
+                    owner.id(),
+                    &targets,
+                    &candidates,
+                )
+                .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))?;
+            }
         }
         let result = f(boundary);
         if result.is_ok() {

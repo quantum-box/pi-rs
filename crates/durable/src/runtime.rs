@@ -9082,7 +9082,7 @@ impl Harness {
                 .map_err(|_| ())
                 .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
             match driver {
-                Ok(Some(driver)) => driver.with_session_child(&children, id, |boundary| {
+                Ok(Some(driver)) => driver.with_session_child(&children, &tasks, id, |boundary| {
                     if !changed {
                         owner.store().commit_with_prefix_put_fence(
                             &documents.checks,
@@ -9172,7 +9172,7 @@ impl Harness {
                 .map_err(|_| ())
                 .map(|guard| guard.as_ref().and_then(|driver| driver.upgrade()));
             match driver {
-                Ok(Some(driver)) => driver.with_session_child(&children, id, |boundary| {
+                Ok(Some(driver)) => driver.with_session_child(&children, &tasks, id, |boundary| {
                     if !changed {
                         owner.store().commit_with_prefix_put_fence(
                             &documents.checks,
