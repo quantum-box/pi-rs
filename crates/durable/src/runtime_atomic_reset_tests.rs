@@ -1060,3 +1060,40 @@ fn repeated_atomic_failure_batches_keep_prior_fork_proofs() {
         third
     );
 }
+
+#[test]
+fn production_replays_nothing_to_answer_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, steps) = setup(&path);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "replacement".into()).unwrap();
+    let (mut checkpoint, version) = h.load(id).unwrap();
+    let occurrence = checkpoint.pending_reset_blocks[&steps[0].reset_id][0].message_id;
+    checkpoint.messages.push(Message::Assistant {
+        content: "already answered".into(),
+        calls: vec![],
+        replay: None,
+    });
+    checkpoint.phase = Phase::ModelReady { turns: 0 };
+    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(
+        &mut failure,
+        "nothing_to_answer".into(),
+        FailureCause::NothingToAnswer,
+    );
+    h.save(&failure, Expected::Version(version)).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(
+        h.conversation(id).unwrap().run_failure.unwrap().reason,
+        "nothing_to_answer"
+    );
+    let fork = h.fork_by_entry_id(id, occurrence).unwrap();
+    assert_eq!(
+        h.conversation(fork).unwrap().resets[0].id,
+        steps[0].reset_id
+    );
+}
