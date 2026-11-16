@@ -821,3 +821,91 @@ async fn queued_fitted_input_survives_scheduler_shutdown_and_recovery() {
             .any(|b| b.blocks[0]["data"] == "bmV3")
     );
 }
+
+#[tokio::test]
+async fn fitted_input_notification_survives_reopen_and_withdrawal() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        runtime::{AdmissionOptions, SubmissionNotify, WithdrawResult, submission_settled_signal},
+        task::{Checkpoint, Task, TaskOwner},
+        task_store::{Save, TaskStore},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let adapter = Arc::new(Adapter::default());
+    let processor = Arc::new(Processor::default());
+    let fit = UserImageAdmission::new(processor.clone());
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter.clone()).unwrap();
+    let conversation = h.create_conversation(config("first")).unwrap();
+    h.select_provider_adapter(conversation, true).unwrap();
+    let task = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(conversation),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap();
+    let store = Store::open(&path).unwrap();
+    TaskStore::new(&store).save(&[Save::Create(&task)]).unwrap();
+    drop(store);
+    h.submit(conversation, None, "active".into()).unwrap();
+    let notify = SubmissionNotify {
+        task_id: task.id(),
+        key: "image".into(),
+    };
+    let result = h
+        .submit_fitted_user_blocks_with_notification(
+            conversation,
+            Some("image-request".into()),
+            vec![image_block()],
+            &fit,
+            AdmissionOptions::default(),
+            notify.clone(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.install_provider_adapter(adapter).unwrap();
+    assert_eq!(
+        h.conversation(conversation)
+            .unwrap()
+            .submission_notification(result.submission_id),
+        Some(&notify)
+    );
+    let duplicate = h
+        .submit_fitted_user_blocks_with_notification(
+            conversation,
+            Some("image-request".into()),
+            vec![image_block()],
+            &fit,
+            AdmissionOptions::default(),
+            SubmissionNotify {
+                task_id: Uuid::new_v4(),
+                key: "other".into(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate, result);
+    assert_eq!(processor.0.lock().unwrap().len(), 1);
+    assert_eq!(
+        h.withdraw_submission(conversation, result.submission_id)
+            .unwrap(),
+        WithdrawResult::Aborted
+    );
+    drop(h);
+    let store = Store::open(&path).unwrap();
+    let value = TaskStore::new(&store)
+        .read_typed_signal(task.id(), &submission_settled_signal(), "image")
+        .unwrap()
+        .unwrap();
+    assert_eq!(value["id"], json!(result.submission_id));
+    assert_eq!(value["reason"], "aborted");
+}

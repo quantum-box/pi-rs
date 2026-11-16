@@ -8188,6 +8188,43 @@ impl Harness {
         options: AdmissionOptions,
         cancel: &CancellationToken,
     ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        self.submit_fitted_user_blocks_inner(
+            id, request_id, blocks, admission, options, None, cancel,
+        )
+        .await
+    }
+    /// Fit and admit input blocks with a durable task settlement notification.
+    pub async fn submit_fitted_user_blocks_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        options: AdmissionOptions,
+        notify: SubmissionNotify,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        self.submit_fitted_user_blocks_inner(
+            id,
+            request_id,
+            blocks,
+            admission,
+            options,
+            Some(notify),
+            cancel,
+        )
+        .await
+    }
+    async fn submit_fitted_user_blocks_inner(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        options: AdmissionOptions,
+        notify: Option<SubmissionNotify>,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
         if request_id
             .as_deref()
             .is_some_and(|id| id.starts_with(crate::subagent::REPORT_REQUEST_PREFIX))
@@ -8222,6 +8259,9 @@ impl Harness {
                     notes: existing.image_notes.clone(),
                 });
             }
+        }
+        if notify.as_ref().is_some_and(|n| n.key.is_empty()) {
+            return Err(Error::Invalid("empty submission notification key".into()));
         }
         let busy = state.active.is_some()
             || matches!(
@@ -8319,6 +8359,9 @@ impl Harness {
                 Status::Queued
             },
         });
+        if let Some(notify) = notify {
+            state.submission_notifications.insert(sid, notify);
+        }
         state.input_modes.insert(sid, options.mode);
         if place_now {
             state.active = Some(sid);
@@ -14981,6 +15024,26 @@ impl Scheduler {
             .harness
             .submit_fitted_user_blocks_with_options(
                 id, request_id, blocks, admission, options, cancel,
+            )
+            .await?;
+        self.schedule(id);
+        Ok(result)
+    }
+    /// Fit input blocks with a task notification and schedule the conversation.
+    pub async fn submit_fitted_user_blocks_with_notification(
+        &mut self,
+        id: Uuid,
+        request_id: Option<String>,
+        blocks: Vec<serde_json::Value>,
+        admission: &crate::images::UserImageAdmission,
+        options: AdmissionOptions,
+        notify: SubmissionNotify,
+        cancel: &CancellationToken,
+    ) -> Result<crate::images::ImageAdmissionResult, Error> {
+        let result = self
+            .harness
+            .submit_fitted_user_blocks_with_notification(
+                id, request_id, blocks, admission, options, notify, cancel,
             )
             .await?;
         self.schedule(id);
