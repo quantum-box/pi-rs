@@ -1469,7 +1469,7 @@ impl Scheduler {
         &mut self,
         pending: PendingSettlement,
     ) -> Result<bool, SettlementError> {
-        let (mut lease, mut failure, conflict) = match pending {
+        let (mut lease, mut failure, mut conflict) = match pending {
             PendingSettlement::Failure { lease, settlement } => (lease, Some(settlement), None),
             PendingSettlement::PreparationConflict { lease, conflict } => {
                 (lease, None, Some(conflict))
@@ -1559,12 +1559,17 @@ impl Scheduler {
                     self.ts().update(&current, |task| task.yield_ready())?;
                     return Ok(true);
                 }
-                if current.version != running.version {
+                if current.task != running.task {
                     rejected = true;
                     return Err(task_store::Error::Store(durable_store::Error::Conflict {
                         key: task_store::key(lease.id),
                     })
                     .into());
+                }
+                if let Some(ref mut settlement) = failure {
+                    settlement.running = current.clone();
+                } else if let Some(ref mut conflict) = conflict {
+                    conflict.running = current.clone();
                 }
                 if failure.is_none() {
                     if let Some(root) = pending_abort_root_for_running(
@@ -1574,7 +1579,7 @@ impl Scheduler {
                     )? {
                         return Err(Error::PendingAbort(root));
                     }
-                    if running.task.replay_safe() && self.registered(&running.task)?.replay_safe {
+                    if current.task.replay_safe() && self.registered(&current.task)?.replay_safe {
                         self.ts().update(&current, |task| task.yield_ready())?;
                         return Ok(true);
                     }
@@ -3400,12 +3405,22 @@ impl Scheduler {
                 .store()
                 .put_version()
                 .map_err(task_store::Error::from)?;
-            if settlement.check_pending
-                && let Some(current) = store.load(settlement.running.task.id())?
-                && current.version != settlement.running.version
-                && current.task.abort_requested()
-            {
-                return Err(Error::PendingAbort(settlement.running.task.id()));
+            if settlement.check_pending {
+                let current = store
+                    .load(settlement.running.task.id())?
+                    .ok_or(Error::Ownership)?;
+                if current.version != settlement.running.version {
+                    if current.task.abort_requested() {
+                        return Err(Error::PendingAbort(settlement.running.task.id()));
+                    }
+                    if current.task != settlement.running.task {
+                        return Err(task_store::Error::Store(durable_store::Error::Conflict {
+                            key: task_store::key(settlement.running.task.id()),
+                        })
+                        .into());
+                    }
+                    settlement.running = current;
+                }
             }
             if settlement.check_pending
                 && let Some(root) = pending_abort_root_for_running(
@@ -3464,20 +3479,30 @@ impl Scheduler {
                     if settlement.attempt < 31
                         && (key == task_store::PREFIX
                             || key == crate::ownership_edge::PREFIX
-                            || key == b"runtime/conversation/") =>
+                            || key == b"runtime/conversation/"
+                            || (settlement.check_pending
+                                && *key == task_store::key(settlement.running.task.id()))) =>
                 {
                     let current = store.load(settlement.running.task.id())?;
                     if current.as_ref().map(|item| item.version) != Some(settlement.running.version)
                     {
-                        if settlement.check_pending
-                            && current.is_some_and(|item| item.task.abort_requested())
-                        {
-                            return Err(Error::PendingAbort(settlement.running.task.id()));
+                        if let Some(current) = current {
+                            if settlement.check_pending && current.task.abort_requested() {
+                                return Err(Error::PendingAbort(settlement.running.task.id()));
+                            }
+                            if settlement.check_pending && current.task == settlement.running.task {
+                                settlement.running = current;
+                            } else {
+                                return Err(task_store::Error::Store(
+                                    durable_store::Error::Conflict {
+                                        key: task_store::key(settlement.running.task.id()),
+                                    },
+                                )
+                                .into());
+                            }
+                        } else {
+                            return Err(Error::Ownership);
                         }
-                        return Err(task_store::Error::Store(durable_store::Error::Conflict {
-                            key: task_store::key(settlement.running.task.id()),
-                        })
-                        .into());
                     }
                     settlement.attempt += 1;
                     continue;
@@ -4079,8 +4104,16 @@ mod tests {
             "before",
             "prepare_conflict",
             "prepare_conflict_stale",
+            "prepare_conflict_stale_rewrite",
+            "prepare_conflict_direct_abort",
+            "prepare_conflict_ancestor_abort",
+            "prepare_conflict_changed",
             "failure",
             "failure_stale",
+            "failure_stale_rewrite",
+            "failure_direct_abort",
+            "failure_ancestor_abort",
+            "failure_changed",
             "preparation",
             "commit",
             "stale",
@@ -4227,18 +4260,20 @@ mod tests {
                     PendingSettlement::Unprepared(*completed)
                 }
                 Err(SettlementError::PendingPrepared { pending })
-                    if matches!(
-                        timing,
-                        "commit"
-                            | "stale"
-                            | "stale_doc"
-                            | "stale_signal"
-                            | "poison_prepared"
-                            | "prepare_conflict"
-                            | "prepare_conflict_stale"
-                            | "failure"
-                            | "failure_stale"
-                    ) =>
+                    if timing.starts_with("prepare_conflict")
+                        || timing.starts_with("failure")
+                        || matches!(
+                            timing,
+                            "commit"
+                                | "stale"
+                                | "stale_doc"
+                                | "stale_signal"
+                                | "poison_prepared"
+                                | "prepare_conflict"
+                                | "prepare_conflict_stale"
+                                | "failure"
+                                | "failure_stale"
+                        ) =>
                 {
                     *pending
                 }
@@ -4324,10 +4359,10 @@ mod tests {
                 drop(pending);
                 continue;
             }
-            if matches!(
-                timing,
-                "stale" | "stale_doc" | "stale_signal" | "prepare_conflict_stale" | "failure_stale"
-            ) {
+            if matches!(timing, "stale" | "stale_doc" | "stale_signal")
+                || timing.contains("_stale")
+                || timing.ends_with("_changed")
+            {
                 // Simulate an external graph rewrite after conflict discovery.
                 let _gate = owner.task_gate().lock().unwrap();
                 let current = scheduler.ts().load(sibling.id()).unwrap().unwrap();
@@ -4336,6 +4371,29 @@ mod tests {
                     .update(&current, |task| {
                         *task = sibling.clone();
                         Ok(())
+                    })
+                    .unwrap();
+            }
+            if timing.ends_with("_rewrite") {
+                let current = scheduler.ts().load(child.id()).unwrap().unwrap();
+                scheduler.ts().update(&current, |_| Ok(())).unwrap();
+                let rewritten = scheduler.ts().load(child.id()).unwrap().unwrap();
+                assert_ne!(rewritten.version, current.version);
+                assert_eq!(rewritten.task, current.task);
+            }
+            if timing.ends_with("_direct_abort") {
+                request_abort_subtree(&scheduler.ts(), child.id()).unwrap();
+            }
+            if timing.ends_with("_ancestor_abort") {
+                request_abort_subtree(&scheduler.ts(), parent.id()).unwrap();
+            }
+            if timing.ends_with("_changed") {
+                let current = scheduler.ts().load(child.id()).unwrap().unwrap();
+                scheduler
+                    .ts()
+                    .update(&current, |task| {
+                        task.recover()?;
+                        task.start_attempt(Uuid::from_u128(888))
                     })
                     .unwrap();
             }
@@ -4366,18 +4424,44 @@ mod tests {
             assert!(!pending.try_cleanup(&mut cleanup_worker).unwrap());
             drop(failure_guard);
             assert!(pending.try_cleanup(&mut cleanup_worker).unwrap());
+            if timing.ends_with("_changed") {
+                let result = scheduler.try_resume_pending(pending);
+                let Err(SettlementError::RejectedPrepared { pending, .. }) = result else {
+                    panic!("changed attempt must remain owned and rejected");
+                };
+                assert!(
+                    scheduler
+                        .live_invocations
+                        .lock()
+                        .unwrap()
+                        .attempts
+                        .contains(&child.id())
+                );
+                assert_eq!(
+                    scheduler
+                        .ts()
+                        .load(child.id())
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .attempt_id(),
+                    Some(Uuid::from_u128(888))
+                );
+                drop(pending);
+                continue;
+            }
             scheduler.try_resume_pending(pending).unwrap();
             let child = scheduler.ts().load(child.id()).unwrap().unwrap().task;
             if timing == "stale" {
                 assert_eq!(child.state(), &TaskState::Completing(json!("discard")));
                 assert!(!child.abort_requested());
-            } else if timing == "failure_stale" {
+            } else if timing.starts_with("failure_stale") {
                 assert!(
                     matches!(child.state(), TaskState::Failed(reason) if reason == "retained failure")
                 );
             } else if timing == "stale_doc"
                 || timing == "stale_signal"
-                || timing == "prepare_conflict_stale"
+                || timing.starts_with("prepare_conflict_stale")
             {
                 assert!(
                     matches!(child.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
@@ -6365,7 +6449,10 @@ mod tests {
             observed.fetch_add(1, Ordering::SeqCst);
             if iteration == 0 {
                 let child = task(2, TaskOwner::Task(Uuid::from_u128(1)), "child", false, 3);
-                TaskStore::new(store).save(&[Save::Create(&child)]).unwrap();
+                let tasks = TaskStore::new(store);
+                tasks.save(&[Save::Create(&child)]).unwrap();
+                let current = tasks.load(Uuid::from_u128(1)).unwrap().unwrap();
+                tasks.update(&current, |_| Ok(())).unwrap();
             }
         }));
         scheduler.tick(0).unwrap();
