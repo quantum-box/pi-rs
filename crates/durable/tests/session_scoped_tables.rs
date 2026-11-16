@@ -6,7 +6,7 @@ use pi_rs_durable::{
     recovery::UncertainPolicy,
     runtime::{Config, Harness, Options, SubmissionNotify, submission_settled_signal},
     task::{Checkpoint, Task, TaskOwner},
-    task_store::TaskStore,
+    task_store::{SignalResult, SignalToken, TaskStore},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -77,7 +77,15 @@ fn scoped_reads_admission_task_creation_and_notification_commit_together() {
     let write_id = h
         .session_transaction(id, |tx| {
             assert_eq!(tx.conversation()?.id, id);
-            assert!(tx.task(task_id)?.is_none());
+            assert_eq!(
+                tx.signal(
+                    task_id,
+                    &SignalToken::new("wake", 1).unwrap(),
+                    "missing",
+                    json!(1)
+                )?,
+                SignalResult::NotFound
+            );
             assert!(tx.entry(Uuid::new_v4())?.is_none());
             assert!(tx.submission(Uuid::new_v4())?.is_none());
             assert!(tx.submission_by_request("absent")?.is_none());
@@ -91,11 +99,19 @@ fn scoped_reads_admission_task_creation_and_notification_commit_together() {
                 }),
             )?;
             tx.create_task(task(task_id, id).registered("worker".into(), true))?;
+            let preview: Vec<_> = tx.entries();
+            assert_eq!(
+                preview.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+                vec![write]
+            );
             assert!(matches!(
                 tx.conversation(),
                 Err(DocumentError::ReadAfterWrite)
             ));
-            assert!(matches!(tx.entries(), Err(DocumentError::ReadAfterWrite)));
+            assert!(matches!(
+                tx.checked_entries(),
+                Err(DocumentError::ReadAfterWrite)
+            ));
             assert!(matches!(
                 tx.submission_by_request("absent"),
                 Err(DocumentError::ReadAfterWrite)
@@ -130,6 +146,73 @@ fn scoped_reads_admission_task_creation_and_notification_commit_together() {
             .unwrap()["id"],
         json!(write_id)
     );
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(task_id, &SignalToken::new("wake", 1).unwrap(), "missing")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn missing_signal_then_create_rejects_intervening_create_delete() {
+    use pi_rs_durable::runtime::Error;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h.create_conversation(config()).unwrap();
+    let mut registry = pi_rs_durable::task_scheduler::Registry::default();
+    registry.register("worker", true, |_: &Task| {
+        Ok(pi_rs_durable::task_scheduler::Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "wait".into(),
+                data: json!(null),
+            },
+            condition: pi_rs_durable::task::WaitFor::Signal("never".into()),
+            children: vec![],
+        })
+    });
+    let driver = h.start_tasks(registry).unwrap();
+    let store = Store::open(&path).unwrap();
+    let target = Uuid::new_v4();
+    let result = h.session_transaction(id, |tx| {
+        assert_eq!(
+            tx.signal(
+                target,
+                &SignalToken::new("wake", 1).unwrap(),
+                "missing",
+                json!(1)
+            )?,
+            SignalResult::NotFound
+        );
+        let mut key = b"durable/task/".to_vec();
+        key.extend_from_slice(target.as_bytes());
+        store.commit(
+            &[],
+            &[Mutation::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&task(target, id))?,
+            }],
+        )?;
+        store.commit(&[], &[Mutation::Delete { key }])?;
+        tx.create_task(task(target, id).registered("worker".into(), true))?;
+        tx.append_entry("note", None)?;
+        tx.put_document(&address(), json!({"x":1}).as_object().unwrap().clone())?;
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
+    assert!(TaskStore::new(&store).load(target).unwrap().is_none());
+    assert!(
+        pi_rs_durable::document::Documents::new(&store)
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    driver.shutdown().unwrap();
 }
 
 #[test]
@@ -421,7 +504,7 @@ fn submission_reads_are_scoped_and_close_after_entry_write() {
     h.session_transaction(id, |tx| {
         assert_eq!(tx.submission(submission)?.unwrap().id, submission);
         assert_eq!(tx.submission_by_request("request")?.unwrap().id, submission);
-        assert!(tx.entries()?.is_empty());
+        assert!(tx.checked_entries()?.is_empty());
         tx.append_entry("note", None)?;
         assert!(matches!(
             tx.submission(submission),

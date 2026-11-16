@@ -220,25 +220,35 @@ impl<'a> SessionTransaction<'a> {
         if self.table_written {
             return Err(Error::ReadAfterWrite);
         }
+        let boundary = self.store.put_version()?;
         let result = self
             .signals
             .signal_at(task_id, token, key, value, (self.clock)())?;
+        if result == crate::task_store::SignalResult::NotFound {
+            self.task_reads
+                .entry(task_id)
+                .or_insert((Expected::MissingUnchangedSince(boundary), None));
+        }
         if self.signals.has_signal_mutations() {
             self.table_written = true;
         }
         Ok(result)
     }
 
-    /// Read placed application writes before the first table write.
-    pub fn entries(&self) -> Result<Vec<ApplicationWrite>, Error> {
-        self.check_table_read()?;
-        Ok(self
-            .state
+    /// Preview placed application writes, including entries staged in this transaction.
+    pub fn entries(&self) -> Vec<ApplicationWrite> {
+        self.state
             .application_writes
             .iter()
             .filter(|entry| entry.placed && !entry.withdrawn)
             .cloned()
-            .collect())
+            .collect()
+    }
+
+    /// Read placed application writes under the table read-before-write rule.
+    pub fn checked_entries(&self) -> Result<Vec<ApplicationWrite>, Error> {
+        self.check_table_read()?;
+        Ok(self.entries())
     }
 
     /// Append a display-only application entry. The ID is provisional until commit.
@@ -338,7 +348,7 @@ impl<'a> SessionTransaction<'a> {
                 });
             }
         }
-        self.signals.append(batch)?;
+        self.signals.append_session_candidate(batch, &self.tasks)?;
         Ok((self.state, self.signals.into_batch()?, changed, self.tasks))
     }
 }

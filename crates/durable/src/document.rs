@@ -1410,6 +1410,8 @@ pub struct HostTransaction<'a> {
     store: &'a Store,
     transaction: Transaction,
     signal_targets: HashSet<Vec<u8>>,
+    missing_signal_targets: HashSet<Vec<u8>>,
+    effect_signal_targets: HashSet<Vec<u8>>,
     wake_targets: HashSet<Vec<u8>>,
     signals: StagedSignals,
 }
@@ -1419,6 +1421,8 @@ impl<'a> HostTransaction<'a> {
             store,
             transaction: Transaction::new(),
             signal_targets: HashSet::new(),
+            missing_signal_targets: HashSet::new(),
+            effect_signal_targets: HashSet::new(),
             wake_targets: HashSet::new(),
             signals: StagedSignals::new(),
         }
@@ -1446,6 +1450,39 @@ impl<'a> HostTransaction<'a> {
                 || key.starts_with(b"durable/signal-revision/")
         }) {
             return Err(Error::InvalidBatch);
+        }
+        self.transaction.append(batch)
+    }
+
+    /// Compose session task creations after a no-op signal observed the same
+    /// target missing. All other post-signal task mutations remain forbidden.
+    pub(crate) fn append_session_candidate(
+        &mut self,
+        batch: OwnedBatch,
+        created: &[crate::task::Task],
+    ) -> Result<(), Error> {
+        for mutation in &batch.mutations {
+            let key = match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+            };
+            if key.starts_with(b"durable/signal/") || key.starts_with(b"durable/signal-revision/") {
+                return Err(Error::InvalidBatch);
+            }
+            if self.signal_targets.contains(key) {
+                let allowed = matches!(mutation, Mutation::Put { .. })
+                    && self.missing_signal_targets.contains(key)
+                    && !self.wake_targets.contains(key)
+                    && created
+                        .iter()
+                        .any(|task| crate::task_store::key(task.id()) == *key)
+                    && batch.checks.iter().any(|check| {
+                        check.key == *key
+                            && matches!(check.expected, Expected::MissingUnchangedSince(_))
+                    });
+                if !allowed {
+                    return Err(Error::InvalidBatch);
+                }
+            }
         }
         self.transaction.append(batch)
     }
@@ -1514,9 +1551,20 @@ impl<'a> HostTransaction<'a> {
             })
             .transpose()?;
         let mutations = self.signals.batch.mutations.clone();
+        let previous_mutations = self.signals.batch.mutations.len();
         let result = self.signals.signal_at_overlay(
             self.store, task_id, token, key, value, now_millis, None, candidate, &mutations,
         )?;
+        if self.signals.batch.mutations.len() != previous_mutations {
+            self.effect_signal_targets.insert(target.clone());
+        }
+        if result == crate::task_store::SignalResult::NotFound
+            && !self.effect_signal_targets.contains(&target)
+        {
+            self.missing_signal_targets.insert(target.clone());
+        } else {
+            self.missing_signal_targets.remove(&target);
+        }
         self.signal_targets.insert(target);
         Ok(result)
     }
