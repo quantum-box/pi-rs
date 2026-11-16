@@ -620,6 +620,7 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
                         || (next_bytes.starts_with(b"-") && !allow_hyphen)
                         || (unknown_long
                             && (next_bytes.starts_with(b"@")
+                                || next.to_str().is_none()
                                 || (!saw_message && root.find_subcommand(next).is_some()))))
                 {
                     break;
@@ -964,6 +965,20 @@ mod tests {
         let plan = export_plan(&args).unwrap();
         assert_eq!(plan.input.as_os_str(), input);
         assert_eq!(plan.output.unwrap().as_os_str(), output);
+        let args = vec![
+            "pi".into(),
+            "--custom".into(),
+            output.clone(),
+            "--export".into(),
+            input.clone(),
+        ];
+        let plan = export_plan(&args).unwrap();
+        assert_eq!(plan.output.unwrap().as_os_str(), output);
+        let (_, flags) = parse(plan.validation_args).unwrap();
+        assert_eq!(
+            flags.get("custom"),
+            Some(&ExtensionFlagValue::Boolean(true))
+        );
     }
 
     #[test]
