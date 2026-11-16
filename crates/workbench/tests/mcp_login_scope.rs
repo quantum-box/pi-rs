@@ -65,7 +65,8 @@ fn list_waits_for_login_configuration_finalization() {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.path().join("mcp-config-gate.lock"))
+        // The production guard takes the legacy lock for the config it reads.
+        .open(root.path().join("mcp.lock"))
         .unwrap();
     gate.lock().unwrap();
     let config = root.path().join("mcp.json");
@@ -121,7 +122,7 @@ fn login_deadline_includes_wait_for_initial_configuration_snapshot() {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.path().join("mcp-config-gate.lock"))
+        .open(root.path().join("mcp.lock"))
         .unwrap();
     gate.lock().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))

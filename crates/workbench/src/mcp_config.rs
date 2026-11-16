@@ -1301,14 +1301,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 deadline,
                 &args.mcp_login_cancel,
                 announce,
-                move |credential_lock| async move {
-                    pi_rs_workbench::mcp_shared_gate::acquire_config_guard(
-                        &guard_paths,
-                        Some(&credential_lock),
-                        false,
-                    )
-                    .await
-                },
+                guard_paths,
                 move |_| {
                     finish_login(
                         &finish_user_path,

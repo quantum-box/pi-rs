@@ -2,11 +2,9 @@
 //!
 //! Hold the returned guard until the protected operation finishes. Never
 //! unlink, rename, or replace the underlying gate while it may be in use.
-use std::{
-    fs::File,
-    io,
-    path::{Path, PathBuf},
-};
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use std::path::Path;
+use std::{fs::File, io, path::PathBuf};
 
 /// Open the stable, per-OS-account gate without consulting HOME or PI_RS_HOME.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -280,6 +278,16 @@ pub(crate) async fn acquire_for_test(
     credential: Option<&File>,
 ) -> io::Result<AccountGuard> {
     acquire_checked(open_in_profile(profile)?, credential).await
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn acquire_config_guard_for_test(
+    profile: &Path,
+    paths: &[PathBuf],
+    credential: Option<&File>,
+) -> pi_rs::Result<ConfigGuard> {
+    let account = acquire_for_test(profile, credential).await?;
+    account_guard_with(account, paths, credential, false).await
 }
 
 #[cfg(windows)]

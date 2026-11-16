@@ -1099,10 +1099,39 @@ where
 /// Undo a configuration change while its caller still holds the write guard.
 pub type LoginConfigRollback = Box<dyn FnOnce() -> Result<()> + Send>;
 
-/// Prepare OAuth credentials, acquire the caller's guard within the deadline,
-/// then validate/update its configuration and save credentials under that guard.
+async fn deadline_login_with_config_guard<F, P, PFut, C>(
+    deadline: tokio::time::Instant,
+    staged: Staging,
+    cancellation: &pi_rs::CancellationToken,
+    prepare: F,
+    acquire: P,
+    update_config: C,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    P: FnOnce(Arc<std::fs::File>) -> PFut,
+    PFut: std::future::Future<Output = Result<crate::mcp_shared_gate::ConfigGuard>>,
+    C: FnOnce(&crate::mcp_shared_gate::ConfigGuard) -> Result<Option<LoginConfigRollback>>
+        + Send
+        + 'static,
+{
+    deadline_login_with_precommit(
+        deadline,
+        staged,
+        cancellation,
+        prepare,
+        acquire,
+        |store, credentials, guard| {
+            commit_login_transaction(store, credentials, guard, update_config)
+        },
+    )
+    .await
+}
+
+/// Prepare OAuth credentials, acquire the configuration guard within the
+/// deadline, then validate/update configuration and save under that guard.
 #[allow(clippy::too_many_arguments)]
-pub async fn login_cli_with_precommit<G, P, PFut, C>(
+pub async fn login_cli_with_precommit<C>(
     name: &str,
     url: &str,
     client: CliLoginClient<'_>,
@@ -1111,14 +1140,13 @@ pub async fn login_cli_with_precommit<G, P, PFut, C>(
     deadline: tokio::time::Instant,
     cancellation: &pi_rs::CancellationToken,
     announce: impl Fn(&str),
-    precommit: P,
+    config_paths: Vec<PathBuf>,
     update_config: C,
 ) -> Result<()>
 where
-    G: Send + 'static,
-    P: FnOnce(Arc<std::fs::File>) -> PFut,
-    PFut: std::future::Future<Output = Result<G>>,
-    C: FnOnce(&G) -> Result<Option<LoginConfigRollback>> + Send + 'static,
+    C: FnOnce(&crate::mcp_shared_gate::ConfigGuard) -> Result<Option<LoginConfigRollback>>
+        + Send
+        + 'static,
 {
     let staged = Staging::default();
     let prepare = async {
@@ -1170,15 +1198,20 @@ where
             }
         }
     };
-    deadline_login_with_precommit(
+    deadline_login_with_config_guard(
         deadline,
         staged.clone(),
         cancellation,
         prepare,
-        precommit,
-        |store, credentials, guard| {
-            commit_login_transaction(store, credentials, guard, update_config)
+        move |credential_lock| async move {
+            crate::mcp_shared_gate::acquire_config_guard(
+                &config_paths,
+                Some(&credential_lock),
+                false,
+            )
+            .await
         },
+        update_config,
     )
     .await
 }
@@ -1904,6 +1937,312 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fixture_profile(root: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let profile = root.join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        profile
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn config_precommit_revalidates_after_wait_before_credential_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let profile = fixture_profile(root.path());
+        let config = root.path().join("mcp.json");
+        let credential = root.path().join("credentials.json");
+        std::fs::write(&config, "original").unwrap();
+        std::fs::write(&credential, "old credentials").unwrap();
+        let held = crate::mcp_shared_gate::acquire_config_guard_for_test(
+            &profile,
+            std::slice::from_ref(&config),
+            None,
+        )
+        .await
+        .unwrap();
+        let (store, staged) = staged_fixture(credential.clone());
+        let task_profile = profile.clone();
+        let task_config = config.clone();
+        let read_config = config.clone();
+        let checked = Arc::new(AtomicBool::new(false));
+        let observed = checked.clone();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let login = tokio::spawn(async move {
+            deadline_login_with_config_guard(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move { stage_fixture(&store).await },
+                move |lock| async move {
+                    let mut gate = Box::pin(crate::mcp_shared_gate::acquire_config_guard_for_test(
+                        &task_profile,
+                        std::slice::from_ref(&task_config),
+                        Some(&lock),
+                    ));
+                    assert!(futures_util::poll!(gate.as_mut()).is_pending());
+                    let _ = waiting_tx.send(());
+                    gate.await
+                },
+                move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    if std::fs::read_to_string(&read_config)? != "original" {
+                        return Err(Error::Config("configuration changed".into()));
+                    }
+                    Ok(None)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(&config, "changed").unwrap();
+        drop(held);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), login)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message == "configuration changed"));
+        assert!(checked.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read_to_string(&credential).unwrap(),
+            "old credentials"
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "changed");
+        let _next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::mcp_shared_gate::acquire_config_guard_for_test(&profile, &[config], None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(credential.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn config_precommit_rejects_held_credential_lock_alias() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let profile = fixture_profile(root.path());
+        let config = root.path().join("mcp.json");
+        let credential = root.path().join("credentials.json");
+        std::fs::write(&credential, "old credentials").unwrap();
+        std::fs::write(credential.with_extension("lock"), "").unwrap();
+        std::fs::hard_link(
+            credential.with_extension("lock"),
+            config.with_extension("lock"),
+        )
+        .unwrap();
+        let (store, staged) = staged_fixture(credential.clone());
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            deadline_login_with_config_guard(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move { stage_fixture(&store).await },
+                move |lock| async move {
+                    crate::mcp_shared_gate::acquire_config_guard_for_test(
+                        &profile,
+                        &[config],
+                        Some(&lock),
+                    )
+                    .await
+                },
+                move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(None)
+                },
+            ),
+        )
+        .await
+        .expect("credential alias must not deadlock");
+        assert!(matches!(result, Err(Error::Config(message)) if message.contains("same file")));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read_to_string(credential).unwrap(),
+            "old credentials"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn config_precommit_cancel_wait_releases_credential_without_writing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let profile = fixture_profile(root.path());
+        let config = root.path().join("mcp.json");
+        let credential = root.path().join("credentials.json");
+        std::fs::write(&credential, "old credentials").unwrap();
+        let held = crate::mcp_shared_gate::acquire_config_guard_for_test(
+            &profile,
+            std::slice::from_ref(&config),
+            None,
+        )
+        .await
+        .unwrap();
+        let (store, staged) = staged_fixture(credential.clone());
+        let task_profile = profile.clone();
+        let task_config = config.clone();
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let cancel = pi_rs::CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let login = tokio::spawn(async move {
+            deadline_login_with_config_guard(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                staged,
+                &child_cancel,
+                async move { stage_fixture(&store).await },
+                move |lock| async move {
+                    let mut gate = Box::pin(crate::mcp_shared_gate::acquire_config_guard_for_test(
+                        &task_profile,
+                        std::slice::from_ref(&task_config),
+                        Some(&lock),
+                    ));
+                    assert!(futures_util::poll!(gate.as_mut()).is_pending());
+                    let _ = waiting_tx.send(());
+                    gate.await
+                },
+                move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(None)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), login)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(Error::Cancelled)
+        ));
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::mcp_shared_gate::acquire_config_guard_for_test(&profile, &[config], None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(next);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(credential.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read_to_string(&credential).unwrap(),
+            "old credentials"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn config_precommit_started_worker_retains_all_locks_after_caller_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = fixture_profile(root.path());
+        let config = root.path().join("mcp.json");
+        let credential = root.path().join("credentials.json");
+        let (store, staged) = staged_fixture(credential.clone());
+        let task_profile = profile.clone();
+        let task_config = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let login = tokio::spawn(async move {
+            deadline_login_with_config_guard(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                staged,
+                &pi_rs::CancellationToken::new(),
+                async move { stage_fixture(&store).await },
+                move |lock| async move {
+                    crate::mcp_shared_gate::acquire_config_guard_for_test(
+                        &task_profile,
+                        &[task_config],
+                        Some(&lock),
+                    )
+                    .await
+                },
+                move |_| {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .map_err(|_| Error::Config("fixture timed out".into()))?;
+                    Ok(None)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        login.abort();
+        assert!(login.await.unwrap_err().is_cancelled());
+        let open_lock = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+        };
+        let account = open_lock(&profile.join(".pi-rs-shared/mcp-config-gate.lock"));
+        let target = open_lock(&config.with_extension("lock"));
+        let credentials = open_lock(&credential.with_extension("lock"));
+        for lock in [&account, &target, &credentials] {
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
+        release_tx.send(()).unwrap();
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::mcp_shared_gate::acquire_config_guard_for_test(&profile, &[config], None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(next);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match credentials.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("credential lock failed: {error:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let saved: Envelope = serde_json::from_slice(&std::fs::read(credential).unwrap()).unwrap();
+        assert_eq!(saved.credentials.client_id, "fixture");
     }
 
     #[tokio::test]
