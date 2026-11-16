@@ -1,11 +1,12 @@
-//! Windows-only checks for the unconnected experimental per-account mutex.
-//! Tests use a random name, never the user's fixed production mutex name.
-#![cfg(windows)]
+//! Checks for the unconnected experimental per-account gate.
+//! Windows tests use a random name, never the user's fixed production mutex.
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
 #![allow(dead_code)]
 
 #[path = "../src/mcp_shared_gate.rs"]
 mod mcp_shared_gate;
 
+#[cfg(windows)]
 #[tokio::test]
 async fn mutex_serializes_tasks_and_cancelled_waiter_exits_while_first_is_held() {
     use mcp_shared_gate::windows_mutex::{WorkerHooks, acquire_named_for_test};
