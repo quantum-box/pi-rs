@@ -310,6 +310,21 @@ struct InvocationState {
     published: std::collections::VecDeque<(Uuid, bool)>,
 }
 
+// A stored Running state alone can be an interrupted invocation after reopen.
+// Only the scheduler that owns its still-unpublished lease may dispatch below it.
+fn live_task_tool_parent(task: &Task, invocations: &Mutex<InvocationState>) -> bool {
+    if !task.is_task_tool() || task.state() != &TaskState::Running {
+        return false;
+    }
+    let Ok(state) = invocations.lock() else {
+        return false;
+    };
+    !state.poisoned
+        && state.attempts.contains(&task.id())
+        && !state.failed_handlers.contains(&task.id())
+        && !state.published.iter().any(|(id, _)| *id == task.id())
+}
+
 /// Shared publication gate used by the driver without taking the scheduler mutex.
 #[derive(Clone)]
 pub(crate) struct FailurePublication {
@@ -1023,6 +1038,7 @@ struct WakeDefinitions {
 pub(crate) struct WakeReader {
     owner: Arc<OwnedStore>,
     definitions: Arc<std::sync::RwLock<WakeDefinitions>>,
+    live_invocations: Arc<Mutex<InvocationState>>,
 }
 impl WakeReader {
     pub(crate) fn snapshot(&self, now_millis: i64) -> Result<WakeSnapshot, Error> {
@@ -1055,11 +1071,7 @@ impl WakeReader {
                 {
                     result.active = true
                 }
-                TaskState::CompletingFailed(_)
-                    if !task.is_task_tool() && !task.abort_requested() =>
-                {
-                    result.active = true
-                }
+                TaskState::CompletingFailed(_) if !task.abort_requested() => result.active = true,
                 TaskState::Completing(_) | TaskState::CompletingFailed(_)
                     if !has_live_owned(self.owner.store(), task.id(), &tasks)? =>
                 {
@@ -1074,7 +1086,12 @@ impl WakeReader {
                     }
                 }
                 TaskState::Ready
-                    if reason.is_none() && definitions.ancestors_available(task, &tasks) =>
+                    if reason.is_none()
+                        && definitions.ancestors_available(
+                            task,
+                            &tasks,
+                            &self.live_invocations,
+                        ) =>
                 {
                     result.active = true
                 }
@@ -1114,7 +1131,12 @@ impl WakeReader {
                     };
                     let ready = ts.wait_ready(item, now_millis)?;
                     if ready
-                        && ((reason.is_none() && definitions.ancestors_available(task, &tasks))
+                        && ((reason.is_none()
+                            && definitions.ancestors_available(
+                                task,
+                                &tasks,
+                                &self.live_invocations,
+                            ))
                             || (task.abort_requested()
                                 && !tasks.iter().any(|child| {
                                     child.task.owner() == &TaskOwner::Task(task.id())
@@ -1155,7 +1177,12 @@ impl WakeDefinitions {
         }
         None
     }
-    fn ancestors_available(&self, task: &Task, tasks: &[task_store::StoredTask]) -> bool {
+    fn ancestors_available(
+        &self,
+        task: &Task,
+        tasks: &[task_store::StoredTask],
+        live: &Mutex<InvocationState>,
+    ) -> bool {
         let mut owner = task.owner();
         let mut visited = HashSet::new();
         while let TaskOwner::Task(id) = owner {
@@ -1167,7 +1194,8 @@ impl WakeDefinitions {
             };
             if parent.task.abort_requested()
                 || parent.task.is_terminal()
-                || parent.task.state() == &TaskState::Running
+                || (parent.task.state() == &TaskState::Running
+                    && !live_task_tool_parent(&parent.task, live))
                 || self.blocked_reason(&parent.task).is_some()
             {
                 return false;
@@ -2199,7 +2227,8 @@ impl Scheduler {
             if !first
                 && (current.abort_requested()
                     || current.is_terminal()
-                    || current.state() == &TaskState::Running
+                    || (current.state() == &TaskState::Running
+                        && !live_task_tool_parent(&current, &self.live_invocations))
                     || self.blocked_reason(&current).is_some())
             {
                 return Ok(false);
@@ -2504,8 +2533,10 @@ impl Scheduler {
     /// all other task executors and direct TaskStore mutations themselves.
     /// Failed attachment or recovery releases the in-process guard.
     pub fn attach(owner: Arc<OwnedStore>, registry: Registry) -> Result<Self, Error> {
+        let live_invocations = Arc::new(Mutex::new(InvocationState::default()));
         let wake_reader = WakeReader {
             owner: owner.clone(),
+            live_invocations: live_invocations.clone(),
             definitions: Arc::new(std::sync::RwLock::new(WakeDefinitions {
                 registry: registry.clone(),
                 failed_migrations: HashMap::new(),
@@ -2513,7 +2544,7 @@ impl Scheduler {
         };
         let mut scheduler = Self {
             attachment: Arc::new(Attachment::acquire(owner)?),
-            live_invocations: Arc::new(Mutex::new(InvocationState::default())),
+            live_invocations,
             failure_fence: Arc::new(Mutex::new(())),
             wake_reader,
             registry,
@@ -2872,7 +2903,6 @@ impl Scheduler {
             // not be recovered before that graph is marked either.
             for record in &records {
                 if matches!(record.task.state(), TaskState::CompletingFailed(_))
-                    && !record.task.is_task_tool()
                     && !record.task.abort_requested()
                     && has_owned_work(self.owner().store(), record.task.id(), &records, true)?
                 {
@@ -3108,13 +3138,22 @@ impl Scheduler {
 
     /// Reserve at most one invocation; run it outside the scheduler mutex.
     pub fn reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, false)
+        self.reserve_tick_inner(now_millis, false, false)
     }
 
     /// Reserve without waiting for conversation poll fences. A maintenance
     /// value must be retried outside the scheduler mutex when a fence is busy.
     pub fn try_reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, true)
+        self.reserve_tick_inner(now_millis, true, false)
+    }
+
+    // The driver's overflow worker is reserved for direct generic children of
+    // live TaskTool invocations, so ordinary handlers cannot consume it.
+    pub(crate) fn try_reserve_task_tool_child(
+        &mut self,
+        now_millis: i64,
+    ) -> Result<TickReservation, Error> {
+        self.reserve_tick_inner(now_millis, true, true)
     }
 
     fn deferred_maintenance(&self, intent: MaintenanceIntent) -> TickReservation {
@@ -3131,6 +3170,7 @@ impl Scheduler {
         &mut self,
         now_millis: i64,
         nonblocking: bool,
+        task_tool_child_only: bool,
     ) -> Result<TickReservation, Error> {
         let fence = self.failure_fence.clone();
         let _failure_guard = if nonblocking {
@@ -3170,10 +3210,11 @@ impl Scheduler {
             }
             let live = has_live_owned(owner.store(), snapshot.task.id(), &held_tasks)?;
             let needs_cascade = matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
-                && !snapshot.task.is_task_tool()
                 && !snapshot.task.abort_requested()
                 && (live || has_owned_work(owner.store(), snapshot.task.id(), &held_tasks, true)?);
-            if snapshot.task.is_task_tool() && has_unmarked_nested(snapshot.task.id(), &held_tasks)
+            if !needs_cascade
+                && snapshot.task.is_task_tool()
+                && has_unmarked_nested(snapshot.task.id(), &held_tasks)
             {
                 if nonblocking && self.validator.is_some() {
                     return Ok(
@@ -3294,10 +3335,26 @@ impl Scheduler {
         } else {
             None
         };
+        let live_invocations = self.live_invocations.clone();
+        let eligible = |task: &Task| {
+            if !task_tool_child_only {
+                return true;
+            }
+            let TaskOwner::Task(parent) = task.owner() else {
+                return false;
+            };
+            !task.is_task_tool()
+                && !task.is_background()
+                && tasks.iter().any(|entry| {
+                    entry.task.id() == *parent
+                        && live_task_tool_parent(&entry.task, &live_invocations)
+                })
+        };
         // Children settle before their owner, including when definitions are missing.
         let mut abortable = None;
         for snapshot in &tasks {
-            if !snapshot.task.abort_requested()
+            if !eligible(&snapshot.task)
+                || !snapshot.task.abort_requested()
                 || snapshot.task.state() != &TaskState::Ready
                 || tasks.iter().any(|child| {
                     child.task.owner() == &TaskOwner::Task(snapshot.task.id())
@@ -3410,7 +3467,8 @@ impl Scheduler {
         let Some(snapshot) = tasks
             .iter()
             .find(|s| {
-                s.task.state() == &TaskState::Ready
+                eligible(&s.task)
+                    && s.task.state() == &TaskState::Ready
                     && !s.task.abort_requested()
                     && self.blocked_reason(&s.task).is_none()
                     && self.ancestors_available(&s.task, &tasks)
@@ -4028,7 +4086,8 @@ impl Scheduler {
             };
             if parent.task.abort_requested()
                 || parent.task.is_terminal()
-                || parent.task.state() == &TaskState::Running
+                || (parent.task.state() == &TaskState::Running
+                    && !live_task_tool_parent(&parent.task, &self.live_invocations))
                 || self.blocked_reason(&parent.task).is_some()
             {
                 return false;
@@ -4490,7 +4549,6 @@ pub(crate) fn pending_abort_root_for_running(
             }));
         }
         if matches!(parent.task.state(), TaskState::CompletingFailed(_))
-            && !parent.task.is_task_tool()
             && !parent.task.abort_requested()
         {
             roots.push(parent.task.id());
@@ -4643,8 +4701,7 @@ pub(crate) fn resolve_maintenance(
             Ok(Some((None, Some(id))))
         }
         MaintenanceIntent::Failed(_)
-            if !parent.task.is_task_tool()
-                && !parent.task.abort_requested()
+            if !parent.task.abort_requested()
                 && matches!(parent.task.state(), TaskState::CompletingFailed(_))
                 && has_owned_work(ts.store(), id, &records, true)? =>
         {
@@ -7965,7 +8022,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn task_tool_crash_recovery_defers_nested_but_not_generic() {
+    fn task_tool_crash_recovery_fences_failed_owned_graph() {
         use std::{
             io::{BufRead, BufReader},
             process::{Child, Command, Stdio},
@@ -8018,9 +8075,12 @@ mod tests {
                 |_: &Task| panic!("must not replay"),
                 |_: &Task| Ok(Step::Succeed(json!(null))),
             );
-            registry.register("generic", true, |_: &Task| {
-                Ok(Step::Succeed(json!("generic")))
-            });
+            registry.register_with_abort(
+                "generic",
+                true,
+                |_: &Task| Ok(Step::Succeed(json!("generic"))),
+                |_: &Task| Ok(Step::Succeed(json!(null))),
+            );
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
             let nested = Uuid::from_u128(1);
             let generic = Uuid::from_u128(2);
@@ -8031,7 +8091,11 @@ mod tests {
             );
             assert_eq!(
                 scheduler.get(generic).unwrap().unwrap().state(),
-                &TaskState::Ready
+                if fail {
+                    &TaskState::Running
+                } else {
+                    &TaskState::Ready
+                }
             );
             assert!(!scheduler.get(generic).unwrap().unwrap().abort_requested());
             scheduler.tick(0).unwrap();
@@ -8040,7 +8104,10 @@ mod tests {
                 scheduler.get(nested).unwrap().unwrap().state(),
                 &TaskState::Running
             );
-            assert!(!scheduler.get(generic).unwrap().unwrap().abort_requested());
+            assert_eq!(
+                scheduler.get(generic).unwrap().unwrap().abort_requested(),
+                fail
+            );
             for _ in 0..12 {
                 scheduler.tick(0).unwrap();
                 if scheduler.get(parent).unwrap().unwrap().is_terminal() {
@@ -8051,9 +8118,14 @@ mod tests {
                 scheduler.get(nested).unwrap().unwrap().state(),
                 &TaskState::Cancelled
             );
+            let expected_generic = if fail {
+                TaskState::Cancelled
+            } else {
+                TaskState::Succeeded(json!("generic"))
+            };
             assert_eq!(
                 scheduler.get(generic).unwrap().unwrap().state(),
-                &TaskState::Succeeded(json!("generic"))
+                &expected_generic
             );
             let result = scheduler.get(parent).unwrap().unwrap();
             if fail {
@@ -8142,7 +8214,7 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_settlement_aborts_nested_roots_together_and_keeps_other_tasks() {
+    fn task_tool_settlement_preserves_ownership_across_restart() {
         for scenario in ["success", "failure", "error", "interrupted"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tasks.db");
@@ -8235,15 +8307,11 @@ mod tests {
                         .abort_requested()
                 );
             }
-            for child in [&generic, &external] {
-                assert!(
-                    !scheduler
-                        .get(child.id())
-                        .unwrap()
-                        .unwrap()
-                        .abort_requested()
-                );
-            }
+            assert_eq!(
+                scheduler.get(generic.id()).unwrap().unwrap().abort_requested(),
+                !success
+            );
+            assert!(!scheduler.get(external.id()).unwrap().unwrap().abort_requested());
             assert!(scheduler.get(parent.id()).unwrap().unwrap().is_completing());
             drop(scheduler); // marks and cleanup must survive another restart
             let mut scheduler = Scheduler::open(&path, registry).unwrap();
@@ -8263,14 +8331,16 @@ mod tests {
                 matches!(scheduler.get(b.id()).unwrap().unwrap().state(), TaskState::Failed(reason) if reason == "cleanup failed")
             );
             assert!(scheduler.get(parent.id()).unwrap().unwrap().is_completing());
-            scheduler
-                .signal(&Signal::new(
-                    Uuid::new_v4(),
-                    generic.id(),
-                    "release".into(),
-                    json!(null),
-                ))
-                .unwrap();
+            if success {
+                scheduler
+                    .signal(&Signal::new(
+                        Uuid::new_v4(),
+                        generic.id(),
+                        "release".into(),
+                        json!(null),
+                    ))
+                    .unwrap();
+            }
             for _ in 0..8 {
                 if scheduler.get(parent.id()).unwrap().unwrap().is_terminal() {
                     break;

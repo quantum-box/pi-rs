@@ -297,10 +297,9 @@ impl<'a> SessionTransaction<'a> {
         if parent.task.state() != &crate::task::TaskState::Running
             || parent.task.abort_requested()
             || parent.task.attempt_id().is_none()
-            || parent.task.is_task_tool()
         {
             return Err(Error::InvalidSessionAdmission(
-                "parent must be a live generic task attempt in this conversation".into(),
+                "parent must be a live task attempt in this conversation".into(),
             ));
         }
         Ok(())

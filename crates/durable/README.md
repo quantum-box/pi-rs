@@ -2018,13 +2018,24 @@ are rejected. New task IDs are provisional. Task records and any settlement
 notification are committed atomically with the transaction's other changes.
 `tx.create_child_task(&parent_snapshot, child)` and
 `tx.create_keyed_child(&parent_snapshot, key, child)` stage registered children
-of the same live generic task attempt. The latter returns the existing ID for a
+of a live generic or TaskTool attempt. The latter returns the existing ID for a
 matching key and rejects identity changes, including definition version, replay
 policy, initial checkpoint and restart limit as well as kind and input. These
 extra identity checks are a pi-rs extension. The driver validates the exact parent
 reservation, registry and pending abort under the admission gate, and fences the
-ownership graph through commit. Multiple children of that parent may be staged.
-This slice rejects task-tool parents, task-owned conversations, multiple parents and mixing root-task and child creation. Ordinary nested-tool
+ownership graph through commit. Multiple parents and children, including
+children of tasks staged earlier in the transaction, may be combined with
+root-task creation. A generic child can execute while its TaskTool parent is
+running, provided the attached driver still owns the parent invocation. The
+driver reserves one additional worker for direct generic children of live
+TaskTool parents when its four ordinary workers are busy. Unrelated work cannot
+use this reserved worker and waits for ordinary capacity. A blocking generic
+child can occupy the reserved worker; this fixed bound does not guarantee
+progress for arbitrary recursively blocking handlers. Handlers must remain
+cooperative. An interrupted parent must recover before its descendants run. Successful TaskTool
+settlement waits for owned work; failure and explicit abort cascade through it. This
+slice rejects task-owned conversations and TaskTool children through these host
+methods. Ordinary nested-tool
 keys use a separate journal, so upstream shared cross-kind key semantics are not
 implemented. Cross-conversation creation is also unsupported.
 
