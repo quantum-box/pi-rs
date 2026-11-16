@@ -481,6 +481,15 @@ impl<'a> Journal<'a> {
             Err(unsupported())
         }
     }
+    /// Conservative admission probe for callers holding the shared gate.
+    /// Every record, including `Complete`, requires independently verified
+    /// reconciliation before unrelated operations may proceed. A corrupt or
+    /// unreadable record is an error, never an absent record. `false` alone is
+    /// not evidence that initial key provisioning or an earlier transaction
+    /// was durable; production admission must establish those facts separately.
+    pub(crate) fn needs_reconciliation(&self) -> io::Result<bool> {
+        Ok(self.read()?.is_some())
+    }
     /// Inspect only after the caller supplies the expected complete identity.
     /// A mismatch is an error, never an absent record or authorization to clear.
     pub(crate) fn read_matching(&self, identity: Identity) -> io::Result<Option<Record>> {
@@ -730,6 +739,35 @@ mod tests {
             r = j.advance(r.identity(), r, stage).unwrap();
         }
         r
+    }
+    #[test]
+    fn admission_requires_reconciliation_for_every_stage_and_rejects_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::new(root.path(), test_auth()).unwrap();
+        assert!(!journal.needs_reconciliation().unwrap());
+        let mut record = journal.begin(target()).unwrap();
+        assert!(journal.needs_reconciliation().unwrap());
+        let wrong_auth = RecordAuthenticator::new(Zeroizing::new([0x43; 32])).unwrap();
+        let wrong_key = Journal::new(root.path(), &wrong_auth).unwrap();
+        assert!(wrong_key.needs_reconciliation().is_err());
+        for stage in [
+            Stage::ConfigInProgress,
+            Stage::CredentialsInProgress,
+            Stage::Complete,
+        ] {
+            record = journal.advance(record.identity(), record, stage).unwrap();
+            assert!(journal.needs_reconciliation().unwrap());
+        }
+        journal.clear_complete(record.identity(), record).unwrap();
+        assert!(!journal.needs_reconciliation().unwrap());
+        std::fs::write(root.path().join(NAME), b"invalid").unwrap();
+        assert!(journal.needs_reconciliation().is_err());
+
+        let other = tempfile::tempdir().unwrap();
+        let poisoned = Journal::new(other.path(), test_auth()).unwrap();
+        poisoned.fail_sync.set(true);
+        assert!(poisoned.begin(target()).is_err());
+        assert!(poisoned.needs_reconciliation().is_err());
     }
     #[test]
     fn derived_record_authentication_matches_fixed_vector() {
