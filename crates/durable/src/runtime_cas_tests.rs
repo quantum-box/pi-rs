@@ -102,6 +102,117 @@ fn interrupted_recovery_retries_racing_stream_append() {
 }
 
 #[test]
+fn interrupted_recovery_retries_racing_bounded_checkpoint() {
+    use crate::output::{OutputBuffer, OutputLimits, OutputSkip, Retain};
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    let (mut state, version) = h.load(id).unwrap();
+    let operation_id = Uuid::new_v4();
+    let attempt = ToolAttempt {
+        operation_id,
+        attempt_id: Uuid::new_v4(),
+    };
+    state.tool_attempt = Some(attempt);
+    state.phase = Phase::ToolRunning {
+        turns: 0,
+        calls: vec![ToolCall {
+            id: "call".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        }],
+        index: 0,
+        operation_id,
+        replay: ReplayPolicy::Unsafe,
+        arguments: serde_json::json!({}),
+        restarts: 0,
+        replay_ready: false,
+        dispatch_identity: Some(DispatchIdentity::Other),
+    };
+    h.save(&state, Expected::Version(version)).unwrap();
+    let output_key = crate::streamed_output::key(attempt.attempt_id);
+    let checkpoint_key = crate::streamed_output::checkpoint_key(attempt.attempt_id);
+    let mut buffer = OutputBuffer::new(OutputLimits {
+        max_bytes: 20,
+        max_lines: 1,
+        retain: Retain::Tail,
+    });
+    buffer.push_str("a\nb\ntail");
+    let first = buffer.checkpoint();
+    h.owner
+        .store()
+        .commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: output_key,
+                    value: b"tail".to_vec(),
+                },
+                Mutation::Put {
+                    key: checkpoint_key.clone(),
+                    value: serde_json::to_vec(&first).unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+    let owner = h.owner.clone();
+    let mut injected = false;
+    h.recover_conversation_with(id, || {
+        if !injected {
+            injected = true;
+            let mut next = OutputBuffer::new(OutputLimits {
+                max_bytes: 20,
+                max_lines: 1,
+                retain: Retain::Tail,
+            });
+            next.push_str_skipped(
+                "a\nb\ntail",
+                OutputSkip {
+                    bytes: 4,
+                    newlines: 1,
+                    ends_with_newline: true,
+                },
+            )
+            .unwrap();
+            let entry = owner.store().get(&checkpoint_key).unwrap().unwrap();
+            owner
+                .store()
+                .commit(
+                    &[Check {
+                        key: checkpoint_key.clone(),
+                        expected: Expected::Version(entry.version),
+                    }],
+                    &[Mutation::Put {
+                        key: checkpoint_key.clone(),
+                        value: serde_json::to_vec(&next.checkpoint()).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
+    })
+    .unwrap();
+    assert!(injected);
+    let (state, _) = h.load(id).unwrap();
+    assert!(
+        matches!(state.phase, Phase::ToolFinished { ref content, .. } if content == "tail\ntool interrupted and may have partially run")
+    );
+    let metadata = state.pending_tool_result.unwrap();
+    assert!(
+        metadata
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("truncated")
+                && d.message == "Output truncated: 3 lines, 8 bytes dropped")
+    );
+}
+
+#[test]
 fn abort_returns_queued_inputs_across_foreground_and_background_boundaries() {
     use crate::ownership_edge::Mode;
     use crate::task::{Checkpoint, Task, TaskOwner};

@@ -119,11 +119,31 @@ pub fn bound_output(text: &str, limits: OutputLimits) -> BoundedOutput<'_> {
 }
 
 /// A retained snapshot. Dropped counts refer to decoded text before sanitization.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutputSnapshot {
     pub text: String,
     pub dropped_bytes: usize,
     pub dropped_lines: usize,
+}
+
+/// Producer-supplied counts for decoded output omitted immediately before a
+/// delivered chunk. The chunk and subsequent text must place the omitted text
+/// entirely outside the tail window. Counts are measured before sanitization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputSkip {
+    pub bytes: usize,
+    pub newlines: usize,
+    pub ends_with_newline: bool,
+}
+
+/// Persisted bounded-stream state for the current attempt. `finished` is the
+/// window after flushing `pending_utf8` as a replacement character if needed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputCheckpoint {
+    pub version: u32,
+    pub current: OutputSnapshot,
+    pub finished: OutputSnapshot,
+    pub pending_utf8: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -215,6 +235,73 @@ impl OutputBuffer {
             }
             self.started = true;
             self.accept(&decoded);
+        }
+    }
+
+    /// Append text after producer-omitted decoded output. Only tail retention
+    /// accepts skips; callers must ensure the delivered suffix exceeds the
+    /// window, as required by upstream's producer skip contract.
+    pub fn push_str_skipped(
+        &mut self,
+        text: &str,
+        skipped: OutputSkip,
+    ) -> Result<(), &'static str> {
+        self.check_skip(skipped)?;
+        self.flush_pending();
+        self.skip(skipped);
+        self.started = true;
+        self.accept(text);
+        Ok(())
+    }
+
+    /// Like `push_str_skipped`, but the delivered chunk is a UTF-8 byte stream.
+    pub fn push_bytes_skipped(
+        &mut self,
+        bytes: &[u8],
+        skipped: OutputSkip,
+    ) -> Result<(), &'static str> {
+        self.check_skip(skipped)?;
+        self.flush_pending();
+        self.skip(skipped);
+        self.started = true;
+        self.push_bytes(bytes);
+        Ok(())
+    }
+
+    fn check_skip(&self, skipped: OutputSkip) -> Result<(), &'static str> {
+        if self.limits.retain != Retain::Tail {
+            return Err("skipped output requires tail retention");
+        }
+        if skipped.newlines > skipped.bytes || (skipped.ends_with_newline && skipped.newlines == 0)
+        {
+            return Err("invalid skipped output counts");
+        }
+        Ok(())
+    }
+
+    fn skip(&mut self, skipped: OutputSkip) {
+        if skipped.bytes == 0 {
+            return;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(skipped.bytes);
+        self.total_newlines = self.total_newlines.saturating_add(skipped.newlines);
+        self.ends_newline = skipped.ends_with_newline;
+        self.chunks.clear();
+        self.stored_bytes = 0;
+        self.stored_newlines = 0;
+    }
+
+    /// Capture the running and end-of-stream views and pending UTF-8 bytes.
+    pub fn checkpoint(&self) -> OutputCheckpoint {
+        let mut current = self.clone();
+        let running = current.snapshot();
+        let pending_utf8 = current.pending.clone();
+        current.end();
+        OutputCheckpoint {
+            version: 1,
+            current: running,
+            finished: current.snapshot(),
+            pending_utf8,
         }
     }
 
@@ -359,6 +446,94 @@ mod tests {
             expected
         );
         assert_eq!(result.bytes, result.text.len());
+    }
+
+    #[test]
+    fn skipped_tail_matches_full_stream_and_head_rejects_without_mutation() {
+        let limits = OutputLimits {
+            max_bytes: 1000,
+            max_lines: 2,
+            retain: Retain::Tail,
+        };
+        let mut full = OutputBuffer::new(limits);
+        let mut skipped = OutputBuffer::new(limits);
+        full.push_str("one\ntwo\nthree\nfour\nfive\nsix");
+        skipped
+            .push_str_skipped(
+                "ee\nfour\nfive\nsix",
+                OutputSkip {
+                    bytes: 11,
+                    newlines: 2,
+                    ends_with_newline: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(skipped.snapshot(), full.snapshot());
+        assert_eq!(
+            skipped.snapshot(),
+            OutputSnapshot {
+                text: "five\nsix".into(),
+                dropped_bytes: 19,
+                dropped_lines: 4
+            }
+        );
+        let mut head = OutputBuffer::new(OutputLimits {
+            retain: Retain::Head,
+            ..limits
+        });
+        head.push_bytes(&[0xe2]);
+        assert!(
+            head.push_str_skipped(
+                "bad",
+                OutputSkip {
+                    bytes: 3,
+                    newlines: 1,
+                    ends_with_newline: true
+                }
+            )
+            .is_err()
+        );
+        head.push_bytes(&[0x82, 0xac]);
+        assert_eq!(head.snapshot().text, "€");
+    }
+
+    #[test]
+    fn skip_flushes_pending_and_preserves_producer_counts() {
+        let mut b = OutputBuffer::new(OutputLimits {
+            max_bytes: 5,
+            max_lines: 1,
+            retain: Retain::Tail,
+        });
+        b.push_bytes(&[0xe2]);
+        b.push_bytes_skipped(
+            b"final!",
+            OutputSkip {
+                bytes: 4,
+                newlines: 1,
+                ends_with_newline: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            b.snapshot(),
+            OutputSnapshot {
+                text: "inal!".into(),
+                dropped_bytes: 8,
+                dropped_lines: 1
+            }
+        );
+        assert!(
+            b.push_bytes_skipped(
+                b"x",
+                OutputSkip {
+                    bytes: 0,
+                    newlines: 1,
+                    ends_with_newline: true
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(b.snapshot().text, "inal!");
     }
 
     #[test]

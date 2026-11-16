@@ -1640,6 +1640,22 @@ struct RuntimeStreamOutput {
 #[async_trait::async_trait]
 impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
     async fn record(&self, text: &str) -> pi_rs_core::ExtensionResult<()> {
+        self.record_inner(text, None)
+    }
+    async fn record_bounded(
+        &self,
+        text: &str,
+        checkpoint: &crate::output::OutputCheckpoint,
+    ) -> pi_rs_core::ExtensionResult<()> {
+        self.record_inner(text, Some(checkpoint))
+    }
+}
+impl RuntimeStreamOutput {
+    fn record_inner(
+        &self,
+        text: &str,
+        checkpoint: Option<&crate::output::OutputCheckpoint>,
+    ) -> pi_rs_core::ExtensionResult<()> {
         let _lease = self
             .source
             .upgrade()
@@ -1670,7 +1686,7 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
                 }
                 let output_key = crate::streamed_output::key(self.attempt.attempt_id);
                 let previous = store.get(&output_key)?;
-                let checks = [
+                let mut checks = vec![
                     Check {
                         key,
                         expected: Expected::Version(entry.version),
@@ -1682,10 +1698,28 @@ impl crate::keyed_tool::StreamSink for RuntimeStreamOutput {
                             .map_or(Expected::Missing, |v| Expected::Version(v.version)),
                     },
                 ];
-                let mutations = [Mutation::Put {
+                let mut mutations = vec![Mutation::Put {
                     key: output_key,
                     value: text.as_bytes().to_vec(),
                 }];
+                if let Some(checkpoint) = checkpoint {
+                    if checkpoint.current.text != text {
+                        return Err(Error::Invalid("bounded stream checkpoint mismatch".into()));
+                    }
+                    let checkpoint_key =
+                        crate::streamed_output::checkpoint_key(self.attempt.attempt_id);
+                    let previous_checkpoint = store.get(&checkpoint_key)?;
+                    checks.push(Check {
+                        key: checkpoint_key.clone(),
+                        expected: previous_checkpoint
+                            .as_ref()
+                            .map_or(Expected::Missing, |v| Expected::Version(v.version)),
+                    });
+                    mutations.push(Mutation::Put {
+                        key: checkpoint_key,
+                        value: serde_json::to_vec(checkpoint)?,
+                    });
+                }
                 match store.commit(&checks, &mutations) {
                     Ok(()) => Ok(true),
                     Err(durable_store::Error::Conflict { .. }) => Ok(false),
@@ -9052,7 +9086,7 @@ impl Harness {
     ) -> Result<(), Error> {
         loop {
             let (mut c, version) = self.load(id)?;
-            let mut stream_check = None;
+            let mut stream_checks = Vec::new();
             self.report_blocked_tool_panic(&c)?;
             if c.abort_requested {
                 return Ok(());
@@ -9310,15 +9344,39 @@ impl Harness {
                             // Only committed output from this exact attempt is
                             // eligible; progress and earlier attempts are not
                             // evidence of what this invocation emitted.
+                            let mut truncation = None;
                             let output = match c.tool_attempt().filter(|a| a.operation_id == operation_id) {
                                 Some(attempt) => {
                                     let key = crate::streamed_output::key(attempt.attempt_id);
                                     let entry = self.owner.store().get(&key)?;
-                                    stream_check = Some(Check { key, expected: entry.as_ref().map_or(Expected::Missing, |entry| Expected::Version(entry.version)) });
+                                    stream_checks.push(Check { key, expected: entry.as_ref().map_or(Expected::Missing, |entry| Expected::Version(entry.version)) });
                                     let output = entry.map(crate::streamed_output::decode).transpose()
                                         .map_err(|error| Error::Invalid(format!("interrupted tool output: {error}")))?;
+                                    let key = crate::streamed_output::checkpoint_key(attempt.attempt_id);
+                                    let checkpoint = self.owner.store().get(&key)?;
+                                    stream_checks.push(Check { key, expected: checkpoint.as_ref().map_or(Expected::Missing, |entry| Expected::Version(entry.version)) });
+                                    let checkpoint = checkpoint.map(crate::streamed_output::decode_checkpoint).transpose()
+                                        .map_err(|error| Error::Invalid(format!("interrupted stream checkpoint: {error}")))?;
                                     after_stream_read();
-                                    output
+                                    if let Some(checkpoint) = checkpoint {
+                                        if output.as_deref() != Some(checkpoint.current.text.as_str()) {
+                                            // Reads are separate: retry if either record moved between them.
+                                            let mut changed = false;
+                                            for check in &stream_checks {
+                                                let actual = self.owner.store().get(&check.key)?;
+                                                let expected = actual.as_ref().map_or(Expected::Missing, |entry| Expected::Version(entry.version));
+                                                if check.expected != expected { changed = true; break; }
+                                            }
+                                            if changed { continue; }
+                                            return Err(Error::Invalid("interrupted stream checkpoint mismatch".into()));
+                                        }
+                                        if checkpoint.finished.dropped_bytes > 0 {
+                                            truncation = Some(ToolDiagnostic { severity: DiagnosticSeverity::Warn,
+                                                code: Some("truncated".into()),
+                                                message: format!("Output truncated: {} lines, {} bytes dropped", checkpoint.finished.dropped_lines, checkpoint.finished.dropped_bytes) });
+                                        }
+                                        Some(checkpoint.finished.text)
+                                    } else { output }
                                 },
                                 None => None,
                             };
@@ -9326,7 +9384,8 @@ impl Harness {
                                 Some(text) => format!("{text}\n{reason}"),
                                 None => reason.to_owned(),
                             };
-                            let reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
+                            let mut reported = read_tool_diagnostics(&self.owner, c.id, operation_id)?;
+                            if let Some(diagnostic) = truncation { reported.push(diagnostic); }
                             record_tool_result(&mut c, &calls, index, operation_id, &Outcome::Failed(reason.into()), reported)?;
                             c.phase = Phase::ToolFinished {
                                 turns,
@@ -9342,12 +9401,10 @@ impl Harness {
                 _ => return Ok(()),
             }
             self.recovering = true;
-            let batch = stream_check
-                .as_ref()
-                .map(|check| crate::task_store::OwnedBatch {
-                    checks: vec![check.clone()],
-                    mutations: vec![],
-                });
+            let batch = (!stream_checks.is_empty()).then(|| crate::task_store::OwnedBatch {
+                checks: stream_checks.clone(),
+                mutations: vec![],
+            });
             let result = self.save_composed_locked(
                 &c,
                 Expected::Version(version),
@@ -9359,7 +9416,7 @@ impl Harness {
             self.recovering = false;
             match result {
                 Err(Error::Storage(durable_store::Error::Conflict { key }))
-                    if stream_check.as_ref().is_some_and(|check| check.key == key) =>
+                    if stream_checks.iter().any(|check| check.key == key) =>
                 {
                     continue;
                 }

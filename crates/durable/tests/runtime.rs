@@ -2381,3 +2381,140 @@ async fn interrupted_bounded_stream_recovers_committed_tail_without_replay() {
     assert!(scheduler.conversation(id).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last\ntool interrupted and may have partially run")));
     scheduler.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn interrupted_bounded_stream_restores_partial_utf8_and_truncation_diagnostic() {
+    use pi_rs_durable::keyed_tool::{
+        BoundedStreamOutput, BoundedStreamedTool, BoundedStreamedToolAdapter, KeyedHost,
+        KeyedToolAdapter, StreamedReply,
+    };
+    use pi_rs_durable::output::{OutputLimits, OutputSkip, Retain};
+    use pi_rs_durable::runtime::Scheduler;
+    struct ToolWithSkip {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Semaphore>,
+        saved: Arc<std::sync::Mutex<Option<BoundedStreamOutput>>>,
+    }
+    #[async_trait]
+    impl BoundedStreamedTool for ToolWithSkip {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "test".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: Option<&pi_rs_core::ExtensionState>,
+            _: KeyedHost,
+            output: BoundedStreamOutput,
+        ) -> StreamedReply {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            output
+                .append_skipped(
+                    "one\ntwo\nlast",
+                    OutputSkip {
+                        bytes: 4,
+                        newlines: 1,
+                        ends_with_newline: true,
+                    },
+                )
+                .await
+                .unwrap();
+            output.append_bytes(&[0xf0, 0x9f]).await.unwrap();
+            *self.saved.lock().unwrap() = Some(output);
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let saved = Arc::new(std::sync::Mutex::new(None));
+    let options = || Options {
+        model: Arc::new(FakeModel {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        }),
+        tools: vec![
+            Arc::new(KeyedToolAdapter::new(BoundedStreamedToolAdapter {
+                tool: ToolWithSkip {
+                    calls: calls.clone(),
+                    started: started.clone(),
+                    saved: saved.clone(),
+                },
+                limits: OutputLimits {
+                    max_bytes: 32,
+                    max_lines: 1,
+                    retain: Retain::Tail,
+                },
+            }))
+            .register(ReplayPolicy::Unsafe),
+        ],
+        restart_limit: 5,
+        max_turns: 8,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    let id = scheduler.create_conversation(config()).unwrap();
+    scheduler.submit(id, None, "work".into()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let attempt = scheduler.conversation(id).unwrap().tool_attempt().unwrap();
+    let stale = saved.lock().unwrap().take().unwrap();
+    scheduler.shutdown().await.unwrap();
+    assert!(stale.append_bytes(&[0x99, 0x82]).await.is_err());
+    assert!(
+        stale
+            .append_skipped(
+                "x\ny\n",
+                OutputSkip {
+                    bytes: 2,
+                    newlines: 1,
+                    ends_with_newline: true
+                }
+            )
+            .await
+            .is_err()
+    );
+    let store = durable_store::Store::open(&path).unwrap();
+    let checkpoint = pi_rs_durable::streamed_output::load_checkpoint(&store, attempt.attempt_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.pending_utf8, vec![0xf0, 0x9f]);
+    assert_eq!(checkpoint.current.text, "last");
+    assert_eq!(checkpoint.finished.text, "last�");
+    assert_eq!(
+        (
+            checkpoint.finished.dropped_bytes,
+            checkpoint.finished.dropped_lines
+        ),
+        (12, 3)
+    );
+    drop(store);
+    let mut scheduler = Scheduler::open(&path, options()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    let conversation = scheduler.conversation(id).unwrap();
+    assert!(conversation.messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content == "last�\ntool interrupted and may have partially run")));
+    assert!(
+        conversation
+            .tool_results
+            .iter()
+            .filter(|r| r.operation_id == attempt.operation_id)
+            .flat_map(|r| &r.diagnostics)
+            .any(|d| d.code.as_deref() == Some("truncated")
+                && d.message == "Output truncated: 3 lines, 12 bytes dropped")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    scheduler.shutdown().await.unwrap();
+}

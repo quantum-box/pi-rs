@@ -262,6 +262,13 @@ pub const MAX_STREAMED_OUTPUT_BYTES: usize = 64 * 1024;
 #[async_trait::async_trait]
 pub(crate) trait StreamSink: Send + Sync {
     async fn record(&self, text: &str) -> ExtensionResult<()>;
+    async fn record_bounded(
+        &self,
+        text: &str,
+        _checkpoint: &crate::output::OutputCheckpoint,
+    ) -> ExtensionResult<()> {
+        self.record(text).await
+    }
 }
 
 /// An explicit durable-only result. `None` selects this attempt's streamed text;
@@ -430,7 +437,7 @@ pub struct BoundedStreamOutput(Arc<BoundedStreamInner>);
 impl BoundedStreamOutput {
     async fn update(
         &self,
-        apply: impl FnOnce(&mut crate::output::OutputBuffer),
+        apply: impl FnOnce(&mut crate::output::OutputBuffer) -> Result<(), &'static str>,
     ) -> ExtensionResult<()> {
         let mut state = self.0.state.lock().await;
         if !self.0.open.load(Ordering::Acquire) {
@@ -440,9 +447,15 @@ impl BoundedStreamOutput {
             return Err("stream recording failed".into());
         }
         let mut candidate = state.buffer.clone();
-        apply(&mut candidate);
-        let snapshot = candidate.snapshot();
-        if let Err(error) = self.0.sink.record(&snapshot.text).await {
+        apply(&mut candidate).map_err(str::to_owned)?;
+        candidate.snapshot();
+        let checkpoint = candidate.checkpoint();
+        if let Err(error) = self
+            .0
+            .sink
+            .record_bounded(&checkpoint.current.text, &checkpoint)
+            .await
+        {
             state.failed = true;
             return Err(error);
         }
@@ -450,10 +463,37 @@ impl BoundedStreamOutput {
         Ok(())
     }
     pub async fn append(&self, text: &str) -> ExtensionResult<()> {
-        self.update(|buffer| buffer.push_str(text)).await
+        self.update(|buffer| {
+            buffer.push_str(text);
+            Ok(())
+        })
+        .await
     }
     pub async fn append_bytes(&self, bytes: &[u8]) -> ExtensionResult<()> {
-        self.update(|buffer| buffer.push_bytes(bytes)).await
+        self.update(|buffer| {
+            buffer.push_bytes(bytes);
+            Ok(())
+        })
+        .await
+    }
+    /// Append text following producer-omitted output; see `OutputSkip` for
+    /// the tail-window contract and pre-sanitization counts.
+    pub async fn append_skipped(
+        &self,
+        text: &str,
+        skipped: crate::output::OutputSkip,
+    ) -> ExtensionResult<()> {
+        self.update(|buffer| buffer.push_str_skipped(text, skipped))
+            .await
+    }
+    /// Append byte chunks following producer-omitted output.
+    pub async fn append_bytes_skipped(
+        &self,
+        bytes: &[u8],
+        skipped: crate::output::OutputSkip,
+    ) -> ExtensionResult<()> {
+        self.update(|buffer| buffer.push_bytes_skipped(bytes, skipped))
+            .await
     }
     pub async fn snapshot(&self) -> ExtensionResult<crate::output::OutputSnapshot> {
         let mut state = self.0.state.lock().await;
@@ -528,8 +568,13 @@ impl<T: BoundedStreamedTool> KeyedTool for BoundedStreamedToolAdapter<T> {
         if !state.failed {
             let mut candidate = state.buffer.clone();
             candidate.end();
-            let text = candidate.snapshot().text;
-            if inner.sink.record(&text).await.is_err() {
+            let checkpoint = candidate.checkpoint();
+            if inner
+                .sink
+                .record_bounded(&checkpoint.current.text, &checkpoint)
+                .await
+                .is_err()
+            {
                 state.failed = true;
             } else {
                 state.buffer = candidate;

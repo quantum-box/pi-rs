@@ -172,7 +172,10 @@ chunks with head/tail retention, split-character decoding, display sanitization,
 and counts of decoded bytes and lines dropped before sanitization. `end()`
 flushes an incomplete final byte sequence as U+FFFD. Memory is bounded by the
 retained window plus the largest chunk; take snapshots to compact tail storage.
-It does not support upstream's producer-supplied skipped-output counts.
+For producer-omitted output, `push_str_skipped` and `push_bytes_skipped` accept
+`OutputSkip` counts only with tail retention. The producer must ensure the
+delivered suffix exceeds the window so omitted output cannot belong in it;
+counts describe decoded text before sanitization.
 
 For opt-in durable streaming, wrap a `BoundedStreamedTool` in
 `KeyedToolAdapter::new(BoundedStreamedToolAdapter { tool, limits })`. A bounded
@@ -180,10 +183,12 @@ stream's byte limit must be at most 64 KiB. `append` and `append_bytes` commit
 the sanitized retained window before returning; `snapshot` exposes dropped
 counts while the invocation runs. Returning `StreamedReply::Success` with
 `output: None` uses the retained window. Explicit replies keep their ordinary
-meaning. The persisted stream contains only retained text: dropped counts and
-incremental decoder state are not recovered after interruption, and no automatic
-truncation diagnostic is emitted. An incomplete byte sequence is not persisted
-until completed or flushed at normal settlement. The separate strict adapter
+meaning. A versioned sidecar checkpoints dropped counts and pending UTF-8 bytes atomically
+with retained text. On interruption, recovery flushes an incomplete byte
+sequence as U+FFFD and adds a `truncated` warning when bytes were dropped. The
+existing text record remains readable, and older streams without a sidecar retain
+their prior recovery behavior. The sidecar stores the recovery projection, not
+a resumable producer or a complete stream history. The separate strict adapter
 below retains its existing overflow behavior.
 
 For model-issued calls, `KeyedToolAdapter::new(StreamedToolAdapter(tool))`
