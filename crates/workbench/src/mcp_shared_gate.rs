@@ -266,24 +266,6 @@ fn open_in_profile(_profile: &Path) -> io::Result<File> {
     ))
 }
 
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_gate_does_not_create_a_directory_or_use_account_profile() {
-        // The profile is deliberately a nonexistent path under the build tree.
-        // This test never asks the OS for the actual account profile.
-        let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("mcp-windows-no-create-{}", std::process::id()));
-        assert!(!profile.exists());
-        let error = open_in_profile(&profile).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(!profile.exists());
-    }
-}
-
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
@@ -613,41 +595,6 @@ pub(crate) mod windows_mutex {
         Ok(())
     }
 
-    #[cfg(test)]
-    mod integrity_tests {
-        use super::*;
-
-        fn parse(sddl: &str) -> Local {
-            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
-            assert_ne!(
-                unsafe {
-                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                        wide(sddl).as_ptr(),
-                        SDDL_REVISION_1,
-                        &mut sd,
-                        null_mut(),
-                    )
-                },
-                0
-            );
-            Local(sd)
-        }
-
-        #[test]
-        fn only_low_no_write_up_label_is_accepted() {
-            for (sddl, accepted) in [
-                ("S:(ML;;NW;;;ME)", false),
-                ("S:(ML;;NW;;;HI)", false),
-                ("S:(ML;;NW;;;LW)", true),
-                ("S:(ML;;NR;;;LW)", false),
-                ("D:(A;;GA;;;SY)", false),
-            ] {
-                let descriptor = parse(sddl);
-                assert_eq!(validate_low_label(descriptor.0).is_ok(), accepted, "{sddl}");
-            }
-        }
-    }
-
     fn open_mutex(test_name: Option<&str>) -> io::Result<Handle> {
         let user = user()?;
         let sd = descriptor(&user)?;
@@ -810,5 +757,58 @@ pub(crate) mod windows_mutex {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    mod integrity_tests {
+        use super::*;
+
+        fn parse(sddl: &str) -> Local {
+            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        wide(sddl).as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut sd,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            Local(sd)
+        }
+
+        #[test]
+        fn only_low_no_write_up_label_is_accepted() {
+            for (sddl, accepted) in [
+                ("S:(ML;;NW;;;ME)", false),
+                ("S:(ML;;NW;;;HI)", false),
+                ("S:(ML;;NW;;;LW)", true),
+                ("S:(ML;;NR;;;LW)", false),
+                ("D:(A;;GA;;;SY)", false),
+            ] {
+                let descriptor = parse(sddl);
+                assert_eq!(validate_low_label(descriptor.0).is_ok(), accepted, "{sddl}");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_gate_does_not_create_a_directory_or_use_account_profile() {
+        // The profile is deliberately a nonexistent path under the build tree.
+        // This test never asks the OS for the actual account profile.
+        let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mcp-windows-no-create-{}", std::process::id()));
+        assert!(!profile.exists());
+        let error = open_in_profile(&profile).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(!profile.exists());
     }
 }
