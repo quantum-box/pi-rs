@@ -519,7 +519,9 @@ fn task_owned_conversation_is_explicitly_rejected() {
     let snapshot = tasks.load(owner.id()).unwrap().unwrap();
     tasks.update(&snapshot, |task| task.start()).unwrap();
     let snapshot = tasks.load(owner.id()).unwrap().unwrap();
-    tasks.update(&snapshot, |task| task.succeed(json!(null))).unwrap();
+    tasks
+        .update(&snapshot, |task| task.succeed(json!(null)))
+        .unwrap();
     let (driver, started, release) = driver(&h);
     let parent = task(TaskOwner::Conversation(c), "parent", 0);
     driver.submit(&parent).unwrap();
