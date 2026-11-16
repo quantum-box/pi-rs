@@ -270,6 +270,13 @@ fn open_in_profile(_profile: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
@@ -309,6 +316,103 @@ mod tests {
         ));
         drop(first);
         second.try_lock().unwrap();
+    }
+    #[test]
+    fn account_profile_does_not_follow_agent_or_home_environment() {
+        use std::os::unix::ffi::OsStrExt;
+        const CHILD: &str = "PI_RS_TEST_SHARED_GATE_PROFILE_CHILD";
+        const OUTPUT: &str = "PI_RS_TEST_SHARED_GATE_PROFILE_OUTPUT";
+        if std::env::var_os(CHILD).is_some() {
+            let profile = account_profile().unwrap();
+            std::fs::write(
+                std::env::var_os(OUTPUT).unwrap(),
+                profile.as_os_str().as_bytes(),
+            )
+            .unwrap();
+            return;
+        }
+        let root = TestDir::new();
+        for index in 0..2 {
+            let mut child = ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mcp_shared_gate::tests::account_profile_does_not_follow_agent_or_home_environment"])
+                .env(CHILD, "1")
+                .env(OUTPUT, root.0.join(format!("profile-{index}")))
+                .env("HOME", root.0.join(format!("home-{index}")))
+                .env("PI_RS_HOME", root.0.join(format!("agent-{index}")))
+                .env("PI_CODING_AGENT_DIR", root.0.join(format!("coding-agent-{index}")))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn().unwrap());
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "profile child failed: {status}");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "profile child did not exit"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let first = std::fs::read(root.0.join("profile-0")).unwrap();
+        let second = std::fs::read(root.0.join("profile-1")).unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn gate_contends_between_processes_with_different_agent_directories() {
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "PI_RS_TEST_SHARED_GATE_PROCESS_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let gate = open_in_profile(&root).unwrap();
+            gate.lock().unwrap();
+            std::fs::write(root.join("ready"), b"ready").unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            while !root.join("release").exists() {
+                assert!(Instant::now() < until, "parent did not release child");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+        let root = TestDir::new();
+        let mut child = ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mcp_shared_gate::tests::gate_contends_between_processes_with_different_agent_directories"])
+            .env(CHILD, &root.0)
+            .env("HOME", root.0.join("other-home"))
+            .env("PI_RS_HOME", root.0.join("other-agent"))
+            .env("PI_CODING_AGENT_DIR", root.0.join("other-coding-agent"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().unwrap());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !root.0.join("ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before acquiring gate"
+            );
+            assert!(Instant::now() < until, "child did not acquire gate");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let gate = open_in_profile(&root.0).unwrap();
+        assert!(matches!(
+            gate.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        std::fs::write(root.0.join("release"), b"release").unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "child failed after release");
+                break;
+            }
+            assert!(Instant::now() < until, "child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        gate.try_lock().unwrap();
     }
     #[test]
     fn reject_directory_symlink_and_unsafe_permissions() {
