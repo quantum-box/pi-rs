@@ -3833,18 +3833,18 @@ matching the current Pi schema subset. The native agent records the actual
 strict-or-fallback decision before dispatch, normalizes a copy of strict tool
 arguments, and records authorized arguments before executing tools. Pending
 strict calls are polled using those recorded arguments and require a stable
-backend recovery identity. Grammar tool execution remains unsupported. The OpenAI
-Responses SDK can send explicitly supplied tool
-declarations with JSON Schema constraints when its caller supplies the model's
+backend recovery identity. Grammar tool execution remains unsupported. The
+OpenAI Responses SDK can send explicitly supplied tool declarations with JSON
+Schema constraints when its caller supplies the model's
 strict capability through prepared dispatch. Declaration-aware stream-only
 methods reject an effective strict decision before model dispatch because they
 cannot return that decision; preferred constraints may stream when they fall
 back to unconstrained sampling. Deferred preparation can resolve credentials,
 including running configured credential commands or refreshing credentials,
-before this rejection; authentication side effects are outside this guarantee. Callers must retain prepared decisions and normalize a
-copy of strict arguments before validation. Legacy
-model implementations reject required constraints and can fall back for
-preferred constraints.
+before this rejection; authentication side effects are outside this guarantee.
+Callers must retain prepared decisions and normalize a copy of strict arguments
+before validation. Legacy model implementations reject required constraints and
+can fall back for preferred constraints.
 Native tools can declare a constraint when registered; the registry retains
 that declaration alongside the registered tool definition. As in Pi, the
 native `read`, `write`, `edit`, and `bash` tools request preferred JSON Schema
@@ -3877,13 +3877,13 @@ constraints for declaration-aware and prepared dispatch. It enables strict mode
 only when `supportsStrictMode` is explicitly true, preserves `strict: false`
 for unconstrained or preferred fallback tools when supported, and omits the
 field otherwise. Required constraints fail before model dispatch when unsupported
-or unsafe to normalize. Prepared session and summary dispatch, including through resolved and deferred
-Workbench clients, bind decisions and budget estimates to the transformed wire
-schemas. Declaration-aware session and summary streams use the same prepared
+or unsafe to normalize. Prepared session and summary dispatch, including through
+resolved and deferred Workbench clients, bind decisions and budget estimates to
+the transformed wire schemas. Declaration-aware session and summary streams use the same prepared
 decision resolution through Client, WorkbenchModel, and context-prepared
 WorkbenchModel for both Chat Completions and Responses, but reject strict
-decisions and direct callers to prepared dispatch. Session dispatch applies the configured prompt-cache policy and
-external session key; summary dispatch suppresses automatic cache controls,
+decisions and direct callers to prepared dispatch. Session dispatch applies the
+configured prompt-cache policy and external session key; summary dispatch suppresses automatic cache controls,
 prompt-cache keys, and retention. Callers must normalize strict arguments
 before validation. Grammar declarations in Chat Completions currently fall back to
 ordinary function tools; custom grammar tools and their streaming/replay remain
