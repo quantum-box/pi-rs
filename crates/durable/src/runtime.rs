@@ -3970,6 +3970,54 @@ impl Harness {
         abort_tasks: &[crate::task_store::StoredTask],
         independent: Option<&crate::compact::CompactionResult>,
     ) -> Result<PreparedConversationSave, Error> {
+        self.prepare_conversation_save_impl(
+            state,
+            expected,
+            wake,
+            children,
+            abort_tasks,
+            independent,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn prepare_atomic_reset_save(
+        &self,
+        id: Uuid,
+        version: u64,
+        steps: &[ResetDerivationStep],
+    ) -> Result<PreparedConversationSave, Error> {
+        let cuts = self.derive_anchored_reset_states(id, version, steps)?;
+        let state = cuts
+            .last()
+            .ok_or_else(|| Error::Invalid("empty reset batch".into()))?;
+        self.prepare_conversation_save_impl(
+            state,
+            Expected::Version(version),
+            None,
+            &[],
+            &[],
+            None,
+            Some((steps, &cuts)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_conversation_save_impl(
+        &self,
+        state: &Conversation,
+        expected: Expected,
+        wake: Option<&crate::conversation_signal::PreparedWake>,
+        children: &[crate::task::Task],
+        abort_tasks: &[crate::task_store::StoredTask],
+        independent: Option<&crate::compact::CompactionResult>,
+        atomic_resets: Option<(&[ResetDerivationStep], &[Conversation])>,
+    ) -> Result<PreparedConversationSave, Error> {
+        #[cfg(not(test))]
+        if atomic_resets.is_some() {
+            return Err(Error::Invalid("atomic reset writer is test-only".into()));
+        }
         if self.failed
             || self.dirty.load(Ordering::Acquire)
             || self.storage_failed.load(Ordering::Acquire)
@@ -4079,28 +4127,39 @@ impl Harness {
         } else {
             false
         };
-        let reset_proven = old.is_some_and(|previous| {
-            state.block_reset_proof.as_ref().is_some_and(|proof| {
-                proof.previous_context == previous.context_generation
-                    && proof.previous_resets == previous.resets
-                    && proof.previous_messages == previous.messages
-                    && proof.previous_blocks == previous.content_blocks
-                    && !proof.placed_resets.is_empty()
-                    && !proof.overwritten_blocks
-                    && state.resets.len() == proof.previous_resets.len() + proof.placed_resets.len()
-                    && state.resets.starts_with(&proof.previous_resets)
-                    && state.resets[proof.previous_resets.len()..] == proof.placed_resets
-                    && state.context_generation != previous.context_generation
-                    && state.content_blocks == proof.blocks
-                    && state.messages == proof.messages
-            })
-        });
+        let reset_proven = atomic_resets.is_some()
+            || old.is_some_and(|previous| {
+                state.block_reset_proof.as_ref().is_some_and(|proof| {
+                    proof.previous_context == previous.context_generation
+                        && proof.previous_resets == previous.resets
+                        && proof.previous_messages == previous.messages
+                        && proof.previous_blocks == previous.content_blocks
+                        && !proof.placed_resets.is_empty()
+                        && !proof.overwritten_blocks
+                        && state.resets.len()
+                            == proof.previous_resets.len() + proof.placed_resets.len()
+                        && state.resets.starts_with(&proof.previous_resets)
+                        && state.resets[proof.previous_resets.len()..] == proof.placed_resets
+                        && state.context_generation != previous.context_generation
+                        && state.content_blocks == proof.blocks
+                        && state.messages == proof.messages
+                })
+            });
         if let Some(previous) = old {
             for (id, expected_blocks) in &previous.pending_reset_blocks {
                 if state.pending_reset_blocks.get(id) == Some(expected_blocks) {
                     continue;
                 }
-                let placed = reset_proven
+                let placed = atomic_resets.is_some_and(|(steps, cuts)| {
+                    steps.iter().zip(cuts).any(|(step, cut)| {
+                        step.reset_id == *id
+                            && cut
+                                .content_blocks
+                                .values()
+                                .take(expected_blocks.len())
+                                .eq(expected_blocks.iter())
+                    })
+                }) || reset_proven
                     && state.block_reset_proof.as_ref().is_some_and(|proof| {
                         proof
                             .placed_resets
@@ -4381,7 +4440,172 @@ impl Harness {
                 return Err(crate::transcript::Error::Corrupt.into());
             }
         }
-        let prepared = if expected == Expected::Missing
+        let mut atomic_evidence: Option<(u64, Vec<Check>, Vec<Mutation>)> = None;
+        let prepared = if let Some((steps, cuts)) = atomic_resets {
+            use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
+            if steps.len() < 2 || steps.len() != cuts.len() || cuts.len() > 64 {
+                return Err(Error::Invalid("invalid reset batch".into()));
+            }
+            let previous = old.ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let predecessor = previous
+                .transcript
+                .clone()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let store = self.owner.store();
+            let version = match expected {
+                Expected::Version(v) => v,
+                _ => return Err(crate::fork::Error::InvalidSnapshot.into()),
+            };
+            let sequence = store
+                .commit_for_version(&key, version)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let prefix = format!("runtime/fork/{}/", state.id);
+            let anchor_key = store
+                .runtime_canonical_snapshot_at(&key, prefix.as_bytes(), sequence)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            let observation: u64 = std::str::from_utf8(
+                anchor_key
+                    .strip_prefix(prefix.as_bytes())
+                    .ok_or(crate::fork::Error::InvalidSnapshot)?,
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            if anchor_key != format!("runtime/fork/{}/{observation:020}", state.id).as_bytes() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            let anchor_version = store
+                .get(&anchor_key)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?
+                .version;
+            let mut predecessor_event = b"durable/observer/".to_vec();
+            predecessor_event.extend_from_slice(state.id.as_bytes());
+            predecessor_event.extend_from_slice(b"/r");
+            predecessor_event.extend_from_slice(&observation.to_be_bytes());
+            let event_version = store
+                .get(&predecessor_event)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?
+                .version;
+            let verified_cuts = self.derive_anchored_reset_states(state.id, version, steps)?;
+            if verified_cuts.len() != cuts.len() {
+                return Err(crate::fork::Error::InvalidSnapshot.into());
+            }
+            for (a, b) in verified_cuts.iter().zip(cuts) {
+                if serde_json::to_value(a)? != serde_json::to_value(b)?
+                    || a.content_blocks != b.content_blocks
+                {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+            }
+            let revision = store.document_snapshot()?;
+            let (_, created) = self.resolved_occurrences_with_ids(state.id, predecessor.clone())?;
+            let mut seen = created;
+            let mut records = Vec::with_capacity(cuts.len());
+            for cut in cuts {
+                let mut ids: Vec<_> = cut.messages.iter().map(|_| Uuid::new_v4()).collect();
+                for (&index, binding) in &cut.content_blocks {
+                    *ids.get_mut(index)
+                        .ok_or(crate::transcript::Error::Corrupt)? = binding.message_id;
+                }
+                if ids.iter().any(|id| id.is_nil() || !seen.insert(*id)) {
+                    return Err(crate::transcript::Error::Corrupt.into());
+                }
+                let change = TranscriptChange::ReplaceV2 {
+                    messages: cut.messages.clone(),
+                    ids,
+                    commit,
+                    origin: state.id,
+                };
+                let blocks = (!cut.content_blocks.is_empty())
+                    .then(|| cut.content_blocks.values().cloned().collect());
+                records.push((serde_json::to_value(change)?, blocks));
+            }
+            let (batch, positions) = crate::transcript::Transcript::new(store, state.id)
+                .prepare_append_batch(&records)?;
+            let manifest_cursor =
+                |cursor: &crate::transcript::Cursor| -> Result<ManifestCursor, Error> {
+                    Ok(serde_json::from_value(serde_json::to_value(cursor)?)?)
+                };
+            let mut manifest_cuts = Vec::with_capacity(cuts.len());
+            for ((step, cut), cursor) in steps.iter().zip(cuts).zip(&positions) {
+                let value = serde_json::json!({"state":cut,"blocks":cut.content_blocks});
+                manifest_cuts.push(ResetCut {
+                    reset_id: step.reset_id,
+                    context_generation: step.context_generation,
+                    write_limit: if step.write_limit == usize::MAX {
+                        u64::MAX
+                    } else {
+                        u64::try_from(step.write_limit)
+                            .map_err(|_| Error::Invalid("reset write limit".into()))?
+                    },
+                    cursor: manifest_cursor(cursor)?,
+                    state_sha256: reset_baseline_digest(&value)?,
+                });
+            }
+            let anchor_cursor = positions
+                .last()
+                .ok_or(crate::transcript::Error::Corrupt)?
+                .clone();
+            let binding = ExpectedBinding {
+                conversation_id: state.id,
+                predecessor_observation: observation,
+                predecessor_root_version: version,
+                anchor_observation: commit,
+                document_revision: revision,
+                predecessor_context_generation: previous.context_generation,
+                predecessor_cursor: manifest_cursor(&predecessor)?,
+                anchor_cursor: manifest_cursor(&anchor_cursor)?,
+                cuts: manifest_cuts,
+            };
+            let manifest = ResetManifest {
+                version: 1,
+                conversation_id: binding.conversation_id,
+                predecessor_observation: binding.predecessor_observation,
+                predecessor_root_version: binding.predecessor_root_version,
+                anchor_observation: binding.anchor_observation,
+                document_revision: binding.document_revision,
+                predecessor_context_generation: binding.predecessor_context_generation,
+                predecessor_cursor: binding.predecessor_cursor.clone(),
+                anchor_cursor: binding.anchor_cursor.clone(),
+                cuts: binding.cuts.clone(),
+            };
+            let bytes = manifest
+                .encode(&binding)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            let mut checks = vec![
+                Check {
+                    key: anchor_key,
+                    expected: Expected::Version(anchor_version),
+                },
+                Check {
+                    key: predecessor_event,
+                    expected: Expected::Version(event_version),
+                },
+                Check {
+                    key: b"durable/document-fork-revision".to_vec(),
+                    expected: Expected::DocumentRevision(revision),
+                },
+            ];
+            let mut mutations = Vec::new();
+            for position in &positions {
+                let (entry, sequence) = position
+                    .entry_identity()
+                    .ok_or(crate::transcript::Error::Corrupt)?;
+                let mut key = crate::reset_manifest::candidate_prefix(state.id, entry, sequence);
+                key.extend_from_slice(Uuid::new_v4().to_string().as_bytes());
+                checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                mutations.push(Mutation::Put {
+                    key,
+                    value: bytes.clone(),
+                });
+            }
+            atomic_evidence = Some((revision, checks, mutations));
+            state.transcript = Some(anchor_cursor);
+            Some(batch)
+        } else if expected == Expected::Missing
             && let Some(len) = state.block_fork_cut
         {
             let source = state
@@ -4557,6 +4781,9 @@ impl Harness {
             Vec::new()
         };
         checks.extend(append.checks);
+        if let Some((_, evidence_checks, _)) = &atomic_evidence {
+            checks.extend(evidence_checks.clone());
+        }
         checks.push(Check {
             key: fork_key.clone(),
             expected: Expected::Missing,
@@ -4602,6 +4829,9 @@ impl Harness {
             }
         }
         mutations.extend(transcript_mutations);
+        if let Some((_, _, evidence_mutations)) = atomic_evidence {
+            mutations.extend(evidence_mutations);
+        }
         mutations.extend(append.mutations);
         mutations.push(Mutation::Put {
             key: fork_key,
@@ -21529,6 +21759,10 @@ mod scheduler_tests {
 #[cfg(test)]
 #[path = "runtime_cas_tests.rs"]
 mod runtime_cas_tests;
+
+#[cfg(test)]
+#[path = "runtime_atomic_reset_tests.rs"]
+mod runtime_atomic_reset_tests;
 
 #[cfg(test)]
 mod tool_allowlist_tests {

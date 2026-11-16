@@ -31,7 +31,7 @@ pub(crate) enum LookupError {
     Invalid,
 }
 
-fn candidate_prefix(id: Uuid, entry: Uuid, sequence: u64) -> Vec<u8> {
+pub(crate) fn candidate_prefix(id: Uuid, entry: Uuid, sequence: u64) -> Vec<u8> {
     format!("runtime/reset-manifest/{id}/{entry}/{sequence:020}/").into_bytes()
 }
 
