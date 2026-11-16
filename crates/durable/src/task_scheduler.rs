@@ -329,7 +329,18 @@ impl FailurePublication {
         if state.poisoned {
             return false;
         }
-        if state.failed_handlers.is_empty() {
+        let pending: Vec<_> = state
+            .failed_handlers
+            .iter()
+            .copied()
+            .chain(
+                state
+                    .published
+                    .iter()
+                    .filter_map(|(id, abort)| abort.then_some(*id)),
+            )
+            .collect();
+        if pending.is_empty() {
             return true;
         }
         let edges = crate::ownership_edge::EdgeStore::new(owner.store());
@@ -357,7 +368,7 @@ impl FailurePublication {
         let Some(root) = root else {
             return false;
         };
-        state.failed_handlers.iter().all(|id| {
+        pending.iter().all(|id| {
             TaskStore::new(owner.store())
                 .load(*id)
                 .ok()

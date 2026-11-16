@@ -243,12 +243,6 @@ impl Driver {
         Ok(state)
     }
     pub fn submit(&self, task: &Task) -> Result<(), Error> {
-        // Never wait here: callers may already hold a conversation gate.
-        let _publication = self
-            .shared
-            .failure_publication
-            .try_lock()
-            .map_err(|_| task_scheduler::Error::Busy)?;
         let state = self.check()?;
         let registered = task
             .kind()
@@ -266,6 +260,13 @@ impl Driver {
             .task_gate()
             .lock()
             .map_err(|_| Error::Poisoned)?;
+        // Admissions share the task gate, so unrelated admissions cannot
+        // spuriously collide on the nonblocking publication fence.
+        let _publication = self
+            .shared
+            .failure_publication
+            .try_lock()
+            .map_err(|_| task_scheduler::Error::Busy)?;
         if let TaskOwner::Conversation(id) = task.owner() {
             if !self
                 .shared
@@ -1215,10 +1216,6 @@ impl Shared {
         conversation: Uuid,
         f: impl FnOnce() -> Result<T, crate::runtime::Error>,
     ) -> Result<T, crate::runtime::Error> {
-        let _publication = self
-            .failure_publication
-            .try_lock()
-            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
         let state = self
             .state
             .lock()
@@ -1243,6 +1240,10 @@ impl Shared {
             .task_gate()
             .lock()
             .map_err(|_| crate::runtime::Error::Failed)?;
+        let _publication = self
+            .failure_publication
+            .try_lock()
+            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
         if !self
             .failure_publication
             .permits_admission(&self.owner, conversation, None)
@@ -1278,10 +1279,6 @@ impl Shared {
         conversation: Uuid,
         f: impl FnOnce(u64) -> Result<T, crate::runtime::Error>,
     ) -> Result<T, crate::runtime::Error> {
-        let _publication = self
-            .failure_publication
-            .try_lock()
-            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
         let state = self
             .state
             .lock()
@@ -1333,6 +1330,10 @@ impl Shared {
             .task_gate()
             .lock()
             .map_err(|_| crate::runtime::Error::Failed)?;
+        let _publication = self
+            .failure_publication
+            .try_lock()
+            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
         let store = self.owner.store();
         let tasks = TaskStore::new(store);
         if !self
@@ -1565,6 +1566,18 @@ impl Shared {
             .task_gate()
             .lock()
             .map_err(|_| crate::runtime::Error::Failed)?;
+        let _publication = self
+            .failure_publication
+            .try_lock()
+            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
+        if !self
+            .failure_publication
+            .permits_admission(&self.owner, conversation, None)
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "task failure fences admission".into(),
+            ));
+        }
         let result = f();
         if result.is_ok() {
             self.notify_work();
@@ -1597,12 +1610,15 @@ mod tests {
 
     #[test]
     fn published_handler_failure_fences_admissions_before_running_record_settles() {
-        for panic_handler in [false, true] {
+        for outcome in 0..3 {
             let dir = tempfile::tempdir().unwrap();
             let mut registry = task_scheduler::Registry::default();
             registry.register("work", false, move |_: &Task| {
-                if panic_handler {
+                if outcome == 1 {
                     panic!("test handler panic");
+                }
+                if outcome == 2 {
+                    return Ok(task_scheduler::Step::Fail("test failure".into()));
                 }
                 Err("test handler error".into())
             });
@@ -1710,7 +1726,7 @@ mod tests {
             thread.join().unwrap();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invocation.execute()));
-            assert_eq!(result.is_err(), panic_handler);
+            assert_eq!(result.is_err(), outcome == 1);
             assert_eq!(
                 TaskStore::new(shared.owner.store())
                     .load(parent.id())
@@ -1743,9 +1759,35 @@ mod tests {
                     .with_admission(&[child], owned_conversation, || Ok(()))
                     .is_err()
             );
+            assert!(
+                shared
+                    .with_hook_children(&[], &[], owned_conversation, || Ok(()))
+                    .is_err()
+            );
             let independent = make_task(4, TaskOwner::Conversation(unrelated));
             driver.submit(&independent).unwrap();
             assert!(shared.with_admission(&[], unrelated, || Ok(())).is_ok());
+            let first = shared.clone();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let one = thread::spawn(move || {
+                first.with_admission(&[], unrelated, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let second = shared.clone();
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let two = thread::spawn(move || {
+                attempt_tx.send(()).unwrap();
+                second.with_admission(&[], unrelated, || Ok(()))
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            release_tx.send(()).unwrap();
+            assert!(one.join().unwrap().is_ok());
+            assert!(two.join().unwrap().is_ok());
         }
     }
 
