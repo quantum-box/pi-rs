@@ -1312,8 +1312,7 @@ impl Shared {
                             ))
                             || intent.parent.task.state() != &TaskState::Running
                             || intent.parent.task.abort_requested()
-                            || intent.parent.task.attempt_id().is_none()
-                            || intent.parent.task.is_task_tool()))
+                            || intent.parent.task.attempt_id().is_none()))
             })
         {
             return Err(crate::runtime::Error::Invalid(
