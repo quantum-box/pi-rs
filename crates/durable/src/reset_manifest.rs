@@ -20,6 +20,11 @@ pub(crate) const MANIFEST_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_TRAILING_ENTRIES: u64 = 64;
 const MAX_FINITE_WRITE_LIMIT: u64 = 1_000_000;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RESET_MANIFEST_CHUNK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A same-commit candidate, not a decoded or authenticated manifest. The
 /// caller must independently derive and validate its binding before use.
 pub(crate) struct RawCandidate {
@@ -172,6 +177,8 @@ pub(crate) fn lookup_candidate(
                 }
                 let mut bytes = Vec::new();
                 for index in 0..header.chunks {
+                    #[cfg(test)]
+                    RESET_MANIFEST_CHUNK_READS.with(|count| count.set(count.get() + 1));
                     let chunk_key = chunk_key(id, reference.batch, index);
                     let chunk = store
                         .get_bounded(&chunk_key, MANIFEST_CHUNK_BYTES)?

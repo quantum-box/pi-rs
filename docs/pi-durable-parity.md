@@ -749,3 +749,5 @@ A conversation run is currently a persisted phase, not a task-graph task, so nei
 **Large snapshot proof lookup:** Runtime-owned root, fork snapshot and observer records are not subject to an independent 8 MiB lookup cap. The same namespace-trust requirement applies; hosts should bound admitted conversation data according to their resource limits.
 
 **Late block reset validation:** Ordered reset derivation validates the pending and placed identity sets once, then updates the pending set as each reset is placed. This preserves reset and block identity checks without repeatedly scanning a large queue when a block-bearing reset is near its end.
+
+**Predecessor batch fencing:** A later reset proof reads a shared predecessor manifest and its chunks once per predecessor batch, then checks each cut reference and transcript entry against that same commit. The dependent transaction retains the manifest, chunk, reference, anchor and entry fences.

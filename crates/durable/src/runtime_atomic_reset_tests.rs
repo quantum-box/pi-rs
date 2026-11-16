@@ -1476,6 +1476,110 @@ fn repeated_atomic_failure_batches_keep_prior_fork_proofs() {
 }
 
 #[test]
+fn later_batch_reuses_chunked_predecessor_evidence_and_fences_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, _) = setup_with_adapter(&path, true);
+    add_many_resets(&mut h, id);
+    for _ in 66..350 {
+        h.reset_with_blocks(
+            id,
+            Some("more".into()),
+            vec![vec![serde_json::json!({"type":"text","text":"block"})]],
+        )
+        .unwrap();
+    }
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    for batch in 0..2 {
+        h.submit(id, None, format!("replacement {batch}")).unwrap();
+        if batch == 1 {
+            for _ in 0..2 {
+                h.reset_with_blocks(
+                    id,
+                    Some("next".into()),
+                    vec![vec![serde_json::json!({"type":"text","text":"block"})]],
+                )
+                .unwrap();
+            }
+        }
+        let (mut stopped, version) = h.load(id).unwrap();
+        stopped.phase = Phase::FailedModel {
+            turns: 0,
+            request_id: Uuid::new_v4(),
+            reason: "error".into(),
+            decision: ModelFailureDecision::Stop,
+        };
+        h.save(&stopped, Expected::Version(version)).unwrap();
+        let (mut failure, version) = h.load(id).unwrap();
+        finish_failure(&mut failure, "error".into(), FailureCause::ModelError);
+        RESET_FORCE_CHUNKED.with(|flag| flag.set(batch == 0));
+        let result = h.save(&failure, Expected::Version(version));
+        RESET_FORCE_CHUNKED.with(|flag| flag.set(false));
+        result.unwrap();
+    }
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let prefix = format!("runtime/reset-batch/{id}/");
+    assert!(
+        h.owner
+            .store()
+            .prefix_keys_bounded(prefix.as_bytes(), 16, prefix.len() + 64)
+            .unwrap()
+            .len()
+            >= 3
+    );
+    let (state, _) = h.load(id).unwrap();
+    let observation = crate::observer::Observer::new(h.owner.store(), id)
+        .head()
+        .unwrap()
+        .0;
+    let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
+    let tail = transcript
+        .read_with_blocks(
+            state.transcript.as_ref().unwrap(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap();
+    let second = transcript
+        .read_with_blocks(&tail.next, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    let target = second.next;
+    crate::reset_manifest::RESET_MANIFEST_CHUNK_READS.with(|count| count.set(0));
+    let (_, _, checks) = h.prove_failure_reset_cut(id, &target, observation).unwrap();
+    let reads = crate::reset_manifest::RESET_MANIFEST_CHUNK_READS.with(std::cell::Cell::get);
+    assert!(reads <= 12, "read {reads} predecessor chunks for 350 cuts");
+    assert!(checks.len() < 350 * 20, "{} evidence checks", checks.len());
+    let candidate_prefix = format!("runtime/reset-manifest/{id}/");
+    assert!(
+        checks
+            .iter()
+            .filter(|check| check.key.starts_with(candidate_prefix.as_bytes())
+                && matches!(check.expected, Expected::Version(_)))
+            .count()
+            >= 350
+    );
+    let chunk = checks
+        .iter()
+        .find(|check| {
+            check
+                .key
+                .starts_with(format!("runtime/reset-batch/{id}/").as_bytes())
+                && check.key.iter().filter(|byte| **byte == b'/').count() == 4
+        })
+        .unwrap()
+        .key
+        .clone();
+    let value = h.owner.store().get(&chunk).unwrap().unwrap().value;
+    h.owner
+        .store()
+        .commit(&[], &[Mutation::Put { key: chunk, value }])
+        .unwrap();
+    assert!(h.owner.store().commit(&checks, &[]).is_err());
+    assert!(h.prove_failure_reset_cut(id, &target, observation).is_err());
+}
+
+#[test]
 fn production_replays_nothing_to_answer_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");

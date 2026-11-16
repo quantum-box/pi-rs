@@ -9351,11 +9351,17 @@ impl Harness {
         // The predecessor's occurrence proof reads its entire immutable chain.
         // Fence those records and their runtime anchors too: otherwise an old
         // entry could change after replay but before the dependent fork commits.
+        struct PriorAnchorEvidence {
+            fork: Vec<u8>,
+            transcript: Option<serde_json::Value>,
+            shared: Option<(crate::reset_manifest::SharedReference, u64)>,
+        }
+        let mut prior_anchors: HashMap<(Uuid, u64), PriorAnchorEvidence> = HashMap::new();
         let mut prior = predecessor_cursor.clone();
         loop {
             let (key, version) = transcript.entry_evidence(&prior)?;
             checks.push(Check {
-                key,
+                key: key.clone(),
                 expected: Expected::Version(version),
             });
             let page = transcript.read_with_blocks(&prior, std::num::NonZeroUsize::MIN)?;
@@ -9370,34 +9376,77 @@ impl Harness {
                     .map(|(_, commit, origin)| (origin, commit)),
             };
             if let Some((origin, commit)) = origin_commit {
-                let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
-                let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
-                let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+                if !prior_anchors.contains_key(&(origin, commit)) {
+                    let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+                    let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
+                    let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+                    checks.push(Check {
+                        key: fork.clone(),
+                        expected: Expected::Version(snapshot.version),
+                    });
+                    let mut event = b"durable/observer/".to_vec();
+                    event.extend_from_slice(origin.as_bytes());
+                    event.extend_from_slice(b"/r");
+                    event.extend_from_slice(&commit.to_be_bytes());
+                    let version = store.get(&event)?.ok_or_else(invalid)?.version;
+                    checks.push(Check {
+                        key: event,
+                        expected: Expected::Version(version),
+                    });
+                    prior_anchors.insert(
+                        (origin, commit),
+                        PriorAnchorEvidence {
+                            fork,
+                            transcript: value.get("_transcript").cloned(),
+                            shared: None,
+                        },
+                    );
+                }
+                let anchor = prior_anchors
+                    .get_mut(&(origin, commit))
+                    .ok_or_else(invalid)?;
                 let mut original = serde_json::to_value(&prior)?;
                 original["transcript"] = serde_json::to_value(origin)?;
                 let original: crate::transcript::Cursor = serde_json::from_value(original)?;
-                if value.get("_transcript") != Some(&serde_json::to_value(&original)?) {
-                    let revision = store.document_cut(&fork)?.ok_or_else(invalid)?;
-                    let evidence = crate::reset_manifest::lookup_candidate(
-                        store, origin, &original, commit, revision,
-                    )
-                    .map_err(|_| invalid())?
-                    .ok_or_else(invalid)?;
-                    checks.extend(evidence.checks);
+                if anchor.transcript.as_ref() != Some(&serde_json::to_value(&original)?) {
+                    if let Some((reference, sequence)) = &anchor.shared {
+                        let captured: crate::transcript::Cursor =
+                            serde_json::from_value(anchor.transcript.clone().ok_or_else(invalid)?)?;
+                        let (_, captured_sequence) =
+                            captured.entry_identity().ok_or_else(invalid)?;
+                        let (_, original_sequence) =
+                            original.entry_identity().ok_or_else(invalid)?;
+                        if captured.transcript_id() != origin
+                            || captured_sequence < original_sequence
+                        {
+                            return Err(invalid());
+                        }
+                        if store.commit_for_version(&key, version)? != Some(*sequence) {
+                            return Err(invalid());
+                        }
+                        checks.extend(
+                            crate::reset_manifest::lookup_shared_reference_checks(
+                                store, origin, &original, reference, *sequence,
+                            )
+                            .map_err(|_| invalid())?,
+                        );
+                    } else {
+                        let revision = store.document_cut(&anchor.fork)?.ok_or_else(invalid)?;
+                        let evidence = crate::reset_manifest::lookup_candidate(
+                            store, origin, &original, commit, revision,
+                        )
+                        .map_err(|_| invalid())?
+                        .ok_or_else(invalid)?;
+                        if let Some(reference) = evidence.shared_reference {
+                            let snapshot = store.get(&anchor.fork)?.ok_or_else(invalid)?;
+                            let sequence = store
+                                .commit_for_version(&anchor.fork, snapshot.version)?
+                                .ok_or_else(invalid)?;
+                            anchor.shared = Some((reference, sequence));
+                        }
+                        checks.extend(evidence.checks);
+                    }
                 }
-                checks.push(Check {
-                    key: fork,
-                    expected: Expected::Version(snapshot.version),
-                });
-                let mut event = b"durable/observer/".to_vec();
-                event.extend_from_slice(origin.as_bytes());
-                event.extend_from_slice(b"/r");
-                event.extend_from_slice(&commit.to_be_bytes());
-                let version = store.get(&event)?.ok_or_else(invalid)?.version;
-                checks.push(Check {
-                    key: event,
-                    expected: Expected::Version(version),
-                });
             }
             if !page.has_more {
                 break;
