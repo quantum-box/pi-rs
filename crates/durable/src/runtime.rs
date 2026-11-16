@@ -3092,10 +3092,119 @@ pub(crate) struct PreparedConversationSave {
 // active; never reuse evidence across operations or across store owners.
 type ResetProofKey = (usize, Uuid, Uuid, u64, u64);
 type ResetProofValue = (Conversation, u64, Vec<Check>);
+type ResetBatchKey = (usize, Uuid, u64);
+struct ResetBatchProof {
+    manifest: Vec<u8>,
+    shared_reference: Option<crate::reset_manifest::SharedReference>,
+    commit_sequence: u64,
+    baseline: Conversation,
+    steps: Vec<ResetDerivationStep>,
+    positions: Vec<crate::transcript::Cursor>,
+    position_index: HashMap<(Uuid, u64), usize>,
+    revision: u64,
+    checks: std::cell::RefCell<Vec<Check>>,
+    checked_sequence: std::cell::Cell<Option<u64>>,
+    checked_references: std::cell::RefCell<std::collections::HashSet<(Uuid, u64)>>,
+    traversal: std::cell::RefCell<Option<(usize, Conversation)>>,
+    undo: Vec<ResetUndo>,
+}
+
+struct ResetUndo {
+    marker: crate::reset::Reset,
+    additions: Option<Vec<crate::transcript::MessageContentBlocks>>,
+    messages: Vec<Message>,
+    blocks: std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    context: Option<Uuid>,
+    occurrence_proven: bool,
+    auto_compaction_attempted: bool,
+    proof: Option<(
+        bool,
+        Vec<Message>,
+        std::collections::BTreeMap<usize, crate::transcript::MessageContentBlocks>,
+    )>,
+    placed_writes: Vec<usize>,
+}
+
+impl ResetUndo {
+    fn capture(state: &Conversation, step: &ResetDerivationStep) -> Self {
+        Self {
+            marker: state.pending_resets[0].clone(),
+            additions: state.pending_reset_blocks.get(&step.reset_id).cloned(),
+            messages: state.messages.clone(),
+            blocks: state.content_blocks.clone(),
+            context: state.context_generation,
+            occurrence_proven: state.occurrence_epoch_proven,
+            auto_compaction_attempted: state.auto_compaction_attempted,
+            proof: state.block_reset_proof.as_ref().map(|proof| {
+                (
+                    proof.overwritten_blocks,
+                    proof.messages.clone(),
+                    proof.blocks.clone(),
+                )
+            }),
+            placed_writes: state
+                .application_writes
+                .iter()
+                .take(step.write_limit)
+                .enumerate()
+                .filter_map(|(i, write)| {
+                    (!write.placed && !write.withdrawn && write.after_reset == Some(step.reset_id))
+                        .then_some(i)
+                })
+                .collect(),
+        }
+    }
+
+    fn restore(&self, state: &mut Conversation) -> Result<(), Error> {
+        if state
+            .resets
+            .pop()
+            .is_none_or(|reset| reset.id != self.marker.id)
+        {
+            return Err(crate::fork::Error::InvalidSnapshot.into());
+        }
+        state.pending_resets.insert(0, self.marker.clone());
+        if let Some(additions) = &self.additions {
+            state
+                .pending_reset_blocks
+                .insert(self.marker.id, additions.clone());
+        }
+        state.messages = self.messages.clone();
+        state.content_blocks = self.blocks.clone();
+        state.context_generation = self.context;
+        state.occurrence_epoch_proven = self.occurrence_proven;
+        state.auto_compaction_attempted = self.auto_compaction_attempted;
+        for &index in &self.placed_writes {
+            state.application_writes[index].placed = false;
+        }
+        if let Some((overwritten, messages, blocks)) = &self.proof {
+            let proof = state
+                .block_reset_proof
+                .as_mut()
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+            proof.placed_resets.pop();
+            proof.overwritten_blocks = *overwritten;
+            proof.messages = messages.clone();
+            proof.blocks = blocks.clone();
+        } else {
+            state.block_reset_proof = None;
+        }
+        Ok(())
+    }
+}
 thread_local! {
     static RESET_PROOF_MEMO: std::cell::RefCell<Option<HashMap<ResetProofKey, ResetProofValue>>> = const { std::cell::RefCell::new(None) };
+    static RESET_BATCH_MEMO: std::cell::RefCell<Option<HashMap<ResetBatchKey, std::rc::Rc<ResetBatchProof>>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static RESET_PROOF_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static RESET_PROOF_TRANSITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static RESET_PROOF_CHECK_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static RESET_PENDING_VALIDATION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static RESET_FORCE_CHUNKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static RESET_PROOF_BEFORE_SAVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -3104,6 +3213,7 @@ impl ResetProofScope {
     fn reset_owned(&self) {
         if self.0 {
             RESET_PROOF_MEMO.with(|memo| *memo.borrow_mut() = Some(HashMap::new()));
+            RESET_BATCH_MEMO.with(|memo| *memo.borrow_mut() = Some(HashMap::new()));
         }
     }
     fn enter() -> Self {
@@ -3113,6 +3223,7 @@ impl ResetProofScope {
                 false
             } else {
                 *memo = Some(HashMap::new());
+                RESET_BATCH_MEMO.with(|memo| *memo.borrow_mut() = Some(HashMap::new()));
                 true
             }
         }))
@@ -3122,6 +3233,7 @@ impl Drop for ResetProofScope {
     fn drop(&mut self) {
         if self.0 {
             RESET_PROOF_MEMO.with(|memo| *memo.borrow_mut() = None);
+            RESET_BATCH_MEMO.with(|memo| *memo.borrow_mut() = None);
         }
     }
 }
@@ -3155,6 +3267,15 @@ fn cached_reset_proof_checks(owner: &Arc<OwnedStore>) -> Vec<Check> {
                 }
             }
         }
+        RESET_BATCH_MEMO.with(|batches| {
+            if let Some(batches) = batches.borrow().as_ref() {
+                for (key, value) in batches {
+                    if key.0 == identity {
+                        merge_reset_proof_checks(&mut checks, value.checks.borrow().clone());
+                    }
+                }
+            }
+        });
         checks
     })
 }
@@ -3163,8 +3284,8 @@ type AtomicFailureResetSelection = (u64, Vec<ResetDerivationStep>, Vec<Check>);
 
 struct AtomicResetPlan<'a> {
     steps: &'a [ResetDerivationStep],
-    cuts: &'a [Conversation],
-    failure_base: Option<&'a Conversation>,
+    base: &'a Conversation,
+    failure: bool,
 }
 
 impl PreparedConversationSave {
@@ -5685,12 +5806,10 @@ impl Harness {
         version: u64,
         steps: &[ResetDerivationStep],
     ) -> Result<PreparedConversationSave, Error> {
-        let cuts = self.derive_anchored_reset_states(id, version, steps)?;
-        let state = cuts
-            .last()
-            .ok_or_else(|| Error::Invalid("empty reset batch".into()))?;
+        let base = self.anchored_reset_baseline(id, version)?;
+        let state = visit_ordered_reset_states(&base, steps, |_| Ok(()))?;
         self.prepare_conversation_save_impl(
-            state,
+            &state,
             Expected::Version(version),
             None,
             &[],
@@ -5698,8 +5817,8 @@ impl Harness {
             None,
             Some(AtomicResetPlan {
                 steps,
-                cuts: &cuts,
-                failure_base: None,
+                base: &base,
+                failure: false,
             }),
         )
     }
@@ -5720,7 +5839,7 @@ impl Harness {
         if base_version != version
             || baseline.abort_requested
             || baseline.after_failed_run != AfterFailedRun::Continue
-            || !(2..=64).contains(&baseline.pending_resets.len())
+            || baseline.pending_resets.len() < 2
             || baseline.pending_reset_blocks.is_empty()
             || baseline.pending_independent_summary.is_some()
             || !baseline
@@ -5758,12 +5877,12 @@ impl Harness {
             })
             .collect();
         apply_failed_run_policy(&mut replay);
-        let cuts = derive_ordered_reset_states(&replay, &steps)?;
-        if cuts.last().is_none_or(|cut| {
-            cut.application_writes
-                .iter()
-                .any(|w| !w.placed && !w.withdrawn)
-        }) {
+        let final_cut = visit_ordered_reset_states(&replay, &steps, |_| Ok(()))?;
+        if final_cut
+            .application_writes
+            .iter()
+            .any(|w| !w.placed && !w.withdrawn)
+        {
             return Ok(None);
         }
         Ok(Some((*version, steps, source_checks)))
@@ -5778,7 +5897,7 @@ impl Harness {
     ) -> Result<PreparedConversationSave, Error> {
         // Authenticate the actual predecessor before deriving from the caller's
         // post-failure candidate. This entry point is not a production boundary.
-        self.derive_anchored_reset_states(failure.id, version, steps)?;
+        self.anchored_reset_baseline(failure.id, version)?;
         if !matches!(failure.phase, Phase::FailedIdle)
             || failure.abort_requested
             || failure.after_failed_run != AfterFailedRun::Continue
@@ -5787,11 +5906,7 @@ impl Harness {
         }
         let mut base = failure.clone();
         apply_failed_run_policy(&mut base);
-        let cuts = derive_ordered_reset_states(&base, steps)?;
-        let mut final_state = cuts
-            .last()
-            .ok_or_else(|| Error::Invalid("empty reset batch".into()))?
-            .clone();
+        let mut final_state = visit_ordered_reset_states(&base, steps, |_| Ok(()))?;
         if !final_state.pending_resets.is_empty()
             || final_state.pending_independent_summary.is_some()
             || final_state
@@ -5821,8 +5936,8 @@ impl Harness {
             None,
             Some(AtomicResetPlan {
                 steps,
-                cuts: &cuts,
-                failure_base: Some(&base),
+                base: &base,
+                failure: true,
             }),
         )
     }
@@ -5974,14 +6089,8 @@ impl Harness {
                     continue;
                 }
                 let placed = atomic_resets.as_ref().is_some_and(|plan| {
-                    plan.steps.iter().zip(plan.cuts).any(|(step, cut)| {
-                        step.reset_id == *id
-                            && cut
-                                .content_blocks
-                                .values()
-                                .take(expected_blocks.len())
-                                .eq(expected_blocks.iter())
-                    })
+                    plan.base.pending_reset_blocks.get(id) == Some(expected_blocks)
+                        && plan.steps.iter().any(|step| step.reset_id == *id)
                 }) || reset_proven
                     && state.block_reset_proof.as_ref().is_some_and(|proof| {
                         proof
@@ -6266,9 +6375,8 @@ impl Harness {
         let mut atomic_evidence: Option<(u64, Vec<Check>, Vec<Mutation>)> = None;
         let prepared = if let Some(plan) = atomic_resets {
             let steps = plan.steps;
-            let cuts = plan.cuts;
             use crate::reset_manifest::{ExpectedBinding, ManifestCursor, ResetCut, ResetManifest};
-            if steps.len() < 2 || steps.len() != cuts.len() || cuts.len() > 64 {
+            if steps.len() < 2 {
                 return Err(Error::Invalid("invalid reset batch".into()));
             }
             let previous = old.ok_or(crate::fork::Error::InvalidSnapshot)?;
@@ -6311,27 +6419,27 @@ impl Harness {
                 .get(&predecessor_event)?
                 .ok_or(crate::fork::Error::InvalidSnapshot)?
                 .version;
-            let anchored_cuts = self.derive_anchored_reset_states(state.id, version, steps)?;
-            let verified_cuts = if let Some(base) = plan.failure_base {
-                derive_ordered_reset_states(base, steps)?
-            } else {
-                anchored_cuts
-            };
-            if verified_cuts.len() != cuts.len() {
+            let anchored = self.anchored_reset_baseline(state.id, version)?;
+            if !plan.failure
+                && (serde_json::to_value(&anchored)? != serde_json::to_value(plan.base)?
+                    || anchored.messages != plan.base.messages
+                    || anchored.content_blocks != plan.base.content_blocks)
+            {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
-            }
-            for (a, b) in verified_cuts.iter().zip(cuts) {
-                if serde_json::to_value(a)? != serde_json::to_value(b)?
-                    || a.content_blocks != b.content_blocks
-                {
-                    return Err(crate::fork::Error::InvalidSnapshot.into());
-                }
             }
             let revision = store.document_snapshot()?;
             let (_, created) = self.resolved_occurrences_with_ids(state.id, predecessor.clone())?;
             let mut seen = created;
-            let mut records = Vec::with_capacity(cuts.len());
-            for cut in cuts {
+            #[cfg(test)]
+            let force_chunked = RESET_FORCE_CHUNKED.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let force_chunked = false;
+            let version_three =
+                steps.len() > crate::reset_manifest::MAX_SHARED_CUTS || force_chunked;
+            let mut records = Vec::with_capacity(steps.len());
+            let mut digests = Vec::with_capacity(steps.len());
+            let mut delta_digests = Vec::with_capacity(steps.len());
+            let last = visit_ordered_reset_states(plan.base, steps, |cut| {
                 let mut ids: Vec<_> = cut.messages.iter().map(|_| Uuid::new_v4()).collect();
                 for (&index, binding) in &cut.content_blocks {
                     *ids.get_mut(index)
@@ -6349,9 +6457,16 @@ impl Harness {
                 let blocks = (!cut.content_blocks.is_empty())
                     .then(|| cut.content_blocks.values().cloned().collect());
                 records.push((serde_json::to_value(change)?, blocks));
-            }
-            if plan.failure_base.is_some() {
-                let last = cuts.last().ok_or(crate::transcript::Error::Corrupt)?;
+                let delta = reset_cut_delta_digest(&steps[digests.len()], cut)?;
+                digests.push(if version_three {
+                    delta.clone()
+                } else {
+                    reset_cut_digest(&serde_json::json!({"state":cut,"blocks":cut.content_blocks}))?
+                });
+                delta_digests.push(delta);
+                Ok(())
+            })?;
+            if plan.failure {
                 if !state.messages.starts_with(&last.messages)
                     || last
                         .content_blocks
@@ -6395,9 +6510,8 @@ impl Harness {
                 |cursor: &crate::transcript::Cursor| -> Result<ManifestCursor, Error> {
                     Ok(serde_json::from_value(serde_json::to_value(cursor)?)?)
                 };
-            let mut manifest_cuts = Vec::with_capacity(cuts.len());
-            for ((step, cut), cursor) in steps.iter().zip(cuts).zip(&positions) {
-                let value = serde_json::json!({"state":cut,"blocks":cut.content_blocks});
+            let mut manifest_cuts = Vec::with_capacity(steps.len());
+            for ((step, digest), cursor) in steps.iter().zip(digests).zip(&positions) {
                 manifest_cuts.push(ResetCut {
                     reset_id: step.reset_id,
                     context_generation: step.context_generation,
@@ -6408,14 +6522,14 @@ impl Harness {
                             .map_err(|_| Error::Invalid("reset write limit".into()))?
                     },
                     cursor: manifest_cursor(cursor)?,
-                    state_sha256: reset_cut_digest(&value)?,
+                    state_sha256: digest,
                 });
             }
             let anchor_cursor = positions
                 .last()
                 .ok_or(crate::transcript::Error::Corrupt)?
                 .clone();
-            let binding = ExpectedBinding {
+            let mut binding = ExpectedBinding {
                 conversation_id: state.id,
                 predecessor_observation: observation,
                 predecessor_root_version: version,
@@ -6426,8 +6540,14 @@ impl Harness {
                 anchor_cursor: manifest_cursor(&anchor_cursor)?,
                 cuts: manifest_cuts,
             };
-            let manifest = ResetManifest {
-                version: 1,
+            let mut manifest = ResetManifest {
+                version: if version_three {
+                    3
+                } else if steps.len() > 64 {
+                    2
+                } else {
+                    1
+                },
                 conversation_id: binding.conversation_id,
                 predecessor_observation: binding.predecessor_observation,
                 predecessor_root_version: binding.predecessor_root_version,
@@ -6438,9 +6558,19 @@ impl Harness {
                 anchor_cursor: binding.anchor_cursor.clone(),
                 cuts: binding.cuts.clone(),
             };
-            let bytes = manifest
-                .encode(&binding)
-                .map_err(|e| Error::Invalid(e.to_string()))?;
+            let bytes = match manifest.encode(&binding) {
+                Err(crate::reset_manifest::Error::TooLarge) if manifest.version == 2 => {
+                    manifest.version = 3;
+                    for (cut, digest) in manifest.cuts.iter_mut().zip(delta_digests) {
+                        cut.state_sha256 = digest;
+                    }
+                    binding.cuts = manifest.cuts.clone();
+                    manifest
+                        .encode(&binding)
+                        .map_err(|e| Error::Invalid(e.to_string()))?
+                }
+                result => result.map_err(|e| Error::Invalid(e.to_string()))?,
+            };
             let mut checks = vec![
                 Check {
                     key: anchor_key,
@@ -6456,7 +6586,49 @@ impl Harness {
                 },
             ];
             let mut mutations = Vec::new();
-            for position in positions.iter().take(cuts.len()) {
+            let shared_reference = if manifest.version >= 2 {
+                let batch = Uuid::new_v4();
+                let key = crate::reset_manifest::shared_key(state.id, batch);
+                checks.push(Check {
+                    key: key.clone(),
+                    expected: Expected::Missing,
+                });
+                let value = if manifest.version == 3 {
+                    let count = bytes
+                        .len()
+                        .div_ceil(crate::reset_manifest::MANIFEST_CHUNK_BYTES);
+                    for (index, chunk) in bytes
+                        .chunks(crate::reset_manifest::MANIFEST_CHUNK_BYTES)
+                        .enumerate()
+                    {
+                        let chunk_key = crate::reset_manifest::chunk_key(state.id, batch, index);
+                        checks.push(Check {
+                            key: chunk_key.clone(),
+                            expected: Expected::Missing,
+                        });
+                        mutations.push(Mutation::Put {
+                            key: chunk_key,
+                            value: chunk.to_vec(),
+                        });
+                    }
+                    serde_json::to_vec(&crate::reset_manifest::ChunkHeader {
+                        version: 3,
+                        chunks: count,
+                    })?
+                } else {
+                    bytes.clone()
+                };
+                mutations.push(Mutation::Put { key, value });
+                Some(serde_json::to_vec(
+                    &crate::reset_manifest::SharedReference {
+                        version: manifest.version,
+                        batch,
+                    },
+                )?)
+            } else {
+                None
+            };
+            for position in positions.iter().take(steps.len()) {
                 let (entry, sequence) = position
                     .entry_identity()
                     .ok_or(crate::transcript::Error::Corrupt)?;
@@ -6468,7 +6640,7 @@ impl Harness {
                 });
                 mutations.push(Mutation::Put {
                     key,
-                    value: bytes.clone(),
+                    value: shared_reference.as_ref().unwrap_or(&bytes).clone(),
                 });
             }
             atomic_evidence = Some((revision, checks, mutations));
@@ -8093,7 +8265,7 @@ impl Harness {
             && !ids.contains(&history.id)
         {
             let mut next = batch.next;
-            for _ in 0..64 {
+            loop {
                 let page = transcript.read_with_blocks(&next, std::num::NonZeroUsize::MIN)?;
                 let Some(record) = page.records.first() else {
                     break;
@@ -8118,7 +8290,7 @@ impl Harness {
                     {
                         return Err(crate::fork::Error::InvalidSnapshot.into());
                     }
-                    self.prove_failure_reset_cut(history.origin, &next, history.commit)?;
+                    self.verify_failure_reset_cut(history.origin, &next, history.commit)?;
                     return Ok(ViewCursor {
                         cursor: next,
                         remaining: Some(index + 1),
@@ -8280,7 +8452,7 @@ impl Harness {
                     else {
                         continue;
                     };
-                    for _ in 0..65 {
+                    loop {
                         let Some(identity) = position.entry_identity() else {
                             break;
                         };
@@ -8311,7 +8483,7 @@ impl Harness {
                             {
                                 return Err(crate::fork::Error::InvalidSnapshot.into());
                             }
-                            self.prove_failure_reset_cut(id, &position, commit)?;
+                            self.verify_failure_reset_cut(id, &position, commit)?;
                             local_match = Some(ViewCursor {
                                 cursor: position.clone(),
                                 remaining: Some(index + 1),
@@ -8981,6 +9153,15 @@ impl Harness {
         expected_version: u64,
         steps: &[ResetDerivationStep],
     ) -> Result<Vec<Conversation>, Error> {
+        let baseline = self.anchored_reset_baseline(id, expected_version)?;
+        derive_ordered_reset_states(&baseline, steps)
+    }
+
+    fn anchored_reset_baseline(
+        &self,
+        id: Uuid,
+        expected_version: u64,
+    ) -> Result<Conversation, Error> {
         let root = Self::key(id);
         let entry = self.owner.store().get(&root)?.ok_or(Error::NotFound)?;
         let version = entry.version;
@@ -9070,16 +9251,69 @@ impl Harness {
             {
                 return Err(crate::fork::Error::InvalidSnapshot.into());
             }
-            derive_ordered_reset_states(&historical, steps)
+            Ok(historical)
         } else {
             // Existing stores can have pending resets from before capture was
             // introduced. Current-version derivation remains supported.
-            derive_ordered_reset_states(&baseline, steps)
+            Ok(baseline)
         }
     }
 
     // Prove a failure/reset cut from independently authenticated predecessor
     // state. The returned checks must be committed with any dependent fork.
+    // Callers that only need to authenticate an occurrence do not need to
+    // materialize its full conversation state on a validated batch-cache hit.
+    fn verify_failure_reset_cut(
+        &self,
+        id: Uuid,
+        target: &crate::transcript::Cursor,
+        observation: u64,
+    ) -> Result<(), Error> {
+        let _scope = ResetProofScope::enter();
+        let key = (Arc::as_ptr(&self.owner) as usize, id, observation);
+        let batch =
+            RESET_BATCH_MEMO.with(|memo| memo.borrow().as_ref().and_then(|m| m.get(&key).cloned()));
+        if let Some(batch) = batch
+            && let Some(identity) = target.entry_identity()
+            && let Some(&index) = batch.position_index.get(&identity)
+            && batch.positions.get(index) == Some(target)
+            && let Some(reference) = &batch.shared_reference
+        {
+            let candidate_checks = crate::reset_manifest::lookup_shared_reference_checks(
+                self.owner.store(),
+                id,
+                target,
+                reference,
+                batch.commit_sequence,
+            )
+            .map_err(reset_manifest_lookup_error)?;
+            let store = self.owner.store();
+            let before = store.commit_sequence()?;
+            #[cfg(test)]
+            RESET_PROOF_CHECK_WORK.with(|count| count.set(count.get() + candidate_checks.len()));
+            store.commit(&candidate_checks, &[])?;
+            let after = store.commit_sequence()?;
+            if batch.checked_sequence.get() != Some(before) || before != after {
+                let before = store.commit_sequence()?;
+                let mut checks = batch.checks.borrow().clone();
+                checks.extend(candidate_checks.iter().cloned());
+                #[cfg(test)]
+                RESET_PROOF_CHECK_WORK.with(|count| count.set(count.get() + checks.len()));
+                store.commit(&checks, &[])?;
+                let after = store.commit_sequence()?;
+                batch
+                    .checked_sequence
+                    .set((before == after).then_some(after));
+            }
+            if batch.checked_references.borrow_mut().insert(identity) {
+                batch.checks.borrow_mut().extend(candidate_checks);
+            }
+            return Ok(());
+        }
+        self.prove_failure_reset_cut(id, target, observation)
+            .map(|_| ())
+    }
+
     fn prove_failure_reset_cut(
         &self,
         id: Uuid,
@@ -9100,6 +9334,67 @@ impl Harness {
             sequence,
             observation,
         );
+        let batch_key = (key.0, id, observation);
+        let batch = RESET_BATCH_MEMO.with(|memo| {
+            memo.borrow()
+                .as_ref()
+                .and_then(|m| m.get(&batch_key).cloned())
+        });
+        if let Some(batch) = batch
+            && let Some(&index) = batch.position_index.get(&(entry, sequence))
+            && batch.positions.get(index) == Some(target)
+        {
+            let candidate_checks = if let Some(reference) = &batch.shared_reference {
+                crate::reset_manifest::lookup_shared_reference_checks(
+                    self.owner.store(),
+                    id,
+                    target,
+                    reference,
+                    batch.commit_sequence,
+                )
+                .map_err(reset_manifest_lookup_error)?
+            } else {
+                let candidate = crate::reset_manifest::lookup_candidate(
+                    self.owner.store(),
+                    id,
+                    target,
+                    observation,
+                    batch.revision,
+                )
+                .map_err(reset_manifest_lookup_error)?
+                .ok_or(crate::fork::Error::InvalidSnapshot)?;
+                if candidate.bytes != batch.manifest {
+                    return Err(crate::fork::Error::InvalidSnapshot.into());
+                }
+                candidate.checks
+            };
+            let mut checks = batch.checks.borrow().clone();
+            merge_reset_proof_checks(&mut checks, candidate_checks);
+            self.owner.store().commit(&checks, &[])?;
+            let mut traversal = batch.traversal.borrow_mut();
+            if let Some((previous, state)) = traversal.as_mut()
+                && *previous > index
+            {
+                for undo in batch.undo[index + 1..=*previous].iter().rev() {
+                    undo.restore(state)?;
+                    #[cfg(test)]
+                    RESET_PROOF_TRANSITIONS.with(|count| count.set(count.get() + 1));
+                }
+                *previous = index;
+            }
+            let (start, base) = match traversal.as_ref() {
+                Some((previous, state)) if *previous <= index => (*previous + 1, state),
+                _ => (0, &batch.baseline),
+            };
+            let cut = if start > index {
+                base.clone()
+            } else {
+                visit_ordered_reset_states(base, &batch.steps[start..=index], |_| Ok(()))?
+            };
+            *traversal = Some((index, cut.clone()));
+            *batch.checks.borrow_mut() = checks.clone();
+            return Ok((cut, batch.revision, checks));
+        }
         if let Some(value) =
             RESET_PROOF_MEMO.with(|memo| memo.borrow().as_ref().and_then(|m| m.get(&key).cloned()))
         {
@@ -9177,8 +9472,10 @@ impl Harness {
                 })
             })
             .collect::<Result<_, Error>>()?;
-        let cuts = derive_ordered_reset_states(&baseline, &steps)?;
         let anchor = store.get(&anchor_key)?.ok_or_else(invalid)?;
+        let commit_sequence = store
+            .commit_for_version(&anchor_key, anchor.version)?
+            .ok_or_else(invalid)?;
         let anchor_value: serde_json::Value = serde_json::from_slice(&anchor.value)?;
         let anchor_cursor: crate::transcript::Cursor = serde_json::from_value(
             anchor_value
@@ -9196,6 +9493,74 @@ impl Harness {
                 serde_json::from_value(serde_json::to_value(&cut.cursor)?).map_err(Error::from)
             })
             .collect::<Result<_, _>>()?;
+        let selected = positions
+            .iter()
+            .position(|position| position == target)
+            .ok_or_else(invalid)?;
+        let transcript = crate::transcript::Transcript::new(store, id);
+        let (_, mut seen) = self.resolved_occurrences_with_ids(id, predecessor_cursor.clone())?;
+        let mut derived_cuts = Vec::with_capacity(steps.len());
+        let mut selected_cut = None;
+        let mut index = 0;
+        let mut undo = Vec::with_capacity(steps.len());
+        let last = visit_ordered_reset_states_with_before(
+            &baseline,
+            &steps,
+            |state, step| undo.push(ResetUndo::capture(state, step)),
+            |cut| {
+                let step = &steps[index];
+                let position = &positions[index];
+                let page = transcript.read_with_blocks(position, std::num::NonZeroUsize::MIN)?;
+                let record = page.records.first().ok_or_else(invalid)?;
+                let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
+                let TranscriptChange::ReplaceV2 {
+                    messages,
+                    ids,
+                    commit,
+                    origin,
+                } = change
+                else {
+                    return Err(invalid());
+                };
+                if messages != cut.messages
+                    || commit != observation
+                    || origin != id
+                    || ids.len() != messages.len()
+                    || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
+                    || cut
+                        .content_blocks
+                        .iter()
+                        .any(|(index, binding)| ids.get(*index) != Some(&binding.message_id))
+                    || record.content_blocks.clone().unwrap_or_default()
+                        != cut.content_blocks.values().cloned().collect::<Vec<_>>()
+                {
+                    return Err(invalid());
+                }
+                derived_cuts.push(ResetCut {
+                    reset_id: step.reset_id,
+                    context_generation: step.context_generation,
+                    write_limit: if step.write_limit == usize::MAX {
+                        u64::MAX
+                    } else {
+                        step.write_limit as u64
+                    },
+                    cursor: cursor(position)?,
+                    state_sha256: if hints.version == 3 {
+                        reset_cut_delta_digest(step, cut)?
+                    } else {
+                        reset_cut_digest(
+                            &serde_json::json!({"state":cut,"blocks":cut.content_blocks}),
+                        )?
+                    },
+                });
+                if index == selected {
+                    selected_cut = Some(cut.clone());
+                }
+                index += 1;
+                Ok(())
+            },
+        )?;
+        let selected_cut = selected_cut.ok_or_else(invalid)?;
         let expected = ExpectedBinding {
             conversation_id: id,
             predecessor_observation: hints.predecessor_observation,
@@ -9205,37 +9570,13 @@ impl Harness {
             predecessor_context_generation: predecessor_generation,
             predecessor_cursor: cursor(&predecessor_cursor)?,
             anchor_cursor: cursor(&anchor_cursor)?,
-            cuts: steps
-                .iter()
-                .zip(&cuts)
-                .zip(&positions)
-                .map(|((step, cut), position)| {
-                    Ok(ResetCut {
-                        reset_id: step.reset_id,
-                        context_generation: step.context_generation,
-                        write_limit: if step.write_limit == usize::MAX {
-                            u64::MAX
-                        } else {
-                            step.write_limit as u64
-                        },
-                        cursor: cursor(position)?,
-                        state_sha256: reset_cut_digest(
-                            &serde_json::json!({"state":cut,"blocks":cut.content_blocks}),
-                        )?,
-                    })
-                })
-                .collect::<Result<_, Error>>()?,
+            cuts: derived_cuts,
         };
         ResetManifest::decode(&candidate.bytes, &expected).map_err(|_| invalid())?;
-        let selected = positions
-            .iter()
-            .position(|position| position == target)
-            .ok_or_else(invalid)?;
         // Failure continuation produces exactly one trailing append.
         if positions.last() == Some(&anchor_cursor) {
             return Err(invalid());
         }
-        let transcript = crate::transcript::Transcript::new(store, id);
         let mut chain = positions.clone();
         chain.push(anchor_cursor.clone());
         let mut checks = candidate.checks;
@@ -9244,11 +9585,17 @@ impl Harness {
         // The predecessor's occurrence proof reads its entire immutable chain.
         // Fence those records and their runtime anchors too: otherwise an old
         // entry could change after replay but before the dependent fork commits.
+        struct PriorAnchorEvidence {
+            fork: Vec<u8>,
+            transcript: Option<serde_json::Value>,
+            shared: Option<(crate::reset_manifest::SharedReference, u64)>,
+        }
+        let mut prior_anchors: HashMap<(Uuid, u64), PriorAnchorEvidence> = HashMap::new();
         let mut prior = predecessor_cursor.clone();
         loop {
             let (key, version) = transcript.entry_evidence(&prior)?;
             checks.push(Check {
-                key,
+                key: key.clone(),
                 expected: Expected::Version(version),
             });
             let page = transcript.read_with_blocks(&prior, std::num::NonZeroUsize::MIN)?;
@@ -9263,70 +9610,83 @@ impl Harness {
                     .map(|(_, commit, origin)| (origin, commit)),
             };
             if let Some((origin, commit)) = origin_commit {
-                let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
-                let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
-                let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+                if !prior_anchors.contains_key(&(origin, commit)) {
+                    let fork = format!("runtime/fork/{origin}/{commit:020}").into_bytes();
+                    let snapshot = store.get(&fork)?.ok_or_else(invalid)?;
+                    let value: serde_json::Value = serde_json::from_slice(&snapshot.value)?;
+                    checks.push(Check {
+                        key: fork.clone(),
+                        expected: Expected::Version(snapshot.version),
+                    });
+                    let mut event = b"durable/observer/".to_vec();
+                    event.extend_from_slice(origin.as_bytes());
+                    event.extend_from_slice(b"/r");
+                    event.extend_from_slice(&commit.to_be_bytes());
+                    let version = store.get(&event)?.ok_or_else(invalid)?.version;
+                    checks.push(Check {
+                        key: event,
+                        expected: Expected::Version(version),
+                    });
+                    prior_anchors.insert(
+                        (origin, commit),
+                        PriorAnchorEvidence {
+                            fork,
+                            transcript: value.get("_transcript").cloned(),
+                            shared: None,
+                        },
+                    );
+                }
+                let anchor = prior_anchors
+                    .get_mut(&(origin, commit))
+                    .ok_or_else(invalid)?;
                 let mut original = serde_json::to_value(&prior)?;
                 original["transcript"] = serde_json::to_value(origin)?;
                 let original: crate::transcript::Cursor = serde_json::from_value(original)?;
-                if value.get("_transcript") != Some(&serde_json::to_value(&original)?) {
-                    let revision = store.document_cut(&fork)?.ok_or_else(invalid)?;
-                    let evidence = crate::reset_manifest::lookup_candidate(
-                        store, origin, &original, commit, revision,
-                    )
-                    .map_err(reset_manifest_lookup_error)?
-                    .ok_or_else(invalid)?;
-                    checks.extend(evidence.checks);
+                if anchor.transcript.as_ref() != Some(&serde_json::to_value(&original)?) {
+                    if let Some((reference, sequence)) = &anchor.shared {
+                        let captured: crate::transcript::Cursor =
+                            serde_json::from_value(anchor.transcript.clone().ok_or_else(invalid)?)?;
+                        let (_, captured_sequence) =
+                            captured.entry_identity().ok_or_else(invalid)?;
+                        let (_, original_sequence) =
+                            original.entry_identity().ok_or_else(invalid)?;
+                        if captured.transcript_id() != origin
+                            || captured_sequence < original_sequence
+                        {
+                            return Err(invalid());
+                        }
+                        if store.commit_for_version(&key, version)? != Some(*sequence) {
+                            return Err(invalid());
+                        }
+                        checks.extend(
+                            crate::reset_manifest::lookup_shared_reference_checks(
+                                store, origin, &original, reference, *sequence,
+                            )
+                            .map_err(reset_manifest_lookup_error)?,
+                        );
+                    } else {
+                        let revision = store.document_cut(&anchor.fork)?.ok_or_else(invalid)?;
+                        let evidence = crate::reset_manifest::lookup_candidate(
+                            store, origin, &original, commit, revision,
+                        )
+                        .map_err(reset_manifest_lookup_error)?
+                        .ok_or_else(invalid)?;
+                        if let Some(reference) = evidence.shared_reference {
+                            let snapshot = store.get(&anchor.fork)?.ok_or_else(invalid)?;
+                            let sequence = store
+                                .commit_for_version(&anchor.fork, snapshot.version)?
+                                .ok_or_else(invalid)?;
+                            anchor.shared = Some((reference, sequence));
+                        }
+                        checks.extend(evidence.checks);
+                    }
                 }
-                checks.push(Check {
-                    key: fork,
-                    expected: Expected::Version(snapshot.version),
-                });
-                let mut event = b"durable/observer/".to_vec();
-                event.extend_from_slice(origin.as_bytes());
-                event.extend_from_slice(b"/r");
-                event.extend_from_slice(&commit.to_be_bytes());
-                let version = store.get(&event)?.ok_or_else(invalid)?.version;
-                checks.push(Check {
-                    key: event,
-                    expected: Expected::Version(version),
-                });
             }
             if !page.has_more {
                 break;
             }
             prior = page.next;
         }
-        let (_, mut seen) = self.resolved_occurrences_with_ids(id, predecessor_cursor)?;
-        for (position, cut) in positions.iter().zip(&cuts) {
-            let page = transcript.read_with_blocks(position, std::num::NonZeroUsize::MIN)?;
-            let record = page.records.first().ok_or_else(invalid)?;
-            let change: TranscriptChange = serde_json::from_value(record.value.clone())?;
-            let TranscriptChange::ReplaceV2 {
-                messages,
-                ids,
-                commit,
-                origin,
-            } = change
-            else {
-                return Err(invalid());
-            };
-            if messages != cut.messages
-                || commit != observation
-                || origin != id
-                || ids.len() != messages.len()
-                || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
-                || cut
-                    .content_blocks
-                    .iter()
-                    .any(|(index, binding)| ids.get(*index) != Some(&binding.message_id))
-                || record.content_blocks.clone().unwrap_or_default()
-                    != cut.content_blocks.values().cloned().collect::<Vec<_>>()
-            {
-                return Err(invalid());
-            }
-        }
-        let last = cuts.last().ok_or_else(invalid)?;
         let mut continuation = last.clone();
         let failure = continuation.run_failure.clone();
         if !place_queued(&mut continuation, true) {
@@ -9405,8 +9765,49 @@ impl Harness {
         // Nested origin validation can discover proofs whose return values are
         // intentionally discarded. Carry their original fences to callers.
         merge_reset_proof_checks(&mut checks, cached_reset_proof_checks(&self.owner));
+        let check_sequence_before = store.commit_sequence()?;
         store.commit(&checks, &[])?;
-        Ok((cuts[selected].clone(), revision, checks))
+        let check_sequence_after = store.commit_sequence()?;
+        let batch_key = (Arc::as_ptr(&self.owner) as usize, id, observation);
+        let last_index = steps.len() - 1;
+        let position_index = positions
+            .iter()
+            .enumerate()
+            .map(|(index, position)| {
+                position
+                    .entry_identity()
+                    .map(|identity| (identity, index))
+                    .ok_or_else(invalid)
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        RESET_BATCH_MEMO.with(|memo| {
+            if let Some(memo) = memo.borrow_mut().as_mut() {
+                memo.insert(
+                    batch_key,
+                    std::rc::Rc::new(ResetBatchProof {
+                        manifest: candidate.bytes,
+                        shared_reference: candidate.shared_reference,
+                        commit_sequence,
+                        baseline,
+                        steps,
+                        positions,
+                        position_index,
+                        revision,
+                        checks: std::cell::RefCell::new(checks.clone()),
+                        checked_sequence: std::cell::Cell::new(
+                            (check_sequence_before == check_sequence_after)
+                                .then_some(check_sequence_after),
+                        ),
+                        checked_references: std::cell::RefCell::new(
+                            std::collections::HashSet::new(),
+                        ),
+                        traversal: std::cell::RefCell::new(Some((last_index, last.clone()))),
+                        undo,
+                    }),
+                );
+            }
+        });
+        Ok((selected_cut, revision, checks))
     }
 
     // Read a captured predecessor after the live root has advanced. The
@@ -9884,7 +10285,7 @@ impl Harness {
             let mut original = serde_json::to_value(position)?;
             original["transcript"] = serde_json::to_value(origin)?;
             let original = serde_json::from_value(original)?;
-            self.prove_failure_reset_cut(origin, &original, commit)?;
+            self.verify_failure_reset_cut(origin, &original, commit)?;
         }
         Ok(())
     }
@@ -21514,11 +21915,13 @@ fn validate_pending_reset_blocks(c: &Conversation) -> Result<(), Error> {
     if c.pending_reset_blocks.is_empty() {
         return Ok(());
     }
+    #[cfg(test)]
+    RESET_PENDING_VALIDATION_VISITS
+        .with(|visits| visits.set(visits.get() + c.resets.len() + c.pending_resets.len()));
+    let placed_ids: std::collections::HashSet<_> = c.resets.iter().map(|reset| reset.id).collect();
     let mut reset_ids = std::collections::HashSet::new();
     if c.pending_resets.iter().any(|reset| {
-        reset.id.is_nil()
-            || !reset_ids.insert(reset.id)
-            || c.resets.iter().any(|placed| placed.id == reset.id)
+        reset.id.is_nil() || !reset_ids.insert(reset.id) || placed_ids.contains(&reset.id)
     }) || c
         .pending_reset_blocks
         .keys()
@@ -21566,6 +21969,25 @@ fn reset_cut_digest(value: &serde_json::Value) -> Result<String, Error> {
     reset_baseline_digest(&canonical)
 }
 
+// Version 3 derives the complete state from an authenticated predecessor and
+// the ordered steps. Its per-cut commitment covers the step and the actual
+// transcript projection; hashing growing pending/reset lists at every cut is
+// unnecessary because those lists are independently replayed and the final
+// state is checked against the committed anchor.
+fn reset_cut_delta_digest(
+    step: &ResetDerivationStep,
+    state: &Conversation,
+) -> Result<String, Error> {
+    reset_cut_digest(&serde_json::json!({
+        "domain": "pi-rs/reset-cut/v3",
+        "reset_id": step.reset_id,
+        "context_generation": step.context_generation,
+        "write_limit": if step.write_limit == usize::MAX { u64::MAX } else { step.write_limit as u64 },
+        "messages": state.messages,
+        "blocks": state.content_blocks,
+    }))
+}
+
 // Derive reset cuts from a caller-authenticated baseline without writing storage.
 // A future batch proof can compare each returned state to its committed cut.
 #[derive(Clone, Copy)]
@@ -21579,17 +22001,49 @@ fn derive_ordered_reset_states(
     baseline: &Conversation,
     steps: &[ResetDerivationStep],
 ) -> Result<Vec<Conversation>, Error> {
+    let mut cuts = Vec::with_capacity(steps.len());
+    visit_ordered_reset_states(baseline, steps, |state| {
+        cuts.push(state.clone());
+        Ok(())
+    })?;
+    Ok(cuts)
+}
+
+// Process each cut while it is live. Callers that only need the final state
+// need not retain a full conversation for every pending reset.
+fn visit_ordered_reset_states(
+    baseline: &Conversation,
+    steps: &[ResetDerivationStep],
+    visit: impl FnMut(&Conversation) -> Result<(), Error>,
+) -> Result<Conversation, Error> {
+    visit_ordered_reset_states_with_before(baseline, steps, |_, _| {}, visit)
+}
+
+fn visit_ordered_reset_states_with_before(
+    baseline: &Conversation,
+    steps: &[ResetDerivationStep],
+    mut before: impl FnMut(&Conversation, &ResetDerivationStep),
+    mut visit: impl FnMut(&Conversation) -> Result<(), Error>,
+) -> Result<Conversation, Error> {
     if steps.is_empty() {
         return Err(Error::Invalid("empty reset derivation".into()));
     }
     validate_pending_reset_blocks(baseline)?;
     let mut state = baseline.clone();
+    let mut pending_ids = (!state.pending_reset_blocks.is_empty()).then(|| {
+        state
+            .pending_resets
+            .iter()
+            .map(|reset| reset.id)
+            .collect::<std::collections::HashSet<_>>()
+    });
     let mut generations = std::collections::HashSet::new();
     if let Some(generation) = state.context_generation {
         generations.insert(generation);
     }
-    let mut cuts = Vec::with_capacity(steps.len());
     for step in steps {
+        #[cfg(test)]
+        RESET_PROOF_TRANSITIONS.with(|count| count.set(count.get() + 1));
         if step.context_generation.is_nil()
             || !generations.insert(step.context_generation)
             || state
@@ -21599,13 +22053,26 @@ fn derive_ordered_reset_states(
         {
             return Err(Error::Invalid("invalid ordered reset derivation".into()));
         }
+        if pending_ids
+            .as_mut()
+            .is_some_and(|ids| !ids.remove(&step.reset_id))
+        {
+            return Err(Error::Invalid(
+                "invalid pending reset block ordering".into(),
+            ));
+        }
+        before(&state, step);
         let marker = state.pending_resets.remove(0);
         place_reset_before_writes(&mut state, marker, step.write_limit);
         state.context_generation = Some(step.context_generation);
-        validate_pending_reset_blocks(&state)?;
-        cuts.push(state.clone());
+        // The initial check proves uniqueness of all pending reset and block
+        // IDs. Placement removes exactly the first reset and its blocks, moves
+        // that reset to the placed list, and replaces active blocks with those
+        // removed blocks. It therefore preserves those invariants for the
+        // remaining pending resets without rescanning the entire queue.
+        visit(&state)?;
     }
-    Ok(cuts)
+    Ok(state)
 }
 
 // Each block-bearing reset needs its own durable transcript transition.
