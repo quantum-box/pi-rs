@@ -4100,22 +4100,22 @@ fn task_input_wake_key(id: Uuid) -> Vec<u8> {
 
 fn admit_task_draft(
     tx: &mut crate::session_transaction::SessionTransaction<'_>,
-    request_id: &str,
+    request_id: Option<&str>,
     draft: &crate::document::TaskSubmissionDraft,
     notify: &Option<SubmissionNotify>,
 ) -> Result<Uuid, crate::document::Error> {
     match draft {
         crate::document::TaskSubmissionDraft::Continue => {
-            tx.submit_continue(Some(request_id.to_owned()), notify.clone())
+            tx.submit_continue(request_id.map(str::to_owned), notify.clone())
         }
         crate::document::TaskSubmissionDraft::Input { content, options } => tx.submit_input(
-            Some(request_id.to_owned()),
+            request_id.map(str::to_owned),
             content.clone(),
             *options,
             notify.clone(),
         ),
         crate::document::TaskSubmissionDraft::Write { kind, data } => tx.submit_write(
-            Some(request_id.to_owned()),
+            request_id.map(str::to_owned),
             kind.clone(),
             data.clone(),
             notify.clone(),
@@ -4142,7 +4142,12 @@ pub(crate) fn validate_task_submissions(
         // Task admission evaluates each draft against the preceding candidate,
         // without exposing that staged table state through the session API.
         tx.table_written = false;
-        admit_task_draft(&mut tx, &item.request_id, &item.draft, &item.notify)?;
+        admit_task_draft(
+            &mut tx,
+            item.request_id.as_deref(),
+            &item.draft,
+            &item.notify,
+        )?;
         item.notification_binding = if tx.table_written {
             item.notify
                 .as_ref()
@@ -4283,7 +4288,12 @@ impl Harness {
         let mut changed = false;
         for item in &intent.admissions {
             tx.table_written = false;
-            admit_task_draft(&mut tx, &item.request_id, &item.draft, &item.notify)?;
+            admit_task_draft(
+                &mut tx,
+                item.request_id.as_deref(),
+                &item.draft,
+                &item.notify,
+            )?;
             changed |= tx.table_written;
         }
         tx.table_written = changed;

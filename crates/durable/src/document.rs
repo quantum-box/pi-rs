@@ -2038,7 +2038,7 @@ pub(crate) struct TaskInputIntent {
 
 #[derive(Clone)]
 pub(crate) struct TaskAdmission {
-    pub request_id: String,
+    pub request_id: Option<String>,
     pub draft: TaskSubmissionDraft,
     pub notify: Option<crate::runtime::SubmissionNotify>,
     pub notification_binding: Option<Vec<u8>>,
@@ -2407,7 +2407,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
         self.stage_submission(
-            request_id,
+            Some(request_id),
             TaskSubmissionDraft::Input { content, options },
             notify,
             || {},
@@ -2421,7 +2421,50 @@ impl<'a> TaskDocuments<'a> {
         request_id: String,
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
-        self.stage_submission(request_id, TaskSubmissionDraft::Continue, notify, || {})
+        self.stage_submission(
+            Some(request_id),
+            TaskSubmissionDraft::Continue,
+            notify,
+            || {},
+        )
+    }
+
+    /// Stage an input without a deduplication request ID.
+    pub fn submit_input_without_request_id(
+        &mut self,
+        content: String,
+        options: crate::state::AdmissionOptions,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_submission(
+            None,
+            TaskSubmissionDraft::Input { content, options },
+            notify,
+            || {},
+        )
+    }
+
+    /// Stage a continuation without a deduplication request ID.
+    pub fn submit_continue_without_request_id(
+        &mut self,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_submission(None, TaskSubmissionDraft::Continue, notify, || {})
+    }
+
+    /// Stage a display write without a deduplication request ID.
+    pub fn submit_write_without_request_id(
+        &mut self,
+        kind: String,
+        data: Option<Value>,
+        notify: Option<crate::runtime::SubmissionNotify>,
+    ) -> Result<(), Error> {
+        self.stage_submission(
+            None,
+            TaskSubmissionDraft::Write { kind, data },
+            notify,
+            || {},
+        )
     }
 
     /// Stage a display-only write, including its optional settlement notification.
@@ -2433,7 +2476,7 @@ impl<'a> TaskDocuments<'a> {
         notify: Option<crate::runtime::SubmissionNotify>,
     ) -> Result<(), Error> {
         self.stage_submission(
-            request_id,
+            Some(request_id),
             TaskSubmissionDraft::Write { kind, data },
             notify,
             || {},
@@ -2448,7 +2491,7 @@ impl<'a> TaskDocuments<'a> {
         hook: impl FnOnce(),
     ) -> Result<(), Error> {
         self.stage_submission(
-            request_id,
+            Some(request_id),
             TaskSubmissionDraft::Input {
                 content,
                 options: crate::state::AdmissionOptions::default(),
@@ -2478,7 +2521,7 @@ impl<'a> TaskDocuments<'a> {
 
     fn stage_submission(
         &mut self,
-        request_id: String,
+        request_id: Option<String>,
         draft: TaskSubmissionDraft,
         notify: Option<crate::runtime::SubmissionNotify>,
         after_snapshot: impl FnOnce(),
@@ -2489,7 +2532,7 @@ impl<'a> TaskDocuments<'a> {
         {
             return Err(Error::ReadAfterWrite);
         }
-        if request_id.is_empty() {
+        if request_id.as_ref().is_some_and(String::is_empty) {
             return Err(Error::InvalidSessionAdmission("request ID required".into()));
         }
         if let Some(intent) = &self.task_input {

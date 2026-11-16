@@ -2548,7 +2548,7 @@ fn task_input_on_reset_fork_fences_original_proof() {
             ancestry_checks: Vec::new(),
             snapshot: record.value,
             admissions: vec![crate::document::TaskAdmission {
-                request_id: "task-request".into(),
+                request_id: Some("task-request".into()),
                 draft: if continuation {
                     crate::document::TaskSubmissionDraft::Continue
                 } else {

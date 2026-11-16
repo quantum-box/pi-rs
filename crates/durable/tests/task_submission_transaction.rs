@@ -157,6 +157,405 @@ fn setup(path: &std::path::Path) -> (Harness, Uuid) {
     (h, id)
 }
 
+struct UnkeyedBatch {
+    fail: bool,
+    notify: bool,
+}
+impl Handler for UnkeyedBatch {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        if task.checkpoint().phase == "waiting" {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        for _ in 0..2 {
+            docs.submit_write_without_request_id("app.unkeyed".into(), Some(json!(1)), None)
+                .map_err(|e| e.to_string())?;
+        }
+        let notify = self.notify.then(|| SubmissionNotify {
+            task_id: task.id(),
+            key: "continue".into(),
+        });
+        docs.submit_continue_without_request_id(notify)
+            .map_err(|e| e.to_string())?;
+        assert!(docs.submit_continue_without_request_id(None).is_err());
+        for _ in 0..2 {
+            docs.submit_input_without_request_id(
+                "follow up".into(),
+                AdmissionOptions::default(),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        docs.get(&address()).map_err(|e| e.to_string())?;
+        docs.put(
+            &address(),
+            json!({"unkeyed":true}).as_object().unwrap().clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if self.fail {
+            return Ok(Step::Fail("rollback".into()));
+        }
+        if !self.notify {
+            return Ok(Step::Succeed(json!(null)));
+        }
+        Ok(Step::Wait {
+            checkpoint: Checkpoint {
+                phase: "waiting".into(),
+                data: json!(null),
+            },
+            condition: WaitFor::TypedSleep {
+                until_millis: None,
+                signals: vec![submission_settled_signal().key("continue").unwrap()],
+            },
+            children: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn unkeyed_task_batch_is_distinct_and_notifies_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let parent = task(id, "hold");
+    let child = descendant(parent.id(), "unkeyed");
+    let mut registry = Registry::default();
+    registry.register(
+        "hold",
+        true,
+        Hold(std::collections::HashMap::from([(
+            parent.id(),
+            vec![child.clone()],
+        )])),
+    );
+    registry.register(
+        "unkeyed",
+        true,
+        UnkeyedBatch {
+            fail: false,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    driver.submit(&parent).unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Waiting(_)));
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 3);
+    assert!(state.submissions.iter().all(|s| s.request_id.is_none()));
+    assert_ne!(state.submissions[1].id, state.submissions[2].id);
+    assert_eq!(state.application_writes.len(), 2);
+    assert!(
+        state
+            .application_writes
+            .iter()
+            .all(|w| w.request_id.is_none())
+    );
+    assert_ne!(
+        state.application_writes[0].id,
+        state.application_writes[1].id
+    );
+    let store = Store::open(&path).unwrap();
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(child.id(), &submission_settled_signal(), "continue")
+            .unwrap()
+            .is_none()
+    );
+    driver.shutdown().unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("hold", true, Hold(std::collections::HashMap::new()));
+    registry.register(
+        "unkeyed",
+        true,
+        UnkeyedBatch {
+            fail: false,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    wait_task(&path, child.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    let signal = TaskStore::new(&store)
+        .read_typed_signal(child.id(), &submission_settled_signal(), "continue")
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal["id"], state.submissions[0].id.to_string());
+    assert_eq!(signal["reason"], "nothing_to_answer");
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert_eq!(h.conversation(id).unwrap().submissions.len(), 3);
+    assert!(Documents::new(&store).get(&address()).unwrap().is_some());
+}
+
+#[test]
+fn failed_unkeyed_batch_discards_all_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let mut registry = Registry::default();
+    registry.register(
+        "unkeyed",
+        true,
+        UnkeyedBatch {
+            fail: true,
+            notify: true,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "unkeyed");
+    driver.submit(&task).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Failed(_)));
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    let store = Store::open(&path).unwrap();
+    assert!(Documents::new(&store).get(&address()).unwrap().is_none());
+    assert!(
+        TaskStore::new(&store)
+            .read_typed_signal(task.id(), &submission_settled_signal(), "continue")
+            .unwrap()
+            .is_none()
+    );
+    driver.shutdown().unwrap();
+}
+
+struct UnkeyedRace {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    staged: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl Handler for UnkeyedRace {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        let result = UnkeyedBatch {
+            fail: false,
+            notify: false,
+        }
+        .run_with_documents(task, docs)?;
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.staged.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(result)
+    }
+}
+#[test]
+fn unkeyed_batch_retries_after_conflict_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id) = setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry.register(
+        "race",
+        true,
+        UnkeyedRace {
+            calls: calls.clone(),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "race");
+    driver.submit(&task).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    h.submit_write(id, None, "app.concurrent".into(), None)
+        .unwrap();
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    release_tx.send(()).unwrap();
+    wait_task(&path, task.id(), |s| matches!(s, TaskState::Succeeded(_)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 3);
+    assert_eq!(state.application_writes.len(), 3);
+    driver.shutdown().unwrap();
+}
+
+#[test]
+fn unkeyed_batch_is_discarded_on_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register(
+        "race",
+        true,
+        UnkeyedRace {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            staged: staged_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    let task = task(id, "race");
+    driver.submit(&task).unwrap();
+    staged_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    driver.request_abort(task.id()).unwrap();
+    release_tx.send(()).unwrap();
+    driver.shutdown().unwrap();
+    let state = h.conversation(id).unwrap();
+    assert!(state.submissions.is_empty());
+    assert!(state.application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+struct KillUnkeyed;
+#[cfg(unix)]
+impl Handler for KillUnkeyed {
+    fn run(&self, _: &Task) -> Result<Step, String> {
+        unreachable!()
+    }
+    fn run_with_documents(
+        &self,
+        task: &Task,
+        docs: &mut TaskDocuments<'_>,
+    ) -> Result<Step, String> {
+        use std::io::Write;
+        UnkeyedBatch {
+            fail: false,
+            notify: false,
+        }
+        .run_with_documents(task, docs)?;
+        println!("UNKEYED_STAGED");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+#[cfg(unix)]
+#[test]
+fn unkeyed_kill_worker() {
+    let Ok(path) = std::env::var("PI_UNKEYED_KILL_DB") else {
+        return;
+    };
+    let id = Uuid::parse_str(&std::env::var("PI_UNKEYED_KILL_CONVERSATION").unwrap()).unwrap();
+    let h = Harness::open_paused(path, options()).unwrap();
+    let mut registry = Registry::default();
+    registry.register("unkeyed", true, KillUnkeyed);
+    let driver = h.start_tasks(registry).unwrap();
+    let task = Task::new(
+        Uuid::from_u128(8847),
+        TaskOwner::Conversation(id),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("unkeyed".into(), true);
+    driver.submit(&task).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn killed_unkeyed_batch_recovers_once() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (h, id) = setup(&path);
+    drop(h);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "unkeyed_kill_worker", "--nocapture"])
+        .env("PI_UNKEYED_KILL_DB", &path)
+        .env("PI_UNKEYED_KILL_CONVERSATION", id.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if line.contains("UNKEYED_STAGED") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+    let reached = rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    reached.expect("worker did not stage batch");
+    let h = Harness::open_paused(&path, options()).unwrap();
+    assert!(h.conversation(id).unwrap().submissions.is_empty());
+    assert!(h.conversation(id).unwrap().application_writes.is_empty());
+    assert!(
+        Documents::new(&Store::open(&path).unwrap())
+            .get(&address())
+            .unwrap()
+            .is_none()
+    );
+    let mut registry = Registry::default();
+    registry.register(
+        "unkeyed",
+        true,
+        UnkeyedBatch {
+            fail: false,
+            notify: false,
+        },
+    );
+    let driver = h.start_tasks(registry).unwrap();
+    wait_task(&path, Uuid::from_u128(8847), |s| {
+        matches!(s, TaskState::Succeeded(_))
+    });
+    driver.shutdown().unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.submissions.len(), 3);
+    assert_eq!(state.application_writes.len(), 2);
+    assert!(state.submissions.iter().all(|s| s.request_id.is_none()));
+    assert!(
+        state
+            .application_writes
+            .iter()
+            .all(|w| w.request_id.is_none())
+    );
+}
+
 struct ContinueBatch {
     fail: bool,
     notify: bool,
