@@ -401,6 +401,11 @@ impl std::fmt::Debug for CompletedInvocation {
 /// not be interpreted as proof that a storage commit failed.
 #[derive(Debug)]
 pub enum SettlementError {
+    /// The poll or failure fence was busy before preparation. The caller
+    /// retains the completed invocation and its exclusive lease.
+    Pending {
+        completed: Box<CompletedInvocation>,
+    },
     Rejected {
         error: Error,
         completed: Box<CompletedInvocation>,
@@ -829,10 +834,242 @@ impl Scheduler {
         })
     }
 
+    /// Try the pre-preparation abort fence without waiting for poll or failure
+    /// gates. A pending result owns the invocation and must be retried by the
+    /// caller. The task gate and later serial settlement paths may still block;
+    /// in particular, a new abort discovered after this check uses serial cleanup.
+    pub fn try_settle_invocation(
+        &mut self,
+        completed: CompletedInvocation,
+    ) -> Result<bool, SettlementError> {
+        let fence = self.failure_fence.clone();
+        let guard = match fence.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(SettlementError::Pending {
+                    completed: Box::new(completed),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SettlementError::Rejected {
+                    error: Error::Poisoned,
+                    completed: Box::new(completed),
+                });
+            }
+        };
+        if !Arc::ptr_eq(&self.live_invocations, &completed.lease.state) {
+            return Err(SettlementError::Rejected {
+                error: Error::Ownership,
+                completed: Box::new(completed),
+            });
+        }
+        let health = self
+            .live_invocations
+            .lock()
+            .map_err(|_| Error::Poisoned)
+            .and_then(|state| {
+                if self.poisoned || state.poisoned {
+                    Err(Error::Poisoned)
+                } else {
+                    Ok(state.handler_failed
+                        && !state.failed_handlers.contains(&completed.task_id()))
+                }
+            });
+        let after_other_failure = match health {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(SettlementError::Rejected {
+                    error,
+                    completed: Box::new(completed),
+                });
+            }
+        };
+        let owner = self.owner();
+        let gate = match owner.task_gate().lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                return Err(SettlementError::Rejected {
+                    error: Error::Poisoned,
+                    completed: Box::new(completed),
+                });
+            }
+        };
+        if after_other_failure {
+            let independent = match completed.running.task.owner() {
+                TaskOwner::Conversation(id) => crate::ownership_edge::EdgeStore::new(owner.store())
+                    .get(*id)
+                    .is_ok_and(|edge| edge.is_none()),
+                TaskOwner::Task(_) => false,
+            };
+            if !independent {
+                return Err(SettlementError::Rejected {
+                    error: Error::Busy,
+                    completed: Box::new(completed),
+                });
+            }
+        }
+        if matches!(&completed.result, InvocationResult::Abort(_)) {
+            drop(gate);
+            drop(guard);
+            return self.settle_invocation(completed);
+        }
+        let pending = (|| {
+            let current = self
+                .ts()
+                .load(completed.task_id())?
+                .ok_or(Error::Ownership)?;
+            if current.version != completed.running.version && current.task.abort_requested() {
+                return Ok(None);
+            }
+            if current.task != completed.running.task {
+                return Err(task_store::Error::Store(durable_store::Error::Conflict {
+                    key: task_store::key(completed.task_id()),
+                })
+                .into());
+            }
+            pending_abort_root_for_running(
+                &self.ts(),
+                completed.task_id(),
+                self.validator.is_none(),
+            )
+        })();
+        drop(gate);
+        drop(guard);
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Err(SettlementError::Rejected {
+                    error,
+                    completed: Box::new(completed),
+                });
+            }
+        };
+        if pending.is_some()
+            && let Some(validator) = self.validator.as_ref()
+        {
+            let mut worker = validator.worker();
+            let state = self.live_invocations.clone();
+            let running = completed.task_id();
+            let result = owner.conversation_controls().try_fence(|| {
+                let _failure = match fence.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Busy),
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+                };
+                {
+                    let state = state.lock().map_err(|_| Error::Poisoned)?;
+                    if state.poisoned {
+                        return Err(Error::Poisoned);
+                    }
+                    if state.handler_failed && !state.failed_handlers.contains(&running) {
+                        return Err(Error::Busy);
+                    }
+                }
+                match worker.abort_pending_task_graph(running) {
+                    Ok(affected) => Ok(affected.unwrap_or_default()),
+                    Err(error) => {
+                        state.lock().map_err(|_| Error::Poisoned)?.poisoned = true;
+                        Err(Error::Handler(format!("checked pending abort: {error}")))
+                    }
+                }
+            });
+            match result {
+                Ok(Some(_)) => (),
+                Ok(None) | Err(durable_store::controls::FenceError::Commit(Error::Busy)) => {
+                    return Err(SettlementError::Pending {
+                        completed: Box::new(completed),
+                    });
+                }
+                Err(durable_store::controls::FenceError::Poisoned) => {
+                    return Err(SettlementError::Rejected {
+                        error: Error::Poisoned,
+                        completed: Box::new(completed),
+                    });
+                }
+                Err(durable_store::controls::FenceError::Commit(error)) => {
+                    return Err(SettlementError::Rejected {
+                        error,
+                        completed: Box::new(completed),
+                    });
+                }
+            }
+        }
+        self.settle_invocation(completed)
+    }
+
     /// Stop admitting new reservations. Existing completed invocations can
     /// still settle while the scheduler remains healthy.
     pub fn stop_reservations(&mut self) {
         self.reservations_stopped = true;
+    }
+
+    /// Reserve one independent conversation-root task without running graph
+    /// maintenance. Intended for progress while a cleanup fence is busy.
+    /// Tasks owned through an edge are conservatively left for ordinary ticks.
+    pub fn reserve_independent_root(&mut self) -> Result<Option<Box<DetachedInvocation>>, Error> {
+        let fence = self.failure_fence.clone();
+        let _failure = fence.lock().map_err(|_| Error::Poisoned)?;
+        self.check()?;
+        if self.reservations_stopped {
+            return Err(Error::Stopped);
+        }
+        let owner = self.owner();
+        let _gate = owner.task_gate().lock().map_err(|_| Error::Poisoned)?;
+        let tasks = self.ts().list()?;
+        for snapshot in &tasks {
+            let TaskOwner::Conversation(conversation) = snapshot.task.owner() else {
+                continue;
+            };
+            if snapshot.task.state() != &TaskState::Ready
+                || snapshot.task.abort_requested()
+                || self.blocked_reason(&snapshot.task).is_some()
+            {
+                continue;
+            }
+            if crate::ownership_edge::EdgeStore::new(owner.store())
+                .get(*conversation)
+                .map_err(|e| Error::Handler(format!("ownership edge: {e}")))?
+                .is_some()
+            {
+                continue;
+            }
+            let key = format!("runtime/conversation/{conversation}");
+            if let Some(entry) = owner
+                .store()
+                .get(key.as_bytes())
+                .map_err(task_store::Error::from)?
+            {
+                let value: crate::runtime::Conversation =
+                    serde_json::from_slice(&entry.value).map_err(task_store::Error::from)?;
+                if value.id != *conversation {
+                    return Err(Error::Ownership);
+                }
+                if value.abort_requested {
+                    continue;
+                }
+            }
+            if pending_abort_root_for_running(
+                &self.ts(),
+                snapshot.task.id(),
+                self.validator.is_none(),
+            )?
+            .is_some()
+            {
+                continue;
+            }
+            let handler = self.registered(&snapshot.task)?.handler.clone();
+            if !self.reserve_resolved(snapshot)? {
+                return Ok(None);
+            }
+            let running = self
+                .ts()
+                .load(snapshot.task.id())?
+                .ok_or(Error::Ownership)?;
+            let invocation = self.make_invocation(running, handler, false)?;
+            self.poisoned = false;
+            return Ok(Some(Box::new(invocation)));
+        }
+        Ok(None)
     }
 
     /// Observe live handler invocations without acquiring the scheduler lock.
@@ -1368,6 +1605,9 @@ impl Scheduler {
                     SettlementError::Rejected { error, .. }
                     | SettlementError::Handler(error)
                     | SettlementError::Indeterminate(error) => error,
+                    SettlementError::Pending { .. } => {
+                        unreachable!("serial settlement does not return pending")
+                    }
                 }),
         }
     }
@@ -2986,6 +3226,164 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pre_prepare_busy_returns_lease_and_independent_root_can_run() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::runtime::{Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        struct Staging(Address);
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                docs.get(&self.0).unwrap();
+                docs.put(
+                    &self.0,
+                    json!({"value": "discard"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                Ok(Step::Succeed(json!("discard")))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let harness = Harness::open_paused(
+            dir.path().join("db"),
+            Options {
+                model: Arc::new(Stub),
+                tools: vec![],
+                restart_limit: 3,
+                max_turns: 3,
+                uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+            },
+        )
+        .unwrap();
+        let address = Address {
+            scope: "pending".into(),
+            name: "result".into(),
+            key: "".into(),
+        };
+        let mut registry = Registry::default();
+        registry.register("parent", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+        registry.register_with_abort("child", false, Staging(address.clone()), |_: &Task| {
+            Ok(Step::Succeed(json!(null)))
+        });
+        registry.register("independent", false, |_: &Task| {
+            Ok(Step::Succeed(json!("independent")))
+        });
+        let mut scheduler = harness.attach_tasks(registry).unwrap();
+        let mut parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        parent.start().unwrap();
+        parent
+            .wait(WaitFor::TasksFailFast(vec![
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+            ]))
+            .unwrap();
+        let child = task(2, TaskOwner::Task(parent.id()), "child", false, 3);
+        let sibling = task(3, TaskOwner::Task(parent.id()), "missing", false, 3);
+        let other = task(
+            4,
+            TaskOwner::Conversation(Uuid::from_u128(10)),
+            "independent",
+            false,
+            3,
+        );
+        scheduler
+            .ts()
+            .save(&[
+                Save::Create(&parent),
+                Save::Create(&child),
+                Save::Create(&sibling),
+                Save::Create(&other),
+            ])
+            .unwrap();
+        let TickReservation::Invocation(child_invocation) = scheduler.reserve_tick(0).unwrap()
+        else {
+            panic!("child")
+        };
+        assert_eq!(child_invocation.task_id(), child.id());
+        let completed = child_invocation.execute().unwrap();
+        let owner = scheduler.owner();
+        let control = owner.conversation_controls().get(Uuid::from_u128(99));
+        let poll = control.gate.lock().unwrap();
+        let sibling = scheduler.ts().load(sibling.id()).unwrap().unwrap();
+        scheduler
+            .ts()
+            .update(&sibling, |task| {
+                task.start()?;
+                task.fail("failed".into())
+            })
+            .unwrap();
+        let completed = match scheduler.try_settle_invocation(completed) {
+            Err(SettlementError::Pending { completed }) => completed,
+            result => panic!("expected pending: {result:?}"),
+        };
+        assert!(
+            scheduler
+                .live_invocations
+                .lock()
+                .unwrap()
+                .attempts
+                .contains(&child.id())
+        );
+        let independent = scheduler.reserve_independent_root().unwrap().unwrap();
+        assert_eq!(independent.task_id(), other.id());
+        scheduler
+            .settle_invocation(independent.execute().unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.get(other.id()).unwrap().unwrap().state(),
+            &TaskState::Succeeded(json!("independent"))
+        );
+        assert!(
+            !scheduler
+                .ts()
+                .load(child.id())
+                .unwrap()
+                .unwrap()
+                .task
+                .abort_requested()
+        );
+        drop(poll);
+        scheduler.try_settle_invocation(*completed).unwrap();
+        let child = scheduler.ts().load(child.id()).unwrap().unwrap().task;
+        assert_eq!(child.state(), &TaskState::Ready);
+        assert!(child.abort_requested());
+        assert!(
+            !scheduler
+                .live_invocations
+                .lock()
+                .unwrap()
+                .attempts
+                .contains(&child.id())
+        );
+        assert!(
+            Documents::new(owner.store())
+                .get(&address)
+                .unwrap()
+                .is_none()
+        );
+    }
     fn task(id: u128, owner: TaskOwner, kind: &str, safe: bool, limit: u32) -> Task {
         Task::new(Uuid::from_u128(id), owner, cp("start"), limit)
             .unwrap()
@@ -3024,7 +3422,7 @@ mod tests {
         assert!(
             matches!(scheduler.settle_invocation(a), Err(SettlementError::Handler(Error::Handler(reason))) if reason == "handler failed")
         );
-        scheduler.settle_invocation(b).unwrap();
+        scheduler.try_settle_invocation(b).unwrap();
         assert_eq!(
             scheduler
                 .ts()
