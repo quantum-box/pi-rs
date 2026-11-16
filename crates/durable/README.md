@@ -907,6 +907,19 @@ Unlike upstream registration-level caller metadata, these overrides are
 conversation-scoped and apply by name, including to a replacement registered
 under that name; hosts must maintain the policy when registrations change.
 
+For task-owned children, `ensure_task_owned_subagent_inheriting_tools` and
+`submit_task_owned_subagent_inheriting_tools` opt in to copying the nearest
+owning conversation's enabled tools, model-facing selection and tool filters.
+The parent must have no selected extensions: admission rejects any extension,
+even one whose tool names appear restricted, because names can shadow host tools.
+The parent snapshot and ownership chain are fenced in the child transaction;
+concurrent changes cause a retry. The committed settings are a snapshot, not a
+live link. A separately versioned provenance record binds each new reservation;
+colliding or experimental reservations are rejected without migration. Matching
+retries return the committed child across reopen, even if the parent later changes.
+As with other admissions, storage errors require reopen before retry. The normal
+non-inheriting APIs retain their existing defaults.
+
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
 children, `ensure_task_owned_subagent_restricted` and
