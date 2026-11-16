@@ -34,6 +34,33 @@ struct Membership {
     conversation: Uuid,
 }
 
+// Conversation deserialization intentionally defaults fields for old runtime
+// snapshots. Authorization cannot infer the absence of an abort mark from an
+// omitted field, so require the relevant evidence independently.
+#[derive(Deserialize)]
+struct AuthorizationEvidence {
+    id: Uuid,
+    abort_requested: bool,
+    config: crate::runtime::Config,
+}
+
+pub(crate) fn validate_conversation(id: Uuid, bytes: &[u8]) -> Result<(), Error> {
+    let evidence: AuthorizationEvidence =
+        serde_json::from_slice(bytes).map_err(|_| Error::InvalidConversation)?;
+    let state: crate::runtime::Conversation =
+        serde_json::from_slice(bytes).map_err(|_| Error::InvalidConversation)?;
+    if id.is_nil()
+        || evidence.id != id
+        || evidence.abort_requested
+        || state.id != id
+        || state.abort_requested
+        || crate::runtime::validate_config(&evidence.config).is_err()
+    {
+        return Err(Error::InvalidConversation);
+    }
+    Ok(())
+}
+
 fn session_key(id: Uuid) -> Vec<u8> {
     format!("durable/session-membership/v1/session/{id}").into_bytes()
 }
@@ -84,10 +111,7 @@ impl<'a> SessionMembership<'a> {
     fn conversation(&self, id: Uuid) -> Result<Check, Error> {
         let key = crate::runtime::Harness::key(id);
         let entry = self.store.get(&key)?.ok_or(Error::InvalidConversation)?;
-        let state: crate::runtime::Conversation = serde_json::from_slice(&entry.value)?;
-        if id.is_nil() || state.id != id || state.abort_requested {
-            return Err(Error::InvalidConversation);
-        }
+        validate_conversation(id, &entry.value)?;
         Ok(checked(key, entry.version))
     }
     fn member(&self, session: Uuid, conversation: Uuid) -> Result<Check, Error> {

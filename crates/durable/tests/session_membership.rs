@@ -231,3 +231,93 @@ fn committed_revocation_survives_process_kill_and_reopen() {
     );
     assert!(reopened.get(b"host/effect").unwrap().is_none());
 }
+
+fn replace_conversation(store: &Store, id: uuid::Uuid, value: &serde_json::Value) {
+    let key = format!("runtime/conversation/{id}").into_bytes();
+    let old = store.get(&key).unwrap().unwrap();
+    store
+        .commit(
+            &[Check {
+                key: key.clone(),
+                expected: Expected::Version(old.version),
+            }],
+            &[Mutation::Put {
+                key,
+                value: serde_json::to_vec(value).unwrap(),
+            }],
+        )
+        .unwrap();
+}
+
+#[test]
+fn authorization_rejects_ambiguous_abort_and_invalid_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (_h, a, b) = setup(&path);
+    let store = Store::open(&path).unwrap();
+    let auth = SessionMembership::new(&store);
+    let session = auth.create().unwrap();
+    auth.enroll(session, a).unwrap();
+    auth.enroll(session, b).unwrap();
+    let key = format!("runtime/conversation/{b}").into_bytes();
+    let original: serde_json::Value =
+        serde_json::from_slice(&store.get(&key).unwrap().unwrap().value).unwrap();
+    let mut missing_abort = original.clone();
+    missing_abort
+        .as_object_mut()
+        .unwrap()
+        .remove("abort_requested");
+    let mut empty_model = original.clone();
+    empty_model["config"]["model"] = "".into();
+    let mut zero_limit = original.clone();
+    zero_limit["config"]["max_output_tokens"] = 0.into();
+    for invalid in [missing_abort, empty_model, zero_limit] {
+        let stale = auth.authorize_pair(session, a, b).unwrap();
+        replace_conversation(&store, b, &invalid);
+        assert!(matches!(
+            auth.authorize_pair(session, a, b),
+            Err(Error::InvalidConversation)
+        ));
+        assert!(matches!(
+            stale.commit(&[], &[effect()]),
+            Err(Error::Store(durable_store::Error::Conflict { .. }))
+        ));
+        assert!(store.get(b"host/effect").unwrap().is_none());
+        auth.revoke(session, b).unwrap();
+        assert!(matches!(
+            auth.enroll(session, b),
+            Err(Error::InvalidConversation)
+        ));
+        replace_conversation(&store, b, &original);
+        auth.enroll(session, b).unwrap();
+    }
+}
+
+#[test]
+fn authorization_accepts_historical_snapshot_with_explicit_abort_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (_h, a, b) = setup(&path);
+    let store = Store::open(&path).unwrap();
+    let auth = SessionMembership::new(&store);
+    let session = auth.create().unwrap();
+    let key = format!("runtime/conversation/{b}").into_bytes();
+    let mut historical: serde_json::Value =
+        serde_json::from_slice(&store.get(&key).unwrap().unwrap().value).unwrap();
+    let object = historical.as_object_mut().unwrap();
+    object.remove("queue_modes");
+    object.remove("after_failed_run");
+    object.remove("extensions");
+    assert_eq!(
+        object.get("abort_requested"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    replace_conversation(&store, b, &historical);
+    auth.enroll(session, a).unwrap();
+    auth.enroll(session, b).unwrap();
+    auth.authorize_pair(session, a, b)
+        .unwrap()
+        .commit(&[], &[effect()])
+        .unwrap();
+    assert!(store.get(b"host/effect").unwrap().is_some());
+}
