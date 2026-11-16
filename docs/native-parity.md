@@ -3692,7 +3692,9 @@ Native tools can declare a constraint when registered; the registry retains
 that declaration alongside the registered tool definition. Until the native
 agent records effective decisions for recovery, it rejects required JSON Schema
 constraints before model dispatch and permits preferred constraints to fall
-back. Built-in tools do not yet opt in.
+back. As in Pi, the native `read`, `write`, `edit`, and `bash` tools request
+preferred JSON Schema constraints, including with injected backends; these
+declarations currently fall back until native dispatch is connected.
 The Responses SDK can also prepare a request once and inspect the effective
 strict-or-fallback decision bound to its wire tools before dispatch.
 Workbench and AIP prepared-dispatch wrappers preserve that decision, routing,
