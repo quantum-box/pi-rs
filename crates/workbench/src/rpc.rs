@@ -744,6 +744,45 @@ mod jsonl_framing_tests {
     use std::io::BufReader;
 
     #[test]
+    fn unescaped_control_characters_use_v8_error_positions() {
+        for (input, expected) in [
+            (
+                "{\"x\":\"a\tb\"}",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "{\"x\":\"\u{1}\"}",
+                "Bad control character in string literal in JSON at position 6 (line 1 column 7)",
+            ),
+            (
+                "{\"x\":\"😀\rb\"}",
+                "Bad control character in string literal in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "{\"x\":\"\\q\t\"}",
+                "Bad escaped character in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\ud800\t\"",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\udc00\t\"",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"x\n\\q\"",
+                "Bad control character in string literal in JSON at position 2 (line 1 column 3)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        let error = parse_request("\"\\ud800\\q\t\"").unwrap_err().to_string();
+        assert!(!error.contains("Bad control character"), "{error}");
+    }
+
+    #[test]
     fn reads_lossy_utf8_with_lf_framing_and_final_cr() {
         let bytes =
             b"{\"id\":\"\xe3\x81\x82\xff\"}\r\n\n{\"id\":\"\xe2\x80\xa8\"}\n{\"id\":\"last\"}\r";
@@ -865,14 +904,9 @@ mod jsonl_framing_tests {
 
     #[test]
     fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
-        for input in ["[false,] \"x\\u1", "\"x\n\\u1"] {
-            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-            assert_eq!(
-                super::rpc_json_error(input, &error),
-                error.to_string(),
-                "{input:?}"
-            );
-        }
+        let input = "[false,] \"x\\u1";
+        let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(super::rpc_json_error(input, &error), error.to_string());
     }
 
     #[test]
@@ -913,7 +947,7 @@ mod jsonl_framing_tests {
                 "{input:?}: {error}"
             );
         }
-        for input in ["[false,] \"x\\q\"", "\"x\n\\q\"", "\"\\uDC00\\x\""] {
+        for input in ["[false,] \"x\\q\"", "\"\\uDC00\\x\""] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
                 super::rpc_json_error(input, &error),
@@ -930,7 +964,8 @@ mod jsonl_framing_tests {
             "\"\\uDC00\" trailing \"unfinished",
             "\"\\uDC00\\x",
             "\"\\uDC00\\u12",
-            "\"\\uDC00\n",
+            "[\"\\ud800\" false,\"\t\"]",
+            "[\"\\ud800\",\"\t\"]",
         ] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
@@ -959,6 +994,31 @@ fn parse_request(line: &str) -> Result<Value> {
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
+    if let Some((offset, start)) = json_string_control_offset(line)
+        && (message.starts_with("control character")
+            || ((message.starts_with("lone leading surrogate in hex escape")
+                || message.starts_with("unexpected end of hex escape"))
+                && invalid_json_escape(line).is_none()
+                && serde_error_offset(line, error)
+                    .is_some_and(|position| position >= start && position <= offset + 1)))
+    {
+        let prefix = &line[..offset];
+        let position = prefix.encode_utf16().count();
+        let row = prefix.bytes().filter(|byte| *byte == b'\r').count()
+            + prefix.bytes().filter(|byte| *byte == b'\n').count()
+            - prefix.matches("\r\n").count()
+            + 1;
+        let column = prefix
+            .rsplit(['\r', '\n'])
+            .next()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count()
+            + 1;
+        return format!(
+            "Bad control character in string literal in JSON at position {position} (line {row} column {column})"
+        );
+    }
     if (message.starts_with("invalid escape")
         || error.is_eof() && message.starts_with("EOF while parsing a string"))
         && let Some((reason, offset)) = invalid_json_escape(line)
@@ -1052,6 +1112,31 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         }
         None => message,
     }
+}
+
+fn serde_error_offset(line: &str, error: &serde_json::Error) -> Option<usize> {
+    let row = error.line().checked_sub(1)?;
+    let offset: usize = line.split_inclusive('\n').take(row).map(str::len).sum();
+    Some(offset.saturating_add(error.column()))
+}
+
+fn json_string_control_offset(line: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut escaped = false;
+    for (offset, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if start.is_some() && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            start = if start.is_some() { None } else { Some(offset) };
+        } else if let Some(start) = start
+            && character < ' '
+        {
+            return Some((offset, start));
+        }
+    }
+    None
 }
 
 // Locate the first malformed escape without interpreting subsequent text.

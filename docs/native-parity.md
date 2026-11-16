@@ -552,7 +552,11 @@ The echoed JSON value retains Rust's parsed integer precision, which can differ
 from JavaScript for integers outside the safe range; out-of-range JSON numbers
 such as `1e400` are rejected by the native parser.
 Malformed JSON produces a `parse` response with a
-parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
+parser diagnostic. Unescaped string control characters reached by the parser
+use Pi's V8 wording and UTF-16 positions, including controls after a lone
+surrogate in the same string. If serde stops on an earlier surrogate in a
+different string, its diagnostic can still differ from Pi. Other diagnostics
+that are not explicitly mapped retain the Rust JSON parser's wording.
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
 requests are bounded and retain their individual response IDs.
