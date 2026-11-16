@@ -933,6 +933,38 @@ impl Store {
         Ok(keys.into_iter().next().map(|key| (runtime_sequence, key)))
     }
 
+    /// Verify that an explicitly selected, currently retained snapshot and a
+    /// runtime root were put in the same tracked commit. This does not prove
+    /// that the snapshot is authorized by a manifest or that its contents are
+    /// correct; the caller must verify those relationships separately. Later
+    /// root updates are allowed, but rewriting the selected snapshot invalidates
+    /// the proof. The prefix must be the caller's trusted snapshot namespace.
+    pub fn runtime_snapshot_exact_at(
+        &self,
+        runtime_key: &[u8],
+        snapshot_prefix: &[u8],
+        snapshot_key: &[u8],
+        sequence: u64,
+    ) -> Result<bool, Error> {
+        if sequence > i64::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        if sequence == 0
+            || runtime_key.is_empty()
+            || snapshot_prefix.is_empty()
+            || snapshot_key == runtime_key
+            || !snapshot_key.starts_with(snapshot_prefix)
+        {
+            return Ok(false);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_commit_versions r JOIN durable_store_entries s ON s.key=?2 JOIN durable_commit_versions c ON c.key=s.key AND c.version=s.version WHERE r.key=?1 AND r.sequence=?3 AND c.sequence=r.sequence)",
+            params![runtime_key, snapshot_key, sequence],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Read an application log at a proven history boundary. Older cuts are
     /// rejected because pre-migration log changes were not recorded.
     pub fn application_entries_at(
@@ -1575,6 +1607,195 @@ mod document_history_tests {
             store.next_scoped_document_commit(b"durable/document/", boundary),
             Err(Error::DocumentFrameTooLarge)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_snapshot_kill_child() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("PI_EXACT_SNAPSHOT_KILL_DB") else {
+            return;
+        };
+        let db = Store::open(path).unwrap();
+        let root = b"runtime/conversation/kill".to_vec();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.clone(),
+                    value: b"root".to_vec(),
+                },
+                Mutation::Put {
+                    key: b"runtime/fork/kill/first".to_vec(),
+                    value: b"first".to_vec(),
+                },
+                Mutation::Put {
+                    key: b"runtime/fork/kill/second".to_vec(),
+                    value: b"second".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let version = db.get(&root).unwrap().unwrap().version;
+        let sequence = db.commit_for_version(&root, version).unwrap().unwrap();
+        println!("EXACT_SNAPSHOT_COMMITTED {sequence}");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_runtime_snapshots_survive_process_kill() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "document_history_tests::exact_snapshot_kill_child",
+                "--nocapture",
+            ])
+            .env("PI_EXACT_SNAPSHOT_KILL_DB", &path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some((_, sequence)) = line.split_once("EXACT_SNAPSHOT_COMMITTED ") {
+                    let _ = tx.send(sequence.to_string());
+                    break;
+                }
+            }
+        });
+        let sequence = rx.recv_timeout(Duration::from_secs(20));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let sequence = sequence.unwrap().parse::<u64>().unwrap();
+        let db = Store::open(&path).unwrap();
+        for key in [
+            b"runtime/fork/kill/first".as_slice(),
+            b"runtime/fork/kill/second".as_slice(),
+        ] {
+            assert!(db
+                .runtime_snapshot_exact_at(
+                    b"runtime/conversation/kill",
+                    b"runtime/fork/kill/",
+                    key,
+                    sequence
+                )
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn explicit_runtime_snapshot_requires_the_same_tracked_root_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let root = b"runtime/conversation/example".to_vec();
+        let other_root = b"runtime/conversation/other".to_vec();
+        let prefix = b"runtime/fork/example/";
+        let first = b"runtime/fork/example/first".to_vec();
+        let second = b"runtime/fork/example/second".to_vec();
+        let doc = b"durable/document/example".to_vec();
+        let db = Store::open(&path).unwrap();
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.clone(),
+                    value: b"root".to_vec(),
+                },
+                Mutation::Put {
+                    key: first.clone(),
+                    value: b"first".to_vec(),
+                },
+                Mutation::Put {
+                    key: second.clone(),
+                    value: b"second".to_vec(),
+                },
+                Mutation::Put {
+                    key: doc.clone(),
+                    value: b"before".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let root_version = db.get(&root).unwrap().unwrap().version;
+        let sequence = db.commit_for_version(&root, root_version).unwrap().unwrap();
+        assert!(db
+            .runtime_snapshot_at(&root, prefix, sequence)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+            .unwrap());
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+            .unwrap());
+        assert!(!db
+            .runtime_snapshot_exact_at(&other_root, prefix, &first, sequence)
+            .unwrap());
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, b"other/", &first, sequence)
+            .unwrap());
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, prefix, &first, 0)
+            .unwrap());
+        let revision = db.document_cut(&first).unwrap().unwrap();
+        assert_eq!(db.document_cut(&second).unwrap(), Some(revision));
+        db.commit(
+            &[],
+            &[
+                Mutation::Put {
+                    key: root.clone(),
+                    value: b"later".to_vec(),
+                },
+                Mutation::Put {
+                    key: doc.clone(),
+                    value: b"after".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        drop(db);
+        let db = Store::open(&path).unwrap();
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+            .unwrap());
+        assert_eq!(
+            db.document_at(&doc, revision).unwrap().unwrap().value,
+            b"before"
+        );
+        db.commit(
+            &[],
+            &[Mutation::Put {
+                key: first.clone(),
+                value: b"first".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, prefix, &first, sequence)
+            .unwrap());
+        assert!(db
+            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+            .unwrap());
+        db.commit(
+            &[],
+            &[Mutation::Delete {
+                key: second.clone(),
+            }],
+        )
+        .unwrap();
+        assert!(!db
+            .runtime_snapshot_exact_at(&root, prefix, &second, sequence)
+            .unwrap());
     }
 
     #[test]
