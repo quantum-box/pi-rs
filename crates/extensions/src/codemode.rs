@@ -3269,6 +3269,72 @@ mod tests {
         }
         session.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn model_catalogue_validates_search_arguments_before_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CatalogHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for CatalogHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(args["id"].is_null() || args["id"] == "fixture");
+                Outcome::Structured {
+                    data: json!([{"id":"fixture"}]),
+                    attachments: vec![],
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let code = r#"
+            for (const call of [
+                () => models.getModelsOfType('chat', 12),
+                () => models.getAvailableOfType('image', {}),
+                () => models.getModelOfType('classifier', 'fixture'),
+                () => models.getModelOfType('chat', null, 'fixture'),
+                () => models.getModelOfType('chat', 'fixture', 42),
+                () => models.getModelsOfType('invalid'),
+            ]) {
+                let rejected = false;
+                try { await call(); } catch (_) { rejected = true; }
+                if (!rejected) throw new Error('invalid search accepted');
+            }
+            await models.getModelsOfType('chat', null);
+            await models.getModelsOfType('chat', 'fixture', 'ignored');
+            await models.getAvailableOfType('chat', NaN);
+            const model = await models.getModelOfType('chat', new String('fixture'), 'fixture');
+            if (model.id !== 'fixture') throw new Error('valid search failed');
+            text('ok');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(2)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(CatalogHost(calls.clone())),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected completed script")
+        };
+        assert_eq!(data["isError"], false, "{data}");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
     #[test]
     fn options_are_restricted_to_the_first_line() {
         let reply = run("text('first');\n// @options: {}", None);

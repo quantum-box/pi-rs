@@ -1466,6 +1466,9 @@ inference; model discovery and resolution remain available while those slots are
 
 ### Native codemode checkpoint
 
+Model catalogue search checks provider and ID argument types before dispatch,
+including the sandbox's JSON conversion of omitted and non-finite values.
+
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
 fresh QuickJS context. Scripts can call registered tools through `tools`, use
 `searchTools`, `describeTool` and `describeNamespace`, emit `text` or `image`,
