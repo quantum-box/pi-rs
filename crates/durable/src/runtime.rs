@@ -906,6 +906,9 @@ pub struct Conversation {
     identity_preparation_required: Option<Uuid>,
     #[serde(default)]
     pub abort_requested: bool,
+    /// Inputs retained at the latest abort mark, to distinguish later admissions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    abort_retained_inputs: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nested_resume: Option<NestedResume>,
     phase: Phase,
@@ -4975,10 +4978,18 @@ impl Harness {
                     }
                     if base.abort_requested
                         && !state.abort_requested
-                        && matches!(state.phase, Phase::FailedIdle)
-                        && state.submissions.iter().any(|s| s.status == Status::Queued)
+                        && matches!(state.phase, Phase::Idle | Phase::FailedIdle)
                     {
-                        state.phase = Phase::Idle;
+                        state.phase = if has_post_abort_input(&state, &base.abort_retained_inputs)
+                            || state
+                                .application_writes
+                                .iter()
+                                .any(|w| !w.placed && !w.withdrawn)
+                        {
+                            Phase::Idle
+                        } else {
+                            Phase::FailedIdle
+                        };
                     }
                     expected = Expected::Version(entry.version);
                     self.loaded.lock().map_err(|_| Error::Failed)?.insert(
@@ -6197,6 +6208,7 @@ impl Harness {
             prepared_identity: None,
             identity_preparation_required: None,
             abort_requested: false,
+            abort_retained_inputs: Vec::new(),
             nested_resume: None,
             phase: Phase::Idle,
         }
@@ -6523,6 +6535,7 @@ impl Harness {
             prepared_identity: None,
             identity_preparation_required: None,
             abort_requested: false,
+            abort_retained_inputs: Vec::new(),
             nested_resume: None,
             phase: Phase::Idle,
         };
@@ -10017,6 +10030,7 @@ impl Harness {
             }
             let sid = Uuid::new_v4();
             let place_now = matches!(c.phase, Phase::Idle | Phase::FailedIdle)
+                && !c.abort_requested
                 && c.active.is_none()
                 && c.pending_independent_summary.is_none()
                 && !c
@@ -10591,6 +10605,12 @@ impl Harness {
                         };
                     }
                 }
+                state.abort_retained_inputs = state
+                    .submissions
+                    .iter()
+                    .filter(|submission| submission.status == Status::Queued)
+                    .map(|submission| submission.id)
+                    .collect();
                 state.abort_requested = true;
             }
             let pending_writes: std::collections::HashMap<Uuid, Uuid> = states
@@ -19234,13 +19254,22 @@ fn apply_failed_run_policy(c: &mut Conversation) {
         }
     }
 }
+fn has_post_abort_input(c: &Conversation, retained: &[Uuid]) -> bool {
+    c.submissions
+        .iter()
+        .any(|submission| submission.status == Status::Queued && !retained.contains(&submission.id))
+}
+
 fn finish_abort(c: &mut Conversation) {
     // Kept inputs remain parked like the default failed-run queue until a
     // later admission or ordered write starts a new boundary.
+    let has_later_input = has_post_abort_input(c, &c.abort_retained_inputs);
+    c.abort_retained_inputs.clear();
     finish_failure(c, "aborted".into(), FailureCause::Aborted);
-    if c.application_writes
-        .iter()
-        .any(|write| !write.placed && !write.withdrawn)
+    if has_later_input
+        || c.application_writes
+            .iter()
+            .any(|write| !write.placed && !write.withdrawn)
     {
         c.phase = Phase::Idle;
     }
@@ -24879,6 +24908,7 @@ mod scheduler_tests {
             failure_continuation_inputs: Vec::new(),
             tool_attempt: None,
             abort_requested: false,
+            abort_retained_inputs: Vec::new(),
             nested_resume: None,
             identity_wait_attempt: None,
             prepared_identity: None,
