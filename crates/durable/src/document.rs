@@ -967,17 +967,31 @@ impl<'a> Documents<'a> {
             key: b"durable/document-fork-revision".to_vec(),
             expected: Expected::DocumentRevision(current),
         });
-        let historical_docs: HashMap<_, _> =
-            self.store.documents_at(revision)?.into_iter().collect();
-        let historical_policies: HashMap<_, _> = self
+        // Addresses are canonical JSON arrays; this includes the closing quote
+        // and comma, so one scope cannot match a different scope's prefix.
+        let scope_prefix = |base: &[u8], scope: uuid::Uuid| {
+            let mut key = base.to_vec();
+            key.extend_from_slice(format!("[\"{scope}\",").as_bytes());
+            key
+        };
+        let historical_docs: HashMap<_, _> = self
             .store
-            .document_policies_at(revision)?
+            .scoped_documents_at(revision, &scope_prefix(PREFIX, parent))?
             .into_iter()
             .collect();
-        let current_docs: HashMap<_, _> = self.store.documents_at(current)?.into_iter().collect();
+        let historical_policies: HashMap<_, _> = self
+            .store
+            .scoped_documents_at(revision, &scope_prefix(POLICY_PREFIX, parent))?
+            .into_iter()
+            .collect();
+        let current_docs: HashMap<_, _> = self
+            .store
+            .scoped_documents_at(current, &scope_prefix(PREFIX, current_parent))?
+            .into_iter()
+            .collect();
         let current_policies: HashMap<_, _> = self
             .store
-            .document_policies_at(current)?
+            .scoped_documents_at(current, &scope_prefix(POLICY_PREFIX, current_parent))?
             .into_iter()
             .collect();
         // Normalize both scopes to the historical owner's address; matching

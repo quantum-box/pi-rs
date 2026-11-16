@@ -13425,6 +13425,68 @@ mod tests {
     }
 
     #[test]
+    fn changed_owned_child_read_fails_unsafe_parent_before_cleanup() {
+        use crate::document::TaskDocuments;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Parent(Arc<AtomicUsize>);
+        impl Handler for Parent {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                _: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let child = docs.get_owned_child(Uuid::from_u128(2))?;
+                assert_eq!(child.state(), &TaskState::Ready);
+                Ok(Step::Succeed(json!("early result")))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry.register("parent", false, Parent(calls.clone()));
+        registry.register_with_abort(
+            "child",
+            true,
+            |_: &Task| panic!("child must not execute"),
+            |_: &Task| Ok(Step::Succeed(json!(null))),
+        );
+        let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+        let parent = task(
+            1,
+            TaskOwner::Conversation(Uuid::from_u128(9)),
+            "parent",
+            false,
+            3,
+        );
+        let child = task(2, TaskOwner::Task(parent.id()), "child", true, 3);
+        scheduler
+            .ts()
+            .save(&[Save::Create(&parent), Save::Create(&child)])
+            .unwrap();
+        let once = Arc::new(AtomicBool::new(false));
+        scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                let ts = TaskStore::new(store);
+                let child = ts.load(Uuid::from_u128(2)).unwrap().unwrap();
+                ts.update(&child, |task| task.start()).unwrap();
+            }
+        }));
+        scheduler.tick(0).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            scheduler.get(parent.id()).unwrap().unwrap().state(),
+            TaskState::CompletingFailed(reason)
+                if reason == "document conflict: execution outcome requires reconciliation"
+        ));
+    }
+
+    #[test]
     fn late_child_rebase_preserves_real_document_and_signal_conflicts() {
         use crate::document::{Address, Documents, TaskDocuments, Transaction};
         use crate::task_store::{SignalResult, SignalToken};

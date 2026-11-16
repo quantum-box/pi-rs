@@ -156,9 +156,6 @@ impl Handler for Parent {
             if task.ended_children() != Some(&[a_id][..]) {
                 return Err("wrong first wake".into());
             }
-            if b.result(task, docs)?.is_some() {
-                return Err("unfinished child reported a result".into());
-            }
             let foreign: NestedTaskCall = serde_json::from_value(json!({
                 "parent": Uuid::new_v4(), "task_id": a_id
             }))
@@ -170,7 +167,12 @@ impl Handler for Parent {
                 return Err("wrong fast result".into());
             }
             if self.finish_after_first {
+                // This path only needs the first result. Reading the still-running
+                // sibling would fence completion against its unrelated progress.
                 return Ok(Step::Succeed(json!("early result")));
+            }
+            if b.result(task, docs)?.is_some() {
+                return Err("unfinished child reported a result".into());
             }
             return Ok(Step::Wait {
                 checkpoint: Checkpoint {
@@ -674,9 +676,62 @@ async fn killed_nested_cleanup_reopens_and_finishes_before_parent() {
     let conversation = ids.next().unwrap();
     let parent = ids.next().unwrap();
     let nested = ids.next().unwrap();
+    let store = durable_store::Store::open(root.join("db")).unwrap();
+    let before = pi_rs_durable::task_store::TaskStore::new(&store)
+        .load(parent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.task.state(),
+        &TaskState::Completing(json!("early result")),
+        "cleanup must start with the successful result durably held"
+    );
+    drop(store);
     let f = Fixture::with_options(false, true);
     let mut scheduler = Scheduler::open(root.join("db"), f.options()).unwrap();
-    let driver = scheduler.start_tasks(f.registry()).unwrap();
+    // Hold the recovered abort handler so the observation cannot race cleanup.
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let blocked = Mutex::new(blocked);
+    let handler_entered = entered.clone();
+    let mut registry = f.registry();
+    assert!(registry.set_abort("slow", move |_: &Task| {
+        handler_entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A dropped sender also releases the worker if an assertion fails.
+        let _ = blocked
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(15));
+        Ok(Step::Succeed(json!(null)))
+    }));
+    let driver = scheduler.start_tasks(registry).unwrap();
+    until(|| entered.load(std::sync::atomic::Ordering::SeqCst)).await;
+    let store = durable_store::Store::open(root.join("db")).unwrap();
+    let tasks = pi_rs_durable::task_store::TaskStore::new(&store);
+    let held = tasks.load(parent).unwrap().unwrap();
+    let pending = tasks.load(nested).unwrap().unwrap();
+    assert_eq!(
+        held.task.state(),
+        &TaskState::Completing(json!("early result"))
+    );
+    assert!(
+        !pending.task.is_terminal(),
+        "child settled while cleanup is held"
+    );
+    // Capture the exact held parent commit. There must be only one later
+    // parent commit, and the child's terminal commit must precede it.
+    let task_key = |id: Uuid| {
+        let mut key = b"durable/task/".to_vec();
+        key.extend_from_slice(id.as_bytes());
+        key
+    };
+    let parent_key = task_key(parent);
+    let child_key = task_key(nested);
+    let held_commit = store
+        .commit_for_version(&parent_key, held.version)
+        .unwrap()
+        .unwrap();
+    release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(15), scheduler.wait(conversation))
         .await
         .unwrap()
@@ -685,8 +740,35 @@ async fn killed_nested_cleanup_reopens_and_finishes_before_parent() {
         driver.get(nested).unwrap().unwrap().state(),
         TaskState::Cancelled
     ));
+    let parent_state = driver.get(parent).unwrap().unwrap();
     assert!(
-        matches!(driver.get(parent).unwrap().unwrap().state(), TaskState::Succeeded(v) if v == &json!("early result"))
+        matches!(parent_state.state(), TaskState::Succeeded(v) if v == &json!("early result")),
+        "parent={parent_state:?}, conversation={:?}",
+        scheduler.conversation(conversation).unwrap()
+    );
+    let child_final = tasks.load(nested).unwrap().unwrap();
+    let parent_final = tasks.load(parent).unwrap().unwrap();
+    assert_eq!(child_final.task.state(), &TaskState::Cancelled);
+    assert_eq!(
+        parent_final.task.state(),
+        &TaskState::Succeeded(json!("early result"))
+    );
+    let child_commit = store
+        .commit_for_version(&child_key, child_final.version)
+        .unwrap()
+        .unwrap();
+    let parent_commit = store
+        .commit_for_version(&parent_key, parent_final.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.next_commit_for_key(&parent_key, held_commit).unwrap(),
+        Some(parent_commit),
+        "parent changed before its final success commit"
+    );
+    assert!(
+        child_commit < parent_commit,
+        "child cancellation committed at {child_commit}, parent success at {parent_commit}"
     );
     scheduler.shutdown().await.unwrap();
     driver.shutdown().unwrap();
