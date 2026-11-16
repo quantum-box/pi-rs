@@ -264,6 +264,9 @@ pub enum Error {
     Stopped,
     #[error("scheduler must be reopened after an invocation or commit failure")]
     Poisoned,
+    #[cfg(test)]
+    #[error("test settlement yield")]
+    TestYield,
 }
 
 // The owner lock prevents another OwnedStore for the same database, but Arc
@@ -307,7 +310,8 @@ struct InvocationState {
 
 // Retain the attachment and activity until settlement or abandonment. Dropping
 // an unretired invocation forces recovery rather than guessing its outcome.
-struct InvocationLease {
+/// The in-process guard for a reserved invocation.
+pub struct InvocationLease {
     attachment: Arc<Attachment>,
     state: Arc<Mutex<InvocationState>>,
     failure_fence: Arc<Mutex<()>>,
@@ -358,7 +362,8 @@ pub struct CompletedInvocation {
 
 // Own the exact checked transaction and the observations needed to revalidate
 // it after graph-only conflicts. The invocation lease remains with its caller.
-struct PreparedSettlement {
+/// A checked transaction and its graph revalidation state.
+pub struct PreparedSettlement {
     transaction: crate::document::Transaction,
     running: task_store::StoredTask,
     candidate: task_store::StoredTask,
@@ -367,6 +372,28 @@ struct PreparedSettlement {
     conflict_keys: HashSet<Vec<u8>>,
     graph_version: u64,
     attempts: usize,
+}
+
+/// Owned settlement state at an invocation or prepared transaction boundary.
+#[allow(clippy::large_enum_variant)]
+pub enum PendingSettlement {
+    Unprepared(CompletedInvocation),
+    Prepared {
+        lease: InvocationLease,
+        settlement: PreparedSettlement,
+    },
+}
+
+impl std::fmt::Debug for PendingSettlement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unprepared(completed) => f
+                .debug_tuple("Unprepared")
+                .field(&completed.task_id())
+                .finish(),
+            Self::Prepared { lease, .. } => f.debug_tuple("Prepared").field(&lease.id).finish(),
+        }
+    }
 }
 
 enum PreparedRevalidation {
@@ -486,6 +513,10 @@ impl std::fmt::Debug for CompletedInvocation {
 /// not be interpreted as proof that a storage commit failed.
 #[derive(Debug)]
 pub enum SettlementError {
+    #[cfg(test)]
+    Yielded {
+        pending: Box<PendingSettlement>,
+    },
     /// The poll or failure fence was busy before preparation. The caller
     /// retains the completed invocation and its exclusive lease.
     Pending {
@@ -746,6 +777,12 @@ pub struct Scheduler {
     inject_batch_prepare_conflict: bool,
     #[cfg(test)]
     inject_post_commit_error: bool,
+    #[cfg(test)]
+    yield_before_preparation: bool,
+    #[cfg(test)]
+    yield_after_graph_conflict: bool,
+    #[cfg(test)]
+    yielded_prepared: Option<PreparedSettlement>,
     activity: crate::worker_activity::WorkerActivity,
 }
 impl Scheduler {
@@ -854,6 +891,14 @@ impl Scheduler {
                 });
             }
         }
+        #[cfg(test)]
+        if self.yield_before_preparation {
+            drop(task_gate);
+            drop(guard);
+            return Err(SettlementError::Yielded {
+                pending: Box::new(PendingSettlement::Unprepared(completed)),
+            });
+        }
         let CompletedInvocation {
             running,
             result,
@@ -890,6 +935,14 @@ impl Scheduler {
                 std::panic::resume_unwind(payload);
             }
         };
+        #[cfg(test)]
+        if matches!(result, Err(Error::TestYield)) {
+            let settlement = self.yielded_prepared.take().expect("prepared yield state");
+            drop(guard);
+            return Err(SettlementError::Yielded {
+                pending: Box::new(PendingSettlement::Prepared { lease, settlement }),
+            });
+        }
         if result.is_ok() {
             let mut state = self
                 .live_invocations
@@ -1236,6 +1289,12 @@ impl Scheduler {
             inject_batch_prepare_conflict: false,
             #[cfg(test)]
             inject_post_commit_error: false,
+            #[cfg(test)]
+            yield_before_preparation: false,
+            #[cfg(test)]
+            yield_after_graph_conflict: false,
+            #[cfg(test)]
+            yielded_prepared: None,
             activity: Default::default(),
         };
         scheduler.reconcile()?;
@@ -1692,6 +1751,10 @@ impl Scheduler {
                     | SettlementError::Indeterminate(error) => error,
                     SettlementError::Pending { .. } => {
                         unreachable!("serial settlement does not return pending")
+                    }
+                    #[cfg(test)]
+                    SettlementError::Yielded { .. } => {
+                        unreachable!("test yield is not enabled for serial tick")
                     }
                 }),
         }
@@ -2275,7 +2338,12 @@ impl Scheduler {
             graph_version: success_graph_version,
             attempts: 0,
         };
-        self.commit_prepared_settlement(&mut prepared, &owner, _gate)
+        let result = self.commit_prepared_settlement(&mut prepared, &owner, _gate);
+        #[cfg(test)]
+        if matches!(result, Err(Error::TestYield)) {
+            self.yielded_prepared = Some(prepared);
+        }
+        result
     }
 
     fn commit_prepared_settlement(
@@ -2304,6 +2372,10 @@ impl Scheduler {
                 || prepared.attempts >= GRAPH_RETRIES
             {
                 break result;
+            }
+            #[cfg(test)]
+            if self.yield_after_graph_conflict {
+                return Err(Error::TestYield);
             }
             match prepared.revalidate(self, owner, &_gate)? {
                 PreparedRevalidation::Ready => (),
@@ -7463,6 +7535,209 @@ mod tests {
                 scheduler.get(Uuid::from_u128(id)).unwrap().unwrap().owner(),
                 &TaskOwner::Task(Uuid::from_u128(1))
             );
+        }
+    }
+
+    #[test]
+    fn yielded_settlement_boundaries_retain_lease_attempt_and_effects() {
+        use crate::document::{Address, Documents, TaskDocuments};
+        use crate::task_store::{SignalResult, SignalToken};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Staging {
+            calls: Arc<AtomicUsize>,
+            attempt: Arc<Mutex<Option<Uuid>>>,
+            address: Address,
+        }
+        impl Handler for Staging {
+            fn run(&self, _: &Task) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn run_with_documents(
+                &self,
+                task: &Task,
+                docs: &mut TaskDocuments<'_>,
+            ) -> Result<Step, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.attempt.lock().unwrap() = task.attempt_id();
+                docs.get(&self.address).unwrap();
+                docs.put(
+                    &self.address,
+                    json!({"value":"staged"}).as_object().unwrap().clone(),
+                )
+                .unwrap();
+                let token = SignalToken::new("answer", 1).unwrap();
+                assert_eq!(
+                    docs.signal_at(Uuid::from_u128(3), &token, "key", json!(7), 0)
+                        .unwrap(),
+                    SignalResult::Delivered
+                );
+                let keyed = super::tests::task(4, TaskOwner::Task(task.id()), "child", false, 3);
+                docs.stage_keyed_child("keyed", "tool", keyed.input(), keyed.clone())
+                    .unwrap();
+                let direct = super::tests::task(5, TaskOwner::Task(task.id()), "child", false, 3);
+                Ok(Step::Wait {
+                    checkpoint: cp("waiting"),
+                    condition: WaitFor::TasksAny(vec![keyed.id(), direct.id()]),
+                    children: vec![direct],
+                })
+            }
+        }
+
+        for after_conflict in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let address = Address {
+                scope: "yield".into(),
+                name: "doc".into(),
+                key: "".into(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempt = Arc::new(Mutex::new(None));
+            let mut registry = Registry::default();
+            registry.register(
+                "parent",
+                false,
+                Staging {
+                    calls: calls.clone(),
+                    attempt: attempt.clone(),
+                    address: address.clone(),
+                },
+            );
+            registry.register("child", false, |_: &Task| Ok(Step::Succeed(json!(null))));
+            let mut scheduler = Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let owner = TaskOwner::Conversation(Uuid::from_u128(9));
+            scheduler
+                .ts()
+                .save(&[
+                    Save::Create(&task(1, owner.clone(), "parent", false, 3)),
+                    Save::Create(&task(2, owner.clone(), "other", false, 3)),
+                    Save::Create(&task(3, owner, "receiver", false, 3)),
+                ])
+                .unwrap();
+            let TickReservation::Invocation(invocation) = scheduler.reserve_tick(0).unwrap() else {
+                panic!("reservation")
+            };
+            let completed = invocation.execute().unwrap();
+            let attempt_id = attempt.lock().unwrap().expect("attempt recorded");
+            scheduler.yield_before_preparation = !after_conflict;
+            scheduler.yield_after_graph_conflict = after_conflict;
+            if after_conflict {
+                let once = Arc::new(AtomicBool::new(false));
+                scheduler.result_commit_hook = Some(Arc::new(move |_, store| {
+                    if !once.swap(true, Ordering::SeqCst) {
+                        let tasks = TaskStore::new(store);
+                        let other = tasks.load(Uuid::from_u128(2)).unwrap().unwrap();
+                        tasks
+                            .update(&other, |task| {
+                                task.start()?;
+                                task.yield_ready()
+                            })
+                            .unwrap();
+                    }
+                }));
+            }
+            let pending = match scheduler.settle_invocation(completed) {
+                Err(SettlementError::Yielded { pending }) => *pending,
+                result => panic!("expected yield: {result:?}"),
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                scheduler
+                    .live_invocations
+                    .lock()
+                    .unwrap()
+                    .attempts
+                    .contains(&Uuid::from_u128(1))
+            );
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .load(Uuid::from_u128(1))
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .attempt_id(),
+                Some(attempt_id)
+            );
+            assert!(
+                Documents::new(scheduler.owner().store())
+                    .get(&address)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(scheduler.get(Uuid::from_u128(4)).unwrap().is_none());
+            let token = SignalToken::new("answer", 1).unwrap();
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .read_typed_signal(Uuid::from_u128(3), &token, "key")
+                    .unwrap(),
+                None
+            );
+            scheduler.yield_before_preparation = false;
+            scheduler.yield_after_graph_conflict = false;
+            match pending {
+                PendingSettlement::Unprepared(completed) if !after_conflict => {
+                    scheduler.settle_invocation(completed).unwrap();
+                }
+                PendingSettlement::Prepared {
+                    mut lease,
+                    mut settlement,
+                } if after_conflict => {
+                    let owner = scheduler.owner();
+                    let fence = scheduler.failure_fence.clone();
+                    let failure_guard = fence.lock().unwrap();
+                    let task_gate = owner.task_gate().lock().unwrap();
+                    let result =
+                        scheduler.resume_prepared_settlement(&mut settlement, &owner, task_gate);
+                    if result.is_ok() {
+                        lease.retired = true;
+                    }
+                    drop(failure_guard);
+                    drop(lease);
+                    result.unwrap();
+                }
+                other => panic!("unexpected yield: {other:?}"),
+            }
+            let root = scheduler.get(Uuid::from_u128(1)).unwrap().unwrap();
+            assert_eq!(
+                root.state(),
+                &TaskState::Waiting(WaitFor::TasksAny(vec![
+                    Uuid::from_u128(4),
+                    Uuid::from_u128(5)
+                ]))
+            );
+            assert_eq!(root.retired_attempt_id(), Some(attempt_id));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                !scheduler
+                    .live_invocations
+                    .lock()
+                    .unwrap()
+                    .attempts
+                    .contains(&root.id())
+            );
+            assert_eq!(
+                Documents::new(scheduler.owner().store())
+                    .get(&address)
+                    .unwrap()
+                    .unwrap()
+                    .value["value"],
+                "staged"
+            );
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .read_typed_signal(Uuid::from_u128(3), &token, "key")
+                    .unwrap(),
+                Some(json!(7))
+            );
+            for id in [4, 5] {
+                assert_eq!(
+                    scheduler.get(Uuid::from_u128(id)).unwrap().unwrap().owner(),
+                    &TaskOwner::Task(root.id())
+                );
+            }
         }
     }
 
