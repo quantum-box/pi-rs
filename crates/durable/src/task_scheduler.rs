@@ -318,6 +318,54 @@ pub(crate) struct FailurePublication {
 }
 
 impl FailurePublication {
+    // The caller holds the publication fence and task gate until admission commits.
+    pub(crate) fn permits_admission(
+        &self,
+        owner: &OwnedStore,
+        conversation: Uuid,
+        parent: Option<&Task>,
+    ) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.poisoned {
+            return false;
+        }
+        if state.failed_handlers.is_empty() {
+            return true;
+        }
+        let edges = crate::ownership_edge::EdgeStore::new(owner.store());
+        let root = match parent {
+            Some(task) => Scheduler::foreground_root(owner, task),
+            None => match edges.get(conversation) {
+                Ok(None) => return true,
+                Ok(Some(edge)) if edge.edge.mode == crate::ownership_edge::Mode::Background => {
+                    return true;
+                }
+                Ok(Some(edge)) => TaskStore::new(owner.store())
+                    .load(edge.edge.task)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| {
+                        if edge.edge.task_owner != *record.task.owner() {
+                            None
+                        } else {
+                            Scheduler::foreground_root(owner, &record.task)
+                        }
+                    }),
+                Err(_) => None,
+            },
+        };
+        let Some(root) = root else {
+            return false;
+        };
+        state.failed_handlers.iter().all(|id| {
+            TaskStore::new(owner.store())
+                .load(*id)
+                .ok()
+                .flatten()
+                .and_then(|record| Scheduler::foreground_root(owner, &record.task))
+                .is_some_and(|failed_root| failed_root != root)
+        })
+    }
     /// Cleanup errors and panics may follow an unknown durable commit. Publish
     /// poison and the driver stop under the same fence as task settlement.
     pub(crate) fn indeterminate(&self, publish_stop: impl FnOnce()) {

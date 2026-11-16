@@ -243,6 +243,12 @@ impl Driver {
         Ok(state)
     }
     pub fn submit(&self, task: &Task) -> Result<(), Error> {
+        // Never wait here: callers may already hold a conversation gate.
+        let _publication = self
+            .shared
+            .failure_publication
+            .try_lock()
+            .map_err(|_| task_scheduler::Error::Busy)?;
         let state = self.check()?;
         let registered = task
             .kind()
@@ -261,6 +267,13 @@ impl Driver {
             .lock()
             .map_err(|_| Error::Poisoned)?;
         if let TaskOwner::Conversation(id) = task.owner() {
+            if !self
+                .shared
+                .failure_publication
+                .permits_admission(&self.shared.owner, *id, None)
+            {
+                return Err(task_scheduler::Error::Busy.into());
+            }
             let key = format!("runtime/conversation/{id}");
             let entry = self
                 .shared
@@ -1202,6 +1215,10 @@ impl Shared {
         conversation: Uuid,
         f: impl FnOnce() -> Result<T, crate::runtime::Error>,
     ) -> Result<T, crate::runtime::Error> {
+        let _publication = self
+            .failure_publication
+            .try_lock()
+            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
         let state = self
             .state
             .lock()
@@ -1226,6 +1243,14 @@ impl Shared {
             .task_gate()
             .lock()
             .map_err(|_| crate::runtime::Error::Failed)?;
+        if !self
+            .failure_publication
+            .permits_admission(&self.owner, conversation, None)
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "task failure fences admission".into(),
+            ));
+        }
         let store = TaskStore::new(self.owner.store());
         for task in tasks {
             if store
@@ -1253,6 +1278,10 @@ impl Shared {
         conversation: Uuid,
         f: impl FnOnce(u64) -> Result<T, crate::runtime::Error>,
     ) -> Result<T, crate::runtime::Error> {
+        let _publication = self
+            .failure_publication
+            .try_lock()
+            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
         let state = self
             .state
             .lock()
@@ -1306,6 +1335,24 @@ impl Shared {
             .map_err(|_| crate::runtime::Error::Failed)?;
         let store = self.owner.store();
         let tasks = TaskStore::new(store);
+        if !self
+            .failure_publication
+            .permits_admission(&self.owner, conversation, None)
+            || intents
+                .iter()
+                .filter(|intent| !intent.staged_parent)
+                .any(|intent| {
+                    !self.failure_publication.permits_admission(
+                        &self.owner,
+                        conversation,
+                        Some(&intent.parent.task),
+                    )
+                })
+        {
+            return Err(crate::runtime::Error::Invalid(
+                "task failure fences admission".into(),
+            ));
+        }
         let boundary = store.put_version()?;
         // A task-owned conversation requires validating its owner's complete
         // abort chain. Until that path is available, reject it explicitly.
@@ -1547,6 +1594,160 @@ mod tests {
     use crate::task::{Checkpoint, WaitFor};
     use serde_json::json;
     use std::sync::mpsc;
+
+    #[test]
+    fn published_handler_failure_fences_admissions_before_running_record_settles() {
+        for panic_handler in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = task_scheduler::Registry::default();
+            registry.register("work", false, move |_: &Task| {
+                if panic_handler {
+                    panic!("test handler panic");
+                }
+                Err("test handler error".into())
+            });
+            let mut scheduler =
+                task_scheduler::Scheduler::open(dir.path().join("db"), registry).unwrap();
+            let conversation = Uuid::from_u128(9);
+            let owned_conversation = Uuid::from_u128(10);
+            let unrelated = Uuid::from_u128(11);
+            let make_task = |id, owner| {
+                Task::new(
+                    Uuid::from_u128(id),
+                    owner,
+                    Checkpoint {
+                        phase: "start".into(),
+                        data: json!({}),
+                    },
+                    3,
+                )
+                .unwrap()
+                .registered("work".into(), false)
+            };
+            let parent = make_task(1, TaskOwner::Conversation(conversation));
+            scheduler.submit(&parent).unwrap();
+            let task_scheduler::TickReservation::Invocation(invocation) =
+                scheduler.reserve_tick(0).unwrap()
+            else {
+                panic!("expected invocation")
+            };
+            let owner = scheduler.owner();
+            let snapshot = TaskStore::new(owner.store())
+                .load(parent.id())
+                .unwrap()
+                .unwrap();
+            let edge = crate::ownership_edge::Edge {
+                task: parent.id(),
+                task_owner: TaskOwner::Conversation(conversation),
+                child: owned_conversation,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let mutations = vec![
+                durable_store::Mutation::Put {
+                    key: crate::ownership_edge::edge_key(owned_conversation),
+                    value: serde_json::to_vec(&edge).unwrap(),
+                },
+                durable_store::Mutation::Put {
+                    key: format!("runtime/conversation/{owned_conversation}").into_bytes(),
+                    value: serde_json::to_vec(&json!({"abort_requested": false})).unwrap(),
+                },
+                durable_store::Mutation::Put {
+                    key: format!("runtime/conversation/{unrelated}").into_bytes(),
+                    value: serde_json::to_vec(&json!({"abort_requested": false})).unwrap(),
+                },
+            ];
+            owner.store().commit(&[], &mutations).unwrap();
+            let policies = scheduler.policies();
+            let shared = Arc::new(Shared {
+                owner,
+                state: Mutex::new(State {
+                    policies,
+                    ..State::default()
+                }),
+                wake_reader: scheduler.wake_reader(),
+                activity: scheduler.worker_activity(),
+                registry_gate: Mutex::new(()),
+                registry_replacing: std::sync::atomic::AtomicBool::new(false),
+                reservation_stop: scheduler.reservation_stop_token(),
+                failure_publication: scheduler.failure_publication(),
+                scheduler: Mutex::new(scheduler),
+                pending: Mutex::new(Vec::new()),
+                wake: Condvar::new(),
+                harness: None,
+                cleanup_stop: pi_rs_core::CancellationToken::new(),
+                notifications: Mutex::new(None),
+                subscription: Mutex::new(None),
+            });
+            let driver = Driver {
+                shared: shared.clone(),
+                worker: None,
+                cleanup: None,
+            };
+            let direct = make_task(2, TaskOwner::Task(parent.id()));
+            let before = crate::session_transaction::SessionChild::test_intent(
+                snapshot.clone(),
+                direct.clone(),
+            );
+            assert!(
+                shared
+                    .with_session_child(&[before], &[], conversation, |_| Ok(()))
+                    .is_ok()
+            );
+            assert!(
+                shared
+                    .with_admission(&[], owned_conversation, || Ok(()))
+                    .is_ok()
+            );
+            let publication = shared.failure_publication.try_lock().unwrap();
+            let contender = shared.clone();
+            let (sent, received) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                sent.send(contender.with_admission(&[], unrelated, || Ok(())).is_err())
+                    .unwrap();
+            });
+            assert!(received.recv_timeout(Duration::from_secs(5)).unwrap());
+            drop(publication);
+            thread.join().unwrap();
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invocation.execute()));
+            assert_eq!(result.is_err(), panic_handler);
+            assert_eq!(
+                TaskStore::new(shared.owner.store())
+                    .load(parent.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .state(),
+                &TaskState::Running
+            );
+            let intent = crate::session_transaction::SessionChild::test_intent(snapshot, direct);
+            assert!(
+                shared
+                    .with_session_child(&[intent], &[], conversation, |_| Ok(()))
+                    .is_err()
+            );
+            let child = make_task(3, TaskOwner::Conversation(owned_conversation));
+            assert!(driver.submit(&child).is_err());
+            assert!(
+                shared
+                    .with_session_child(
+                        &[],
+                        std::slice::from_ref(&child),
+                        owned_conversation,
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            assert!(
+                shared
+                    .with_admission(&[child], owned_conversation, || Ok(()))
+                    .is_err()
+            );
+            let independent = make_task(4, TaskOwner::Conversation(unrelated));
+            driver.submit(&independent).unwrap();
+            assert!(shared.with_admission(&[], unrelated, || Ok(())).is_ok());
+        }
+    }
 
     #[test]
     fn replacement_drains_pool_before_starting_more_handlers() {
