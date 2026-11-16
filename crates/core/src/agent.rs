@@ -1,3 +1,4 @@
+mod display_layout;
 use crate::runtime::time as platform_time;
 #[path = "turn_scheduler.rs"]
 mod turn_scheduler;
@@ -2728,6 +2729,7 @@ impl Agent<'_> {
         const MAX_ENRICHED_ITEMS: usize = 256;
         const MAX_LEGACY_TEXT_SEGMENTS: usize = 128;
         let mut metadata = ModelMetadata::default();
+        let mut display_candidate = display_layout::Candidate::default();
         let mut tool_delta_bytes = 0_usize;
         let mut reasoning_delta_bytes = 0_usize;
         let mut text_item_ids = std::collections::HashMap::<u64, usize>::new();
@@ -2774,6 +2776,7 @@ impl Agent<'_> {
                 };
                 let event = event?;
                 let redacted_start = event.is_redacted_start();
+                display_candidate.observe(&event.event);
                 match event.event {
                     EnrichedModelEvent::Legacy(ModelEvent::Text(delta)) => {
                         text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
@@ -3029,44 +3032,65 @@ impl Agent<'_> {
                 observer,
             )?;
         }
-        commit(
-            session,
-            Event::ModelFinished {
-                request_id,
-                metadata: metadata.clone(),
-                usage: usage.clone(),
-                failure,
-                // A completed summary must survive interruption between the
-                // billable response and the compaction commit. Turn replies
-                // already use RecordedReply for that purpose.
-                partial: if retain_reply {
-                    content
-                } else {
-                    match &result {
-                        Ok(reply)
-                            if self.registry.extensions.is_empty()
-                                && !reply.truncated
-                                && reply.invocations.is_empty()
-                                && !reply.content.trim().is_empty()
-                                && reply.content.len() <= 64 * 1024 =>
-                        {
-                            reply.content.clone()
-                        }
-                        Ok(_) => String::new(),
-                        Err(_) => content,
+        let display_metadata = if retain_reply
+            && metadata.provider_api == Some(crate::ModelApi::AnthropicMessages)
+            && metadata.reasoning.is_none()
+            && metadata.replay.is_none()
+        {
+            result.as_ref().ok().and_then(|reply| {
+                display_candidate.finish(
+                    &reply.content,
+                    reply
+                        .invocations
+                        .iter()
+                        .map(|invocation| invocation.call.clone()),
+                )
+            })
+        } else {
+            None
+        };
+        let completion = Event::ModelFinished {
+            request_id,
+            metadata: metadata.clone(),
+            usage: usage.clone(),
+            failure,
+            // A completed summary must survive interruption between the
+            // billable response and the compaction commit. Turn replies
+            // already use RecordedReply for that purpose.
+            partial: if retain_reply {
+                content
+            } else {
+                match &result {
+                    Ok(reply)
+                        if self.registry.extensions.is_empty()
+                            && !reply.truncated
+                            && reply.invocations.is_empty()
+                            && !reply.content.trim().is_empty()
+                            && reply.content.len() <= 64 * 1024 =>
+                    {
+                        reply.content.clone()
                     }
-                },
-                reply: advertised_tools.and_then(|advertised_tools| {
-                    result.as_ref().ok().map(|reply| RecordedReply {
-                        content: reply.content.clone(),
-                        invocations: reply.invocations.clone(),
-                        advertised_tools,
-                        max_output_tokens: allowance,
-                    })
-                }),
+                    Ok(_) => String::new(),
+                    Err(_) => content,
+                }
             },
-            observer,
-        )?;
+            reply: advertised_tools.and_then(|advertised_tools| {
+                result.as_ref().ok().map(|reply| RecordedReply {
+                    content: reply.content.clone(),
+                    invocations: reply.invocations.clone(),
+                    advertised_tools,
+                    max_output_tokens: allowance,
+                })
+            }),
+        };
+        let record_id = session
+            .append_with_advisory_metadata(completion, display_metadata)?
+            .id;
+        let record_metadata = session.record_metadata(record_id).cloned();
+        let record = &session.records()[record_id as usize - 1];
+        with_record_event_metadata(record_id, record_metadata, || {
+            observer(Notification::Committed(record));
+        });
         self.settle_usage(request_id, &usage, &metadata).await?;
         Ok(ReplyAttempt { outcome: result })
     }

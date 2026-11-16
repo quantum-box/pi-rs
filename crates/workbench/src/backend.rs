@@ -406,6 +406,7 @@ impl SessionSnapshot {
                 emitted.extend(cursor.appended(
                     &self.records[..=index],
                     self.record_metadata.get(&self.records[index].id),
+                    &self.record_metadata,
                 ));
             }
             self.deferred_from = None;
@@ -555,6 +556,7 @@ impl SessionSnapshot {
             emitted.extend(cursor.appended(
                 &self.records[..=index],
                 self.record_metadata.get(&self.records[index].id),
+                &self.record_metadata,
             ));
         }
         self.deferred_from = None;
