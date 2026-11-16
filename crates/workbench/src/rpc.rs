@@ -965,6 +965,7 @@ mod jsonl_framing_tests {
             "\"\\uDC00\\x",
             "\"\\uDC00\\u12",
             "[\"\\ud800\" false,\"\t\"]",
+            "[\"\\ud800\",\"\t\"]",
         ] {
             let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
             assert_eq!(
