@@ -172,3 +172,75 @@ fn rpc_replaces_invalid_utf8_and_continues_after_parse_errors() {
     assert_eq!(responses[14]["id"], "after");
     assert_eq!(responses[14]["success"], true);
 }
+
+#[test]
+fn rpc_session_name_type_errors_use_pi_response_envelopes() {
+    let root = tempfile::tempdir().unwrap();
+    let input_path = root.path().join("input");
+    let output_path = root.path().join("output");
+    std::fs::write(
+        &input_path,
+        concat!(
+            "{\"type\":\"set_session_name\",\"id\":\"missing\"}\n",
+            "{\"type\":\"set_session_name\",\"id\":\"null\",\"name\":null}\n",
+            "{\"type\":\"set_session_name\",\"id\":\"number\",\"name\":42}\n",
+            "{\"type\":\"get_state\",\"id\":\"after\"}\n",
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::from(std::fs::File::open(input_path).unwrap()))
+        .stdout(Stdio::from(std::fs::File::create(&output_path).unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("RPC process did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    let output = std::fs::read_to_string(output_path).unwrap();
+    let responses: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for (id, error) in [
+        (
+            "missing",
+            "Cannot read properties of undefined (reading 'trim')",
+        ),
+        ("null", "Cannot read properties of null (reading 'trim')"),
+        ("number", "command.name.trim is not a function"),
+    ] {
+        let response = responses
+            .iter()
+            .find(|response| response["id"] == id)
+            .unwrap();
+        assert_eq!(response["command"], "set_session_name");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["error"], error);
+    }
+    assert!(
+        responses
+            .iter()
+            .any(|response| response["id"] == "after" && response["success"] == true)
+    );
+}
