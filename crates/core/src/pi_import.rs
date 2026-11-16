@@ -814,12 +814,12 @@ pub(crate) fn validate_conversions(
                     ));
                 }
                 Some(Value::String(parent)) => {
-                    if let Some(candidates) = by_name.get(parent.as_str()) {
-                        if candidates.len() != 1 || parent_source != Some(candidates[0]) {
-                            return Err(Error::Session(
-                                "imported Pi source parent does not match its branch".into(),
-                            ));
-                        }
+                    if let Some(candidates) = by_name.get(parent.as_str())
+                        && (candidates.len() != 1 || parent_source != Some(candidates[0]))
+                    {
+                        return Err(Error::Session(
+                            "imported Pi source parent does not match its branch".into(),
+                        ));
                     }
                     // An absent parent may be an original orphan or a label
                     // removed by an existing fork; neither can be distinguished
