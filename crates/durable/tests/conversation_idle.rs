@@ -323,6 +323,64 @@ async fn follows_terminal_task_anchor_to_recovered_child() {
 }
 
 #[tokio::test]
+async fn all_idle_excludes_child_behind_terminal_background_edge() {
+    use durable_store::Store;
+    use pi_rs_durable::{
+        ownership_edge::{Edge, EdgeStore, Mode},
+        runtime::Harness,
+        task_store::{Save, TaskStore},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (parent, child) = {
+        let mut harness = Harness::open_paused(&path, options()).unwrap();
+        let parent = harness.create_conversation(config()).unwrap();
+        let child = harness.create_conversation(config()).unwrap();
+        harness.submit(child, None, "child work".into()).unwrap();
+        (parent, child)
+    };
+    {
+        let db = Store::open(&path).unwrap();
+        let anchor = task(parent, false);
+        let tasks = TaskStore::new(&db);
+        tasks.save(&[Save::Create(&anchor)]).unwrap();
+        let batch = EdgeStore::new(&db)
+            .prepare_create(&Edge {
+                task: anchor.id(),
+                task_owner: anchor.owner().clone(),
+                child,
+                mode: Mode::Background,
+            })
+            .unwrap();
+        db.commit(&batch.checks, &batch.mutations).unwrap();
+        let snapshot = tasks.load(anchor.id()).unwrap().unwrap();
+        tasks.update(&snapshot, |t| t.start()).unwrap();
+        let snapshot = tasks.load(anchor.id()).unwrap().unwrap();
+        tasks.update(&snapshot, |t| t.succeed(json!(null))).unwrap();
+    }
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut opts = options();
+    opts.model = Arc::new(GatedModel {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let scheduler = Scheduler::open(&path, opts).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.wait_for_all_idle(&CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    release.notify_one();
+    scheduler.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn conversation_abort_fences_nested_task_entry_and_document_transaction() {
     use durable_store::{Expected, Store};
     use pi_rs_durable::{
