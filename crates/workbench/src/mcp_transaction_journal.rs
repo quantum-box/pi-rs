@@ -11,38 +11,81 @@
 //! persist `ConfigInProgress` before config mutation and
 //! `CredentialsInProgress` before credential mutation. Persist `Complete` only
 //! after both operations are known durable. A crash can occur on either side of
-//! each action. This record contains opaque target identities and a random transaction ID but no URL, credentials,
-//! raw paths, or rollback data, so it cannot decide or perform recovery.
-//! Secure identity generation, domain-separated keyed derivation and HMAC key
-//! management are NOT implemented: callers must supply fixed-length values that
-//! do not reveal secrets or low-entropy identifiers. This is not enforced by
-//! the type. Recovery, integration and Windows support are not implemented. Incomplete records
-//! Effective-auth fingerprint derivation and reading actual configuration are
-//! not implemented. The target records the expected effective auth state at
-//! completion, including any intended configuration changes.
-//! must block new work until a separately designed recovery policy resolves them.
+//! each action. This record contains opaque identities and a random transaction
+//! ID, but no URL, credentials, raw paths, or rollback data. It cannot perform
+//! recovery. Secure opaque identity derivation, effective-auth fingerprint
+//! derivation, actual configuration reads, and key management are unimplemented.
+//! Callers must not supply secret or low-entropy IDs. Incomplete records must
+//! block work until a separately designed recovery policy resolves them. The
+//! target's auth fingerprint describes the expected post-commit state.
 //! An absent record alone is not evidence that no transaction ever existed.
 //!
 //! On Unix, updates sync a temporary file, atomically rename it in the same
 //! directory, and sync that directory; removal also syncs the directory. A sync
 //! error has an ambiguous outcome: stop the transaction and require explicit
-//! recovery. A re-read cannot prove durability and must not resume operations. Filesystem and
-//! hardware guarantees vary, and external deletion or snapshot rollback cannot
+//! recovery. A re-read cannot prove durability and must not resume operations.
+//! Filesystem and hardware guarantees vary; external deletion or snapshot rollback cannot
 //! be detected. Windows fails closed until durable directory syncing is designed.
-use sha2::{Digest, Sha256};
+//! The caller must inject a stable secret record MAC key, independent of keys
+//! used for opaque identities. Actual credential/config binding, key durability
+//! (including cross-process sync failure), recovery and Windows are unimplemented.
+//! Authentication does not prevent deletion, replay or storage rollback.
+//! MAC keys are wrapped with `zeroize`; HMAC's internal digest state, compiler
+//! copies, registers and swap are not guaranteed to be erased.
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::{
     cell::Cell,
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
+use zeroize::Zeroizing;
 
 const NAME: &str = "mcp-oauth-transaction.journal";
 const MAGIC: &[u8; 8] = b"PIMCPJNL";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 // Header + seven tagged 32-byte IDs + the previous-generation presence byte.
 const PREFIX_LEN: usize = 10 + 7 * 33 + 1;
 const RECORD_LEN: usize = PREFIX_LEN + 32;
+const MAC_DOMAIN: &[u8] = b"pi-rs:mcp-journal-record:v1\0";
+
+/// Caller supplies a stable secret key. Keeping that key durable, private and
+/// consistently bound to the real credential store is outside this prototype.
+pub(crate) struct RecordAuthenticator(Zeroizing<[u8; 32]>);
+impl RecordAuthenticator {
+    /// Derive a journal-only key from the identity key. This does not make
+    /// provisioning, durability, recovery, or key replacement safe by itself.
+    pub(crate) fn from_identity_key(key: &crate::mcp_journal_identity::Key) -> io::Result<Self> {
+        let derived = key.derive(
+            crate::mcp_journal_identity::Domain::RecordKey,
+            &[b"record authentication key"],
+        )?;
+        Self::new(Zeroizing::new(derived))
+    }
+
+    pub(crate) fn new(key: Zeroizing<[u8; 32]>) -> io::Result<Self> {
+        if *key == [0; 32] {
+            return Err(invalid("invalid record authentication key"));
+        }
+        Ok(Self(key))
+    }
+    fn mac(&self, bytes: &[u8]) -> io::Result<Hmac<Sha256>> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0[..])
+            .map_err(|_| invalid("invalid record authentication key"))?;
+        mac.update(MAC_DOMAIN);
+        mac.update(bytes);
+        Ok(mac)
+    }
+    fn sign(&self, bytes: &[u8]) -> io::Result<[u8; 32]> {
+        Ok(self.mac(bytes)?.finalize().into_bytes().into())
+    }
+    fn verify(&self, bytes: &[u8], tag: &[u8]) -> io::Result<()> {
+        self.mac(bytes)?
+            .verify_slice(tag)
+            .map_err(|_| invalid("journal authentication failed"))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stage {
@@ -203,7 +246,7 @@ impl Record {
     pub(crate) fn identity(self) -> Identity {
         self.identity
     }
-    fn encode(self) -> Vec<u8> {
+    fn encode(self, auth: &RecordAuthenticator) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::with_capacity(RECORD_LEN);
         bytes.extend_from_slice(MAGIC);
         bytes.push(VERSION);
@@ -231,11 +274,11 @@ impl Record {
         bytes.push(7);
         bytes.extend_from_slice(&self.identity.target.auth_fingerprint.0);
         debug_assert_eq!(bytes.len(), PREFIX_LEN);
-        let checksum = Sha256::digest(&bytes);
-        bytes.extend_from_slice(&checksum);
-        bytes
+        let tag = auth.sign(&bytes)?;
+        bytes.extend_from_slice(&tag);
+        Ok(bytes)
     }
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
+    fn decode(bytes: &[u8], auth: &RecordAuthenticator) -> io::Result<Self> {
         if bytes.len() != RECORD_LEN {
             return Err(invalid("journal has an invalid length"));
         }
@@ -245,10 +288,8 @@ impl Record {
         if bytes[8] != VERSION {
             return Err(invalid("unknown journal version"));
         }
+        auth.verify(&bytes[..PREFIX_LEN], &bytes[PREFIX_LEN..])?;
         let stage = Stage::parse(bytes[9])?;
-        if Sha256::digest(&bytes[..PREFIX_LEN]).as_slice() != &bytes[PREFIX_LEN..] {
-            return Err(invalid("journal checksum mismatch"));
-        }
         let mut offset = 10;
         let mut get = |kind: u8| -> io::Result<OpaqueId> {
             if bytes[offset] != kind {
@@ -314,19 +355,20 @@ fn conflict(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, message)
 }
 
-pub(crate) struct Journal {
+pub(crate) struct Journal<'a> {
     path: PathBuf,
+    auth: &'a RecordAuthenticator,
     #[cfg(unix)]
     directory: File,
     poisoned: Cell<bool>,
     #[cfg(test)]
     fail_sync: Cell<bool>,
 }
-impl Journal {
+impl<'a> Journal<'a> {
     /// Open and pin the existing private, trusted directory under the shared gate.
     /// Keep its pathname and ancestors stable; replacement across restarts cannot
     /// be detected from this journal alone.
-    pub(crate) fn new(directory: &Path) -> io::Result<Self> {
+    pub(crate) fn new(directory: &Path, auth: &'a RecordAuthenticator) -> io::Result<Self> {
         require_durable_platform()?;
         #[cfg(unix)]
         {
@@ -337,6 +379,7 @@ impl Journal {
                 .open(directory)?;
             let journal = Self {
                 path: directory.join(NAME),
+                auth,
                 directory: handle,
                 poisoned: Cell::new(false),
                 #[cfg(test)]
@@ -347,7 +390,7 @@ impl Journal {
         }
         #[cfg(not(unix))]
         {
-            let _ = directory;
+            let _ = (directory, auth);
             Err(unsupported())
         }
     }
@@ -431,7 +474,7 @@ impl Journal {
             let mut bytes = Vec::with_capacity(RECORD_LEN + 1);
             file.take((RECORD_LEN + 1) as u64).read_to_end(&mut bytes)?;
             self.check_directory()?;
-            Record::decode(&bytes).map(Some)
+            Record::decode(&bytes, self.auth).map(Some)
         }
         #[cfg(not(unix))]
         {
@@ -571,7 +614,7 @@ impl Journal {
         #[cfg(unix)]
         {
             use std::{ffi::CString, os::fd::AsRawFd};
-            let bytes = record.encode();
+            let bytes = record.encode(self.auth)?;
             let temp = CString::new(format!(".mcp-journal-{}", uuid::Uuid::new_v4()))
                 .expect("UUID has no NUL");
             self.poisoned.set(true);
@@ -629,6 +672,12 @@ fn require_durable_platform() -> io::Result<()> {
     Err(unsupported())
 }
 
+#[cfg(test)]
+fn test_auth() -> &'static RecordAuthenticator {
+    static AUTH: std::sync::OnceLock<RecordAuthenticator> = std::sync::OnceLock::new();
+    AUTH.get_or_init(|| RecordAuthenticator::new(Zeroizing::new([0x42; 32])).unwrap())
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
@@ -636,6 +685,7 @@ mod windows_tests {
     fn reads_are_unsupported_without_touching_the_path() {
         let journal = Journal {
             path: PathBuf::from("nonexistent-journal"),
+            auth: test_auth(),
             poisoned: Cell::new(false),
             fail_sync: Cell::new(false),
         };
@@ -644,7 +694,7 @@ mod windows_tests {
             io::ErrorKind::Unsupported
         );
         assert_eq!(
-            Journal::new(Path::new("nonexistent-directory"))
+            Journal::new(Path::new("nonexistent-directory"), test_auth())
                 .err()
                 .unwrap()
                 .kind(),
@@ -656,6 +706,7 @@ mod windows_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use sha2::Digest;
     fn id(byte: u8) -> OpaqueId {
         OpaqueId::new([byte; 32]).unwrap()
     }
@@ -681,9 +732,116 @@ mod tests {
         r
     }
     #[test]
+    fn derived_record_authentication_matches_fixed_vector() {
+        let master = crate::mcp_journal_identity::Key::fixture([0x42; 32]);
+        let other = crate::mcp_journal_identity::Key::fixture([0x43; 32]);
+        let auth = RecordAuthenticator::from_identity_key(&master).unwrap();
+        let tag = auth.sign(b"canonical record").unwrap();
+        assert_eq!(
+            tag,
+            [
+                0x8e, 0x2b, 0x50, 0x11, 0x87, 0x19, 0x15, 0xa2, 0x6e, 0x88, 0xa2, 0xa8, 0x10, 0xdc,
+                0xdd, 0x14, 0x77, 0x78, 0x9d, 0xe1, 0x37, 0x8b, 0xa3, 0xa8, 0x83, 0xef, 0xff, 0xaa,
+                0x32, 0x0a, 0x4c, 0x71
+            ]
+        );
+        assert!(auth.verify(b"canonical record", &tag).is_ok());
+        let mut altered = tag;
+        altered[0] ^= 1;
+        assert!(auth.verify(b"canonical record", &altered).is_err());
+        assert!(auth.verify(b"changed record", &tag).is_err());
+        assert!(
+            RecordAuthenticator::from_identity_key(&other)
+                .unwrap()
+                .verify(b"canonical record", &tag)
+                .is_err()
+        );
+    }
+    #[test]
+    fn identity_key_authenticates_journal_after_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = crate::mcp_journal_identity::KeyStore::open(dir.path()).unwrap();
+        let key = store.provision().unwrap();
+        let auth = RecordAuthenticator::from_identity_key(&key).unwrap();
+        let journal = Journal::new(dir.path(), &auth).unwrap();
+        let record = journal.begin(target()).unwrap();
+        drop(journal);
+        let loaded_key = crate::mcp_journal_identity::KeyStore::open(dir.path())
+            .unwrap()
+            .load()
+            .unwrap();
+        let loaded_auth = RecordAuthenticator::from_identity_key(&loaded_key).unwrap();
+        let reopened = Journal::new(dir.path(), &loaded_auth).unwrap();
+        assert_eq!(
+            reopened.read_matching(record.identity()).unwrap(),
+            Some(record)
+        );
+        let other = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(other.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let other_key = crate::mcp_journal_identity::KeyStore::open(other.path())
+            .unwrap()
+            .provision()
+            .unwrap();
+        let other_auth = RecordAuthenticator::from_identity_key(&other_key).unwrap();
+        assert!(
+            Journal::new(dir.path(), &other_auth)
+                .unwrap()
+                .read_matching(record.identity())
+                .is_err()
+        );
+    }
+    #[test]
+    fn authenticated_record_restart_wrong_key_and_tampering_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
+        let record = complete(&j, target());
+        let valid = std::fs::read(&j.path).unwrap();
+        drop(j);
+        let other = RecordAuthenticator::new(Zeroizing::new([0x43; 32])).unwrap();
+        let wrong = Journal::new(dir.path(), &other).unwrap();
+        assert!(wrong.read_matching(record.identity()).is_err());
+        assert!(wrong.inspect_scope(target().scope()).is_err());
+        assert!(wrong.begin(target()).is_err());
+        let mut pretend_prepared = record;
+        pretend_prepared.stage = Stage::Prepared;
+        assert!(
+            wrong
+                .advance(record.identity(), pretend_prepared, Stage::ConfigInProgress)
+                .is_err()
+        );
+        assert!(wrong.clear_complete(record.identity(), record).is_err());
+        assert_eq!(std::fs::read(&wrong.path).unwrap(), valid);
+        drop(wrong);
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
+        assert_eq!(j.read_matching(record.identity()).unwrap(), Some(record));
+        for offset in [9, 11, 44, 77, 110, 144, 177, 210, PREFIX_LEN] {
+            let mut changed = valid.clone();
+            changed[offset] ^= 1;
+            std::fs::write(&j.path, &changed).unwrap();
+            assert!(
+                j.read_matching(record.identity()).is_err(),
+                "offset {offset}"
+            );
+            assert!(j.begin(target()).is_err());
+            assert!(j.clear_complete(record.identity(), record).is_err());
+            assert_eq!(std::fs::read(&j.path).unwrap(), changed);
+        }
+        let mut old = valid.clone();
+        old[8] = 4;
+        let legacy_checksum = Sha256::digest(&old[..PREFIX_LEN]);
+        old[PREFIX_LEN..].copy_from_slice(&legacy_checksum);
+        std::fs::write(&j.path, &old).unwrap();
+        assert!(j.read_matching(record.identity()).is_err());
+        assert!(j.clear_complete(record.identity(), record).is_err());
+        assert_eq!(std::fs::read(&j.path).unwrap(), old);
+        assert!(RecordAuthenticator::new(Zeroizing::new([0; 32])).is_err());
+    }
+    #[test]
     fn generated_transaction_ids_prevent_stale_record_reuse() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         let target = target();
         let old = complete(&j, target);
         let old_identity = old.identity();
@@ -705,7 +863,7 @@ mod tests {
     #[test]
     fn same_generations_rejected_on_begin_and_decode() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         let mut bad = target();
         bad.previous_generation = Some(bad.new_generation);
         assert!(j.begin(bad).is_err());
@@ -713,7 +871,7 @@ mod tests {
         let valid = j.begin(target()).unwrap();
         let mut forged = valid;
         forged.identity.target = bad;
-        std::fs::write(&j.path, forged.encode()).unwrap();
+        std::fs::write(&j.path, forged.encode(test_auth()).unwrap()).unwrap();
         assert!(j.read_matching(valid.identity()).is_err());
         assert!(j.begin(target()).is_err());
         assert!(
@@ -724,13 +882,13 @@ mod tests {
     #[test]
     fn identities_and_first_login_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         for prior in [None, Some(id(5))] {
             let mut target = target();
             target.previous_generation = prior;
             let r = complete(&j, target);
             assert_eq!(
-                Journal::new(dir.path())
+                Journal::new(dir.path(), test_auth())
                     .unwrap()
                     .read_matching(r.identity())
                     .unwrap(),
@@ -742,9 +900,9 @@ mod tests {
     #[test]
     fn restart_can_inspect_only_the_exact_target() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::new(dir.path()).unwrap();
+        let journal = Journal::new(dir.path(), test_auth()).unwrap();
         let record = journal.begin(target()).unwrap();
-        let reopened = Journal::new(dir.path()).unwrap();
+        let reopened = Journal::new(dir.path(), test_auth()).unwrap();
         assert_eq!(
             reopened.inspect_scope(target().scope()).unwrap(),
             Some(Inspection {
@@ -773,10 +931,10 @@ mod tests {
     #[test]
     fn recovery_clears_complete_after_restart_with_verified_state() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         complete(&j, target());
         drop(j);
-        let reopened = Journal::new(dir.path()).unwrap();
+        let reopened = Journal::new(dir.path(), test_auth()).unwrap();
         let inspection = reopened.inspect_scope(target().scope()).unwrap().unwrap();
         let observed = VerifiedObservation::from_caller_verified(
             target().scope(),
@@ -798,7 +956,7 @@ mod tests {
             Stage::Complete,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let j = Journal::new(dir.path()).unwrap();
+            let j = Journal::new(dir.path(), test_auth()).unwrap();
             let mut r = j.begin(target()).unwrap();
             for next in [
                 Stage::ConfigInProgress,
@@ -861,7 +1019,7 @@ mod tests {
     #[test]
     fn recovery_refuses_stale_or_replaced_record() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         let old = complete(&j, target());
         let inspection = j.inspect_scope(target().scope()).unwrap().unwrap();
         j.clear_complete(old.identity(), old).unwrap();
@@ -881,7 +1039,7 @@ mod tests {
     #[test]
     fn recovery_rejects_changed_or_unknown_effective_auth_in_same_config() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         let record = complete(&j, target());
         let inspection = j.inspect_scope(target().scope()).unwrap().unwrap();
         let before = std::fs::read(&j.path).unwrap();
@@ -905,7 +1063,7 @@ mod tests {
         different.target.auth_fingerprint = id(9);
         assert!(j.read_matching(different).is_err());
         drop(j);
-        let reopened = Journal::new(dir.path()).unwrap();
+        let reopened = Journal::new(dir.path(), test_auth()).unwrap();
         let inspection = reopened.inspect_scope(target().scope()).unwrap().unwrap();
         let matching = VerifiedObservation::from_caller_verified(
             target().scope(),
@@ -922,7 +1080,7 @@ mod tests {
     #[test]
     fn wrong_target_or_generation_cannot_read_advance_or_clear() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         let before = j.begin(target()).unwrap();
         let identity = before.identity();
         let mut wrongs = Vec::new();
@@ -969,7 +1127,7 @@ mod tests {
     #[test]
     fn old_truncated_unknown_kind_and_other_invalid_records_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         let record = j.begin(target()).unwrap();
         let identity = record.identity();
         let valid = std::fs::read(&j.path).unwrap();
@@ -978,11 +1136,11 @@ mod tests {
             assert!(j.read_matching(identity).is_err());
             assert!(j.begin(target()).is_err());
         }
-        for version in [1, 2, 3, 99] {
+        for version in [1, 2, 3, 4, 99] {
             let mut old = valid.clone();
             old[8] = version;
-            let checksum = Sha256::digest(&old[..PREFIX_LEN]);
-            old[PREFIX_LEN..].copy_from_slice(&checksum);
+            let tag = test_auth().sign(&old[..PREFIX_LEN]).unwrap();
+            old[PREFIX_LEN..].copy_from_slice(&tag);
             std::fs::write(&j.path, old).unwrap();
             assert!(j.read_matching(identity).is_err());
         }
@@ -996,8 +1154,8 @@ mod tests {
         for offset in [10, 43, 76, 109, 142, 176, 209] {
             let mut corrupt = valid.clone();
             corrupt[offset] = 99;
-            let checksum = Sha256::digest(&corrupt[..PREFIX_LEN]);
-            corrupt[PREFIX_LEN..].copy_from_slice(&checksum);
+            let tag = test_auth().sign(&corrupt[..PREFIX_LEN]).unwrap();
+            corrupt[PREFIX_LEN..].copy_from_slice(&tag);
             std::fs::write(&j.path, corrupt).unwrap();
             assert!(j.read_matching(identity).is_err());
             assert!(
@@ -1030,7 +1188,10 @@ mod tests {
                     .unwrap();
                 barrier.wait();
                 gate.lock().unwrap();
-                Journal::new(&path).unwrap().begin(target()).is_ok()
+                Journal::new(&path, test_auth())
+                    .unwrap()
+                    .begin(target())
+                    .is_ok()
             }));
         }
         barrier.wait();
@@ -1047,12 +1208,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("journal");
         std::fs::create_dir(&path).unwrap();
-        let j = Journal::new(&path).unwrap();
+        let j = Journal::new(&path, test_auth()).unwrap();
         std::fs::rename(&path, root.path().join("moved")).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(j.read().is_err());
         assert!(j.begin(target()).is_err());
-        let j = Journal::new(&path).unwrap();
+        let j = Journal::new(&path, test_auth()).unwrap();
         j.fail_sync.set(true);
         assert!(j.begin(target()).is_err());
         assert!(j.read().is_err());
@@ -1061,7 +1222,7 @@ mod tests {
     fn sync_failure_during_advance_and_clear_poison_instance() {
         for clear in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let j = Journal::new(dir.path()).unwrap();
+            let j = Journal::new(dir.path(), test_auth()).unwrap();
             let r = if clear {
                 complete(&j, target())
             } else {
@@ -1083,7 +1244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let external = dir.path().join("external");
         std::fs::write(&external, b"untouched").unwrap();
-        let j = Journal::new(dir.path()).unwrap();
+        let j = Journal::new(dir.path(), test_auth()).unwrap();
         symlink(&external, &j.path).unwrap();
         assert!(j.begin(target()).is_err());
         assert_eq!(std::fs::read(&external).unwrap(), b"untouched");
