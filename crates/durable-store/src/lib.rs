@@ -772,20 +772,24 @@ impl Store {
         let end = prefix_end(prefix);
         let rows = {
             let query = if end.is_some() {
-                "SELECT key, CASE WHEN ?5 IS NULL OR length(value)<=?5 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4"
+                "SELECT CASE WHEN ?5 IS NULL OR length(key)<=?5 THEN key ELSE NULL END, CASE WHEN ?5 IS NULL OR length(value)<=?5 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND key<?3 ORDER BY key LIMIT ?4"
             } else {
-                "SELECT key, CASE WHEN ?5 IS NULL OR length(value)<=?5 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND ?3 IS NULL ORDER BY key LIMIT ?4"
+                "SELECT CASE WHEN ?5 IS NULL OR length(key)<=?5 THEN key ELSE NULL END, CASE WHEN ?5 IS NULL OR length(value)<=?5 THEN value ELSE NULL END, version FROM durable_store_entries WHERE key>=?1 AND key>?2 AND ?3 IS NULL ORDER BY key LIMIT ?4"
             };
             let mut stmt = tx.prepare(query)?;
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let cap = value_limit.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
             let rows = stmt.query_map(params![prefix, after, end, limit, cap], |r| {
-                Ok((r.get(0)?, r.get::<_, Option<Vec<u8>>>(1)?, r.get(2)?))
+                Ok((
+                    r.get::<_, Option<Vec<u8>>>(0)?,
+                    r.get::<_, Option<Vec<u8>>>(1)?,
+                    r.get(2)?,
+                ))
             })?;
             rows.map(|row| {
                 let (key, value, version) = row?;
                 Ok((
-                    key,
+                    key.ok_or(Error::DocumentFrameTooLarge)?,
                     Entry {
                         value: value.ok_or(Error::DocumentFrameTooLarge)?,
                         version,
@@ -1214,13 +1218,15 @@ impl Store {
         if revision < first || revision > current {
             return Err(Error::InvalidSnapshot);
         }
+        let cap = read_limit(key).map(|v| i64::try_from(v).unwrap_or(i64::MAX));
         let row: Option<(Option<Vec<u8>>, Option<u64>)> = conn.query_row(
-            "SELECT value,version FROM durable_document_history WHERE key=?1 AND revision<=?2 ORDER BY revision DESC LIMIT 1",
-            params![key, revision], |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT CASE WHEN ?3 IS NULL OR length(value)<=?3 THEN value ELSE NULL END,version FROM durable_document_history WHERE key=?1 AND revision<=?2 ORDER BY revision DESC LIMIT 1",
+            params![key, revision, cap], |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional()?;
         match row {
             Some((Some(value), Some(version))) => Ok(Some(Entry { value, version })),
             Some((None, None)) | None => Ok(None),
+            Some((None, Some(_))) if cap.is_some() => Err(Error::DocumentFrameTooLarge),
             _ => Err(Error::Storage(rusqlite::Error::InvalidQuery)),
         }
     }
@@ -1236,6 +1242,20 @@ impl Store {
         self.entries_at_prefix(revision, b"durable/document-policy/")
     }
 
+    /// Enumerate a specific document or fork-policy key prefix at a revision.
+    pub fn scoped_documents_at(
+        &self,
+        revision: u64,
+        prefix: &[u8],
+    ) -> Result<Vec<KeyedEntry>, Error> {
+        if !prefix.starts_with(b"durable/document/")
+            && !prefix.starts_with(b"durable/document-policy/")
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        self.entries_at_prefix(revision, prefix)
+    }
+
     fn entries_at_prefix(&self, revision: u64, prefix: &[u8]) -> Result<Vec<KeyedEntry>, Error> {
         let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
         let current: u64 = conn.query_row(
@@ -1246,17 +1266,29 @@ impl Store {
         if revision > current {
             return Err(Error::InvalidSnapshot);
         }
-        let mut stmt = conn.prepare("SELECT h.key,h.value,h.version FROM durable_document_history h WHERE substr(h.key,1,length(?2))=?2 AND h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
-        let rows = stmt.query_map(params![revision, prefix], |r| {
+        let cap = read_limit(prefix);
+        let sql_cap = cap.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+        let mut stmt = conn.prepare("SELECT CASE WHEN ?3 IS NULL OR length(h.key)<=?3 THEN h.key ELSE NULL END,CASE WHEN ?3 IS NULL OR length(h.value)<=?3 THEN h.value ELSE NULL END,h.version FROM durable_document_history h WHERE substr(h.key,1,length(?2))=?2 AND h.revision=(SELECT max(x.revision) FROM durable_document_history x WHERE x.key=h.key AND x.revision<=?1) AND h.value IS NOT NULL ORDER BY h.key")?;
+        let rows = stmt.query_map(params![revision, prefix, sql_cap], |r| {
             Ok((
-                r.get(0)?,
-                Entry {
-                    value: r.get(1)?,
-                    version: r.get(2)?,
-                },
+                r.get::<_, Option<Vec<u8>>>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?,
+                r.get(2)?,
             ))
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mut total = 0usize;
+        let mut result = Vec::new();
+        for row in rows {
+            let (key, value, version) = row?;
+            let key = key.ok_or(Error::DocumentFrameTooLarge)?;
+            let value = value.ok_or(Error::DocumentFrameTooLarge)?;
+            total = total.saturating_add(key.len()).saturating_add(value.len());
+            if cap.is_some_and(|cap| total > cap) {
+                return Err(Error::DocumentFrameTooLarge);
+            }
+            result.push((key, Entry { value, version }));
+        }
+        Ok(result)
     }
 
     /// All checks are evaluated against the pre-commit state; mutations apply

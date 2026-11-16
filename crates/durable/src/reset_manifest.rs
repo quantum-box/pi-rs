@@ -164,6 +164,16 @@ pub(crate) fn lookup_candidate(
     let reference = store
         .get_bounded(key, MAX_MANIFEST_BYTES)?
         .ok_or(LookupError::Invalid)?;
+    // Authenticate the reference against the anchor before accumulating any
+    // chunks; all observed versions are also fenced through publication.
+    let reference_sequence = store
+        .commit_for_version(key, reference.version)?
+        .ok_or(LookupError::Invalid)?;
+    let anchor = format!("runtime/fork/{id}/{anchor_observation:020}").into_bytes();
+    let anchor_entry = store.get(&anchor)?.ok_or(LookupError::Invalid)?;
+    if store.commit_for_version(&anchor, anchor_entry.version)? != Some(reference_sequence) {
+        return Err(LookupError::Invalid);
+    }
     let shared_reference = serde_json::from_slice::<SharedReference>(&reference.value).ok();
     let mut chunks = Vec::new();
     let mut chunked_bytes = None;
@@ -175,6 +185,9 @@ pub(crate) fn lookup_candidate(
             let entry = store
                 .get_bounded(&batch_key, MAX_SHARED_MANIFEST_BYTES)?
                 .ok_or(LookupError::Invalid)?;
+            if store.commit_for_version(&batch_key, entry.version)? != Some(reference_sequence) {
+                return Err(LookupError::Invalid);
+            }
             if reference.version == 3 {
                 let header: ChunkHeader =
                     serde_json::from_slice(&entry.value).map_err(|_| LookupError::Invalid)?;
@@ -189,7 +202,9 @@ pub(crate) fn lookup_candidate(
                     let chunk = store
                         .get_bounded(&chunk_key, MANIFEST_CHUNK_BYTES)?
                         .ok_or(LookupError::Invalid)?;
-                    if chunk.value.is_empty()
+                    if store.commit_for_version(&chunk_key, chunk.version)?
+                        != Some(reference_sequence)
+                        || chunk.value.is_empty()
                         || (index + 1 < header.chunks && chunk.value.len() != MANIFEST_CHUNK_BYTES)
                     {
                         return Err(LookupError::Invalid);
@@ -223,9 +238,7 @@ pub(crate) fn lookup_candidate(
     if root_json.get("id") != Some(&serde_json::json!(id)) {
         return Err(LookupError::Invalid);
     }
-    let anchor = format!("runtime/fork/{id}/{anchor_observation:020}").into_bytes();
     let fork_prefix = format!("runtime/fork/{id}/");
-    let anchor_entry = store.get(&anchor)?.ok_or(LookupError::Invalid)?;
     let mut event_key = b"durable/observer/".to_vec();
     event_key.extend_from_slice(id.as_bytes());
     event_key.extend_from_slice(b"/r");
@@ -274,6 +287,9 @@ pub(crate) fn lookup_candidate(
     let sequence = store
         .commit_for_version(&anchor, anchor_entry.version)?
         .ok_or(LookupError::Invalid)?;
+    if reference_sequence != sequence {
+        return Err(LookupError::Invalid);
+    }
     let shared_sequence = shared
         .as_ref()
         .map(|(batch_key, batch)| store.commit_for_version(batch_key, batch.version))
@@ -1145,13 +1161,43 @@ mod tests {
             .commit(
                 &[],
                 &[Mutation::Put {
-                    key: second,
+                    key: first,
                     value: vec![b'c'],
                 }],
             )
             .unwrap();
         assert!(f.store.commit(&candidate.checks, &[]).is_err());
+        RESET_MANIFEST_CHUNK_READS.with(|count| count.set(0));
         assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+        assert_eq!(RESET_MANIFEST_CHUNK_READS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn chunked_lookup_rejects_foreign_reference_before_reading_chunks() {
+        let f = lookup_fixture(true);
+        let batch = Uuid::new_v4();
+        f.store
+            .commit(
+                &[],
+                &[
+                    durable_store::Mutation::Put {
+                        key: f.manifest.clone(),
+                        value: serde_json::to_vec(&SharedReference { version: 3, batch }).unwrap(),
+                    },
+                    durable_store::Mutation::Put {
+                        key: shared_key(f.id, batch),
+                        value: serde_json::to_vec(&ChunkHeader {
+                            version: 3,
+                            chunks: 1_000_000,
+                        })
+                        .unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        RESET_MANIFEST_CHUNK_READS.with(|count| count.set(0));
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+        assert_eq!(RESET_MANIFEST_CHUNK_READS.with(std::cell::Cell::get), 0);
     }
 
     fn id(value: u128) -> Uuid {

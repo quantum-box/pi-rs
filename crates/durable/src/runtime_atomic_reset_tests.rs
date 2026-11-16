@@ -350,6 +350,16 @@ fn oversized_reset_settlement_and_fork_survive_reopen() {
             .status,
         Status::Running
     );
+    // This valid large-reset history exceeds the display fork's scoped root
+    // limit. It must fail closed, while ordinary occurrence forks below remain
+    // available after reopen.
+    let display = h
+        .submit_write(id, None, "app.after-large-reset".into(), None)
+        .unwrap();
+    assert!(matches!(
+        h.fork_by_display_entry_id(id, display),
+        Err(Error::Storage(durable_store::Error::DocumentFrameTooLarge))
+    ));
     drop(h);
     let mut h = Harness::open_paused(&path, options()).unwrap();
     let fork = h.fork_by_entry_id(id, occurrence).unwrap();

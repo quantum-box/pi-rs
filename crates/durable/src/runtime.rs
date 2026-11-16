@@ -8302,6 +8302,9 @@ impl Harness {
                 b"runtime/fork/",
                 b"durable/observer/",
                 b"runtime/tool-result-pending/",
+                b"durable/application-entries/",
+                b"durable/document/",
+                b"durable/document-policy/",
             ],
             crate::transcript::DISPLAY_FORK_RECORD_LIMIT,
         );

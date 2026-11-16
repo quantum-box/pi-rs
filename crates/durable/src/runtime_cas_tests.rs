@@ -277,6 +277,83 @@ fn display_entry_fork_fences_source_transcript_rewrite() {
 }
 
 #[test]
+fn display_entry_fork_bounds_observer_keys_and_relevant_history() {
+    use crate::document::Address;
+    for kind in [
+        "observer-key",
+        "application",
+        "document",
+        "unrelated-document",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let root = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        let cap = crate::transcript::DISPLAY_FORK_RECORD_LIMIT;
+        let key = match kind {
+            "observer-key" => {
+                let mut key = b"durable/observer/".to_vec();
+                key.extend_from_slice(root.as_bytes());
+                key.extend_from_slice(b"/r");
+                key.extend_from_slice(&0u64.to_be_bytes());
+                key.resize(cap + 1, b'x');
+                key
+            }
+            "application" => crate::application_entry::key(root),
+            _ => Address {
+                scope: if kind == "document" {
+                    root
+                } else {
+                    Uuid::new_v4()
+                }
+                .to_string(),
+                name: "test".into(),
+                key: "".into(),
+            }
+            .storage_key()
+            .unwrap(),
+        };
+        let mut value = if kind == "application" {
+            b"[]".to_vec()
+        } else {
+            b"{}".to_vec()
+        };
+        if kind != "observer-key" {
+            value.resize(cap + 1, b' ');
+        }
+        h.owner
+            .store()
+            .commit(&[], &[Mutation::Put { key, value }])
+            .unwrap();
+        let display = h.submit_write(root, None, "app.note".into(), None).unwrap();
+        let result = h.fork_by_display_entry_id(root, display);
+        if kind == "unrelated-document" {
+            assert!(result.is_ok(), "{kind}: {result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    Error::Storage(durable_store::Error::DocumentFrameTooLarge)
+                        | Error::Observer(crate::observer::Error::Store(
+                            durable_store::Error::DocumentFrameTooLarge
+                        ))
+                        | Error::Document(crate::document::Error::Store(
+                            durable_store::Error::DocumentFrameTooLarge
+                        ))
+                ),
+                "{kind}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn display_entry_fork_bounds_runtime_and_observer_values_before_parsing() {
     for kind in ["root", "event", "lookahead", "fork"] {
         let dir = tempfile::tempdir().unwrap();
