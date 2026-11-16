@@ -260,6 +260,32 @@ impl Google {
         }))
     }
 
+    // Declaration-only streams cannot return the effective decision needed for
+    // normalization and journaling. Resolve first and fail closed if strict.
+    async fn stream_unretained_declarations(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: pi_rs_core::ToolDispatchContext,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_bound_tool_dispatch(&request, declarations, &context)?;
+        pi_rs_core::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            declarations,
+        )?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        prepared.dispatch().await
+    }
+
     pub fn with_progress(mut self, observer: impl Fn(Progress) + Send + Sync + 'static) -> Self {
         self.progress = Some(Arc::new(observer));
         self
@@ -938,6 +964,47 @@ impl Model for Google {
             context,
         )?))
     }
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_unretained_declarations(
+            request,
+            declarations,
+            pi_rs_core::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: external_id.into(),
+                summary: false,
+            },
+        )
+        .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_unretained_declarations(
+            request,
+            declarations,
+            pi_rs_core::ToolDispatchContext {
+                request_id,
+                session_id,
+                external_id: session_id.to_string(),
+                summary: true,
+            },
+        )
+        .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         if !self.http_proxies.is_empty() {
             return None;
@@ -961,7 +1028,7 @@ impl Model for Google {
         }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v1",
+            "google-v2-const-enum",
             self.endpoint.as_str(),
             self.provider.as_ref(),
             self.replay_scope.as_ref(),
@@ -1319,6 +1386,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declaration_streams_fail_closed_only_for_effective_strict() {
+        use pi_rs_core::{StrictToolPolicy, ToolConstraint, ToolDeclaration, ToolSpec};
+        let client = Google::new("http://localhost:9", "key")
+            .unwrap()
+            .with_context_probe(false);
+        let spec = ToolSpec {
+            name: "test".into(),
+            description: "".into(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "gemini-3-pro".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 32,
+        };
+        let decl = ToolDeclaration {
+            spec,
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Prefer,
+            }),
+        };
+        let id = uuid::Uuid::new_v4();
+        let error = match client
+            .stream_detailed_with_tool_declarations(id, id, "s", request.clone(), &[decl.clone()])
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("strict decision was not retained"),
+        };
+        assert!(error.contains("requires prepared dispatch"));
+        let error = match client
+            .stream_detailed_summary_with_tool_declarations(
+                id,
+                id,
+                request.clone(),
+                &[decl.clone()],
+            )
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("strict decision was not retained"),
+        };
+        assert!(error.contains("requires prepared dispatch"));
+        let mut old = request;
+        old.model = "gemini-2.5-pro".into();
+        let error = match client
+            .stream_detailed_with_tool_declarations(id, id, "s", old, &[decl])
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected connection failure"),
+        };
+        assert!(
+            !error.contains("requires prepared dispatch"),
+            "fallback should dispatch: {error}"
+        );
+    }
+
+    #[test]
+    fn mixed_google_tools_bind_strict_and_fallback_individually() {
+        use pi_rs_core::{
+            EffectiveToolSampling, StrictToolPolicy, ToolConstraint, ToolDeclaration,
+            ToolDispatchContext, ToolSpec,
+        };
+        let client = Google::new("http://localhost:9", "key").unwrap();
+        let strict = ToolSpec {
+            name: "strict".into(),
+            description: "".into(),
+            parameters: json!({"type":"object", "properties":{"x":{"type":"string"}}}),
+        };
+        let fallback = ToolSpec {
+            name: "fallback".into(),
+            description: "".into(),
+            parameters: json!({"type":"object", "$dynamicRef":"#x", "properties":{"tag":{"const":"a"}}}),
+        };
+        let declarations: Vec<_> = [strict, fallback]
+            .into_iter()
+            .map(|spec| ToolDeclaration {
+                spec,
+                constrained_sampling: Some(ToolConstraint::JsonSchema {
+                    strict: StrictToolPolicy::Prefer,
+                }),
+            })
+            .collect();
+        let request = ModelRequest {
+            model: "gemini-3-pro".into(),
+            messages: vec![],
+            tools: declarations.iter().map(|d| d.spec.clone()).collect(),
+            max_output_tokens: 32,
+        };
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let bound = client
+            .prepare_bound_tool_dispatch(&request, &declarations, &context)
+            .unwrap();
+        assert!(matches!(
+            bound.effective_tools()[0].sampling,
+            EffectiveToolSampling::StrictJsonSchema { .. }
+        ));
+        assert!(matches!(
+            bound.effective_tools()[1].sampling,
+            EffectiveToolSampling::Unconstrained
+        ));
+        assert_eq!(
+            bound.reservation_request().tools[1].parameters["properties"]["tag"]["enum"],
+            json!(["a"])
+        );
+        assert_eq!(
+            bound.reservation_request().tools[1].parameters["$dynamicRef"],
+            "#x"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_google_usage_anchor_is_invalidated_by_wire_version() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct AnchorModel {
+            old: String,
+            current: String,
+            upgraded: AtomicBool,
+            estimates: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Model for AnchorModel {
+            fn context_identity(&self) -> Option<String> {
+                Some(
+                    if self.upgraded.load(Ordering::SeqCst) {
+                        &self.current
+                    } else {
+                        &self.old
+                    }
+                    .clone(),
+                )
+            }
+            fn estimate_request_tokens(&self, _: &ModelRequest) -> u64 {
+                self.estimates.fetch_add(1, Ordering::SeqCst);
+                1
+            }
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        let google = Google::new("http://localhost:9", "key").unwrap();
+        let headers: Vec<(&str, &[u8])> = vec![];
+        let old = pi_rs_core::protected_model_fingerprint(&(
+            headers,
+            "google-v1",
+            google.endpoint.as_str(),
+            google.provider.as_ref(),
+            google.replay_scope.as_ref(),
+            google.api_key.as_bytes(),
+            &google.thinking,
+            &google.thinking_budgets,
+            &google.disabled_thinking_fallback,
+            &google.reasoning_supported,
+        ))
+        .unwrap();
+        let current = google.context_identity().unwrap();
+        assert_ne!(old, current);
+        let model = Arc::new(AnchorModel {
+            old,
+            current,
+            upgraded: AtomicBool::new(false),
+            estimates: AtomicUsize::new(0),
+        });
+        let mut session = pi_rs_core::SessionBuilder::new(model.clone(), "gemini-3-pro")
+            .limits(pi_rs_core::Limits {
+                context_window: Some(5000),
+                output_tokens_per_request: 1,
+                ..Default::default()
+            })
+            .in_memory()
+            .unwrap();
+        session
+            .controls()
+            .set_auto_compaction_enabled(false)
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let first = model.estimates.load(Ordering::SeqCst);
+        session.prompt("second").await.unwrap();
+        assert_eq!(
+            model.estimates.load(Ordering::SeqCst),
+            first,
+            "old identity should reuse its usage anchor"
+        );
+        model.upgraded.store(true, Ordering::SeqCst);
+        session.prompt("third").await.unwrap();
+        assert!(
+            model.estimates.load(Ordering::SeqCst) > first,
+            "new wire identity must invalidate the existing anchor"
+        );
+    }
+
+    #[tokio::test]
     async fn prepared_google_dispatch_sends_bound_validated_schema() {
         use pi_rs_core::{
             StrictToolPolicy, ToolConstraint, ToolDeclaration, ToolDispatchContext, ToolSpec,
@@ -1368,16 +1643,27 @@ mod tests {
             description: "".into(),
             parameters: json!({"type":"object","properties":{"x":{"type":"string"}}}),
         };
+        let fallback = ToolSpec {
+            name: "fallback".into(),
+            description: "".into(),
+            parameters: json!({"type":"object", "$dynamicRef":"#x", "properties":{"tag":{"const":"a"}}}),
+        };
         let request = ModelRequest {
             model: "gemini-3-pro".into(),
             messages: vec![],
-            tools: vec![spec.clone()],
+            tools: vec![spec.clone(), fallback.clone()],
             max_output_tokens: 32,
         };
         let decl = ToolDeclaration {
             spec,
             constrained_sampling: Some(ToolConstraint::JsonSchema {
                 strict: StrictToolPolicy::Require,
+            }),
+        };
+        let fallback_decl = ToolDeclaration {
+            spec: fallback,
+            constrained_sampling: Some(ToolConstraint::JsonSchema {
+                strict: StrictToolPolicy::Prefer,
             }),
         };
         let context = ToolDispatchContext {
@@ -1387,9 +1673,10 @@ mod tests {
             summary: true,
         };
         let prepared = client
-            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .prepare_bound_tool_dispatch(&request, &[decl, fallback_decl], &context)
             .unwrap();
         let expected = prepared.reservation_request().tools[0].parameters.clone();
+        let expected_fallback = prepared.reservation_request().tools[1].parameters.clone();
         let _ = prepared.dispatch().await.unwrap();
         let body = server.join().unwrap();
         assert_eq!(
@@ -1400,6 +1687,11 @@ mod tests {
             body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"],
             expected
         );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][1]["parametersJsonSchema"],
+            expected_fallback
+        );
+        assert_eq!(expected_fallback["properties"]["tag"]["enum"], json!(["a"]));
     }
 
     #[test]

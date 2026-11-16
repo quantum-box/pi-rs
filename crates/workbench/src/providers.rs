@@ -1125,8 +1125,7 @@ impl Client {
                     client
                         .with_strict_tool_support(
                             args.model_profiles
-                                .chat_compatibility(&args.provider, metadata.as_ref())
-                                .supports_strict_mode(),
+                                .explicit_strict_tool_support(&args.provider, &args.model),
                         )
                         .with_thinking(mapped.as_deref().or(selected))
                         .with_disabled_thinking_fallback(fallback.as_deref())
@@ -1535,6 +1534,93 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn google_strict_support_uses_only_explicit_overrides_in_direct_and_deferred_clients() {
+        use clap::Parser;
+        for deferred in [false, true] {
+            for (provider_compat, model_compat, override_compat, expected) in [
+                (json!({}), json!({}), json!({}), true),
+                (
+                    json!({"supportsStrictMode":false}),
+                    json!({}),
+                    json!({}),
+                    false,
+                ),
+                (
+                    json!({"supportsStrictMode":false}),
+                    json!({"supportsStrictMode":true}),
+                    json!({}),
+                    true,
+                ),
+                (
+                    json!({"supportsStrictMode":true}),
+                    json!({"supportsStrictMode":true}),
+                    json!({"supportsStrictMode":false}),
+                    false,
+                ),
+            ] {
+                let endpoint = "http://localhost:9876";
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"together":{
+                    "api":"openai-completions", "baseUrl":endpoint, "compat":provider_compat,
+                    "models":[{"id":"gemini-3-test", "api":"google-generative-ai", "baseUrl":endpoint, "compat":model_compat}],
+                    "modelOverrides":{"gemini-3-test":{"compat":override_compat}}
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("together").unwrap();
+                args.model = "gemini-3-test".into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Google,
+                        endpoint,
+                        Some(Credential::Literal("key".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Google(pi_rs::google::Google::new(endpoint, "key").unwrap())
+                }
+                .with_model_options(&args, false)
+                .unwrap();
+                let spec = pi_rs::ToolSpec {
+                    name: "t".into(),
+                    description: "".into(),
+                    parameters: json!({"type":"object"}),
+                };
+                let request = ModelRequest {
+                    model: args.model.clone(),
+                    messages: vec![],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 10,
+                };
+                let declaration = pi_rs::ToolDeclaration {
+                    spec,
+                    constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                        strict: pi_rs::StrictToolPolicy::Prefer,
+                    }),
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                let prepared = client
+                    .prepare_tool_dispatch(&request, &[declaration], &context)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    matches!(
+                        prepared.effective_tools()[0].sampling,
+                        pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                    ),
+                    expected,
+                    "deferred={deferred}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn prepared_responses_dispatch_preserves_capability_and_session_policy() {

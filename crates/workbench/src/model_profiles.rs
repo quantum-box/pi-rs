@@ -1039,6 +1039,26 @@ impl Profiles {
             .static_headers(provider, token)
     }
 
+    /// Only user-configured compatibility applies to non-chat adapters.
+    pub fn explicit_strict_tool_support(
+        &self,
+        provider: &Provider,
+        model_id: &str,
+    ) -> Option<bool> {
+        let profile = self.entries.get(provider.id())?;
+        let provider_value = profile.compat.chat.supports_strict_mode();
+        let model_value = profile
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .and_then(|model| model.metadata.compat.chat.supports_strict_mode());
+        let override_value = profile
+            .overrides
+            .get(model_id)
+            .and_then(|model| model.compat.chat.supports_strict_mode());
+        override_value.or(model_value).or(provider_value)
+    }
+
     pub fn chat_compatibility(
         &self,
         provider: &Provider,

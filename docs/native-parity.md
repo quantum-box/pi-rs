@@ -5414,3 +5414,8 @@ This comparison uses upstream Pi `463e17f8dc08a76a1e24e55db37f88de81b4b118`
 is also present in its `v1.5.2` tag. pi-rs additionally rejects strict schemas
 that cannot be safely normalized for local tool execution; `prefer` falls back
 and `require` fails in that case.
+Declaration-only Google streams resolve constraints but reject an effective
+strict decision, because those APIs cannot retain it for tool normalization;
+callers that need strict sampling must use prepared dispatch. The Google context
+identity is versioned for the `const` wire conversion, so usage measured with
+the previous declaration format is not reused as a budget anchor.
