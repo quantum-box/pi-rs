@@ -3862,9 +3862,27 @@ when the caller enables `with_strict_tool_support(true)` for the selected model.
 Unknown capability defaults to unsupported; required constraints fail, while
 preferred constraints fall back. The adapter applies Anthropic's strict keyword
 limits, binds the effective decision and transformed schemas to the prepared
-dispatch, and exposes raw model tool arguments for caller normalization. It does
-not infer the current Pi catalog capability or wire this setting through native
-workbench configuration. Unlike Pi v1.5/current, it does not retry a rejected
+dispatch, and exposes raw model tool arguments for caller normalization. The
+workbench enables it for bundled direct Anthropic catalog models, and resolves
+`compat.supportsStrictTools` through provider, model and model override settings;
+unknown and compatible models default to false. Resolved and deferred clients
+forward prepared requests with their effective decisions, transformed reservation
+schemas, configured headers, session affinity and summary cache policy. If a
+before-request hook changes the selected model, Anthropic prepared dispatch
+uses a frozen map of catalog and profile capabilities for models on the same
+route. An uncatalogued selected model uses its provider capability or the
+unsupported default; a rewrite to an unknown model or a model configured for
+another route fails closed. A partial model override alone does not establish a
+routable model for a rewrite. Direct Anthropic declaration-aware streams reject
+strict decisions that only prepared dispatch can retain; preferred fallback
+streams use their resolved unconstrained wire schema. A model capability
+map with no strict-capable entries keeps the legacy Anthropic model fingerprint.
+Existing usage anchors for constrained Anthropic requests can still be invalidated:
+the native agent records a separate prepared-tool configuration hash, and the
+new fallback projection can change the wire schema even with strict disabled
+(for example, it drops root annotations and adds missing defaults). The current
+hash also conservatively invalidates older anchors when the schemas happen to match.
+Unlike Pi v1.5/current, it does not retry a rejected
 preferred strict request without strict mode: changing the wire decision after
 preparation would invalidate the recorded decision. Current Pi also remembers a
 strict-limit rejection for the session and sends subsequent preferred tools
@@ -3872,7 +3890,6 @@ non-strict; this prepared path does not implement that session memoization.
 Provider errors are returned until a safe decision-bound fallback is available.
 Root combinators fall back for preferred constraints or fail when required,
 since dropping them from a strict schema would change its meaning.
-Native Anthropic capability selection remains unwired.
 
 The Chat Completions adapter also resolves explicitly supplied JSON Schema
 constraints for declaration-aware and prepared dispatch. It enables strict mode

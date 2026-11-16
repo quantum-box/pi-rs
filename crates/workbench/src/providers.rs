@@ -456,10 +456,13 @@ impl Deferred {
 impl Client {
     pub fn supports_prepared_tool_dispatch(&self) -> bool {
         match self {
-            Self::OpenAi(_) | Self::Ollama(_) | Self::Google(_) => true,
+            Self::OpenAi(_) | Self::Ollama(_) | Self::Google(_) | Self::Anthropic(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
-                Adapter::OpenAiResponses | Adapter::ChatCompletions | Adapter::Google
+                Adapter::OpenAiResponses
+                    | Adapter::ChatCompletions
+                    | Adapter::Google
+                    | Adapter::Anthropic
             ),
             _ => false,
         }
@@ -801,6 +804,18 @@ impl Client {
         workbench_routing: bool,
     ) -> Result<Option<Box<dyn pi_rs::PreparedToolDispatch>>> {
         match self {
+            Self::Anthropic(client) => {
+                let client = if context.summary {
+                    client.clone().without_cache()
+                } else {
+                    client.clone().with_default_headers(defaults)
+                };
+                Ok(Some(client.prepare_bound_tool_dispatch(
+                    request,
+                    declarations,
+                    context,
+                )?))
+            }
             Self::Ollama(client) => {
                 let client = if context.summary {
                     client.clone()
@@ -836,7 +851,10 @@ impl Client {
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
-                    Adapter::OpenAiResponses | Adapter::ChatCompletions | Adapter::Google
+                    Adapter::OpenAiResponses
+                        | Adapter::ChatCompletions
+                        | Adapter::Google
+                        | Adapter::Anthropic
                 ) =>
             {
                 Box::pin(client.resolve().await?.prepare_tool_dispatch_with_headers(
@@ -1034,7 +1052,15 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
+                let strict = args
+                    .model_profiles
+                    .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
                 let mut client = client
+                    .with_strict_tool_support(strict)
+                    .with_strict_tool_models(
+                        args.model_profiles
+                            .anthropic_strict_tool_models(&args.provider, &args.model),
+                    )
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),
@@ -1534,6 +1560,483 @@ impl Model for Client {
 mod contention_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn anthropic_disabled_capability_preserves_workbench_context_fingerprint() {
+        use clap::Parser;
+        let endpoint = "http://127.0.0.1:1234/v1/messages";
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+            "api":"anthropic-messages","baseUrl":endpoint,"compat":{"supportsStrictTools":false},"models":[{"id":"known"}]
+        }}})).unwrap();
+        args.provider = args.model_profiles.provider("test").unwrap();
+        args.model = "selected-unknown".into();
+        let base = Anthropic::new(endpoint, "fixture")
+            .unwrap()
+            .with_context_probe(false);
+        let legacy = Client::Anthropic(
+            base.clone()
+                .with_thinking(args.provider_thinking())
+                .with_thinking_budget_settings(
+                    args.settings.value().get("thinkingBudgets").cloned(),
+                )
+                .with_cache_retention(cache_retention(true), true),
+        );
+        let current = Client::Anthropic(base)
+            .with_model_options(&args, false)
+            .unwrap();
+        assert!(legacy.context_identity().is_some());
+        assert_eq!(current.context_identity(), legacy.context_identity());
+        let wrap = |client| super::super::image_policy::WorkbenchModel {
+            client,
+            block_images: false,
+            supports_images: None,
+            session_affinity: &[],
+            price: None,
+        };
+        assert_eq!(
+            wrap(current).context_identity(),
+            wrap(legacy).context_identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_selected_unknown_uses_provider_default() {
+        use clap::Parser;
+        for (setting, supported) in [(None, false), (Some(false), false), (Some(true), true)] {
+            for deferred in [false, true] {
+                let endpoint = "http://127.0.0.1:1234/v1/messages";
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                    "api":"anthropic-messages", "baseUrl":endpoint, "compat":{"supportsStrictTools":setting}, "models":[{"id":"catalogued"}],
+                    "modelOverrides":{"another-unknown":{"name":"partial override"}}
+                }}})).unwrap();
+                args.provider = args.model_profiles.provider("test").unwrap();
+                args.model = "selected-unknown".into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Anthropic,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                };
+                let client = client
+                    .with_context_probes(false)
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let spec = pi_rs::ToolSpec {
+                    name: "lookup".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let mut request = ModelRequest {
+                    model: args.model.clone(),
+                    messages: vec![pi_rs::Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 16,
+                };
+                let context = pi_rs::ToolDispatchContext {
+                    request_id: uuid::Uuid::nil(),
+                    session_id: uuid::Uuid::nil(),
+                    external_id: "s".into(),
+                    summary: false,
+                };
+                for policy in [
+                    pi_rs::StrictToolPolicy::Prefer,
+                    pi_rs::StrictToolPolicy::Require,
+                ] {
+                    let declaration = pi_rs::ToolDeclaration {
+                        spec: spec.clone(),
+                        constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                            strict: policy,
+                        }),
+                    };
+                    request.model = "selected-unknown".into();
+                    let result = client
+                        .prepare_tool_dispatch(
+                            &request,
+                            std::slice::from_ref(&declaration),
+                            &context,
+                        )
+                        .await;
+                    if !supported && policy == pi_rs::StrictToolPolicy::Require {
+                        assert!(result.is_err());
+                    } else {
+                        let prepared = result.unwrap().unwrap();
+                        pi_rs::validate_prepared_tool_dispatch(
+                            prepared.as_ref(),
+                            &context,
+                            &request,
+                            std::slice::from_ref(&declaration),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            matches!(
+                                prepared.effective_tools()[0].sampling,
+                                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                            ),
+                            supported
+                        );
+                    }
+                    request.model = "another-unknown".into();
+                    assert!(
+                        client
+                            .prepare_tool_dispatch(&request, &[declaration], &context)
+                            .await
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("cannot be resolved")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_resolves_model_rewrites_in_both_directions() {
+        use clap::Parser;
+        let endpoint = "http://127.0.0.1:1234/v1/messages";
+        for (configured, rewritten, supported) in
+            [("strict", "loose", true), ("loose", "strict", false)]
+        {
+            for deferred in [false, true] {
+                let mut args = super::super::Cli::parse_from(["pi"]);
+                args.model_profiles =
+                    super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                        "api":"anthropic-messages", "baseUrl":endpoint, "models":[
+                            {"id":"strict","compat":{"supportsStrictTools":true}},
+                            {"id":"loose","compat":{"supportsStrictTools":false}},
+                            {"id":"other-route","baseUrl":"http://127.0.0.1:1235/v1/messages","compat":{"supportsStrictTools":true}}]
+                    }}}))
+                    .unwrap();
+                args.provider = args.model_profiles.provider("test").unwrap();
+                args.model = configured.into();
+                let client = if deferred {
+                    Client::deferred(
+                        args.provider.clone(),
+                        Adapter::Anthropic,
+                        endpoint,
+                        Some(Credential::Literal("fixture".into())),
+                        RequestHeaders::default(),
+                    )
+                } else {
+                    Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
+                }
+                .with_context_probes(false)
+                .with_model_options(&args, false)
+                .unwrap();
+                let model = super::super::image_policy::WorkbenchModel {
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let spec = pi_rs::ToolSpec {
+                    name: "lookup".into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                };
+                let mut request = ModelRequest {
+                    model: configured.into(),
+                    messages: vec![pi_rs::Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![spec.clone()],
+                    max_output_tokens: 16,
+                };
+                for summary in [false, true] {
+                    let context = pi_rs::ToolDispatchContext {
+                        request_id: uuid::Uuid::nil(),
+                        session_id: uuid::Uuid::nil(),
+                        external_id: "s".into(),
+                        summary,
+                    };
+                    for policy in [
+                        pi_rs::StrictToolPolicy::Prefer,
+                        pi_rs::StrictToolPolicy::Require,
+                    ] {
+                        let declaration = pi_rs::ToolDeclaration {
+                            spec: spec.clone(),
+                            constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                                strict: policy,
+                            }),
+                        };
+                        request.model = configured.into();
+                        let original = model
+                            .prepare_tool_dispatch(
+                                &request,
+                                std::slice::from_ref(&declaration),
+                                &context,
+                            )
+                            .await;
+                        if !supported && policy == pi_rs::StrictToolPolicy::Require {
+                            assert!(original.is_err());
+                        } else {
+                            let prepared = original.unwrap().unwrap();
+                            assert_eq!(
+                                matches!(
+                                    prepared.effective_tools()[0].sampling,
+                                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                ),
+                                supported
+                            );
+                        }
+                        // The final model determines the frozen sampling decision.
+                        request.model = rewritten.into();
+                        let rewritten_result = model
+                            .prepare_tool_dispatch(
+                                &request,
+                                std::slice::from_ref(&declaration),
+                                &context,
+                            )
+                            .await;
+                        if supported && policy == pi_rs::StrictToolPolicy::Require {
+                            assert!(rewritten_result.is_err());
+                        } else {
+                            let prepared = rewritten_result.unwrap().unwrap();
+                            pi_rs::validate_prepared_tool_dispatch(
+                                prepared.as_ref(),
+                                &context,
+                                &request,
+                                std::slice::from_ref(&declaration),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                matches!(
+                                    prepared.effective_tools()[0].sampling,
+                                    pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+                                ),
+                                !supported
+                            );
+                            assert_eq!(prepared.reservation_request().model, rewritten);
+                        }
+                        for unresolved in ["unknown", "other-route"] {
+                            request.model = unresolved.into();
+                            let error = model
+                                .prepare_tool_dispatch(
+                                    &request,
+                                    std::slice::from_ref(&declaration),
+                                    &context,
+                                )
+                                .await
+                                .err()
+                                .expect("unresolved model must fail closed");
+                            assert!(error.to_string().contains("cannot be resolved"), "{error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_dispatch_preserves_config_wire_and_routing() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        for (deferred, summary, direct) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|n| n.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + length {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                (headers, body)
+            });
+            let endpoint = format!("http://{address}/v1/messages");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
+                "api":"anthropic-messages","baseUrl":endpoint,"models":[{"id":"m-base","compat":{"supportsStrictTools":false}},{"id":"m","compat":{"supportsStrictTools":true}}]
+            }}})).unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m-base".into();
+            let client = if deferred {
+                Client::deferred(
+                    args.provider.clone(),
+                    Adapter::Anthropic,
+                    &endpoint,
+                    Some(Credential::Literal("fixture".into())),
+                    RequestHeaders::for_test("x-configured", "configured"),
+                )
+            } else {
+                Client::Anthropic(Anthropic::new(&endpoint, "fixture").unwrap().with_headers({
+                    let mut h = HeaderMap::new();
+                    h.insert("x-configured", "configured".parse().unwrap());
+                    h
+                }))
+            }
+            .with_context_probes(false)
+            .with_model_options(&args, false)
+            .unwrap();
+            let model = super::super::image_policy::WorkbenchModel {
+                client: client.clone(),
+                block_images: true,
+                supports_images: None,
+                session_affinity: &["session-id"],
+                price: None,
+            };
+            let spec = pi_rs::ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            };
+            let req = ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs::Message::UserWithImages {
+                    content: "image".into(),
+                    images: vec![pi_rs::ImageContent {
+                        data: "aA==".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 10,
+            };
+            let decl = pi_rs::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema {
+                    strict: pi_rs::StrictToolPolicy::Require,
+                }),
+            };
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::nil(),
+                session_id: uuid::Uuid::nil(),
+                external_id: "session-fixture".into(),
+                summary,
+            };
+            let selected: &dyn Model = if direct { &client } else { &model };
+            let prepared = selected
+                .prepare_tool_dispatch(&req, std::slice::from_ref(&decl), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            pi_rs::validate_prepared_tool_dispatch(
+                prepared.as_ref(),
+                &context,
+                &req,
+                std::slice::from_ref(&decl),
+            )
+            .unwrap();
+            assert!(matches!(
+                prepared.effective_tools()[0].sampling,
+                pi_rs::EffectiveToolSampling::StrictJsonSchema { .. }
+            ));
+            let reserved = prepared.reservation_request().tools[0].parameters.clone();
+            let _ = prepared.dispatch().await;
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(body["model"], "m");
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(body["tools"][0]["input_schema"], reserved);
+            assert!(headers.contains("x-configured: configured"));
+            assert_eq!(
+                headers.contains("session-id: session-fixture"),
+                !summary && !direct
+            );
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_anthropic_unknown_capability_falls_back_or_fails() {
+        let client =
+            Client::Anthropic(Anthropic::new("http://127.0.0.1:1234/v1/messages", "key").unwrap());
+        let spec = pi_rs::ToolSpec {
+            name: "x".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "unknown".into(),
+            messages: vec![pi_rs::Message::User {
+                content: "hi".into(),
+            }],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for (policy, ok) in [
+            (pi_rs::StrictToolPolicy::Prefer, true),
+            (pi_rs::StrictToolPolicy::Require, false),
+        ] {
+            let decl = pi_rs::ToolDeclaration {
+                spec: spec.clone(),
+                constrained_sampling: Some(pi_rs::ToolConstraint::JsonSchema { strict: policy }),
+            };
+            let result = client
+                .prepare_tool_dispatch(&request, &[decl], &context)
+                .await;
+            assert_eq!(result.is_ok(), ok);
+            if let Ok(Some(prepared)) = result {
+                assert!(matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::Unconstrained
+                ));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn google_before_request_rewrite_resolves_final_model_strict_policy() {

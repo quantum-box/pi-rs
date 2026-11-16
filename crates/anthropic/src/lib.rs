@@ -80,6 +80,7 @@ pub struct Anthropic {
     cache_retention: CacheRetention,
     cache_tools: bool,
     strict_tool_support: bool,
+    strict_tool_models: Option<Arc<BTreeMap<String, bool>>>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -172,6 +173,7 @@ impl Anthropic {
             cache_retention: CacheRetention::None,
             cache_tools: true,
             strict_tool_support: false,
+            strict_tool_models: None,
             progress: None,
             reasoning: None,
         })
@@ -184,6 +186,19 @@ impl Anthropic {
         self
     }
 
+    /// Freeze strict-tool capabilities for models on this route.
+    /// A constrained request for an absent model fails closed.
+    pub fn with_strict_tool_models(mut self, models: BTreeMap<String, bool>) -> Self {
+        self.strict_tool_models = Some(Arc::new(models));
+        self
+    }
+
+    /// Bind the configured strict capability to a single selected model.
+    pub fn with_strict_tool_model(self, model: &str) -> Self {
+        let supported = self.strict_tool_support;
+        self.with_strict_tool_models([(model.to_owned(), supported)].into_iter().collect())
+    }
+
     /// Resolve and bind the exact tools to be sent for this dispatch.
     pub fn prepare_bound_tool_dispatch(
         &self,
@@ -191,8 +206,19 @@ impl Anthropic {
         declarations: &[pi_rs_core::ToolDeclaration],
         context: &pi_rs_core::ToolDispatchContext,
     ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
-        let (wire_tools, effective) =
-            resolve_tools(request, declarations, self.strict_tool_support)?;
+        let constrained = declarations.iter().any(|declaration| {
+            matches!(
+                declaration.constrained_sampling,
+                Some(pi_rs_core::ToolConstraint::JsonSchema { .. })
+            )
+        });
+        let supported = match (&self.strict_tool_models, constrained) {
+            (Some(models), true) => *models.get(&request.model).ok_or_else(|| {
+                Error::Config("Anthropic strict-tool capability cannot be resolved for the final request model and route".into())
+            })?,
+            _ => self.strict_tool_support,
+        };
+        let (wire_tools, effective) = resolve_tools(request, declarations, supported)?;
         let snapshot =
             pi_rs_core::ToolDecisionSnapshot::capture(context, request, declarations, &effective)
                 .map_err(|error| Error::Config(error.to_string()))?;
@@ -1423,6 +1449,43 @@ impl Model for Anthropic {
         )?))
     }
 
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: external_id.into(),
+            summary: false,
+        };
+        self.stream_without_retained_decision(request, declarations, context)
+            .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: session_id.to_string(),
+            summary: true,
+        };
+        self.clone()
+            .without_cache()
+            .stream_without_retained_decision(request, declarations, context)
+            .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         // Thinking and discovered output limits can depend on a changing catalog.
         if !self.http_proxies.is_empty()
@@ -1453,10 +1516,22 @@ impl Model for Anthropic {
             self.cache_retention.anthropic_control(),
             self.cache_tools,
         );
-        if self.strict_tool_support {
+        let base = if self.strict_tool_support {
             pi_rs_core::protected_model_fingerprint(&(identity, "strict-tools-v1"))
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
+        }?;
+        match &self.strict_tool_models {
+            // A map containing only unsupported models cannot change any
+            // successful request's sampling compared with the default.
+            Some(models) if models.values().any(|supported| *supported) => {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "strict-models-v1",
+                    models.as_ref(),
+                ))
+            }
+            _ => Some(base),
         }
     }
 
@@ -1545,6 +1620,30 @@ impl Model for Anthropic {
 }
 
 impl Anthropic {
+    async fn stream_without_retained_decision(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: pi_rs_core::ToolDispatchContext,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_bound_tool_dispatch(&request, declarations, &context)?;
+        pi_rs_core::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            declarations,
+        )?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        prepared.dispatch().await
+    }
+
     async fn stream_enriched(
         &self,
         request: ModelRequest,
@@ -2105,6 +2204,254 @@ mod tests {
             );
             assert!(super::resolve_tools(&request, &[decl], true).is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn constrained_declaration_streams_reject_strict_and_dispatch_fallback() {
+        use pi_rs_core::StrictToolPolicy as P;
+        use std::io::{Read, Write};
+        for summary in [false, true] {
+            for policy in [P::Prefer, P::Require] {
+                let (request, declaration) = constrained_fixture(policy, json!({"type":"object"}));
+                let client = Anthropic::new("http://127.0.0.1:9/v1/messages", "key")
+                    .unwrap()
+                    .with_strict_tool_support(true)
+                    .with_context_probe(false);
+                let result = if summary {
+                    client
+                        .stream_detailed_summary_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            request,
+                            &[declaration],
+                        )
+                        .await
+                } else {
+                    client
+                        .stream_detailed_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            "session",
+                            request,
+                            &[declaration],
+                        )
+                        .await
+                };
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("effective decisions can be retained")
+                );
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|s| s.parse().unwrap())
+                            })
+                            .unwrap();
+                        if data.len() >= pos + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let pos = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                let body: Value = serde_json::from_slice(&data[pos + 4..]).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let client = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false)
+                .with_cache_retention(CacheRetention::Short, true);
+            let (request, declaration) = constrained_fixture(
+                P::Prefer,
+                json!({"type":"object","anyOf":[{"type":"object"}]}),
+            );
+            let result = if summary {
+                client
+                    .stream_detailed_summary_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        request,
+                        &[declaration],
+                    )
+                    .await
+            } else {
+                client
+                    .stream_detailed_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        request,
+                        &[declaration],
+                    )
+                    .await
+            };
+            assert!(result.is_ok());
+            let body = server.join().unwrap();
+            assert!(body["tools"][0].get("strict").is_none());
+            assert_eq!(
+                body["tools"][0]["input_schema"],
+                json!({"type":"object","properties":{},"required":[]})
+            );
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+        }
+    }
+
+    #[test]
+    fn constrained_bound_model_rejects_rewritten_request() {
+        use pi_rs_core::{StrictToolPolicy as P, ToolDispatchContext};
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for supported in [false, true] {
+            let client = Anthropic::new(DEFAULT_ENDPOINT, "key")
+                .unwrap()
+                .with_strict_tool_support(supported)
+                .with_strict_tool_model("selected");
+            for policy in [P::Prefer, P::Require] {
+                let (mut request, decl) = constrained_fixture(policy, json!({"type":"object"}));
+                request.model = "rewritten".into();
+                let error = client
+                    .prepare_bound_tool_dispatch(&request, &[decl], &context)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("cannot be resolved"));
+            }
+            let (mut request, mut decl) = constrained_fixture(P::Prefer, json!({"type":"object"}));
+            request.model = "rewritten".into();
+            decl.constrained_sampling = None;
+            assert!(
+                client
+                    .prepare_bound_tool_dispatch(&request, &[decl], &context)
+                    .is_ok()
+            );
+            if supported {
+                assert_ne!(
+                    client.context_identity(),
+                    client
+                        .clone()
+                        .with_strict_tool_model("other")
+                        .context_identity()
+                );
+            } else {
+                assert_eq!(
+                    client.context_identity(),
+                    client
+                        .clone()
+                        .with_strict_tool_model("other")
+                        .context_identity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_final_model_uses_frozen_capability_map() {
+        use pi_rs_core::{EffectiveToolSampling as S, StrictToolPolicy as P, ToolDispatchContext};
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let client = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_models(
+                [("strict".into(), true), ("loose".into(), false)]
+                    .into_iter()
+                    .collect(),
+            );
+        let other = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_models(
+                [("strict".into(), false), ("loose".into(), false)]
+                    .into_iter()
+                    .collect(),
+            );
+        assert_ne!(client.context_identity(), other.context_identity());
+        for (model, supported) in [("strict", true), ("loose", false)] {
+            for policy in [P::Prefer, P::Require] {
+                let (mut request, declaration) =
+                    constrained_fixture(policy, json!({"type":"object"}));
+                request.model = model.into();
+                let result = client.prepare_bound_tool_dispatch(
+                    &request,
+                    std::slice::from_ref(&declaration),
+                    &context,
+                );
+                if !supported && policy == P::Require {
+                    assert!(result.is_err());
+                } else {
+                    let prepared = result.unwrap();
+                    pi_rs_core::validate_prepared_tool_dispatch(
+                        prepared.as_ref(),
+                        &context,
+                        &request,
+                        &[declaration],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        matches!(
+                            prepared.effective_tools()[0].sampling,
+                            S::StrictJsonSchema { .. }
+                        ),
+                        supported
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_disabled_capability_map_preserves_legacy_fingerprint() {
+        let legacy = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let disabled = legacy.clone().with_strict_tool_models(
+            [("selected".into(), false), ("other".into(), false)]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(legacy.context_identity(), disabled.context_identity());
+        let enabled = legacy.clone().with_strict_tool_models(
+            [("selected".into(), false), ("other".into(), true)]
+                .into_iter()
+                .collect(),
+        );
+        assert_ne!(legacy.context_identity(), enabled.context_identity());
+        // Prepared fallback can still alter the wire even with strict disabled.
+        let (request, declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","title":"dropped"}),
+        );
+        let old = encode_request(request.clone(), &legacy.replay_scope, "", false).unwrap();
+        let (wire, _) = super::resolve_tools(&request, &[declaration], false).unwrap();
+        assert_ne!(old["tools"][0]["input_schema"], wire[0]["input_schema"]);
+        assert_eq!(
+            wire[0]["input_schema"],
+            json!({"type":"object","properties":{},"required":[]})
+        );
     }
 
     #[test]
