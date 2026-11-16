@@ -611,6 +611,9 @@ impl ModelMetadata {
         if let Some(cost) = &self.cost {
             model["cost"] = cost.value();
         }
+        if !self.thinking_level_map.is_empty() {
+            model["thinkingLevelMap"] = serde_json::json!(self.thinking_level_map);
+        }
     }
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {

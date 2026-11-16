@@ -1156,7 +1156,15 @@ impl Client {
                 let (supports_long, explicit_cache) = args
                     .model_profiles
                     .responses_cache_support(&args.provider, metadata.as_ref());
+                let supports_developer = args
+                    .model_profiles
+                    .chat_compatibility(&args.provider, metadata.as_ref())
+                    .supports_developer_role();
+                let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
+                    == Some(true)
+                    && supports_developer != Some(false);
                 let client = client
+                    .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(
                         args.model_profiles
@@ -2210,6 +2218,137 @@ mod estimation_tests {
                     .and_then(serde_json::Value::as_str),
                 (!summary).then_some("imported-session")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_instruction_role_follows_model_capabilities() {
+        use std::io::{Read, Write};
+        for (models, overrides, provider_compat, expected) in [
+            (
+                serde_json::json!([{"id":"m","reasoning":true}]),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                "developer",
+            ),
+            (
+                serde_json::json!([{"id":"m","reasoning":false}]),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                "system",
+            ),
+            (
+                serde_json::json!([{"id":"m","reasoning":true}]),
+                serde_json::json!({}),
+                serde_json::json!({"supportsDeveloperRole":false}),
+                "system",
+            ),
+            (
+                serde_json::json!([{"id":"m","reasoning":true,"compat":{"supportsDeveloperRole":true}}]),
+                serde_json::json!({}),
+                serde_json::json!({"supportsDeveloperRole":false}),
+                "developer",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                "system",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!({"m":{"name":"partial"}}),
+                serde_json::json!({}),
+                "system",
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut block = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let size: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < end + size {
+                    let n = socket.read(&mut block).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&block[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                body
+            });
+            let endpoint = format!("http://{address}/responses");
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(
+                &serde_json::json!({"providers":{"test":{
+                    "api":"openai-responses", "baseUrl":endpoint, "compat":provider_compat,
+                    "models":models, "modelOverrides":overrides
+                }}}),
+            )
+            .unwrap();
+            args.provider = args.model_profiles.provider("test").unwrap();
+            args.model = "m".into();
+            let client = Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api_provider(
+                    &endpoint,
+                    "fixture".into(),
+                    "test",
+                )
+                .unwrap(),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let _ = client
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![pi_rs::Message::System {
+                        content: "rules".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 10,
+                })
+                .await;
+            let body = server.join().unwrap();
+            assert_eq!(body["input"][0]["role"], expected);
         }
     }
 

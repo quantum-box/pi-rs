@@ -1345,6 +1345,7 @@ impl Agent<'_> {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let failed_assistants = crate::journal::failed_assistant_records(&session.branch());
         let trigger_unanswered = has_trigger_message(session, run_id)
             && !session.branch().iter().any(|record| {
                 record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. })
@@ -1365,6 +1366,9 @@ impl Agent<'_> {
                     if current_entries.contains(&record.id)
                         && !session.records().iter().any(|entry| matches!(&entry.event,
                             Event::CustomMessageQueued { input } if input.id == *id && input.delivery == crate::CustomMessageDelivery::AfterTurn)) => Some(None),
+                // A failed attempt is a boundary, not a completed answer. Do
+                // not return its partial text or fall back to an older reply.
+                Event::Assistant { .. } if failed_assistants.contains(&record.id) => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -3083,6 +3087,18 @@ impl Agent<'_> {
                 }),
             ),
         };
+        // Only turn replies are displayable. Summary requests can contain
+        // private prompt material and must never enter the RPC transcript.
+        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:aborted-turn-partial".into(),
+                    entry: serde_json::json!({"requestId": request_id}),
+                },
+                observer,
+            )?;
+        }
         commit(
             session,
             Event::ModelFinished {
@@ -5018,27 +5034,7 @@ fn model_conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let failed: HashSet<_> = path
-        .iter()
-        .filter_map(|record| match record.event {
-            Event::ModelFinished {
-                request_id,
-                failure: Some(_),
-                ..
-            } => Some(request_id),
-            _ => None,
-        })
-        .collect();
-    let excluded: HashSet<_> = path
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Assistant {
-                request_id: Some(id),
-                ..
-            } if failed.contains(id) => Some(record.id),
-            _ => None,
-        })
-        .collect();
+    let excluded = crate::journal::failed_assistant_records(path);
     conversation_entries(path, operations)
         .into_iter()
         .filter(|(source, _)| !excluded.contains(source))
@@ -7247,6 +7243,91 @@ mod tree_tests {
         );
     }
 
+    #[tokio::test]
+    async fn resume_after_failed_assistant_does_not_return_older_answer() {
+        struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
+        #[async_trait::async_trait]
+        impl Model for Capture {
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.0.lock().unwrap().push(request);
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(ModelEvent::Text("new answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "failed partial".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        let model = Capture(std::sync::Mutex::new(Vec::new()));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "new answer"
+        );
+        let requests = model.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !serde_json::to_string(&requests[0])
+                .unwrap()
+                .contains("failed partial")
+        );
+    }
+
     struct TreeHook {
         veto: bool,
         completed: Arc<AtomicBool>,
@@ -8370,8 +8451,14 @@ mod tree_tests {
     impl Model for CancelSilentSummary {
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
             if request.messages.iter().any(|message| matches!(message, Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
-                self.0.cancel();
-                return Ok(Box::pin(futures_util::stream::pending()));
+                let cancel = self.0.clone();
+                return Ok(Box::pin(
+                    futures_util::stream::iter([Ok(ModelEvent::Text("private summary".into()))])
+                        .chain(futures_util::stream::once(async move {
+                            cancel.cancel();
+                            futures_util::future::pending::<Result<ModelEvent>>().await
+                        })),
+                ));
             }
             Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(ModelEvent::Text("answer".into())),
@@ -8436,6 +8523,8 @@ mod tree_tests {
             Err(Error::Cancelled)
         ));
         assert!(resumable_compaction_run(&session).is_some());
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::ModelFinished { failure: Some(ModelFailure::Cancelled), partial, .. } if partial == "private summary")));
+        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:aborted-turn-partial")));
         assert!(session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow")));
         assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
         assert_eq!(

@@ -1136,6 +1136,31 @@ impl Session {
         Ok(project_messages(&branch, ops))
     }
 
+    /// Snapshot a settled branch for use as model input. Failed or cancelled
+    /// assistant records remain available through `conversation_at` for display,
+    /// but are excluded here even when their content was edited.
+    pub fn model_conversation_at(&self, record_id: u64) -> Result<Vec<Message>> {
+        if record_id == 0
+            || record_id > self.records.len() as u64
+            || matches!(
+                self.records[record_id as usize - 1].event,
+                Event::Checkout { .. }
+            )
+        {
+            return Err(Error::Session(
+                "invalid conversation snapshot record".into(),
+            ));
+        }
+        let branch = self.path(record_id);
+        let ops = operations(&branch);
+        ensure_settled(ops.clone())?;
+        let excluded = failed_assistant_records(&branch);
+        Ok(project_message_entries(&branch, ops)
+            .into_iter()
+            .filter_map(|(source, message)| (!excluded.contains(&source)).then_some(message))
+            .collect())
+    }
+
     pub(crate) fn abandoned_branch(&self, target: u64) -> AbandonedBranch {
         let (branch, common_ancestor) = self.branch_divergence(target);
         let first_abandoned = common_ancestor.map_or(0, |index| index + 1);
@@ -1143,8 +1168,11 @@ impl Session {
         let Some(first) = branch.get(first_abandoned) else {
             return abandoned;
         };
+        let excluded = failed_assistant_records(&branch);
         let mut messages = conversation_entries_since(&branch, self.operations(), first.id);
-        messages.retain(|(_, message)| !matches!(message, Message::Tool { .. }));
+        messages.retain(|(source, message)| {
+            !excluded.contains(source) && !matches!(message, Message::Tool { .. })
+        });
         for (_, message) in &messages {
             if let Message::Assistant { calls, .. } = message {
                 for call in calls {
@@ -3368,6 +3396,31 @@ fn publish_snapshot(
     Ok(())
 }
 
+/// Whether a completion is a marked, display-only cancelled turn partial.
+#[doc(hidden)]
+pub fn is_aborted_turn_partial(records: &[Record], record: &Record) -> bool {
+    let Event::ModelFinished {
+        request_id,
+        failure: Some(ModelFailure::Cancelled),
+        partial,
+        ..
+    } = &record.event
+    else {
+        return false;
+    };
+    let Some(parent) = record
+        .parent
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| records.get(index as usize))
+    else {
+        return false;
+    };
+    matches!(&parent.event, Event::SourceEntry { format, entry }
+        if format == "pi-rs:aborted-turn-partial"
+            && entry["requestId"].as_str().and_then(|id| Uuid::parse_str(id).ok()) == Some(*request_id)
+            && !partial.is_empty())
+}
+
 fn validate_context_edit(
     records: &[Record],
     target: u64,
@@ -3377,7 +3430,8 @@ fn validate_context_edit(
         .checked_sub(1)
         .and_then(|index| records.get(index as usize))
         .ok_or_else(|| Error::Session("invalid context edit target".into()))?;
-    let assistant = matches!(record.event, Event::Assistant { .. });
+    let assistant =
+        matches!(record.event, Event::Assistant { .. }) || is_aborted_turn_partial(records, record);
     if !assistant
         && !matches!(
             record.event,
@@ -3997,6 +4051,30 @@ fn project_message_entries(
     }
     messages.extend(conversation_entries(branch, operations));
     messages
+}
+
+/// Failed assistant records remain visible in history, but are never model input.
+pub(crate) fn failed_assistant_records(path: &[&Record]) -> std::collections::HashSet<u64> {
+    let failed: std::collections::HashSet<_> = path
+        .iter()
+        .filter_map(|record| match record.event {
+            Event::ModelFinished {
+                request_id,
+                failure: Some(_),
+                ..
+            } => Some(request_id),
+            _ => None,
+        })
+        .collect();
+    path.iter()
+        .filter_map(|record| match &record.event {
+            Event::Assistant {
+                request_id: Some(id),
+                ..
+            } if failed.contains(id) => Some(record.id),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn conversation_entries(
@@ -5216,6 +5294,44 @@ mod session_metadata_tests {
         );
         assert_eq!(session.records().len(), source_records);
         assert!(session.records().iter().any(|record| matches!(&record.event, Event::Assistant { content, .. } if content == "old answer")));
+    }
+
+    #[test]
+    fn abandoned_branch_excludes_failed_assistant_when_failure_precedes_boundary() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let request_id = Uuid::new_v4();
+        let target = session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .append(Event::Assistant {
+                content: "failed partial".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "keep this".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let abandoned = session.abandoned_branch(target);
+        assert_eq!(
+            abandoned.messages,
+            vec![Message::User {
+                content: "keep this".into()
+            }]
+        );
     }
 
     #[test]

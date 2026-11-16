@@ -524,6 +524,10 @@ impl Cursor {
                 position.imported = None;
                 None
             }
+            Event::ModelFinished { .. } if pi_rs::is_aborted_turn_partial(records, record) => self
+                .messages
+                .aborted_partial(records, record)
+                .map(|message| json!({"type":"message", "message":message})),
             Event::CacheWarm {
                 metadata,
                 usage,
@@ -1098,6 +1102,203 @@ mod tests {
         ] {
             let entries = Cursor::default().appended(&records, Some(&metadata));
             assert_eq!(entries[0].get("details"), metadata.get("details"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_aborted_partial_stays_out_of_next_model_request_after_import() {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<pi_rs::ModelRequest>>>);
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Capture {
+            async fn stream(
+                &self,
+                request: pi_rs::ModelRequest,
+            ) -> pi_rs::Result<pi_rs::ModelStream> {
+                self.0.lock().unwrap().push(request);
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("answer".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(pi_rs::Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        for edit in ["unchanged", "replace", "delete"] {
+            let mut original = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            original
+                .append_user_with_images("question".into(), vec![], None)
+                .unwrap();
+            let request_id = uuid::Uuid::new_v4();
+            let mut records = original.records().to_vec();
+            for event in [
+                Event::Assistant {
+                    content: "retained answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                },
+                Event::User {
+                    content: "pending question".into(),
+                    input_id: None,
+                },
+                Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 64,
+                    request_id: Some(request_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                },
+                Event::SourceEntry {
+                    format: "pi-rs:aborted-turn-partial".into(),
+                    entry: json!({"requestId":request_id}),
+                },
+                Event::ModelFinished {
+                    request_id,
+                    metadata: pi_rs::ModelMetadata::default(),
+                    usage: pi_rs::UsageReport::Unconfirmed,
+                    failure: Some(pi_rs::ModelFailure::Cancelled),
+                    partial: "partial sentinel".into(),
+                    reply: None,
+                },
+            ] {
+                let parent = records.last().unwrap();
+                records.push(Record {
+                    id: parent.id + 1,
+                    parent: Some(parent.id),
+                    version: parent.version,
+                    timestamp: None,
+                    run_id: None,
+                    event,
+                });
+            }
+            let mut original = Session::from_records(records).unwrap();
+            if edit != "unchanged" {
+                let target = original.head();
+                let replacement = (edit == "replace")
+                    .then(|| pi_rs::ContextContent::Text("edited sentinel".into()));
+                original.edit_context(target, replacement).unwrap();
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let body = Entries::new(&original)
+                .write_share_branch(&original, directory.path())
+                .unwrap();
+            let shared = directory.path().join("shared.jsonl");
+            std::fs::write(&shared, body).unwrap();
+            let mut imported = super::super::session_import::read(&shared).unwrap();
+            let visible = super::super::rpc_messages::snapshot(&imported).0;
+            let assistant = visible.iter().find(|message| {
+                message["role"] == "assistant" && message["stopReason"] == "aborted"
+            });
+            if edit == "delete" {
+                assert!(assistant.is_none());
+            } else {
+                let assistant = assistant.unwrap();
+                assert_eq!(assistant["stopReason"], "aborted");
+                assert_eq!(
+                    assistant["content"][0]["text"],
+                    if edit == "replace" {
+                        "edited sentinel"
+                    } else {
+                        "partial sentinel"
+                    }
+                );
+            }
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let model = Capture(captured.clone());
+            let mut registry = pi_rs::Registry::default();
+            registry
+                .register(Arc::new(pi_rs_review::ReviewContext))
+                .unwrap();
+            let agent = pi_rs::Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: pi_rs::Limits::default(),
+            };
+            let mut summary_session = Session::from_records(imported.records().to_vec()).unwrap();
+            agent
+                .summarize_branch(
+                    &mut summary_session,
+                    1,
+                    None,
+                    0,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let summary_request = serde_json::to_string(&captured.lock().unwrap()[0]).unwrap();
+            assert!(summary_request.contains("question"));
+            assert!(summary_request.contains("retained answer"));
+            assert!(!summary_request.contains("partial sentinel"));
+            assert!(!summary_request.contains("edited sentinel"));
+            let mut review_parent = Session::from_records(imported.records().to_vec()).unwrap();
+            let mut review_child = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let review = pi_rs_review::Review {
+                task: "inspect",
+                from_record: None,
+                allowed_tools: Default::default(),
+                output_budget: 64,
+                timeout: std::time::Duration::from_secs(10),
+                resume: false,
+            };
+            review
+                .run(
+                    &agent,
+                    &mut review_parent,
+                    &mut review_child,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let review_request = serde_json::to_string(&captured.lock().unwrap()[1]).unwrap();
+            assert!(review_request.contains("question"));
+            assert!(review_request.contains("retained answer"));
+            assert!(!review_request.contains("partial sentinel"));
+            assert!(!review_request.contains("edited sentinel"));
+            let mut resume_session = Session::from_records(imported.records().to_vec()).unwrap();
+            let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+            let resumed = agent
+                .run(
+                    &mut resume_session,
+                    None,
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed, "answer");
+            let resume_request = serde_json::to_string(&captured.lock().unwrap()[2]).unwrap();
+            assert!(resume_request.contains("pending question"));
+            assert!(!resume_request.contains("partial sentinel"));
+            assert!(!resume_request.contains("edited sentinel"));
+            let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+            agent
+                .run(
+                    &mut imported,
+                    Some("next".into()),
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let request = serde_json::to_string(&captured.lock().unwrap()[3]).unwrap();
+            assert!(!request.contains("partial sentinel"));
+            assert!(!request.contains("edited sentinel"));
         }
     }
 
