@@ -29,6 +29,8 @@ pub mod mcp_oauth_client;
 mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod mcp_refresh;
+#[doc(hidden)]
+pub mod mcp_shared_gate;
 pub mod model_factory;
 #[doc(hidden)]
 pub mod oauth_callback;

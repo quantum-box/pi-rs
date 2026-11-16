@@ -31,7 +31,6 @@ mod image_policy;
 mod interactive;
 mod kimi_auth;
 mod mcp_config;
-mod mcp_shared_gate;
 mod meta_auth;
 mod model_auth;
 mod model_listing;

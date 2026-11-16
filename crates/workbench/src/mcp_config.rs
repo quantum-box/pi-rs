@@ -130,8 +130,8 @@ async fn configurations_with_project_scope(
     with_config_gate(mcp_read_guard(args), || read_configurations(args, strict)).await
 }
 
-async fn with_config_gate<T>(
-    gate: impl std::future::Future<Output = Result<McpWriteGuard>>,
+async fn with_config_gate<T, G>(
+    gate: impl std::future::Future<Output = Result<G>>,
     read: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let _guard = gate.await?;
@@ -425,123 +425,6 @@ fn login_needs_enable(server: &ServerConfig) -> bool {
     )
 }
 
-struct McpWriteGuard {
-    _account: Option<super::mcp_shared_gate::AccountGuard>,
-    _gate: Option<std::fs::File>,
-    _targets: Vec<std::fs::File>,
-}
-
-// All participating clients acquire credential (if any), account, then
-// sorted legacy mcp.lock files. Old readers/login transactions are not atomic.
-async fn account_guard_for(
-    paths: &[PathBuf],
-    credential: Option<&std::fs::File>,
-    readonly: bool,
-) -> Result<McpWriteGuard> {
-    let account = super::mcp_shared_gate::acquire(credential).await?;
-    account_guard_with(account, paths, credential, readonly).await
-}
-
-async fn account_guard_with(
-    account: super::mcp_shared_gate::AccountGuard,
-    paths: &[PathBuf],
-    credential: Option<&std::fs::File>,
-    readonly: bool,
-) -> Result<McpWriteGuard> {
-    let credential_id = credential
-        .map(|file| same_file::Handle::from_file(file.try_clone()?))
-        .transpose()?;
-    let mut lock_paths: Vec<_> = paths.iter().map(|p| p.with_extension("lock")).collect();
-    lock_paths.sort();
-    let mut opened = Vec::new();
-    for path in lock_paths {
-        let result = if readonly {
-            let writable = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path);
-            match writable {
-                Err(ref error) if weak_read_lock_error(&path, error) => {
-                    std::fs::File::open(&path).map_err(Error::from)
-                }
-                result => result.map_err(Error::from),
-            }
-        } else {
-            open_mcp_lock(&path)
-        };
-        let lock = match result {
-            Ok(lock) => lock,
-            Err(Error::Io(error)) if readonly && weak_read_lock_error(&path, &error) => continue,
-            Err(error) => return Err(error),
-        };
-        let id = same_file::Handle::from_file(lock.try_clone()?)?;
-        if account.aliases_file(&lock)? || credential_id.as_ref() == Some(&id) {
-            return Err(Error::Config("MCP locks refer to the same file".into()));
-        }
-        if opened.iter().any(|(other, _, _)| other == &id) {
-            continue;
-        }
-        let order = lock_identity(&lock)?;
-        opened.push((id, order, lock));
-    }
-    // Open and validate every handle before waiting. The account gate serializes
-    // new participants; stable physical ordering also avoids alias path inversions.
-    opened.sort_by_key(|(_, order, _)| *order);
-    let mut targets = Vec::with_capacity(opened.len());
-    for (_, _, lock) in opened {
-        lock_mcp_file(&lock).await?;
-        targets.push(lock);
-    }
-    Ok(McpWriteGuard {
-        _account: Some(account),
-        _gate: None,
-        _targets: targets,
-    })
-}
-
-fn weak_read_lock_error(path: &std::path::Path, error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::PermissionDenied {
-        return true;
-    }
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::EROFS) {
-        return true;
-    }
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return path.parent().is_some_and(|parent| matches!(std::fs::metadata(parent), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
-    }
-    false
-}
-
-#[cfg(unix)]
-fn lock_identity(file: &std::fs::File) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata()?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-#[cfg(windows)]
-fn lock_identity(file: &std::fs::File) -> Result<(u64, u64)> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let info = unsafe { info.assume_init() };
-    Ok((
-        u64::from(info.dwVolumeSerialNumber),
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    ))
-}
-#[cfg(not(any(unix, windows)))]
-fn lock_identity(_file: &std::fs::File) -> Result<(u64, u64)> {
-    Err(Error::Config("MCP lock identity is unavailable".into()))
-}
-
 fn read_paths(args: &Cli) -> Vec<PathBuf> {
     let mut paths = vec![path(args, false)];
     if args.trusted {
@@ -549,10 +432,11 @@ fn read_paths(args: &Cli) -> Vec<PathBuf> {
     }
     paths
 }
-async fn mcp_read_guard(args: &Cli) -> Result<McpWriteGuard> {
-    account_guard_for(&read_paths(args), None, true).await
+async fn mcp_read_guard(args: &Cli) -> Result<pi_rs_workbench::mcp_shared_gate::ConfigGuard> {
+    pi_rs_workbench::mcp_shared_gate::acquire_config_guard(&read_paths(args), None, true).await
 }
 
+#[cfg(test)]
 fn open_mcp_lock(path: &std::path::Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
     Ok(std::fs::OpenOptions::new()
@@ -563,6 +447,7 @@ fn open_mcp_lock(path: &std::path::Path) -> Result<std::fs::File> {
         .open(path)?)
 }
 
+#[cfg(test)]
 async fn lock_mcp_file(file: &std::fs::File) -> Result<()> {
     loop {
         match file.try_lock() {
@@ -578,12 +463,18 @@ async fn lock_mcp_file(file: &std::fs::File) -> Result<()> {
 async fn mcp_write_guard(
     target: Option<&std::path::Path>,
     credential_lock: Option<&std::fs::File>,
-) -> Result<McpWriteGuard> {
+) -> Result<pi_rs_workbench::mcp_shared_gate::ConfigGuard> {
     let paths = target
         .into_iter()
         .map(std::path::Path::to_path_buf)
         .collect::<Vec<_>>();
-    account_guard_for(&paths, credential_lock, false).await
+    pi_rs_workbench::mcp_shared_gate::acquire_config_guard(&paths, credential_lock, false).await
+}
+
+#[cfg(test)]
+struct McpWriteGuard {
+    _gate: Option<std::fs::File>,
+    _targets: Vec<std::fs::File>,
 }
 
 #[cfg(test)]
@@ -617,7 +508,6 @@ async fn mcp_write_guard_at(
         None
     };
     Ok(McpWriteGuard {
-        _account: None,
         _gate: Some(gate),
         _targets: target.into_iter().collect(),
     })
@@ -1412,7 +1302,12 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 &args.mcp_login_cancel,
                 announce,
                 move |credential_lock| async move {
-                    account_guard_for(&guard_paths, Some(&credential_lock), false).await
+                    pi_rs_workbench::mcp_shared_gate::acquire_config_guard(
+                        &guard_paths,
+                        Some(&credential_lock),
+                        false,
+                    )
+                    .await
                 },
                 move |_| {
                     finish_login(
@@ -1533,169 +1428,6 @@ fn path(args: &Cli, local: bool) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn injected_account_gate_serializes_distinct_homes_and_cancels_waiter() {
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let first = super::super::mcp_shared_gate::acquire_for_test(&profile, None)
-            .await
-            .unwrap();
-        let project = root.path().join("project/mcp.json");
-        let guard = account_guard_with(
-            first,
-            &[root.path().join("home-a/mcp.json"), project.clone()],
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-        let waiting = tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            super::super::mcp_shared_gate::acquire_for_test(&profile, None),
-        )
-        .await;
-        assert!(waiting.is_err());
-        drop(guard);
-        let second = super::super::mcp_shared_gate::acquire_for_test(&profile, None)
-            .await
-            .unwrap();
-        let _guard = account_guard_with(
-            second,
-            &[root.path().join("home-b/mcp.json"), project],
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn injected_gate_acquires_duplicate_legacy_locks_once() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let first = root.path().join("first/mcp.json");
-        let second = root.path().join("second/mcp.json");
-        let _held = open_mcp_lock(&first.with_extension("lock")).unwrap();
-        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
-        std::fs::hard_link(first.with_extension("lock"), second.with_extension("lock")).unwrap();
-        let account = super::super::mcp_shared_gate::acquire_for_test(&profile, None)
-            .await
-            .unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            account_guard_with(account, &[first, second], None, false),
-        )
-        .await;
-        assert!(result.expect("duplicate must not deadlock").is_ok());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn injected_gate_rejects_credential_lock_alias_before_waiting() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let credential_path = root.path().join("credentials.lock");
-        let credential = open_mcp_lock(&credential_path).unwrap();
-        credential.lock().unwrap();
-        let config = root.path().join("mcp.json");
-        std::fs::hard_link(&credential_path, config.with_extension("lock")).unwrap();
-        let account = super::super::mcp_shared_gate::acquire_for_test(&profile, Some(&credential))
-            .await
-            .unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            account_guard_with(account, &[config], Some(&credential), false),
-        )
-        .await;
-        assert!(result.expect("credential alias must not deadlock").is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn injected_gate_rejects_account_lock_alias_before_waiting() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let account = super::super::mcp_shared_gate::acquire_for_test(&profile, None)
-            .await
-            .unwrap();
-        let config = root.path().join("mcp.json");
-        std::fs::hard_link(
-            profile.join(".pi-rs-shared/mcp-config-gate.lock"),
-            config.with_extension("lock"),
-        )
-        .unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            account_guard_with(account, &[config], None, false),
-        )
-        .await;
-        assert!(result.expect("account alias must not deadlock").is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn injected_read_guard_locks_existing_readonly_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let config = root.path().join("mcp.json");
-        let lock_path = config.with_extension("lock");
-        std::fs::File::create(&lock_path).unwrap();
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let account = super::super::mcp_shared_gate::acquire_for_test(&profile, None)
-            .await
-            .unwrap();
-        let guard = account_guard_with(account, &[config], None, true)
-            .await
-            .unwrap();
-        let contender = std::fs::File::open(&lock_path).unwrap();
-        assert!(matches!(
-            contender.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        drop(guard);
-        contender.try_lock().unwrap();
-    }
-
-    #[test]
-    fn readonly_fallback_distinguishes_missing_parent_and_contention() {
-        let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("missing/mcp.lock");
-        assert!(weak_read_lock_error(
-            &missing,
-            &std::io::Error::from(std::io::ErrorKind::NotFound)
-        ));
-        assert!(!weak_read_lock_error(
-            &missing,
-            &std::io::Error::from(std::io::ErrorKind::WouldBlock)
-        ));
-        assert!(!weak_read_lock_error(
-            &root.path().join("mcp.lock"),
-            &std::io::Error::from(std::io::ErrorKind::NotFound)
-        ));
-        #[cfg(unix)]
-        assert!(weak_read_lock_error(
-            &missing,
-            &std::io::Error::from_raw_os_error(libc::EROFS)
-        ));
-    }
 
     #[test]
     fn login_resolution_uses_trusted_definition_and_oauth_override() {
