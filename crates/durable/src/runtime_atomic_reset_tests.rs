@@ -1253,3 +1253,95 @@ fn reset_proof_replays_each_prior_cut_once_per_traversal() {
     assert!(h.owner.store().commit(&checks, &[]).is_err());
     assert!(h.prove_failure_reset_cut(id, &first, observation).is_err());
 }
+
+#[test]
+fn atomic_reset_save_fences_predecessor_proofs_until_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut h, id, _, _) = setup_with_adapter(&path, true);
+    h.set_after_failed_run(id, AfterFailedRun::Continue)
+        .unwrap();
+    h.submit(id, None, "replacement one".into()).unwrap();
+    let (mut checkpoint, version) = h.load(id).unwrap();
+    checkpoint.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "first".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "first".into(), FailureCause::ModelError);
+    h.save(&failure, Expected::Version(version)).unwrap();
+    let (previous, _) = h.load(id).unwrap();
+    let transcript = crate::transcript::Transcript::new(h.owner.store(), id);
+    let tail = transcript
+        .read_with_blocks(
+            previous.transcript.as_ref().unwrap(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap();
+    let last_reset = transcript
+        .read_with_blocks(&tail.next, std::num::NonZeroUsize::MIN)
+        .unwrap();
+    let (entry, sequence) = last_reset.next.entry_identity().unwrap();
+    let prefix = crate::reset_manifest::candidate_prefix(id, entry, sequence);
+    let old_manifest = h
+        .owner
+        .store()
+        .prefix_keys_bounded(&prefix, 2, prefix.len() + 36)
+        .unwrap()
+        .pop()
+        .unwrap();
+    h.submit(id, None, "replacement two".into()).unwrap();
+    for text in ["third", "fourth"] {
+        h.reset_with_blocks(
+            id,
+            Some(text.into()),
+            vec![vec![serde_json::json!({"type":"text","text":text})]],
+        )
+        .unwrap();
+    }
+    let (mut checkpoint, version) = h.load(id).unwrap();
+    checkpoint.phase = Phase::FailedModel {
+        turns: 0,
+        request_id: Uuid::new_v4(),
+        reason: "second".into(),
+        decision: ModelFailureDecision::Stop,
+    };
+    h.save(&checkpoint, Expected::Version(version)).unwrap();
+    let (mut failure, version) = h.load(id).unwrap();
+    finish_failure(&mut failure, "second".into(), FailureCause::ModelError);
+    let owner = h.owner.clone();
+    RESET_PROOF_BEFORE_SAVE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                let value = owner.store().get(&old_manifest).unwrap().unwrap().value;
+                owner
+                    .store()
+                    .commit(
+                        &[],
+                        &[Mutation::Put {
+                            key: old_manifest,
+                            value,
+                        }],
+                    )
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }))
+    });
+    assert!(matches!(
+        h.save(&failure, Expected::Version(version)),
+        Err(Error::Storage(durable_store::Error::Conflict { .. }))
+    ));
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.resets.len(), 2);
+    assert_eq!(state.pending_resets.len(), 2);
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let state = h.conversation(id).unwrap();
+    assert_eq!(state.resets.len(), 2);
+    assert_eq!(state.pending_resets.len(), 2);
+}

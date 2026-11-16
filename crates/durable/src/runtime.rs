@@ -2466,9 +2466,16 @@ thread_local! {
     static RESET_PROOF_MEMO: std::cell::RefCell<Option<HashMap<ResetProofKey, ResetProofValue>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static RESET_PROOF_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static RESET_PROOF_BEFORE_SAVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 struct ResetProofScope(bool);
 impl ResetProofScope {
+    fn reset_owned(&self) {
+        if self.0 {
+            RESET_PROOF_MEMO.with(|memo| *memo.borrow_mut() = Some(HashMap::new()));
+        }
+    }
     fn enter() -> Self {
         Self(RESET_PROOF_MEMO.with(|memo| {
             let mut memo = memo.borrow_mut();
@@ -3814,6 +3821,8 @@ impl Harness {
         {
             return Err(Error::Failed);
         }
+        // Keep nested transcript proofs alive through preparation and commit.
+        let proof_scope = ResetProofScope::enter();
         let key = Self::key(state.id);
         let mut state = state.clone();
         let failed_transition = {
@@ -3874,8 +3883,14 @@ impl Harness {
                     mutations: batch.mutations.clone(),
                 })?;
             }
-            // Preparing a fork can itself validate nested reset origins. Fence
-            // every such proof in the same transaction that creates the child.
+            #[cfg(test)]
+            RESET_PROOF_BEFORE_SAVE.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            // Preparing a fork or reset can validate nested reset origins. Fence
+            // every such proof in the transaction publishing the result.
             merge_reset_proof_checks(&mut prepared.checks, cached_reset_proof_checks(&self.owner));
             match self.commit_conversation_save(prepared) {
                 Ok(()) => break,
@@ -3889,6 +3904,7 @@ impl Harness {
                 {
                     // A callback won the race with sealing. Reload its latest
                     // partial and retry the whole atomic transition.
+                    proof_scope.reset_owned();
                     continue;
                 }
                 Err(Error::Storage(durable_store::Error::Conflict { key }))
@@ -4033,6 +4049,7 @@ impl Harness {
                         state.phase = Phase::Idle;
                     }
                     expected = Expected::Version(entry.version);
+                    proof_scope.reset_owned();
                     self.loaded.lock().map_err(|_| Error::Failed)?.insert(
                         state.id,
                         (entry.version, {
