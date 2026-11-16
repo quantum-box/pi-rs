@@ -6046,3 +6046,355 @@ fn keep_abort_cascade_retries_concurrent_admission_and_recovers() {
         }
     );
 }
+
+#[tokio::test]
+async fn abort_queue_boundary_survives_reopen_and_cleanup_conflicts() {
+    for later_policy in [None, Some(OnAbort::Withdraw), Some(OnAbort::Keep)] {
+        for retry in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            let id = h
+                .create_conversation(Config {
+                    model: "test".into(),
+                    system_prompt: String::new(),
+                    max_output_tokens: 10,
+                })
+                .unwrap();
+            h.submit(id, None, "active".into()).unwrap();
+            let before = h
+                .submit_with_options(
+                    id,
+                    None,
+                    "before".into(),
+                    AdmissionOptions {
+                        on_abort: OnAbort::Keep,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            h.request_abort(id).unwrap();
+            drop(h);
+            let h = Harness::open_paused(&path, options()).unwrap();
+            let mut writer = h.worker();
+            let mut cleanup_worker = h.worker();
+            let (mut cleanup, version) = cleanup_worker.load(id).unwrap();
+            cleanup.abort_requested = false;
+            finish_abort(&mut cleanup);
+            let later = if retry {
+                // A settings-only update forces the merge even when there is no new input.
+                writer
+                    .set_after_failed_run(id, AfterFailedRun::Withdraw)
+                    .unwrap();
+                later_policy.map(|policy| {
+                    writer
+                        .submit_with_options(
+                            id,
+                            None,
+                            "later".into(),
+                            AdmissionOptions {
+                                on_abort: policy,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                })
+            } else {
+                let later = later_policy.map(|policy| {
+                    writer
+                        .submit_with_options(
+                            id,
+                            None,
+                            "later".into(),
+                            AdmissionOptions {
+                                on_abort: policy,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                });
+                if later.is_some() {
+                    let (mut current, _) = cleanup_worker.load(id).unwrap();
+                    current.abort_requested = false;
+                    finish_abort(&mut current);
+                    cleanup = current;
+                }
+                later
+            };
+            let version = if retry {
+                version
+            } else {
+                cleanup_worker.load(id).unwrap().1
+            };
+            cleanup_worker
+                .save(&cleanup, Expected::Version(version))
+                .unwrap();
+            drop(writer);
+            drop(cleanup_worker);
+            drop(h);
+            let mut h = Harness::open_paused(&path, options()).unwrap();
+            let c = h.conversation(id).unwrap();
+            assert_eq!(
+                c.submissions
+                    .iter()
+                    .find(|s| s.id == before)
+                    .unwrap()
+                    .status,
+                Status::Queued
+            );
+            assert_eq!(
+                matches!(c.phase, Phase::Idle),
+                later.is_some(),
+                "policy={later_policy:?} retry={retry}"
+            );
+            h.resume_conversation(id, &CancellationToken::new())
+                .await
+                .unwrap();
+            let c = h.conversation(id).unwrap();
+            if let Some(later) = later {
+                assert!(matches!(
+                    c.submissions
+                        .iter()
+                        .find(|s| s.id == before)
+                        .unwrap()
+                        .status,
+                    Status::Done { .. }
+                ));
+                assert!(matches!(
+                    c.submissions.iter().find(|s| s.id == later).unwrap().status,
+                    Status::Done { .. }
+                ));
+            } else {
+                assert_eq!(
+                    c.submissions
+                        .iter()
+                        .find(|s| s.id == before)
+                        .unwrap()
+                        .status,
+                    Status::Queued
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_abort_moves_post_mark_keep_into_retained_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    h.request_abort(id).unwrap();
+    let kept = h
+        .submit_with_options(
+            id,
+            None,
+            "keep".into(),
+            AdmissionOptions {
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let withdrawn = h.submit(id, None, "withdraw".into()).unwrap();
+    h.request_abort(id).unwrap();
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert_eq!(
+        c.submissions.iter().find(|s| s.id == kept).unwrap().status,
+        Status::Queued
+    );
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == withdrawn)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn abort_cleanup_conflict_with_withdrawal_keeps_other_retained_input_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let keep = AdmissionOptions {
+        on_abort: OnAbort::Keep,
+        ..Default::default()
+    };
+    let retained = h
+        .submit_with_options(id, None, "retained".into(), keep)
+        .unwrap();
+    let withdraw = h
+        .submit_with_options(id, None, "withdraw".into(), keep)
+        .unwrap();
+    h.request_abort(id).unwrap();
+    drop(h);
+    let h = Harness::open_paused(&path, options()).unwrap();
+    let mut cleanup_worker = h.worker();
+    let (mut cleanup, version) = cleanup_worker.load(id).unwrap();
+    cleanup.abort_requested = false;
+    finish_abort(&mut cleanup);
+    let mut writer = h.worker();
+    assert!(matches!(
+        writer.withdraw_submission(id, withdraw).unwrap(),
+        WithdrawResult::Aborted
+    ));
+    cleanup_worker
+        .save(&cleanup, Expected::Version(version))
+        .unwrap();
+    drop(writer);
+    drop(cleanup_worker);
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(matches!(c.phase, Phase::FailedIdle));
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == retained)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == withdraw)
+            .unwrap()
+            .status,
+        Status::Unanswered {
+            reason: "aborted".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn abort_idle_post_mark_inputs_wait_for_cleanup() {
+    for policy in [OnAbort::Withdraw, OnAbort::Keep] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let id = h
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 10,
+            })
+            .unwrap();
+        h.request_abort(id).unwrap();
+        let later = h
+            .submit_with_options(
+                id,
+                None,
+                "later".into(),
+                AdmissionOptions {
+                    on_abort: policy,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            h.conversation(id).unwrap().submissions[0].status,
+            Status::Queued
+        );
+        drop(h);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        h.resume_conversation(id, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.conversation(id)
+                .unwrap()
+                .submissions
+                .iter()
+                .find(|s| s.id == later)
+                .unwrap()
+                .status,
+            Status::Done { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn abort_cleanup_conflict_withdraws_only_post_mark_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    let id = h
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        })
+        .unwrap();
+    h.submit(id, None, "active".into()).unwrap();
+    let retained = h
+        .submit_with_options(
+            id,
+            None,
+            "retained".into(),
+            AdmissionOptions {
+                on_abort: OnAbort::Keep,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    h.request_abort(id).unwrap();
+    let later = h.submit(id, None, "later".into()).unwrap();
+    let mut cleanup_worker = h.worker();
+    let (mut cleanup, version) = cleanup_worker.load(id).unwrap();
+    cleanup.abort_requested = false;
+    finish_abort(&mut cleanup);
+    assert!(matches!(cleanup.phase, Phase::Idle));
+    let mut writer = h.worker();
+    assert!(matches!(
+        writer.withdraw_submission(id, later).unwrap(),
+        WithdrawResult::Aborted
+    ));
+    cleanup_worker
+        .save(&cleanup, Expected::Version(version))
+        .unwrap();
+    drop(writer);
+    drop(cleanup_worker);
+    drop(h);
+    let mut h = Harness::open_paused(&path, options()).unwrap();
+    h.resume_conversation(id, &CancellationToken::new())
+        .await
+        .unwrap();
+    let c = h.conversation(id).unwrap();
+    assert!(matches!(c.phase, Phase::FailedIdle));
+    assert_eq!(
+        c.submissions
+            .iter()
+            .find(|s| s.id == retained)
+            .unwrap()
+            .status,
+        Status::Queued
+    );
+}
