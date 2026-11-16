@@ -557,7 +557,11 @@ impl Worker {
                         .as_str()
                         .and_then(|id| self.extension_sources.get(id))
                 {
-                    event["extensionPath"] = source.clone();
+                    if event.get("extensionPath").is_some() {
+                        event["nativeExtensionPath"] = source.clone();
+                    } else {
+                        event["extensionPath"] = source.clone();
+                    }
                 }
                 Some(event)
             })

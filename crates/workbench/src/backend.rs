@@ -1264,19 +1264,43 @@ async fn run_worker(
                     mut images,
                     queued_only,
                     require_command,
+                    rpc,
                     ..
                 } => {
                     let mut prompt_acknowledged = false;
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
                     }
-                    if let Some(input) = content.as_deref()
-                        && let Some(trigger) = agent.try_extension_command_with_trigger(
-                            session,
-                            input,
-                            &mut observer,
-                        )?
-                    {
+                    let command = if let Some(input) = content.as_deref() {
+                        if rpc {
+                            match agent.try_extension_command_rpc(session, input, &mut observer) {
+                                Err(pi_rs::CommandDispatchError::Callback { id, message }) => {
+                                    let name = input
+                                        .split_once(char::is_whitespace)
+                                        .map_or(input, |(name, _)| name)
+                                        .strip_prefix('/')
+                                        .unwrap_or(input);
+                                    output(
+                                        json!({"type":"extension_error","extension":id,"extensionPath":format!("command:{name}"),"event":"command","message":message}),
+                                    );
+                                    return Ok(());
+                                }
+                                Err(pi_rs::CommandDispatchError::Other(error)) => {
+                                    return Err(error);
+                                }
+                                Ok(result) => result,
+                            }
+                        } else {
+                            agent.try_extension_command_with_trigger(
+                                session,
+                                input,
+                                &mut observer,
+                            )?
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(trigger) = command {
                         if !trigger {
                             return Ok(());
                         }

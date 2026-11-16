@@ -490,6 +490,16 @@ is rejected before its hook runs. A prompt that runs an extension command return
 Idle extension commands
 take precedence over valid attached images in RPC; the
 attachments are not sent to the model even when the command triggers a turn.
+When an idle RPC command callback reports an identifiable error, native emits
+an `extension_error` with Pi's `command:<invocation>` path and returns `handled`.
+The native extension ID remains in `extension`, and executable extensions also
+include `nativeExtensionPath`. Executables advertise typed command failure
+support; legacy executable `Err` responses remain prompt failures because they
+cannot distinguish callback failures from dispatch failures. Executable transport
+and protocol failures, state migration, action validation, and journal failures
+remain prompt errors. Native in-process extensions report command callback errors
+as strings and do not distinguish a transport error unless they override the
+classified callback.
 RPC validates images before command dispatch. An idle command that triggers a
 model turn reports `handled` before that turn completes, as in Pi. Commands
 submitted while a turn is active cannot yet execute immediately. A normal model turn returns

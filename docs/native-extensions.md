@@ -60,6 +60,15 @@ trigger-turn, or after-turn delivery. Supported callbacks and recovery behavior
 are listed in the [native parity details](native-parity.md#active-run-native-custom-messages).
 Custom message renderers are not yet supported.
 
+Executable hosts advertising `command_failure_classification_v1` accept the
+`command_effects_classified_v1` request. Its successful protocol envelope
+contains a typed `Ok` effects value or an `Err` containing `Callback` or
+`Transport`. An outer protocol error is a host or dispatch failure. A host
+without this capability receives the existing command request; its untyped
+errors remain failures because their origin is unknown. The standard extension
+server advertises the capability and propagates typed errors from extensions it
+hosts, including executable extensions.
+
 ## Write another extension
 
 Add the extension crate to the host's Cargo dependencies, implement
