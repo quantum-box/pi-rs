@@ -62,7 +62,11 @@ external effects. Even a crash before dispatch can require reconciliation. An
 unrelated missing owned conversation, malformed edge, or invalid abort mark is skipped during
 candidate discovery; the affected graph requires separate repair. Task abort
 settlement and held completion also isolate damaged edges when an immutable owned
-subagent reservation independently identifies the affected task; a missing
+subagent reservation independently identifies the affected task. An unmarked
+held failure with an uncertain ownership graph stays parked rather than starting
+an unauthenticated abort cascade; unrelated tasks continue only when their owner
+chains prove they are outside that graph. Attaching an existing named subagent is
+fenced against the child’s active or uncertain cleanup marker. A missing
 background child does not hold its owner's abort. If an edge
 is too malformed to identify its owner, all task abort settlements remain parked
 until repair because the runtime cannot prove which task owns it; independent

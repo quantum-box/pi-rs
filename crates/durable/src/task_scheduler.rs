@@ -3529,6 +3529,14 @@ impl Scheduler {
             if !snapshot.task.is_completing() {
                 continue;
             }
+            if matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
+                && !snapshot.task.abort_requested()
+                && owned_graph_uncertain(owner.store(), snapshot.task.id())?
+            {
+                // Do not turn an unproven graph into cancellation authority.
+                // Keep this owner parked while unrelated work continues.
+                continue;
+            }
             let live = has_live_owned(owner.store(), snapshot.task.id(), &held_tasks)?;
             let needs_cascade = matches!(snapshot.task.state(), TaskState::CompletingFailed(_))
                 && !snapshot.task.abort_requested()
@@ -5033,7 +5041,6 @@ pub(crate) fn pending_abort_root_for_running(
     include_background: bool,
 ) -> Result<Option<Uuid>, Error> {
     let records = ts.list()?;
-    let edges = crate::ownership_edge::EdgeStore::new(ts.store());
     let mut roots = Vec::new();
     for parent in &records {
         if let TaskState::Waiting(WaitFor::TasksFailFast(ids)) = parent.task.state()
@@ -5064,7 +5071,31 @@ pub(crate) fn pending_abort_root_for_running(
             }));
         }
     }
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let graph = crate::ownership_edge::CleanupGraph::load(ts.store())
+        .map_err(|error| Error::Handler(format!("ownership graph: {error}")))?;
     for root in roots {
+        if graph.uncertain_task(root) {
+            if root == running {
+                return Ok(Some(root));
+            }
+            let running_task = records
+                .iter()
+                .find(|item| item.task.id() == running)
+                .ok_or(Error::Ownership)?;
+            // A valid foreground owner chain proves this invocation is outside
+            // the uncertain root. Otherwise retain the outcome for revalidation.
+            if include_background
+                || !task_ancestors_available(ts.store(), &running_task.task, &records, |parent| {
+                    parent.id() == root
+                })
+            {
+                return Err(Error::Busy);
+            }
+            continue;
+        }
         let mut pending = vec![root];
         let mut seen = HashSet::new();
         while let Some(task_id) = pending.pop() {
@@ -5073,6 +5104,11 @@ pub(crate) fn pending_abort_root_for_running(
             }
             if task_id == running {
                 return Ok(Some(root));
+            }
+            // Background task descendants are traversed only in the broader
+            // mode and are not represented in the foreground uncertainty walk.
+            if graph.uncertain_task(task_id) {
+                return Err(Error::Busy);
             }
             let task = records
                 .iter()
@@ -5085,16 +5121,13 @@ pub(crate) fn pending_abort_root_for_running(
                     pending.push(child.task.id());
                 }
             }
-            for edge in edges
-                .children(task_id)
-                .map_err(|e| Error::Handler(format!("ownership edges: {e}")))?
-            {
-                if edge.edge.task_owner != *task.task.owner() {
+            for edge in graph.task_edges(task_id) {
+                if edge.task_owner != *task.task.owner() {
                     return Err(Error::Ownership);
                 }
-                if edge.edge.mode == crate::ownership_edge::Mode::Foreground {
+                if edge.mode == crate::ownership_edge::Mode::Foreground {
                     for child in &records {
-                        if child.task.owner() == &TaskOwner::Conversation(edge.edge.child)
+                        if child.task.owner() == &TaskOwner::Conversation(edge.child)
                             && (include_background || !child.task.is_background())
                         {
                             pending.push(child.task.id());
@@ -5204,6 +5237,7 @@ pub(crate) fn resolve_maintenance(
         MaintenanceIntent::Failed(_)
             if !parent.task.abort_requested()
                 && matches!(parent.task.state(), TaskState::CompletingFailed(_))
+                && !owned_graph_uncertain(ts.store(), id)?
                 && has_owned_work(ts.store(), id, &records, true)? =>
         {
             Ok(Some((Some(id), None)))
@@ -5228,6 +5262,12 @@ fn has_unmarked_nested(parent: Uuid, tasks: &[task_store::StoredTask]) -> bool {
             && !child.task.is_terminal()
             && !child.task.abort_requested()
     })
+}
+
+fn owned_graph_uncertain(store: &durable_store::Store, root: Uuid) -> Result<bool, Error> {
+    Ok(crate::ownership_edge::CleanupGraph::load(store)
+        .map_err(|error| Error::Handler(format!("ownership graph: {error}")))?
+        .uncertain_task(root))
 }
 
 // Walk through terminal tasks and owned conversations as well: work may be
@@ -17326,6 +17366,179 @@ mod standalone_foreground_cleanup_tests {
             Err(durable_store::Error::Conflict { .. })
         ));
         assert!(EdgeStore::new(&db).get(child).unwrap().is_none());
+    }
+
+    #[test]
+    fn uncertain_failed_owner_is_parked_while_unrelated_task_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let broken = task(1, TaskOwner::Conversation(root), "parent");
+        let good = task(2, TaskOwner::Conversation(root), "work");
+        let db = Store::open(dir.path().join("db")).unwrap();
+        let tasks = TaskStore::new(&db);
+        tasks
+            .save(&[Save::Create(&broken), Save::Create(&good)])
+            .unwrap();
+        let child = h
+            .ensure_task_owned_subagent(
+                broken.id(),
+                broken.owner().clone(),
+                "child",
+                cfg,
+                Mode::Foreground,
+            )
+            .unwrap()
+            .child;
+        let descendant = task(3, TaskOwner::Conversation(child), "work");
+        tasks.save(&[Save::Create(&descendant)]).unwrap();
+        tasks
+            .update(&tasks.load(broken.id()).unwrap().unwrap(), |task| {
+                task.start()?;
+                task.hold_failure("failed".into())
+            })
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let mut registry = Registry::default();
+        registry.register("work", true, move |_: &Task| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::Succeed(json!(null)))
+        });
+        let mut scheduler = h.attach_tasks(registry).unwrap();
+        tasks
+            .reserve(&tasks.load(descendant.id()).unwrap().unwrap())
+            .unwrap();
+        let edge_key = crate::ownership_edge::edge_key(child);
+        let entry = db.get(&edge_key).unwrap().unwrap();
+        let mut edge: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
+        edge["mode"] = json!("corrupt");
+        db.commit(
+            &[durable_store::Check {
+                key: edge_key.clone(),
+                expected: Expected::Version(entry.version),
+            }],
+            &[durable_store::Mutation::Put {
+                key: edge_key,
+                value: serde_json::to_vec(&edge).unwrap(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            pending_abort_root_for_running(&tasks, descendant.id(), false),
+            Err(Error::Busy)
+        ));
+        // A deferred failure selected before corruption must revalidate too.
+        assert!(
+            resolve_maintenance(&tasks, MaintenanceIntent::Failed(broken.id()))
+                .unwrap()
+                .is_none()
+        );
+        for _ in 0..10 {
+            scheduler.tick(0).unwrap();
+            if calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let state = scheduler.get(broken.id()).unwrap().unwrap();
+        assert!(matches!(state.state(), TaskState::CompletingFailed(_)));
+        assert!(!state.abort_requested());
+        assert!(scheduler.get(good.id()).unwrap().unwrap().is_terminal());
+    }
+
+    #[test]
+    fn anchoring_existing_subagent_and_cleanup_marker_fence_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let cfg = Config {
+            model: "stub".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 10,
+        };
+        let root = h.create_conversation(cfg.clone()).unwrap();
+        let child = h.ensure_subagent(root, "race", cfg.clone()).unwrap().child;
+        let db = Store::open(&path).unwrap();
+        let marker_key = crate::runtime::owned_cleanup_key(child);
+        let root_key = format!("runtime/conversation/{child}").into_bytes();
+        let root_version = db.get(&root_key).unwrap().unwrap().version;
+        let edge_key = crate::ownership_edge::edge_key(child);
+        let injected = Store::open(&path).unwrap();
+        let m = marker_key.clone();
+        let e = edge_key.clone();
+        crate::subagent::set_before_anchor_commit(Box::new(move || {
+            injected
+                .commit(
+                    &[
+                        durable_store::Check {
+                            key: m.clone(),
+                            expected: Expected::Missing,
+                        },
+                        durable_store::Check {
+                            key: e,
+                            expected: Expected::Missing,
+                        },
+                        durable_store::Check {
+                            key: root_key,
+                            expected: Expected::Version(root_version),
+                        },
+                    ],
+                    &[durable_store::Mutation::Put {
+                        key: m,
+                        value: serde_json::to_vec(&Uuid::new_v4()).unwrap(),
+                    }],
+                )
+                .unwrap();
+        }));
+        assert!(h.anchor_subagent(root, "race").is_err());
+        assert!(EdgeStore::new(&db).get(child).unwrap().is_none());
+        let marker = db.get(&marker_key).unwrap().unwrap();
+        db.commit(
+            &[durable_store::Check {
+                key: marker_key.clone(),
+                expected: Expected::Version(marker.version),
+            }],
+            &[durable_store::Mutation::Delete { key: marker_key }],
+        )
+        .unwrap();
+        h.anchor_subagent(root, "race").unwrap();
+        // The reverse order is fenced by the cleanup transaction's edge check.
+        let second = h.ensure_subagent(root, "reverse", cfg).unwrap().child;
+        let edge_key = crate::ownership_edge::edge_key(second);
+        let marker_key = crate::runtime::owned_cleanup_key(second);
+        let root_key = format!("runtime/conversation/{second}").into_bytes();
+        let root_version = db.get(&root_key).unwrap().unwrap().version;
+        h.anchor_subagent(root, "reverse").unwrap();
+        assert!(matches!(
+            db.commit(
+                &[
+                    durable_store::Check {
+                        key: marker_key.clone(),
+                        expected: Expected::Missing
+                    },
+                    durable_store::Check {
+                        key: edge_key,
+                        expected: Expected::Missing
+                    },
+                    durable_store::Check {
+                        key: root_key,
+                        expected: Expected::Version(root_version)
+                    },
+                ],
+                &[durable_store::Mutation::Put {
+                    key: marker_key,
+                    value: serde_json::to_vec(&Uuid::new_v4()).unwrap()
+                }]
+            ),
+            Err(durable_store::Error::Conflict { .. })
+        ));
     }
 
     #[test]
