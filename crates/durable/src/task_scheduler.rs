@@ -2436,7 +2436,7 @@ pub(crate) fn failed_sibling_to_abort(
 
 // Locate a pending cancellation root that owns this invocation. The caller holds
 // the task gate and fences graph puts through the result commit.
-fn pending_abort_root_for_running(
+pub(crate) fn pending_abort_root_for_running(
     ts: &TaskStore<'_>,
     running: Uuid,
     include_background: bool,
@@ -2792,6 +2792,151 @@ mod tests {
         Checkpoint {
             phase: phase.into(),
             data: json!(null),
+        }
+    }
+
+    #[test]
+    fn checked_abort_rechecks_intent_under_task_gate() {
+        use crate::runtime::{Config, Harness, Options};
+        use async_trait::async_trait;
+        use pi_rs_core::{Error as ModelError, Model, ModelRequest, ModelStream};
+        use std::{sync::mpsc, time::Duration};
+        struct Stub;
+        #[async_trait]
+        impl Model for Stub {
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream, ModelError> {
+                unreachable!()
+            }
+        }
+        for stale in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut harness = Harness::open_paused(
+                dir.path().join("db"),
+                Options {
+                    model: Arc::new(Stub),
+                    tools: vec![],
+                    restart_limit: 3,
+                    max_turns: 3,
+                    uncertain_policy: crate::recovery::UncertainPolicy::InterruptedResult,
+                },
+            )
+            .unwrap();
+            let nested = harness
+                .create_conversation(Config {
+                    model: "stub".into(),
+                    system_prompt: "".into(),
+                    max_output_tokens: 20,
+                })
+                .unwrap();
+            let scheduler = harness.attach_tasks(Registry::default()).unwrap();
+            let mut parent = task(
+                1,
+                TaskOwner::Conversation(Uuid::from_u128(9)),
+                "parent",
+                false,
+                3,
+            );
+            parent.start().unwrap();
+            parent
+                .wait(WaitFor::TasksFailFast(vec![
+                    Uuid::from_u128(2),
+                    Uuid::from_u128(3),
+                ]))
+                .unwrap();
+            let mut running = task(2, TaskOwner::Task(parent.id()), "running", false, 3);
+            running.start().unwrap();
+            let mut failed = task(3, TaskOwner::Task(parent.id()), "failed", false, 3);
+            failed.start().unwrap();
+            failed.fail("failure".into()).unwrap();
+            let child = task(4, TaskOwner::Task(running.id()), "child", false, 3);
+            let nested_task = task(5, TaskOwner::Conversation(nested), "nested", false, 3);
+            scheduler
+                .ts()
+                .save(&[
+                    Save::Create(&parent),
+                    Save::Create(&running),
+                    Save::Create(&failed),
+                    Save::Create(&child),
+                    Save::Create(&nested_task),
+                ])
+                .unwrap();
+            let owner = scheduler.owner();
+            let edge = crate::ownership_edge::Edge {
+                task: running.id(),
+                task_owner: running.owner().clone(),
+                child: nested,
+                mode: crate::ownership_edge::Mode::Foreground,
+            };
+            let prepared = crate::ownership_edge::EdgeStore::new(owner.store())
+                .prepare_create(&edge)
+                .unwrap();
+            owner
+                .store()
+                .commit(&prepared.checks, &prepared.mutations)
+                .unwrap();
+            let gate = owner.task_gate().lock().unwrap();
+            assert_eq!(
+                pending_abort_root_for_running(&scheduler.ts(), running.id(), false).unwrap(),
+                Some(running.id())
+            );
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let mut worker = harness.worker();
+            let id = running.id();
+            let thread = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(worker.abort_pending_task_graph(id)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            if stale {
+                let parent = scheduler.ts().load(parent.id()).unwrap().unwrap();
+                scheduler
+                    .ts()
+                    .update(&parent, |task| task.request_abort())
+                    .unwrap();
+            }
+            drop(gate);
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            thread.join().unwrap();
+            assert_eq!(result.is_some(), !stale);
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .load(running.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested(),
+                !stale
+            );
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .load(nested_task.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested(),
+                !stale
+            );
+            assert_eq!(
+                harness.conversation(nested).unwrap().abort_requested,
+                !stale
+            );
+            assert_eq!(
+                scheduler
+                    .ts()
+                    .load(child.id())
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .abort_requested(),
+                !stale
+            );
         }
     }
     fn task(id: u128, owner: TaskOwner, kind: &str, safe: bool, limit: u32) -> Task {
