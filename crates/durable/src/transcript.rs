@@ -90,6 +90,10 @@ impl Cursor {
     pub(crate) fn transcript_id(&self) -> Uuid {
         self.transcript
     }
+
+    pub(crate) fn entry_identity(&self) -> Option<(Uuid, u64)> {
+        self.next.map(|link| (link.id, link.sequence))
+    }
 }
 #[derive(Debug)]
 pub struct Record {
@@ -128,6 +132,22 @@ pub struct Transcript<'a> {
 impl<'a> Transcript<'a> {
     pub fn new(store: &'a Store, id: Uuid) -> Self {
         Self { store, id }
+    }
+
+    /// Locate and validate the exact entry addressed by a cursor. This does
+    /// not prove that the entry is reachable or authorize a fork.
+    pub(crate) fn entry_evidence(&self, cursor: &Cursor) -> Result<(Vec<u8>, u64), Error> {
+        if cursor.transcript != self.id {
+            return Err(Error::WrongTranscript);
+        }
+        let link = cursor.next.ok_or(Error::Corrupt)?;
+        let key = entry_key(link.id);
+        let stored = self
+            .store
+            .get_bounded(&key, 8 * 1024 * 1024)?
+            .ok_or(Error::Corrupt)?;
+        decode_entry(link, &stored.value)?;
+        Ok((key, stored.version))
     }
 
     /// Create an empty transcript, failing atomically if its ID already exists.

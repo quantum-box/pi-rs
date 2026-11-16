@@ -1,8 +1,9 @@
 //! Private structural format for a future atomic reset-batch proof.
 //!
-//! This module does not read storage or authorize forks. Callers must obtain
-//! `ExpectedBinding` from authenticated committed state, independently derive
-//! each cut, and prove the stored cursor chain and snapshots in one transaction.
+//! The private lookup checks storage evidence but does not decode a candidate
+//! or authorize forks. Callers must obtain `ExpectedBinding` from authenticated
+//! committed state, independently derive each cut, and prove the stored cursor
+//! chain and snapshots in one transaction.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -13,6 +14,170 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_CUTS: usize = 64;
 const MAX_TRAILING_ENTRIES: u64 = 64;
 const MAX_FINITE_WRITE_LIMIT: u64 = 1_000_000;
+
+/// A same-commit candidate, not a decoded or authenticated manifest. The
+/// caller must independently derive and validate its binding before use.
+pub(crate) struct RawCandidate {
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LookupError {
+    #[error(transparent)]
+    Store(#[from] durable_store::Error),
+    #[error(transparent)]
+    Transcript(#[from] crate::transcript::Error),
+    #[error("invalid or ambiguous reset manifest evidence")]
+    Invalid,
+}
+
+fn candidate_prefix(id: Uuid, entry: Uuid, sequence: u64) -> Vec<u8> {
+    format!("runtime/reset-manifest/{id}/{entry}/{sequence:020}/").into_bytes()
+}
+
+/// Find one raw candidate for this cursor and validate its storage evidence.
+/// `document_revision` must be independently obtained by the caller. This
+/// verifies the recorded cut and the writer's tracked document-revision check.
+/// It does not decode the manifest, prove reachability, validate
+/// reset state, or authorize a fork.
+pub(crate) fn lookup_candidate(
+    store: &durable_store::Store,
+    id: Uuid,
+    cursor: &crate::transcript::Cursor,
+    anchor_observation: u64,
+    document_revision: u64,
+) -> Result<Option<RawCandidate>, LookupError> {
+    use durable_store::{Check, Expected};
+    if id.is_nil() || cursor.transcript_id() != id || anchor_observation == 0 {
+        return Err(LookupError::Invalid);
+    }
+    let (entry_id, entry_sequence) = cursor.entry_identity().ok_or(LookupError::Invalid)?;
+    if entry_id.is_nil() || entry_sequence == 0 {
+        return Err(LookupError::Invalid);
+    }
+    let prefix = candidate_prefix(id, entry_id, entry_sequence);
+    let boundary = store.put_version()?;
+    let keys = store.prefix_keys_bounded(&prefix, 2, prefix.len() + 36)?;
+    if keys.is_empty() {
+        // A concurrent insertion must not turn a stale miss into a result.
+        store.commit_with_prefix_put_fence(&[], &[], &[&prefix], boundary)?;
+        return Ok(None);
+    }
+    if keys.len() != 1 {
+        return Err(LookupError::Invalid);
+    }
+    let key = &keys[0];
+    let suffix = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| LookupError::Invalid)?;
+    let nonce = Uuid::parse_str(suffix).map_err(|_| LookupError::Invalid)?;
+    if nonce.is_nil() || nonce.to_string() != suffix {
+        return Err(LookupError::Invalid);
+    }
+    let manifest = store
+        .get_bounded(key, MAX_MANIFEST_BYTES)?
+        .ok_or(LookupError::Invalid)?;
+    let root = format!("runtime/conversation/{id}").into_bytes();
+    let root_entry = store
+        .get_bounded(&root, 8 * 1024 * 1024)?
+        .ok_or(LookupError::Invalid)?;
+    let root_json: serde_json::Value =
+        serde_json::from_slice(&root_entry.value).map_err(|_| LookupError::Invalid)?;
+    if root_json.get("id") != Some(&serde_json::json!(id)) {
+        return Err(LookupError::Invalid);
+    }
+    let anchor = format!("runtime/fork/{id}/{anchor_observation:020}").into_bytes();
+    let fork_prefix = format!("runtime/fork/{id}/");
+    let anchor_entry = store
+        .get_bounded(&anchor, 8 * 1024 * 1024)?
+        .ok_or(LookupError::Invalid)?;
+    let mut event_key = b"durable/observer/".to_vec();
+    event_key.extend_from_slice(id.as_bytes());
+    event_key.extend_from_slice(b"/r");
+    event_key.extend_from_slice(&anchor_observation.to_be_bytes());
+    let event = store
+        .get_bounded(&event_key, 8 * 1024 * 1024)?
+        .ok_or(LookupError::Invalid)?;
+    let event_json: serde_json::Value =
+        serde_json::from_slice(&event.value).map_err(|_| LookupError::Invalid)?;
+    let anchor_json: serde_json::Value =
+        serde_json::from_slice(&anchor_entry.value).map_err(|_| LookupError::Invalid)?;
+    if anchor_json.get("version") != Some(&serde_json::json!(1))
+        || anchor_json.get("conversation_id") != Some(&serde_json::json!(id))
+        || anchor_json
+            .get("_transcript")
+            .is_none_or(serde_json::Value::is_null)
+        || anchor_json.get("_transcript") != event_json.get("_transcript")
+        || store.document_cut_for_version(&anchor, anchor_entry.version)? != Some(document_revision)
+    {
+        return Err(LookupError::Invalid);
+    }
+    let fenced_revision = store
+        .document_fence_for_version(&anchor, anchor_entry.version)?
+        .ok_or(LookupError::Invalid)?;
+    if document_revision != fenced_revision
+        && fenced_revision.checked_add(1) != Some(document_revision)
+    {
+        return Err(LookupError::Invalid);
+    }
+    let anchor_cursor: crate::transcript::Cursor = serde_json::from_value(
+        anchor_json
+            .get("_transcript")
+            .cloned()
+            .ok_or(LookupError::Invalid)?,
+    )
+    .map_err(|_| LookupError::Invalid)?;
+    if anchor_cursor.transcript_id() != id
+        || anchor_cursor
+            .entry_identity()
+            .is_none_or(|(entry, sequence)| entry.is_nil() || sequence < entry_sequence)
+    {
+        return Err(LookupError::Invalid);
+    }
+    let (entry_key, entry_version) =
+        crate::transcript::Transcript::new(store, id).entry_evidence(cursor)?;
+    let (anchor_entry_key, anchor_entry_version) =
+        crate::transcript::Transcript::new(store, id).entry_evidence(&anchor_cursor)?;
+    let sequence = store
+        .commit_for_version(&anchor, anchor_entry.version)?
+        .ok_or(LookupError::Invalid)?;
+    if store.commit_for_version(&event_key, event.version)? != Some(sequence)
+        || store.commit_for_version(key, manifest.version)? != Some(sequence)
+        || store.commit_for_version(&entry_key, entry_version)? != Some(sequence)
+        || store.commit_for_version(&anchor_entry_key, anchor_entry_version)? != Some(sequence)
+        || !store.runtime_snapshot_exact_at(&root, fork_prefix.as_bytes(), &anchor, sequence)?
+    {
+        return Err(LookupError::Invalid);
+    }
+    let checks = [
+        Check {
+            key: root,
+            expected: Expected::Version(root_entry.version),
+        },
+        Check {
+            key: anchor,
+            expected: Expected::Version(anchor_entry.version),
+        },
+        Check {
+            key: event_key,
+            expected: Expected::Version(event.version),
+        },
+        Check {
+            key: entry_key,
+            expected: Expected::Version(entry_version),
+        },
+        Check {
+            key: anchor_entry_key,
+            expected: Expected::Version(anchor_entry_version),
+        },
+        Check {
+            key: key.clone(),
+            expected: Expected::Version(manifest.version),
+        },
+    ];
+    store.commit_with_prefix_put_fence(&checks, &[], &[&prefix], boundary)?;
+    Ok(Some(RawCandidate {
+        bytes: manifest.value,
+    }))
+}
 
 /// Mirrors the serialized transcript cursor without accepting extra fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +423,346 @@ impl ResetManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LookupFixture {
+        dir: tempfile::TempDir,
+        store: durable_store::Store,
+        id: Uuid,
+        cursor: crate::transcript::Cursor,
+        final_cursor: crate::transcript::Cursor,
+        root: Vec<u8>,
+        anchor: Vec<u8>,
+        event: Vec<u8>,
+        manifest: Vec<u8>,
+        revision: u64,
+    }
+
+    fn lookup_fixture(include_root: bool) -> LookupFixture {
+        use durable_store::Mutation;
+        let dir = tempfile::tempdir().unwrap();
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let id = Uuid::new_v4();
+        let transcript = crate::transcript::Transcript::new(&store, id);
+        let create = transcript.prepare_create().unwrap();
+        store.commit(&create.checks, &create.mutations).unwrap();
+        let (batch, positions) = transcript
+            .prepare_append_batch(&[
+                (serde_json::json!({"cut": 1}), None),
+                (serde_json::json!({"cut": 2}), None),
+            ])
+            .unwrap();
+        let cursor = positions[0].clone();
+        let (entry, sequence) = cursor.entry_identity().unwrap();
+        let mut manifest = candidate_prefix(id, entry, sequence);
+        manifest.extend_from_slice(Uuid::new_v4().to_string().as_bytes());
+        let root = format!("runtime/conversation/{id}").into_bytes();
+        let anchor = format!("runtime/fork/{id}/{:020}", 1).into_bytes();
+        let mut event = b"durable/observer/".to_vec();
+        event.extend_from_slice(id.as_bytes());
+        event.extend_from_slice(b"/r");
+        event.extend_from_slice(&1u64.to_be_bytes());
+        let transcript = serde_json::to_value(&positions[1]).unwrap();
+        let revision = store.document_snapshot().unwrap();
+        let mut mutations = batch.mutations;
+        if include_root {
+            mutations.push(Mutation::Put {
+                key: root.clone(),
+                value: serde_json::to_vec(&serde_json::json!({"id": id})).unwrap(),
+            });
+        }
+        mutations.extend([
+            Mutation::Put {
+                key: anchor.clone(),
+                value: serde_json::to_vec(
+                    &serde_json::json!({"version":1,"conversation_id":id,"_transcript":transcript}),
+                )
+                .unwrap(),
+            },
+            Mutation::Put {
+                key: event.clone(),
+                value: serde_json::to_vec(&serde_json::json!({"_transcript":transcript})).unwrap(),
+            },
+            // Deliberately not JSON: lookup must return bytes without decoding.
+            Mutation::Put {
+                key: manifest.clone(),
+                value: b"raw candidate".to_vec(),
+            },
+        ]);
+        let mut checks = batch.checks;
+        checks.push(durable_store::Check {
+            key: b"durable/document-fork-revision".to_vec(),
+            expected: durable_store::Expected::DocumentRevision(revision),
+        });
+        store.commit(&checks, &mutations).unwrap();
+        LookupFixture {
+            dir,
+            store,
+            id,
+            cursor,
+            final_cursor: positions[1].clone(),
+            root,
+            anchor,
+            event,
+            manifest,
+            revision,
+        }
+    }
+
+    #[test]
+    fn lookup_returns_raw_candidate_for_atomic_evidence() {
+        let f = lookup_fixture(true);
+        let found = lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.bytes, b"raw candidate");
+        f.store
+            .commit(
+                &[],
+                &[
+                    durable_store::Mutation::Put {
+                        key: f.root.clone(),
+                        value: serde_json::to_vec(&serde_json::json!({"id": f.id, "later": true}))
+                            .unwrap(),
+                    },
+                    durable_store::Mutation::Put {
+                        key: b"durable/document/later".to_vec(),
+                        value: b"{}".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        let reopened = durable_store::Store::open(f.dir.path().join("db")).unwrap();
+        assert_eq!(
+            lookup_candidate(&reopened, f.id, &f.cursor, 1, f.revision)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"raw candidate"
+        );
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision + 1).is_err());
+        assert!(lookup_candidate(&f.store, Uuid::new_v4(), &f.cursor, 1, f.revision).is_err());
+    }
+
+    #[test]
+    fn lookup_rejects_forged_and_missing_root_evidence() {
+        use durable_store::Mutation;
+        let f = lookup_fixture(false);
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+        for field in ["manifest", "anchor", "event", "root", "candidate"] {
+            let f = lookup_fixture(true);
+            let (candidate, _) = crate::transcript::Transcript::new(&f.store, f.id)
+                .entry_evidence(&f.cursor)
+                .unwrap();
+            let key = match field {
+                "manifest" => &f.manifest,
+                "anchor" => &f.anchor,
+                "event" => &f.event,
+                "root" => &f.root,
+                _ => &candidate,
+            };
+            if field == "root" {
+                f.store
+                    .commit(&[], &[Mutation::Delete { key: key.clone() }])
+                    .unwrap();
+            } else {
+                let value = f.store.get(key).unwrap().unwrap().value;
+                f.store
+                    .commit(
+                        &[],
+                        &[Mutation::Put {
+                            key: key.clone(),
+                            value,
+                        }],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err(),
+                "{field}"
+            );
+        }
+        let f = lookup_fixture(true);
+        f.store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: f.root.clone(),
+                    value: serde_json::to_vec(&serde_json::json!({"id": Uuid::new_v4()})).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+    }
+
+    #[test]
+    fn lookup_rejects_ambiguous_candidates_and_detects_absence() {
+        use durable_store::Mutation;
+        let f = lookup_fixture(true);
+        let (entry, sequence) = f.cursor.entry_identity().unwrap();
+        let mut second = candidate_prefix(f.id, entry, sequence);
+        second.extend_from_slice(Uuid::new_v4().to_string().as_bytes());
+        f.store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: second,
+                    value: vec![],
+                }],
+            )
+            .unwrap();
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+        let f = lookup_fixture(true);
+        f.store
+            .commit(
+                &[],
+                &[Mutation::Delete {
+                    key: f.manifest.clone(),
+                }],
+            )
+            .unwrap();
+        assert!(
+            lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lookup_rejects_rewritten_anchor_with_stale_key_only_document_cut() {
+        use durable_store::Mutation;
+        let f = lookup_fixture(true);
+        f.store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"durable/document/change".to_vec(),
+                    value: b"{}".to_vec(),
+                }],
+            )
+            .unwrap();
+        let (entry, _) = crate::transcript::Transcript::new(&f.store, f.id)
+            .entry_evidence(&f.cursor)
+            .unwrap();
+        let (final_entry, _) = crate::transcript::Transcript::new(&f.store, f.id)
+            .entry_evidence(&f.final_cursor)
+            .unwrap();
+        let mut mutations = Vec::new();
+        for key in [
+            &f.root,
+            &f.anchor,
+            &f.event,
+            &f.manifest,
+            &entry,
+            &final_entry,
+        ] {
+            mutations.push(Mutation::Put {
+                key: key.clone(),
+                value: f.store.get(key).unwrap().unwrap().value,
+            });
+        }
+        let current = f.store.document_snapshot().unwrap();
+        f.store
+            .commit(
+                &[durable_store::Check {
+                    key: b"durable/document-fork-revision".to_vec(),
+                    expected: durable_store::Expected::DocumentRevision(current),
+                }],
+                &mutations,
+            )
+            .unwrap();
+        assert_eq!(f.store.document_cut(&f.anchor).unwrap(), Some(f.revision));
+        let version = f.store.get(&f.anchor).unwrap().unwrap().version;
+        assert_ne!(
+            f.store
+                .document_cut_for_version(&f.anchor, version)
+                .unwrap(),
+            Some(f.revision)
+        );
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, current).is_ok());
+    }
+
+    #[test]
+    fn lookup_rejects_atomic_evidence_without_document_fence() {
+        use durable_store::Mutation;
+        let f = lookup_fixture(true);
+        let transcript = crate::transcript::Transcript::new(&f.store, f.id);
+        let (entry, _) = transcript.entry_evidence(&f.cursor).unwrap();
+        let (final_entry, _) = transcript.entry_evidence(&f.final_cursor).unwrap();
+        let mutations: Vec<_> = [
+            &f.root,
+            &f.anchor,
+            &f.event,
+            &f.manifest,
+            &entry,
+            &final_entry,
+        ]
+        .iter()
+        .map(|key| Mutation::Put {
+            key: (*key).clone(),
+            value: f.store.get(key).unwrap().unwrap().value,
+        })
+        .collect();
+        f.store.commit(&[], &mutations).unwrap();
+        let version = f.store.get(&f.anchor).unwrap().unwrap().version;
+        assert_eq!(
+            f.store
+                .document_cut_for_version(&f.anchor, version)
+                .unwrap(),
+            Some(f.revision)
+        );
+        assert_eq!(
+            f.store
+                .document_fence_for_version(&f.anchor, version)
+                .unwrap(),
+            None
+        );
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+    }
+
+    #[test]
+    fn lookup_accepts_document_write_fenced_in_same_commit() {
+        use durable_store::{Check, Expected, Mutation};
+        let f = lookup_fixture(true);
+        let transcript = crate::transcript::Transcript::new(&f.store, f.id);
+        let (entry, _) = transcript.entry_evidence(&f.cursor).unwrap();
+        let (last, _) = transcript.entry_evidence(&f.final_cursor).unwrap();
+        let mut mutations: Vec<_> = [&f.root, &f.anchor, &f.event, &f.manifest, &entry, &last]
+            .iter()
+            .map(|key| Mutation::Put {
+                key: (*key).clone(),
+                value: f.store.get(key).unwrap().unwrap().value,
+            })
+            .collect();
+        mutations.push(Mutation::Put {
+            key: b"durable/document/same-commit".to_vec(),
+            value: b"{}".to_vec(),
+        });
+        f.store
+            .commit(
+                &[Check {
+                    key: b"durable/document-fork-revision".to_vec(),
+                    expected: Expected::DocumentRevision(f.revision),
+                }],
+                &mutations,
+            )
+            .unwrap();
+        let version = f.store.get(&f.anchor).unwrap().unwrap().version;
+        assert_eq!(
+            f.store
+                .document_fence_for_version(&f.anchor, version)
+                .unwrap(),
+            Some(f.revision)
+        );
+        assert_eq!(
+            f.store
+                .document_cut_for_version(&f.anchor, version)
+                .unwrap(),
+            Some(f.revision + 1)
+        );
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision + 1).is_ok());
+        assert!(lookup_candidate(&f.store, f.id, &f.cursor, 1, f.revision).is_err());
+    }
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)

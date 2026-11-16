@@ -174,6 +174,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_document_history (key BLOB NOT NULL, revision INTEGER NOT NULL, value BLOB, version INTEGER, PRIMARY KEY(key, revision)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS durable_document_history_by_revision ON durable_document_history(revision, key);
             CREATE TABLE IF NOT EXISTS durable_document_cuts (key BLOB PRIMARY KEY NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS durable_document_cut_versions (key BLOB NOT NULL, version INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,version)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS durable_document_fence_versions (key BLOB NOT NULL, version INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,version)) WITHOUT ROWID;
             INSERT INTO durable_document_history(key, revision, value, version)
                 SELECT key, 0, value, version FROM durable_store_entries
                 WHERE substr(key, 1, 17)=CAST('durable/document/' AS BLOB)
@@ -597,6 +599,27 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// Read at most `limit` keys without allocating their values. Oversized
+    /// keys fail closed instead of being copied out of SQLite.
+    pub fn prefix_keys_bounded(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        max_key_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if limit == 0 || limit > 256 || max_key_bytes < prefix.len() {
+            return Err(Error::InvalidSnapshot);
+        }
+        let limit = i64::try_from(limit).map_err(|_| Error::InvalidSnapshot)?;
+        let cap = i64::try_from(max_key_bytes).map_err(|_| Error::InvalidSnapshot)?;
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT CASE WHEN length(key)<=?3 THEN key ELSE NULL END FROM durable_store_entries WHERE substr(key,1,?1)=?2 ORDER BY key LIMIT ?4")?;
+        let rows = stmt.query_map(params![prefix.len() as i64, prefix, cap, limit], |r| {
+            r.get::<_, Option<Vec<u8>>>(0)
+        })?;
+        rows.map(|row| row?.ok_or(Error::InvalidSnapshot)).collect()
+    }
     /// Read multiple key ranges from one SQLite snapshot.
     pub fn list_prefixes(&self, prefixes: &[&[u8]]) -> Result<Vec<(Vec<u8>, Entry)>, Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
@@ -857,6 +880,44 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Document cut captured for this exact snapshot version. Evidence is
+    /// forward-only; older snapshots are not assigned inferred versions.
+    pub fn document_cut_for_version(
+        &self,
+        key: &[u8],
+        version: u64,
+    ) -> Result<Option<u64>, Error> {
+        if version > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn
+            .query_row(
+                "SELECT revision FROM durable_document_cut_versions WHERE key=?1 AND version=?2",
+                params![key, version],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The document revision explicitly checked by the snapshot's commit.
+    /// Absence means no tracked fence; legacy records are not backfilled.
+    pub fn document_fence_for_version(
+        &self,
+        key: &[u8],
+        version: u64,
+    ) -> Result<Option<u64>, Error> {
+        if version > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT revision FROM durable_document_fence_versions WHERE key=?1 AND version=?2",
+            params![key, version],
+            |r| r.get(0),
+        ).optional()?)
     }
 
     /// Bounded, immutable application snapshots in commit order. Missing commit
@@ -1472,10 +1533,18 @@ impl Store {
         }
         // Capture the post-mutation revision in the same transaction as every
         // conversation snapshot, even when the document batch is appended later.
+        let document_fence = checks.iter().find_map(|check| match check.expected {
+            Expected::DocumentRevision(revision) => Some(revision),
+            _ => None,
+        });
         for mutation in mutations {
             if let Mutation::Put { key, .. } = mutation {
                 if key.starts_with(b"runtime/fork/") {
                     tx.execute("INSERT OR IGNORE INTO durable_document_cuts(key,revision) SELECT ?1,revision FROM durable_document_history_meta WHERE id=1", [key])?;
+                    tx.execute("INSERT OR IGNORE INTO durable_document_cut_versions(key,version,revision) SELECT ?1,e.version,m.revision FROM durable_store_entries e CROSS JOIN durable_document_history_meta m WHERE e.key=?1 AND m.id=1", [key])?;
+                    if let Some(revision) = document_fence {
+                        tx.execute("INSERT OR IGNORE INTO durable_document_fence_versions(key,version,revision) SELECT ?1,version,?2 FROM durable_store_entries WHERE key=?1", params![key, revision])?;
+                    }
                 }
             }
         }
