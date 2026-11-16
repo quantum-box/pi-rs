@@ -94,6 +94,9 @@ pub enum Error {
     Interrupted,
     #[error("wait cancelled")]
     WaitCancelled,
+    /// A task outcome is being published or settled; the admission can be retried.
+    #[error("task publication is temporarily busy")]
+    TaskPublicationBusy,
     #[error("invalid operation: {0}")]
     Invalid(String),
 }
@@ -4705,12 +4708,16 @@ impl Harness {
         };
         self.save_composed_locked(state, expected, wake, children, &[], None)
     }
-    fn save_hook_children(
+    // Keep the completed hook/dispatch and its child IDs in this future while
+    // the driver publishes an outcome. Never wait holding the poll gate: abort
+    // settlement may need that gate to make the publication fence available.
+    async fn save_hook_children(
         &mut self,
         state: &Conversation,
         expected: Expected,
         children: &[crate::task::Task],
         handlers: &[Arc<dyn crate::task_scheduler::Handler>],
+        cancel: &CancellationToken,
     ) -> Result<(), Error> {
         if children.is_empty() {
             return self.save_composed(state, expected, None, children);
@@ -4722,9 +4729,36 @@ impl Harness {
             .as_ref()
             .and_then(|driver| driver.upgrade())
             .ok_or_else(|| Error::Invalid("task driver is not running".into()))?;
-        driver.with_hook_children(children, handlers, state.id, || {
-            self.save_composed_locked(state, expected, None, children, &[], None)
-        })
+        loop {
+            let gate = self.execution_gate.clone();
+            let result = fenced_poll(
+                async {
+                    driver.with_hook_children(children, handlers, state.id, || {
+                        self.save_composed_locked(
+                            state,
+                            expected.clone(),
+                            None,
+                            children,
+                            &[],
+                            None,
+                        )
+                    })
+                },
+                gate.as_ref(),
+                cancel,
+            )
+            .await
+            .ok_or(Error::Interrupted)?;
+            match result {
+                Err(Error::TaskPublicationBusy) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(Error::Interrupted),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                    }
+                }
+                other => return other,
+            }
+        }
     }
     fn save_composed_locked(
         &mut self,
@@ -12938,7 +12972,9 @@ impl Harness {
                             Expected::Version(version),
                             &children,
                             &handlers,
-                        )?;
+                            cancel,
+                        )
+                        .await?;
                         continue;
                     }
                     let continuation = continuation.and_then(|value| {
@@ -13131,7 +13167,14 @@ impl Harness {
                     // The phase transition and any hook-created children are
                     // committed together. Admission conflicts merge the queued
                     // summary without executing this completed hook again.
-                    self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
+                    self.save_hook_children(
+                        &c,
+                        Expected::Version(version),
+                        &children,
+                        &handlers,
+                        cancel,
+                    )
+                    .await?;
                 }
                 Phase::AfterRun {
                     answer,
@@ -13157,7 +13200,14 @@ impl Harness {
                             turns: None,
                         }
                     };
-                    self.save_hook_children(&c, Expected::Version(version), &children, &handlers)?;
+                    self.save_hook_children(
+                        &c,
+                        Expected::Version(version),
+                        &children,
+                        &handlers,
+                        cancel,
+                    )
+                    .await?;
                 }
                 Phase::HookTasksWaiting { children, turns } => {
                     let store = crate::task_store::TaskStore::new(self.owner.store());
@@ -14328,7 +14378,9 @@ impl Harness {
                             Expected::Version(version),
                             &[task],
                             &[adapter.handler()],
-                        )?;
+                            cancel,
+                        )
+                        .await?;
                         continue;
                     }
                     match reply.outcome {

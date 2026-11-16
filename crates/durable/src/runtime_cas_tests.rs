@@ -6406,3 +6406,122 @@ async fn abort_cleanup_conflict_withdraws_only_post_mark_trigger() {
         Status::Queued
     );
 }
+
+#[tokio::test]
+async fn publication_defers_completed_hook_without_replay() {
+    use crate::extension::{
+        Context, Extension, GenerationDecision, GenerationEvent, Hook, HookTask,
+    };
+    use crate::ownership_edge::{Edge, EdgeStore, Mode};
+    use crate::task::{Checkpoint, Task, TaskOwner};
+    use crate::task_scheduler::{Handler, Registry, Step};
+    use crate::task_store::{Save, TaskStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct YieldHook(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Hook for YieldHook {
+        async fn generation(
+            &self,
+            event: GenerationEvent,
+            _: &serde_json::Value,
+            _: &Context<'_>,
+        ) -> Result<GenerationDecision, String> {
+            if event == GenerationEvent::OnYield {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(GenerationDecision::Tasks(vec![HookTask {
+                    name: "job".into(),
+                    input: serde_json::Value::Null,
+                }]))
+            } else {
+                Ok(GenerationDecision::Pass)
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
+    let config = Config {
+        model: "test".into(),
+        system_prompt: String::new(),
+        max_output_tokens: 10,
+    };
+    let root = h.create_conversation(config.clone()).unwrap();
+    let child_conversation = h.create_conversation(config).unwrap();
+    let owner = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(root),
+        Checkpoint {
+            phase: "initial".into(),
+            data: serde_json::Value::Null,
+        },
+        3,
+    )
+    .unwrap();
+    let store = h.owner.store();
+    TaskStore::new(store).save(&[Save::Create(&owner)]).unwrap();
+    let edge = EdgeStore::new(store)
+        .prepare_create(&Edge {
+            task: owner.id(),
+            task_owner: owner.owner().clone(),
+            child: child_conversation,
+            mode: Mode::Foreground,
+        })
+        .unwrap();
+    store.commit(&edge.checks, &edge.mutations).unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let handler: Arc<dyn Handler> = Arc::new(|_: &Task| Ok(Step::Succeed(serde_json::Value::Null)));
+    h.install_extension(Extension {
+        name: "deferred".into(),
+        hooks: vec![Arc::new(YieldHook(count.clone()))],
+        tasks: vec![("job".into(), handler.clone())],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut registry = Registry::default();
+    registry.register_shared("job", true, handler);
+    let driver = h.start_tasks(registry).unwrap();
+    h.select_extensions(child_conversation, vec!["deferred".into()])
+        .unwrap();
+    h.submit(child_conversation, None, "hello".into()).unwrap();
+    let publication = driver.test_failure_publication();
+    publication.test_set_published(owner.id(), true);
+    let mut worker = h.worker();
+    let running = tokio::spawn(async move {
+        worker
+            .resume_conversation(child_conversation, &CancellationToken::new())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(!running.is_finished());
+    assert!(
+        TaskStore::new(h.owner.store())
+            .list()
+            .unwrap()
+            .iter()
+            .all(|item| item.task.kind() != Some("job"))
+    );
+    publication.test_set_published(owner.id(), false);
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        TaskStore::new(h.owner.store())
+            .list()
+            .unwrap()
+            .iter()
+            .filter(|item| item.task.kind() == Some("job"))
+            .count(),
+        1
+    );
+    driver.shutdown().unwrap();
+}

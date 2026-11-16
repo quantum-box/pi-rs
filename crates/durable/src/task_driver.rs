@@ -233,6 +233,10 @@ impl Driver {
     pub(crate) fn weak(&self) -> std::sync::Weak<Shared> {
         Arc::downgrade(&self.shared)
     }
+    #[cfg(test)]
+    pub(crate) fn test_failure_publication(&self) -> task_scheduler::FailurePublication {
+        self.shared.failure_publication.clone()
+    }
     fn check(&self) -> Result<std::sync::MutexGuard<'_, State>, Error> {
         let state = self.shared.state.lock().map_err(|_| Error::Poisoned)?;
         if state.stop {
@@ -260,19 +264,15 @@ impl Driver {
             .task_gate()
             .lock()
             .map_err(|_| Error::Poisoned)?;
-        // Admissions share the task gate, so unrelated admissions cannot
-        // spuriously collide on the nonblocking publication fence.
+        // Serialize publication state with the commit without taking the
+        // settlement fence, which can be waiting for a conversation gate.
         let _publication = self
             .shared
             .failure_publication
-            .try_lock()
-            .map_err(|_| task_scheduler::Error::Busy)?;
+            .admission()
+            .map_err(|_| task_scheduler::Error::Poisoned)?;
         if let TaskOwner::Conversation(id) = task.owner() {
-            if !self
-                .shared
-                .failure_publication
-                .permits_admission(&self.shared.owner, *id, None)
-            {
+            if !_publication.permits_admission(&self.shared.owner, *id, None) {
                 return Err(task_scheduler::Error::Busy.into());
             }
             let key = format!("runtime/conversation/{id}");
@@ -1242,15 +1242,10 @@ impl Shared {
             .map_err(|_| crate::runtime::Error::Failed)?;
         let _publication = self
             .failure_publication
-            .try_lock()
-            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
-        if !self
-            .failure_publication
-            .permits_admission(&self.owner, conversation, None)
-        {
-            return Err(crate::runtime::Error::Invalid(
-                "task failure fences admission".into(),
-            ));
+            .admission()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        if !_publication.permits_admission(&self.owner, conversation, None) {
+            return Err(crate::runtime::Error::TaskPublicationBusy);
         }
         let store = TaskStore::new(self.owner.store());
         for task in tasks {
@@ -1332,27 +1327,23 @@ impl Shared {
             .map_err(|_| crate::runtime::Error::Failed)?;
         let _publication = self
             .failure_publication
-            .try_lock()
-            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
+            .admission()
+            .map_err(|_| crate::runtime::Error::Failed)?;
         let store = self.owner.store();
         let tasks = TaskStore::new(store);
-        if !self
-            .failure_publication
-            .permits_admission(&self.owner, conversation, None)
+        if !_publication.permits_admission(&self.owner, conversation, None)
             || intents
                 .iter()
                 .filter(|intent| !intent.staged_parent)
                 .any(|intent| {
-                    !self.failure_publication.permits_admission(
+                    !_publication.permits_admission(
                         &self.owner,
                         conversation,
                         Some(&intent.parent.task),
                     )
                 })
         {
-            return Err(crate::runtime::Error::Invalid(
-                "task failure fences admission".into(),
-            ));
+            return Err(crate::runtime::Error::TaskPublicationBusy);
         }
         let boundary = store.put_version()?;
         // A task-owned conversation requires validating its owner's complete
@@ -1568,15 +1559,10 @@ impl Shared {
             .map_err(|_| crate::runtime::Error::Failed)?;
         let _publication = self
             .failure_publication
-            .try_lock()
-            .map_err(|_| crate::runtime::Error::Invalid("task failure publication busy".into()))?;
-        if !self
-            .failure_publication
-            .permits_admission(&self.owner, conversation, None)
-        {
-            return Err(crate::runtime::Error::Invalid(
-                "task failure fences admission".into(),
-            ));
+            .admission()
+            .map_err(|_| crate::runtime::Error::Failed)?;
+        if !_publication.permits_admission(&self.owner, conversation, None) {
+            return Err(crate::runtime::Error::TaskPublicationBusy);
         }
         let result = f();
         if result.is_ok() {
@@ -1716,10 +1702,19 @@ mod tests {
             );
             let publication = shared.failure_publication.try_lock().unwrap();
             let contender = shared.clone();
+            let unrelated_task = make_task(5, TaskOwner::Conversation(unrelated));
             let (sent, received) = mpsc::channel();
             let thread = thread::spawn(move || {
-                sent.send(contender.with_admission(&[], unrelated, || Ok(())).is_err())
-                    .unwrap();
+                let result = contender.with_admission(
+                    std::slice::from_ref(&unrelated_task),
+                    unrelated,
+                    || {
+                        TaskStore::new(contender.owner.store())
+                            .save(&[Save::Create(&unrelated_task)])
+                            .map_err(|e| crate::runtime::Error::Invalid(e.to_string()))
+                    },
+                );
+                sent.send(result.is_ok()).unwrap();
             });
             assert!(received.recv_timeout(Duration::from_secs(5)).unwrap());
             drop(publication);

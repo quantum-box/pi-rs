@@ -318,14 +318,52 @@ pub(crate) struct FailurePublication {
 }
 
 impl FailurePublication {
-    // The caller holds the publication fence and task gate until admission commits.
+    // Held through admission commit. Publishers update this ledger under the
+    // same mutex. Ledger holders never wait for the task or conversation gates.
+    pub(crate) fn admission(&self) -> Result<AdmissionPublication<'_>, Error> {
+        Ok(AdmissionPublication {
+            state: self.state.lock().map_err(|_| Error::Poisoned)?,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn test_set_published(&self, task: Uuid, present: bool) {
+        let _fence = self.fence.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.published.retain(|(id, _)| *id != task);
+        if present {
+            state.published.push_back((task, true));
+        }
+    }
+    /// Cleanup errors and panics may follow an unknown durable commit. Publish
+    /// poison and the driver stop under the same fence as task settlement.
+    pub(crate) fn indeterminate(&self, publish_stop: impl FnOnce()) {
+        let _guard = self.fence.lock().unwrap_or_else(|e| e.into_inner());
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poisoned = true;
+        publish_stop();
+    }
+
+    pub(crate) fn try_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, std::sync::TryLockError<std::sync::MutexGuard<'_, ()>>>
+    {
+        self.fence.try_lock()
+    }
+}
+
+pub(crate) struct AdmissionPublication<'a> {
+    state: std::sync::MutexGuard<'a, InvocationState>,
+}
+impl AdmissionPublication<'_> {
     pub(crate) fn permits_admission(
         &self,
         owner: &OwnedStore,
         conversation: Uuid,
         parent: Option<&Task>,
     ) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &self.state;
         if state.poisoned {
             return false;
         }
@@ -376,23 +414,6 @@ impl FailurePublication {
                 .and_then(|record| Scheduler::foreground_root(owner, &record.task))
                 .is_some_and(|failed_root| failed_root != root)
         })
-    }
-    /// Cleanup errors and panics may follow an unknown durable commit. Publish
-    /// poison and the driver stop under the same fence as task settlement.
-    pub(crate) fn indeterminate(&self, publish_stop: impl FnOnce()) {
-        let _guard = self.fence.lock().unwrap_or_else(|e| e.into_inner());
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .poisoned = true;
-        publish_stop();
-    }
-
-    pub(crate) fn try_lock(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, ()>, std::sync::TryLockError<std::sync::MutexGuard<'_, ()>>>
-    {
-        self.fence.try_lock()
     }
 }
 
