@@ -309,6 +309,31 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
 #[test]
 fn delayed_color_reply_does_not_type_tail_or_open_editor() {
     use std::os::unix::fs::PermissionsExt;
+    struct BoundedProcess {
+        child: Child,
+        master: Option<File>,
+    }
+    impl Drop for BoundedProcess {
+        fn drop(&mut self) {
+            drop(self.master.take());
+            let _ = self.child.kill();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    result => {
+                        if !std::thread::panicking() {
+                            panic!("terminal child did not exit after kill: {result:?}");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
     fn wait_for(master: &mut File, expected: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         let mut bytes = Vec::new();
@@ -356,7 +381,7 @@ fn delayed_color_reply_does_not_type_tail_or_open_editor() {
         },
         0
     );
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
     assert_eq!(
@@ -373,8 +398,8 @@ fn delayed_color_reply_does_not_type_tail_or_open_editor() {
             Ok(())
         });
     }
-    let _process = Process(
-        command
+    let mut process = BoundedProcess {
+        child: command
             .current_dir(root.path())
             .env("PI_RS_HOME", root.path().join("home"))
             .env("TERM", "xterm-256color")
@@ -387,12 +412,14 @@ fn delayed_color_reply_does_not_type_tail_or_open_editor() {
             .stderr(Stdio::from(slave))
             .spawn()
             .unwrap(),
-    );
-    wait_for(&mut master, "Enter to send", Duration::from_secs(30));
+        master: Some(master),
+    };
+    let master = process.master.as_mut().unwrap();
+    wait_for(master, "Enter to send", Duration::from_secs(30));
     master.write_all(b"\x1b]11;rgb:0000/").unwrap();
     std::thread::sleep(Duration::from_millis(650));
     master.write_all(b"0000/0000\x07typed-after-color").unwrap();
-    let text = wait_for(&mut master, "typed-after-color", Duration::from_secs(10));
+    let text = wait_for(master, "typed-after-color", Duration::from_secs(10));
     assert!(
         !text.contains("0000/0000"),
         "OSC tail reached the editor: {text}"
