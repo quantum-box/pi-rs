@@ -933,8 +933,9 @@ An embedding host can instead install a foreground `subagent` extension with
 parent, child_config, allowed_tools)`. Create the parent first with a paused
 harness, then select `foreground_subagent::extension_name(parent)` on that
 settled conversation. The model calls `subagent` with `{ "task": "..." }`.
-The runtime admits a task-backed invocation directly after the before-tool
-hooks and schema validation; it does not dispatch or replay an ordinary tool
+The task accepts up to 65,536 Unicode characters; whitespace-only text returns
+a known tool error without creating a child. The runtime admits a task-backed
+invocation directly after the before-tool hooks and schema validation; it does not dispatch or replay an ordinary tool
 invocation. The task owns a foreground child conversation and waits on its
 submission settlement signal. A successful child answer becomes the tool result;
 an unanswered child becomes a tool error. Child work may itself park on a

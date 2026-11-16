@@ -82,8 +82,12 @@ impl Handler for Foreground {
             .input()
             .get("task")
             .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty() && text.len() <= 65536)
             .ok_or("invalid foreground subagent task")?;
+        if content.trim().is_empty() {
+            return Ok(Step::Succeed(json!({
+                "foreground_error": "Subagent task must contain non-whitespace text"
+            })));
+        }
         let mut harness = self
             .harness
             .lock()
@@ -237,6 +241,120 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_arguments_report_whitespace_and_accept_multibyte_boundaries() {
+        struct ArgumentModel {
+            input: String,
+            children: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Model for ArgumentModel {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream, Error> {
+                let root = request.messages.iter().any(
+                    |message| matches!(message, Message::User { content } if content == "root"),
+                );
+                let (text, calls) = if root
+                    && !request
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, Message::Tool { .. }))
+                {
+                    (
+                        "",
+                        vec![ToolCall {
+                            id: "delegate".into(),
+                            name: "subagent".into(),
+                            arguments: json!({"task": self.input}).to_string(),
+                        }],
+                    )
+                } else if root {
+                    ("parent done", vec![])
+                } else {
+                    let input = request
+                        .messages
+                        .iter()
+                        .find_map(|message| match message {
+                            Message::User { content } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .unwrap();
+                    self.children.lock().unwrap().push(input);
+                    ("child done", vec![])
+                };
+                Ok(stream::iter(vec![
+                    Ok(ModelEvent::Text(text.into())),
+                    Ok(ModelEvent::Complete { calls, usage: None }),
+                ])
+                .boxed())
+            }
+        }
+
+        let boundary = "あ".repeat(21_845) + "a";
+        assert_eq!(boundary.len(), 65_536);
+        for (input, is_error) in [
+            ("  \t　".to_string(), true),
+            (boundary.clone(), false),
+            (boundary + "b", false),
+            ("あ".repeat(65_536), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let children = Arc::new(Mutex::new(Vec::new()));
+            let options = || Options {
+                model: Arc::new(ArgumentModel {
+                    input: input.clone(),
+                    children: children.clone(),
+                }),
+                tools: vec![],
+                restart_limit: 5,
+                max_turns: 4,
+                uncertain_policy: UncertainPolicy::RequireReconciliation,
+            };
+            let mut initial = Harness::open_paused(&path, options()).unwrap();
+            let parent = initial.create_conversation(config()).unwrap();
+            drop(initial);
+            let mut owner = RuntimeOwner::open_with_foreground_subagent(
+                &path,
+                options(),
+                crate::extension::Registry::default(),
+                Registry::default(),
+                parent,
+                config(),
+                Some(vec![]),
+            )
+            .unwrap();
+            owner
+                .scheduler_mut()
+                .select_extensions(parent, vec![extension_name(parent)])
+                .unwrap();
+            owner
+                .scheduler_mut()
+                .submit(parent, None, "root".into())
+                .unwrap();
+            until(|| {
+                matches!(
+                    owner.scheduler().conversation(parent).unwrap().submissions[0].status,
+                    Status::Done { .. }
+                )
+            })
+            .await;
+            let state = owner.scheduler().conversation(parent).unwrap();
+            let result = state
+                .tool_results
+                .iter()
+                .find(|result| result.tool == "subagent")
+                .unwrap();
+            assert_eq!(result.is_error, is_error);
+            if is_error {
+                assert!(children.lock().unwrap().is_empty());
+                assert!(state.messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("non-whitespace"))));
+            } else {
+                assert_eq!(&*children.lock().unwrap(), &[input]);
+            }
+            owner.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
