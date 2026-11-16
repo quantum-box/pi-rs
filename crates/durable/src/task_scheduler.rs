@@ -247,6 +247,8 @@ pub enum Error {
     Transition(TransitionError),
     #[error("unknown or mismatched task registration")]
     Registration,
+    #[error("untrusted task-owned tool inheritance; host review required")]
+    UntrustedToolInheritance,
     #[error("invalid ownership or child creation")]
     Ownership,
     #[error("a pending ownership abort must settle task {0}")]
@@ -2678,6 +2680,11 @@ impl Scheduler {
     /// all other task executors and direct TaskStore mutations themselves.
     /// Failed attachment or recovery releases the in-process guard.
     pub fn attach(owner: Arc<OwnedStore>, registry: Registry) -> Result<Self, Error> {
+        if !crate::owned_subagent::check_inheritance_provenance(owner.store())
+            .map_err(task_store::Error::from)?
+        {
+            return Err(Error::UntrustedToolInheritance);
+        }
         let live_invocations = Arc::new(Mutex::new(InvocationState::default()));
         let wake_reader = WakeReader {
             owner: owner.clone(),

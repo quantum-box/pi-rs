@@ -920,6 +920,15 @@ retries return the committed child across reopen, even if the parent later chang
 As with other admissions, storage errors require reopen before retry. The normal
 non-inheriting APIs retain their existing defaults.
 
+Before conversation recovery or task scheduler attachment, the runtime scans
+owned-subagent reservations and refuses to open if an inheritance-marked record
+lacks matching v2 provenance. This quarantines the entire affected store before
+any queued conversation or task can dispatch; malformed reservations also fail
+closed. No records are migrated or repaired automatically. An unmarked record
+cannot prove that its child settings were not copied by other code or from an
+older store: hosts must review such pre-copied stores before opening them.
+Direct store writers and executors outside this ownership protocol are not fenced.
+
 Use `ensure_subagent_restricted` or `submit_subagent_reported_restricted` to bind an
 initial child allowlist to the durable reservation before submission. For task-owned
 children, `ensure_task_owned_subagent_restricted` and

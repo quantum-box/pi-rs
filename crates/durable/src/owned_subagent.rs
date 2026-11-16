@@ -76,6 +76,43 @@ struct InheritanceV2 {
     tool_filters: crate::runtime::ToolFilters,
 }
 
+/// Validate inherited reservations before any runtime or task recovery can run.
+/// Unmarked legacy reservations are unchanged. Corrupt reservations cannot be
+/// classified safely and are rejected rather than guessed to be unmarked.
+pub(crate) fn check_inheritance_provenance(
+    store: &durable_store::Store,
+) -> Result<bool, durable_store::Error> {
+    for (key, entry) in store.list(b"durable/owned-subagent/")? {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+            return Ok(false);
+        };
+        let Some(object) = value.as_object() else {
+            return Ok(false);
+        };
+        match object.get("inherit_parent_tools") {
+            None | Some(serde_json::Value::Bool(false)) => continue,
+            Some(serde_json::Value::Bool(true)) => {}
+            _ => return Ok(false),
+        }
+        let Ok(admission) = serde_json::from_value::<Admission>(value) else {
+            return Ok(false);
+        };
+        if key != reservation_key(admission.task, &admission.key) {
+            return Ok(false);
+        }
+        let Some(entry) = store.get(&inheritance_v2_key(admission.task, &admission.key))? else {
+            return Ok(false);
+        };
+        let Ok(provenance) = serde_json::from_slice::<InheritanceV2>(&entry.value) else {
+            return Ok(false);
+        };
+        if provenance.admission != admission || provenance.parent == admission.child {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn child_key(id: Uuid) -> Vec<u8> {
     format!("runtime/conversation/{id}").into_bytes()
 }
@@ -950,18 +987,30 @@ mod tests {
                 }],
             )
             .unwrap();
+        // Both runtimes must reject this store before recovering or dispatching it.
         drop(h);
-        let mut h = Harness::open_paused(&path, options()).unwrap();
-        assert!(
-            h.ensure_task_owned_subagent_inheriting_tools(
-                task,
-                owner.clone(),
-                "old",
-                config(),
-                Mode::Background
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+        let raw = durable_store::owner::OwnedStore::open(&path).unwrap();
+        let store = raw.store();
+        let key = reservation_key(task, "old");
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&old).unwrap(),
+                }],
             )
-            .is_err()
-        );
+            .unwrap();
+        drop(raw);
+        let mut h = Harness::open_paused(&path, options()).unwrap();
         assert!(
             h.ensure_task_owned_subagent_inheriting_tools(
                 task,
@@ -976,6 +1025,153 @@ mod tests {
             h.ensure_task_owned_subagent(task, owner, "stray", config(), Mode::Background)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn corrupted_v2_provenance_quarantines_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        h.ensure_task_owned_subagent_inheriting_tools(
+            task,
+            owner,
+            "child",
+            config(),
+            Mode::Foreground,
+        )
+        .unwrap();
+        let store = h.subagent_store().unwrap();
+        let key = inheritance_v2_key(task, "child");
+        let entry = store.get(&key).unwrap().unwrap();
+        let mut record: InheritanceV2 = serde_json::from_slice(&entry.value).unwrap();
+        record.admission.child = Uuid::new_v4();
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(h);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+        assert!(matches!(
+            crate::task_scheduler::Scheduler::open(&path, Default::default()),
+            Err(crate::task_scheduler::Error::UntrustedToolInheritance)
+        ));
+    }
+
+    #[tokio::test]
+    async fn untrusted_experimental_child_blocks_conversation_and_task_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut h = Harness::open_paused(&path, options()).unwrap();
+        let (task, owner) = setup(&mut h);
+        let admission = h
+            .submit_task_owned_subagent(
+                task,
+                owner,
+                "experimental",
+                config(),
+                Mode::Foreground,
+                "queued".into(),
+            )
+            .unwrap();
+        let mut running = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(admission.child),
+            Checkpoint {
+                phase: "running".into(),
+                data: serde_json::Value::Null,
+            },
+            2,
+        )
+        .unwrap();
+        running.start().unwrap();
+        let ready = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(admission.child),
+            Checkpoint {
+                phase: "ready".into(),
+                data: serde_json::Value::Null,
+            },
+            2,
+        )
+        .unwrap();
+        let store = h.subagent_store().unwrap();
+        TaskStore::new(store)
+            .save(&[Save::Create(&running), Save::Create(&ready)])
+            .unwrap();
+        let key = reservation_key(task, "experimental");
+        let entry = store.get(&key).unwrap().unwrap();
+        let mut old = admission.clone();
+        old.inherit_parent_tools = true;
+        store
+            .commit(
+                &[Check {
+                    key: key.clone(),
+                    expected: Expected::Version(entry.version),
+                }],
+                &[Mutation::Put {
+                    key,
+                    value: serde_json::to_vec(&old).unwrap(),
+                }],
+            )
+            .unwrap();
+        let before_child = store.get(&child_key(admission.child)).unwrap().unwrap();
+        let before_running = store.get(&task_store::key(running.id())).unwrap().unwrap();
+        let before_ready = store.get(&task_store::key(ready.id())).unwrap().unwrap();
+        drop(h);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+        assert!(matches!(
+            Harness::open(&path, options(), &pi_rs_core::CancellationToken::new()).await,
+            Err(Error::UntrustedToolInheritance)
+        ));
+        assert!(matches!(
+            crate::runtime::Scheduler::open(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
+        assert!(matches!(
+            crate::task_scheduler::Scheduler::open(&path, Default::default()),
+            Err(crate::task_scheduler::Error::UntrustedToolInheritance)
+        ));
+        let raw = Arc::new(durable_store::owner::OwnedStore::open(&path).unwrap());
+        assert!(matches!(
+            crate::task_scheduler::Scheduler::attach(raw.clone(), Default::default()),
+            Err(crate::task_scheduler::Error::UntrustedToolInheritance)
+        ));
+        let store = raw.store();
+        let after_child = store.get(&child_key(admission.child)).unwrap().unwrap();
+        let after_running = store.get(&task_store::key(running.id())).unwrap().unwrap();
+        let after_ready = store.get(&task_store::key(ready.id())).unwrap().unwrap();
+        assert_eq!(
+            (after_child.version, after_child.value),
+            (before_child.version, before_child.value)
+        );
+        assert_eq!(
+            (after_running.version, after_running.value),
+            (before_running.version, before_running.value)
+        );
+        assert_eq!(
+            (after_ready.version, after_ready.value),
+            (before_ready.version, before_ready.value)
+        );
+        drop(raw);
+        assert!(matches!(
+            Harness::open_paused(&path, options()),
+            Err(Error::UntrustedToolInheritance)
+        ));
     }
 
     #[test]

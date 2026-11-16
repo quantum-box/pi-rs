@@ -82,6 +82,8 @@ pub enum Error {
     TaskScheduler(#[from] crate::task_scheduler::Error),
     #[error("model: {0}")]
     Model(#[from] pi_rs_core::Error),
+    #[error("untrusted task-owned tool inheritance; host review required")]
+    UntrustedToolInheritance,
     #[error("conversation not found")]
     NotFound,
     #[error("submission not found in conversation")]
@@ -4419,6 +4421,9 @@ impl Harness {
             }
         }
         let owner = Arc::new(OwnedStore::open(path)?);
+        if !crate::owned_subagent::check_inheritance_provenance(owner.store())? {
+            return Err(Error::UntrustedToolInheritance);
+        }
         let merged_source = Arc::new(MergedSourceLease {
             owner: Arc::downgrade(&owner),
             signal: Arc::new(MergedSourceSignal {
