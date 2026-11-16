@@ -1925,8 +1925,15 @@ profile state stable during admission. Duplicate requests reuse stored notes
 without fitting again. A cancellation or failed validation discards the
 candidate if the callback returns that error.
 
-This is a subset of upstream session transactions: arbitrary table/signal
-operations, unfitted block admission, entry trees and mutable Chord drafts are
-not exposed.
+`tx.signal(task_id, token, key, value)` stages a typed task signal using the
+runtime signal clock. Call it before the first table write: a delivered signal
+or an expired-key marker counts as a write, while duplicate, invalid, closed
+target and not-found results retain their checks without writing. Results are
+provisional. Settlement notifications are assembled against the same candidate
+and commit atomically with signal and document changes. The API does not expose
+concurrent table operations.
+
+This is a subset of upstream session transactions: arbitrary table operations,
+unfitted block admission, entry trees and mutable Chord drafts are not exposed.
 Transactional continue rejects multiple pending block resets when they need
 separate commits. See [the parity notes](../../docs/pi-durable-parity.md).

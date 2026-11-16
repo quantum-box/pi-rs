@@ -25,6 +25,8 @@ pub struct SessionTransaction<'a> {
     pub(crate) entries_allowed: bool,
     reads: HashMap<Address, Option<Map<String, Value>>>,
     writes: HashMap<Address, Option<Map<String, Value>>>,
+    signals: crate::document::HostTransaction<'a>,
+    clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl<'a> SessionTransaction<'a> {
@@ -35,6 +37,7 @@ impl<'a> SessionTransaction<'a> {
         entries_allowed: bool,
         supports_context: bool,
         adapter: Option<std::sync::Arc<dyn crate::model::ProviderAdapter>>,
+        clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
     ) -> Result<Self, Error> {
         Ok(Self {
             store,
@@ -48,6 +51,8 @@ impl<'a> SessionTransaction<'a> {
             entries_allowed,
             reads: HashMap::new(),
             writes: HashMap::new(),
+            signals: crate::document::HostTransaction::new(store),
+            clock,
         })
     }
 
@@ -82,6 +87,27 @@ impl<'a> SessionTransaction<'a> {
         self.document(address)?;
         self.writes.insert(address.clone(), None);
         Ok(())
+    }
+
+    /// Stage a typed task signal before the first table write. The result is
+    /// provisional until the enclosing session transaction commits.
+    pub fn signal(
+        &mut self,
+        task_id: Uuid,
+        token: &crate::task_store::SignalToken,
+        key: &str,
+        value: Value,
+    ) -> Result<crate::task_store::SignalResult, Error> {
+        if self.table_written {
+            return Err(Error::ReadAfterWrite);
+        }
+        let result = self
+            .signals
+            .signal_at(task_id, token, key, value, (self.clock)())?;
+        if self.signals.has_signal_mutations() {
+            self.table_written = true;
+        }
+        Ok(result)
     }
 
     /// Return placed application writes, including entries staged by this transaction.
@@ -124,7 +150,7 @@ impl<'a> SessionTransaction<'a> {
         Ok(id)
     }
 
-    pub(crate) fn into_parts(self) -> Result<(Conversation, OwnedBatch, bool), Error> {
+    pub(crate) fn into_parts(mut self) -> Result<(Conversation, OwnedBatch, bool), Error> {
         if let Some(profile) = self.image_profile_guard {
             let adapter = self
                 .adapter
@@ -165,6 +191,7 @@ impl<'a> SessionTransaction<'a> {
                 });
             }
         }
-        Ok((self.state, batch, changed))
+        self.signals.append(batch)?;
+        Ok((self.state, self.signals.into_batch()?, changed))
     }
 }

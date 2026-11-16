@@ -8682,6 +8682,7 @@ impl Harness {
             entries_allowed,
             supports_context,
             self.provider_adapter.clone(),
+            self.clock.clone(),
         )?;
         let result = change(&mut transaction)?;
         let (state, mut documents, changed) = transaction.into_parts()?;
@@ -8740,6 +8741,7 @@ impl Harness {
             entries_allowed,
             supports_context,
             self.provider_adapter.clone(),
+            self.clock.clone(),
         )?;
         let result = change(&mut transaction).await?;
         let (state, mut documents, changed) = transaction.into_parts()?;

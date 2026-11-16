@@ -1480,6 +1480,9 @@ impl<'a> HostTransaction<'a> {
         }
         self.transaction.append(ordinary)
     }
+    pub(crate) fn has_signal_mutations(&self) -> bool {
+        !self.signals.batch.mutations.is_empty()
+    }
     /// Stage typed deliveries after candidate task and signal writes. Results
     /// remain provisional until commit; later target writes are rejected.
     pub fn signal_at(
