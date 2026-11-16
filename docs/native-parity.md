@@ -184,6 +184,11 @@ can still be missed in those
 cases. Package resources are evaluated in settings order, with project sources
 first.
 
+Diagnostic manifest globs expand bounded numeric and same-case ASCII letter
+brace ranges, including descending ranges, signed steps and padded numbers,
+and include the starting directory for a trailing directory globstar. Complex,
+invalid or oversized brace expansions fall back to native candidates.
+
 Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
 custom IDs are preserved across native export and reopen and used for

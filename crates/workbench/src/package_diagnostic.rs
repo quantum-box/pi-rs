@@ -16,6 +16,177 @@ const MAX_EXTGLOB_DEPTH: usize = 16;
 const MAX_EXTGLOB_INPUT: usize = 16 * 1024;
 const NEGATIVE_BACKTRACK_LIMIT: usize = 2_000;
 const MAX_NEGATIVE_EVALUATIONS: usize = 256;
+const MAX_BRACE_VARIANTS: usize = 128;
+const MAX_BRACE_PATTERN_BYTES: usize = 65_536;
+const MAX_BRACE_INPUT: usize = 4_096;
+const MAX_BRACE_DEPTH: usize = 16;
+
+// Expand only syntax whose Node semantics we can establish. Bounds apply to
+// the whole expansion, before any filesystem traversal or matcher compilation.
+fn expand_diagnostic_braces(pattern: &str) -> Option<Vec<String>> {
+    fn expand(pattern: &str, depth: usize, out: &mut Vec<String>, bytes: &mut usize) -> Option<()> {
+        if depth > MAX_BRACE_DEPTH || pattern.len() > MAX_BRACE_INPUT {
+            return None;
+        }
+        let Some(start) = pattern.find('{') else {
+            if pattern.contains('}') || out.len() >= MAX_BRACE_VARIANTS {
+                return None;
+            }
+            *bytes = bytes.checked_add(pattern.len())?;
+            if *bytes > MAX_BRACE_PATTERN_BYTES {
+                return None;
+            }
+            out.push(pattern.to_owned());
+            return Some(());
+        };
+        let mut level = 0usize;
+        let mut end = None;
+        let mut separators = Vec::new();
+        for (i, ch) in pattern.char_indices().skip_while(|(i, _)| *i < start) {
+            match ch {
+                '{' => {
+                    level += 1;
+                    if level > MAX_BRACE_DEPTH {
+                        return None;
+                    }
+                }
+                '}' => {
+                    level = level.checked_sub(1)?;
+                    if level == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                ',' if level == 1 => separators.push(i),
+                _ => {}
+            }
+        }
+        let end = end?;
+        let body = &pattern[start + 1..end];
+        let mut alternatives = Vec::new();
+        if !separators.is_empty() {
+            let mut begin = start + 1;
+            for stop in separators.into_iter().chain(std::iter::once(end)) {
+                let part = &pattern[begin..stop];
+                if part.is_empty() {
+                    return None;
+                }
+                alternatives.push(part.to_owned());
+                begin = stop + 1;
+            }
+        } else {
+            let parts: Vec<_> = body.split("..").collect();
+            if !(2..=3).contains(&parts.len()) {
+                return None;
+            }
+            let numeric = |s: &str| {
+                !s.is_empty()
+                    && s.trim_start_matches('-')
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                    && s != "-"
+                    && !s.starts_with("--")
+            };
+            let step = if parts.len() == 3 {
+                if !numeric(parts[2]) {
+                    return None;
+                }
+                parts[2].parse::<i64>().ok()?.checked_abs()?.max(1)
+            } else {
+                1
+            };
+            let (first, last, width, alphabetic) = if numeric(parts[0]) && numeric(parts[1]) {
+                let padded = [parts[0], parts[1]].iter().any(|s| {
+                    let digits = s.strip_prefix('-').unwrap_or(s);
+                    digits.len() > 1 && digits.starts_with('0')
+                });
+                (
+                    parts[0].parse::<i64>().ok()?,
+                    parts[1].parse::<i64>().ok()?,
+                    if padded {
+                        parts[0].len().max(parts[1].len())
+                    } else {
+                        0
+                    },
+                    false,
+                )
+            } else if parts[0].len() == 1
+                && parts[1].len() == 1
+                && ((parts[0].as_bytes()[0].is_ascii_lowercase()
+                    && parts[1].as_bytes()[0].is_ascii_lowercase())
+                    || (parts[0].as_bytes()[0].is_ascii_uppercase()
+                        && parts[1].as_bytes()[0].is_ascii_uppercase()))
+            {
+                (
+                    parts[0].as_bytes()[0] as i64,
+                    parts[1].as_bytes()[0] as i64,
+                    0,
+                    true,
+                )
+            } else {
+                return None;
+            };
+            // JavaScript range expansion uses Number; do not infer results
+            // outside its exact integer range.
+            if [first, last, step]
+                .iter()
+                .any(|n| i128::from(*n).abs() > 9_007_199_254_740_991)
+            {
+                return None;
+            }
+            let distance = (i128::from(last) - i128::from(first)).unsigned_abs();
+            if distance / step as u128 + 1 > MAX_BRACE_VARIANTS as u128 {
+                return None;
+            }
+            let mut value = first;
+            loop {
+                alternatives.push(if alphabetic {
+                    char::from(value as u8).to_string()
+                } else if width > 0 {
+                    if value < 0 {
+                        format!("-{:0width$}", value.unsigned_abs(), width = width - 1)
+                    } else {
+                        format!("{value:0width$}")
+                    }
+                } else {
+                    value.to_string()
+                });
+                let Some(next) = (if first <= last {
+                    value.checked_add(step)
+                } else {
+                    value.checked_sub(step)
+                }) else {
+                    break;
+                };
+                if (first <= last && next > last) || (first > last && next < last) {
+                    break;
+                }
+                value = next;
+            }
+        }
+        for alternative in alternatives {
+            expand(
+                &format!(
+                    "{}{}{}",
+                    &pattern[..start],
+                    alternative,
+                    &pattern[end + 1..]
+                ),
+                depth + 1,
+                out,
+                bytes,
+            )?;
+        }
+        Some(())
+    }
+    if pattern.contains(['[', ']']) || has_extglob(pattern) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    expand(pattern, 0, &mut out, &mut bytes)?;
+    Some(out)
+}
 
 // One top-level negation with literal alternatives and a simple component
 // suffix. Anything more complex must keep using the diagnostic fallback.
@@ -289,7 +460,22 @@ impl Scanner {
         regex.is_match(input).ok()
     }
     fn glob(&mut self, root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
+        if pattern.contains(['{', '}']) {
+            let mut results = Vec::new();
+            for variant in expand_diagnostic_braces(pattern)? {
+                results.extend(self.glob_variant(root, &variant)?);
+            }
+            results.sort();
+            results.dedup();
+            return Some(results);
+        }
+        self.glob_variant(root, pattern)
+    }
+    fn glob_variant(&mut self, root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
         // Keep discovery within the package and avoid walking through symlinked trees.
+        if pattern.len() > 4096 {
+            return None;
+        }
         let pattern = pattern.replace('\\', "/");
         let path = Path::new(&pattern);
         if path.is_absolute()
@@ -339,6 +525,34 @@ impl Scanner {
         } else {
             None
         };
+        // A trailing globstar can consume zero directories, including when
+        // several trailing globstars occur or the match is the traversal root.
+        let mut zero_depth = Vec::new();
+        let mut zero_root = false;
+        if directory_only && matcher.is_some() {
+            let mut prefix = normalized.as_str();
+            loop {
+                if prefix == "**" {
+                    zero_root = true;
+                    break;
+                }
+                let Some(parent) = prefix.strip_suffix("/**") else {
+                    break;
+                };
+                if zero_depth.len() >= MAX_DEPTH {
+                    return None;
+                }
+                zero_depth.push(
+                    globset::GlobBuilder::new(parent)
+                        .literal_separator(true)
+                        .backslash_escape(false)
+                        .build()
+                        .ok()?
+                        .compile_matcher(),
+                );
+                prefix = parent;
+            }
+        }
         let mut matches = Vec::new();
         let mut matched_bytes = 0usize;
         let mut symlink_checks = 0usize;
@@ -435,6 +649,8 @@ impl Scanner {
                 regex.is_match(&input.replace('\\', "/"))
             } else {
                 matcher.as_ref()?.is_match(relative)
+                    || (zero_root && relative.as_os_str().is_empty())
+                    || zero_depth.iter().any(|matcher| matcher.is_match(relative))
             };
             if matched && (!directory_only || entry.file_type().is_some_and(|kind| kind.is_dir())) {
                 matches.push(entry.into_path());
@@ -673,6 +889,148 @@ mod tests {
     use super::*;
 
     #[test]
+    fn brace_ranges_expand_with_node_numeric_rules_and_bounds() {
+        for (pattern, expected) in [
+            ("{1..3}", vec!["1", "2", "3"]),
+            ("{3..1..-2}", vec!["3", "1"]),
+            ("{1..3..0}", vec!["1", "2", "3"]),
+            ("{-03..02..2}", vec!["-03", "-01", "001"]),
+            ("{a..e..2}", vec!["a", "c", "e"]),
+            ("{z..v..2}", vec!["z", "x", "v"]),
+            ("{1..2}{a,b}", vec!["1a", "1b", "2a", "2b"]),
+            ("{x,{1..2}}", vec!["x", "1", "2"]),
+        ] {
+            assert_eq!(
+                expand_diagnostic_braces(pattern).unwrap(),
+                expected,
+                "{pattern}"
+            );
+        }
+        for pattern in [
+            "{1..999999999999}*",
+            "{1..129}*",
+            "{1..12}{1..12}*",
+            "{1..3..oops}*",
+            "{a..Z}*",
+            "{a}*",
+            "{,a}*",
+            "{1..3}@(a|b)*",
+            "{9007199254740992..9007199254740993}*",
+        ] {
+            assert!(expand_diagnostic_braces(pattern).is_none(), "{pattern}");
+        }
+        assert!(
+            expand_diagnostic_braces(&format!(
+                "{}a{}*",
+                "{".repeat(MAX_BRACE_DEPTH + 1),
+                "}".repeat(MAX_BRACE_DEPTH + 1)
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn brace_and_directory_globstar_match_node_when_available() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("prompts/sub/deep")).unwrap();
+        for name in [
+            "1.md", "2.md", "3.md", "01.md", "02.md", "03.md", "-01.md", "-03.md", "a.md", "b.md",
+            "c.md", "1a.md", "2b.md",
+        ] {
+            std::fs::write(root.path().join("prompts").join(name), "fixture").unwrap();
+        }
+        let patterns = [
+            "prompts/{1..3}*.md",
+            "prompts/{3..1}*.md",
+            "prompts/{1..3..2}*.md",
+            "prompts/{-03..02..2}*.md",
+            "prompts/{01..03}*.md",
+            "prompts/{a..c}*.md",
+            "prompts/{c..a..-2}*.md",
+            "prompts/{1..2}{a,b}*.md",
+            "prompts/{1,{2..3}}*.md",
+            "prompts/{1..3..0}*.md",
+            "prompts/**/",
+            "prompts/**/**/",
+            "prompts/*/**/",
+            "**/",
+        ];
+        let output = std::process::Command::new("node")
+            .args(["-e", "const f=require('fs'); if(!f.globSync)process.exit(77); const p=JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(p.map(x=>f.globSync(x,{cwd:process.cwd()}).sort())))", &serde_json::to_string(&patterns).unwrap()])
+            .current_dir(root.path()).output();
+        let Ok(output) = output else { return };
+        if output.status.code() == Some(77) {
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<Vec<String>> = serde_json::from_slice(&output.stdout).unwrap();
+        for (pattern, expected) in patterns.into_iter().zip(expected) {
+            let mut scanner = Scanner {
+                count: 0,
+                ignore_bytes: 0,
+                active: HashSet::new(),
+                negative_evaluations: 0,
+            };
+            let actual = scanner.glob(root.path(), pattern).unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|name| root.path().join(name))
+                .collect();
+            assert_eq!(actual, expected, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn brace_fallback_and_zero_depth_flow_through_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("prompts")).unwrap();
+        std::fs::write(root.path().join("prompts/1.md"), "fixture").unwrap();
+        for pattern in ["prompts/{1..3}*.md", "prompts/**/"] {
+            std::fs::write(
+                root.path().join("package.json"),
+                serde_json::json!({"pi":{"prompts":[pattern]}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                candidates(root.path(), Kind::Prompt).unwrap().unwrap(),
+                vec![root.path().join("prompts/1.md")]
+            );
+        }
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::json!({"pi":{"prompts":["prompts/1.md", "prompts/{1..10000}*.md"]}})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(candidates(root.path(), Kind::Prompt).unwrap().is_none());
+        let mut scanner = Scanner {
+            count: MAX_ENTRIES - 1,
+            ignore_bytes: 0,
+            active: HashSet::new(),
+            negative_evaluations: 0,
+        };
+        assert!(scanner.glob(root.path(), "prompts/{1..2}*.md").is_none());
+        let mut scanner = Scanner {
+            count: 0,
+            ignore_bytes: 0,
+            active: HashSet::new(),
+            negative_evaluations: 0,
+        };
+        assert!(
+            scanner
+                .glob(
+                    root.path(),
+                    &format!("prompts{}/", "/**".repeat(MAX_DEPTH + 1))
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn extglob_matches_node_when_available() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("p")).unwrap();
@@ -837,7 +1195,11 @@ mod tests {
         {
             assert!(output.status.success());
             let paths: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-            assert!(paths.contains(&"p/a.md".to_owned()));
+            assert!(
+                paths
+                    .iter()
+                    .any(|path| Path::new(path) == Path::new("p").join("a.md"))
+            );
         }
     }
 
