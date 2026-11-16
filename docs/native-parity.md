@@ -1931,6 +1931,8 @@ numbers, and highlight changed words for one-line replacements. Added, removed
 and context lines use their dedicated theme colors. Tabs expand to three spaces,
 and word comparison follows Pi's `diffWords` token grouping and whitespace
 deduplication, including the first changed fragment's indentation treatment.
+Numbered diff gutters use JavaScript's whitespace and line-terminator rules,
+including its treatment of BOM and U+0085.
 Comparison has a shared 100 ms budget per render; oversized or unfinished
 comparisons retain line-level highlighting. The Rust word-diff implementation
 derives from jsdiff 8.0.4; its BSD license is in
