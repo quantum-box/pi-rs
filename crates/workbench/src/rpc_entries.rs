@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::{Value, json};
 
-use super::rpc_messages::Projection;
+use super::rpc_messages::{MetadataSource, Projection};
 
 const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
@@ -153,7 +153,7 @@ impl Entries {
         let values = session
             .records()
             .iter()
-            .flat_map(|record| cursor.append(session.records(), record, Some(session), None))
+            .flat_map(|record| cursor.append(session.records(), record, Some(session), None, None))
             .collect();
         Self {
             values,
@@ -450,11 +450,16 @@ impl Cursor {
             return;
         }
         for record in records.iter().skip(self.positions.len() - 1) {
-            self.append(records, record, None, None);
+            self.append(records, record, None, None, None);
         }
     }
 
-    pub(super) fn appended(&mut self, records: &[Record], metadata: Option<&Value>) -> Vec<Value> {
+    pub(super) fn appended(
+        &mut self,
+        records: &[Record],
+        metadata: Option<&Value>,
+        record_metadata: &std::collections::BTreeMap<u64, Value>,
+    ) -> Vec<Value> {
         if self.invalid {
             return Vec::new();
         }
@@ -465,7 +470,7 @@ impl Cursor {
         if record.id as usize != self.positions.len() {
             return Vec::new();
         }
-        self.append(records, record, None, metadata)
+        self.append(records, record, None, metadata, Some(record_metadata))
     }
 
     fn append(
@@ -474,6 +479,7 @@ impl Cursor {
         record: &Record,
         session: Option<&Session>,
         live_metadata: Option<&Value>,
+        record_metadata: Option<&std::collections::BTreeMap<u64, Value>>,
     ) -> Vec<Value> {
         let mut entries = Vec::new();
         self.messages.record(record);
@@ -827,7 +833,13 @@ impl Cursor {
             }
             _ => self
                 .messages
-                .raw_message(records, record)
+                .raw_message(
+                    records,
+                    record,
+                    session
+                        .map(MetadataSource::Session)
+                        .or_else(|| record_metadata.map(MetadataSource::Snapshot)),
+                )
                 .map(|message| json!({"type":"message","message":message})),
         };
         if let Some(entry) = entry {
@@ -948,7 +960,7 @@ pub(super) fn changes(session: &Session, previous: usize) -> Result<Vec<Value>> 
     cursor.advance(prefix);
     Ok(appended
         .iter()
-        .flat_map(|record| cursor.append(records, record, Some(session), None))
+        .flat_map(|record| cursor.append(records, record, Some(session), None, None))
         .collect())
 }
 
@@ -984,6 +996,143 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unsigned_anthropic_entries_and_share_preserve_layout_and_context() {
+        use super::*;
+        use pi_rs::{EnrichedModelEvent as E, ModelEvent};
+
+        struct Fixture;
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Fixture {
+            async fn stream(&self, _: pi_rs::ModelRequest) -> pi_rs::Result<pi_rs::ModelStream> {
+                unreachable!()
+            }
+
+            async fn stream_enriched_in_session_with_identity(
+                &self,
+                _: uuid::Uuid,
+                _: uuid::Uuid,
+                _: &str,
+                _: pi_rs::ModelRequest,
+            ) -> pi_rs::Result<pi_rs::EnrichedModelStream> {
+                let events = vec![
+                    E::Legacy(ModelEvent::Metadata(pi_rs::ModelMetadata {
+                        provider_api: Some(pi_rs::ModelApi::AnthropicMessages),
+                        ..Default::default()
+                    })),
+                    E::TextStart { index: 0 },
+                    E::TextDelta {
+                        index: 0,
+                        delta: "first".into(),
+                    },
+                    E::TextEnd {
+                        index: 0,
+                        content: "first".into(),
+                    },
+                    E::TextStart { index: 1 },
+                    E::TextDelta {
+                        index: 1,
+                        delta: "second".into(),
+                    },
+                    E::TextEnd {
+                        index: 1,
+                        content: "second".into(),
+                    },
+                    E::Legacy(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(futures_util::stream::iter(
+                    events.into_iter().map(Ok),
+                )))
+            }
+        }
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let registry = pi_rs::Registry::default();
+        let agent = pi_rs::Agent {
+            model: &Fixture,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: pi_rs::Limits::default(),
+        };
+        let (_sender, mut inputs) = tokio::sync::mpsc::channel(1);
+        agent
+            .run_with_events(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let finished = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::ModelFinished { .. }))
+            .unwrap()
+            .id;
+        let metadata = session.record_metadata(finished).unwrap().clone();
+        let before = session.conversation_at(session.head()).unwrap();
+        let entries = Entries::new(&session);
+        let projected = Entries::new(&session).after(None).unwrap();
+        let assistant = projected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["message"]["role"] == "assistant")
+            .unwrap();
+        let expected = json!([{"type":"text","text":"first"},{"type":"text","text":"second"}]);
+        assert_eq!(assistant["message"]["content"], expected);
+        let mut cursor = Cursor::default();
+        let mut completion_metadata = std::collections::BTreeMap::new();
+        let mut live_assistant = None;
+        for record in session.records() {
+            if let Some(metadata) = session.record_metadata(record.id) {
+                completion_metadata.insert(record.id, metadata.clone());
+            }
+            for entry in cursor.appended(
+                &session.records()[..record.id as usize],
+                session.record_metadata(record.id),
+                &completion_metadata,
+            ) {
+                if entry["message"]["role"] == "assistant" {
+                    live_assistant = Some(entry);
+                }
+            }
+        }
+        assert_eq!(live_assistant.as_ref(), Some(assistant));
+        let share = entries
+            .write_share_branch(&session, std::path::Path::new("."))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share.jsonl");
+        std::fs::write(&path, &share).unwrap();
+        let exported: Vec<Value> = share
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let shared = exported
+            .iter()
+            .find(|entry| entry["message"]["role"] == "assistant")
+            .unwrap();
+        assert_eq!(shared["message"], assistant["message"]);
+        let imported = super::super::session_import::read(&path).unwrap();
+        let (messages, _) = super::super::rpc_messages::snapshot(&imported);
+        let restored = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(restored["content"], expected);
+        assert_eq!(imported.conversation_at(imported.head()).unwrap(), before);
+        assert_eq!(session.record_metadata(finished), Some(&metadata));
+        assert_eq!(session.conversation_at(session.head()).unwrap(), before);
+    }
+
     #[test]
     fn native_compaction_system_prompt_survives_pi_projection_and_import() {
         use super::*;
@@ -1092,6 +1241,7 @@ mod tests {
         let entries = cursor.appended(
             &records,
             Some(&json!({"fromExtension":true,"details":{"origin":"hook"}})),
+            &Default::default(),
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["fromHook"], true);
@@ -1100,7 +1250,8 @@ mod tests {
             json!({"fromExtension":true}),
             json!({"fromExtension":true,"details":null}),
         ] {
-            let entries = Cursor::default().appended(&records, Some(&metadata));
+            let entries =
+                Cursor::default().appended(&records, Some(&metadata), &Default::default());
             assert_eq!(entries[0].get("details"), metadata.get("details"));
         }
     }

@@ -269,7 +269,7 @@ pub fn fork(
     destination: &Path,
     workspace: &Path,
 ) -> Result<()> {
-    let mut copy = Session::from_records(session.fork_records(target)?)?;
+    let mut copy = session.fork_session(target)?;
     copy.set_parent_session(&source.to_string_lossy())?;
     copy.set_working_directory(workspace)?;
     if let Some(name) = session.name() {
@@ -1260,6 +1260,55 @@ async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_fork_preserves_imported_compaction_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("imported.jsonl");
+        std::fs::write(&source, concat!(
+            "{\"type\":\"session\",\"version\":3}\n",
+            "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
+            "{\"type\":\"message\",\"id\":\"s\",\"parentId\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"sibling\"}}\n",
+            "{\"type\":\"label\",\"id\":\"l\",\"parentId\":\"u\",\"targetId\":\"u\",\"label\":\"old\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n",
+            "{\"type\":\"compaction\",\"id\":\"c\",\"parentId\":\"l\",\"firstKeptEntryId\":\"u\",\"summary\":\"summary\",\"tokensBefore\":42,\"fromHook\":true,\"details\":{\"source\":\"extension\"}}\n",
+            "{\"type\":\"label\",\"id\":\"new\",\"parentId\":\"s\",\"targetId\":\"u\",\"label\":\"current\",\"timestamp\":\"2024-01-02T00:00:00Z\"}\n",
+        )).unwrap();
+        let session = super::super::session_import::read(&source).unwrap();
+        let target = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let destination = directory.path().join("fork.jsonl");
+        fork(&session, &source, target, &destination, directory.path()).unwrap();
+        let forked = Session::open(&destination).unwrap();
+        let compacted = forked
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            forked.record_metadata(compacted.id),
+            Some(&serde_json::json!({"fromExtension":true,"details":{"source":"extension"}}))
+        );
+        forked.validated_pi_conversion_counts().unwrap();
+        let entries = super::super::rpc_entries::Entries::new(&forked)
+            .after(None)
+            .unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry["message"]["content"] == "sibling")
+        );
+        let label = entries
+            .iter()
+            .find(|entry| entry["type"] == "label")
+            .unwrap();
+        assert_eq!(label["label"], "current");
+        assert_eq!(label["timestamp"], "2024-01-02T00:00:00Z");
+    }
 
     #[test]
     fn startup_fork_keeps_legacy_pending_tree_trigger_fallback() {

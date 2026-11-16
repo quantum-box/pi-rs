@@ -8,10 +8,16 @@ pub fn agent_dir() -> PathBuf {
     pi_rs_workbench::agent_dir()
 }
 
-#[derive(Clone, Default)]
+type WorkerHistory =
+    std::sync::Arc<std::sync::Mutex<Option<(PathBuf, bool, Vec<(PathBuf, Value)>)>>>;
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     value: Value,
     resource_layers: Vec<(PathBuf, Value)>,
+    diagnostics: Vec<String>,
+    #[serde(skip)]
+    worker_history: WorkerHistory,
     // Live controls override merged settings only for this running session.
     live_auto_retry: Option<bool>,
     live_auto_compaction: Option<bool>,
@@ -46,6 +52,11 @@ impl Settings {
             }
         }
         self.refresh_effective();
+        self.update_remembered_user(path, |settings| {
+            for (key, value) in values {
+                settings.insert(key.clone(), value.clone());
+            }
+        });
         Ok(())
     }
     fn refresh_effective(&mut self) {
@@ -62,8 +73,189 @@ impl Settings {
         let user_path = agent_dir().join("settings.json");
         Self::load_from_paths(workspace, trusted, &user_path)
     }
+    pub(super) fn reload_latest(&self, workspace: &Path, trusted: bool) -> Result<Self> {
+        let fallback = self.worker_fallback(workspace, trusted);
+        let settings =
+            self.reload_with_fallback(workspace, trusted, fallback.as_ref().unwrap_or(self))?;
+        self.remember_worker_snapshot(workspace, trusted, &settings);
+        Ok(settings)
+    }
+    pub(super) fn reload_with_fallback(
+        &self,
+        workspace: &Path,
+        trusted: bool,
+        fallback: &Self,
+    ) -> Result<Self> {
+        let user_path = agent_dir().join("settings.json");
+        let mut settings =
+            Self::load_from_paths_with_previous(workspace, trusted, &user_path, Some(fallback))?;
+        settings.worker_history = self.worker_history.clone();
+        settings.live_auto_retry = self.live_auto_retry;
+        settings.live_auto_compaction = self.live_auto_compaction;
+        Ok(settings)
+    }
+    pub(super) fn fork_worker_history(&mut self) {
+        let snapshot = self
+            .worker_history
+            .lock()
+            .ok()
+            .and_then(|history| history.clone());
+        self.worker_history = std::sync::Arc::new(std::sync::Mutex::new(snapshot));
+    }
+    pub(super) fn worker_fallback(&self, workspace: &Path, trusted: bool) -> Option<Self> {
+        let history = self.worker_history.lock().ok()?;
+        let (old_workspace, old_trusted, layers) = history.as_ref()?;
+        let same = old_workspace == workspace
+            || matches!((old_workspace.canonicalize(), workspace.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        let mut fallback = self.clone();
+        fallback.resource_layers = if same && *old_trusted == trusted {
+            layers.clone()
+        } else {
+            let mut available: Vec<_> = layers.first().cloned().into_iter().collect();
+            let project = workspace.join(".pi");
+            if trusted && let Some(layer) = self.resource_layers.iter().skip(1).find(|(base, _)| {
+                base == &project || matches!((base.canonicalize(), project.canonicalize()), (Ok(a), Ok(b)) if a == b)
+            }) {
+                available.push(layer.clone());
+            }
+            available
+        };
+        fallback.refresh_effective();
+        Some(fallback)
+    }
+    fn update_remembered_user(&self, path: &Path, update: impl FnOnce(&mut Map<String, Value>)) {
+        let Some(base) = path.parent() else {
+            return;
+        };
+        let Ok(mut history) = self.worker_history.lock() else {
+            return;
+        };
+        let Some((_, _, layers)) = history.as_mut() else {
+            return;
+        };
+        let Some((old_base, value)) = layers.first_mut() else {
+            return;
+        };
+        if old_base != base
+            && !matches!((old_base.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        {
+            return;
+        }
+        if let Some(object) = value.as_object_mut() {
+            update(object);
+        }
+    }
+    pub(super) fn remember_worker_snapshot(
+        &self,
+        workspace: &Path,
+        trusted: bool,
+        snapshot: &Self,
+    ) {
+        if let Ok(mut history) = self.worker_history.lock() {
+            *history = Some((
+                workspace.to_owned(),
+                trusted,
+                snapshot.resource_layers.clone(),
+            ));
+        }
+    }
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+    pub(super) fn apply_queue_reload(&mut self, reloaded: &Self) {
+        for (base, layer) in &mut self.resource_layers {
+            let Some((_, incoming)) = reloaded
+                .resource_layers
+                .iter()
+                .find(|(path, _)| path == base)
+            else {
+                continue;
+            };
+            let Some(object) = layer.as_object_mut() else {
+                continue;
+            };
+            for key in ["steeringMode", "followUpMode"] {
+                if let Some(value) = incoming.get(key) {
+                    object.insert(key.into(), value.clone());
+                } else {
+                    object.remove(key);
+                }
+            }
+        }
+        if let Ok(mut history) = self.worker_history.lock()
+            && let Some((_, _, layers)) = history.as_mut()
+        {
+            for (base, layer) in layers {
+                let Some((_, incoming)) = reloaded.resource_layers.iter().find(|(path, _)| {
+                    path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b)
+                }) else { continue; };
+                let Some(object) = layer.as_object_mut() else {
+                    continue;
+                };
+                for key in ["steeringMode", "followUpMode"] {
+                    if let Some(value) = incoming.get(key) {
+                        object.insert(key.into(), value.clone());
+                    } else {
+                        object.remove(key);
+                    }
+                }
+            }
+        }
+        self.diagnostics = reloaded.diagnostics.clone();
+        self.refresh_effective();
+    }
+    pub(super) fn validate_worker_snapshot(
+        &mut self,
+        workspace: &Path,
+        trusted: bool,
+    ) -> Result<()> {
+        let equal = |a: &Path, b: &Path| {
+            a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        };
+        let user = agent_dir();
+        if self.resource_layers.is_empty()
+            || self.resource_layers.len() > if trusted { 2 } else { 1 }
+            || !equal(&self.resource_layers[0].0, &user)
+            || self
+                .resource_layers
+                .get(1)
+                .is_some_and(|(base, _)| !equal(base, &workspace.join(".pi")))
+        {
+            return Err(Error::Config("invalid worker settings scope".into()));
+        }
+        for (base, value) in &self.resource_layers {
+            validate_settings(value, &base.join("settings.json"))?;
+        }
+        self.refresh_effective();
+        Ok(())
+    }
+    pub(super) fn stored_layer(&self, base: &Path) -> Option<&Value> {
+        self.resource_layers
+            .iter()
+            .find(|(path, _)| path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b))
+            .map(|(_, value)| value)
+    }
     fn load_from_paths(workspace: &Path, trusted: bool, user_path: &Path) -> Result<Self> {
-        let mut value = read_object(user_path)?;
+        Self::load_from_paths_with_previous(workspace, trusted, user_path, None)
+    }
+    fn load_from_paths_with_previous(
+        workspace: &Path,
+        trusted: bool,
+        user_path: &Path,
+        previous: Option<&Self>,
+    ) -> Result<Self> {
+        let mut diagnostics = Vec::new();
+        let old_layer = |base: &Path| {
+            previous.and_then(|settings| {
+                settings
+                    .resource_layers
+                    .iter()
+                    .find(|(path, _)| path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b))
+                    .map(|(_, value)| value)
+            })
+        };
+        let user_base = user_path.parent().unwrap_or(Path::new("."));
+        let mut value = read_settings_layer(user_path, old_layer(user_base), &mut diagnostics);
         migrate_legacy_settings(&mut value);
         validate_settings(&value, user_path)?;
         let mut resource_layers = vec![(
@@ -72,7 +264,11 @@ impl Settings {
         )];
         if trusted {
             let project_path = workspace.join(".pi/settings.json");
-            let mut project = read_object(&project_path)?;
+            let mut project = read_settings_layer(
+                &project_path,
+                old_layer(&workspace.join(".pi")),
+                &mut diagnostics,
+            );
             migrate_legacy_settings(&mut project);
             let user_only = project.as_object_mut().expect("object");
             user_only.remove("defaultProjectTrust");
@@ -84,7 +280,12 @@ impl Settings {
         Ok(Self {
             value,
             resource_layers,
-            ..Self::default()
+            diagnostics,
+            worker_history: previous
+                .map(|settings| settings.worker_history.clone())
+                .unwrap_or_default(),
+            live_auto_retry: previous.and_then(|settings| settings.live_auto_retry),
+            live_auto_compaction: previous.and_then(|settings| settings.live_auto_compaction),
         })
     }
     pub fn string(&self, key: &str) -> Option<&str> {
@@ -108,14 +309,10 @@ impl Settings {
         self.value.get(key)?.as_bool()
     }
     pub fn http_idle_timeout_ms(&self) -> u64 {
-        match self.value.get("httpIdleTimeoutMs") {
-            Some(Value::String(value)) if value == "disabled" => 0,
-            Some(Value::Number(value)) => value
-                .as_f64()
-                .unwrap_or(300_000.0)
-                .clamp(0.0, 2_147_483_647.0) as u64,
-            _ => 300_000,
-        }
+        self.value
+            .get("httpIdleTimeoutMs")
+            .and_then(parse_http_idle_timeout)
+            .unwrap_or(300_000)
     }
     pub fn http_idle_timeout(&self) -> Option<std::time::Duration> {
         let value = self.http_idle_timeout_ms();
@@ -297,19 +494,33 @@ impl Settings {
             update(layer.as_object_mut().expect("settings layer"))?;
         }
         self.refresh_effective();
+        self.update_remembered_user(path, |settings| {
+            let object = settings
+                .entry(key)
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !object.is_object() {
+                *object = Value::Object(Map::new());
+            }
+            object
+                .as_object_mut()
+                .expect("object")
+                .insert(member.into(), value);
+        });
         Ok(())
     }
 
     pub fn remove_user_member(&mut self, key: &str, member: &str) -> Result<()> {
-        let path = agent_dir().join("settings.json");
-        update_object(&path, |settings| {
+        self.remove_user_member_at(&agent_dir().join("settings.json"), key, member)
+    }
+    fn remove_user_member_at(&mut self, path: &Path, key: &str, member: &str) -> Result<()> {
+        update_object(path, |settings| {
             if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
                 object.remove(member);
                 if object.is_empty() {
                     settings.remove(key);
                 }
             }
-            validate_settings(&Value::Object(settings.clone()), &path)
+            validate_settings(&Value::Object(settings.clone()), path)
         })?;
         if let Some((_, user)) = self.resource_layers.first_mut()
             && let Some(settings) = user.as_object_mut()
@@ -342,6 +553,14 @@ impl Settings {
         {
             settings.remove(key);
         }
+        self.update_remembered_user(path, |settings| {
+            if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
+                object.remove(member);
+                if object.is_empty() {
+                    settings.remove(key);
+                }
+            }
+        });
         Ok(())
     }
     pub fn set_user(&mut self, key: &str, value: Value) -> Result<()> {
@@ -374,11 +593,84 @@ impl Settings {
             layer
                 .as_object_mut()
                 .expect("settings layer")
-                .insert(key.into(), value);
+                .insert(key.into(), value.clone());
         }
         self.refresh_effective();
+        self.update_remembered_user(path, |settings| {
+            settings.insert(key.into(), value);
+        });
         Ok(())
     }
+}
+
+// A broken settings file must not hide the other layer. Writes still read the
+// original file under lock and fail rather than replacing malformed contents.
+fn read_settings_layer(
+    path: &Path,
+    previous: Option<&Value>,
+    diagnostics: &mut Vec<String>,
+) -> Value {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let absolute = absolute
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
+        .unwrap_or(absolute);
+    match read_object(&absolute) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(format!(
+                "Warning: Invalid settings file {}: {error}",
+                absolute.display()
+            ));
+            previous
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()))
+        }
+    }
+}
+
+fn parse_http_idle_timeout(value: &Value) -> Option<u64> {
+    let number = match value {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(value) => {
+            let value = value.trim_matches(|ch: char| matches!(ch, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'));
+            if value.eq_ignore_ascii_case("disabled") {
+                return Some(0);
+            }
+            if value.is_empty() {
+                return None;
+            }
+            let digits = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .map(|digits| (digits, 16))
+                .or_else(|| {
+                    value
+                        .strip_prefix("0b")
+                        .or_else(|| value.strip_prefix("0B"))
+                        .map(|digits| (digits, 2))
+                })
+                .or_else(|| {
+                    value
+                        .strip_prefix("0o")
+                        .or_else(|| value.strip_prefix("0O"))
+                        .map(|digits| (digits, 8))
+                });
+            if let Some((digits, radix)) = digits {
+                if digits.is_empty() {
+                    return None;
+                }
+                digits.chars().try_fold(0.0, |number, digit| {
+                    Some(number * f64::from(radix) + f64::from(digit.to_digit(radix)?))
+                })?
+            } else {
+                value.parse::<f64>().ok()?
+            }
+        }
+        _ => return None,
+    };
+    (number.is_finite() && number >= 0.0).then(|| number.min(2_147_483_647.0) as u64)
 }
 
 /// Validate implemented settings while retaining extension-owned and future keys.
@@ -396,6 +688,14 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
             path.display(),
             error.instance_path,
             error
+        )));
+    }
+    if let Some(timeout) = normalized.get("httpIdleTimeoutMs")
+        && parse_http_idle_timeout(timeout).is_none()
+    {
+        return Err(Error::Config(format!(
+            "{}/httpIdleTimeoutMs: invalid HTTP idle timeout",
+            path.display()
         )));
     }
     Ok(())
@@ -443,7 +743,10 @@ pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<
             return Ok(Some(decision));
         }
     }
-    let settings = read_object(&agent_dir().join("settings.json"))?;
+    // Settings::load reports a broken file. The trust gate must still choose
+    // the conservative default instead of failing before that diagnostic.
+    let settings = read_object(&agent_dir().join("settings.json"))
+        .unwrap_or_else(|_| Value::Object(Map::new()));
     match settings["defaultProjectTrust"].as_str() {
         Some("always") => Ok(Some(true)),
         Some("never") => Ok(Some(false)),
@@ -677,6 +980,10 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
+            // Pi treats an empty settings file as an empty settings scope.
+            if bytes.is_empty() && path.file_name().is_some_and(|name| name == "settings.json") {
+                return Ok(Value::Object(Map::new()));
+            }
             // Pi accepts a UTF-8 BOM in settings and MCP configuration when loading and editing them.
             let input = if path
                 .file_name()
@@ -1062,13 +1369,175 @@ mod tests {
         assert!(error.contains("settings.json/hideThinkingBlock"), "{error}");
         assert!(super::Settings::load_from_paths(&workspace, false, &user).is_ok());
         std::fs::write(&user, "\u{feff}{ broken").unwrap();
-        assert!(super::Settings::load_from_paths(&workspace, false, &user).is_err());
+        assert!(super::Settings::load_from_paths(&workspace, false, &user).is_ok());
         assert!(
             settings
                 .set_user_values_at(&user, &[("theme".into(), json!("dark"))])
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&user).unwrap(), "\u{feff}{ broken");
+    }
+
+    #[test]
+    fn broken_settings_leave_the_other_scope_usable_and_do_not_rewrite_files() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("agent/settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&user, r#"{"theme":"global"}"#).unwrap();
+        std::fs::write(&project, "{").unwrap();
+        let settings = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(settings.string("theme"), Some("global"));
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), "{");
+
+        std::fs::write(&user, "{").unwrap();
+        std::fs::write(&project, r#"{"theme":"project"}"#).unwrap();
+        let mut settings = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        assert_eq!(settings.string("theme"), Some("project"));
+        assert!(
+            settings
+                .set_user_values_at(&user, &[("theme".into(), json!("dark"))])
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), "{");
+        let untrusted = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        assert_eq!(untrusted.string("theme"), None);
+        std::fs::write(&user, "").unwrap();
+        let empty = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        assert!(empty.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn reload_preserves_only_broken_layers_and_recovers_after_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("agent/settings.json");
+        let workspace = root.path().join("project");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&user, r#"{"theme":"global","quietStartup":false}"#).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"theme":"project","retry":{"enabled":true},"compaction":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let mut initial = super::Settings::load_from_paths(&workspace, true, &user).unwrap();
+        initial.live_auto_retry = Some(false);
+        initial.live_auto_compaction = Some(false);
+        std::fs::write(&user, r#"{"theme":"new-global","quietStartup":true}"#).unwrap();
+        std::fs::write(&project, "{").unwrap();
+        let reloaded =
+            super::Settings::load_from_paths_with_previous(&workspace, true, &user, Some(&initial))
+                .unwrap();
+        assert_eq!(reloaded.string("theme"), Some("project"));
+        assert_eq!(reloaded.boolean("quietStartup"), Some(true));
+        assert!(!reloaded.retry_settings().enabled);
+        assert!(!reloaded.auto_compaction_enabled());
+        assert_eq!(reloaded.diagnostics().len(), 1);
+        std::fs::write(&user, "{").unwrap();
+        std::fs::write(&project, r#"{"theme":"new-project"}"#).unwrap();
+        let reloaded = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            true,
+            &user,
+            Some(&reloaded),
+        )
+        .unwrap();
+        assert_eq!(reloaded.string("theme"), Some("new-project"));
+        assert_eq!(reloaded.boolean("quietStartup"), Some(true));
+        assert!(!reloaded.retry_settings().enabled);
+        assert!(!reloaded.auto_compaction_enabled());
+        assert_eq!(reloaded.diagnostics().len(), 1);
+        std::fs::write(&user, r#"{"quietStartup":false}"#).unwrap();
+        let repaired = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            true,
+            &user,
+            Some(&reloaded),
+        )
+        .unwrap();
+        assert_eq!(repaired.boolean("quietStartup"), Some(false));
+        assert!(repaired.diagnostics().is_empty());
+        let untrusted = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            false,
+            &user,
+            Some(&repaired),
+        )
+        .unwrap();
+        assert_eq!(untrusted.string("theme"), None);
+    }
+
+    #[test]
+    fn worker_snapshot_rejects_untrusted_or_mismatched_project_layers() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let snapshot = json!({"value":{},"resource_layers":[[super::agent_dir(),{}],[project.join(".pi"),{"theme":"project"}]],"diagnostics":[],"live_auto_retry":null,"live_auto_compaction":null});
+        let mut settings: super::Settings = serde_json::from_value(snapshot.clone()).unwrap();
+        assert!(settings.validate_worker_snapshot(&project, false).is_err());
+        assert!(
+            settings
+                .validate_worker_snapshot(root.path(), true)
+                .is_err()
+        );
+        settings.validate_worker_snapshot(&project, true).unwrap();
+        assert_eq!(settings.string("theme"), Some("project"));
+    }
+
+    #[test]
+    fn queue_reload_updates_only_queue_values_and_keeps_model_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("agent/settings.json");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &user,
+            r#"{"defaultModel":"old","steeringMode":"one-at-a-time"}"#,
+        )
+        .unwrap();
+        let mut settings = super::Settings::load_from_paths(&workspace, false, &user).unwrap();
+        settings.remember_worker_snapshot(&workspace, false, &settings);
+        std::fs::write(&user, r#"{"defaultModel":"new","steeringMode":"all"}"#).unwrap();
+        let reloaded = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            false,
+            &user,
+            Some(&settings),
+        )
+        .unwrap();
+        let mut staged = settings.clone();
+        staged.fork_worker_history();
+        staged.apply_queue_reload(&reloaded);
+        assert_eq!(
+            settings
+                .worker_fallback(&workspace, false)
+                .unwrap()
+                .string("steeringMode"),
+            Some("one-at-a-time")
+        );
+        settings.apply_queue_reload(&reloaded);
+        let history = settings.worker_fallback(&workspace, false).unwrap();
+        assert_eq!(history.string("defaultModel"), Some("old"));
+        assert_eq!(history.string("steeringMode"), Some("all"));
+        assert_eq!(settings.string("defaultModel"), Some("old"));
+        assert_eq!(settings.string("steeringMode"), Some("all"));
+        std::fs::write(&user, "{").unwrap();
+        let reloaded = super::Settings::load_from_paths_with_previous(
+            &workspace,
+            false,
+            &user,
+            Some(&settings),
+        )
+        .unwrap();
+        settings.apply_queue_reload(&reloaded);
+        assert_eq!(settings.string("defaultModel"), Some("old"));
+        assert_eq!(settings.string("steeringMode"), Some("all"));
+        assert_eq!(settings.diagnostics().len(), 1);
     }
     #[tokio::test]
     async fn auth_read_waits_asynchronously_until_lock_is_released() {
@@ -1217,6 +1686,29 @@ mod tests {
         assert!(settings.http_idle_timeout().is_none());
         settings.value = serde_json::json!({"httpIdleTimeoutMs": 0});
         assert!(settings.http_idle_timeout().is_none());
+        for (input, expected) in [
+            (" Disabled ", 0),
+            ("\u{feff} 60000.9 ", 60000),
+            ("0x10", 16),
+            ("0b101", 5),
+            ("0o10", 8),
+            ("1e3", 1000),
+        ] {
+            settings.value = serde_json::json!({"httpIdleTimeoutMs": input});
+            super::validate_settings(&settings.value, std::path::Path::new("settings.json"))
+                .unwrap();
+            assert_eq!(settings.http_idle_timeout_ms(), expected, "{input:?}");
+        }
+        for input in ["", " ", "-1", "NaN", "Infinity", "0x", "10ms"] {
+            assert!(
+                super::validate_settings(
+                    &serde_json::json!({"httpIdleTimeoutMs":input}),
+                    std::path::Path::new("settings.json")
+                )
+                .is_err(),
+                "{input:?}"
+            );
+        }
         assert!(
             super::validate_settings(
                 &serde_json::json!({"httpIdleTimeoutMs": -1}),
@@ -1795,6 +2287,146 @@ mod tests {
             let error = validate_settings(&invalid, path).unwrap_err().to_string();
             assert!(error.contains("settings.json/"), "{error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_settings_diagnostic_is_stable_across_workspace_aliases() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        let alias = root.path().join("alias");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        symlink(&workspace, &alias).unwrap();
+        std::fs::write(workspace.join(".pi/settings.json"), "{").unwrap();
+        let user = root.path().join("settings.json");
+        let first = Settings::load_from_paths(&alias, true, &user).unwrap();
+        let second =
+            Settings::load_from_paths_with_previous(&workspace, true, &user, Some(&first)).unwrap();
+        assert_eq!(first.diagnostics(), second.diagnostics());
+        assert!(second.stored_layer(&alias.join(".pi")).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_settings_keep_settings_specific_parsing() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("other.json");
+        let user = root.path().join("settings.json");
+        symlink(&target, &user).unwrap();
+        for content in ["\u{feff}{\"theme\":\"light\"}", ""] {
+            std::fs::write(&target, content).unwrap();
+            let settings = Settings::load_from_paths(root.path(), false, &user).unwrap();
+            assert!(
+                settings.diagnostics().is_empty(),
+                "{:?}",
+                settings.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn saved_user_settings_update_worker_history_without_losing_other_values() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let user = root.path().join("settings.json");
+        std::fs::write(&user, r#"{"theme":"dark","retry":{"enabled":true}}"#).unwrap();
+        let mut settings = Settings::load_from_paths(&workspace, false, &user).unwrap();
+        let mut snapshot = settings.clone();
+        snapshot.resource_layers[0].1["extensionValue"] = json!("newer");
+        settings.remember_worker_snapshot(&workspace, false, &snapshot);
+        settings
+            .set_user_at(&user, "theme", json!("light"))
+            .unwrap();
+        settings
+            .set_user_member_at(&user, "retry", "enabled", json!(false))
+            .unwrap();
+        settings
+            .set_user_values_at(&user, &[("hideThinkingBlock".into(), json!(true))])
+            .unwrap();
+        let fallback = settings
+            .worker_fallback(&root.path().join("other"), false)
+            .unwrap();
+        assert_eq!(fallback.value()["theme"], "light");
+        assert_eq!(fallback.value()["retry"]["enabled"], false);
+        assert_eq!(fallback.value()["hideThinkingBlock"], true);
+        assert_eq!(fallback.value()["extensionValue"], "newer");
+        settings
+            .remove_user_member_at(&user, "retry", "enabled")
+            .unwrap();
+        assert!(
+            settings
+                .worker_fallback(&workspace, false)
+                .unwrap()
+                .value()
+                .get("retry")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn worker_snapshot_survives_reload_but_respects_workspace_and_trust() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let other = root.path().join("other");
+        let initial = Settings::default();
+        let snapshot = Settings {
+            resource_layers: vec![
+                (root.path().to_owned(), json!({"skills":["new"]})),
+                (workspace.join(".pi"), json!({"privateProject":"secret"})),
+            ],
+            ..Settings::default()
+        };
+        initial.remember_worker_snapshot(&workspace, true, &snapshot);
+        let reloaded = Settings::load_from_paths_with_previous(
+            &workspace,
+            true,
+            &root.path().join("settings.json"),
+            Some(&initial),
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
+            "new"
+        );
+        assert_eq!(
+            reloaded.worker_fallback(&workspace, true).unwrap().value()["privateProject"],
+            "secret"
+        );
+        for fallback in [
+            reloaded.worker_fallback(&workspace, false),
+            reloaded.worker_fallback(&other, true),
+        ] {
+            let fallback = fallback.unwrap();
+            assert_eq!(fallback.value()["skills"][0], "new");
+            assert_eq!(fallback.resource_layers.len(), 1);
+            assert!(fallback.value().get("privateProject").is_none());
+        }
+        let mut target = reloaded.clone();
+        target.resource_layers = vec![
+            (root.path().to_owned(), json!({"skills":["frontend"]})),
+            (other.join(".pi"), json!({"targetProject":"target"})),
+        ];
+        let target_fallback = target.worker_fallback(&other, true).unwrap();
+        assert_eq!(target_fallback.value()["skills"][0], "new");
+        assert_eq!(target_fallback.value()["targetProject"], "target");
+        assert!(target_fallback.value().get("privateProject").is_none());
+        let mut staged = reloaded.clone();
+        staged.fork_worker_history();
+        let newer = Settings {
+            resource_layers: vec![(root.path().to_owned(), json!({"skills":["staged"]}))],
+            ..Settings::default()
+        };
+        staged.remember_worker_snapshot(&workspace, true, &newer);
+        assert_eq!(
+            staged.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
+            "staged"
+        );
+        assert_eq!(
+            reloaded.worker_fallback(&workspace, true).unwrap().value()["skills"][0],
+            "new"
+        );
     }
 
     #[test]

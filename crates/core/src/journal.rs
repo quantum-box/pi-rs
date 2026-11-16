@@ -3526,7 +3526,7 @@ impl Session {
     }
 
     fn append_inner(&mut self, event: Event, model_marker: bool) -> Result<&Record> {
-        self.append_inner_with_metadata(event, model_marker, None)
+        self.append_inner_with_metadata(event, model_marker, None, false)
     }
 
     pub(crate) fn append_with_record_metadata(
@@ -3537,15 +3537,28 @@ impl Session {
         if metadata.is_null() {
             return Err(Error::Session("record metadata must not be null".into()));
         }
-        self.append_inner_with_metadata(event, true, Some(metadata))
+        self.append_inner_with_metadata(event, true, Some(metadata), false)
+    }
+
+    /// Append optional presentation metadata only when the store can retain it.
+    pub(crate) fn append_with_advisory_metadata(
+        &mut self,
+        event: Event,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<&Record> {
+        self.append_inner_with_metadata(event, true, metadata, true)
     }
 
     fn append_inner_with_metadata(
         &mut self,
         event: Event,
         model_marker: bool,
-        metadata: Option<serde_json::Value>,
+        mut metadata: Option<serde_json::Value>,
+        advisory: bool,
     ) -> Result<&Record> {
+        if advisory && !self.store.supports_record_metadata() {
+            metadata = None;
+        }
         if self.poisoned {
             return Err(Error::Session(
                 "journal write failed; reopen before continuing".into(),
@@ -3706,7 +3719,11 @@ impl Session {
                 .saturating_add(1)
                 > limit
         {
-            return Err(Error::Session("journal record exceeds size limit".into()));
+            if advisory {
+                metadata = None;
+            } else {
+                return Err(Error::Session("journal record exceeds size limit".into()));
+            }
         }
         if let Err(err) = self.store.append_with_metadata(&record, metadata.as_ref()) {
             self.poisoned = true;

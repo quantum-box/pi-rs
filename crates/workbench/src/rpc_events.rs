@@ -208,19 +208,12 @@ impl Stream {
     fn record(&mut self, event: Event, args: &Cli, events: &mut Vec<Value>) {
         match event {
             Event::User { content, .. } => {
-                self.user(json!(content), events);
+                self.user(user_content(&content, &[]), events);
             }
             Event::UserWithImages {
                 content, images, ..
             } => {
-                let mut blocks = Vec::new();
-                if !content.is_empty() {
-                    blocks.push(json!({"type":"text","text":content}));
-                }
-                blocks.extend(images.into_iter().map(
-                    |image| json!({"type":"image","data":image.data,"mimeType":image.mime_type}),
-                ));
-                self.user(json!(blocks), events);
+                self.user(user_content(&content, &images), events);
             }
             Event::ModelRequested { .. } if self.summary => {}
             Event::ModelRequested {
@@ -765,6 +758,16 @@ pub(super) fn tool_call_value(call: &ToolCall) -> Value {
     value
 }
 
+pub(super) fn user_content(content: &str, images: &[pi_rs::ImageContent]) -> Value {
+    let mut blocks = vec![json!({"type":"text", "text":content})];
+    blocks.extend(
+        images
+            .iter()
+            .map(|image| json!({"type":"image", "data":image.data, "mimeType":image.mime_type})),
+    );
+    json!(blocks)
+}
+
 pub(super) fn tool_failed(outcome: &Outcome) -> bool {
     outcome.is_error()
 }
@@ -1001,6 +1004,41 @@ mod streaming_tool_tests {
                 update["partial"]["content"][0],
                 json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
             );
+        }
+    }
+
+    #[test]
+    fn user_events_preserve_text_block_for_text_and_image_only_inputs() {
+        let image = pi_rs::ImageContent {
+            data: "aW1hZ2U=".into(),
+            mime_type: "image/png".into(),
+        };
+        let cases = [
+            (
+                Event::User {
+                    content: "hello".into(),
+                    input_id: None,
+                },
+                json!([{ "type":"text", "text":"hello" }]),
+            ),
+            (
+                Event::UserWithImages {
+                    content: "".into(),
+                    images: vec![image],
+                    input_id: None,
+                },
+                json!([{ "type":"text", "text":"" }, { "type":"image", "data":"aW1hZ2U=", "mimeType":"image/png" }]),
+            ),
+        ];
+        for (event, expected) in cases {
+            let mut stream = Stream::default();
+            let mut events = Vec::new();
+            stream.record(event, &Cli::parse_from(["pi"]), &mut events);
+            for kind in ["message_start", "message_end"] {
+                let message = events.iter().find(|event| event["type"] == kind).unwrap();
+                assert_eq!(message["message"]["content"], expected);
+            }
+            assert_eq!(stream.messages[0]["content"], expected);
         }
     }
 

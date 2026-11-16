@@ -1945,6 +1945,7 @@ impl View {
                 "Error › {}",
                 value["message"].as_str().unwrap_or_default()
             )),
+            Some("warning") => self.append(value["message"].as_str().unwrap_or_default()),
             Some("extension_error") => self.append(&format!(
                 "Extension {} ({}) · {}",
                 value["extension"].as_str().unwrap_or_default(),
@@ -4080,7 +4081,13 @@ pub(super) async fn run(
     {
         std::fs::create_dir_all(parent)?;
     }
+    let reported_settings = args.settings.diagnostics().to_vec();
     args = prepare_initial_session_async(args).await?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -4263,8 +4270,12 @@ pub(super) async fn run(
         if worker
             .as_ref()
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
+            && let Some(mut old) = worker.take()
         {
-            worker.take();
+            for warning in old.take_pending_warnings() {
+                view.append(&warning);
+                dirty = true;
+            }
         }
         if !is_busy(&worker)
             && let Some(pending) = &view.pending_thinking
@@ -5854,7 +5865,10 @@ pub(super) async fn run(
                             view.ui_status.clear();
                             view.widgets.clear();
                             args.settings =
-                                crate::config::Settings::load(&args.workspace, args.trusted)?;
+                                args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            for warning in args.settings.diagnostics() {
+                                view.append(warning);
+                            }
                             auth_reload =
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
@@ -6635,6 +6649,9 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
         });
     restore_workspace(args)?;
     view.restore(args)?;
+    for warning in args.settings.diagnostics() {
+        view.append(warning);
+    }
     if let Some(input) = input {
         view.editor.replace(input);
     }
@@ -7571,7 +7588,10 @@ fn select(
             crate::config::save_trust(&args.workspace, decision)?;
             args.trusted = decision;
             args.trust_pending = false;
-            args.settings = crate::config::Settings::load(&args.workspace, decision)?;
+            args.settings = args.settings.reload_latest(&args.workspace, decision)?;
+            for warning in args.settings.diagnostics() {
+                view.append(warning);
+            }
             view.resources = super::resources::Resources::load(args)?;
             view.append(if decision {
                 "Project configuration trusted"
@@ -7660,6 +7680,7 @@ fn queued_transition_cancel(
 
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     next.session = path;
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
     if view.async_transitions {
@@ -7689,6 +7710,9 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
         initialize_session(&mut next)?;
     }
     view.restore(&next)?;
+    for warning in next.settings.diagnostics() {
+        view.append(warning);
+    }
     view.resources = resources;
     *args = next;
     if args.trust_pending {
@@ -7717,6 +7741,7 @@ pub(super) fn restore_workspace_cancellable(
 ) -> Result<()> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     std::thread::spawn(move || {
         let result = restore_workspace(&mut next).map(|()| next);
         let _ = sender.send(result);
@@ -7785,7 +7810,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     )?;
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
-    args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
     args.refresh_workspace_selection();
     args.restore_session_model(&session)?;
     drop(session);

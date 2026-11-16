@@ -12,6 +12,27 @@ pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
+const MAX_SETTINGS_BOOTSTRAP: usize = 16 * 1024 * 1024;
+
+pub(super) fn read_settings_bootstrap() -> Result<super::config::Settings> {
+    read_settings_frame(&mut std::io::stdin().lock())
+}
+
+fn read_settings_frame(input: &mut impl std::io::Read) -> Result<super::config::Settings> {
+    let mut length = [0_u8; 8];
+    input.read_exact(&mut length)?;
+    let length = usize::try_from(u64::from_be_bytes(length))
+        .map_err(|_| Error::Config("invalid worker settings length".into()))?;
+    if length > MAX_SETTINGS_BOOTSTRAP {
+        return Err(Error::Config(
+            "worker settings snapshot is too large".into(),
+        ));
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Config("invalid worker settings snapshot".into()))
+}
 
 pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -152,20 +173,53 @@ pub(super) struct Worker {
     events: Receiver<Value>,
     pending_events: Vec<Value>,
     extension_sources: std::collections::BTreeMap<String, Value>,
+    settings_snapshot: super::config::Settings,
+    workspace: std::path::PathBuf,
+    trusted: bool,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
+fn retain_warning_on_start_error(error: Error, pending: &[Value]) -> Error {
+    let warnings: Vec<_> = pending
+        .iter()
+        .filter(|event| event["type"] == "warning")
+        .filter_map(|event| event["message"].as_str())
+        .collect();
+    if warnings.is_empty() {
+        error
+    } else {
+        Error::Config(format!("{}\n{}", warnings.join("\n"), error))
+    }
+}
 impl Worker {
+    pub(super) fn settings_for<'a>(
+        slot: &'a Option<Self>,
+        args: &Cli,
+    ) -> Option<&'a super::config::Settings> {
+        let worker = slot.as_ref()?;
+        let same_workspace = worker.workspace == args.workspace
+            || matches!((worker.workspace.canonicalize(), args.workspace.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        (same_workspace && worker.trusted == args.trusted).then_some(&worker.settings_snapshot)
+    }
     pub(super) fn start(args: &Cli, operation: &[&str]) -> Result<Self> {
-        Self::start_with_transition(args, operation, None)
+        Self::start_with_transition(args, operation, None, None)
     }
 
     fn start_with_transition(
         args: &Cli,
         operation: &[&str],
         transition: Option<(SessionStartReason, Option<std::path::PathBuf>)>,
+        fallback: Option<&super::config::Settings>,
     ) -> Result<Self> {
-        let steering_mode = session_queue_mode(args, pi_rs::InputKind::Steer)?;
-        let follow_up_mode = session_queue_mode(args, pi_rs::InputKind::FollowUp)?;
+        let history = args.settings.worker_fallback(&args.workspace, args.trusted);
+        let settings = args.settings.reload_with_fallback(
+            &args.workspace,
+            args.trusted,
+            history.as_ref().or(fallback).unwrap_or(&args.settings),
+        )?;
+        let mut snapshot_args = args.clone();
+        snapshot_args.settings = settings.clone();
+        let steering_mode = session_queue_mode(&snapshot_args, pi_rs::InputKind::Steer)?;
+        let follow_up_mode = session_queue_mode(&snapshot_args, pi_rs::InputKind::FollowUp)?;
         let refresh_barrier = tempfile::NamedTempFile::new()?;
         let mut command = Command::new(std::env::current_exe()?);
         command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
@@ -187,6 +241,26 @@ impl Worker {
             command.env("PI_RS_MODEL_TOKEN", token);
         }
 
+        let mut startup_warnings = Vec::new();
+        let bootstrap = if operation.first() == Some(&"serve") {
+            startup_warnings.extend(
+                settings
+                    .diagnostics()
+                    .iter()
+                    .filter(|warning| !args.settings.diagnostics().contains(warning))
+                    .map(|warning| json!({"type":"warning", "message":warning})),
+            );
+            let bytes = serde_json::to_vec(&settings)?;
+            if bytes.len() > MAX_SETTINGS_BOOTSTRAP {
+                return Err(Error::Config(
+                    "worker settings snapshot is too large".into(),
+                ));
+            }
+            command.arg("--worker-settings-stdin");
+            Some(bytes)
+        } else {
+            None
+        };
         command
             .arg("--session")
             .arg(&args.session)
@@ -311,7 +385,18 @@ impl Worker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take();
+        if let Some(bytes) = bootstrap {
+            let input = stdin.as_mut().expect("piped stdin");
+            let sent = input
+                .write_all(&(bytes.len() as u64).to_be_bytes())
+                .and_then(|()| input.write_all(&bytes));
+            if let Err(error) = sent {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        }
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let (sender, events) = mpsc::channel();
@@ -333,6 +418,10 @@ impl Worker {
             }),
         ];
         let persistent = operation.first() == Some(&"serve");
+        if persistent {
+            args.settings
+                .remember_worker_snapshot(&args.workspace, args.trusted, &settings);
+        }
         Ok(Self {
             compacting: operation.first() == Some(&"compact"),
             retrying: false,
@@ -349,15 +438,13 @@ impl Worker {
             stdin,
             refresh_barrier,
             events,
-            pending_events: Vec::new(),
+            pending_events: startup_warnings,
             extension_sources: Default::default(),
+            settings_snapshot: settings,
+            workspace: args.workspace.clone(),
+            trusted: args.trusted,
             readers,
         })
-    }
-    pub(super) fn start_request(args: &Cli, request: Value) -> Result<Self> {
-        let mut worker = Self::start(args, &["serve"])?;
-        worker.request(args, request)?;
-        Ok(worker)
     }
     pub(super) fn submit(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
         if let Some(active) = slot.as_mut().filter(|worker| worker.matches(args)) {
@@ -371,8 +458,17 @@ impl Worker {
                     "cannot change the worker while a shell command is running".into(),
                 ));
             }
-            slot.take();
-            *slot = Some(Self::start_request(args, request)?);
+            let previous = Self::settings_for(slot, args).cloned();
+            let pending = slot
+                .take()
+                .map(|mut worker| std::mem::take(&mut worker.pending_events))
+                .unwrap_or_default();
+            let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
+                .map_err(|error| retain_warning_on_start_error(error, &pending))?;
+            next.pending_events.splice(0..0, pending);
+            next.request(args, request)
+                .map_err(|error| retain_warning_on_start_error(error, &next.pending_events))?;
+            *slot = Some(next);
             Ok(())
         }
     }
@@ -390,8 +486,15 @@ impl Worker {
                     "cannot redirect controls for an active session".into(),
                 ));
             }
-            slot.take();
-            *slot = Some(Self::start(args, &["serve"])?);
+            let previous = Self::settings_for(slot, args).cloned();
+            let pending = slot
+                .take()
+                .map(|mut worker| std::mem::take(&mut worker.pending_events))
+                .unwrap_or_default();
+            let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
+                .map_err(|error| retain_warning_on_start_error(error, &pending))?;
+            next.pending_events.splice(0..0, pending);
+            *slot = Some(next);
         }
         slot.as_mut().expect("queue worker").send(request)
     }
@@ -459,6 +562,21 @@ impl Worker {
                 Some(event)
             })
             .collect()
+    }
+
+    pub(super) fn take_pending_warnings(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        self.pending_events.retain(|event| {
+            if event["type"] == "warning" {
+                if let Some(message) = event["message"].as_str() {
+                    warnings.push(message.to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        warnings
     }
 
     pub(super) fn interrupt_shutdown(&mut self) {
@@ -546,14 +664,22 @@ impl Worker {
     }
 
     pub(super) fn request_share_context(slot: &mut Option<Self>, args: &Cli) -> Result<uuid::Uuid> {
+        let mut previous = None;
+        let mut pending = Vec::new();
         if slot
             .as_ref()
             .is_some_and(|worker| !worker.busy && !worker.bashing && !worker.matches(args))
         {
-            slot.take();
+            previous = Self::settings_for(slot, args).cloned();
+            if let Some(mut worker) = slot.take() {
+                pending = std::mem::take(&mut worker.pending_events);
+            }
         }
         if slot.is_none() {
-            *slot = Some(Self::start(args, &["serve"])?);
+            let mut next = Self::start_with_transition(args, &["serve"], None, previous.as_ref())
+                .map_err(|error| retain_warning_on_start_error(error, &pending))?;
+            next.pending_events.splice(0..0, pending);
+            *slot = Some(next);
         }
         let worker = slot.as_mut().expect("share worker");
         if worker.session != args.session || !worker.persistent {
@@ -659,10 +785,18 @@ impl Worker {
             shutdown_reason(reason),
             replacing_session.then(|| args.session.clone()),
         ));
-        let pending_events = std::mem::take(&mut active.pending_events);
+        let mut pending_events = std::mem::take(&mut active.pending_events);
         let extension_sources = std::mem::take(&mut active.extension_sources);
+        let fallback = Self::settings_for(slot, args).cloned();
         drop(slot.take());
-        let mut next = Self::start_with_transition(args, &["serve"], Some((reason, previous)))?;
+        let mut next = Self::start_with_transition(
+            args,
+            &["serve"],
+            Some((reason, previous)),
+            fallback.as_ref(),
+        )
+        .map_err(|error| retain_warning_on_start_error(error, &pending_events))?;
+        pending_events.append(&mut next.pending_events);
         next.pending_events = pending_events;
         next.extension_sources = extension_sources;
         *slot = Some(next);
@@ -812,6 +946,26 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_bootstrap_frame_preserves_following_input_and_rejects_invalid_lengths() {
+        use std::io::Read;
+        let settings = super::super::config::Settings::default();
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        let mut wire = (bytes.len() as u64).to_be_bytes().to_vec();
+        wire.extend_from_slice(&bytes);
+        wire.extend_from_slice(b"next-control-line\n");
+        let mut input = std::io::Cursor::new(wire);
+        super::read_settings_frame(&mut input).unwrap();
+        let mut rest = String::new();
+        input.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "next-control-line\n");
+        assert!(
+            super::read_settings_frame(&mut std::io::Cursor::new(u64::MAX.to_be_bytes())).is_err()
+        );
+        assert!(
+            super::read_settings_frame(&mut std::io::Cursor::new(100_u64.to_be_bytes())).is_err()
+        );
+    }
     use clap::Parser;
     #[cfg(unix)]
     #[test]
@@ -851,6 +1005,9 @@ mod tests {
             events,
             pending_events: Vec::new(),
             extension_sources: Default::default(),
+            settings_snapshot: args.settings.clone(),
+            workspace: args.workspace.clone(),
+            trusted: args.trusted,
             readers: Vec::new(),
             refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
         };

@@ -58,7 +58,8 @@ Invalid `--thinking` values produce a warning and leave the previous valid
 selection or configured default in place. Repeated values use the last valid
 selection, including when an invalid value follows it.
 
-`httpIdleTimeoutMs` defaults to five minutes and applies to model HTTP response
+`httpIdleTimeoutMs` accepts Pi's numeric strings and case-insensitive `disabled`
+with ECMAScript whitespace, and defaults to five minutes. It applies to model HTTP response
 headers and individual body reads; `0` or `"disabled"` disables this idle
 deadline. `/settings` can change it. The separate `--model-timeout-secs` bounds
 the entire model operation and defaults to 2,147,483 seconds.
@@ -177,7 +178,9 @@ reached against an available native or Pi manifest diagnostic candidate. For a l
 package it stops the current declaration at that resource type, retaining
 earlier resources and processing later declarations. Remote errors propagate.
 Startup theme discovery uses cached candidates when available. Single-file
-sources and other resource filter paths still treat invalid URLs as non-matches.
+sources load only the selected executable and bypass package filters, as in Pi;
+the native executable must pass protocol validation. Other resource filter
+paths still treat invalid URLs as non-matches.
 Pi-only extensions, skills and prompts are scanned only for filter diagnostics;
 they are not loaded as native resources. Diagnostic scans are bounded and fall
 back to native candidates on cycles, excessive traversal, unsafe ignore files,
@@ -512,8 +515,10 @@ strings. The fullscreen and regular terminals also show the prepared tool and
 its partial path, command or pattern while the model streams it. Completed
 calls are still validated before execution. `get_messages` returns
 Pi message roles and blocks, with a correlated partial assistant message
-during streaming. Set `includeNative: true` to include the native model
-projection in `nativeMessages`. The `steer` and `follow_up` commands
+during streaming. Completed unsigned Anthropic responses retain bounded text
+and tool-call block order across session reopen when the stored layout matches
+the current message; provider continuation still uses its existing representation.
+Set `includeNative: true` to include the native model projection in `nativeMessages`. The `steer` and `follow_up` commands
 can queue input before the next prompt without starting the model. The same
 queue accepts prompts with `streamingBehavior` during a turn, expands prompt
 templates and skills, and emits `queue_update` as inputs are saved or consumed.
@@ -523,7 +528,8 @@ out of order, and a settings-write failure can leave the live mode changed.
 Queued input is acknowledged after it is saved. The `get_entries` and
 `get_tree` responses use Pi entry types, string IDs, parent links, and a leaf
 ID. Session records used internally for run recovery are omitted from this
-view. Set `includeNative: true` for the native entries or tree and the native
+view. `get_entries` compares `since` to string IDs without coercion and uses
+JavaScript string conversion in the not-found diagnostic. Set `includeNative: true` for the native entries or tree and the native
 leaf ID. Newly committed entries are emitted as `entry_appended` with those
 same IDs. Full malformed-JSON preview fidelity and additional session events
 remain in progress.
@@ -1673,6 +1679,11 @@ image encodings and oversized input are rejected before that entry is written.
 CLI, RPC and a real terminal
 fixture verify the new input paths.
 
+RPC user `message_start` and `message_end` events and reconstructed native user
+messages use Pi's ordered content blocks: a text block first, including for
+image-only input, followed by image blocks. Unedited imported Pi messages retain
+their original representation; native model-facing messages are unchanged.
+
 ### Multimodal tool event checkpoint
 
 Live JSON/RPC tool completion events and reconstructed RPC tool messages
@@ -2142,8 +2153,13 @@ input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
-BOM when loaded or updated. Invalid JSON and invalid implemented settings remain
-errors; settings updates preserve unknown keys.
+BOM when loaded or updated. Malformed or unreadable user and trusted-project
+settings are reported and the other scope remains available. Settings updates
+do not overwrite malformed files. Invalid implemented setting values remain
+errors; updates preserve unknown keys. On reload, a failed scope retains its
+previous in-memory values while valid changes in the other scope take effect.
+When a worker restarts, it reads valid external settings changes as before;
+the frontend keeps its own snapshot until it reloads or changes sessions.
 
 `defaultTools` follows Pi's layered selection: project modifiers extend the
 user selection, while project plain-name lists replace it. Mixed plain names
@@ -3204,6 +3220,8 @@ are recreated; compaction boundaries and retained record metadata are remapped.
 New Pi imports record conversion provenance. Forking rejects ambiguous legacy
 ownership or inconsistent provenance when it cannot safely reconstruct the
 selected history.
+Interactive and startup branch forks retain imported conversion provenance and
+compaction metadata when saving and reopening the fork.
 
 ### Session-name validation checkpoint
 
@@ -3657,7 +3675,9 @@ the redacted flag without a synthetic delta. Unlike Pi, they omit the opaque
 thinking signature. Legacy model and agent observers continue to receive the
 placeholder delta. RPC `get_messages` reconstructs signed Anthropic block order
 from validated replay, retains the redacted flag, and omits opaque signatures
-from history. Unsigned text-only responses are still collapsed into one text block.
+from history. For unsigned responses, validated display-layout metadata preserves
+block order in RPC history, entries, and shared sessions. If layout metadata is
+unavailable or does not match the message, projection falls back to aggregated text.
 Unlike Pi, the native agent has separate 1 MiB cumulative budgets for reasoning
 deltas and provider-supplied finalized reasoning. When the finalized budget is
 exceeded, block-end notifications contain only that block's observed deltas;
@@ -4464,6 +4484,8 @@ files. A declared root takes precedence over nested skills. Name and
 description diagnostics preserve otherwise loadable skills. Malformed
 prompt templates report their path while other templates remain usable.
 Prompt descriptions without frontmatter use a bounded first-line preview.
+Missing explicit prompt template paths are silently skipped, while native glob
+patterns that match no files remain errors.
 
 Native `grep` now applies inclusion and exclusion globs with the same
 walker semantics as ripgrep, including workspace-relative patterns. Explicit
