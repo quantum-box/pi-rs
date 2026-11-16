@@ -974,6 +974,27 @@ impl Session {
         )
     }
 
+    /// Locate a unique request on the active branch and validate its decision.
+    /// The returned decision does not itself prove an invocation belongs to it.
+    pub fn active_tool_decision(&self, request_id: Uuid) -> Result<RecordedToolDecision> {
+        if request_id.is_nil() {
+            return Err(Error::Session("invalid tool decision request ID".into()));
+        }
+        let mut matches = self.branch().into_iter().filter(|record| {
+            matches!(
+                &record.event,
+                Event::ModelRequested { request_id: Some(id), .. } if *id == request_id
+            )
+        });
+        let record = matches
+            .next()
+            .ok_or_else(|| Error::Session("missing active tool decision request".into()))?;
+        if matches.next().is_some() {
+            return Err(Error::Session("duplicate tool decision request ID".into()));
+        }
+        self.recorded_tool_decision(record.id)
+    }
+
     pub(crate) fn set_run_id(&mut self, run_id: Option<Uuid>) {
         self.run_id = run_id;
     }
@@ -5842,16 +5863,30 @@ mod durable_tool_decision_tests {
             session.recorded_tool_decision(id).unwrap(),
             RecordedToolDecision::Current(_)
         ));
+        let request_id = snapshot.context().request_id;
+        assert!(matches!(
+            session.active_tool_decision(request_id).unwrap(),
+            RecordedToolDecision::Current(_)
+        ));
         session.checkout(base).unwrap();
         assert!(matches!(
             session.recorded_tool_decision(id).unwrap(),
             RecordedToolDecision::Historical(_)
         ));
+        assert!(session.active_tool_decision(request_id).is_err());
         session.checkout(id).unwrap();
         assert!(matches!(
             session.recorded_tool_decision(id).unwrap(),
             RecordedToolDecision::Current(_)
         ));
+        let (mut duplicate, _, _, _) = fixture(&session);
+        if let Event::ModelRequested { request_id: id, .. } = &mut duplicate {
+            *id = Some(request_id);
+        } else {
+            unreachable!();
+        }
+        session.append(duplicate).unwrap();
+        assert!(session.active_tool_decision(request_id).is_err());
     }
 
     #[test]
