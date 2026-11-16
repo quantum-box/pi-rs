@@ -132,6 +132,7 @@ impl<'a> SessionTransaction<'a> {
             || task.owner() != &crate::task::TaskOwner::Conversation(self.state.id)
             || task.state() != &crate::task::TaskState::Ready
             || task.abort_requested()
+            || task.kind().is_none()
         {
             return Err(Error::InvalidSessionAdmission(
                 "invalid scoped task creation".into(),

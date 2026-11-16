@@ -170,6 +170,20 @@ fn invalid_tasks_and_missing_driver_roll_back_all_changes() {
         assert!(load(&path, id).is_none());
     }
     let result = h.session_transaction(c, |tx| {
+        let unregistered = Task::new(
+            Uuid::new_v4(),
+            TaskOwner::Conversation(c),
+            Checkpoint {
+                phase: "start".into(),
+                data: json!(null),
+            },
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            tx.create_task(unregistered),
+            Err(DError::InvalidSessionAdmission(_))
+        ));
         assert!(matches!(
             tx.create_task(task(Uuid::new_v4())),
             Err(DError::InvalidSessionAdmission(_))
