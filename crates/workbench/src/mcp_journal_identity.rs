@@ -44,6 +44,7 @@ pub(crate) enum Domain {
     Store,
     Config,
     Generation,
+    Authentication,
 }
 impl Domain {
     fn tag(self) -> u8 {
@@ -52,6 +53,7 @@ impl Domain {
             Self::Store => 2,
             Self::Config => 3,
             Self::Generation => 4,
+            Self::Authentication => 5,
         }
     }
 }
@@ -426,6 +428,12 @@ mod tests {
         );
         assert_ne!(a, loaded.derive(Domain::Store, &[b"ab", b"c"]).unwrap());
         assert_ne!(a, loaded.derive(Domain::Config, &[b"ab", b"c"]).unwrap());
+        assert_ne!(
+            loaded.derive(Domain::Config, &[b"ab", b"c"]).unwrap(),
+            loaded
+                .derive(Domain::Authentication, &[b"ab", b"c"])
+                .unwrap()
+        );
         assert_ne!(
             a,
             loaded.derive(Domain::Generation, &[b"ab", b"c"]).unwrap()

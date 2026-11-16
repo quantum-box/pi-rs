@@ -14,20 +14,25 @@ const REFERENCE: &str = "${PI_RS_OAUTH_REFERENCE_TEST_SECRET}";
 
 #[tokio::test]
 async fn add_reference_is_resolved_only_for_oauth_token_exchange() {
-    run_reference_login(false, false).await;
+    run_reference_login(false, false, false).await;
 }
 
 #[tokio::test]
 async fn trusted_project_login_uses_its_configured_oauth_client() {
-    run_reference_login(true, false).await;
+    run_reference_login(true, false, false).await;
 }
 
 #[tokio::test]
 async fn changed_project_authentication_does_not_replace_existing_credentials() {
-    run_reference_login(true, true).await;
+    run_reference_login(true, true, false).await;
 }
 
-async fn run_reference_login(project_scope: bool, change_during_login: bool) {
+#[tokio::test]
+async fn local_login_uses_trusted_project_oauth_client() {
+    run_reference_login(true, false, true).await;
+}
+
+async fn run_reference_login(project_scope: bool, change_during_login: bool, local: bool) {
     let root = tempfile::tempdir().unwrap();
     let browser_dir = root.path().join("bin");
     std::fs::create_dir(&browser_dir).unwrap();
@@ -235,7 +240,11 @@ async fn run_reference_login(project_scope: bool, change_during_login: bool) {
     if project_scope {
         command.arg("--trust");
     }
-    let login = timeout_at(deadline, command.args(["mcp", "login", "fixture"]).output())
+    command.args(["mcp", "login", "fixture"]);
+    if local {
+        command.arg("--local");
+    }
+    let login = timeout_at(deadline, command.output())
         .await
         .expect("login deadline")
         .unwrap();

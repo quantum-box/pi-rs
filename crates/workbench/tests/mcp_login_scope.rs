@@ -46,6 +46,15 @@ fn login_selects_trusted_project_definition_and_restricts_local() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("not configured in the trusted project")
     );
+    std::fs::remove_file(project.join("mcp.json")).unwrap();
+    let output = run(&["--trust", "mcp", "login", "service"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("uses credentials from provider"));
+    let output = run(&["--trust", "mcp", "login", "service", "--local"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not configured in the trusted project")
+    );
 }
 
 #[test]
