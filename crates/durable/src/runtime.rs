@@ -97,8 +97,6 @@ pub enum Error {
     /// A task outcome is being published or settled; the admission can be retried.
     #[error("task publication is temporarily busy")]
     TaskPublicationBusy,
-    #[error("inherited tool policy predates extension safety check; reconciliation required")]
-    UnsafeInheritedPolicy,
     #[error("invalid operation: {0}")]
     Invalid(String),
 }
@@ -4956,7 +4954,6 @@ impl Harness {
         Ok((state, entry.version))
     }
     fn hydrate(&self, state: &mut Conversation) -> Result<(), Error> {
-        crate::owned_subagent::validate_inherited_policy(self.owner.store(), state.id)?;
         if let Phase::ToolFinished { operation_id, .. } = &state.phase {
             let key = format!("runtime/tool-result-pending/{}/{}", state.id, operation_id);
             state.pending_tool_result = self
@@ -12848,10 +12845,7 @@ impl Harness {
     }
     fn recover(&mut self) -> Result<(), Error> {
         for id in self.conversations()? {
-            match self.recover_conversation(id) {
-                Ok(()) | Err(Error::UnsafeInheritedPolicy) => (),
-                Err(error) => return Err(error),
-            }
+            self.recover_conversation(id)?;
         }
         Ok(())
     }

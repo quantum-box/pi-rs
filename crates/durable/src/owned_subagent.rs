@@ -24,9 +24,6 @@ pub struct Admission {
     /// Whether this reservation copied the owning conversation's tool configuration.
     #[serde(default, skip_serializing_if = "is_false")]
     pub inherit_parent_tools: bool,
-    /// Runtime proof that the inherited admission rejected extension-dependent policy.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub inherited_policy_checked: bool,
     /// Initial submission, if this reservation was created with input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<InitialSubmission>,
@@ -110,39 +107,6 @@ fn owning_conversation(
             }
         }
     }
-}
-
-// Admissions created before the extension-policy check did not record enough
-// information to prove their child is safe to execute. Fail closed after upgrade.
-pub(crate) fn validate_inherited_policy(
-    store: &durable_store::Store,
-    child: Uuid,
-) -> Result<(), Error> {
-    let Some(edge) = ownership_edge::EdgeStore::new(store)
-        .get(child)
-        .map_err(|e| Error::Invalid(format!("owned subagent edge: {e}")))?
-    else {
-        return Ok(());
-    };
-    let prefix = format!("durable/owned-subagent/{}/", edge.edge.task);
-    let mut matched = false;
-    for (_, entry) in store.list(prefix.as_bytes())? {
-        let admission: Admission = serde_json::from_slice(&entry.value)?;
-        if admission.child == child {
-            if matched
-                || admission.task != edge.edge.task
-                || admission.task_owner != edge.edge.task_owner
-                || admission.mode != edge.edge.mode
-            {
-                return Err(invalid());
-            }
-            matched = true;
-            if admission.inherit_parent_tools && !admission.inherited_policy_checked {
-                return Err(Error::UnsafeInheritedPolicy);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -374,7 +338,6 @@ impl Harness {
                     || a.mode != mode
                     || a.allowed_tools != allowed_tools
                     || a.inherit_parent_tools != inherit_parent_tools
-                    || (a.inherit_parent_tools && !a.inherited_policy_checked)
                     || a.submission.as_ref().map(|s| &s.content) != content.as_ref()
                     || a.submission.as_ref().and_then(|s| s.notify.as_ref()) != notify.as_ref()
                     || a.task_owner == TaskOwner::Conversation(a.child)
@@ -474,7 +437,6 @@ impl Harness {
                 mode,
                 allowed_tools: allowed_tools.clone(),
                 inherit_parent_tools,
-                inherited_policy_checked: inherit_parent_tools,
                 submission: content.as_ref().map(|content| InitialSubmission {
                     id: Uuid::new_v4(),
                     content: content.clone(),
@@ -492,11 +454,6 @@ impl Harness {
             child_state.allowed_tools = allowed_tools.clone();
             let inherited = if inherit_parent_tools {
                 let (parent, parent_checks) = owning_conversation(store, &owner)?;
-                if !parent.extensions.is_empty() {
-                    return Err(Error::Invalid(
-                        "cannot inherit tool policy while parent extensions are selected".into(),
-                    ));
-                }
                 child_state.allowed_tools = parent.allowed_tools;
                 child_state.model_tools = parent.model_tools;
                 child_state.tool_filters = parent.tool_filters;
@@ -758,32 +715,6 @@ mod tests {
             pi_rs_core::Outcome::Succeeded("ok".into())
         }
     }
-    struct RestrictedTool;
-    #[async_trait]
-    impl pi_rs_core::Tool for RestrictedTool {
-        fn spec(&self) -> pi_rs_core::ToolSpec {
-            pi_rs_core::ToolSpec {
-                name: "beta".into(),
-                description: "restricted extension implementation".into(),
-                parameters: serde_json::json!({"type":"object"}),
-            }
-        }
-        async fn invoke(
-            &self,
-            _: serde_json::Value,
-            _: pi_rs_core::ToolContext,
-        ) -> pi_rs_core::Outcome {
-            pi_rs_core::Outcome::Failed("denied".into())
-        }
-    }
-    fn policy_extension() -> crate::extension::Extension {
-        crate::extension::Extension {
-            name: "policy".into(),
-            tools: vec![Arc::new(RestrictedTool)],
-            ..Default::default()
-        }
-    }
-
     struct Stub;
     #[async_trait]
     impl Model for Stub {
@@ -965,175 +896,6 @@ mod tests {
             h.conversation(leaf.child).unwrap().tool_filters.deferred,
             vec!["middle"]
         );
-    }
-
-    #[test]
-    fn inherited_policy_rejects_extension_override_and_retries_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let mut opts = options();
-        opts.tools.push(crate::runtime::RegisteredTool {
-            tool: Arc::new(TestTool),
-            replay: crate::recovery::ReplayPolicy::Safe,
-        });
-        let mut h = Harness::open_paused(&path, opts).unwrap();
-        h.install_extension(policy_extension()).unwrap();
-        let (task, owner) = setup(&mut h);
-        let TaskOwner::Conversation(parent) = owner.clone() else {
-            unreachable!()
-        };
-        h.select_tools(parent, Some(vec!["beta".into()])).unwrap();
-        h.select_extensions(parent, vec!["policy".into()]).unwrap();
-        assert!(
-            h.ensure_task_owned_subagent_inheriting_tools(
-                task,
-                owner.clone(),
-                "blocked",
-                config(),
-                Mode::Foreground
-            )
-            .is_err()
-        );
-        assert!(
-            h.subagent_store()
-                .unwrap()
-                .get(&reservation_key(task, "blocked"))
-                .unwrap()
-                .is_none()
-        );
-        drop(h);
-        let mut h = Harness::open_paused(&path, options()).unwrap();
-        assert!(
-            h.ensure_task_owned_subagent_inheriting_tools(
-                task,
-                owner.clone(),
-                "blocked",
-                config(),
-                Mode::Foreground
-            )
-            .is_err()
-        );
-        h.select_extensions(parent, vec![]).unwrap();
-        let safe = h
-            .ensure_task_owned_subagent_inheriting_tools(
-                task,
-                owner.clone(),
-                "blocked",
-                config(),
-                Mode::Foreground,
-            )
-            .unwrap();
-        assert!(safe.inherited_policy_checked);
-        drop(h);
-        let mut h = Harness::open_paused(&path, options()).unwrap();
-        assert_eq!(
-            h.ensure_task_owned_subagent_inheriting_tools(
-                task,
-                owner,
-                "blocked",
-                config(),
-                Mode::Foreground
-            )
-            .unwrap(),
-            safe
-        );
-        assert_eq!(
-            h.conversation(safe.child).unwrap().allowed_tools,
-            Some(vec!["beta".into()])
-        );
-    }
-
-    #[test]
-    fn inherited_policy_rechecks_extensions_changed_before_commit() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut h = Harness::open_paused(dir.path().join("db"), options()).unwrap();
-        h.install_extension(policy_extension()).unwrap();
-        let (task, owner) = setup(&mut h);
-        let TaskOwner::Conversation(parent) = owner.clone() else {
-            unreachable!()
-        };
-        let mut concurrent = h.worker();
-        BEFORE_INHERITED_ADMISSION.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                concurrent
-                    .select_extensions(parent, vec!["policy".into()])
-                    .unwrap();
-            }))
-        });
-        assert!(
-            h.ensure_task_owned_subagent_inheriting_tools(
-                task,
-                owner,
-                "race-policy",
-                config(),
-                Mode::Background
-            )
-            .is_err()
-        );
-        assert!(
-            h.subagent_store()
-                .unwrap()
-                .get(&reservation_key(task, "race-policy"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn precheck_inherited_child_is_blocked_after_upgrade_and_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let mut h = Harness::open_paused(&path, options()).unwrap();
-        let (task, owner) = setup(&mut h);
-        let a = h
-            .submit_task_owned_subagent_inheriting_tools(
-                task,
-                owner.clone(),
-                "old",
-                config(),
-                Mode::Foreground,
-                "work".into(),
-            )
-            .unwrap();
-        let key = reservation_key(task, "old");
-        let store = h.subagent_store().unwrap();
-        let entry = store.get(&key).unwrap().unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&entry.value).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("inherited_policy_checked");
-        store
-            .commit(
-                &[Check {
-                    key: key.clone(),
-                    expected: Expected::Version(entry.version),
-                }],
-                &[Mutation::Put {
-                    key,
-                    value: serde_json::to_vec(&value).unwrap(),
-                }],
-            )
-            .unwrap();
-        drop(h);
-        let mut h = Harness::open_paused(&path, options()).unwrap();
-        assert!(h.conversation(a.child).is_err());
-        assert!(
-            h.submit_task_owned_subagent_inheriting_tools(
-                task,
-                owner,
-                "old",
-                config(),
-                Mode::Foreground,
-                "work".into()
-            )
-            .is_err()
-        );
-        assert!(matches!(
-            h.resume_conversation(a.child, &pi_rs_core::CancellationToken::new())
-                .await,
-            Err(Error::UnsafeInheritedPolicy)
-        ));
     }
 
     #[test]
