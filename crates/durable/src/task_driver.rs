@@ -758,11 +758,12 @@ impl Shared {
 
     fn run_bounded_workers(self: &Arc<Self>) {
         const WORKERS: usize = 4;
+        const TOTAL_WORKERS: usize = WORKERS + 1;
         let (jobs_tx, jobs_rx) = mpsc::channel::<Box<task_scheduler::DetachedInvocation>>();
         let jobs_rx = Arc::new(Mutex::new(jobs_rx));
         let (done_tx, done_rx) = mpsc::channel::<WorkerEvent>();
-        let mut workers = Vec::with_capacity(WORKERS);
-        for _ in 0..WORKERS {
+        let mut workers = Vec::with_capacity(TOTAL_WORKERS);
+        for _ in 0..TOTAL_WORKERS {
             let jobs = jobs_rx.clone();
             let done = done_tx.clone();
             let shared = self.clone();
@@ -905,7 +906,7 @@ impl Shared {
                     .registry_replacing
                     .load(std::sync::atomic::Ordering::Acquire)
                     || graph_pending)
-                && active < WORKERS
+                && active < TOTAL_WORKERS
             {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -930,11 +931,17 @@ impl Shared {
                             || pending
                             || scheduler.has_published_outcomes().unwrap_or(true)
                         {
-                            scheduler.reserve_independent_root().map(|value| {
-                                value
-                                    .map(task_scheduler::TickReservation::Invocation)
-                                    .unwrap_or(task_scheduler::TickReservation::Progress(false))
-                            })
+                            if active >= WORKERS {
+                                Ok(task_scheduler::TickReservation::Progress(false))
+                            } else {
+                                scheduler.reserve_independent_root().map(|value| {
+                                    value
+                                        .map(task_scheduler::TickReservation::Invocation)
+                                        .unwrap_or(task_scheduler::TickReservation::Progress(false))
+                                })
+                            }
+                        } else if active >= WORKERS {
+                            scheduler.try_reserve_task_tool_child(now)
                         } else {
                             scheduler.try_reserve_tick(now)
                         }

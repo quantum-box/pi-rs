@@ -1990,8 +1990,13 @@ reservation, registry and pending abort under the admission gate, and fences the
 ownership graph through commit. Multiple parents and children, including
 children of tasks staged earlier in the transaction, may be combined with
 root-task creation. A generic child can execute while its TaskTool parent is
-running, provided the attached driver still owns the parent invocation. An
-interrupted parent must recover before its descendants run. Successful TaskTool
+running, provided the attached driver still owns the parent invocation. The
+driver reserves one additional worker for direct generic children of live
+TaskTool parents when its four ordinary workers are busy. Unrelated work cannot
+use this reserved worker and waits for ordinary capacity. A blocking generic
+child can occupy the reserved worker; this fixed bound does not guarantee
+progress for arbitrary recursively blocking handlers. Handlers must remain
+cooperative. An interrupted parent must recover before its descendants run. Successful TaskTool
 settlement waits for owned work; failure and explicit abort cascade through it. This
 slice rejects task-owned conversations and TaskTool children through these host
 methods. Ordinary nested-tool

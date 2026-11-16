@@ -3138,13 +3138,22 @@ impl Scheduler {
 
     /// Reserve at most one invocation; run it outside the scheduler mutex.
     pub fn reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, false)
+        self.reserve_tick_inner(now_millis, false, false)
     }
 
     /// Reserve without waiting for conversation poll fences. A maintenance
     /// value must be retried outside the scheduler mutex when a fence is busy.
     pub fn try_reserve_tick(&mut self, now_millis: i64) -> Result<TickReservation, Error> {
-        self.reserve_tick_inner(now_millis, true)
+        self.reserve_tick_inner(now_millis, true, false)
+    }
+
+    // The driver's overflow worker is reserved for direct generic children of
+    // live TaskTool invocations, so ordinary handlers cannot consume it.
+    pub(crate) fn try_reserve_task_tool_child(
+        &mut self,
+        now_millis: i64,
+    ) -> Result<TickReservation, Error> {
+        self.reserve_tick_inner(now_millis, true, true)
     }
 
     fn deferred_maintenance(&self, intent: MaintenanceIntent) -> TickReservation {
@@ -3161,6 +3170,7 @@ impl Scheduler {
         &mut self,
         now_millis: i64,
         nonblocking: bool,
+        task_tool_child_only: bool,
     ) -> Result<TickReservation, Error> {
         let fence = self.failure_fence.clone();
         let _failure_guard = if nonblocking {
@@ -3325,10 +3335,26 @@ impl Scheduler {
         } else {
             None
         };
+        let live_invocations = self.live_invocations.clone();
+        let eligible = |task: &Task| {
+            if !task_tool_child_only {
+                return true;
+            }
+            let TaskOwner::Task(parent) = task.owner() else {
+                return false;
+            };
+            !task.is_task_tool()
+                && !task.is_background()
+                && tasks.iter().any(|entry| {
+                    entry.task.id() == *parent
+                        && live_task_tool_parent(&entry.task, &live_invocations)
+                })
+        };
         // Children settle before their owner, including when definitions are missing.
         let mut abortable = None;
         for snapshot in &tasks {
-            if !snapshot.task.abort_requested()
+            if !eligible(&snapshot.task)
+                || !snapshot.task.abort_requested()
                 || snapshot.task.state() != &TaskState::Ready
                 || tasks.iter().any(|child| {
                     child.task.owner() == &TaskOwner::Task(snapshot.task.id())
@@ -3441,7 +3467,8 @@ impl Scheduler {
         let Some(snapshot) = tasks
             .iter()
             .find(|s| {
-                s.task.state() == &TaskState::Ready
+                eligible(&s.task)
+                    && s.task.state() == &TaskState::Ready
                     && !s.task.abort_requested()
                     && self.blocked_reason(&s.task).is_none()
                     && self.ancestors_available(&s.task, &tasks)

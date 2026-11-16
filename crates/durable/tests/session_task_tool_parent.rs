@@ -386,3 +386,142 @@ async fn running_child_result_is_fenced_by_parent_failure_and_abort() {
         driver.shutdown().unwrap();
     }
 }
+
+#[tokio::test]
+async fn admitted_children_run_when_four_task_tool_parents_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let handler: Arc<dyn Handler> = Arc::new(move |task: &Task| {
+        started_tx.send(task.id()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|error| error.to_string())?;
+        Ok(Step::Succeed(json!("done")))
+    });
+    let adapter = Arc::new(TaskTool::new(
+        ToolSpec {
+            name: "parent".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        },
+        "parent",
+        true,
+        1,
+        handler.clone(),
+    ));
+    let options = Options {
+        model: Arc::new(ToolModel),
+        tools: vec![adapter.register()],
+        restart_limit: 3,
+        max_turns: 3,
+        uncertain_policy: UncertainPolicy::InterruptedResult,
+    };
+    let (child_tx, child_rx) = mpsc::channel();
+    let (unrelated_tx, unrelated_rx) = mpsc::channel();
+    let mut registry = Registry::default();
+    registry.register_shared("parent", true, handler);
+    registry.register("child", true, move |task: &Task| {
+        child_tx.send(task.id()).unwrap();
+        Ok(Step::Succeed(json!(null)))
+    });
+    registry.register("unrelated", true, move |task: &Task| {
+        unrelated_tx.send(task.id()).unwrap();
+        Ok(Step::Succeed(json!(null)))
+    });
+    let mut scheduler = Scheduler::open(&path, options).unwrap();
+    let driver = scheduler.start_tasks(registry).unwrap();
+    let mut conversations = Vec::new();
+    for _ in 0..4 {
+        let conversation = scheduler.create_conversation(config()).unwrap();
+        scheduler.submit(conversation, None, "work".into()).unwrap();
+        conversations.push(conversation);
+    }
+    let parents = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut parents = Vec::new();
+        while parents.len() < 4 {
+            if let Ok(id) = started_rx.try_recv() {
+                parents.push(id);
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        parents
+    })
+    .await
+    .expect("four TaskTool parents must start");
+    let unrelated = Task::new(
+        Uuid::new_v4(),
+        TaskOwner::Conversation(conversations[0]),
+        Checkpoint {
+            phase: "start".into(),
+            data: json!(null),
+        },
+        3,
+    )
+    .unwrap()
+    .registered_versioned("unrelated".into(), true, 1, json!(null))
+    .unwrap();
+    driver.submit(&unrelated).unwrap();
+    let store = Store::open(&path).unwrap();
+    let tasks = TaskStore::new(&store);
+    let mut children = std::collections::HashSet::new();
+    for parent in &parents {
+        let snapshot = tasks.load(*parent).unwrap().unwrap();
+        let TaskOwner::Conversation(conversation) = snapshot.task.owner() else {
+            panic!("parent owner")
+        };
+        assert!(conversations.contains(conversation));
+        assert_eq!(snapshot.task.state(), &TaskState::Running);
+        let child = child(*parent);
+        children.insert(child.id());
+        scheduler
+            .session_transaction(*conversation, |tx| tx.create_child_task(&snapshot, child))
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !children.is_empty() {
+            if let Ok(id) = child_rx.try_recv() {
+                assert!(children.remove(&id));
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .expect("children must execute despite saturated ordinary workers");
+    assert!(
+        unrelated_rx.try_recv().is_err(),
+        "unrelated work must not use the reserved worker"
+    );
+    assert_eq!(
+        tasks.load(unrelated.id()).unwrap().unwrap().task.state(),
+        &TaskState::Ready
+    );
+    for parent in &parents {
+        assert_eq!(
+            tasks.load(*parent).unwrap().unwrap().task.state(),
+            &TaskState::Running
+        );
+    }
+    for _ in &parents {
+        release_tx.send(()).unwrap();
+    }
+    let ran_unrelated = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(id) = unrelated_rx.try_recv() {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unrelated work must resume when ordinary capacity is free");
+    assert_eq!(ran_unrelated, unrelated.id());
+    scheduler.shutdown().await.unwrap();
+    driver.shutdown().unwrap();
+}
